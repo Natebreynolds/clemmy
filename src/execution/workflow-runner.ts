@@ -75,6 +75,10 @@ import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.
 import { deliverOutcome } from '../runtime/outcome.js';
 import { rewriteInClementineVoice } from './voice-rewrite.js';
 import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
+import {
+  claudeAgentSdkWorkflowStepEnabled,
+  runClaudeAgentSdkWorkflowStep,
+} from '../runtime/harness/claude-agent-workflow-step.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
@@ -968,6 +972,45 @@ function workerIntentRoutingEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_INTENT_ROUTING', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
+interface WorkflowStepModelRoute {
+  model?: string;
+  trace?: {
+    seam: 'workflow';
+    stepId: string;
+    attemptedIntent: string;
+    matchedIntent: string | null;
+    modelId: string;
+    provider: string;
+    source: string;
+  };
+}
+
+function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRoute {
+  const explicit = step.model || undefined;
+  if (explicit) return { model: explicit };
+  if (!workerIntentRoutingEnabled() || !step.intent) return {};
+  const routed = resolveRoleModel('worker', step.intent);
+  return {
+    model: routed.modelId,
+    trace: {
+      seam: 'workflow',
+      stepId: step.id,
+      attemptedIntent: step.intent,
+      matchedIntent: routed.matchedIntent ?? null,
+      modelId: routed.modelId,
+      provider: routed.provider,
+      source: routed.source,
+    },
+  };
+}
+
+function workflowStepCanRunOnClaudeAgentSdk(step: WorkflowStepInput): boolean {
+  if (step.requiresApproval) return false;
+  if (step.sideEffect === 'write' || step.sideEffect === 'send') return false;
+  if (stepLooksMutating(step) || stepLooksLikeIrreversibleSend(step.prompt)) return false;
+  return true;
+}
+
 function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowStepInput): string[] {
   if (step.allowedTools && step.allowedTools.length > 0) {
     return step.allowedTools;
@@ -1078,6 +1121,7 @@ export const workflowRunnerInternalsForTest = {
     hasCompletedUpstreamMutation(steps, blockedStepId, completedStepIds),
   tryAutoHealAndRequeue,
   selfHealAutoMaxAttempts,
+  resolveWorkflowStepModel,
 };
 
 async function runStepViaHarness(
@@ -1151,24 +1195,53 @@ async function runStepViaHarness(
     // user bound for it (worker role), e.g. Claude Opus — while untagged steps
     // stay on the brain. An explicit step.model still wins. The registered
     // RouterModelProvider dispatches the resolved id to its provider.
-    let stepModel: string | undefined = step.model || undefined;
-    if (!stepModel && workerIntentRoutingEnabled() && step.intent) {
-      const routed = resolveRoleModel('worker', step.intent);
-      stepModel = routed.modelId;
+    const modelRoute = resolveWorkflowStepModel(step);
+    const stepModel = modelRoute.model;
+    const appendWorkerRoute = (data: Record<string, unknown>) => {
       try {
         appendHarnessEvent({
           sessionId: realSessionId,
           turn: 0,
           role: 'system',
           type: 'worker_model_routed',
-          data: {
-            seam: 'workflow', stepId: step.id, attemptedIntent: step.intent,
-            matchedIntent: routed.matchedIntent ?? null, modelId: routed.modelId,
-            provider: routed.provider, source: routed.source,
-          },
+          data,
         });
       } catch { /* trace is best-effort */ }
+    };
+    if (stepModel && claudeAgentSdkWorkflowStepEnabled(stepModel) && workflowStepCanRunOnClaudeAgentSdk(step)) {
+      const sdkResult = await runClaudeAgentSdkWorkflowStep({
+        step,
+        workflowName,
+        prompt: message,
+        modelId: stepModel,
+      });
+      appendWorkerRoute({
+        ...(modelRoute.trace ?? {
+          seam: 'workflow',
+          stepId: step.id,
+          attemptedIntent: step.intent ?? null,
+          matchedIntent: null,
+          modelId: stepModel,
+          provider: 'claude',
+          source: step.model ? 'step-model' : 'default',
+        }),
+        modelId: stepModel,
+        provider: 'claude',
+        transport: 'claude_agent_sdk_workflow_step',
+        sdkSessionId: sdkResult.sdkSessionId ?? null,
+        sdkModel: sdkResult.model ?? null,
+        toolUses: sdkResult.toolUses,
+        structured: sdkResult.structured,
+      });
+      return {
+        output: sdkResult.output,
+        hadApprovals: false,
+        approvalIds: [],
+        usedStructuredResult: sdkResult.structured,
+        sessionId: realSessionId,
+      };
     }
+    if (modelRoute.trace) appendWorkerRoute(modelRoute.trace);
     const agent = useWorkflowStepAgent()
       ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools, model: stepModel })
       : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId, model: stepModel });

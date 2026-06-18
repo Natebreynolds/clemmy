@@ -58,7 +58,9 @@ const {
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
-const { resetEventLog } = await import('../runtime/harness/eventlog.js');
+const { resetEventLog, listEvents } = await import('../runtime/harness/eventlog.js');
+const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
+const { setClaudeAgentSdkWorkflowStepRunForTest } = await import('../runtime/harness/claude-agent-workflow-step.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
@@ -88,6 +90,23 @@ function writeParkedRun(runId: string, approvalIds: string[]): string {
 
 const statusOf = (filePath: string): string | undefined =>
   JSON.parse(readFileSync(filePath, 'utf-8')).status;
+
+function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
+  const prev: Record<string, string | undefined> = {};
+  for (const key of Object.keys(over)) {
+    prev[key] = process.env[key];
+    if (over[key] === undefined) delete process.env[key];
+    else process.env[key] = over[key];
+  }
+  try {
+    fn();
+  } finally {
+    for (const key of Object.keys(over)) {
+      if (prev[key] === undefined) delete process.env[key];
+      else process.env[key] = prev[key];
+    }
+  }
+}
 
 test('reapResolvedParkedRuns keeps a run parked while its approval is pending, re-admits once resolved', () => {
   process.env.WORKFLOW_APPROVAL_PARKING = 'on';
@@ -476,6 +495,151 @@ test('bindStepContext carries dependsOn outputs even without explicit step input
   assert.match(rendered, /fetch_accounts/);
   assert.match(rendered, /example\.com/);
   assert.doesNotMatch(rendered, /unrelated/);
+});
+
+test('workflow step model route uses the intent-bound worker model and trace metadata', () => {
+  withEnv({
+    AUTH_MODE: 'codex_oauth',
+    MODEL_ROUTING_MODE: undefined,
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'minimax-01',
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_WORKER_INTENT_ROUTING: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'minimax-01', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]),
+  }, () => {
+    const route = workflowRunnerInternalsForTest.resolveWorkflowStepModel({
+      id: 'design',
+      prompt: 'Design the hero.',
+      intent: 'design',
+    });
+    assert.equal(route.model, 'minimax-01');
+    assert.deepEqual(route.trace, {
+      seam: 'workflow',
+      stepId: 'design',
+      attemptedIntent: 'design',
+      matchedIntent: 'design',
+      modelId: 'minimax-01',
+      provider: 'byo',
+      source: 'chat-rule',
+    });
+  });
+});
+
+test('workflow step explicit model wins over intent routing', () => {
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'minimax-01',
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'minimax-01', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]),
+  }, () => {
+    const route = workflowRunnerInternalsForTest.resolveWorkflowStepModel({
+      id: 'design',
+      prompt: 'Design the hero.',
+      intent: 'design',
+      model: 'gpt-5.5',
+    });
+    assert.equal(route.model, 'gpt-5.5');
+    assert.equal(route.trace, undefined);
+  });
+});
+
+test('workflow Claude-routed read-only step uses Claude Agent SDK and returns structured output', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const stateDir = path.join(tmp, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'auth.json'),
+    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-test-token', refreshToken: 'refresh' } }),
+    'utf-8',
+  );
+  writeFileSync(
+    path.join(stateDir, 'claude-auth.json'),
+    JSON.stringify({
+      accessToken: 'sk-ant-oat01-workflow-step-test-token',
+      refreshToken: 'refresh-token',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    }),
+    'utf-8',
+  );
+
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+  };
+  let captured: any;
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
+    delete process.env.WORKFLOW_USE_HARNESS;
+    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+      { role: 'worker', modelId: 'claude-sonnet-4-6', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]);
+    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+      captured = options;
+      return {
+        text: '{"status":"completed","output":{"report":"CLAUDE_WORKFLOW_STEP_OK"}}',
+        structuredOutput: { status: 'completed', output: { report: 'CLAUDE_WORKFLOW_STEP_OK' } },
+        sessionId: 'sdk-workflow-step-session',
+        model: 'claude-sonnet-4-6',
+        toolUses: ['mcp__clementine-local__skill_read'],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+    });
+
+    const step = {
+      id: 'design_report',
+      prompt: 'Design the report section using the installed test-skill.',
+      intent: 'design',
+      usesSkill: 'test-skill',
+      sideEffect: 'read' as const,
+      output: { type: 'object' as const, required_keys: ['report'], non_empty: ['report'] },
+    };
+    const ctx = {
+      workflow: { name: 'Claude Workflow Step Smoke', description: 'test', enabled: true, steps: [step], trigger: { manual: true } },
+      workflowSlug: 'claude-workflow-step-smoke',
+      runId: 'wf-sdk-1',
+      inputs: {},
+      stepOutputs: {},
+      assistant: { respond: async () => { throw new Error('legacy assistant should not be called'); } },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+
+    const output = await executeStep(step, ctx);
+    assert.deepEqual(output, { report: 'CLAUDE_WORKFLOW_STEP_OK' });
+    assert.equal(captured.modelId, 'claude-sonnet-4-6');
+    assert.ok(captured.prompt.includes('Test Skill Instructions'));
+    assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
+    assert.deepEqual(captured.outputSchema.required, ['status', 'output']);
+
+    const routed = listEvents('workflow:wf-sdk-1:design_report', { types: ['worker_model_routed'] });
+    assert.equal(routed.length, 1);
+    const data = routed[0].data as Record<string, unknown>;
+    assert.equal(data.seam, 'workflow');
+    assert.equal(data.modelId, 'claude-sonnet-4-6');
+    assert.equal(data.transport, 'claude_agent_sdk_workflow_step');
+    assert.deepEqual(data.toolUses, ['mcp__clementine-local__skill_read']);
+  } finally {
+    setClaudeAgentSdkWorkflowStepRunForTest(null);
+    resetHarnessRuntimeConfig();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('workflow harness sessions are deterministic per run step', () => {

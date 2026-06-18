@@ -1,0 +1,224 @@
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-headless-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+const mod = await import('./claude-headless-model.js');
+const {
+  ClaudeHeadlessModel,
+  buildClaudeHeadlessArgs,
+  buildClaudeHeadlessEnv,
+  claudeCliModelArg,
+  renderClaudeHeadlessPrompt,
+  normalizeClaudeHeadlessOutputText,
+  resetClaudeHeadlessModelCache,
+  setClaudeHeadlessSpawnForTest,
+} = mod;
+
+const STATE_DIR = path.join(TMP_HOME, 'state');
+const CLAUDE_AUTH_FILE = path.join(STATE_DIR, 'claude-auth.json');
+mkdirSync(STATE_DIR, { recursive: true });
+
+function writeClaudeToken(): void {
+  writeFileSync(
+    CLAUDE_AUTH_FILE,
+    JSON.stringify({
+      accessToken: 'sk-ant-oat01-test-token',
+      refreshToken: 'refresh-token',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      scopes: ['user:inference'],
+    }),
+    'utf-8',
+  );
+}
+
+test.beforeEach(() => {
+  writeClaudeToken();
+  resetClaudeHeadlessModelCache();
+});
+
+test.after(() => {
+  resetClaudeHeadlessModelCache();
+  rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('claudeCliModelArg maps Clementine Claude ids to Claude Code aliases', () => {
+  assert.equal(claudeCliModelArg('claude-opus-4-8'), 'opus');
+  assert.equal(claudeCliModelArg('claude-sonnet-4-6'), 'sonnet');
+  assert.equal(claudeCliModelArg('claude-haiku-4-5'), 'haiku');
+  assert.equal(claudeCliModelArg('claude-fable-5'), 'fable');
+});
+
+test('buildClaudeHeadlessArgs uses print-mode stream-json without bare mode', () => {
+  const args = buildClaudeHeadlessArgs('claude-opus-4-8');
+  assert.deepEqual(args.slice(0, 2), ['-p', '--safe-mode']);
+  assert.equal(args.includes('--bare'), false);
+  assert.equal(args.includes('--output-format'), true);
+  assert.equal(args.includes('stream-json'), true);
+  assert.equal(args.includes('--model'), true);
+  assert.equal(args[args.indexOf('--model') + 1], 'opus');
+});
+
+test('buildClaudeHeadlessEnv uses OAuth token and strips API-key envs', async () => {
+  const oldApi = process.env.ANTHROPIC_API_KEY;
+  const oldAuth = process.env.ANTHROPIC_AUTH_TOKEN;
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-api03-should-not-leak';
+  process.env.ANTHROPIC_AUTH_TOKEN = 'auth-token-should-not-leak';
+  try {
+    const env = await buildClaudeHeadlessEnv();
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-test-token');
+    assert.equal(env.ANTHROPIC_API_KEY, undefined);
+    assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
+    assert.equal(env.CLAUDE_AGENT_SDK_CLIENT_APP, 'clementine');
+  } finally {
+    if (oldApi == null) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = oldApi;
+    if (oldAuth == null) delete process.env.ANTHROPIC_AUTH_TOKEN;
+    else process.env.ANTHROPIC_AUTH_TOKEN = oldAuth;
+  }
+});
+
+test('renderClaudeHeadlessPrompt preserves system/input and marks text-specialist limits', () => {
+  const prompt = renderClaudeHeadlessPrompt({
+    systemInstructions: 'Be precise.',
+    input: [{ role: 'user', content: [{ type: 'input_text', text: 'Draft a layout critique.' }] }],
+    modelSettings: {},
+    tools: [{ type: 'function', name: 'read_file', description: 'Read', parameters: {}, strict: false }],
+    outputType: { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'] },
+    handoffs: [],
+    tracing: false,
+  } as any);
+  assert.match(prompt, /System instructions:\nBe precise\./);
+  assert.match(prompt, /text specialist/);
+  assert.match(prompt, /Return only valid JSON/);
+  assert.match(prompt, /Do not wrap the JSON in markdown fences/);
+  assert.match(prompt, /user:\nDraft a layout critique\./);
+});
+
+test('normalizeClaudeHeadlessOutputText strips markdown fences for structured output', () => {
+  assert.equal(
+    normalizeClaudeHeadlessOutputText('```json\n{"reply":"ok"}\n```', { type: 'object' } as any),
+    '{"reply":"ok"}',
+  );
+  assert.equal(
+    normalizeClaudeHeadlessOutputText('Here is the JSON:\n{"reply":"ok"}\nDone.', { type: 'object' } as any),
+    '{"reply":"ok"}',
+  );
+  assert.equal(
+    normalizeClaudeHeadlessOutputText('```json\n{"reply":"ok"}\n```', 'text' as any),
+    '```json\n{"reply":"ok"}\n```',
+  );
+});
+
+function installSpawnMock(lines: unknown[], captured: { args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv }): void {
+  setClaudeHeadlessSpawnForTest(((_cmd: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    captured.args = args;
+    captured.env = options.env;
+    const child = new EventEmitter() as any;
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {
+      child.emit('close', null, 'SIGTERM');
+      return true;
+    };
+    child.stdin.on('data', (chunk: Buffer) => {
+      captured.prompt = (captured.prompt ?? '') + chunk.toString('utf8');
+    });
+    child.stdin.on('finish', () => {
+      queueMicrotask(() => {
+        for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`);
+        child.stdout.end();
+        child.stderr.end();
+        child.emit('close', 0, null);
+      });
+    });
+    return child;
+  }) as any);
+}
+
+test('ClaudeHeadlessModel streams deltas and emits a conformant done event', async () => {
+  const captured: { args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv } = {};
+  installSpawnMock([
+    { type: 'system', subtype: 'init', session_id: 'session-1' },
+    { type: 'assistant', message: { id: 'msg-1', model: 'claude-opus', content: [{ type: 'text', text: 'Hello' }], usage: { input_tokens: 3, output_tokens: 1 } } },
+    { type: 'assistant', message: { id: 'msg-1', model: 'claude-opus', content: [{ type: 'text', text: 'Hello world' }], usage: { input_tokens: 3, cache_read_input_tokens: 2, output_tokens: 2 } } },
+    { type: 'result', subtype: 'success', session_id: 'session-1', result: 'Hello world', total_cost_usd: 0 },
+  ], captured);
+
+  const model = new ClaudeHeadlessModel('claude-opus-4-8');
+  const events = [];
+  for await (const event of model.getStreamedResponse({
+    systemInstructions: 'Speak plainly.',
+    input: 'Say hello.',
+    modelSettings: {},
+    tools: [],
+    outputType: 'text',
+    handoffs: [],
+    tracing: false,
+  } as any)) {
+    events.push(event as any);
+  }
+
+  assert.equal(captured.args?.[captured.args.indexOf('--model') + 1], 'opus');
+  assert.match(captured.prompt ?? '', /Speak plainly/);
+  assert.equal(captured.env?.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-test-token');
+  assert.deepEqual(events.map((e) => e.type), ['response_started', 'output_text_delta', 'output_text_delta', 'response_done']);
+  assert.equal(events[1].delta, 'Hello');
+  assert.equal(events[2].delta, ' world');
+  const done = events[3];
+  assert.equal(done.response.id, 'session-1');
+  assert.equal(done.response.output[0].content[0].text, 'Hello world');
+  assert.equal(done.response.usage.inputTokens, 5);
+  assert.equal(done.response.usage.outputTokens, 2);
+});
+
+test('ClaudeHeadlessModel.getResponse returns assistant output and usage', async () => {
+  const captured: { args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv } = {};
+  installSpawnMock([
+    { type: 'system', subtype: 'init', session_id: 'session-2' },
+    { type: 'result', subtype: 'success', session_id: 'session-2', result: 'Final only', usage: { input_tokens: 7, output_tokens: 3 } },
+  ], captured);
+
+  const model = new ClaudeHeadlessModel('claude-sonnet-4-6');
+  const response = await model.getResponse({
+    input: 'Answer once.',
+    modelSettings: {},
+    tools: [],
+    outputType: 'text',
+    handoffs: [],
+    tracing: false,
+  } as any);
+
+  assert.equal(response.responseId, 'session-2');
+  assert.equal((response.output[0] as any).content[0].text, 'Final only');
+  assert.equal(response.usage.inputTokens, 7);
+  assert.equal(response.usage.outputTokens, 3);
+});
+
+test('ClaudeHeadlessModel.getResponse normalizes fenced JSON for structured contracts', async () => {
+  const captured: { args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv } = {};
+  installSpawnMock([
+    { type: 'system', subtype: 'init', session_id: 'session-3' },
+    { type: 'result', subtype: 'success', session_id: 'session-3', result: '```json\n{"reply":"ok"}\n```', usage: { input_tokens: 7, output_tokens: 3 } },
+  ], captured);
+
+  const model = new ClaudeHeadlessModel('claude-sonnet-4-6');
+  const response = await model.getResponse({
+    input: 'Return JSON.',
+    modelSettings: {},
+    tools: [],
+    outputType: { type: 'object' },
+    handoffs: [],
+    tracing: false,
+  } as any);
+
+  assert.equal((response.output[0] as any).content[0].text, '{"reply":"ok"}');
+});

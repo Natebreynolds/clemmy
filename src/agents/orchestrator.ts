@@ -28,12 +28,13 @@ import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { buildWorkerJobPrompt, WorkerToolInputSchema } from './worker-job-packet.js';
+import { buildWorkerJobPrompt, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
 import { DEFAULT_MAX_TURNS, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
+import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -127,6 +128,47 @@ export interface BuildOrchestratorAgentOptions {
 }
 
 // ---------- internal helpers ----------
+
+/** Intent-routed chat workers (default on). off => run_worker ignores the
+ *  optional packet intent and uses the role-wide Worker binding. */
+function workerIntentRoutingEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKER_INTENT_ROUTING', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+interface ChatWorkerModelRoute {
+  model?: string;
+  trace?: {
+    seam: 'chat';
+    attemptedIntent: string;
+    matchedIntent: string | null;
+    item: string;
+    modelId: string;
+    provider: string;
+    source: string;
+  };
+}
+
+function resolveChatWorkerModel(input: Pick<WorkerToolInput, 'intent' | 'item'>): ChatWorkerModelRoute {
+  if (!workerIntentRoutingEnabled() || !input.intent) return {};
+  const routed = resolveRoleModel('worker', input.intent);
+  return {
+    model: routed.modelId,
+    trace: {
+      seam: 'chat',
+      attemptedIntent: input.intent,
+      matchedIntent: routed.matchedIntent ?? null,
+      item: input.item,
+      modelId: routed.modelId,
+      provider: routed.provider,
+      source: routed.source,
+    },
+  };
+}
+
+export const orchestratorInternalsForTest = {
+  resolveChatWorkerModel,
+  workerIntentRoutingEnabled,
+};
 
 function extractSessionId(runContext: unknown): string | undefined {
   if (!runContext || typeof runContext !== 'object') return undefined;
@@ -437,7 +479,7 @@ export const ORCHESTRATOR_INSTRUCTIONS = [
   'Multi-step external work — you do the chain yourself. Sequence the tool calls in your own turn: search Outlook → create calendar event → query Salesforce → create task → done. Do NOT split the work across separate turns expecting someone else to continue; YOU continue. The model handles the chain via parallel or sequential tool calls in the same response.',
   'SKILLS ARE RUNNABLE, NOT STUDY MATERIAL. When a skill has a `src/` directory and `package.json`, it is a NODE.JS PIPELINE you EXECUTE — call `run_shell_command("cd <skill-dir> && npm install && node src/<entry>.js ...")` or `npm run <script>`. Do NOT read every file in src/ trying to understand the pipeline. The SKILL.md tells you the workflow; the source files implement it. Reading 6 source files just to learn what `npm run audit` would have done is wasted budget. Read source ONLY when (a) the SKILL.md is missing entry-point guidance OR (b) something failed and you need to debug. Otherwise: skill_read → run the skill\'s scripts → use the output.',
   'PARALLELIZE — the SDK runs tool calls in the SAME response concurrently; sequential-when-not-needed is wasted wall-clock. RULE: if a second `tool_called` uses nothing from the first, put them in the SAME response. So fire all per-intent `tool_choice_recall` (and any resulting `composio_search_tools`) IN PARALLEL at the start of a multi-tool request, and fire one call PER target for independent reads ("emails from Marlow AND Bob AND Cindy", "calendar Mon/Tue/Wed") instead of looping. Go SEQUENTIAL only when one call\'s output feeds the next ("find the email THEN make a calendar event from its subject").',
-  'RUN_WORKER FAN-OUT — for 3+ independent same-shape units (50 Salesforce tasks, 30 Outlook drafts, 10 Slack posts, 25 URL scrapes) use `run_worker` unless the service has one real batch API — and ESPECIALLY for the prime, most-missed case: independent MULTI-STEP per-item work ("research these 10 prospects" = per item pull SERP/keyword → analyze → write the record). Fan out one worker per item in waves of up to 8; do NOT serialize them in your own context. Serial is a real trap: every item\'s raw output (a 76KB DataForSEO result ×10) piles into YOUR context, the harness clips your own freshly-fetched data, and you enrich from STUBS — isolated ~10K worker contexts avoid this and run concurrently. PARENT-PLANNED, WORKER-EXECUTED: resolve the shared tools/slugs/schema/source-rows/approval-scope ONCE, then pass each worker a structured packet with the exact slugs/commands/schema — never make workers rediscover the same catalog. For external writes: `execution_create` FIRST, `request_approval` ONCE with the batch summary, then the parallel workers (sticky/plan approval covers the writes inside them); aggregate their tight results. For N>50, author a workflow with `forEach` so per-item progress survives a daemon restart. If you catch yourself calling the same research tool a 3rd time for a different item in one turn, STOP and fan out the rest.',
+  'RUN_WORKER FAN-OUT — for 3+ independent same-shape units (50 Salesforce tasks, 30 Outlook drafts, 10 Slack posts, 25 URL scrapes) use `run_worker` unless the service has one real batch API — and ESPECIALLY for the prime, most-missed case: independent MULTI-STEP per-item work ("research these 10 prospects" = per item pull SERP/keyword → analyze → write the record). Fan out one worker per item in waves of up to 8; do NOT serialize them in your own context. Serial is a real trap: every item\'s raw output (a 76KB DataForSEO result ×10) piles into YOUR context, the harness clips your own freshly-fetched data, and you enrich from STUBS — isolated ~10K worker contexts avoid this and run concurrently. PARENT-PLANNED, WORKER-EXECUTED: resolve the shared tools/slugs/schema/source-rows/approval-scope ONCE, then pass each worker a structured packet with the exact slugs/commands/schema — never make workers rediscover the same catalog. If the user configured a worker category ("use Claude Opus for design", "use DeepSeek for research"), set the packet\'s intent to that category word for matching items so the harness routes that worker to the configured model; leave intent unset for ordinary workers. For external writes: `execution_create` FIRST, `request_approval` ONCE with the batch summary, then the parallel workers (sticky/plan approval covers the writes inside them); aggregate their tight results. For N>50, author a workflow with `forEach` so per-item progress survives a daemon restart. If you catch yourself calling the same research tool a 3rd time for a different item in one turn, STOP and fan out the rest.',
   'EXECUTION WRAP — before a MUTATING `composio_execute_tool` (slug with UPDATE/CREATE/INSERT/DELETE/REPLACE/APPEND/SEND/POST/PATCH/WRITE/REMOVE/PUBLISH/BATCH), including inside `run_worker`, you MUST have an active execution lane: `execution_list` → if none, `execution_create({title, objective, successCriteria, nextStep})` where successCriteria is REQUIRED and records the RULE you used (e.g. "dropped any account with no activity in 30d OR ICP<40"). For batch writes create it BEFORE `request_approval` and before worker fan-out; `execution_update_step` between major sub-steps, `execution_complete` at the end. Read-only composio (GOOGLESHEETS_VALUES_GET, *_LIST_*) + DataForSEO/Firecrawl reads are NOT gated. An `EXECUTION_WRAP_REQUIRED` error is the harness telling you HOW to comply, not refusing — recover IN THE SAME TURN: `execution_create(...)`, immediately re-issue the exact failed call, continue. Don\'t ask permission to wrap and never report it as "couldn\'t do the work"; only stop if you genuinely don\'t know the successCriteria (then `ask_user_question` for the rule, create, retry).',
   'INSTRUCTION REVIEW before high-stakes / batch external writes — proactively call `memory_review_instructions(objective)`, review it SILENTLY, and act; raise ONLY an instruction that is stale or wrong for this objective (offer `memory_forget(id)`), never recite the list. A `CONFIRM_FIRST_REQUIRED` error means a batch of same-shape writes needs a reviewed plan first: call `memory_review_instructions(objective)`, then `draft_plan` — if it has `needsUserInput`, ask that and do NOT surface yet; otherwise `surface_plan` (plain language + preview) and STOP until "Plan approved". If a reviewed instruction is unrelated/wrong for this objective (a home-services rule on a legal task), call THAT one out + offer `memory_forget(id)` before proceeding. Approval opens a plan scope covering the rest of the batch, including worker fan-out.',
   'APPROVAL DISCIPLINE — a single mutating external/file/shell call may pause per the tool taxonomy; for a BATCH of same-shape external writes (25 Outlook drafts, 50 Salesforce tasks, 10 Slack posts) call `request_approval` ONCE with the batch summary before the concrete calls/workers. SDK sticky approval only covers IDENTICAL raw calls — different recipients/subjects/files/SQL are different calls, so don\'t lean on it for a batch; the one batch approval is what covers them. LOCAL writes (memory_remember, task_add, goal_update, write_file inside the workspace) never need approval — they ARE the consent the user gave by asking.',
@@ -594,20 +636,78 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const n = Number.parseInt(getRuntimeEnv('CLEMMY_WORKER_MAX_TURNS', '8') ?? '8', 10);
     return Number.isFinite(n) && n >= 2 ? n : 8;
   })();
-  const runWorkerTool = worker.asTool({
-    toolName: 'run_worker',
-    toolDescription: [
+  const runWorkerToolDescription = [
       'Spawn a stateless Worker on ONE item using a structured parent-planned job packet. Call this MULTIPLE TIMES IN PARALLEL when you have N independent items to process (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
       'Each worker call gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
-      'Input: a structured packet for ONE item. You must include the item identifier, exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet.',
+      'Input: a structured packet for ONE item. You must include the item identifier, exact resolved tool slugs/commands/schemas, source rows/URLs, instructions, and expected output. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the item should use a user-configured worker category such as design, writing, research, code, or analysis.',
       'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate. TRIP-WIRE: if you catch yourself about to call the same research/enrichment/read/write tool a 3rd time for a DIFFERENT item in one turn, STOP and fan the REMAINING items out with run_worker instead of looping serially (serial piles every item\'s payload into your context and is exactly what tripped the loop guard and got the last batch cancelled).',
       'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never summarize a batch as complete if any worker returned ERROR. Report exactly which items succeeded and which failed, including the worker reason, and treat the run as needs-attention rather than success.',
       'Before fanning out N mutating workers: call `request_approval` ONCE with the batch summary ("Create 50 Salesforce tasks for these leads — review the list?") instead of letting each worker pause individually. Sticky approval then covers the fan-out.',
       'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
-    ].join(' '),
+    ].join(' ');
+  const runWorkerAsToolOptions = {
+    toolName: 'run_worker',
+    toolDescription: runWorkerToolDescription,
     parameters: WorkerToolInputSchema,
     inputBuilder: buildWorkerJobPrompt,
     ...(workerThrashGuardEnabled() ? { runOptions: { maxTurns: workerMaxTurns } } : {}),
+  };
+  const runWorkerTool = tool({
+    name: 'run_worker',
+    description: runWorkerToolDescription,
+    parameters: WorkerToolInputSchema,
+    strict: true,
+    execute: async (params, runContext, details) => {
+      const input = params as WorkerToolInput;
+      const route = resolveChatWorkerModel(input);
+      const sessionId = extractSessionId(runContext);
+      const turn = extractTurn(runContext);
+      const toolCallId = details?.toolCall?.callId ?? null;
+      const workerModel = route.model ?? resolveRoleModel('worker').modelId;
+      const appendWorkerRoute = (data: Record<string, unknown>) => {
+        if (!sessionId) return;
+        try {
+          appendEvent({
+            sessionId,
+            turn,
+            role: 'system',
+            type: 'worker_model_routed',
+            data: {
+              ...data,
+              toolCallId,
+            },
+          });
+        } catch {
+          // Routing telemetry should never block worker fan-out.
+        }
+      };
+      if (claudeAgentSdkWorkerEnabled(workerModel)) {
+        const sdkResult = await runClaudeAgentSdkWorker(input, workerModel);
+        appendWorkerRoute({
+          ...(route.trace ?? {
+            seam: 'chat',
+            attemptedIntent: input.intent ?? null,
+            matchedIntent: null,
+            item: input.item,
+            modelId: workerModel,
+            provider: 'claude',
+            source: 'default',
+          }),
+          modelId: workerModel,
+          provider: 'claude',
+          transport: 'claude_agent_sdk_worker',
+          sdkSessionId: sdkResult.sdkSessionId ?? null,
+          sdkModel: sdkResult.model ?? null,
+          toolUses: sdkResult.toolUses,
+        });
+        return sdkResult.text;
+      }
+      if (route.trace) appendWorkerRoute(route.trace);
+      const workerForCall = route.model ? worker.clone({ model: route.model }) : worker;
+      const nestedWorkerTool = workerForCall.asTool(runWorkerAsToolOptions);
+      if (!runContext) throw new Error('run_worker requires an SDK run context');
+      return nestedWorkerTool.invoke(runContext, JSON.stringify(input), details);
+    },
   }) as Tool<RuntimeContextValue>;
 
   // Read-only Composio discovery tool. Surfaces `composio_search_tools`

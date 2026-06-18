@@ -16,6 +16,7 @@ const validPacket = {
   context: 'Use the parent-provided firm/domain and Scorpion outbound memory rules. No other firms are in scope.',
   instructions: 'Read-only SEO research in this worker. Do not send email. Return ERROR if the SEO tool cannot provide data after one retry.',
   expectedOutput: 'JSON object with firm, domain, seoFindings, emailAngle, sources, or final line ERROR: <reason>.',
+  intent: null,
 };
 
 test('WorkerToolInputSchema requires a parent-planned packet, not a legacy raw prompt', () => {

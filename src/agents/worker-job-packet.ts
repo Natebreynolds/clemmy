@@ -26,6 +26,11 @@ export const WorkerToolInputSchema = z.object({
     .string()
     .min(1)
     .describe('The compact output shape the parent will aggregate. Include required fields and failure format.'),
+  intent: z
+    .string()
+    .min(1)
+    .nullable()
+    .describe('Model-routing intent/category for this item, using the user\'s own word such as "design", "writing", or "research". Pass null for ordinary workers.'),
 });
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;

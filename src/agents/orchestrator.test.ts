@@ -34,10 +34,14 @@ const {
   buildAskUserQuestionTool,
   recentPriorUserInputsForScope,
   ORCHESTRATOR_INSTRUCTIONS,
+  orchestratorInternalsForTest,
 } = await import('./orchestrator.js');
 const { resolveMcpToolScopeWithContinuity } = await import('../runtime/mcp-tool-scope.js');
+const { RunContext, Usage } = await import('@openai/agents');
+const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 
 test.after(() => {
+  setClaudeAgentSdkWorkerRunForTest(null);
   try {
     rmSync(TMP_HOME, { recursive: true, force: true });
   } catch {
@@ -264,10 +268,214 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     'context',
     'instructions',
     'expectedOutput',
+    'intent',
   ]);
   assert.equal(runWorker.parameters?.additionalProperties, false);
   assert.ok(runWorker.parameters?.properties?.resolvedTools);
+  assert.ok(runWorker.parameters?.properties?.intent);
   assert.equal(Object.hasOwn(runWorker.parameters?.properties ?? {}, 'input'), false);
+});
+
+test('chat run_worker intent routing resolves the per-intent worker model', () => {
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+    BYO_MODEL_BASE_URL: process.env.BYO_MODEL_BASE_URL,
+    BYO_MODEL_API_KEY: process.env.BYO_MODEL_API_KEY,
+    BYO_MODEL_ID: process.env.BYO_MODEL_ID,
+    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+  };
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    delete process.env.MODEL_ROUTING_MODE;
+    process.env.BYO_MODEL_BASE_URL = 'https://api.example.test';
+    process.env.BYO_MODEL_API_KEY = 'k';
+    process.env.BYO_MODEL_ID = 'minimax-01';
+    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+      { role: 'worker', modelId: 'minimax-01', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]);
+
+    const route = orchestratorInternalsForTest.resolveChatWorkerModel({ item: 'landing page hero', intent: 'design' });
+    assert.equal(route.model, 'minimax-01');
+    assert.equal(route.trace?.seam, 'chat');
+    assert.equal(route.trace?.matchedIntent, 'design');
+    assert.equal(route.trace?.provider, 'byo');
+    assert.equal(route.trace?.source, 'chat-rule');
+  } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('chat run_worker intent routing kill-switch keeps legacy role-wide worker', () => {
+  const prev = process.env.CLEMMY_WORKER_INTENT_ROUTING;
+  try {
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'off';
+    const route = orchestratorInternalsForTest.resolveChatWorkerModel({ item: 'landing page hero', intent: 'design' });
+    assert.equal(route.model, undefined);
+    assert.equal(route.trace, undefined);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_WORKER_INTENT_ROUTING;
+    else process.env.CLEMMY_WORKER_INTENT_ROUTING = prev;
+  }
+});
+
+test('run_worker invokes the nested Worker on the routed intent model (offline SDK path)', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat', title: 'run_worker intent route' });
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+    BYO_MODEL_BASE_URL: process.env.BYO_MODEL_BASE_URL,
+    BYO_MODEL_API_KEY: process.env.BYO_MODEL_API_KEY,
+    BYO_MODEL_ID: process.env.BYO_MODEL_ID,
+    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+  };
+  const requestedModels: Array<string | undefined> = [];
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    delete process.env.MODEL_ROUTING_MODE;
+    process.env.BYO_MODEL_BASE_URL = 'https://api.example.test';
+    process.env.BYO_MODEL_API_KEY = 'k';
+    process.env.BYO_MODEL_ID = 'minimax-01';
+    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+      { role: 'worker', modelId: 'minimax-01', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]);
+
+    const stubModel: import('@openai/agents').Model = {
+      async getResponse() {
+        return {
+          output: [{
+            type: 'message',
+            id: 'msg_worker_done',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'worker finished on routed model', providerData: {} }],
+          }],
+          usage: new Usage(),
+          responseId: 'resp_worker_done',
+        } as unknown as import('@openai/agents').ModelResponse;
+      },
+      async *getStreamedResponse() {
+        throw new Error('not used in this test');
+      },
+    };
+    const stubProvider: import('@openai/agents').ModelProvider = {
+      getModel(modelName?: string) {
+        requestedModels.push(modelName);
+        return stubModel;
+      },
+    };
+
+    const agent = await buildOrchestratorAgent();
+    const runWorker = (agent.tools ?? []).find((t) => (t as { name?: string }).name === 'run_worker') as {
+      invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+    } | undefined;
+    assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+
+    const packet = {
+      objective: 'Generate one design variation for the parent batch.',
+      item: 'landing page hero',
+      resolvedTools: 'none needed',
+      context: 'Use the supplied brand brief.',
+      instructions: 'Return one compact design direction.',
+      expectedOutput: 'One sentence or ERROR: <reason>.',
+      intent: 'design',
+    };
+    const input = JSON.stringify(packet);
+    const result = await runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      input,
+      {
+        parentRunConfig: { modelProvider: stubProvider },
+        toolCall: { name: 'run_worker', callId: 'call_worker_design', arguments: input },
+      },
+    );
+
+    assert.equal(result, 'worker finished on routed model');
+    assert.ok(requestedModels.includes('minimax-01'), `expected nested Worker to request minimax-01, got ${requestedModels.join(', ')}`);
+    const routed = listEvents(session.id, { types: ['worker_model_routed'] });
+    assert.equal(routed.length, 1);
+    assert.equal((routed[0].data as { modelId?: string }).modelId, 'minimax-01');
+    assert.equal((routed[0].data as { seam?: string }).seam, 'chat');
+  } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('run_worker routes Claude workers through the Claude Agent SDK worker path', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat', title: 'claude sdk worker route' });
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKER: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+  };
+  let captured: any;
+  try {
+    process.env.AUTH_MODE = 'claude_oauth';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER = 'on';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    setClaudeAgentSdkWorkerRunForTest(async (options) => {
+      captured = options;
+      return {
+        text: 'sdk worker used skill',
+        sessionId: 'sdk-worker-session',
+        model: 'claude-sonnet-4-6',
+        toolUses: ['mcp__clementine-local__skill_read'],
+      };
+    });
+
+    const agent = await buildOrchestratorAgent();
+    const runWorker = (agent.tools ?? []).find((t) => (t as { name?: string }).name === 'run_worker') as {
+      invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+    } | undefined;
+    assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+
+    const packet = {
+      objective: 'Design one report section using the taste skill.',
+      item: 'report hero',
+      resolvedTools: 'skill_read',
+      context: 'Use the installed taste skill.',
+      instructions: 'Call skill_read before writing the design.',
+      expectedOutput: 'One compact design direction.',
+      intent: 'design',
+    };
+    const input = JSON.stringify(packet);
+    const result = await runWorker.invoke(
+      new RunContext({ sessionId: session.id }),
+      input,
+      { toolCall: { name: 'run_worker', callId: 'call_worker_claude_design', arguments: input } },
+    );
+
+    assert.equal(result, 'sdk worker used skill');
+    assert.equal(captured.modelId.startsWith('claude-'), true);
+    assert.match(captured.prompt, /WORKER JOB PACKET/);
+    assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
+    const routed = listEvents(session.id, { types: ['worker_model_routed'] });
+    const sdkEvent = routed.find((event) => (event.data as { transport?: string }).transport === 'claude_agent_sdk_worker');
+    assert.ok(sdkEvent, 'expected SDK worker telemetry event');
+    assert.deepEqual((sdkEvent.data as { toolUses?: string[] }).toolUses, ['mcp__clementine-local__skill_read']);
+  } finally {
+    setClaudeAgentSdkWorkerRunForTest(null);
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('Orchestrator has NO handoffs in Phase 3 (single-agent architecture)', async () => {

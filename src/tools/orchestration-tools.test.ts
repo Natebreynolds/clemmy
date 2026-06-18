@@ -12,7 +12,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
-const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow, bindDiscussedToolkitsIntoSteps } = await import('./orchestration-tools.js');
+const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow, bindDiscussedToolkitsIntoSteps, autoTagStepsWithModelRoleIntents } = await import('./orchestration-tools.js');
 const { traceToWorkflowDraft } = await import('../execution/trace-to-workflow.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
@@ -53,6 +53,30 @@ function workflowUpdate(): ToolHandler {
 
 function resultText(result: ToolResult): string {
   return result.content.map((item) => item.text).join('\n');
+}
+
+function withEnv(over: Record<string, string | undefined>, fn: () => Promise<void> | void): Promise<void> | void {
+  const prev: Record<string, string | undefined> = {};
+  for (const key of Object.keys(over)) {
+    prev[key] = process.env[key];
+    if (over[key] === undefined) delete process.env[key];
+    else process.env[key] = over[key];
+  }
+  const restore = (): void => {
+    for (const key of Object.keys(over)) {
+      if (prev[key] === undefined) delete process.env[key];
+      else process.env[key] = prev[key];
+    }
+  };
+  try {
+    const out = fn();
+    if (out && typeof (out as Promise<void>).then === 'function') return (out as Promise<void>).finally(restore);
+    restore();
+    return out;
+  } catch (err) {
+    restore();
+    throw err;
+  }
 }
 
 function writeAuditWorkflow(): void {
@@ -147,6 +171,83 @@ test('workflow_create persists a step OUTPUT contract (declarable verification u
   assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, contract);
 });
 
+test('workflow_create persists step intent for intent-routed worker models', async () => {
+  const result = await workflowCreate()({
+    name: 'intent-wf',
+    description: 'Create a design artifact.',
+    steps: [{ id: 'design', prompt: 'Design the hero.', intent: 'design' }],
+  });
+  assert.match(resultText(result), /Created workflow "intent-wf"/);
+  assert.equal(readWorkflow('intent-wf')!.data.steps[0].intent, 'design');
+});
+
+test('autoTagStepsWithModelRoleIntents fills blank step intents from worker rules only', () => {
+  const steps = [
+    { id: 'design', prompt: 'Design the hero section.' },
+    { id: 'research', prompt: 'Research the market.', intent: 'research' },
+    { id: 'copy', prompt: 'Design the ad copy.', model: 'gpt-5.5' },
+    { id: 'judge', prompt: 'Judge the design.' },
+  ];
+  const notes = autoTagStepsWithModelRoleIntents(steps, [
+    { role: 'worker', modelId: 'claude-opus-4-8', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    { role: 'judge', modelId: 'claude-sonnet-4-6', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+  ]);
+  assert.equal(steps[0].intent, 'design');
+  assert.equal(steps[1].intent, 'research', 'explicit intent is preserved');
+  assert.equal(steps[2].intent, undefined, 'explicit model wins, so auto-tagging skips it');
+  assert.equal(steps[3].intent, 'design');
+  assert.deepEqual(notes, [
+    'Step `design` auto-tagged intent `design` → worker model claude-opus-4-8.',
+    'Step `judge` auto-tagged intent `design` → worker model claude-opus-4-8.',
+  ]);
+});
+
+test('autoTagStepsWithModelRoleIntents matches multi-word user categories conservatively', () => {
+  const steps = [
+    { id: 'hero', prompt: 'Design the product hero for the homepage.' },
+    { id: 'redesign', prompt: 'Polish the existing redesign notes.' },
+  ];
+  autoTagStepsWithModelRoleIntents(steps, [
+    { role: 'worker', modelId: 'claude-opus-4-8', whenIntent: 'product design', scope: 'durable', source: 'chat-rule' },
+  ]);
+  assert.equal(steps[0].intent, 'product-design');
+  assert.equal(steps[1].intent, undefined, 'single-token substring accidents are not enough');
+});
+
+test('workflow_create auto-tags steps from durable intent-scoped worker rules', async () => {
+  await withEnv({
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'claude-opus-4-8', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]),
+  }, async () => {
+    const result = await workflowCreate()({
+      name: 'auto-intent-wf',
+      description: 'Create a design artifact.',
+      steps: [{ id: 'hero', prompt: 'Design the hero.' }],
+    });
+    assert.match(resultText(result), /auto-tagged intent `design`/);
+    assert.equal(readWorkflow('auto-intent-wf')!.data.steps[0].intent, 'design');
+  });
+});
+
+test('workflow_create simple mode generates a design step intent when the description says design', async () => {
+  await withEnv({
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'claude-opus-4-8', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]),
+  }, async () => {
+    const result = await workflowCreate()({
+      name: 'simple-design-wf',
+      description: 'Design a polished landing page hero.',
+    });
+    assert.match(resultText(result), /Created workflow "simple-design-wf"/);
+    const step = readWorkflow('simple-design-wf')!.data.steps.find((s) => s.id === 'design');
+    assert.equal(step?.intent, 'design');
+  });
+});
+
 test('workflow_create without an output contract leaves step.output undefined (no-regression)', async () => {
   await workflowCreate()({
     name: 'plain-wf',
@@ -168,6 +269,40 @@ test('workflow_update can add an output contract to an existing step', async () 
     steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.', output: contract }],
   });
   assert.deepEqual(readWorkflow('upc-wf')!.data.steps[0].output, contract);
+});
+
+test('workflow_update can set step intent for intent-routed worker models', async () => {
+  await workflowCreate()({
+    name: 'intent-update-wf',
+    description: 'x',
+    steps: [{ id: 'design', prompt: 'Design the hero.' }],
+  });
+  await workflowUpdate()({
+    name: 'intent-update-wf',
+    steps: [{ id: 'design', prompt: 'Design the hero.', intent: 'design' }],
+  });
+  assert.equal(readWorkflow('intent-update-wf')!.data.steps[0].intent, 'design');
+});
+
+test('workflow_update auto-tags edited steps from durable intent-scoped worker rules', async () => {
+  await workflowCreate()({
+    name: 'auto-intent-update-wf',
+    description: 'x',
+    steps: [{ id: 'hero', prompt: 'Build the hero.' }],
+  });
+  await withEnv({
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'claude-opus-4-8', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]),
+  }, async () => {
+    const result = await workflowUpdate()({
+      name: 'auto-intent-update-wf',
+      steps: [{ id: 'hero', prompt: 'Design the hero.' }],
+    });
+    assert.match(resultText(result), /auto-tagged intent `design`/);
+    assert.equal(readWorkflow('auto-intent-update-wf')!.data.steps[0].intent, 'design');
+  });
 });
 
 test('workflow_update refuses to save an ENABLED workflow that becomes invalid — P0-4 gate', async () => {

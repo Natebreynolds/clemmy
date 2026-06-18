@@ -57,6 +57,11 @@ test('buildWorkerAgent returns a configured stateless leaf', async () => {
   assert.match(worker.handoffDescription, /worker|fan-out|parallel/i);
 });
 
+test('buildWorkerAgent honors an explicit routed model override', async () => {
+  const worker = await buildWorkerAgent({ model: 'claude-opus-4-8' });
+  assert.equal(worker.model, 'claude-opus-4-8');
+});
+
 test('Worker is a LEAF (has no handoffs of its own)', async () => {
   const worker = await buildWorkerAgent();
   const handoffs = (worker as unknown as { handoffs?: unknown[] }).handoffs;

@@ -51,6 +51,7 @@ const INTENT_TO_TOOLS: Record<string, string[]> = {
   'write': ['write_file', 'composio_execute_tool'],
   'create': ['write_file', 'composio_execute_tool'],
   'build': ['write_file', 'run_shell_command'],
+  'design': ['write_file', 'run_shell_command'],
   'generate': ['write_file', 'composio_execute_tool'],
   'format': ['run_shell_command', 'write_file'],
   'transform': ['run_shell_command', 'composio_execute_tool'],
@@ -164,7 +165,7 @@ export function suggestStepsFromDescription(
     }));
   } else {
     // Custom pattern: identify verbs and create steps
-    const actionVerbs = ['research', 'fetch', 'search', 'analyze', 'build', 'create', 'send', 'publish', 'deliver'];
+    const actionVerbs = ['research', 'fetch', 'search', 'analyze', 'design', 'write', 'build', 'create', 'generate', 'send', 'publish', 'deliver'];
     const identifiedActions: string[] = [];
 
     for (const verb of actionVerbs) {

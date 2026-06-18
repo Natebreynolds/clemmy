@@ -108,7 +108,7 @@ function filterToolsForWorker<T extends { name?: string }>(tools: T[]): T[] {
   );
 }
 
-export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } = {}): Promise<SubAgent> {
+export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; model?: string } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
   const baseInstructions = [
@@ -150,7 +150,7 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope } 
     // worker model (a UI/chat binding wins; else the provider-derived default,
     // which delegates to getWorkerModel() → MODELS.primary, byte-identical to
     // the old behavior). The registered provider still routes the resulting id.
-    model: resolveRoleModel('worker').modelId,
+    model: options.model ?? resolveRoleModel('worker').modelId,
     tools: wrapTools(tools),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
     // the user has configured. Tools surface as `<server>__<tool>`.

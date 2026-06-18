@@ -10,8 +10,11 @@
  *
  * Optional:
  *   --full runs production builds too.
- *   --live also runs the existing Claude tool-turn and debate live smokes using
- *   the user's real Clementine home/auth. Live mode spends model calls.
+ *   --live also runs the Claude subscription transport, Claude Agent SDK local
+ *   MCP + memory-read + brain-route + brain workflow-authoring + worker-skill
+ *   + workflow-step smokes, Codex-brain→Claude-design workflow smoke, chat
+ *   worker routing, and debate live smokes using the user's real Clementine
+ *   home/auth. Live mode spends model calls.
  *
  * Run:
  *   npm run smoke:fusion-readiness
@@ -255,6 +258,13 @@ async function main(): Promise<void> {
   runCommand('targeted role/debate/failover tests', 'npx', [
     'tsx',
     '--test',
+    'src/agents/orchestrator.test.ts',
+    'src/runtime/harness/claude-agent-brain.test.ts',
+    'src/runtime/harness/claude-agent-sdk.test.ts',
+    'src/runtime/harness/claude-agent-worker.test.ts',
+    'src/runtime/harness/claude-agent-workflow-step.test.ts',
+    'src/runtime/harness/claude-headless-model.test.ts',
+    'src/execution/workflow-runner.test.ts',
     'src/runtime/harness/model-role-options.test.ts',
     'src/runtime/harness/model-roles.test.ts',
     'src/runtime/harness/debate-model.test.ts',
@@ -272,8 +282,24 @@ async function main(): Promise<void> {
     const liveEnv: NodeJS.ProcessEnv = { ...process.env };
     if (REAL_CLEMENTINE_HOME === undefined) delete liveEnv.CLEMENTINE_HOME;
     else liveEnv.CLEMENTINE_HOME = REAL_CLEMENTINE_HOME;
-    runCommand('live Claude tool-turn smoke', 'npx', ['tsx', 'scripts/diag-claude-toolturn.ts'], liveEnv);
+    runCommand('live Claude headless provider smoke', 'npx', ['tsx', 'scripts/smoke-claude-headless-provider.ts'], liveEnv);
+    runCommand('live Claude Agent SDK local MCP smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-local-mcp.ts'], liveEnv);
+    runCommand('live Claude Agent SDK memory read smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-memory-read.ts'], liveEnv);
+    runCommand('live Claude Agent SDK brain read-only smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-brain-readonly.ts'], liveEnv);
+    runCommand('live Claude Agent SDK brain workflow-authoring smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-brain-workflow-authoring.ts'], liveEnv);
+    runCommand('live Claude Agent SDK worker skill smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-worker-skill.ts'], liveEnv);
+    runCommand('live Claude Agent SDK workflow-step skill smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-workflow-step.ts'], liveEnv);
+    runCommand('live Codex brain → Claude design workflow smoke', 'npx', ['tsx', 'scripts/smoke-codex-brain-claude-design-workflow.ts'], liveEnv);
+    runCommand(
+      'live chat worker intent-routing smoke',
+      'npx',
+      ['tsx', 'scripts/smoke-chat-worker-routing-live.ts'],
+      { ...liveEnv, CLEMMY_LIVE_WORKER_MODEL: liveEnv.CLEMMY_LIVE_WORKER_MODEL || 'claude-sonnet-4-6' },
+    );
     runCommand('live fusion debate smoke', 'npx', ['tsx', 'scripts/debate-smoke.ts'], liveEnv);
+    if (process.env.CLEMMY_READINESS_LEGACY_CLAUDE_TOOLTURN === '1') {
+      runCommand('legacy live Claude OpenAI-SDK tool-turn diagnostic', 'npx', ['tsx', 'scripts/diag-claude-toolturn.ts'], liveEnv);
+    }
   } else {
     console.log('\nLive model smokes skipped. Run with --live or CLEMMY_READINESS_LIVE=1 to spend real Claude/Codex calls.');
   }

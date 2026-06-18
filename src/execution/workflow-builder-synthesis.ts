@@ -61,6 +61,7 @@ function suggestedToWorkflowStep(
     id: step.id,
     prompt,
     dependsOn: step.dependsOn,
+    intent: step.intent,
     allowedTools: step.suggestedTools.length > 0 ? step.suggestedTools : ['composio_execute_tool'],
     output,
   };

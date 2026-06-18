@@ -99,6 +99,24 @@ test('typed step contract (inputs/output) round-trips through write→read', () 
   assert.deepEqual(s?.output?.required_keys, ['domain', 'clientName']);
 });
 
+test('step intent round-trips through write→read for intent-routed workers', () => {
+  writeWorkflow('intent-rt', {
+    name: 'intent-rt',
+    description: 'intent round-trip',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'design', prompt: 'Design the landing page.', intent: 'design' },
+      { id: 'ship', prompt: 'Publish the files.', dependsOn: ['design'] },
+    ],
+  });
+  const wf = readWorkflow('intent-rt');
+  const design = wf!.data.steps.find((s) => s.id === 'design');
+  const ship = wf!.data.steps.find((s) => s.id === 'ship');
+  assert.equal(design?.intent, 'design');
+  assert.equal(ship?.intent, undefined);
+});
+
 test('output.verify (verifiable handles) round-trips', () => {
   writeWorkflow('verify-rt', {
     name: 'verify-rt', description: 'verify round-trip', enabled: true, trigger: { manual: true },

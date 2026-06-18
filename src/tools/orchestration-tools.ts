@@ -14,6 +14,7 @@ import {
   writeWorkflow,
   type WorkflowDefinition,
   type WorkflowEntry,
+  type WorkflowStepInput,
 } from '../memory/workflow-store.js';
 import { workflowExecutionSurfaceChanged, prepareWorkflowForWrite, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } from '../execution/workflow-describe.js';
@@ -55,9 +56,10 @@ import {
   type ResolverEntry,
 } from './workflow-resolve.js';
 import { addNotification } from '../runtime/notifications.js';
-import { matchToolChoicesForStep, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
+import { matchToolChoicesForStep, slugifyIntent, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { analyzeWorkflowIntent, type WorkflowBuilderIntent } from '../execution/workflow-builder-analysis.js';
 import { synthesizeWorkflowDefinition, renderAnalysisForApproval } from '../execution/workflow-builder-synthesis.js';
+import { readDurableBindings, type RoleBinding } from '../runtime/harness/model-roles.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -95,18 +97,19 @@ export interface AuthoredWorkflowResult {
  * real consumer — promotion — needs the exact same author behavior.)
  */
 export function commitAuthoredWorkflow(def: WorkflowDefinition, dirName: string): AuthoredWorkflowResult {
+  const routeNotes = autoTagStepsWithModelRoleIntents(def.steps);
   const bind = bindStepsToToolChoices(def.steps);
   const prep = prepareWorkflowForWrite(def);
   if (!prep.ok) {
     return {
       ok: false, errors: prep.errors, savedDef: prep.def, repairs: prep.repairs,
-      warnings: prep.warnings, boundNotes: bind.boundNotes, advisories: bind.advisories, gaps: [],
+      warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories, gaps: [],
     };
   }
   writeWorkflow(dirName, prep.def);
   return {
     ok: true, errors: [], savedDef: prep.def, repairs: prep.repairs,
-    warnings: prep.warnings, boundNotes: bind.boundNotes, advisories: bind.advisories,
+    warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories,
     gaps: analyzeWorkflowGaps(prep.def),
   };
 }
@@ -147,6 +150,45 @@ export interface StepBindResult {
  *  directive's own prose, which would otherwise let a 2nd workflow_update bind a
  *  different choice off boilerplate words). */
 const BIND_DIRECTIVE_MARKER = '\n\n→ Proven tool (engine-bound):';
+
+function slugContainsPhrase(haystackSlug: string, phraseSlug: string): boolean {
+  if (!haystackSlug || !phraseSlug) return false;
+  return `-${haystackSlug}-`.includes(`-${phraseSlug}-`);
+}
+
+function stepMatchesIntent(step: Pick<WorkflowStepInput, 'id' | 'prompt'>, intent: string): boolean {
+  const intentSlug = slugifyIntent(intent);
+  if (!intentSlug) return false;
+  const haystackSlug = slugifyIntent(`${step.id} ${step.prompt}`);
+  if (slugContainsPhrase(haystackSlug, intentSlug)) return true;
+
+  const tokens = intentSlug.split('-').filter(Boolean);
+  // Multi-word user categories like "product design" should match a step that
+  // says "design the product hero", but single-word categories stay exact.
+  return tokens.length > 1 && tokens.every((token) => slugContainsPhrase(haystackSlug, token));
+}
+
+export function autoTagStepsWithModelRoleIntents(
+  steps: Array<WorkflowStepInput | { id: string; prompt: string; intent?: string; model?: string }>,
+  bindings: RoleBinding[] = readDurableBindings(),
+): string[] {
+  const workerIntents = bindings
+    .filter((b) => b.role === 'worker' && typeof b.whenIntent === 'string' && b.whenIntent.trim().length > 0)
+    .map((b) => ({ ...b, intentSlug: slugifyIntent(b.whenIntent as string) }))
+    .filter((b) => b.intentSlug.length > 0)
+    .sort((a, b) => b.intentSlug.length - a.intentSlug.length);
+  if (workerIntents.length === 0) return [];
+
+  const notes: string[] = [];
+  for (const step of steps) {
+    if (step.intent || step.model) continue;
+    const match = workerIntents.find((b) => stepMatchesIntent(step, b.intentSlug));
+    if (!match) continue;
+    step.intent = match.intentSlug;
+    notes.push(`Step \`${step.id}\` auto-tagged intent \`${match.intentSlug}\` → worker model ${match.modelId}.`);
+  }
+  return notes;
+}
 
 /** Convert `{{var}}` placeholders to `<var>` so a baked command is GUIDANCE, not
  *  a workflow template token — otherwise checkMalformedTokens would reject the
@@ -696,6 +738,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         orderingOnlyDeps: z.array(z.string()).optional().describe('Deprecated compatibility field. dependsOn now carries data automatically; omit this for new workflows.'),
         model: z.string().optional(),
+        intent: z.string().optional().describe('Optional free-form model-routing category for this step, e.g. "design". If a worker model is bound for that category, this step routes there unless model is explicitly set.'),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
@@ -784,6 +827,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           dependsOn: s.dependsOn,
           orderingOnlyDeps: s.orderingOnlyDeps,
           model: s.model,
+          intent: s.intent,
           tier: s.tier,
           maxTurns: s.maxTurns,
           useHarness: s.useHarness,
@@ -1183,6 +1227,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         orderingOnlyDeps: z.array(z.string()).optional().describe('Deprecated compatibility field. dependsOn now carries data automatically; omit this for new workflows.'),
         model: z.string().optional(),
+        intent: z.string().optional().describe('Optional free-form model-routing category for this step, e.g. "design". If a worker model is bound for that category, this step routes there unless model is explicitly set.'),
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
@@ -1241,6 +1286,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           dependsOn: s.dependsOn,
           orderingOnlyDeps: s.orderingOnlyDeps,
           model: s.model,
+          intent: s.intent,
           tier: s.tier,
           maxTurns: s.maxTurns,
           useHarness: s.useHarness,
@@ -1256,6 +1302,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         }));
       }
       // Tight authoring: bind any newly-provided steps to proven tool-choices.
+      const updateRouteNotes = steps ? autoTagStepsWithModelRoleIntents(next.steps) : [];
       const updateBind = steps ? bindStepsToToolChoices(next.steps) : { boundNotes: [], advisories: [] };
       if (inputsProvided) next.inputs = inputsSchema;
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
@@ -1340,7 +1387,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       // Non-blocking authoring advisories (output-contract / forEach hints).
       // Update has never gated on validation; keep it that way — surface the
       // hints so the author can sharpen the workflow without blocking the save.
-      const updateBindReport = updateBind.boundNotes.length > 0 ? `\n\n${updateBind.boundNotes.join('\n')}` : '';
+      const updateBindNotes = [...updateRouteNotes, ...updateBind.boundNotes];
+      const updateBindReport = updateBindNotes.length > 0 ? `\n\n${updateBindNotes.join('\n')}` : '';
       const updateAdvisories = renderAuthoringAdvisories([
         ...updatePrep.repairs,
         ...updatePrep.warnings,

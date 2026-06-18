@@ -46,6 +46,8 @@ beforeEach(() => {
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
   delete process.env.CLEMMY_HARNESS_HOME;
   delete process.env.CLEMMY_HARNESS_WORKFLOW;
+  delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
+  process.env.AUTH_MODE = 'api_key';
 });
 
 after(() => {
@@ -171,6 +173,60 @@ test('respondPreferHarness: harness auth unavailable falls back to legacy (pre-r
   });
   assert.equal(legacyCalled, 1);
   assert.equal(res.text, 'legacy');
+});
+
+test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through Claude Agent SDK brain', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  let legacyCalled = 0;
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => { runConversationCalled += 1; return { status: 'completed' }; }) as never,
+    claudeAgentBrain: (async (_surface, req) => ({
+      text: 'claude sdk brain',
+      sessionId: req.sessionId,
+      stoppedReason: 'success',
+    })) as never,
+  });
+
+  const res = await respondPreferHarness('home', { message: 'hi', sessionId: 'claude-brain-route' }, async (req) => {
+    legacyCalled += 1;
+    return { text: 'legacy', sessionId: req.sessionId };
+  });
+
+  assert.equal(res.text, 'claude sdk brain');
+  assert.equal(legacyCalled, 0);
+  assert.equal(runConversationCalled, 0, 'Claude SDK brain is a distinct route from the OpenAI SDK runner');
+});
+
+test('respondPreferHarness: Claude SDK brain opt-in does not route execution surfaces', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  let claudeBrainCalled = 0;
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string }) => {
+      runConversationCalled += 1;
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, lastDecision: { reply: 'harness', summary: 's', done: true, nextAction: 'completed' } };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      claudeBrainCalled += 1;
+      return { text: 'claude', sessionId: req.sessionId };
+    }) as never,
+  });
+
+  const res = await respondPreferHarness('workflow', { message: 'step', sessionId: 'claude-brain-workflow' }, async (req) => ({
+    text: 'legacy',
+    sessionId: req.sessionId,
+  }));
+
+  assert.equal(res.text, 'harness');
+  assert.equal(runConversationCalled, 1);
+  assert.equal(claudeBrainCalled, 0, 'workflow stays on the guarded harness until mutation parity is ported');
 });
 
 test('respondPreferHarness: harness run errors PROPAGATE — no post-start legacy retry', async () => {

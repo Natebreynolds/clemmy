@@ -221,6 +221,8 @@ export interface AssistantResponse {
   stoppedReason?: RunStoppedReason;
   /** Number of model→tool→model turns the run actually used. */
   turnsUsed?: number;
+  /** Runtime-specific diagnostics for smoke tests and advanced callers. */
+  raw?: unknown;
 }
 
 export interface RuntimeContextValue {

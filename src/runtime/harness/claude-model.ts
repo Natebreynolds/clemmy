@@ -2,18 +2,14 @@
  * ClaudeModelProvider — runs Claude (Anthropic) as a flagship brain on the
  * user's Claude Max/Pro SUBSCRIPTION via OAuth, peer to CodexModelProvider.
  *
- * Why this shape (for reviewers): the scope considered a fully hand-rolled
- * Messages adapter (mirroring CodexResponsesModel). The reason it preferred
- * native — keeping the OAuth Bearer instead of an x-api-key — is satisfied here
- * by a custom `fetch` that we fully control. With that resolved, we use the
- * maintained `@openai/agents-extensions/ai-sdk` adapter over `@ai-sdk/anthropic`
- * to get correct Messages streaming + tool-use + extended-thinking translation
- * into the SDK `Model` interface, instead of re-deriving ~1000 lines of SSE /
- * StreamEvent plumbing. The Claude-specific work that actually matters — the
- * subscription-OAuth billing guarantee and the Claude-Code identity envelope —
- * lives entirely in `makeClaudeFetch` below.
+ * Default transport: Claude Code headless print mode (`claude -p`) via
+ * claude-headless-model.ts. Live verification showed this is the path that
+ * draws from the user's Claude subscription quota. The raw Anthropic Messages
+ * adapter below is retained only as `CLEMMY_CLAUDE_TRANSPORT=raw_messages` for
+ * diagnostics/rollback; it can authenticate with an oat01 token, but it did not
+ * behave like the official Claude Code / Agent SDK subscription runner.
  *
- * BILLING GUARANTEE ("subscription-or-stop", fail closed):
+ * RAW-MESSAGES BILLING GUARD ("subscription-or-stop", fail closed):
  *   - Every request resolves a fresh `oat01` SUBSCRIPTION token via the auth
  *     wallet, which THROWS unless it's an oat01 (an api03 API key is refused).
  *   - The fetch DELETES any `x-api-key` header (so a stray ANTHROPIC_API_KEY in
@@ -33,6 +29,7 @@ import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
+import { claudeSubscriptionTransport, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-model' });
@@ -546,6 +543,11 @@ const modelCache = new Map<string, Model>();
 export function getClaudeModel(modelId: string): Model {
   const cached = modelCache.get(modelId);
   if (cached) return cached;
+  if (claudeSubscriptionTransport() === 'headless') {
+    const model = getClaudeHeadlessModel(modelId);
+    modelCache.set(modelId, model);
+    return model;
+  }
   // Sanitize cross-model input FIRST (innermost), so a Codex-shaped reasoning
   // item can't crash the aisdk adapter — on the primary call OR any retry.
   let model: Model = withClaudeInputSanitizer(aisdk(getProvider()(modelId)));
@@ -608,5 +610,6 @@ export class ClaudeModelProvider implements ModelProvider {
 export function resetClaudeModelCache(): void {
   cachedToken = null;
   modelCache.clear();
+  resetClaudeHeadlessModelCache();
   provider = null;
 }

@@ -68,6 +68,7 @@
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.82",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.181",
     "@composio/core": "^0.10.0",
     "@inquirer/prompts": "^8.4.1",
     "@modelcontextprotocol/sdk": "^1.29.0",

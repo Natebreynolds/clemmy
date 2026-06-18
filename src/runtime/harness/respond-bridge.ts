@@ -38,6 +38,7 @@ import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
 import { configureHarnessRuntime } from './codex-client.js';
 import { clearKill, createSession, getSession, requestKill } from './eventlog.js';
 import { listPending } from './approval-registry.js';
+import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from './claude-agent-brain.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { getRuntimeEnv } from '../../config.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
@@ -108,17 +109,21 @@ export function harnessSurfaceEnabled(surface: HarnessSurface): boolean {
 type RunConversationFn = typeof runConversation;
 type BuildAgentFn = typeof buildOrchestratorAgent;
 type ConfigureFn = typeof configureHarnessRuntime;
+type ClaudeAgentBrainFn = typeof respondViaClaudeAgentSdkBrain;
 let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
+let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
 export function _setBridgeImplsForTests(impls: {
   runConversation?: RunConversationFn | null;
   buildAgent?: BuildAgentFn | null;
   configure?: ConfigureFn | null;
+  claudeAgentBrain?: ClaudeAgentBrainFn | null;
 }): void {
   runConversationImpl = impls.runConversation ?? runConversation;
   buildAgentImpl = impls.buildAgent ?? buildOrchestratorAgent;
   configureImpl = impls.configure ?? configureHarnessRuntime;
+  claudeAgentBrainImpl = impls.claudeAgentBrain ?? respondViaClaudeAgentSdkBrain;
 }
 
 /** Poll cadence for mapping the legacy `shouldCancel` callback onto the
@@ -261,5 +266,8 @@ export async function respondPreferHarness(
     auth = { ok: false };
   }
   if (!auth.ok) return legacyRespond(request);
+  if (claudeAgentSdkBrainEnabled(surface)) {
+    return claudeAgentBrainImpl(surface, request);
+  }
   return respondViaHarness(surface, request);
 }

@@ -584,8 +584,9 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
     frontmatter.steps = def.steps.map((s) => {
       const out: Record<string, unknown> = { id: s.id };
       if (s.dependsOn && s.dependsOn.length > 0) out.dependsOn = s.dependsOn;
-    if (s.orderingOnlyDeps && s.orderingOnlyDeps.length > 0) out.orderingOnlyDeps = s.orderingOnlyDeps;
+      if (s.orderingOnlyDeps && s.orderingOnlyDeps.length > 0) out.orderingOnlyDeps = s.orderingOnlyDeps;
       if (s.model) out.model = s.model;
+      if (s.intent) out.intent = s.intent;
       if (s.tier !== undefined) out.tier = s.tier;
       if (s.maxTurns !== undefined) out.maxTurns = s.maxTurns;
       if (s.forEach) out.forEach = s.forEach;

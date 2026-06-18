@@ -28,8 +28,29 @@ import { registerModelRoleTools } from './model-role-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
+import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 
 const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
+
+function installAmbientToolContext(): void {
+  const sessionId = process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
+  if (!sessionId) return;
+  const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
+  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+    const toolName = typeof args[0] === 'string' ? args[0] : undefined;
+    const last = args.length - 1;
+    const handler = args[last];
+    if (toolName && typeof handler === 'function') {
+      args[last] = async (...handlerArgs: any[]) => withToolOutputContext(
+        { sessionId, toolName },
+        () => handler(...handlerArgs),
+      );
+    }
+    return originalTool(...args);
+  };
+}
+
+installAmbientToolContext();
 
 registerMemoryTools(server);
 registerFocusTools(server);
