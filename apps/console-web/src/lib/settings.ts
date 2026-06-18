@@ -78,7 +78,27 @@ export interface SettingsSnapshot {
   claudeAuth?: ClaudeAuth;
   activeBrain?: ActiveBrain;
   fusion?: FusionSettings;
+  modelRoles?: ModelRolesSnapshot;
 }
+
+// Role→model registry: which model serves each role (brain/worker/judge), the
+// source of that choice, and the models available grouped by CONNECTED provider.
+export type ModelRoleName = 'brain' | 'worker' | 'judge';
+export interface ResolvedRole {
+  modelId: string;
+  provider: 'codex' | 'claude' | 'byo';
+  source: 'default' | 'settings' | 'chat-rule' | 'session';
+}
+export interface ModelRolesSnapshot {
+  roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole };
+  bindings: { role: ModelRoleName; modelId: string; whenIntent?: string; source: string }[];
+  available: { provider: string; label: string; models: { id: string; label: string }[] }[];
+  activeBrain: ActiveBrain;
+}
+// Set (or clear) a worker/judge role model. Brain is a provider login switch
+// (setActiveBrain). Applies on the next message, no restart.
+export const patchModelRole = (p: { role: 'worker' | 'judge'; modelId?: string; clear?: boolean }) =>
+  patch<{ modelRoles: ModelRolesSnapshot }>('/api/console/settings/models/roles', p);
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
 
