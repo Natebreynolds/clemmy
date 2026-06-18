@@ -578,6 +578,10 @@ export function harnessToolBracketsEnabled(): boolean {
   return (getRuntimeEnv('HARNESS_TOOL_BRACKETS', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+function stripAnsi(input: string): string {
+  return input.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+}
+
 /**
  * Wrap a tool so its execute fires the three reliability checks at the
  * entry edge. Gated by HARNESS_TOOL_BRACKETS (default ON; =off kill-switch).
@@ -630,7 +634,7 @@ function buildPublishProvenance(sessionId: string): (target: string) => boolean 
       } else if (e.type === 'tool_returned') {
         const callId = String(d?.callId ?? '');
         if (createCallIds.has(callId)) {
-          const res = String(d?.result ?? '');
+          const res = stripAnsi(String(d?.result ?? ''));
           for (const m of res.matchAll(/"(?:id|site_id|name|site_name)"\s*:\s*"([\w.-]+)"/gi)) created.add(m[1].toLowerCase());
           for (const m of res.matchAll(/\b(?:project|site)\s+id\s*:\s*([A-Za-z0-9][\w.-]*)/gi)) created.add(m[1].toLowerCase());
           for (const m of res.matchAll(/([\w-]+)\.netlify\.app/gi)) created.add(m[1].toLowerCase());

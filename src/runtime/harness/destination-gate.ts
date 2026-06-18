@@ -108,6 +108,34 @@ function tokenize(segment: string): string[] {
     .filter(Boolean);
 }
 
+function shellSegments(command: string): string[] {
+  return command.split(/&&|\|\||;|\||[\r\n]+/);
+}
+
+function normalizedBinaryName(token: string | undefined): string | undefined {
+  if (!token) return undefined;
+  const raw = token.toLowerCase();
+  if (raw === '@netlify/cli') return 'netlify';
+  const base = raw.split('/').pop();
+  if (!base) return undefined;
+  if (base === 'netlify-cli') return 'netlify';
+  return base;
+}
+
+function effectiveCommand(tokens: string[], idx: number): { binary: string | undefined; idx: number } {
+  const binary = normalizedBinaryName(tokens[idx]);
+  if (binary === 'npx' || binary === 'pnpx' || binary === 'bunx') {
+    let j = idx + 1;
+    while (j < tokens.length && tokens[j].startsWith('-')) {
+      const flag = tokens[j].toLowerCase();
+      j += 1;
+      if (flag === '-p' || flag === '--package' || flag === '--cache' || flag === '--userconfig') j += 1;
+    }
+    if (tokens[j]) return { binary: normalizedBinaryName(tokens[j]), idx: j };
+  }
+  return { binary, idx };
+}
+
 /**
  * Classify a raw shell command for the destination gate. Pure — no I/O.
  *
@@ -119,8 +147,8 @@ function tokenize(segment: string): string[] {
  *   - a publish verb only counts in the LEADING sub-command run of a
  *     segment (the non-flag tokens right after the binary), so
  *     `firefox --foo deploy` style noise after a flag is ignored. Handles
- *     compound commands (`cd x && netlify deploy`) by scanning each
- *     `&&`/`||`/`;`/`|` segment.
+ *     compound commands (`cd x && netlify deploy`, or newline-separated
+ *     `set -e\ncd x\nnpx netlify-cli deploy`) by scanning each segment.
  *   - `--prod`/`--production` anywhere (unquoted) is itself a publish
  *     signal even without a verb (`vercel --prod`).
  * Explicit-destination detection runs against the RAW command (a
@@ -132,7 +160,7 @@ export function classifyShellCommand(command: string): ShellWriteShape {
   }
   // Strip quoted regions so verbs inside messages/strings don't match.
   const unquoted = command.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ');
-  const segments = unquoted.split(/&&|\|\||;|\|/);
+  const segments = shellSegments(unquoted);
 
   let verb: string | undefined;
   let binary: string | undefined;
@@ -143,12 +171,14 @@ export function classifyShellCommand(command: string): ShellWriteShape {
     // Skip a leading env-var assignment / sudo to find the real binary.
     let idx = 0;
     while (idx < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx]) || tokens[idx] === 'sudo')) idx += 1;
-    const segBinary = tokens[idx]?.split('/').pop();
+    const effective = effectiveCommand(tokens, idx);
+    const segBinary = effective.binary;
+    const subcommandIdx = effective.idx;
     // PROD flag anywhere in this segment is a publish signal.
     const prodFlag = tokens.find((t) => PROD_FLAGS.has(t.toLowerCase()));
     // Leading sub-command run: non-flag tokens immediately after the binary.
     let verbInSegment: string | undefined;
-    for (let j = idx + 1; j < tokens.length; j += 1) {
+    for (let j = subcommandIdx + 1; j < tokens.length; j += 1) {
       if (tokens[j].startsWith('-')) break; // first flag ends the sub-command run
       if (PUBLISH_VERBS.has(tokens[j].toLowerCase())) { verbInSegment = tokens[j].toLowerCase(); break; }
     }
@@ -282,19 +312,20 @@ function binaryIsNetworkMutation(binary: string, rest: string): boolean {
 /**
  * Classify a shell command as a clear network mutation (send). Pure, binary-
  * anchored, quote-stripped: scans each `&&`/`||`/`;`/`|` segment, finds the
- * command binary (skipping env-assigns / sudo), and tests it + its args.
+ * command binary (skipping env-assigns / sudo / `npx` wrappers), and tests it + its args.
  */
 export function classifyShellNetworkMutation(command: string): ShellNetworkMutation {
   if (!command || typeof command !== 'string') return { isNetworkMutation: false };
   const unquoted = command.replace(/"[^"]*"/g, ' ').replace(/'[^']*'/g, ' ');
-  for (const segment of unquoted.split(/&&|\|\||;|\|/)) {
+  for (const segment of shellSegments(unquoted)) {
     const tokens = tokenize(segment);
     if (tokens.length === 0) continue;
     let i = 0;
     while (i < tokens.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]) || tokens[i] === 'sudo')) i += 1;
-    const binary = tokens[i]?.split('/').pop()?.toLowerCase();
+    const effective = effectiveCommand(tokens, i);
+    const binary = effective.binary;
     if (!binary) continue;
-    const rest = ` ${tokens.slice(i + 1).join(' ')} `;
+    const rest = ` ${tokens.slice(effective.idx + 1).join(' ')} `;
     if (binaryIsNetworkMutation(binary, rest)) {
       return { isNetworkMutation: true, shapeKey: `shell:${binary}` };
     }

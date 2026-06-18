@@ -803,7 +803,7 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     //    for the immediate explicit --site deploy.
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
-      data: { tool: 'run_shell_command', callId: 'cs2', arguments: JSON.stringify({ command: 'netlify sites:create --name ai-agent-loop-site --account-slug natebreynolds' }) },
+      data: { tool: 'run_shell_command', callId: 'cs2', arguments: JSON.stringify({ command: 'npx netlify-cli sites:create --name ai-agent-loop-runloop --account-slug natebreynolds' }) },
     });
     appendEvent({
       sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_returned',
@@ -816,13 +816,19 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
           'stdout:',
           '',
           'Project Created',
-          'Admin URL: https://app.netlify.com/projects/ai-agent-loop-site',
-          'URL:       https://ai-agent-loop-site.netlify.app',
-          'Project ID: d47019df-0443-4a78-b89a-d0171e9108b3',
+          '\x1B[32mAdmin URL: \x1B[39m https://app.netlify.com/projects/ai-agent-loop-runloop',
+          '\x1B[32mURL: \x1B[39m       https://ai-agent-loop-runloop.netlify.app',
+          '\x1B[32mProject ID: \x1B[39m9fce1eaf-84db-4d7c-911e-fb9bd4d92498',
+          '',
+          'Project already linked to "ai-agent-loop-site"',
+          'Admin url: https://app.netlify.com/projects/ai-agent-loop-site',
+          '',
+          'To unlink this project, run: npx netlify unlink',
         ].join('\n'),
       },
     });
-    assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site d47019df-0443-4a78-b89a-d0171e9108b3 --json'), 'deployed');
+    assert.equal(await shell('npx netlify-cli deploy --dir "/x/site" --prod --site 9fce1eaf-84db-4d7c-911e-fb9bd4d92498 --json'), 'deployed');
+    await assert.rejects(() => Promise.resolve(shell('npx netlify-cli deploy --dir "/x/site" --prod --site ai-agent-loop-site --json')), /UNVERIFIED_DESTINATION/);
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;

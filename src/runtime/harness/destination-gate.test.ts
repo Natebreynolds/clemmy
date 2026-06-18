@@ -84,6 +84,19 @@ test('compound command: cd x && netlify deploy --prod flags on the publish segme
   assert.equal(r.shapeKey, 'netlify:deploy');
 });
 
+test('multiline npx netlify-cli deploy is read as the Netlify publish command', () => {
+  const command = [
+    'set -e',
+    'cd /tmp/site',
+    'npx netlify-cli deploy --dir . --prod --json',
+  ].join('\n');
+  const r = evaluateShellDestination(command);
+  assert.equal(r.action, 'flag');
+  assert.equal(r.verb, 'deploy');
+  assert.equal(r.shapeKey, 'netlify:deploy');
+  assert.equal(r.hardBlock, true);
+});
+
 // ---- false-positive guards (precision matters: this nudges on every shell publish) ----
 
 test('NO false positive: a verb inside a quoted commit message', () => {
@@ -203,6 +216,16 @@ test('provenance gate HARD-BLOCKS a deploy to an explicit target never created/n
   assert.equal(v.action, 'flag');
   assert.equal(v.hardBlock, true);
   assert.match(v.reason, /no session provenance/i);
+});
+
+test('provenance gate reports multiline npx netlify-cli deploys as netlify deploys', () => {
+  const v = evaluateDestinationProvenance(
+    ['set -e', 'cd /x', 'npx netlify-cli deploy --prod --dir . --site 6c97fed4-6043-4841-975c-b8f99b2e274c'].join('\n'),
+    () => false,
+  );
+  assert.equal(v.action, 'flag');
+  assert.equal(v.verb, 'deploy');
+  assert.equal(v.shapeKey, 'netlify:deploy:unverified');
 });
 
 test('provenance gate ALLOWS a deploy to a site created this session', () => {
