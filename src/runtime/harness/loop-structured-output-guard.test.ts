@@ -60,6 +60,8 @@ function makeRunner(cfg: {
 }
 const callRunner = (runner: unknown) =>
   __defaultRunRunner(runner as never, {} as never, [] as never, {} as never);
+const callRunnerWithItems = (runner: unknown, items: unknown[]) =>
+  __defaultRunRunner(runner as never, {} as never, items as never, {} as never);
 
 test('guard: ZodError on completed → recovers raw assistant text, ends cleanly', async () => {
   const zodErr = Object.assign(new Error('invalid'), { name: 'ZodError', issues: [] });
@@ -85,6 +87,20 @@ test('guard: parse error with no recoverable text → safe fallback string', asy
   const runner = makeRunner({ completed: Promise.reject(new SyntaxError('bad')), history: [] });
   const out = await callRunner(runner);
   assert.match(out.finalOutput as string, /couldn't be structured/);
+});
+
+test('guard: parse recovery does not reuse stale assistant text from prior turns', async () => {
+  const prior = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'make a site' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'I would frame it as The Loop.' }] },
+  ];
+  const runner = makeRunner({
+    completed: Promise.reject(new SyntaxError('bad')),
+    history: [...prior, { type: 'function_call', callId: 'call_write', name: 'write_file', arguments: '{}' }],
+  });
+  const out = await callRunnerWithItems(runner, prior);
+  assert.match(out.finalOutput as string, /couldn't be structured/);
+  assert.doesNotMatch(out.finalOutput as string, /The Loop/);
 });
 
 test('guard: NON-parse error (transport) is re-thrown, never swallowed', async () => {

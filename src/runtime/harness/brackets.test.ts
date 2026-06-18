@@ -798,6 +798,31 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
       data: { tool: 'run_shell_command', callId: 'cs1', result: 'exit_code: 0\n\n{"id":"244fc7d2-newsite","name":"fernwood","ssl_url":"https://fernwood.netlify.app"}' },
     });
     assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site 244fc7d2-newsite --json'), 'deployed');
+    // 7. PROVENANCE via current Netlify CLI plain-text output. netlify-cli 24
+    //    prints "Project ID:" instead of JSON; that id must confer provenance
+    //    for the immediate explicit --site deploy.
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
+      data: { tool: 'run_shell_command', callId: 'cs2', arguments: JSON.stringify({ command: 'netlify sites:create --name ai-agent-loop-site --account-slug natebreynolds' }) },
+    });
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_returned',
+      data: {
+        tool: 'run_shell_command',
+        callId: 'cs2',
+        result: [
+          'exit_code: 0',
+          '',
+          'stdout:',
+          '',
+          'Project Created',
+          'Admin URL: https://app.netlify.com/projects/ai-agent-loop-site',
+          'URL:       https://ai-agent-loop-site.netlify.app',
+          'Project ID: d47019df-0443-4a78-b89a-d0171e9108b3',
+        ].join('\n'),
+      },
+    });
+    assert.equal(await shell('netlify deploy --dir "/x/site" --prod --site d47019df-0443-4a78-b89a-d0171e9108b3 --json'), 'deployed');
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;

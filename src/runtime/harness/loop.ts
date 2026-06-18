@@ -555,6 +555,11 @@ function findLatestAssistantMessage(history: AgentInputItem[]): AgentInputItem |
   return null;
 }
 
+function findLatestNewAssistantMessage(history: AgentInputItem[], previousItemCount: number): AgentInputItem | null {
+  const start = Math.max(0, Math.min(previousItemCount, history.length));
+  return findLatestAssistantMessage(history.slice(start));
+}
+
 export function rewriteHistoryWithNativeCompaction(
   history: AgentInputItem[],
   rawResponses: unknown[] | undefined,
@@ -5235,7 +5240,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
 
   let finalOutput: unknown;
   if (structuredOutputFailed) {
-    finalOutput = assistantItemText(findLatestAssistantMessage(history)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+    finalOutput = assistantItemText(findLatestNewAssistantMessage(history, items.length)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
   } else {
     try {
       finalOutput = result.finalOutput;
@@ -5244,7 +5249,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       structuredOutputFailed = true;
       console.warn('[harness] finalOutput failed to parse/validate — ending turn with raw text',
         err instanceof Error ? err.message : err);
-      finalOutput = assistantItemText(findLatestAssistantMessage(history)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+      finalOutput = assistantItemText(findLatestNewAssistantMessage(history, items.length)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
     }
   }
 

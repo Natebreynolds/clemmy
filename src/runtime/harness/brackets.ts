@@ -632,6 +632,7 @@ function buildPublishProvenance(sessionId: string): (target: string) => boolean 
         if (createCallIds.has(callId)) {
           const res = String(d?.result ?? '');
           for (const m of res.matchAll(/"(?:id|site_id|name|site_name)"\s*:\s*"([\w.-]+)"/gi)) created.add(m[1].toLowerCase());
+          for (const m of res.matchAll(/\b(?:project|site)\s+id\s*:\s*([A-Za-z0-9][\w.-]*)/gi)) created.add(m[1].toLowerCase());
           for (const m of res.matchAll(/([\w-]+)\.netlify\.app/gi)) created.add(m[1].toLowerCase());
         }
       }
