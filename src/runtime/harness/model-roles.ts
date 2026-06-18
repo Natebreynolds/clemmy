@@ -35,6 +35,7 @@ import {
 } from '../../config.js';
 import { validateRoleModelBinding } from './model-role-options.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
+import { slugifyIntent } from '../../memory/tool-choice-store.js';
 
 /** Fixed internal role seam. brain = the active orchestrator model; worker =
  *  delegated run_worker/grunt labor; judge = the fusion verify checker / debate
@@ -66,6 +67,9 @@ export interface ResolvedRoleModel {
   provider: ModelProviderClass;
   source: 'default' | 'settings' | 'chat-rule' | 'session';
   inactiveBinding?: InactiveRoleBinding;
+  /** The binding's free-form intent slug that matched this resolution (set only
+   *  when an intent-scoped binding won) — drives the routing trace + hit/miss. */
+  matchedIntent?: string;
 }
 
 /** Kill-switch. off ⇒ resolveRoleModel returns ONLY the provider-derived default
@@ -146,33 +150,51 @@ export function defaultForRole(role: ModelRole): string {
 }
 
 /**
- * Resolve the model + provider for a role. Precedence: a durable role-wide
- * binding (no whenIntent) wins, else the provider-derived default. (Session
- * bindings + free-form intent matching arrive with later phases; the `intent`
- * param is accepted now so call sites are forward-compatible.)
+ * Resolve the model + provider for a role, optionally scoped to a free-form
+ * INTENT (the user's own category word, e.g. "design"). Precedence, most-specific
+ * first: (1) an EXACT-slug intent binding for this role, (2) a role-wide binding
+ * (no whenIntent), (3) the provider-derived default. Each non-default candidate
+ * is live-checked (validateRoleModelBinding); a stale one falls through to the
+ * NEXT tier (not straight to default) and the highest failed binding is carried
+ * as inactiveBinding. Intent matching is EXACT-slug only — the brain emits the
+ * user's word verbatim, so a fuzzy tier never fires on realistic input and only
+ * adds mis-route risk. `intent` undefined ⇒ no intent tier ⇒ byte-identical to
+ * before this change.
  */
-export function resolveRoleModel(role: ModelRole, _intent?: string): ResolvedRoleModel {
-  const bindings = readDurableBindings();
-  const match = bindings.find((b) => b.role === role && !b.whenIntent);
-  if (match) {
-    const validation = validateRoleModelBinding(role, match.modelId);
-    if (validation.ok) {
-      return { modelId: match.modelId, provider: validation.provider, source: match.source };
-    }
+export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRoleModel {
+  const roleBindings = readDurableBindings().filter((b) => b.role === role);
+  const querySlug = intent ? slugifyIntent(intent) : '';
+  const intentMatch = querySlug
+    ? roleBindings.find((b) => b.whenIntent && slugifyIntent(b.whenIntent) === querySlug)
+    : undefined;
+  const roleWide = roleBindings.find((b) => !b.whenIntent);
+  const candidates = [intentMatch, roleWide].filter((b): b is RoleBinding => !!b);
 
-    const modelId = defaultForRole(role);
-    return {
-      modelId,
-      provider: resolveProvider(modelId),
-      source: 'default',
-      inactiveBinding: {
+  let firstInvalid: { match: RoleBinding; reason: string } | undefined;
+  for (const match of candidates) {
+    const v = validateRoleModelBinding(role, match.modelId);
+    if (v.ok) {
+      return {
         modelId: match.modelId,
-        provider: resolveProvider(match.modelId),
+        provider: v.provider,
         source: match.source,
-        reason: validation.reason,
-      },
-    };
+        ...(match.whenIntent ? { matchedIntent: match.whenIntent } : {}),
+      };
+    }
+    if (!firstInvalid) firstInvalid = { match, reason: v.reason };
   }
   const modelId = defaultForRole(role);
-  return { modelId, provider: resolveProvider(modelId), source: 'default' };
+  return firstInvalid
+    ? {
+        modelId,
+        provider: resolveProvider(modelId),
+        source: 'default',
+        inactiveBinding: {
+          modelId: firstInvalid.match.modelId,
+          provider: resolveProvider(firstInvalid.match.modelId),
+          source: firstInvalid.match.source,
+          reason: firstInvalid.reason,
+        },
+      }
+    : { modelId, provider: resolveProvider(modelId), source: 'default' };
 }

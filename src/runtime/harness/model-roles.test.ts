@@ -181,6 +181,61 @@ test('a stale role-wide binding falls back to default and reports the inactive b
   });
 });
 
+// ── Intent-scoped routing (Phase A) ──────────────────────────────
+const BYO_ENV = { BYO_MODEL_BASE_URL: 'https://api.example.test', BYO_MODEL_API_KEY: 'k' };
+
+test('intent-scoped worker binding wins over default; matchedIntent is set; a different intent misses', () => {
+  withEnv({
+    AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: undefined, ...BYO_ENV, BYO_MODEL_ID: 'minimax-01',
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', whenIntent: 'design', scope: 'durable', source: 'chat-rule' }]),
+  }, () => {
+    const hit = resolveRoleModel('worker', 'design');
+    assert.equal(hit.modelId, 'minimax-01');
+    assert.equal(hit.provider, 'byo');
+    assert.equal(hit.matchedIntent, 'design');
+    // raw word slugifies to the stored slug → still matches
+    assert.equal(resolveRoleModel('worker', 'Design').modelId, 'minimax-01');
+    // a different intent → no match → default; no matchedIntent
+    const miss = resolveRoleModel('worker', 'research');
+    assert.equal(miss.modelId, MODELS.primary);
+    assert.equal(miss.matchedIntent, undefined);
+    // NO intent → byte-identical to before (default, since no role-wide rule)
+    assert.equal(resolveRoleModel('worker').modelId, MODELS.primary);
+    assert.equal(resolveRoleModel('worker').matchedIntent, undefined);
+  });
+});
+
+test('two distinct-intent worker rules coexist with a role-wide rule; precedence is intent > role-wide > default', () => {
+  withEnv({
+    AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: undefined, ...BYO_ENV, BYO_MODEL_ID: 'minimax-01', OPENAI_MODEL_WORKER: 'deepseek-chat',
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'minimax-01', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+      { role: 'worker', modelId: 'deepseek-chat', whenIntent: 'research', scope: 'durable', source: 'chat-rule' },
+      { role: 'worker', modelId: 'deepseek-chat', scope: 'durable', source: 'settings' },
+    ]),
+  }, () => {
+    assert.equal(resolveRoleModel('worker', 'design').modelId, 'minimax-01');
+    assert.equal(resolveRoleModel('worker', 'research').modelId, 'deepseek-chat');
+    assert.equal(resolveRoleModel('worker', 'something-else').modelId, 'deepseek-chat', 'unmatched intent → role-wide');
+    assert.equal(resolveRoleModel('worker').modelId, 'deepseek-chat', 'no intent → role-wide');
+  });
+});
+
+test('a stale intent binding falls through to default and reports the inactive binding', () => {
+  withEnv({
+    AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off', BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '',
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', whenIntent: 'design', scope: 'durable', source: 'chat-rule' }]),
+  }, () => {
+    const r = resolveRoleModel('worker', 'design');
+    assert.equal(r.modelId, MODELS.primary, 'byo unconfigured → intent binding stale → default');
+    assert.equal(r.source, 'default');
+    assert.equal(r.inactiveBinding?.modelId, 'minimax-01');
+  });
+});
+
 test('kill-switch off: bindings ignored, pure default', () => {
   withEnv({ AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: undefined, CLEMMY_MODEL_ROLES_REGISTRY: 'off', CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'minimax-01', scope: 'durable', source: 'settings' }]) }, () => {
     assert.equal(modelRolesRegistryEnabled(), false);
