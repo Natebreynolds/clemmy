@@ -35,6 +35,19 @@ export function dynamicReasoningEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_DYNAMIC_REASONING', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+/**
+ * Continuation-aware classification (CLEMMY_CONTINUATION_CLASSIFY, default on).
+ * On a self-continuation turn the harness re-enters with a canned CONTINUATION
+ * nudge as the input, which always classifies 'simple' → effort 'none' even when
+ * the parked goal is a multi-step build. When enabled, the loop classifies the
+ * context packet against the active goal's objective instead — so complexity
+ * (and skill/workflow ranking) reflect the TASK she is mid-flight on, not the
+ * boilerplate. `off` → classify the literal input (byte-identical to before).
+ */
+export function continuationClassifyEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CONTINUATION_CLASSIFY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 export interface EffortSignals {
   /**
    * True when a human is waiting on this turn (interactive chat). Caps effort

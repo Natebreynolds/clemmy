@@ -27,7 +27,7 @@ import {
   harnessToolBracketsEnabled,
 } from './brackets.js';
 import { compactSessionIfNeeded, checkpointGoalStage } from './compaction.js';
-import { selectReasoningEffort, dynamicReasoningEnabled } from './reasoning-effort.js';
+import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
 import { buildAgentContextPacket } from './context-packet.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
 import type { HarnessBudgetRuntime } from './budget-settings.js';
@@ -2577,6 +2577,29 @@ function renderGoalContextBlock(goal: PlanProposal): string {
   ].filter(Boolean).join('\n');
 }
 
+/**
+ * Build the complexity-classification input for a self-continuation turn from
+ * the parked goal: the objective plus the criteria she is CURRENTLY working
+ * (current stage on a staged goal, else the full success criteria). This is
+ * what the deterministic classifier — and skill/workflow ranking — should judge
+ * on a continuation turn (the real task), instead of the canned CONTINUATION
+ * nudge, which always classifies 'simple' → reasoning effort 'none'. The criteria
+ * carry the multi-domain / batch signal the regex classifier keys on, so a
+ * multi-system build lands 'complex'/'moderate' and a trivial objective still
+ * lands 'simple'. Null-safe: returns undefined when there is no usable objective,
+ * so the caller falls back to the literal input (today's behavior).
+ */
+export function goalObjectiveString(goal: PlanProposal): string | undefined {
+  const plan = goal.approvedPlan ?? goal.plan;
+  const objective = (plan?.objective ?? '').trim();
+  if (!objective) return undefined;
+  const currentStage = getCurrentGoalStage(goal);
+  const criteria = (currentStage ? currentStage.criteria : (plan?.successCriteria ?? []))
+    .map((c) => c.trim())
+    .filter(Boolean);
+  return criteria.length > 0 ? `${objective}\n${criteria.join('\n')}` : objective;
+}
+
 export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const row = getSession(options.sessionId);
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
@@ -2950,7 +2973,22 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // store (never trusted to transcript memory) so the model always works
   // against the authoritative objective + criteria + progress ledger.
   const activeGoalForTurn = safeActiveGoal(options.sessionId);
-  const contextPacket = buildAgentContextPacket(options.input, {
+  // CONTINUATION-AWARE CLASSIFICATION (CLEMMY_CONTINUATION_CLASSIFY, default on).
+  // On a self-continuation, options.input is the canned CONTINUATION_INPUT nudge,
+  // which always classifies 'simple' → reasoning effort 'none' even when the
+  // parked goal is a multi-step build — so she runs the hardest turns at zero
+  // budget and thrashes. Classify the packet against the real objective so
+  // complexity / skill / workflow ranking reflect the TASK she is mid-flight on.
+  // Fires ONLY on the exact continuation signal (not merely "a goal exists"), so
+  // a real user message in a goal-bearing session is still judged on its own
+  // text. Any gap (flag off, no goal, empty objective) → options.input, which is
+  // byte-identical to the prior behavior.
+  let classifierInput = options.input;
+  if (continuationClassifyEnabled() && options.input === CONTINUATION_INPUT && activeGoalForTurn) {
+    const objective = goalObjectiveString(activeGoalForTurn);
+    if (objective) classifierInput = objective;
+  }
+  const contextPacket = buildAgentContextPacket(classifierInput, {
     enabled: turnMemoryPrimer.enabled,
     hitCount: turnMemoryPrimer.hitCount,
     source: turnMemoryPrimer.source ?? null,

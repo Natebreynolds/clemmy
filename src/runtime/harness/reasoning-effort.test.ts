@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { selectReasoningEffort } from './reasoning-effort.js';
+import { selectReasoningEffort, continuationClassifyEnabled } from './reasoning-effort.js';
 import { buildAgentContextPacket } from './context-packet.js';
 
 const primer = { enabled: false, hitCount: 0, source: null, injected: false, skippedReason: null };
@@ -52,4 +52,43 @@ test('a multi-domain read+write request → high background / capped medium inte
   const c = complexityOf(input);
   assert.equal(selectReasoningEffort(c).effort, 'high');
   assert.equal(selectReasoningEffort(c, { interactive: true }).effort, 'medium');
+});
+
+// ── FIX 1 (continuation-aware classification) ──────────────────────
+test('continuationClassifyEnabled: default on; "off" disables', () => {
+  const prev = process.env.CLEMMY_CONTINUATION_CLASSIFY;
+  try {
+    delete process.env.CLEMMY_CONTINUATION_CLASSIFY;
+    assert.equal(continuationClassifyEnabled(), true, 'default on');
+    process.env.CLEMMY_CONTINUATION_CLASSIFY = 'off';
+    assert.equal(continuationClassifyEnabled(), false);
+    process.env.CLEMMY_CONTINUATION_CLASSIFY = 'on';
+    assert.equal(continuationClassifyEnabled(), true);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CONTINUATION_CLASSIFY;
+    else process.env.CLEMMY_CONTINUATION_CLASSIFY = prev;
+  }
+});
+
+test('FIX 1 lever: the continuation boilerplate classifies simple→none, but the goal objective classifies complex→high — substituting it restores the reasoning budget', () => {
+  // The canned self-continuation nudge the loop re-enters with (loop.ts
+  // CONTINUATION_INPUT). This is the bug: a multi-step build runs at 'none'.
+  const boilerplate =
+    'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.';
+  assert.equal(selectReasoningEffort(complexityOf(boilerplate)).effort, 'none', 'boilerplate → none (the bug)');
+
+  // The real parked objective (objective + multi-system success criteria) — what
+  // FIX 1 classifies instead. Mirrors the observed 12-email build: Google
+  // Sheets + email/draft + SEO data = 3 domains, read + write.
+  const objective =
+    'Build and send outbound Scorpion emails for every market-leader prospect\n'
+    + 'Pull each prospect row from the Google Sheets tracker\n'
+    + "Draft a personalized email from each row's SEO ranking and keyword data\n"
+    + 'Skip rows with no usable contact and list them';
+  assert.equal(selectReasoningEffort(complexityOf(objective)).effort, 'high', 'objective → high (background)');
+  assert.equal(
+    selectReasoningEffort(complexityOf(objective), { interactive: true }).effort,
+    'medium',
+    'objective → medium when a human is waiting (the observed chat-continuation case)',
+  );
 });

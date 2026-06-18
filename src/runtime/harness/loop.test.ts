@@ -63,7 +63,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -161,6 +161,40 @@ test('normalizeError: a non-Error object never renders as "[object Object]" (the
   for (const v of [{ statusCode: 529 }, { a: 1 }, {}, null, undefined]) {
     assert.notEqual(normalizeError(v), '[object Object]');
   }
+});
+
+// ── FIX 1: goalObjectiveString — the continuation classifier input ──────────
+test('goalObjectiveString: builds objective + success criteria from the parked plan', () => {
+  const goal = {
+    plan: {
+      objective: 'Build outbound emails for every market-leader prospect',
+      successCriteria: ['One email drafted per usable row', 'Rows without contacts skipped and listed'],
+    },
+  } as any;
+  const out = goalObjectiveString(goal);
+  assert.ok(out!.includes('Build outbound emails'), 'carries the objective');
+  assert.ok(out!.includes('One email drafted per usable row'), 'carries the criteria (the multi-domain signal)');
+});
+
+test('goalObjectiveString: prefers approvedPlan over plan, and the CURRENT stage criteria when staged', () => {
+  const goal = {
+    plan: { objective: 'OLD', successCriteria: ['old'] },
+    approvedPlan: { objective: 'Pull each prospect and draft outreach', successCriteria: ['all crit'] },
+    stages: [
+      { id: 's1', title: 'Stage 1', status: 'done', criteria: ['done crit'] },
+      { id: 's2', title: 'Stage 2', status: 'pending', criteria: ['pull the sheet rows'] },
+    ],
+  } as any;
+  const out = goalObjectiveString(goal);
+  assert.ok(out!.startsWith('Pull each prospect'), 'uses approvedPlan objective');
+  assert.ok(out!.includes('pull the sheet rows'), 'uses the CURRENT (pending) stage criteria');
+  assert.ok(!out!.includes('done crit'), 'does not include a completed stage');
+});
+
+test('goalObjectiveString: null-safe when the plan has no objective (caller falls back to the literal input)', () => {
+  assert.equal(goalObjectiveString({ plan: { objective: '', successCriteria: [] } } as any), undefined);
+  assert.equal(goalObjectiveString({ plan: {} } as any), undefined);
+  assert.equal(goalObjectiveString({} as any), undefined);
 });
 
 test('dynamic reasoning effort: real runTurn injects effort per turn (simple→none; interactive chat caps complex at medium)', async () => {
