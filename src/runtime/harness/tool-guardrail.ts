@@ -142,6 +142,41 @@ const MUTATING_TOOLS = new Set<string>([
 ]);
 
 // ─────────────────────────────────────────────────────────────────
+// Within-task fetch memory (FIX 2) — see CLEMMY_WITHIN_TASK_RECALL_NUDGE.
+//
+// A byte-identical repeat of a PROVABLY-STATIC read means she already has that
+// result in her own tool memory (the lossless tool_outputs side-store) — so we
+// nudge her to recall_tool_result instead of re-fetching. This is an ALLOWLIST,
+// deliberately NARROWER than IDEMPOTENT_TOOLS: idempotent ≠ static. A read can
+// be idempotent (no state change) yet return DIFFERENT bytes next call because
+// an external actor mutated the source — every composio read (AIRTABLE_LIST,
+// *_GET, *_SEARCH), every poll (background_task_status, workflow_run_status,
+// agent_run_get), git_status. Nudging toward a cached copy of those would point
+// her at STALE data. So the allowlist contains only reads whose result is stable
+// for the life of a task absent an IN-SESSION mutation we can observe:
+const CACHE_SAFE_READS = new Set<string>([
+  'read_file', 'list_files',
+  'skill_read', 'skill_list',
+  'composio_search_tools', 'composio_list_tools',
+  'memory_search', 'memory_recall',
+  'focus_get',
+]);
+
+// In-session mutators per cache-safe read: if any of these ran AFTER the prior
+// identical read and BEFORE this one, the cached copy may be stale → suppress
+// the nudge. A read with no mapped mutator family (skill_*, composio_*_tools)
+// has no in-session writer, so its cache never invalidates. Conservative: a
+// write to ANY path invalidates a read_file cache (the intervening tool's path
+// args aren't tracked here), so we under-nudge rather than serve stale.
+const READ_MUTATORS: Record<string, ReadonlySet<string>> = {
+  read_file: new Set(['write_file', 'replace_file', 'run_shell_command']),
+  list_files: new Set(['write_file', 'replace_file', 'run_shell_command']),
+  focus_get: new Set(['focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear']),
+  memory_search: new Set(['memory_remember', 'memory_forget']),
+  memory_recall: new Set(['memory_remember', 'memory_forget']),
+};
+
+// ─────────────────────────────────────────────────────────────────
 // composio_execute_tool is a GATEWAY: it wraps a read (AIRTABLE_LIST_RECORDS,
 // *_GET_*, *_SEARCH_*) just as often as a write. Classifying the wrapper as
 // flatly mutating means a looping READ gets escalate-KILLED with a raw error
@@ -290,12 +325,30 @@ export interface GuardrailDecision {
    *  to the tool's RESULT so the model actually reads it mid-stride and can
    *  switch to run_worker / the service's batch API. Never blocks. */
   fanoutNudge?: string;
+  /** Within-task fetch memory (FIX 2). Set when THIS call is a byte-identical
+   *  repeat of a CACHE_SAFE read whose source hasn't mutated in-session — the
+   *  call_id of the PRIOR identical call, which the harness turns into a
+   *  "recall_tool_result(this id) instead of re-fetching" nudge. Advisory,
+   *  never blocks, never serves a payload (so it can never serve stale data —
+   *  the model decides whether to recall or re-fetch). Only set when
+   *  CLEMMY_WITHIN_TASK_RECALL_NUDGE=on. */
+  cachedCallId?: string;
+  /** Age in ms of the prior identical call the cache nudge points at. */
+  cachedAgeMs?: number;
 }
 
 function readMode(): GuardrailMode {
   const raw = (process.env.CLEMMY_TOOL_GUARDRAIL ?? 'warn').toLowerCase();
   if (raw === 'off' || raw === 'strict') return raw;
   return 'warn';
+}
+
+/** Within-task fetch-memory nudge (FIX 2). Default OFF — the continuation-effort
+ *  fix (FIX 1) is the primary lever; this is a measured backstop. `on` lets the
+ *  guardrail mark a byte-identical cache-safe read so the harness can point the
+ *  model at recall_tool_result instead of re-fetching. */
+function readNudgeEnabled(): boolean {
+  return (process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE ?? 'off').toLowerCase() === 'on';
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -311,6 +364,10 @@ interface TrackedCall {
   /** Fan-out grouping key (composio_execute_tool keyed by inner slug).
    *  Optional — absent on rows persisted before this field existed. */
   fanoutKey?: string;
+  /** SDK call_id of this invocation — lets the within-task fetch-memory nudge
+   *  (FIX 2) point at the PRIOR identical call's tool_outputs row. Optional:
+   *  absent on the legacy/test path and on rows persisted before this field. */
+  callId?: string;
 }
 
 interface SessionTrackerState {
@@ -376,6 +433,7 @@ export function evaluateToolCall(
   sessionId: string | undefined,
   toolName: string,
   args: unknown,
+  callId?: string,
 ): GuardrailDecision {
   const thresholds = readThresholds();
   const signature = hashToolCall(toolName, args);
@@ -401,7 +459,7 @@ export function evaluateToolCall(
   const fanoutKey = slug ? `composio::${slug}` : undefined;
 
   // Push + bound the window
-  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}) });
+  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}), ...(callId ? { callId } : {}) });
   if (tracker.recent.length > thresholds.recentWindowSize) {
     const dropped = tracker.recent.shift();
     if (dropped) {
@@ -452,6 +510,24 @@ export function evaluateToolCall(
         + `For very large batches (>50), author a workflow with forEach instead. `
         + `Serial looping piles every item's payload into your context and is dramatically slower.`
         + (batchHint ? ` ${batchHint}` : '');
+    }
+  }
+
+  // Within-task fetch memory (FIX 2, CLEMMY_WITHIN_TASK_RECALL_NUDGE=on).
+  // A byte-identical repeat of a CACHE_SAFE read whose source hasn't mutated
+  // in-session → mark the PRIOR identical call's id so the harness can point her
+  // at recall_tool_result instead of re-fetching. Allowlist (not the broad
+  // idempotent set) + in-session mutation invalidation keep external-mutable
+  // reads and pollers out by construction; the nudge never serves a payload, so
+  // it can't serve stale data. The serve-side (brackets.ts) additionally drops
+  // it inside worker scope and when the prior output was error-shaped.
+  let cachedCallId: string | undefined;
+  let cachedAgeMs: number | undefined;
+  if (readNudgeEnabled() && CACHE_SAFE_READS.has(toolName)) {
+    const prior = priorIdenticalCall(tracker, signature);
+    if (prior?.callId && !mutatedSince(tracker, toolName, signature)) {
+      cachedCallId = prior.callId;
+      cachedAgeMs = Math.max(0, Date.now() - prior.firstSeenMs);
     }
   }
 
@@ -507,6 +583,7 @@ export function evaluateToolCall(
       count: exactCount,
       mutating: isMut,
       ...(fanoutNudge ? { fanoutNudge } : {}),
+      ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
     };
   }
 
@@ -552,13 +629,54 @@ export function evaluateToolCall(
     count: exactCount,
     mutating: isMut,
     ...(fanoutNudge ? { fanoutNudge } : {}),
+    ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
   };
+}
+
+/** The PRIOR identical call in the window (the second-from-newest match for this
+ *  signature; the newest is the current call, just pushed). Undefined if this is
+ *  the first time the signature appears. Drives the within-task fetch-memory
+ *  nudge — its callId points at the cached tool_outputs row. */
+function priorIdenticalCall(tracker: SessionTrackerState, signature: string): TrackedCall | undefined {
+  const recent = tracker.recent;
+  let seen = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].signature === signature) {
+      seen += 1;
+      if (seen === 2) return recent[i];
+    }
+  }
+  return undefined;
+}
+
+/** True when an in-session mutator for `readTool` ran AFTER the prior identical
+ *  read and BEFORE this one — i.e. the cached copy may be stale, so suppress the
+ *  nudge. A read with no mapped mutator family never invalidates this way. */
+function mutatedSince(tracker: SessionTrackerState, readTool: string, signature: string): boolean {
+  const mutators = READ_MUTATORS[readTool];
+  if (!mutators) return false;
+  const recent = tracker.recent;
+  // Find the prior identical call (second match from the tail); scan the entries
+  // strictly between it and the current call (the tail) for a mutator.
+  let seen = 0;
+  let priorIdx = -1;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].signature === signature) {
+      seen += 1;
+      if (seen === 2) { priorIdx = i; break; }
+    }
+  }
+  if (priorIdx < 0) return false;
+  for (let i = priorIdx + 1; i < recent.length - 1; i++) {
+    if (mutators.has(recent[i].toolName)) return true;
+  }
+  return false;
 }
 
 /** Strict-mode promotion: in warn mode, block→warn and halt→warn.
  *  In strict mode, decisions enforce as-is. Off mode always allows. */
 export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = readMode()): GuardrailDecision {
-  if (mode === 'off') return { ...decision, action: 'allow', fanoutNudge: undefined };
+  if (mode === 'off') return { ...decision, action: 'allow', fanoutNudge: undefined, cachedCallId: undefined, cachedAgeMs: undefined };
   // 'escalate' is a terminal-stuck signal — it is NEVER downgraded (even in
   // warn mode) because the model cannot recover by retrying. The ONLY way to
   // suppress it is mode 'off' (handled above). This is what actually stops the

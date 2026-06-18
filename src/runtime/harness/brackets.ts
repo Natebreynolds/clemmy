@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { isKillRequested, appendEvent, getSession, listEvents } from './eventlog.js';
+import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput } from './eventlog.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
@@ -745,6 +745,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const runBrackets = async (
     sessionId: string,
     parsedInput: unknown,
+    callId?: string,
   ): Promise<string | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
@@ -758,8 +759,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // 2b. Tool-call guardrail (loop detection). Keyed by guardrailScopeId
     // when set (a worker run isolates its own window) else sessionId.
     let fanoutNudge: string | undefined;
+    let cacheNudge: string | undefined;
     try {
-      const rawDecision = evaluateToolCall(ctx.guardrailScopeId ?? ctx.sessionId, tool.name, parsedInput);
+      const rawDecision = evaluateToolCall(ctx.guardrailScopeId ?? ctx.sessionId, tool.name, parsedInput, callId);
       const decision = applyMode(rawDecision);
       // Fan-out nudge: only steer the ORCHESTRATOR's own context toward
       // run_worker — inside a worker scope (guardrailScopeId set) the nudge
@@ -780,6 +782,41 @@ export function wrapToolForHarness<T extends WrappableTool>(
             },
           });
         } catch { /* telemetry write must never block */ }
+      }
+      // Within-task fetch-memory nudge (FIX 2). Only in the ORCHESTRATOR scope
+      // (guardrailScopeId unset) — there the guardrail tracker and tool_outputs
+      // share the real sessionId keying, so the prior call_id is reachable; in a
+      // worker scope they diverge, so suppress. Also suppress when the prior
+      // output was error-shaped: a retry after a transient failure must NOT be
+      // discouraged. Nudge points at recall_tool_result; never serves a payload.
+      if (decision.cachedCallId && !ctx.guardrailScopeId) {
+        let priorOutput: string | null = null;
+        try {
+          priorOutput = getToolOutput(ctx.sessionId, decision.cachedCallId)?.output ?? null;
+        } catch { priorOutput = null; }
+        const errorShaped = priorOutput != null && /^\s*ERROR:/i.test(priorOutput);
+        if (priorOutput != null && !errorShaped) {
+          const ageS = Math.round((decision.cachedAgeMs ?? 0) / 1000);
+          cacheNudge =
+            `[within-task memory] You already ran ${decision.toolName} with these EXACT arguments ${ageS}s ago — `
+            + `that result is still in your tool memory. Call recall_tool_result with call_id "${decision.cachedCallId}" `
+            + `to re-read it instead of re-fetching, then take the next step. Do NOT repeat this read.`;
+          try {
+            appendEvent({
+              sessionId: ctx.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'guardrail_tripped',
+              data: {
+                kind: 'within_task_recall_nudge',
+                toolName: decision.toolName,
+                count: decision.count,
+                cachedCallId: decision.cachedCallId,
+                cachedAgeMs: decision.cachedAgeMs ?? 0,
+              },
+            });
+          } catch { /* telemetry write must never block */ }
+        }
       }
       if (decision.action !== 'allow') {
         try {
@@ -1259,7 +1296,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // (sessionId arg is unused — included for future per-session
     // behavior without forcing callers to refactor.)
     void sessionId;
-    return fanoutNudge;
+    // Both nudges ride the same advisory rail (appended to the tool result by
+    // the caller). Combine so a turn that trips both still delivers both.
+    const nudges = [fanoutNudge, cacheNudge].filter(Boolean);
+    return nudges.length > 0 ? nudges.join('\n\n') : undefined;
   };
 
   // Resolve the per-tool timeout once at wrap time.
@@ -1295,9 +1335,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       }
       const ctx = harnessRunContextStorage.getStore();
+      // SDK call_id for THIS invocation — lets the within-task fetch-memory nudge
+      // correlate a future identical call back to this one's tool_outputs row.
+      const invokeCall = (details as { toolCall?: { callId?: string; id?: string } } | undefined)?.toolCall;
+      const invokeCallId = invokeCall?.callId ?? invokeCall?.id;
       let fanoutNudge: string | undefined;
       try {
-        fanoutNudge = await runBrackets(ctx?.sessionId ?? '', parsedInput);
+        fanoutNudge = await runBrackets(ctx?.sessionId ?? '', parsedInput, invokeCallId);
       } catch (err) {
         // A recoverable gate throw lands as a SOFT tool error — the model sees
         // it as the tool's output and self-corrects. Throwing here would abort

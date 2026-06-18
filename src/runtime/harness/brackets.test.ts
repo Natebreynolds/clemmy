@@ -22,7 +22,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 // Dynamic imports — see eventlog.test.ts for why.
-const { resetEventLog, createSession, requestKill, appendEvent } = await import('./eventlog.js');
+const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput } = await import('./eventlog.js');
 const {
   assertNotKilled,
   KillRequested,
@@ -599,6 +599,78 @@ test('fan-out nudge: appended to the tool RESULT on serial same-slug calls; supp
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+  }
+});
+
+test('within-task fetch-memory nudge: appended to the result on an identical CACHE_SAFE read; suppressed in worker scope and on error-shaped prior output', async () => {
+  // FIX 2. A byte-identical repeat of a static read points the model at
+  // recall_tool_result instead of re-fetching. callId threads only on the
+  // INVOKE path (production), so the wrapped tool exposes `invoke`.
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevNudge = process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE = 'on';
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({ name: 'memory_search', invoke: async () => 'memory rows' });
+    const args = JSON.stringify({ query: 'market leaders' });
+    const invoke = (callId: string, scopeId?: string) =>
+      withHarnessRunContext(
+        { sessionId: sess.id, counter, ...(scopeId ? { guardrailScopeId: scopeId } : {}) },
+        () => (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+          .invoke(null, args, { toolCall: { callId } }),
+      );
+    assert.equal(await invoke('call-1'), 'memory rows');
+    // hooks.ts persists tool_outputs in prod; seed it so the serve-side peek finds it.
+    writeToolOutput({ sessionId: sess.id, callId: 'call-1', tool: 'memory_search', output: 'memory rows' });
+    const r2 = String(await invoke('call-2'));
+    assert.ok(r2.includes('[within-task memory]'), 'cache nudge lands in the result');
+    assert.ok(r2.includes('recall_tool_result'), 'nudge points at recall_tool_result');
+    assert.ok(r2.includes('call-1'), 'nudge carries the prior call id');
+
+    // Worker scope: identical repeat, nudge suppressed (tracker/tool_outputs keying diverges).
+    resetEventLog();
+    const sess2 = createSession({ kind: 'chat' });
+    const counter2 = new ToolCallsCounter(100);
+    const wrapped2 = wrapToolForHarness({ name: 'memory_search', invoke: async () => 'rows' });
+    const wargs = JSON.stringify({ query: 'q' });
+    const winvoke = (callId: string) =>
+      withHarnessRunContext(
+        { sessionId: sess2.id, counter: counter2, guardrailScopeId: `${sess2.id}::w:test` },
+        () => (wrapped2 as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+          .invoke(null, wargs, { toolCall: { callId } }),
+      );
+    await winvoke('w-1');
+    writeToolOutput({ sessionId: sess2.id, callId: 'w-1', tool: 'memory_search', output: 'rows' });
+    assert.equal(await winvoke('w-2'), 'rows', 'worker-scope repeat carries NO cache nudge');
+
+    // Error-shaped prior output: a retry after a transient failure must NOT be discouraged.
+    resetEventLog();
+    const sess3 = createSession({ kind: 'chat' });
+    const counter3 = new ToolCallsCounter(100);
+    const wrapped3 = wrapToolForHarness({ name: 'memory_search', invoke: async () => 'ERROR: timed out' });
+    const eargs = JSON.stringify({ query: 'e' });
+    const einvoke = (callId: string) =>
+      withHarnessRunContext(
+        { sessionId: sess3.id, counter: counter3 },
+        () => (wrapped3 as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+          .invoke(null, eargs, { toolCall: { callId } }),
+      );
+    await einvoke('e-1');
+    writeToolOutput({ sessionId: sess3.id, callId: 'e-1', tool: 'memory_search', output: 'ERROR: timed out' });
+    assert.equal(await einvoke('e-2'), 'ERROR: timed out', 'an error-shaped prior result does NOT become a do-not-retry nudge');
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevNudge === undefined) delete process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE;
+    else process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE = prevNudge;
   }
 });
 

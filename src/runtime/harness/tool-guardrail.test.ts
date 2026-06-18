@@ -200,6 +200,106 @@ test('fanoutNudge: non-composio tools never nudge (local serialization is legiti
   }
 });
 
+// ─── FIX 2: within-task fetch memory (cache nudge) ────────────────
+function withRecallNudge<T>(fn: () => T): T {
+  const prev = process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE;
+  process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE = 'on';
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE;
+    else process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE = prev;
+  }
+}
+
+test('FIX 2: a CACHE_SAFE read repeated with identical args sets cachedCallId pointing at the prior call', () => {
+  withRecallNudge(() => {
+    _resetAllTrackersForTests();
+    const args = { query: 'market leaders' };
+    evaluateToolCall('sess-cache-1', 'memory_search', args, 'call-A');
+    const d2 = evaluateToolCall('sess-cache-1', 'memory_search', args, 'call-B');
+    assert.equal(d2.cachedCallId, 'call-A', 'points at the prior identical call');
+    assert.ok((d2.cachedAgeMs ?? -1) >= 0, 'carries an age');
+  });
+});
+
+test('FIX 2: flag OFF (default) never sets cachedCallId', () => {
+  _resetAllTrackersForTests();
+  const args = { query: 'x' };
+  evaluateToolCall('sess-cache-2', 'memory_search', args, 'call-A');
+  const d2 = evaluateToolCall('sess-cache-2', 'memory_search', args, 'call-B');
+  assert.equal(d2.cachedCallId, undefined, 'no nudge when the feature is off (default)');
+});
+
+test('FIX 2: external-mutable reads + pollers are NOT cached (allowlist polarity)', () => {
+  withRecallNudge(() => {
+    // composio read (AIRTABLE_LIST_RECORDS): idempotent, but an external actor
+    // can change the rows between calls — never serve a cached copy.
+    _resetAllTrackersForTests();
+    const a = { tool_slug: 'AIRTABLE_LIST_RECORDS', arguments: '{"view":"v"}' };
+    evaluateToolCall('s-ext', 'composio_execute_tool', a, 'c1');
+    assert.equal(
+      evaluateToolCall('s-ext', 'composio_execute_tool', a, 'c2').cachedCallId,
+      undefined,
+      'composio reads are never cached (external-mutable)',
+    );
+    // a poller — re-reading an async status is the whole point.
+    _resetAllTrackersForTests();
+    const p = { id: 'run-1' };
+    evaluateToolCall('s-poll', 'workflow_run_status', p, 'c1');
+    assert.equal(
+      evaluateToolCall('s-poll', 'workflow_run_status', p, 'c2').cachedCallId,
+      undefined,
+      'pollers are never cached',
+    );
+  });
+});
+
+test('FIX 2: an intervening write invalidates a read_file cache (no stale nudge)', () => {
+  withRecallNudge(() => {
+    _resetAllTrackersForTests();
+    const readArgs = { path: '/x/draft.md' };
+    evaluateToolCall('s-rw', 'read_file', readArgs, 'r1');
+    evaluateToolCall('s-rw', 'write_file', { path: '/x/draft.md', content: '...' }, 'w1');
+    assert.equal(
+      evaluateToolCall('s-rw', 'read_file', readArgs, 'r2').cachedCallId,
+      undefined,
+      'a write since the last read suppresses the cache nudge',
+    );
+  });
+});
+
+test('FIX 2: focus_get cache invalidated by a focus_set between reads', () => {
+  withRecallNudge(() => {
+    _resetAllTrackersForTests();
+    evaluateToolCall('s-focus', 'focus_get', {}, 'f1');
+    evaluateToolCall('s-focus', 'focus_set', { title: 'X' }, 'fs1');
+    assert.equal(evaluateToolCall('s-focus', 'focus_get', {}, 'f2').cachedCallId, undefined);
+  });
+});
+
+test('FIX 2: a static read with NO in-session mutator (skill_read) caches across a write', () => {
+  withRecallNudge(() => {
+    _resetAllTrackersForTests();
+    const args = { name: 'proposal-builder' };
+    evaluateToolCall('s-skill', 'skill_read', args, 'k1');
+    evaluateToolCall('s-skill', 'write_file', { path: '/x', content: 'y' }, 'w1');
+    // skill_read has no mapped mutator family — a file write can't change a skill.
+    assert.equal(evaluateToolCall('s-skill', 'skill_read', args, 'k2').cachedCallId, 'k1');
+  });
+});
+
+test('FIX 2: applyMode off strips the cache nudge (one coherent off-switch)', () => {
+  withRecallNudge(() => {
+    _resetAllTrackersForTests();
+    const args = { query: 'x' };
+    evaluateToolCall('s-mode', 'memory_search', args, 'c1');
+    const d2 = evaluateToolCall('s-mode', 'memory_search', args, 'c2');
+    assert.equal(d2.cachedCallId, 'c1');
+    assert.equal(applyMode(d2, 'off').cachedCallId, undefined);
+  });
+});
+
 test('fanoutNudge: rides on a warn decision too (same-mut-tool warn keeps the nudge)', () => {
   _resetAllTrackersForTests();
   // 3 distinct WRITE-slug calls: hits same_mut_tool_repeat warn AND the
