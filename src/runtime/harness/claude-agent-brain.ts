@@ -20,12 +20,15 @@ export function setClaudeAgentSdkBrainRunForTest(fn: ClaudeAgentSdkRunFn | null)
 }
 
 export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home';
-export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring';
+export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring' | 'full';
 
 function configuredMode(): ClaudeAgentBrainMode | null {
   const raw = (getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN', 'off') ?? 'off').trim().toLowerCase();
   if (raw === 'off' || raw === '0' || raw === 'false' || raw === 'no') return null;
   if (raw === 'read_only' || raw === 'readonly') return 'read_only';
+  // Full agentic: Claude executes gated tools (shell/composio/sends) under the
+  // approval gate. (Step 5 will make this the default for claude_oauth.)
+  if (raw === 'full' || raw === 'agentic' || raw === 'all') return 'full';
   if (
     raw === 'on'
     || raw === '1'
@@ -58,7 +61,9 @@ function maxTurns(): number {
 }
 
 function toolProfileForMode(mode: ClaudeAgentBrainMode): ClaudeAgentSdkToolProfile {
-  return mode === 'local_authoring' ? 'local_authoring' : 'read_only';
+  if (mode === 'full') return 'full';
+  if (mode === 'local_authoring') return 'local_authoring';
+  return 'read_only';
 }
 
 function allowedToolsForRequest(request: AssistantRequest, mode: ClaudeAgentBrainMode): string[] {
@@ -75,6 +80,16 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
       '- Do not claim you created workflows, wrote files, ran shell commands, sent messages, updated external systems, or performed any mutation unless a tool result in this run proves it.',
       '- If the user asks for a mutation or full workflow execution, answer with the best design/analysis you can and say that the mutating execution should run through the guarded Codex harness until Claude SDK local-authoring mode is enabled.',
       '- For design/report/writing guidance, use memory and skills when relevant, then produce the user-facing output directly.',
+    ].join('\n');
+  }
+  if (mode === 'full') {
+    return [
+      'CAPABILITY — you are the AGENTIC Clementine brain on the user\'s Claude subscription. You CAN execute tools to complete the request: run shell commands (run_shell_command), discover + execute Composio actions (composio_search_tools → composio_execute_tool), write files, and chain multi-step work — exactly like the Codex harness.',
+      '- Every tool call runs through Clementine\'s safety gates (grounding, goal-fidelity, execution-wrap, destination, duplicate-write, loop-guard). Irreversible/external actions (sends, batch external writes) PAUSE for the user\'s approval BEFORE they run. Do the work — the gates + approval protect it; you do not need to ask permission in prose first.',
+      '- Before a MUTATING external write (a composio send/create, a batch), call execution_create FIRST (title, objective, successCriteria), then proceed — the harness requires an active execution lane for those.',
+      '- A large tool result may be clipped with a `[digest: … tool_output_query("call_…")]` footer — call tool_output_query or recall_tool_result to pull the records. Never report stored data as unavailable.',
+      '- Do NOT claim you ran a command, sent a message, or wrote a file unless a tool result in THIS run proves it. If a tool result begins with `ERROR:`, treat that item as failed and say so.',
+      '- If an installed skill applies (design/report/audit), call skill_read for it before producing the artifact.',
     ].join('\n');
   }
   return [
@@ -150,6 +165,7 @@ export async function respondViaClaudeAgentSdkBrain(
     modelId,
     systemAppend: renderClaudeAgentBrainSystemAppend(surface, request, mode),
     allowedLocalMcpTools: allowedToolsForRequest(request, mode),
+    agentic: mode === 'full',
     maxTurns: maxTurns(),
   });
 

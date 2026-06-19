@@ -25,6 +25,7 @@ import { isSpacesEnabled } from '../spaces/store.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
+import { registerRecallTools } from './recall-tools.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
@@ -75,6 +76,11 @@ if (isSpacesEnabled()) registerSpaceTools(server);
 registerMcpStatusTools(server);
 registerToolChoiceTools(server);
 registerModelRoleTools(server);
+// Recall tools (read-only): pull the verbatim/sliced payload of a clipped tool
+// result. Needed so the Claude Agent SDK lane can read large outputs (e.g. a
+// 25-row `sf data query`) the harness clipped — without them it hits the same
+// "tool not found" the @openai/agents lane was fixed for.
+registerRecallTools(server);
 registerDynamicTools(server);
 // Agent SDK lane only (CLEMENTINE_MCP_GATED_MUTATIONS=on): expose the mutating
 // tools (shell/composio/write) through the full harness gate chain so the Claude

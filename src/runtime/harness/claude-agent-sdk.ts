@@ -47,6 +47,9 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'skill_list',
   'skill_read',
   'tool_choice_recall',
+  // Recall the verbatim / sliced payload of a clipped tool result (read-only).
+  'recall_tool_result',
+  'tool_output_query',
 ] as const;
 
 export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
@@ -83,10 +86,49 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   'workflow_unschedule',
 ] as const;
 
-export type ClaudeAgentSdkToolProfile = 'read_only' | 'local_authoring';
+// Mutating tools exposed through the harness gate chain (gated-mutating-tools.ts)
+// + the async approval gate (claude-agent-approval.ts). Shared by the brain
+// (full) and worker (scoped) agentic profiles.
+const AGENTIC_EXECUTION_TOOLS = [
+  'run_shell_command',
+  'write_file',
+  'composio_search_tools',
+  'composio_list_tools',
+  'composio_execute_tool',
+  'local_cli_list',
+  'local_cli_probe',
+] as const;
+
+/** Full agentic surface for the Claude BRAIN: local-authoring + execution tools
+ *  + the gated mutating surface. Execution lanes let the execution-wrap gate be
+ *  satisfied and batch fan-out wrap. */
+export const CLAUDE_AGENT_SDK_FULL_TOOLS = [
+  ...CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
+  ...AGENTIC_EXECUTION_TOOLS,
+  'execution_create',
+  'execution_list',
+  'execution_get',
+  'execution_update_step',
+  'execution_mark_blocked',
+  'execution_complete',
+] as const;
+
+/** Scoped agentic surface for a Claude WORKER (one parent-planned item). The
+ *  PARENT owns the execution lane + batch approval, so a worker gets the gated
+ *  mutating tools but NOT execution_create / workflow authoring. The shared
+ *  parent session means the parent's execution lane + plan-scope cover the
+ *  worker's gated writes. */
+export const CLAUDE_AGENT_SDK_WORKER_TOOLS = [
+  ...CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
+  ...AGENTIC_EXECUTION_TOOLS,
+] as const;
+
+export type ClaudeAgentSdkToolProfile = 'read_only' | 'local_authoring' | 'full' | 'worker';
 
 export function defaultClaudeAgentSdkAllowedLocalTools(profile: ClaudeAgentSdkToolProfile = 'read_only'): string[] {
   const raw = process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS?.trim();
+  if (!raw && profile === 'full') return [...new Set(CLAUDE_AGENT_SDK_FULL_TOOLS)];
+  if (!raw && profile === 'worker') return [...new Set(CLAUDE_AGENT_SDK_WORKER_TOOLS)];
   if (!raw && profile === 'local_authoring') return [...new Set(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS)];
   if (!raw) return [...CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS];
   return raw
