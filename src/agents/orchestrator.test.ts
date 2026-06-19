@@ -245,6 +245,16 @@ test('every tool the instructions tell the model to call is ON the surface (allo
   assert.ok(mentioned.size >= 30, `extraction sanity: expected 30+ instructed tool mentions, got ${mentioned.size}`);
   const missing = [...mentioned].filter((n) => !surface.has(n) && !NON_TOOL_MENTIONS.has(n)).sort();
   assert.deepEqual(missing, [], `instructions promise tools the surface does not expose: ${missing.join(', ')}`);
+
+  // The clip/digest RECOVERY tools are instructed at RUNTIME by the digest
+  // footer (tool-output-digest.ts), NOT in ORCHESTRATOR_INSTRUCTIONS — so the
+  // scan above can't catch them. A chat turn that clips a large tool result
+  // (e.g. `sf data query` → 25 records) MUST be able to call them, or the
+  // Runner hard-fails "Tool <x> not found in agent". (2026-06-18: tool_output_query
+  // was on the worker/planner/workflow-step allowlists but never the chat one.)
+  for (const recallTool of ['recall_tool_result', 'tool_output_query']) {
+    assert.ok(surface.has(recallTool), `clip/digest recovery tool ${recallTool} must be on the chat surface (the digest footer tells the model to call it)`);
+  }
 });
 
 test('run_worker requires a structured parent-planned job packet', async () => {

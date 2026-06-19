@@ -902,6 +902,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // orchestrator.test.ts now cross-checks instructions ↔ surface so a
       // fourth occurrence fails CI instead of stranding a live session.
       'recall_tool_result',
+      // FOURTH occurrence (2026-06-18): a CLIPPED tool result appends a digest
+      // footer (tool-output-digest.ts) that literally instructs the model to
+      // `call tool_output_query("call_…", {…})` to pull specific records — but
+      // tool_output_query lived ONLY in the worker/planner/workflow-step
+      // allowlists, never the chat orchestrator's. A live Claude chat turn ran
+      // `sf data query`, the 25-record result was clipped, the model followed
+      // the footer, and the Runner hard-failed "Tool tool_output_query not
+      // found in agent Clem." The CI cross-check missed it because the
+      // instruction is in the runtime footer, not ORCHESTRATOR_INSTRUCTIONS.
+      'tool_output_query',
       'focus_get',
       'focus_set',
       'focus_update',
