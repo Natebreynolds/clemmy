@@ -120,8 +120,9 @@ test('normalizeClaudeHeadlessOutputText strips markdown fences for structured ou
   );
 });
 
-function installSpawnMock(lines: unknown[], captured: { args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv }): void {
-  setClaudeHeadlessSpawnForTest(((_cmd: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+function installSpawnMock(lines: unknown[], captured: { cmd?: string; args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv }): void {
+  setClaudeHeadlessSpawnForTest(((cmd: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    captured.cmd = cmd;
     captured.args = args;
     captured.env = options.env;
     const child = new EventEmitter() as any;
@@ -204,6 +205,37 @@ test('ClaudeHeadlessModel.getResponse returns assistant output and usage', async
   assert.equal((response.output[0] as any).content[0].text, 'Final only');
   assert.equal(response.usage.inputTokens, 7);
   assert.equal(response.usage.outputTokens, 3);
+});
+
+test('ClaudeHeadlessModel spawns the resolved CLAUDE_CLI_PATH override, not a literal PATH lookup', async () => {
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-spawn-override-'));
+  const overrideBin = path.join(binDir, 'claude-custom');
+  writeFileSync(overrideBin, '#!/bin/sh\necho stub', { mode: 0o755 });
+  const prevOverride = process.env.CLAUDE_CLI_PATH;
+  const captured: { cmd?: string; args?: string[]; prompt?: string; env?: NodeJS.ProcessEnv } = {};
+  try {
+    process.env.CLAUDE_CLI_PATH = overrideBin;
+    installSpawnMock([
+      { type: 'system', subtype: 'init', session_id: 'session-override' },
+      { type: 'result', subtype: 'success', session_id: 'session-override', result: 'ok', usage: { input_tokens: 1, output_tokens: 1 } },
+    ], captured);
+
+    const model = new ClaudeHeadlessModel('claude-sonnet-4-6');
+    await model.getResponse({
+      input: 'Answer once.',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    } as any);
+
+    assert.equal(captured.cmd, overrideBin);
+  } finally {
+    if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
+    else process.env.CLAUDE_CLI_PATH = prevOverride;
+    rmSync(binDir, { recursive: true, force: true });
+  }
 });
 
 test('ClaudeHeadlessModel.getResponse normalizes fenced JSON for structured contracts', async () => {

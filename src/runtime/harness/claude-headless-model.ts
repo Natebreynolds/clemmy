@@ -379,7 +379,8 @@ async function* runClaudeHeadless(request: ModelRequest, modelId: string): Async
     emittedText: '',
     rawEvents: 0,
   };
-  const child = spawnImpl('claude', args, {
+  const command = resolveClaudeCliPath() ?? 'claude';
+  const child = spawnImpl(command, args, {
     env,
     cwd: process.cwd(),
     stdio: ['pipe', 'pipe', 'pipe'],
