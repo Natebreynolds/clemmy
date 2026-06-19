@@ -30,13 +30,17 @@ const CORE_SAMPLE = ['memory_recall', 'composio_execute_tool', 'execution_create
 const JITABLE = ['workflow_create', 'workflow_update', 'space_save', 'git_status', 'task_add'];
 const TOOLS: JitTool[] = [...CORE_SAMPLE, ...JITABLE].map((name) => ({ name, description: `desc for ${name}` }));
 
-test('flag default OFF: exposes the full surface, never reduced', async () => {
+test('REL-5 guard: selectToolsForTurn does NOT re-gate on the global flag (A/B jit arm works with global OFF)', async () => {
+  // Whether JIT runs is decided by resolveToolJitDecision at the call site, NOT here.
+  // With the global CLEMMY_TOOL_JIT OFF but a real ranking, selection MUST still reduce —
+  // otherwise the A/B jit arm (which activates without the global flag) is a silent no-op.
   await withEnv({ CLEMMY_TOOL_JIT: undefined }, async () => {
     assert.equal(toolJitEnabled(), false);
-    const sel = await selectToolsForTurn({ userInput: 'create a workflow', tools: TOOLS });
-    assert.equal(sel.reduced, false);
-    assert.equal(sel.reason, 'jit-off');
-    assert.equal(sel.exposed.size, TOOLS.length);
+    const ranker: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, t.name === 'workflow_create' ? 0.9 : 0]));
+    const sel = await selectToolsForTurn({ userInput: 'create a workflow', tools: TOOLS, rankFn: ranker });
+    assert.equal(sel.reduced, true, 'must reduce even with the global flag off');
+    assert.ok(sel.exposed.has('workflow_create'));
+    assert.ok(!sel.exposed.has('space_save'));
   });
 });
 

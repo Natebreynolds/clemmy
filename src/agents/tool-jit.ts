@@ -241,7 +241,11 @@ export async function selectToolsForTurn(opts: {
   const all = new Set(opts.tools.map((t) => t.name));
   const exposeAll = (reason: string): ToolJitSelection => ({ exposed: all, reduced: false, reason, droppedCount: 0 });
 
-  if (!toolJitEnabled()) return exposeAll('jit-off');
+  // NB: this function does NOT re-check the global CLEMMY_TOOL_JIT flag. Whether JIT
+  // runs at all is decided ONCE by resolveToolJitDecision() at the call site — the
+  // single source of truth that also handles the A/B arm (the jit arm must reduce even
+  // when the global flag is off). A redundant global-flag guard here made the A/B jit
+  // arm a silent no-op unless the global flag was ALSO on (pre-tag review REL-5).
   const query = (opts.userInput ?? '').trim();
   if (!query) return exposeAll('no-query');
 
