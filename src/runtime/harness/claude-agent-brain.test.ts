@@ -16,6 +16,7 @@ const {
   respondViaClaudeAgentSdkBrain,
   setClaudeAgentSdkBrainRunForTest,
   setClaudeAgentSdkBrainJudgeForTest,
+  looksLikeToolNarration,
 } = brain;
 const { getSession, listEvents, resetEventLog } = await import('./eventlog.js');
 
@@ -28,6 +29,7 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS;
   delete process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE;
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
+  delete process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY;
   process.env.AUTH_MODE = 'api_key';
 });
 
@@ -61,10 +63,13 @@ test('renderClaudeAgentBrainSystemAppend carries Clementine context and the read
   const prompt = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: 'brain-prompt' }, 'read_only');
   assert.match(prompt, /official Claude Agent SDK/);
   assert.match(prompt, /READ-ONLY\/local-context/);
-  assert.match(prompt, /Core Clementine operating rubric/);
+  assert.match(prompt, /How you operate here/);
   assert.match(prompt, /You are Clementine/);
-  assert.match(prompt, /native tool-calling agent/);
+  assert.match(prompt, /CALL TOOLS — NEVER DESCRIBE THEM/);
   assert.doesNotMatch(prompt, /Return an OrchestratorDecision/);
+  // The lean rubric must NOT leak the harness's internal event protocol — that
+  // leakage is what the model reproduced as text ("Tool:… / System: tool result").
+  assert.doesNotMatch(prompt, /tool_called event|tool_returned event|\[clipped:/);
 });
 
 test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/model-role capability', () => {
@@ -169,6 +174,47 @@ test('turn-budget stop surfaces as max-turns-with-grace and writes user_input + 
   const types = listEvents('brain-limit').map((e) => (e as { type?: string }).type);
   assert.ok(types.includes('user_input_received'), 'user_input_received written for the SDK brain');
   assert.ok(types.includes('conversation_completed'), 'conversation_completed emitted');
+});
+
+test('looksLikeToolNarration flags described-but-not-called tool protocol, ignores real tool calls', () => {
+  // The exact shape from the live failure (sess-mql8hb50): narrated, zero tool calls.
+  assert.equal(looksLikeToolNarration('Tool:run_shell_command\n\nSystem: tool result is empty\n\nfunction\n{"command":"sf data query"}', []), true);
+  assert.equal(looksLikeToolNarration('{"command": "sf data query --json"}', []), true);
+  // Real tool calls happened ⇒ not narration, even if text mentions tools.
+  assert.equal(looksLikeToolNarration('Tool:run_shell_command', ['mcp__clementine-local__run_shell_command']), false);
+  // Normal prose ⇒ not narration.
+  assert.equal(looksLikeToolNarration('Pulled your 5 accounts — here they are.', []), false);
+  assert.equal(looksLikeToolNarration('', []), false);
+});
+
+test('full mode: a narrated (no-tool-call) turn triggers ONE retry that actually invokes the tool', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off'; // isolate the narration retry
+  const calls: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls.push(options.prompt);
+    return calls.length === 1
+      ? { text: 'Tool:run_shell_command\n\nSystem: tool result is empty\n\nfunction\n{"command":"sf data query"}', sessionId: 's', toolUses: [] }
+      : { text: 'Pulled 5 accounts: Acme, Globex, Initech, Umbrella, Stark.', sessionId: 's', toolUses: ['mcp__clementine-local__run_shell_command'] };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 salesforce accounts', sessionId: 'brain-narrate' });
+
+  assert.equal(calls.length, 2, 'narration triggered exactly one retry');
+  assert.match(calls[1], /INVOKE the real tool now/);
+  assert.match(res.text, /Pulled 5 accounts/);
+});
+
+test('full mode: narration retry kill-switch off ⇒ no retry', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY = 'off';
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => { runs += 1; return { text: 'Tool:run_shell_command\n\nfunction\n{"command":"x"}', sessionId: 's', toolUses: [] }; });
+  await respondViaClaudeAgentSdkBrain('home', { message: 'do it', sessionId: 'brain-narrate-off' });
+  assert.equal(runs, 1, 'no retry when the kill-switch is off');
 });
 
 test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local authoring tools but not broad execution', async () => {
