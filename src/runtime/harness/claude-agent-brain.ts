@@ -56,8 +56,16 @@ export function claudeAgentSdkBrainEnabled(surface: string): surface is ClaudeAg
 }
 
 function maxTurns(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS', '6') ?? '6', 10);
-  return Number.isFinite(raw) && raw >= 1 ? raw : 6;
+  // Each SDK "turn" is one assistant message (which may carry tool calls). Real
+  // agentic work needs headroom: a single gated send alone is execution_create →
+  // composio_execute_tool → execution_complete → final (~5 turns), and a
+  // multi-step read/transform/report is more. The old default of 6 starved
+  // legitimate flows — they hit the cap mid-task, returned a hard "Reached
+  // maximum number of turns" error, and the brain thrashed (retrying the same
+  // send) trying to finish in time. The loop-guard + duplicate-write gates bound
+  // any runaway, so a generous cap is safe.
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS', '24') ?? '24', 10);
+  return Number.isFinite(raw) && raw >= 1 ? raw : 24;
 }
 
 function toolProfileForMode(mode: ClaudeAgentBrainMode): ClaudeAgentSdkToolProfile {

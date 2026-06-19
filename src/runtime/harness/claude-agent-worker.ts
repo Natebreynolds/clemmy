@@ -24,8 +24,12 @@ export function claudeAgentSdkWorkerEnabled(modelId: string | undefined | null):
 }
 
 function maxTurns(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS', '5') ?? '5', 10);
-  return Number.isFinite(raw) && raw >= 1 ? raw : 5;
+  // A worker handles ONE parent-planned item, but that item can still be a few
+  // gated steps (read → transform → one gated write). 5 was too tight once the
+  // worker became agentic; give it headroom (loop-guard + duplicate gates bound
+  // runaways). Parent fan-out breadth is unchanged — this is per-item depth.
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS', '12') ?? '12', 10);
+  return Number.isFinite(raw) && raw >= 1 ? raw : 12;
 }
 
 export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agentic = false): string {

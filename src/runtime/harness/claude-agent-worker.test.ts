@@ -81,7 +81,7 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
   assert.equal(result.sdkSessionId, 'sdk-worker-session');
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__skill_read']);
   assert.equal(captured.modelId, 'claude-sonnet-4-6');
-  assert.equal(captured.maxTurns, 5);
+  assert.equal(captured.maxTurns, 12);
   assert.match(captured.prompt, /\[WORKER JOB PACKET\]/);
   assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));

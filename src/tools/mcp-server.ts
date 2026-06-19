@@ -31,8 +31,15 @@ import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 
 const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
+
+// Counter cap for the ambient harness run context. Most tools wrapped here are
+// reads that never touch the counter; the gated mutating tools set their OWN
+// inner context (gated-mutating-tools.ts), so this ambient counter only ever
+// matters as a benign fallback.
+const AMBIENT_COUNTER_LIMIT = 1000;
 
 function installAmbientToolContext(): void {
   const sessionId = process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
@@ -45,7 +52,18 @@ function installAmbientToolContext(): void {
     if (toolName && typeof handler === 'function') {
       args[last] = async (...handlerArgs: any[]) => withToolOutputContext(
         { sessionId, toolName },
-        () => handler(...handlerArgs),
+        // Also establish the harness run context so tools that read it for the
+        // active session (execution_create / execution_* / plan / goal, etc.)
+        // resolve CLEMENTINE_MCP_SESSION_ID instead of failing with "requires a
+        // harness session context". Without this, the Agent SDK lane deadlocks:
+        // the execution-wrap gate demands an execution lane before an outbound
+        // send, but execution_create could not see the session to open one.
+        // The gated mutating tools nest their own inner context (with the real
+        // per-call counter), so this is a safe outer fallback for everything else.
+        () => withHarnessRunContext(
+          { sessionId, counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT) },
+          () => handler(...handlerArgs),
+        ),
       );
     }
     return originalTool(...args);

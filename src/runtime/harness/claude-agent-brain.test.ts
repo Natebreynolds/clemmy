@@ -99,7 +99,7 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.equal(getSession('brain-run')?.metadata?.readOnly, true);
   assert.equal(captured.prompt, 'search memory');
   assert.equal(captured.sessionId, 'brain-run');
-  assert.equal(captured.maxTurns, 6);
+  assert.equal(captured.maxTurns, 24);
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));
   assert.equal(captured.allowedLocalMcpTools.includes('memory_read'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
