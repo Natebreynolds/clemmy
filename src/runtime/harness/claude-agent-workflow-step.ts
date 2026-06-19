@@ -23,28 +23,44 @@ export function claudeAgentSdkWorkflowStepEnabled(modelId: string | undefined | 
   return flagEnabled() && typeof modelId === 'string' && modelId.startsWith('claude-');
 }
 
-function maxTurns(step: WorkflowStepInput): number {
+function maxTurns(step: WorkflowStepInput, fullLane: boolean): number {
   if (typeof step.maxTurns === 'number' && Number.isFinite(step.maxTurns) && step.maxTurns >= 1) {
     return Math.floor(step.maxTurns);
   }
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP_MAX_TURNS', '6') ?? '6', 10);
-  return Number.isFinite(raw) && raw >= 1 ? raw : 6;
+  // The full gated lane does real multi-tool work (scrape → analyze, write,
+  // send) and needs the same headroom the agentic brain gets (24). The
+  // read-only lane stays tight (6) — it only reads/recalls. A too-low cap here
+  // hard-failed scrape-class steps with "Reached maximum number of turns".
+  const fallback = fullLane ? '24' : '6';
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP_MAX_TURNS', fallback) ?? fallback, 10);
+  return Number.isFinite(raw) && raw >= 1 ? raw : (fullLane ? 24 : 6);
 }
 
 export function renderClaudeAgentWorkflowStepSystemAppend(args: {
   workflowName: string;
   step: WorkflowStepInput;
+  fullLane?: boolean;
 }): string {
-  const { workflowName, step } = args;
+  const { workflowName, step, fullLane } = args;
+  const boundary = fullLane
+    ? [
+        'Current capability boundary (FULL gated lane — Claude is the active brain):',
+        '- You may use the exposed Clementine MCP tools for read/recall AND the gated execution tools: run_shell_command, write_file, and composio_search_tools / composio_list_tools / composio_execute_tool, plus local_cli_list / local_cli_probe.',
+        '- Every mutating/external call is routed through the harness gate chain (grounding, goal-fidelity, confirm-first, and async approval) and the workflow\'s pre-authorized tool grants — so do the real work the step asks for; do not fabricate or merely describe it.',
+        '- If a required tool is genuinely unavailable or a gate blocks you, return status "blocked" with a concrete reason rather than claiming completion.',
+      ]
+    : [
+        'Current capability boundary:',
+        '- This Claude SDK workflow-step lane is READ-ONLY/local-context only.',
+        '- You may use exposed Clementine MCP tools for memory, skill, profile, session, workspace, status, and read-only file/context lookup.',
+        '- Do not write files, run shell commands, create workflows, send messages, update external systems, or perform any mutation in this lane.',
+        '- If the step requires mutation or external writes, return status "blocked" with a concrete reason rather than fabricating completion.',
+      ];
   return [
     'You are a Clementine workflow-step specialist running through the official Claude Agent SDK under the user\'s Claude subscription auth.',
     'Your scope is exactly ONE workflow step. Do the step task, keep the result compact, and do not converse with the user.',
     '',
-    'Current capability boundary:',
-    '- This Claude SDK workflow-step lane is READ-ONLY/local-context only.',
-    '- You may use exposed Clementine MCP tools for memory, skill, profile, session, workspace, status, and read-only file/context lookup.',
-    '- Do not write files, run shell commands, create workflows, send messages, update external systems, or perform any mutation in this lane.',
-    '- If the step requires mutation or external writes, return status "blocked" with a concrete reason rather than fabricating completion.',
+    ...boundary,
     '- If the step declares a skill, names a taste/design/style skill, or says to use installed skill rules, call `skill_read` for that skill before producing the result.',
     '- Finish by returning the structured output requested by the schema. Do not call `workflow_step_result`; this SDK lane returns the step result directly.',
     '',
@@ -134,15 +150,38 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   workflowName: string;
   prompt: string;
   modelId: string;
+  /** The step's REAL harness session id. Required for the full lane so the gated
+   *  tools + async approval read/write the workflow session's plan-scope grants. */
+  sessionId?: string;
+  /** Tool-capable gated lane (read + write/send through the harness gate chain)
+   *  rather than the read-only profile. */
+  fullLane?: boolean;
 }): Promise<ClaudeAgentSdkWorkflowStepResult> {
+  const fullLane = Boolean(args.fullLane);
   const result = await runClaudeAgentSdkImpl({
     prompt: args.prompt,
     modelId: args.modelId,
-    systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step }),
-    allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(),
-    maxTurns: maxTurns(args.step),
+    sessionId: args.sessionId,
+    systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step, fullLane }),
+    allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only'),
+    agentic: fullLane,
+    maxTurns: maxTurns(args.step, fullLane),
     outputSchema: claudeWorkflowStepOutputSchema(),
   });
+  // A turn-budget stop is NOT a clean completion. Surface it as a BLOCKED step so
+  // the runner's self-heal / retry handles it honestly, rather than reporting the
+  // partial text as a finished result (or hard-failing the whole workflow run).
+  if (result.limitHit) {
+    return {
+      output: { blocked: true, reason: 'Claude reached the workflow-step turn budget before finishing this step.' },
+      sdkSessionId: result.sessionId,
+      model: result.model,
+      toolUses: result.toolUses,
+      usage: result.usage,
+      modelUsage: result.modelUsage,
+      structured: true,
+    };
+  }
   const normalized = normalizeWorkflowStepOutput(result);
   return {
     output: normalized.output,

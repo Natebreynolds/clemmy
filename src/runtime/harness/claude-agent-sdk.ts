@@ -107,6 +107,11 @@ const AGENTIC_EXECUTION_TOOLS = [
   'composio_execute_tool',
   'local_cli_list',
   'local_cli_probe',
+  // Surface-to-user channel. A workflow "notify"/report step (and agentic
+  // workers) need this to actually deliver — it's registered on the MCP server
+  // (registerAutonomyActionTools) but was absent from the allowlist, so a Claude
+  // notify step blocked with no tool to call.
+  'notify_user',
 ] as const;
 
 /** Full agentic surface for the Claude BRAIN: local-authoring + execution tools
@@ -248,6 +253,10 @@ export interface ClaudeAgentSdkRunResult {
   toolUses: string[];
   usage?: unknown;
   modelUsage?: unknown;
+  /** True when the run stopped because it hit the turn budget (error_max_turns)
+   *  rather than finishing. The caller surfaces a graceful "say continue" instead
+   *  of a hard error — parity with the harness loop's auto-continue-on-limit. */
+  limitHit?: boolean;
 }
 
 function extractAssistantToolUses(message: SDKMessage): string[] {
@@ -336,6 +345,21 @@ export function claudeSdkReflectionEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_REFLECTION', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
+/** Flatten an assistant message's text blocks — used to keep the latest partial
+ *  answer so a turn-limit stop can surface it gracefully (error results carry no
+ *  `result` text). */
+function extractAssistantText(message: SDKMessage): string {
+  if (message.type !== 'assistant') return '';
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    const b = block as { type?: unknown; text?: unknown };
+    if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
+  }
+  return parts.join('');
+}
+
 function extractResult(message: SDKMessage): SDKResultMessage | null {
   return message.type === 'result' ? (message as SDKResultMessage) : null;
 }
@@ -405,9 +429,20 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const reflectSessionId = options.sessionId?.trim();
   const reflectLearning = Boolean(reflectSessionId) && claudeSdkReflectionEnabled();
   const toolById = new Map<string, { name: string; input: unknown }>();
+  // Keep the latest assistant text so a turn-budget stop can surface the partial
+  // answer (error results carry no `result` field).
+  let lastAssistantText = '';
+  // Some Claude Code SDK versions surface a turn-budget stop NOT as a clean
+  // `result` message (subtype error_max_turns) but as a THROWN stream error
+  // ("Claude Code returned an error result: Reached maximum number of turns (N)").
+  // That bypasses the clean-result grace below, so a workflow step hard-failed.
+  // Catch it here and fall through to the same limitHit handling.
+  let threwTurnLimit = false;
   try {
     for await (const message of stream) {
       init = init ?? extractInit(message);
+      const atext = extractAssistantText(message);
+      if (atext) lastAssistantText = atext;
       if (reflectLearning) for (const use of extractToolUseIds(message)) toolById.set(use.id, { name: use.name, input: use.input });
       toolUses.push(...extractAssistantToolUses(message));
       if (reflectLearning) {
@@ -420,12 +455,46 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       }
       result = extractResult(message) ?? result;
     }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && (result?.subtype ?? 'success') !== 'success') {
+      threwTurnLimit = true;
+    } else {
+      throw err;
+    }
   } finally {
     try { stream.close?.(); } catch { /* ignore */ }
   }
 
+  if (threwTurnLimit) {
+    return {
+      text: (lastAssistantText.trim() || 'I reached the turn budget before finishing. Say "continue" and I\'ll pick up where I left off.'),
+      sessionId: result?.session_id ?? init?.session_id,
+      model: init?.model,
+      toolUses,
+      usage: result?.usage,
+      modelUsage: result?.modelUsage,
+      limitHit: true,
+    };
+  }
+
   if (!result) throw new Error('Claude Agent SDK finished without a result message.');
   if (result.subtype !== 'success') {
+    // Long-running parity: a turn-budget stop is NOT a failure. Surface the
+    // partial answer + a limitHit flag so the brain can offer "say continue"
+    // (mirrors the harness loop's max-turns-with-grace) instead of throwing a
+    // raw "Claude Agent SDK failed" error that the caller reports as run_failed.
+    if (result.subtype === 'error_max_turns') {
+      return {
+        text: (lastAssistantText.trim() || 'I reached the turn budget before finishing. Say "continue" and I\'ll pick up where I left off.'),
+        sessionId: result.session_id,
+        model: init?.model,
+        toolUses,
+        usage: result.usage,
+        modelUsage: result.modelUsage,
+        limitHit: true,
+      };
+    }
     throw new Error(`Claude Agent SDK failed: ${JSON.stringify(result).slice(0, 800)}`);
   }
   return {

@@ -1,0 +1,100 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+/**
+ * Claude-as-the-ONLY-brain workflow execution.
+ *
+ * The gap (found 2026-06-19): when Claude is the brain (AUTH_MODE=claude_oauth)
+ * and there is NO Codex token, an UNTAGGED (no-intent) tool-using workflow step
+ * resolves to NO model (resolveWorkflowStepModel → {}), falls back to
+ * MODELS.primary (a gpt-* id), and the router — with Codex absent — remaps it to
+ * the Claude brain id served by the HEADLESS transport, which is text-only
+ * (`claude -p --tools ''`) and CANNOT call tools. So a Claude-only user's
+ * tool-using workflows have no tool-capable executor.
+ *
+ * The fix (CLEMMY_CLAUDE_WORKFLOW_FULL_LANE, default on): under claude_oauth,
+ * untagged workflow steps resolve to the Claude brain model so the tool-capable,
+ * gated Claude Agent SDK workflow-step lane engages — for read AND write/send.
+ *
+ * This file asserts the FIXED behavior: it is RED before the fix (proving the
+ * gap) and GREEN after. A regression guard pins the Codex path byte-identical.
+ */
+
+// Fresh temp home BEFORE imports ⇒ no stored Codex token ⇒ codexModelsAvailable()
+// is false, exactly the "Claude is my only model" machine we need to simulate.
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-only-wf-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.AUTH_MODE = 'claude_oauth';
+process.env.CLEMMY_CLAUDE_TRANSPORT = 'headless';
+delete process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE; // default-on
+
+const { workflowRunnerInternalsForTest } = await import('./workflow-runner.js');
+const { resolveWorkflowStepModel, workflowStepCanRunOnClaudeAgentSdk } = workflowRunnerInternalsForTest;
+const { claudeAgentSdkWorkflowStepEnabled } = await import('../runtime/harness/claude-agent-workflow-step.js');
+const { buildClaudeHeadlessArgs } = await import('../runtime/harness/claude-headless-model.js');
+const { getClaudeBrainModel, MODELS } = await import('../config.js');
+const { codexModelsAvailable } = await import('../runtime/harness/model-role-options.js');
+
+const readStep = { id: 'find_page', prompt: 'Find the official page', sideEffect: 'read' as const };
+const sendStep = { id: 'notify_nate', prompt: 'Notify Nate with the read', sideEffect: 'send' as const };
+
+test('pre-req: this run simulates a Claude-only machine (no Codex token)', () => {
+  assert.equal(codexModelsAvailable(), false, 'temp home must have no Codex token to simulate Claude-only');
+});
+
+test('headless transport is genuinely text-only — it disables tools (--tools "")', () => {
+  const args = buildClaudeHeadlessArgs(getClaudeBrainModel());
+  const i = args.indexOf('--tools');
+  assert.ok(i >= 0, 'headless args carry --tools');
+  assert.equal(args[i + 1], '', 'headless explicitly disables tools — cannot execute a tool-using step');
+});
+
+test('FIX: an untagged tool-using workflow step resolves to the Claude brain model under claude_oauth', () => {
+  // Before the fix this returns {} (no model) ⇒ falls to MODELS.primary (gpt-*).
+  const routed = resolveWorkflowStepModel(readStep as never);
+  assert.equal(
+    typeof routed.model === 'string' && routed.model.startsWith('claude-'),
+    true,
+    `untagged step should resolve to a claude-* model under claude_oauth, got ${JSON.stringify(routed)}`,
+  );
+});
+
+test('FIX: the resolved untagged-step model engages the tool-capable Claude SDK workflow lane', () => {
+  const routed = resolveWorkflowStepModel(readStep as never);
+  assert.equal(
+    claudeAgentSdkWorkflowStepEnabled(routed.model),
+    true,
+    'the resolved untagged-step model must enable the tool-capable Claude workflow-step lane',
+  );
+});
+
+test('FIX: write/send steps may run on the full gated Claude lane (gates enforce safety)', () => {
+  assert.equal(
+    workflowStepCanRunOnClaudeAgentSdk(sendStep as never),
+    true,
+    'a send step should be allowed on the full gated Claude lane (grounding/approval gates still apply)',
+  );
+});
+
+test('REGRESSION GUARD: with Codex/api_key auth, untagged steps are byte-identical (no model picked)', () => {
+  process.env.AUTH_MODE = 'api_key';
+  try {
+    const routed = resolveWorkflowStepModel(readStep as never);
+    assert.deepEqual(routed, {}, 'non-claude_oauth untagged steps must keep returning {} (Codex path untouched)');
+  } finally {
+    process.env.AUTH_MODE = 'claude_oauth';
+  }
+});
+
+test('REGRESSION GUARD: kill-switch off ⇒ Claude-only routing disabled (untagged → {})', () => {
+  process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE = 'off';
+  try {
+    const routed = resolveWorkflowStepModel(readStep as never);
+    assert.deepEqual(routed, {}, 'with the kill-switch off, behavior reverts to the prior {} default');
+  } finally {
+    delete process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE;
+  }
+});

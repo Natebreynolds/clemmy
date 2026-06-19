@@ -101,6 +101,50 @@ test('runClaudeAgentSdkWorkflowStep builds a schema-bound SDK call and returns s
   assert.deepEqual(captured.outputSchema.required, ['status', 'output']);
 });
 
+test('renderClaudeAgentWorkflowStepSystemAppend full lane permits gated execution tools (no read-only boundary)', () => {
+  const prompt = renderClaudeAgentWorkflowStepSystemAppend({ workflowName: 'Report Workflow', step, fullLane: true });
+  assert.doesNotMatch(prompt, /READ-ONLY\/local-context/);
+  assert.match(prompt, /FULL gated lane/);
+  assert.match(prompt, /composio_execute_tool/);
+  assert.match(prompt, /run_shell_command/);
+  assert.match(prompt, /harness gate chain/);
+  assert.match(prompt, /call `skill_read`/);
+});
+
+test('runClaudeAgentSdkWorkflowStep full lane runs the tool-capable gated profile on the workflow session', async () => {
+  let captured: any;
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    captured = options;
+    return {
+      text: '{"status":"completed","output":{"report":"did the real work"}}',
+      structuredOutput: { status: 'completed', output: { report: 'did the real work' } },
+      sessionId: 'sdk-workflow-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'],
+    };
+  });
+
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step,
+    workflowName: 'Report Workflow',
+    prompt: 'Scrape and analyze.',
+    modelId: 'claude-sonnet-4-6',
+    sessionId: 'workflow:run-xyz:scrape',
+    fullLane: true,
+  });
+
+  assert.deepEqual(result.output, { report: 'did the real work' });
+  assert.equal(captured.agentic, true, 'full lane runs in agentic (gated-mutation) mode');
+  assert.equal(captured.maxTurns, 24, 'full lane gets brain-level turn headroom (not the read-only 6)');
+  assert.equal(captured.sessionId, 'workflow:run-xyz:scrape', 'gated tools run on the workflow session for plan-scope grants');
+  assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'), 'composio exposed for external read/write');
+  assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'), 'shell exposed (gated)');
+  assert.ok(captured.allowedLocalMcpTools.includes('write_file'), 'file write exposed (gated)');
+  assert.ok(captured.allowedLocalMcpTools.includes('notify_user'), 'notify_user exposed so notify/report steps can deliver');
+  // Workflow authoring stays out of a step lane even in full mode.
+  assert.equal(captured.allowedLocalMcpTools.includes('execution_create'), false);
+});
+
 test('runClaudeAgentSdkWorkflowStep converts blocked SDK output into a workflow blocked result', async () => {
   setClaudeAgentSdkWorkflowStepRunForTest(async () => ({
     text: '',
