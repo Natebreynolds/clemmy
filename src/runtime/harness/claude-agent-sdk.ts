@@ -98,12 +98,20 @@ function localNodeCommand(): string {
   return process.execPath || 'node';
 }
 
-export function buildClaudeAgentSdkLocalMcpServers(sessionId?: string): Record<string, McpServerConfig> {
+export function buildClaudeAgentSdkLocalMcpServers(
+  sessionId?: string,
+  gatedMutations = false,
+): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
   const srcEntry = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
+  // gatedMutations=on exposes the mutating tools (shell/composio/write) on the
+  // MCP surface, each run through the full harness gate chain (see
+  // gated-mutating-tools.ts). Set only for the agentic brain/worker profiles —
+  // a read-only run leaves it off so those tools never appear.
   const env = mergedSpawnEnv({
     CLEMENTINE_HOME: BASE_DIR,
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
+    ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
   });
   if (existsSync(distEntry)) {
     return {

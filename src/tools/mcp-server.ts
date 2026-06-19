@@ -25,6 +25,7 @@ import { isSpacesEnabled } from '../spaces/store.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
+import { registerGatedMutatingTools } from './gated-mutating-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
@@ -75,6 +76,10 @@ registerMcpStatusTools(server);
 registerToolChoiceTools(server);
 registerModelRoleTools(server);
 registerDynamicTools(server);
+// Agent SDK lane only (CLEMENTINE_MCP_GATED_MUTATIONS=on): expose the mutating
+// tools (shell/composio/write) through the full harness gate chain so the Claude
+// Agent SDK can execute them safely. No-op for the Codex/OpenAI MCP wiring.
+registerGatedMutatingTools(server);
 
 server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
 
