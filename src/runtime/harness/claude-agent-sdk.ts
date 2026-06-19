@@ -12,7 +12,7 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 import { BASE_DIR, PKG_DIR } from '../../config.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
-import { buildClaudeHeadlessEnv, claudeCliModelArg } from './claude-headless-model.js';
+import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import { buildGatedToolPermission } from './claude-agent-approval.js';
 
 type QueryFn = typeof claudeQuery;
@@ -268,8 +268,17 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Agentic lane requires a session id (the gate chain + approval read/write the
   // session's event log). Without one, fall back to the read-only allowlist.
   const agentic = Boolean(options.agentic && options.sessionId?.trim());
+  // Point the SDK at the user's installed `claude` CLI. The npm package ships the
+  // native CLI as an OPTIONAL per-arch dep (@anthropic-ai/claude-agent-sdk-<plat>);
+  // when packaged with --omit=optional (and/or when the daemon's arch differs from
+  // the only bundled arch) the SDK's auto-resolve throws "Native CLI binary for
+  // <plat>-<arch> not found". Resolving the user's own subscription-authed,
+  // auto-updating `claude` here removes that dependency entirely (and the SDK
+  // spawns it the same way it would the bundled native binary).
+  const pathToClaudeCodeExecutable = resolveClaudeCliPath() ?? undefined;
   const sdkOptions: ClaudeAgentOptions = {
     env,
+    ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
     model: options.modelId ? claudeCliModelArg(options.modelId) : undefined,
     cwd: PKG_DIR,
     persistSession: false,

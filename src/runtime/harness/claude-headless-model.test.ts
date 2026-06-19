@@ -22,6 +22,7 @@ const {
   setClaudeHeadlessSpawnForTest,
   claudeHeadlessCliAvailable,
   setClaudeHeadlessCliAvailableForTest,
+  resolveClaudeCliPath,
 } = mod;
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
@@ -233,21 +234,46 @@ test('claudeHeadlessCliAvailable: test override forces the value; null restores 
   setClaudeHeadlessCliAvailableForTest(null);
 });
 
-test('claudeHeadlessCliAvailable: real PATH scan finds (and misses) a `claude` binary', () => {
+test('resolveClaudeCliPath: finds a `claude` binary on the (augmented) PATH', () => {
   setClaudeHeadlessCliAvailableForTest(null);
   const binDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-bin-'));
-  const emptyDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-empty-bin-'));
   const claudeBin = path.join(binDir, process.platform === 'win32' ? 'claude.cmd' : 'claude');
   writeFileSync(claudeBin, '#!/bin/sh\necho stub', { mode: 0o755 });
   const prevPath = process.env.PATH;
+  const prevOverride = process.env.CLAUDE_CLI_PATH;
   try {
+    delete process.env.CLAUDE_CLI_PATH;
     process.env.PATH = binDir;
+    // resolveClaudeCliPath scans the AUGMENTED PATH, so it finds claude in
+    // binDir (and would also find a real ~/.local/bin/claude — the whole point:
+    // a minimal /Applications launch PATH no longer hides the CLI). We can't
+    // assert a pure "absent" case here precisely because of that widening.
     assert.equal(claudeHeadlessCliAvailable(), true, 'finds claude on PATH');
-    process.env.PATH = emptyDir;
-    assert.equal(claudeHeadlessCliAvailable(), false, 'absent when PATH lacks claude');
+    const resolved = resolveClaudeCliPath();
+    assert.ok(typeof resolved === 'string' && resolved.length > 0, 'returns an absolute path');
   } finally {
     process.env.PATH = prevPath;
+    if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
+    else process.env.CLAUDE_CLI_PATH = prevOverride;
     rmSync(binDir, { recursive: true, force: true });
-    rmSync(emptyDir, { recursive: true, force: true });
+  }
+});
+
+test('resolveClaudeCliPath: an explicit CLAUDE_CLI_PATH override wins when it exists', () => {
+  setClaudeHeadlessCliAvailableForTest(null);
+  const binDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-override-'));
+  const overrideBin = path.join(binDir, 'my-claude');
+  writeFileSync(overrideBin, '#!/bin/sh\necho stub', { mode: 0o755 });
+  const prevOverride = process.env.CLAUDE_CLI_PATH;
+  try {
+    process.env.CLAUDE_CLI_PATH = overrideBin;
+    assert.equal(resolveClaudeCliPath(), overrideBin, 'override path wins');
+    process.env.CLAUDE_CLI_PATH = path.join(binDir, 'does-not-exist');
+    assert.notEqual(resolveClaudeCliPath(), path.join(binDir, 'does-not-exist'),
+      'a non-existent override falls through to the PATH scan');
+  } finally {
+    if (prevOverride === undefined) delete process.env.CLAUDE_CLI_PATH;
+    else process.env.CLAUDE_CLI_PATH = prevOverride;
+    rmSync(binDir, { recursive: true, force: true });
   }
 });

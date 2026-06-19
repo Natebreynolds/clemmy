@@ -6,6 +6,7 @@ import { Usage } from '@openai/agents-core';
 import type { AgentInputItem, AgentOutputItem, Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { getRuntimeEnv } from '../../config.js';
+import { augmentPath } from '../spawn-env.js';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import pino from 'pino';
 
@@ -31,18 +32,34 @@ export function setClaudeHeadlessCliAvailableForTest(value: boolean | null): voi
  *  fallover error, so nothing auto-recovers from it. */
 export function claudeHeadlessCliAvailable(): boolean {
   if (cliAvailableOverride !== null) return cliAvailableOverride;
+  return resolveClaudeCliPath() !== null;
+}
+
+/**
+ * Resolve the absolute path to the `claude` CLI binary, or null if absent.
+ * Scans the AUGMENTED PATH (so a /Applications Electron launch — whose inherited
+ * PATH lacks ~/.local/bin where the native installer drops the launcher — still
+ * finds it). An explicit CLAUDE_CLI_PATH env override wins. Used by the headless
+ * transport (spawn `claude -p`) AND the Agent SDK lane (pathToClaudeCodeExecutable),
+ * so both run the user's real, subscription-authed, auto-updating Claude Code.
+ */
+export function resolveClaudeCliPath(): string | null {
+  const override = (process.env.CLAUDE_CLI_PATH || '').trim();
+  if (override && existsSync(override)) return override;
   const exts = process.platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : [''];
-  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+  const dirs = augmentPath(process.env.PATH).split(path.delimiter);
+  for (const dir of dirs) {
     if (!dir) continue;
     for (const ext of exts) {
       try {
-        if (existsSync(path.join(dir, `claude${ext}`))) return true;
+        const candidate = path.join(dir, `claude${ext}`);
+        if (existsSync(candidate)) return candidate;
       } catch {
         /* unreadable PATH entry — keep scanning */
       }
     }
   }
-  return false;
+  return null;
 }
 
 export type ClaudeSubscriptionTransport = 'headless' | 'raw_messages';
@@ -86,6 +103,10 @@ export async function buildClaudeHeadlessEnv(): Promise<NodeJS.ProcessEnv> {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;
+  // A /Applications Electron launch inherits a minimal PATH; widen it so the
+  // spawned `claude` CLI (and anything it shells out to) resolves the same dirs
+  // the rest of the harness uses.
+  env.PATH = augmentPath(env.PATH);
   env.CLAUDE_CODE_OAUTH_TOKEN = token;
   env.CLAUDE_AGENT_SDK_CLIENT_APP = env.CLAUDE_AGENT_SDK_CLIENT_APP || 'clementine';
   return env;

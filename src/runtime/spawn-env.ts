@@ -1,4 +1,5 @@
 import path from 'node:path';
+import os from 'node:os';
 
 /**
  * macOS Electron apps launched from /Applications inherit a minimal PATH
@@ -26,6 +27,16 @@ export function augmentPath(existing: string | undefined): string {
     if (dir) candidates.push(dir);
   } catch {
     /* execPath unset is fine */
+  }
+  // The native installers for user CLIs (Claude Code → ~/.local/bin/claude,
+  // plus many others) put their launcher here; a /Applications Electron launch
+  // never inherits it. Add it before the system dirs so the daemon discovers
+  // them (idempotent, widen-only).
+  try {
+    const home = os.homedir();
+    if (home) candidates.push(path.join(home, '.local', 'bin'));
+  } catch {
+    /* homedir unavailable is fine */
   }
   candidates.push(
     '/opt/homebrew/bin',
