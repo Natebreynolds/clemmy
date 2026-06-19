@@ -886,10 +886,25 @@ function withThinkingDisabled(request: ModelRequest): ModelRequest {
  *  [AGENT CONTEXT PACKET] with the focus line, the memory primer, and the goal
  *  block). The `...request` spread preserves them; do NOT rebuild the judge's
  *  input or the judge loses its focus / memory / goal context. */
+// Position-bias mitigation. An LLM judge favors whichever draft is presented
+// first (~⅓ of comparative verdicts flip on re-order). draftA is ALWAYS Claude
+// and draftB ALWAYS Codex (resolveDebateBrains), so a FIXED presentation order is
+// a SYSTEMATIC provider bias — exactly the self-/position-preference a
+// cross-provider panel exists to cancel. Randomize which draft is labelled
+// "DRAFT A" per judge call so neither flagship is structurally favored.
+let judgeOrderCoin: () => boolean = () => Math.random() < 0.5;
+/** Test seam: force the draft-order coin (true ⇒ swap A/B presentation). */
+export function setJudgeOrderCoinForTest(fn: (() => boolean) | null): void {
+  judgeOrderCoin = fn ?? (() => Math.random() < 0.5);
+}
+
 export function buildJudgeRequest(request: ModelRequest, a: ModelResponse, b: ModelResponse): ModelRequest {
   const base = ((request as { systemInstructions?: string }).systemInstructions ?? '').toString();
-  const draftA = summarizeOutput(a.output);
-  const draftB = summarizeOutput(b.output);
+  // Present in a randomized order so the verdict isn't biased toward the model
+  // that is always drafted first (Claude). Content is identical either way.
+  const swap = judgeOrderCoin();
+  const first = swap ? b : a;
+  const second = swap ? a : b;
   const block = [
     base,
     '',
@@ -897,10 +912,10 @@ export function buildJudgeRequest(request: ModelRequest, a: ModelResponse, b: Mo
     JUDGE_PREAMBLE,
     '',
     '--- DRAFT A ---',
-    draftA || '(empty)',
+    summarizeOutput(first.output) || '(empty)',
     '',
     '--- DRAFT B ---',
-    draftB || '(empty)',
+    summarizeOutput(second.output) || '(empty)',
     '=== END DEBATE DRAFTS ===',
   ].join('\n');
   return withThinkingDisabled({ ...request, systemInstructions: block } as ModelRequest);

@@ -21,6 +21,7 @@ const {
   summarizeOutput,
   heartbeatsUntil,
   streamResponseAsEvents,
+  setJudgeOrderCoinForTest,
 } = await import('./debate-model.js');
 const { getDebateCheckerModel } = await import('../../config.js');
 
@@ -295,6 +296,39 @@ test('buildJudgeRequest: preserves tools/modelSettings, appends both drafts to s
   assert.match(jr.systemInstructions, /BASE/, 'original system kept');
   assert.match(jr.systemInstructions, /DRAFT-A/);
   assert.match(jr.systemInstructions, /DRAFT-B/);
+});
+
+test('buildJudgeRequest randomizes draft order to cancel position bias (content preserved)', () => {
+  const r = req();
+  try {
+    // No swap: Claude (a) renders under "DRAFT A", Codex (b) under "DRAFT B".
+    setJudgeOrderCoinForTest(() => false);
+    const noSwap = (buildJudgeRequest(r, msg('CLAUDE_DRAFT'), msg('CODEX_DRAFT')) as any).systemInstructions as string;
+    assert.ok(
+      noSwap.indexOf('CLAUDE_DRAFT') > noSwap.indexOf('--- DRAFT A ---') &&
+        noSwap.indexOf('CLAUDE_DRAFT') < noSwap.indexOf('--- DRAFT B ---'),
+      'no-swap: Claude draft sits under DRAFT A',
+    );
+    assert.ok(noSwap.indexOf('CODEX_DRAFT') > noSwap.indexOf('--- DRAFT B ---'), 'no-swap: Codex draft under DRAFT B');
+
+    // Swap: the order flips so neither provider is structurally first.
+    setJudgeOrderCoinForTest(() => true);
+    const swapped = (buildJudgeRequest(r, msg('CLAUDE_DRAFT'), msg('CODEX_DRAFT')) as any).systemInstructions as string;
+    assert.ok(
+      swapped.indexOf('CODEX_DRAFT') > swapped.indexOf('--- DRAFT A ---') &&
+        swapped.indexOf('CODEX_DRAFT') < swapped.indexOf('--- DRAFT B ---'),
+      'swap: Codex draft sits under DRAFT A',
+    );
+    assert.ok(swapped.indexOf('CLAUDE_DRAFT') > swapped.indexOf('--- DRAFT B ---'), 'swap: Claude draft under DRAFT B');
+
+    // Both drafts are always present regardless of order.
+    for (const s of [noSwap, swapped]) {
+      assert.match(s, /CLAUDE_DRAFT/);
+      assert.match(s, /CODEX_DRAFT/);
+    }
+  } finally {
+    setJudgeOrderCoinForTest(null);
+  }
 });
 
 test('buildVerifyRequest / buildJudgeRequest DISABLE extended thinking (effort=none + strips a pre-set anthropic.effort)', () => {

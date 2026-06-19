@@ -18,6 +18,7 @@ const {
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
   setClaudeAgentSdkQueryForTest,
+  setClaudeAgentSdkReflectionForTest,
 } = mod;
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
@@ -40,10 +41,12 @@ function writeClaudeToken(): void {
 test.beforeEach(() => {
   writeClaudeToken();
   setClaudeAgentSdkQueryForTest(null);
+  setClaudeAgentSdkReflectionForTest(null);
 });
 
 test.after(() => {
   setClaudeAgentSdkQueryForTest(null);
+  setClaudeAgentSdkReflectionForTest(null);
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -233,4 +236,56 @@ test('runClaudeAgentSdk uses the conservative read-only tool set by default', as
   assert.ok(capture.call.options.allowedTools.includes('mcp__clementine-local__memory_search'));
   assert.equal(capture.call.options.allowedTools.includes('mcp__clementine-local__run_shell_command'), false);
   assert.equal(capture.call.options.allowedTools.includes('mcp__clementine-local__composio_execute_tool'), false);
+});
+
+// Brain continuity: a Claude Agent SDK turn must feed its tool returns into the
+// SAME reflection pipeline the Codex loop uses, so Clementine learns from Claude
+// turns instead of going amnesiac. The Agent SDK runs its tool loop outside the
+// @openai/agents RunHooks, so this is sourced from the SDK message stream.
+function streamWithToolReturn(): SDKMessage[] {
+  return [
+    { type: 'system', subtype: 'init', model: 'claude-opus-4-8', session_id: 'sdk-session', uuid: 'u1', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any,
+    { type: 'assistant', session_id: 'sdk-session', uuid: 'u2', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', id: 'toolu_42', name: 'mcp__clementine-local__composio_execute_tool', input: { tool_slug: 'SALESFORCE_QUERY' } }] } } as any,
+    { type: 'user', session_id: 'sdk-session', uuid: 'u3', parent_tool_use_id: null, message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_42', content: 'Acme Corp has 3 open opportunities worth $45,000 total.' }] } } as any,
+    { type: 'result', subtype: 'success', session_id: 'sdk-session', uuid: 'u4', result: 'done', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] } as any,
+  ];
+}
+
+test('runClaudeAgentSdk reflects each tool return into the learning pipeline (brain continuity)', async () => {
+  setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages(streamWithToolReturn(), {})) as any);
+  const reflected: Array<{ sessionId: string; callId: string; tool: string | null; output: string }> = [];
+  setClaudeAgentSdkReflectionForTest(((input: any) => { reflected.push(input); }) as any);
+
+  await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: 'clem-sess-1', agentic: true });
+
+  assert.equal(reflected.length, 1);
+  assert.equal(reflected[0].sessionId, 'clem-sess-1');
+  assert.equal(reflected[0].callId, 'toolu_42');
+  // The MCP-namespaced Composio wrapper is unwrapped to the real action slug
+  // for source-trust parity with the Codex RunHooks path.
+  assert.equal(reflected[0].tool, 'SALESFORCE_QUERY');
+  assert.match(reflected[0].output, /Acme Corp has 3 open opportunities/);
+});
+
+test('learning-OUT is skipped without a session id and when kill-switched off', async () => {
+  // No session id → nothing to attribute facts to → no reflection.
+  setClaudeAgentSdkQueryForTest(((_p: any) => queryFromMessages(streamWithToolReturn(), {})) as any);
+  const noSession: unknown[] = [];
+  setClaudeAgentSdkReflectionForTest(((input: any) => { noSession.push(input); }) as any);
+  await runClaudeAgentSdk({ prompt: 'x' });
+  assert.equal(noSession.length, 0);
+
+  // Kill-switch off → legacy behaviour (no learning OUT) even with a session.
+  const prior = process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+  try {
+    process.env.CLEMMY_CLAUDE_SDK_REFLECTION = 'off';
+    setClaudeAgentSdkQueryForTest(((_p: any) => queryFromMessages(streamWithToolReturn(), {})) as any);
+    const killed: unknown[] = [];
+    setClaudeAgentSdkReflectionForTest(((input: any) => { killed.push(input); }) as any);
+    await runClaudeAgentSdk({ prompt: 'x', sessionId: 'clem-sess-2', agentic: true });
+    assert.equal(killed.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
+    else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = prior;
+  }
 });

@@ -10,7 +10,9 @@ import type {
   SDKResultMessage,
   SDKSystemMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import { BASE_DIR, PKG_DIR } from '../../config.js';
+import { BASE_DIR, PKG_DIR, getRuntimeEnv } from '../../config.js';
+import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
+import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import { buildGatedToolPermission } from './claude-agent-approval.js';
@@ -20,6 +22,14 @@ let queryImpl: QueryFn = claudeQuery;
 
 export function setClaudeAgentSdkQueryForTest(fn: QueryFn | null): void {
   queryImpl = fn ?? claudeQuery;
+}
+
+// Test seam for the learning-OUT bridge (see runClaudeAgentSdk). Lets a test
+// assert which tool returns get reflected without running the real extractor.
+type ReflectFn = typeof scheduleReflection;
+let reflectImpl: ReflectFn = scheduleReflection;
+export function setClaudeAgentSdkReflectionForTest(fn: ReflectFn | null): void {
+  reflectImpl = fn ?? scheduleReflection;
 }
 
 export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
@@ -252,6 +262,80 @@ function extractAssistantToolUses(message: SDKMessage): string[] {
   return out;
 }
 
+/** Pair tool_use ids → names from an assistant message (the MCP tool name is
+ *  namespaced, e.g. `mcp__clementine-local__run_shell_command`). Used to label
+ *  the reflection so the source-trust classifier can see the producing tool. */
+function extractToolUseIds(message: SDKMessage): Array<{ id: string; name: string; input: unknown }> {
+  if (message.type !== 'assistant') return [];
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (!Array.isArray(content)) return [];
+  const out: Array<{ id: string; name: string; input: unknown }> = [];
+  for (const block of content) {
+    const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: unknown };
+    if (b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
+      out.push({ id: b.id, name: b.name, input: b.input });
+    }
+  }
+  return out;
+}
+
+function bareMcpToolName(rawName: string): string {
+  return rawName.split('__').at(-1) ?? rawName;
+}
+
+function reflectionToolName(rawName: string | null, input: unknown): string | null {
+  if (!rawName) return null;
+  const bare = bareMcpToolName(rawName);
+  if (bare === 'composio_execute_tool') {
+    const slug = (input as { tool_slug?: unknown } | null | undefined)?.tool_slug;
+    return typeof slug === 'string' && slug.trim() ? slug.trim() : bare;
+  }
+  if (bare === 'run_shell_command') {
+    const command = (input as { command?: unknown } | null | undefined)?.command;
+    return typeof command === 'string' ? (cliBinaryFromCommand(command) ?? bare) : bare;
+  }
+  return bare;
+}
+
+function normalizeToolResultContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => {
+        const cc = c as { type?: unknown; text?: unknown };
+        return cc.type === 'text' && typeof cc.text === 'string' ? cc.text : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (content == null) return '';
+  try { return JSON.stringify(content); } catch { return String(content); }
+}
+
+/** Pull tool_result blocks (callId + flattened text) from a user message — the
+ *  Agent SDK feeds MCP tool results back as a user turn carrying
+ *  `{ type: 'tool_result', tool_use_id, content }` blocks. */
+function extractToolResults(message: SDKMessage): Array<{ callId: string; output: string }> {
+  if (message.type !== 'user') return [];
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (!Array.isArray(content)) return [];
+  const out: Array<{ callId: string; output: string }> = [];
+  for (const block of content) {
+    const b = block as { type?: unknown; tool_use_id?: unknown; content?: unknown };
+    if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
+      out.push({ callId: b.tool_use_id, output: normalizeToolResultContent(b.content) });
+    }
+  }
+  return out;
+}
+
+/** Kill-switch for the Agent SDK learning-OUT bridge (default ON). Off ⇒ Claude
+ *  brain/worker turns no longer write facts back (legacy behaviour). The global
+ *  reflection disable flag still applies inside scheduleReflection regardless. */
+export function claudeSdkReflectionEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_REFLECTION', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
 function extractResult(message: SDKMessage): SDKResultMessage | null {
   return message.type === 'result' ? (message as SDKResultMessage) : null;
 }
@@ -309,10 +393,31 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   let result: SDKResultMessage | null = null;
   let init: SDKSystemMessage | null = null;
   const toolUses: string[] = [];
+  // Learning OUT (brain continuity). The Agent SDK runs its tool loop OUTSIDE
+  // the @openai/agents RunHooks, so the onToolEnd → scheduleReflection path the
+  // Codex loop uses (hooks.ts) never fires here. Without this, a Claude
+  // brain/worker turn READS memory but never writes facts back — Clementine
+  // would stop learning from Claude turns. Re-source the same per-tool-return
+  // reflection from the SDK message stream, in-process (where the extractor +
+  // memory store live). scheduleReflection dedupes on sessionId::callId and
+  // applies the same importance / self-tool / length gates, so this is parity
+  // with Codex, not a second pipeline.
+  const reflectSessionId = options.sessionId?.trim();
+  const reflectLearning = Boolean(reflectSessionId) && claudeSdkReflectionEnabled();
+  const toolById = new Map<string, { name: string; input: unknown }>();
   try {
     for await (const message of stream) {
       init = init ?? extractInit(message);
+      if (reflectLearning) for (const use of extractToolUseIds(message)) toolById.set(use.id, { name: use.name, input: use.input });
       toolUses.push(...extractAssistantToolUses(message));
+      if (reflectLearning) {
+        for (const tr of extractToolResults(message)) {
+          if (!tr.output) continue;
+          const source = toolById.get(tr.callId);
+          const tool = source ? reflectionToolName(source.name, source.input) : null;
+          reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
+        }
+      }
       result = extractResult(message) ?? result;
     }
   } finally {
