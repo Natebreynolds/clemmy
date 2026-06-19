@@ -180,6 +180,7 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from '../runtime/harness/claude-agent-brain.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
@@ -6938,7 +6939,13 @@ export function registerConsoleRoutes(
       } catch { /* best-effort primer */ }
     }
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();
-    const intent = isPausedOnApproval ? parseApprovalIntent(input) : null;
+    // The Agent SDK brain lane pauses in the approval registry (its still-alive
+    // query() awaits a poll), NOT in RunState. Detect that separately so a typed
+    // approve/reject resolves the registry row instead of trying (and failing) to
+    // rehydrate a RunState that does not exist.
+    const sdkApprovalPending = !isPausedOnApproval
+      && approvalRegistry.listPending({ sessionId, status: 'pending' }).length > 0;
+    const intent = (isPausedOnApproval || sdkApprovalPending) ? parseApprovalIntent(input) : null;
     const sinceSeq = getLatestHarnessEventSeq(sessionId);
     const autonomy = loadProactivityPolicy().autoApproveScope;
     const planFirst = !intent && shouldUsePlanFirst({ input: turnInput, freshSession, autonomy });
@@ -7086,6 +7093,76 @@ export function registerConsoleRoutes(
               steps: 0,
             },
           });
+          return;
+        }
+        // Agent SDK brain lane: a paused run awaits in the approval registry (no
+        // RunState interrupt). A typed approve/reject resolves the registry row;
+        // the original still-alive query() picks it up via its poll and continues,
+        // delivering its own final reply. Do NOT runConversationFromResume here —
+        // there is no RunState to rehydrate (that would fail + clear state).
+        if (intent && sdkApprovalPending) {
+          const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
+          let resolved = 0;
+          for (const row of approvalRegistry.listPending({ sessionId, status: 'pending' })) {
+            const r = approvalRegistry.resolve(row.approvalId, resolution, 'chat-dock-user');
+            if (r.ok) resolved += 1;
+          }
+          appendHarnessEvent({
+            sessionId,
+            turn: 0,
+            role: 'Clem',
+            type: 'conversation_step',
+            data: {
+              reason: 'sdk_approval_resolved',
+              summary: resolved > 0
+                ? `${resolution === 'approved' ? 'Approved' : 'Rejected'} — continuing.`
+                : '(no pending approval to resolve)',
+              steps: 0,
+            },
+          });
+          return;
+        }
+        // Agentic Claude brain lane (claude_oauth + CLEMMY_CLAUDE_AGENT_SDK_BRAIN):
+        // run the turn through the official Anthropic Agent SDK on the user's Claude
+        // subscription. The SDK owns its own tool loop; mutations route through the
+        // harness gate chain (gated-mutating-tools) + the async approval gate
+        // (claude-agent-approval). The brain does not emit harness events itself, so
+        // deliver the final reply via conversation_completed — that is what the
+        // desktop SSE stream + session history read. Flag-gated + auth-gated, so
+        // Codex / API-key users are byte-identical (branch never taken).
+        if (!intent && claudeAgentSdkBrainEnabled('home')) {
+          try {
+            const brainResp = await respondViaClaudeAgentSdkBrain('home', {
+              message: effectiveInput,
+              sessionId,
+              channel: 'desktop',
+              userId: 'desktop',
+            });
+            const reply = (brainResp.text ?? '').trim() || '(no reply produced)';
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'Clem',
+              type: 'conversation_completed',
+              data: {
+                reason: 'claude_agent_sdk_brain',
+                reply,
+                summary: reply,
+                steps: brainResp.turnsUsed ?? 0,
+              },
+            });
+          } catch (err) {
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'run_failed',
+              data: {
+                error: err instanceof Error ? err.message : String(err),
+                stage: 'claude_agent_sdk_brain',
+              },
+            });
+          }
           return;
         }
         const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId });
