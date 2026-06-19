@@ -169,6 +169,7 @@ let status: DiscordRuntimeStatus = {
 
 interface DiscordDmPollState {
   lastSeenByChannel: Record<string, string>;
+  channelIdByUserId: Record<string, string>;
 }
 
 interface DiscordRestDmChannel {
@@ -194,27 +195,54 @@ interface DiscordRestSentMessage {
 
 function loadDiscordDmPollState(): DiscordDmPollState {
   if (!existsSync(DISCORD_DM_POLL_STATE_FILE)) {
-    return { lastSeenByChannel: {} };
+    return { lastSeenByChannel: {}, channelIdByUserId: {} };
   }
 
   try {
     const parsed = JSON.parse(readFileSync(DISCORD_DM_POLL_STATE_FILE, 'utf-8')) as Partial<DiscordDmPollState>;
+    const lastSeenByChannel = typeof parsed.lastSeenByChannel === 'object' && parsed.lastSeenByChannel
+      ? Object.fromEntries(
+        Object.entries(parsed.lastSeenByChannel)
+          .filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string'),
+      )
+      : {};
+    const channelIdByUserId = typeof parsed.channelIdByUserId === 'object' && parsed.channelIdByUserId
+      ? Object.fromEntries(
+        Object.entries(parsed.channelIdByUserId)
+          .filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string'),
+      )
+      : {};
+
+    if (Object.keys(channelIdByUserId).length === 0 && DISCORD_DM_ALLOWED_USERS.length === 1) {
+      const knownChannels = Object.keys(lastSeenByChannel);
+      if (knownChannels.length === 1) {
+        channelIdByUserId[DISCORD_DM_ALLOWED_USERS[0]!] = knownChannels[0]!;
+      }
+    }
+
     return {
-      lastSeenByChannel: typeof parsed.lastSeenByChannel === 'object' && parsed.lastSeenByChannel
-        ? Object.fromEntries(
-          Object.entries(parsed.lastSeenByChannel)
-            .filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string'),
-        )
-        : {},
+      lastSeenByChannel,
+      channelIdByUserId,
     };
   } catch {
-    return { lastSeenByChannel: {} };
+    return { lastSeenByChannel: {}, channelIdByUserId: {} };
   }
 }
 
 function saveDiscordDmPollState(state: DiscordDmPollState): void {
   mkdirSync(path.dirname(DISCORD_DM_POLL_STATE_FILE), { recursive: true });
   writeFileSync(DISCORD_DM_POLL_STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+const discordDmChannelCache = new Map<string, string>();
+
+function rememberDiscordDmChannel(userId: string, channelId: string): void {
+  discordDmChannelCache.set(userId, channelId);
+  const state = loadDiscordDmPollState();
+  if (state.channelIdByUserId[userId] !== channelId) {
+    state.channelIdByUserId[userId] = channelId;
+    saveDiscordDmPollState(state);
+  }
 }
 
 function compareSnowflakes(left: string, right: string): number {
@@ -345,10 +373,18 @@ async function discordApiVoid(path: string, init?: { method?: string; body?: unk
 }
 
 async function ensureDiscordDmChannel(userId: string): Promise<DiscordRestDmChannel> {
-  return discordApiJson<DiscordRestDmChannel>('/users/@me/channels', {
+  const cached = discordDmChannelCache.get(userId) ?? loadDiscordDmPollState().channelIdByUserId[userId];
+  if (cached) {
+    rememberDiscordDmChannel(userId, cached);
+    return { id: cached };
+  }
+
+  const dm = await discordApiJson<DiscordRestDmChannel>('/users/@me/channels', {
     method: 'POST',
     body: { recipient_id: userId },
   });
+  rememberDiscordDmChannel(userId, dm.id);
+  return dm;
 }
 
 async function listDiscordChannelMessages(channelId: string, limit = 15): Promise<DiscordRestMessage[]> {
