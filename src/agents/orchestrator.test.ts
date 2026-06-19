@@ -37,6 +37,7 @@ const {
   orchestratorInternalsForTest,
 } = await import('./orchestrator.js');
 const { resolveMcpToolScopeWithContinuity } = await import('../runtime/mcp-tool-scope.js');
+const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 
@@ -255,6 +256,48 @@ test('every tool the instructions tell the model to call is ON the surface (allo
   for (const recallTool of ['recall_tool_result', 'tool_output_query']) {
     assert.ok(surface.has(recallTool), `clip/digest recovery tool ${recallTool} must be on the chat surface (the digest footer tells the model to call it)`);
   }
+});
+
+test('JIT classification guard: every rubric-named built-in is consciously CORE or JIT-able-allowed', async () => {
+  // Closes the audit gap (crosscheck-test-never-exercises-jit): the cross-check
+  // above runs with JIT OFF, so it can't catch that CLEMMY_TOOL_JIT=on could DROP a
+  // tool the rubric imperatively names. There is no mid-run acquisition for built-in
+  // tools yet, so a dropped instructed tool revives the "instructed-but-absent" stall.
+  // Guarantee instead: every rubric-named built-in is EITHER in TOOL_JIT_CORE (never
+  // dropped) OR in JITABLE_ALLOWED — a curated set of CONDITIONAL, intent-evident tools
+  // the user's own message names, which semantic retrieval brings back. A NEW rubric
+  // tool fails here until it's classified, so the contract can't silently rot.
+  const agent = await buildOrchestratorAgent();
+  const surface = new Set((agent.tools ?? []).map((t) => (t as { name?: string }).name));
+  const NON_TOOL_MENTIONS = new Set(['awaiting_approval', 'awaiting_user_input', 'tool_called']);
+  // Conditional / intent-evident tools the rubric names that are SAFE to JIT-drop:
+  // the user's message names the domain (workflow / space / task / goal / browser /
+  // background / app status / cache forget), so semantic retrieval surfaces them.
+  const JITABLE_ALLOWED = new Set<string>([
+    'workflow_create', 'workflow_run', 'workflow_run_status', 'workflow_update', 'workflow_schedule',
+    'memory_pin', 'memory_restore', 'memory_list_facts',
+    'task_add', 'task_update', 'task_list',
+    'background_tasks_recent', 'background_task_status',
+    'browser_harness_status', 'browser_harness_run',
+    'workspace_config', 'workspace_list', 'workspace_info',
+    'goal_update',
+  ]);
+  const mentioned = new Set<string>();
+  for (const m of String(ORCHESTRATOR_INSTRUCTIONS).matchAll(/`([a-z][a-z0-9_]+)(?:\([^`]*)?`/g)) {
+    const n = m[1];
+    if (n.includes('_') && !n.includes('__')) mentioned.add(n);
+  }
+  // Only classify names that are ACTUALLY built-in tools on the surface.
+  const rubricBuiltins = [...mentioned].filter((n) => surface.has(n) && !NON_TOOL_MENTIONS.has(n));
+  const unclassified = rubricBuiltins
+    .filter((n) => !TOOL_JIT_CORE.has(n) && !JITABLE_ALLOWED.has(n))
+    .sort();
+  assert.deepEqual(
+    unclassified,
+    [],
+    `rubric names these built-in tools but they are neither in TOOL_JIT_CORE nor JITABLE_ALLOWED — ` +
+      `classify each (CORE if needed every-turn/for-correctness, JITABLE_ALLOWED if conditional+intent-evident): ${unclassified.join(', ')}`,
+  );
 });
 
 test('run_worker requires a structured parent-planned job packet', async () => {

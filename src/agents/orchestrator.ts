@@ -25,6 +25,8 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
+import { toolJitEnabled, selectToolsForTurn } from './tool-jit.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
@@ -125,6 +127,16 @@ export interface BuildOrchestratorAgentOptions {
    * gated harness loop without losing that routing.
    */
   model?: string;
+  /**
+   * Phase 1 Tool-RAG gate. JIT tool loading (CLEMMY_TOOL_JIT) only ever applies
+   * when this is true AND there is a userInput. It MUST be set ONLY on interactive
+   * chat lanes where a user is present turn-by-turn — never on autonomous lanes
+   * (cron / background / workflow steps / goal-resume / outcome), which cannot
+   * recover a JIT-dropped built-in tool (no mid-run acquisition exists yet) and
+   * have no user to consult. Default (undefined/false) ⇒ full surface, so a new
+   * caller is safe-by-omission.
+   */
+  allowToolJit?: boolean;
 }
 
 // ---------- internal helpers ----------
@@ -524,6 +536,34 @@ export const ORCHESTRATOR_BEHAVIOR_NATIVE = [
   ...ORCH_BEHAVIOR_TAIL,
 ].join('\n\n');
 
+// Engine-over-prompt A/B substrate (Phase 0c). The variant→instructions map for
+// the @openai/agents (Codex/headless) lane. Today only 'legacy' is implemented,
+// so the DEFAULT is byte-identical to before — the switch and telemetry land now;
+// Phase 5 registers a characterization-tested 'lean' variant here and A/B's it.
+// resolveRubricVariant() falls back to legacy (observably) on any unknown value.
+export const RUBRIC_INSTRUCTIONS_BY_VARIANT: Record<string, string> = {
+  legacy: ORCHESTRATOR_INSTRUCTIONS,
+};
+
+/** Resolve the Codex-lane rubric (instructions string) + the chosen variant for
+ *  telemetry. Bounded by what RUBRIC_INSTRUCTIONS_BY_VARIANT actually implements. */
+export function selectOrchestratorRubric(): {
+  variant: string;
+  requested: string;
+  fellBack: boolean;
+  instructions: string;
+} {
+  const choice = resolveRubricVariant(Object.keys(RUBRIC_INSTRUCTIONS_BY_VARIANT));
+  const mapped = RUBRIC_INSTRUCTIONS_BY_VARIANT[choice.variant];
+  // fellBack reflects "did we actually serve the proven legacy rubric instead of
+  // the requested one" — true if resolveRubricVariant fell back OR the resolved
+  // variant has no real instructions registered (a future mis-registration).
+  if (mapped == null) {
+    return { variant: DEFAULT_RUBRIC_VARIANT, requested: choice.requested, fellBack: true, instructions: ORCHESTRATOR_INSTRUCTIONS };
+  }
+  return { ...choice, instructions: mapped };
+}
+
 /**
  * Recent prior user-turn texts for continuity-aware tool scoping, NEWEST FIRST.
  * Reads this session's `user_input_received` events (excluding the current turn);
@@ -611,11 +651,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // inputs (this session + continuation lineage) so a bare follow-up inherits
   // the active scope instead of collapsing to maxTools:0. No session → exact
   // legacy behavior. Still gated by CLEMMY_SCOPED_MCP_TOOLS (no new flag).
+  // Prior-turn texts (this session + continuation lineage), newest-first. Reused by
+  // BOTH the MCP scope (continuity) and the JIT ranking query, so a bare follow-up
+  // ("do it", "schedule it") ranks against the work the conversation built toward.
+  const priorUserInputs = options.sessionId
+    ? recentPriorUserInputsForScope(options.sessionId, options.userInput)
+    : [];
   const mcpToolScope = options.mcpToolScope ?? (
     options.sessionId
       ? resolveMcpToolScopeWithRecall({
           userInput: options.userInput,
-          priorUserInputs: recentPriorUserInputsForScope(options.sessionId, options.userInput),
+          priorUserInputs,
         })
       : resolveMcpToolScope({ userInput: options.userInput })
   );
@@ -641,6 +687,30 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       });
     } catch {
       // Scope telemetry should never block agent construction.
+    }
+  }
+
+  // Engine-over-prompt A/B substrate (Phase 0c): pick the rubric variant in force
+  // and tag the run so it is attributable to an arm. Emitted at agent construction
+  // (i.e. PER TURN, like mcp_tool_scope) — A/B aggregation should dedupe to one row
+  // per session. Default 'legacy' → byte-identical to before. The extra row on the
+  // default path is intended telemetry. Must never block construction.
+  const rubricChoice = selectOrchestratorRubric();
+  if (options.sessionId) {
+    try {
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'rubric_variant',
+        data: {
+          variant: rubricChoice.variant,
+          requested: rubricChoice.requested,
+          fellBack: rubricChoice.fellBack,
+        },
+      });
+    } catch {
+      // Variant telemetry should never block agent construction.
     }
   }
 
@@ -975,6 +1045,55 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     return true;
   });
 
+  // Phase 1 Tool-RAG (default OFF via CLEMMY_TOOL_JIT): retrieve only the built-in
+  // discovery tools this turn plausibly needs (CORE + semantic top-K). Structural
+  // tools (planner/approval/question/worker) are ALWAYS kept (added below). Gated to
+  // INTERACTIVE chat lanes only (options.allowToolJit) — autonomous lanes can't
+  // recover a dropped built-in (no mid-run acquisition yet) and have no user. Off /
+  // not-allowed / no-query / no-embeddings / no-signal → full surface (byte-identical).
+  // The ranking query folds in recent prior-turn texts so bare follow-ups inherit
+  // the conversation's intent. Never throws into construction.
+  let jitDiscoveryTools = dedupedDiscoveryTools;
+  if (toolJitEnabled() && options.allowToolJit === true && typeof options.userInput === 'string' && options.userInput.trim()) {
+    try {
+      const jitQuery = [options.userInput, ...priorUserInputs.slice(0, 3)]
+        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+        .join('\n');
+      const selection = await selectToolsForTurn({
+        userInput: jitQuery,
+        tools: dedupedDiscoveryTools.map((t) => ({
+          name: (t as { name?: string }).name ?? '',
+          description: (t as { description?: string }).description ?? '',
+        })),
+      });
+      if (selection.reduced) {
+        jitDiscoveryTools = dedupedDiscoveryTools.filter((t) =>
+          selection.exposed.has((t as { name?: string }).name ?? ''),
+        );
+        if (options.sessionId) {
+          try {
+            appendEvent({
+              sessionId: options.sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'tool_jit_scope',
+              data: {
+                droppedCount: selection.droppedCount,
+                exposedCount: selection.exposed.size,
+                reason: selection.reason,
+              },
+            });
+          } catch {
+            // JIT telemetry should never block agent construction.
+          }
+        }
+      }
+    } catch {
+      // JIT selection must never break construction — fall back to the full surface.
+      jitDiscoveryTools = dedupedDiscoveryTools;
+    }
+  }
+
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'Clem',
     handoffDescription:
@@ -983,7 +1102,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // (SOUL, MEMORY, IDENTITY, working memory, facts, goals) each
     // turn — vault edits and new facts surface immediately without
     // restarting the daemon.
-    instructions: harnessInstructions(ORCHESTRATOR_INSTRUCTIONS),
+    instructions: harnessInstructions(rubricChoice.instructions),
     // Per-call override (dormant — no caller passes it yet) so worker-model
     // routing survives a workflow-step conversion onto the harness loop.
     model: options.model ?? resolveRoleModel('brain').modelId,
@@ -1007,7 +1126,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // kill check + pre-increment limit check. No-op when
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even
     // before the flag flips default-on.
-    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool, ...dedupedDiscoveryTools]
+    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool, ...jitDiscoveryTools]
       // Per-call tool-exclusion (narrowed surface for architect / autonomy lanes
       // riding the harness loop). No-op when excludeToolNames is absent/empty.
       .filter((t) => {

@@ -151,6 +151,17 @@ export const EVENT_TYPES = [
   // role registry) — records the attempted intent, whether it matched, and the
   // resolved model/provider, so a trace can show "ran on Opus because 'design'".
   'worker_model_routed',
+  // Engine-over-prompt A/B substrate: emitted at agent construction with the
+  // rubric variant in force (CLEMMY_RUBRIC_VARIANT) so a live session is
+  // attributable to an arm (legacy vs a future lean prune). Sibling of
+  // mcp_tool_scope — pure telemetry, never alters behavior.
+  'rubric_variant',
+  // Phase 1 Tool-RAG: emitted at agent construction when JIT tool loading
+  // (CLEMMY_TOOL_JIT) actually reduced the built-in surface — records how many
+  // tools were dropped + the selection reason, so a trace explains a smaller
+  // surface and an A/B can attribute token/accuracy deltas. Sibling of
+  // mcp_tool_scope; only emitted when a reduction occurred.
+  'tool_jit_scope',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

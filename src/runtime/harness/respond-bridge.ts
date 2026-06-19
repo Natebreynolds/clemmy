@@ -178,6 +178,11 @@ export async function respondViaHarness(
       // Only surfaces flagged honorModel forward request.model (workflow steps);
       // every other surface keeps the harness's configured model (byte-identical).
       ...(config.honorModel && request.model ? { model: request.model } : {}),
+      // Phase 1 Tool-RAG: JIT tool loading is allowed ONLY on interactive chat
+      // lanes (a user is present turn-by-turn). Execution surfaces (cron /
+      // background / workflow) have no user and can't recover a dropped built-in
+      // tool, so they keep the full surface. Still default-off via CLEMMY_TOOL_JIT.
+      allowToolJit: config.kind === 'chat',
     });
     const result = await runConversationImpl({
       agent,
