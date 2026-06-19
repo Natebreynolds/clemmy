@@ -5,6 +5,7 @@ import { usePoll } from '@/lib/poll';
 import { getSettings } from '@/lib/settings';
 import { ModelRolesCard } from './ModelRolesCard';
 import { ClaudeLoginForm } from './ClaudeLoginForm';
+import { CodexLoginForm } from './CodexLoginForm';
 import { ModelBackendForm } from './ModelBackendForm';
 import { FusionForm } from './FusionForm';
 
@@ -58,7 +59,8 @@ export function ModelsRoutingSection() {
       <ModelRolesCard embedded />
 
       <div className="mt-5 space-y-3">
-        <Disclosure summary="Connect more models" hint="Claude login · alternative provider backend">
+        <Disclosure summary="Connect more models" hint="Codex · Claude login · alternative provider backend">
+          <CodexLoginForm embedded />
           <ClaudeLoginForm embedded />
           <ModelBackendForm embedded />
         </Disclosure>

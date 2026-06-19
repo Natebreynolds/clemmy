@@ -1,4 +1,5 @@
-import { Sun, Moon, Monitor, ExternalLink } from 'lucide-react';
+import { Sun, Moon, Monitor, ChevronRight } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -14,16 +15,19 @@ const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
   { key: 'system', label: 'System', icon: Monitor },
 ];
 
-function ClassicRow({ title, desc }: { title: string; desc: string }) {
+// In-app navigation row (NOT the legacy app). Used to point at the Connect
+// screen for stored keys + connections; sign-in itself now lives inline in
+// Models & routing (Codex + Claude), so nothing here bounces to /console-legacy.
+function LinkRow({ title, desc, to }: { title: string; desc: string; to: string }) {
   return (
     <Card className="flex items-center gap-3 p-5">
       <div className="flex-1">
         <h3 className="text-h3 text-fg">{title}</h3>
         <p className="text-small text-muted">{desc}</p>
       </div>
-      <a href="/console-legacy" target="_self">
-        <Button variant="secondary" size="sm"><ExternalLink className="h-4 w-4" aria-hidden /> Manage</Button>
-      </a>
+      <Link to={to}>
+        <Button variant="secondary" size="sm">Manage <ChevronRight className="h-4 w-4" aria-hidden /></Button>
+      </Link>
     </Card>
   );
 }
@@ -58,7 +62,7 @@ export function Settings() {
 
         <ModelsRoutingSection />
 
-        <ClassicRow title="Sign-in & credentials" desc="Codex/OpenAI sign-in and stored keys (in Connect → Keys)." />
+        <LinkRow title="Connections & API keys" desc="Composio apps, stored keys, and MCP servers. (Codex & Claude sign-in are in Models & routing above.)" to="/connect" />
       </div>
     </Page>
   );
