@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Check, BrainCircuit, Users, Scale } from 'lucide-react';
+import { AlertTriangle, Check, BrainCircuit, Users, Scale, Sparkles, X } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
-import { Field, Select } from '@/components/ui/Field';
+import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import {
@@ -61,6 +61,8 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   const [busy, setBusy] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [newIntent, setNewIntent] = useState('');
+  const [newIntentModel, setNewIntentModel] = useState('');
 
   if (settings.isLoading || !mr) {
     const sk = <Skeleton className="h-44 w-full" />;
@@ -88,6 +90,23 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   const onBrain = (v: ActiveBrain) => run('brain', () => setActiveBrain(v));
   const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
+
+  // Task-specific (intent-scoped) worker routing — e.g. "design" → Claude. Reads
+  // the same bindings the chat tool writes; routes only workers tagged with that
+  // intent.
+  const workerIntents = mr.bindings.filter((b) => b.role === 'worker' && b.whenIntent);
+  const modelLabel = (id: string) => workerFlat.find((m) => m.id === id)?.label ?? id;
+  const modelProvider = (id: string) => workerFlat.find((m) => m.id === id)?.provider;
+  const onAddIntent = () => {
+    const intent = newIntent.trim();
+    if (!intent || !newIntentModel) return;
+    run('intent-add', async () => {
+      await patchModelRole({ role: 'worker', modelId: newIntentModel, whenIntent: intent });
+      setNewIntent(''); setNewIntentModel('');
+    });
+  };
+  const onRemoveIntent = (whenIntent: string) =>
+    run(`intent-rm-${whenIntent}`, () => patchModelRole({ role: 'worker', whenIntent, clear: true }));
 
   const body = (
     <>
@@ -133,6 +152,54 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
             </Select>
           )}
         </RoleRow>
+      </div>
+
+      <div className="mt-5 border-t border-border pt-4">
+        <div className="mb-1 flex items-center gap-2 text-label text-fg">
+          <Sparkles className="h-4 w-4 text-muted" aria-hidden /> Task-specific routing
+        </div>
+        <p className="mb-3 text-caption text-muted">
+          Send a kind of task to a specific model — e.g. <span className="text-fg">design</span> or{' '}
+          <span className="text-fg">writing</span> to Claude. Used when a worker is tagged with that intent
+          (or just say it in chat: “use Claude for design”).
+        </p>
+
+        {workerIntents.length > 0 && (
+          <ul className="mb-3 space-y-1.5">
+            {workerIntents.map((b) => (
+              <li key={`wi-${b.whenIntent}`} className="flex min-w-0 items-center gap-2 text-small">
+                <span className="shrink-0 rounded bg-canvas px-1.5 py-0.5 text-caption text-fg">{b.whenIntent}</span>
+                <span className="text-muted" aria-hidden>→</span>
+                <span className="truncate text-fg" title={b.modelId}>{modelLabel(b.modelId)}</span>
+                {modelProvider(b.modelId) && <span className="shrink-0 text-caption text-muted">· {modelProvider(b.modelId)}</span>}
+                <button type="button"
+                  className="ml-auto shrink-0 rounded p-1 text-muted hover:text-danger disabled:opacity-50"
+                  disabled={busy === `intent-rm-${b.whenIntent}`}
+                  onClick={() => onRemoveIntent(b.whenIntent as string)}
+                  aria-label={`Remove ${b.whenIntent} routing`}>
+                  <X className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <div className="flex items-center gap-2">
+          <Input className="h-9 max-w-[8rem]" placeholder="design" value={newIntent}
+            onChange={(e) => setNewIntent(e.target.value)} aria-label="Task intent" />
+          <span className="text-muted" aria-hidden>→</span>
+          <Select className="h-9 min-w-0" value={newIntentModel}
+            onChange={(e) => setNewIntentModel(e.target.value)} aria-label="Model for this intent">
+            <option value="">Pick a model…</option>
+            {workerFlat.map((m) => <option key={`wi-opt-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
+          </Select>
+          <button type="button"
+            className="h-9 shrink-0 rounded-md border border-border px-3 text-small text-fg hover:border-primary disabled:opacity-50"
+            disabled={busy === 'intent-add' || !newIntent.trim() || !newIntentModel}
+            onClick={onAddIntent}>
+            Add
+          </button>
+        </div>
       </div>
 
       <div className="mt-4 flex items-center gap-3">

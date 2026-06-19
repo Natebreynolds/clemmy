@@ -190,6 +190,7 @@ import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
+import { slugifyIntent } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
@@ -6598,6 +6599,11 @@ export function registerConsoleRoutes(
       const rawModelId = typeof body.modelId === 'string' ? body.modelId.trim() : '';
       const modelId = cleanId(body.modelId);
       if (rawModelId && !modelId) { res.status(400).json({ error: 'modelId contains unsupported characters.' }); return; }
+      // Optional intent scope ("design", "writing", …) — same slug form the chat
+      // tool (set_model_role) writes, so Settings and chat share one binding store.
+      const whenIntentRaw = typeof body.whenIntent === 'string' ? body.whenIntent.trim() : '';
+      const slug = whenIntentRaw ? slugifyIntent(whenIntentRaw) : '';
+      if (whenIntentRaw && !slug) { res.status(400).json({ error: 'whenIntent is empty after normalization' }); return; }
       const clear = body.clear === true || rawModelId === '';
       if (!clear && !modelId) { res.status(400).json({ error: 'modelId required (or clear:true to reset to default)' }); return; }
       if (!clear) {
@@ -6605,14 +6611,24 @@ export function registerConsoleRoutes(
         if (!validation.ok) { res.status(400).json({ error: validation.reason }); return; }
       }
 
-      // Upsert the role-wide binding (intent-scoped bindings arrive with chat routing).
+      // Upsert the binding. An intent-scoped binding (whenIntent) routes only that
+      // user-named category (e.g. "design") to the model; a role-wide binding (no
+      // whenIntent) is the role default. Both write to the SAME CLEMMY_MODEL_ROLES
+      // store the chat tool uses, so Settings and chat stay one source of truth.
       const current = readDurableBindings();
-      const next: RoleBinding[] = current.filter((b) => !(b.role === role && !b.whenIntent));
-      if (!clear) next.push({ role, modelId, scope: 'durable', source: 'settings' });
+      const next: RoleBinding[] = slug
+        ? current.filter((b) => !(b.role === role && b.whenIntent && slugifyIntent(b.whenIntent) === slug))
+        : current.filter((b) => !(b.role === role && !b.whenIntent));
+      if (!clear) {
+        next.push(slug
+          ? { role, modelId, whenIntent: slug, scope: 'durable', source: 'settings' }
+          : { role, modelId, scope: 'durable', source: 'settings' });
+      }
       updateEnvKey('CLEMMY_MODEL_ROLES', JSON.stringify(next));
 
-      if (role === 'judge') {
-        // Keep the fusion judge BRANCH aligned with the model's provider.
+      // The fusion judge BRANCH is GLOBAL (which provider reconciles), so only a
+      // role-WIDE judge binding flips it — an intent-scoped judge rule must not.
+      if (role === 'judge' && !slug) {
         const prov = clear ? 'claude' : resolveProvider(modelId);
         const branch = prov === 'codex' ? 'codex' : 'claude';
         updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);

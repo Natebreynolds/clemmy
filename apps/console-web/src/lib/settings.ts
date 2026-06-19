@@ -107,7 +107,7 @@ export interface ModelRolesSnapshot {
 }
 // Set (or clear) a worker/judge role model. Brain is a provider login switch
 // (setActiveBrain). Applies on the next message, no restart.
-export const patchModelRole = (p: { role: 'worker' | 'judge'; modelId?: string; clear?: boolean }) =>
+export const patchModelRole = (p: { role: 'worker' | 'judge'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
   patch<{ modelRoles: ModelRolesSnapshot }>('/api/console/settings/models/roles', p);
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
