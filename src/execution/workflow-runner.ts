@@ -985,18 +985,25 @@ interface WorkflowStepModelRoute {
   };
 }
 
-/** Kill-switch for the Claude-as-the-brain workflow EXECUTION lane (default on).
- *  When Claude is the active brain (AUTH_MODE=claude_oauth), untagged workflow
- *  steps run on the tool-capable, gated Claude Agent SDK workflow-step lane —
- *  so Claude actually EXECUTES workflows (read + write/send) on the subscription
- *  instead of falling to MODELS.primary (a gpt-* id), which, with no Codex token,
- *  the router serves on the text-only HEADLESS transport (cannot call tools).
- *  Set =off to revert to the prior behavior (Codex / text-only). No effect when
- *  the brain isn't Claude — the Codex path stays byte-identical. */
-function claudeWorkflowFullLaneEnabled(): boolean {
-  if (getActiveAuthMode() !== 'claude_oauth') return false;
+/** Kill-switch (default on) for running workflow steps on Claude's tool-capable,
+ *  gated SDK lane. Applies WHEREVER a step resolves to a Claude model — both when
+ *  Claude is the active brain (untagged steps default to Claude) AND when a
+ *  Codex-brain workflow INJECTS a Claude step via intent routing (e.g. a
+ *  `intent:"design"` step bound to Claude). The gate chain (grounding /
+ *  goal-fidelity / confirm-first / async approval) enforces safety in both cases,
+ *  so an injected Claude step is as capable as a Claude-brain one. Set =off to
+ *  revert to the prior read-only/Codex behavior. */
+function claudeWorkflowLaneFlagEnabled(): boolean {
   const raw = (getRuntimeEnv('CLEMMY_CLAUDE_WORKFLOW_FULL_LANE', 'on') || 'on').trim().toLowerCase();
   return !(raw === 'off' || raw === '0' || raw === 'false' || raw === 'no');
+}
+
+/** True only when Claude is the ACTIVE BRAIN (and the lane is enabled). Decides
+ *  whether an UNTAGGED step DEFAULTS to Claude (vs MODELS.primary / Codex). The
+ *  Codex-brain path stays byte-identical: untagged steps never silently move to
+ *  Claude — only an intent-routed step the user explicitly bound to Claude does. */
+function claudeIsActiveWorkflowBrain(): boolean {
+  return getActiveAuthMode() === 'claude_oauth' && claudeWorkflowLaneFlagEnabled();
 }
 
 function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRoute {
@@ -1021,7 +1028,7 @@ function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRou
   // falls to MODELS.primary (gpt-*) → text-only headless under claude_oauth, so a
   // tool-using step has no tool-capable executor. Bind it to the Claude brain
   // model so the gated Claude Agent SDK workflow-step lane (tool-capable) engages.
-  if (claudeWorkflowFullLaneEnabled()) {
+  if (claudeIsActiveWorkflowBrain()) {
     const modelId = getClaudeBrainModel();
     return {
       model: modelId,
@@ -1039,26 +1046,30 @@ function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRou
   return {};
 }
 
+// NOTE: both predicates below are consulted at the SDK-lane dispatch ONLY after
+// the step model is confirmed to be a Claude id (claudeAgentSdkWorkflowStepEnabled).
+// So they gate purely on the kill-switch — a Claude step is a Claude step whether
+// Claude is the brain or a Codex-brain workflow injected it via intent routing.
 function workflowStepCanRunOnClaudeAgentSdk(step: WorkflowStepInput): boolean {
   // requiresApproval steps always use the runner's declarative approval
   // orchestration (the SDK lane returns early, before the approval-parking loop).
   if (step.requiresApproval) return false;
-  // Full gated lane (Claude is the brain): write/send run through the harness
-  // gate chain (grounding / goal-fidelity / confirm-first / async approval) on
-  // the SDK worker tool profile, with the step's session carrying the workflow's
-  // auto-approval grants. So they're allowed here.
-  if (claudeWorkflowFullLaneEnabled()) return true;
+  // Full gated lane: write/send run through the harness gate chain (grounding /
+  // goal-fidelity / confirm-first / async approval) on the SDK worker tool
+  // profile, with the step's session carrying the workflow's auto-approval grants.
+  if (claudeWorkflowLaneFlagEnabled()) return true;
   if (step.sideEffect === 'write' || step.sideEffect === 'send') return false;
   if (stepLooksMutating(step) || stepLooksLikeIrreversibleSend(step.prompt)) return false;
   return true;
 }
 
 /** Whether THIS step should run the SDK workflow-step lane in tool-capable
- *  (gated mutating) mode rather than the read-only profile. True under the full
- *  lane — so even read steps that hit external read-only APIs (DataForSEO via
- *  composio) have the tools — and required for any write/send step. */
+ *  (gated mutating) mode rather than the read-only profile. True under the lane
+ *  flag — so even read steps that hit external read-only APIs (DataForSEO via
+ *  composio) have the tools — and required for any write/send step. Applies to an
+ *  injected Claude step (Codex brain) exactly as to a Claude-brain step. */
 function workflowStepUsesFullClaudeLane(step: WorkflowStepInput): boolean {
-  if (!claudeWorkflowFullLaneEnabled()) return false;
+  if (!claudeWorkflowLaneFlagEnabled()) return false;
   if (step.requiresApproval) return false;
   return true;
 }
@@ -2654,7 +2665,7 @@ async function executeWorkflow(
       // Claude (via the SDK workflow-step lane) like every other step, instead of
       // hardcoding MODELS.primary (gpt-*) which routed synthesis to Codex — or to
       // text-only headless for a Claude-only user.
-      model: claudeWorkflowFullLaneEnabled() ? getClaudeBrainModel() : MODELS.primary,
+      model: claudeIsActiveWorkflowBrain() ? getClaudeBrainModel() : MODELS.primary,
       maxTurns: 8,
     };
     const synthesisResult = await runStepViaHarness(

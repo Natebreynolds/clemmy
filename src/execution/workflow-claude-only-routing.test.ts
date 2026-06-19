@@ -79,6 +79,24 @@ test('FIX: write/send steps may run on the full gated Claude lane (gates enforce
   );
 });
 
+test('HEADLINE: under a CODEX brain, the full Claude lane is still available for an INJECTED Claude step', () => {
+  // "Codex starts a workflow and injects Claude where needed." Untagged steps stay
+  // on Codex (byte-identical), but a step the user routed to Claude (intent) gets
+  // the SAME tool-capable, write/send-capable, 24-turn lane as a Claude-brain step.
+  process.env.AUTH_MODE = 'codex_oauth';
+  try {
+    // Untagged step under a Codex brain → NOT moved to Claude (Codex path intact).
+    assert.deepEqual(resolveWorkflowStepModel(readStep as never), {}, 'Codex-brain untagged steps stay on Codex');
+    // But the lane capability is brain-agnostic: an injected Claude send step (the
+    // dispatch only consults this once the step model is already a claude-* id) may
+    // run the full gated lane — so injected Claude isn't second-classed to read-only.
+    assert.equal(workflowStepCanRunOnClaudeAgentSdk(sendStep as never), true, 'injected Claude send step gets the full lane under a Codex brain');
+    assert.equal(workflowStepCanRunOnClaudeAgentSdk(readStep as never), true, 'injected Claude read step too');
+  } finally {
+    process.env.AUTH_MODE = 'claude_oauth';
+  }
+});
+
 test('REGRESSION GUARD: with Codex/api_key auth, untagged steps are byte-identical (no model picked)', () => {
   process.env.AUTH_MODE = 'api_key';
   try {
