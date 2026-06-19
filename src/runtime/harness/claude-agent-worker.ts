@@ -28,17 +28,28 @@ function maxTurns(): number {
   return Number.isFinite(raw) && raw >= 1 ? raw : 5;
 }
 
-export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput): string {
+export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agentic = false): string {
+  const boundary = agentic
+    ? [
+        'Current capability — you CAN execute the gated tools for THIS item:',
+        '- run_shell_command, composio discovery + composio_execute_tool, write_file, plus read/recall tools.',
+        '- Every call runs through Clementine\'s safety gates; irreversible/external actions pause for the user\'s approval. The PARENT already opened the execution lane and the batch approval, so just do the item — do not call execution_create or request_approval yourself.',
+        '- Do NOT claim a mutation happened unless the tool result proves it. If a tool result begins with `ERROR:`, return `ERROR: <reason>` for this item instead of fabricating completion.',
+        '- If the packet names a skill, a style guide, or installed skill rules, call `skill_read` for it before producing the output.',
+      ]
+    : [
+        'Current capability boundary:',
+        '- This Claude SDK worker lane is READ-ONLY/local-context only.',
+        '- You may use exposed Clementine MCP tools for memory, skill, profile, session, workspace, status, and read-only file/context lookup.',
+        '- Do not claim you wrote files, ran shell commands, created workflows, sent messages, updated external systems, or performed any mutation unless this lane later exposes a guarded mutating tool and its tool result proves it.',
+        '- If the packet requires a mutating or external-write action, return `ERROR: Claude SDK worker needs guarded mutating tool <tool/action>` rather than fabricating completion.',
+        '- If the packet names a skill, a style guide, a taste/design skill, or says to use installed skill rules, call `skill_read` for that skill before producing the output.',
+      ];
   return [
     'You are a Clementine Worker running through the official Claude Agent SDK under the user\'s Claude subscription auth.',
     'Your scope is ONE parent-planned item. Do exactly the packet, keep the result compact, and do not converse with the user.',
     '',
-    'Current capability boundary:',
-    '- This Claude SDK worker lane is READ-ONLY/local-context only.',
-    '- You may use exposed Clementine MCP tools for memory, skill, profile, session, workspace, status, and read-only file/context lookup.',
-    '- Do not claim you wrote files, ran shell commands, created workflows, sent messages, updated external systems, or performed any mutation unless this lane later exposes a guarded mutating tool and its tool result proves it.',
-    '- If the packet requires a mutating or external-write action, return `ERROR: Claude SDK worker needs guarded mutating tool <tool/action>` rather than fabricating completion.',
-    '- If the packet names a skill, a style guide, a taste/design skill, or says to use installed skill rules, call `skill_read` for that skill before producing the output.',
+    ...boundary,
     '',
     `Worker item: ${input.item}`,
     input.intent ? `Worker intent: ${input.intent}` : '',
@@ -54,12 +65,24 @@ export interface ClaudeAgentSdkWorkerResult {
   modelUsage?: unknown;
 }
 
-export async function runClaudeAgentSdkWorker(input: WorkerToolInput, modelId: string): Promise<ClaudeAgentSdkWorkerResult> {
+export async function runClaudeAgentSdkWorker(
+  input: WorkerToolInput,
+  modelId: string,
+  sessionId?: string,
+): Promise<ClaudeAgentSdkWorkerResult> {
+  // Agentic only with the PARENT session id — the gates + plan-scope + execution
+  // lane aggregate across the worker fan-out via the shared session (one batch
+  // approval covers them all). Without a parent session, fall back to the
+  // read-only worker (safe; mutations return ERROR rather than running ungated).
+  const sid = sessionId?.trim();
+  const agentic = Boolean(sid);
   const result = await runClaudeAgentSdkImpl({
     prompt: buildWorkerJobPrompt(input),
+    sessionId: sid,
     modelId,
-    systemAppend: renderClaudeAgentWorkerSystemAppend(input),
-    allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(),
+    systemAppend: renderClaudeAgentWorkerSystemAppend(input, agentic),
+    allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(agentic ? 'worker' : 'read_only'),
+    agentic,
     maxTurns: maxTurns(),
   });
   return {

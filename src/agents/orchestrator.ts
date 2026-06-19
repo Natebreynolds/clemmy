@@ -683,7 +683,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         }
       };
       if (claudeAgentSdkWorkerEnabled(workerModel)) {
-        const sdkResult = await runClaudeAgentSdkWorker(input, workerModel);
+        // Pass the PARENT chat session so the Claude SDK worker's gates +
+        // plan-scope + execution lane aggregate across the fan-out (one batch
+        // approval covers all workers).
+        const sdkResult = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
         appendWorkerRoute({
           ...(route.trace ?? {
             seam: 'chat',
