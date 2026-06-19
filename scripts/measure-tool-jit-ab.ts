@@ -38,10 +38,24 @@ const sessionArm = new Map<string, 'jit' | 'control'>();
 const jitRows = db
   .prepare(`SELECT session_id, data_json FROM events WHERE type = 'tool_jit_scope' ORDER BY seq ASC`)
   .all() as Array<{ session_id: string; data_json: string }>;
+// Lane scope: JIT runs on TWO lanes (codex orchestrator + claude_sdk brain) and each
+// has different baseline token costs, so pooling them muddies the comparison. Default
+// scopes to whichever lane has the most events; override with CLEMMY_TOOL_JIT_AB_LANE.
+const laneCounts = new Map<string, number>();
+const laneFilter = (process.env.CLEMMY_TOOL_JIT_AB_LANE ?? '').trim();
 for (const row of jitRows) {
-  let data: { arm?: string; experiment?: boolean; droppedCount?: number } = {};
+  let data: { arm?: string; experiment?: boolean; droppedCount?: number; lane?: string } = {};
   try { data = JSON.parse(row.data_json) as typeof data; } catch { continue; }
   if (!data.experiment || (data.arm !== 'jit' && data.arm !== 'control')) continue;
+  const lane = data.lane ?? 'codex';
+  laneCounts.set(lane, (laneCounts.get(lane) ?? 0) + 1);
+}
+const targetLane = laneFilter || [...laneCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'codex';
+for (const row of jitRows) {
+  let data: { arm?: string; experiment?: boolean; droppedCount?: number; lane?: string } = {};
+  try { data = JSON.parse(row.data_json) as typeof data; } catch { continue; }
+  if (!data.experiment || (data.arm !== 'jit' && data.arm !== 'control')) continue;
+  if ((data.lane ?? 'codex') !== targetLane) continue; // scope to one lane for a clean comparison
   const arm = data.arm;
   sessionArm.set(row.session_id, arm); // stable per session; last write fine (deterministic)
   arms[arm].jitTurns += 1;
@@ -80,6 +94,8 @@ function pct(n: number, d: number): string {
 console.log('\n══════════════════════════════════════════════════════════════');
 console.log('  PHASE 1.2 — LIVE A/B READOUT: JIT tool loading');
 console.log('══════════════════════════════════════════════════════════════');
+const laneSummary = [...laneCounts.entries()].map(([l, n]) => `${l}:${n}`).join(' · ');
+console.log(`  lane: ${targetLane}  (events by lane → ${laneSummary || 'none'}${laneCounts.size > 1 ? '; set CLEMMY_TOOL_JIT_AB_LANE to switch' : ''})`);
 console.log(`  A/B sessions: ${totalAbSessions}  (jit ${arms.jit.sessions.size} · control ${arms.control.sessions.size})`);
 
 for (const arm of ['jit', 'control'] as const) {
@@ -89,7 +105,9 @@ for (const arm of ['jit', 'control'] as const) {
   console.log(`    sessions: ${s.sessions.size} · turns(tagged): ${s.jitTurns}`);
   if (arm === 'jit') {
     const avgDropped = s.jitTurns > 0 ? s.droppedTotal / s.jitTurns : 0;
-    console.log(`    avg tools dropped/turn: ${avgDropped.toFixed(1)}  ≈ ${Math.round(avgDropped * TOK_PER_TOOL)} tok/turn saved`);
+    console.log(`    avg tools dropped/turn: ${avgDropped.toFixed(1)}  ≈ ${Math.round(avgDropped * TOK_PER_TOOL)} tok/turn saved (cache-write/miss)`);
+    console.log('      (caveat: tool schemas are prompt-cached, so the STEADY-STATE win within a cached');
+    console.log('       conversation is smaller than this; the full win lands on cache writes + cold turns.)');
   } else {
     console.log(`    avg tools dropped/turn: 0 (full surface — the baseline)`);
   }

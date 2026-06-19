@@ -4,7 +4,7 @@ import { resolveToolJitDecision, selectToolsForTurn } from '../../agents/tool-ji
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
-import { appendEvent, clearKill, createSession, getSession } from './eventlog.js';
+import { appendEvent, clearKill, createSession, getSession, listEvents } from './eventlog.js';
 import { actionBus } from '../action-bus.js';
 import {
   judgeObjectiveComplete,
@@ -121,6 +121,42 @@ function toolProfileForMode(mode: ClaudeAgentBrainMode): ClaudeAgentSdkToolProfi
 function allowedToolsForRequest(request: AssistantRequest, mode: ClaudeAgentBrainMode): string[] {
   const excluded = new Set(request.excludeToolNames ?? []);
   return defaultClaudeAgentSdkAllowedLocalTools(toolProfileForMode(mode)).filter((toolName) => !excluded.has(toolName));
+}
+
+// JIT tool-RAG helpers (Claude-brain port).
+// Tool descriptions are static (code-defined), so build the name→description map
+// ONCE per daemon lifetime instead of rebuilding every zod tool object each JIT turn.
+let coreToolDescCache: Map<string, string> | null = null;
+async function coreToolDescriptions(): Promise<Map<string, string>> {
+  if (coreToolDescCache) return coreToolDescCache;
+  const core = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  coreToolDescCache = new Map(
+    core.map((t) => [(t as { name?: string }).name ?? '', (t as { description?: string }).description ?? '']),
+  );
+  return coreToolDescCache;
+}
+
+// Recent prior user messages in this session, newest-first (excluding the current).
+// Folded into the JIT ranking query so a bare follow-up ("do it", "make it weekly")
+// inherits the intent the conversation built toward — parity with the Codex lane's
+// recentPriorUserInputsForScope. Minimal (this session only); best-effort.
+function recentPriorBrainInputs(sessionId: string, current: string, limit = 3): string[] {
+  const cur = (current ?? '').trim();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  try {
+    const rows = listEvents(sessionId, { types: ['user_input_received'], desc: true, limit: 8 });
+    for (const ev of [...rows].reverse()) {
+      const text = typeof (ev.data as { text?: unknown })?.text === 'string'
+        ? ((ev.data as { text?: string }).text ?? '').trim()
+        : '';
+      if (!text || text === cur || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+      if (out.length >= limit) break;
+    }
+  } catch { /* best effort */ }
+  return out;
 }
 
 function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
@@ -241,12 +277,14 @@ export async function respondViaClaudeAgentSdkBrain(
   let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
   if (jitDecision.active && request.message.trim()) {
     try {
-      const core = await getCoreToolsAsync({ includeDynamicComposioTools: false });
-      const descByName = new Map(
-        core.map((t) => [(t as { name?: string }).name ?? '', (t as { description?: string }).description ?? '']),
-      );
+      const descByName = await coreToolDescriptions();
+      // Fold recent prior-turn messages into the ranking query so bare follow-ups
+      // inherit the conversation's intent (parity with the Codex lane).
+      const jitQuery = [request.message, ...recentPriorBrainInputs(sessionId, request.message)]
+        .filter((s) => s.trim().length > 0)
+        .join('\n');
       const selection = await selectToolsForTurn({
-        userInput: request.message,
+        userInput: jitQuery,
         tools: fullAllowed.map((name) => ({ name, description: descByName.get(name) ?? '' })),
       });
       jitReason = selection.reason;
