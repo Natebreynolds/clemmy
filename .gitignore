@@ -67,3 +67,6 @@ console-home.png
 
 # Vendored uv binaries — fetched at prepack by scripts/vendor-uv.mjs, shipped in the npm tarball, not committed
 vendor/
+
+# Local Netlify folder
+.netlify
