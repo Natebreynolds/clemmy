@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+// Import the composed strings via orchestrator.js (the re-export path every other
+// importer uses — so this also guards that the Phase-3 re-export stays intact).
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_BEHAVIOR_NATIVE } from './orchestrator.js';
+// The shared rubric module (Phase 3): the single source both flagship lanes consume.
+import { CLAUDE_BRAIN_RUBRIC, renderClemRubric } from './clem-rubric.js';
 
 /**
  * PHASE 0b — prompt-assembly characterization (the engine-over-prompt regression net).
@@ -25,6 +29,7 @@ const TOK = (chars: number): number => Math.round(chars / 4);
 const GOLDEN = {
   instructions: { len: 34919, sha16: '8f32f27992f9ad5a' },
   native: { len: 33684, sha16: '62561fc10e75f519' },
+  claudeBrain: { len: 3335, sha16: '3b6e995c647521c8' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -45,6 +50,21 @@ test('characterization: ORCHESTRATOR_INSTRUCTIONS is byte-stable (reviewable-dif
 
 test('characterization: ORCHESTRATOR_BEHAVIOR_NATIVE is byte-stable (reviewable-diff guard)', () => {
   snapshotGuard('native', ORCHESTRATOR_BEHAVIOR_NATIVE, GOLDEN.native);
+});
+
+test('characterization: CLAUDE_BRAIN_RUBRIC (lean) is byte-stable (reviewable-diff guard)', () => {
+  snapshotGuard('claudeBrain', CLAUDE_BRAIN_RUBRIC, GOLDEN.claudeBrain);
+});
+
+// --- Phase 3: ONE shared rubric source feeds every lane ---------------------
+test('shared source: renderClemRubric feeds all three lanes from clem-rubric', () => {
+  // The Phase-3 invariant: both flagship lanes (and the lean chat brain) draw from
+  // the SAME module. If a lane ever forks its own copy, this breaks.
+  assert.equal(renderClemRubric('codex'), ORCHESTRATOR_INSTRUCTIONS, 'codex lane = the re-exported instructions');
+  assert.equal(renderClemRubric('native'), ORCHESTRATOR_BEHAVIOR_NATIVE, 'native lane = the re-exported native rubric');
+  assert.equal(renderClemRubric('claude_brain'), CLAUDE_BRAIN_RUBRIC, 'claude chat brain = the lean rubric');
+  // and the lean brain rubric is genuinely lean vs the 34KB Codex one.
+  assert.ok(CLAUDE_BRAIN_RUBRIC.length * 4 < ORCHESTRATOR_INSTRUCTIONS.length, 'claude brain rubric must stay far leaner than the Codex rubric');
 });
 
 // --- The two-lane invariant (Codex vs Claude native) -----------------------

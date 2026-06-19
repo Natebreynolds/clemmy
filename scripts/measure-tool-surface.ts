@@ -107,7 +107,7 @@ const nativeChars = ORCHESTRATOR_BEHAVIOR_NATIVE.length;
 // magnitude only — it varies with how much memory the user has accrued. Treated as a
 // comparison datapoint, not a precise constant.
 const MEMORY_CTX_TOK = 12_000;
-const CLAUDE_LEAN_TOK = 3_000; // Phase-0 documented: CLAUDE_BRAIN_RUBRIC (claude-agent-brain.ts)
+const CLAUDE_LEAN_TOK = 834; // MEASURED: CLAUDE_BRAIN_RUBRIC body (clem-rubric.ts), 3335 chars/4
 
 console.log('\n══════════════════════════════════════════════════════════════');
 console.log('  THESIS CHECK — per-turn context budget (chars/4 tokens)');
@@ -117,7 +117,7 @@ const lines: Array<[string, number]> = [
   ['Persistent memory-context (Phase-0 baseline)', MEMORY_CTX_TOK],
   ['Codex rubric (ORCHESTRATOR_INSTRUCTIONS)', TOK(rubricChars)],
   ['Claude SDK-worker native rubric (HEAD+TAIL)', TOK(nativeChars)],
-  ['Claude chat-brain lean rubric (documented)', CLAUDE_LEAN_TOK],
+  ['Claude chat-brain lean rubric (measured)', CLAUDE_LEAN_TOK],
 ];
 for (const [label, tok] of lines) {
   console.log(`  ${label.padEnd(46)} ${tok.toLocaleString().padStart(8)} tok`);
