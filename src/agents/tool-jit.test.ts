@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { selectToolsForTurn, toolJitEnabled, TOOL_JIT_CORE, TOOL_JIT_MANDATED, type JitTool, type JitRankFn } from './tool-jit.js';
+import { selectToolsForTurn, toolJitEnabled, TOOL_JIT_CORE, TOOL_JIT_MANDATED, assignToolJitArm, resolveToolJitDecision, toolJitExperimentEnabled, type JitTool, type JitRankFn } from './tool-jit.js';
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => Promise<void> | void): Promise<void> | void {
   const prev: Record<string, string | undefined> = {};
@@ -122,6 +122,83 @@ test('TOOL_JIT_CORE includes the acquisition escape-hatch + execution lane', () 
   for (const must of ['composio_search_tools', 'composio_execute_tool', 'execution_create', 'memory_recall', 'run_shell_command']) {
     assert.ok(TOOL_JIT_CORE.has(must), `${must} must be in the always-loaded core`);
   }
+});
+
+// --- Live A/B: bucketing + decision ---------------------------------------
+
+test('assignToolJitArm is deterministic + stable per session', () => {
+  const a = assignToolJitArm('sess-abc');
+  const b = assignToolJitArm('sess-abc');
+  assert.equal(a, b, 'same session → same arm (no flapping)');
+  assert.ok(a === 'jit' || a === 'control');
+});
+
+test('assignToolJitArm honors the ratio extremes (all-jit / all-control)', () => {
+  withEnv({ CLEMMY_TOOL_JIT_AB_RATIO: '1' }, () => {
+    for (const s of ['a', 'b', 'c', 'd', 'e']) assert.equal(assignToolJitArm(s), 'jit');
+  });
+  withEnv({ CLEMMY_TOOL_JIT_AB_RATIO: '0' }, () => {
+    for (const s of ['a', 'b', 'c', 'd', 'e']) assert.equal(assignToolJitArm(s), 'control');
+  });
+});
+
+test('assignToolJitArm splits a population roughly by ratio', () => {
+  withEnv({ CLEMMY_TOOL_JIT_AB_RATIO: '0.5' }, () => {
+    let jit = 0;
+    const n = 400;
+    for (let i = 0; i < n; i++) if (assignToolJitArm(`session-${i}`) === 'jit') jit++;
+    // sha1-hash uniformity → expect ~50%; allow a wide band so it's not flaky.
+    assert.ok(jit > n * 0.35 && jit < n * 0.65, `expected ~50% jit, got ${jit}/${n}`);
+  });
+});
+
+test('resolveToolJitDecision: lane gate always wins (autonomous lane never JITs)', () => {
+  withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_AB: 'on' }, () => {
+    const d = resolveToolJitDecision({ allowLane: false, sessionId: 'sess-x' });
+    assert.equal(d.active, false);
+    assert.equal(d.experiment, false);
+  });
+});
+
+test('resolveToolJitDecision: A/B off → global flag governs (no arm)', () => {
+  withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_AB: undefined }, () => {
+    const d = resolveToolJitDecision({ allowLane: true, sessionId: 'sess-x' });
+    assert.equal(d.active, true);
+    assert.equal(d.experiment, false);
+    assert.equal(d.arm, null);
+  });
+  withEnv({ CLEMMY_TOOL_JIT: undefined, CLEMMY_TOOL_JIT_AB: undefined }, () => {
+    assert.equal(resolveToolJitDecision({ allowLane: true, sessionId: 'sess-x' }).active, false);
+  });
+});
+
+test('resolveToolJitDecision: A/B on → per-session arm governs, regardless of global flag', () => {
+  // experiment on, global OFF: the jit arm still activates (arm overrides global).
+  withEnv({ CLEMMY_TOOL_JIT: undefined, CLEMMY_TOOL_JIT_AB: 'on', CLEMMY_TOOL_JIT_AB_RATIO: '1' }, () => {
+    const d = resolveToolJitDecision({ allowLane: true, sessionId: 'sess-x' });
+    assert.equal(d.experiment, true);
+    assert.equal(d.arm, 'jit');
+    assert.equal(d.active, true);
+  });
+  // control arm: inactive even if global flag is ON.
+  withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_AB: 'on', CLEMMY_TOOL_JIT_AB_RATIO: '0' }, () => {
+    const d = resolveToolJitDecision({ allowLane: true, sessionId: 'sess-x' });
+    assert.equal(d.arm, 'control');
+    assert.equal(d.active, false);
+  });
+});
+
+test('resolveToolJitDecision: A/B on but no sessionId → falls back to global flag', () => {
+  withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_AB: 'on' }, () => {
+    const d = resolveToolJitDecision({ allowLane: true, sessionId: null });
+    assert.equal(d.experiment, false, 'no session → cannot bucket → global flag');
+    assert.equal(d.active, true);
+  });
+});
+
+test('toolJitExperimentEnabled reads CLEMMY_TOOL_JIT_AB', () => {
+  withEnv({ CLEMMY_TOOL_JIT_AB: undefined }, () => assert.equal(toolJitExperimentEnabled(), false));
+  withEnv({ CLEMMY_TOOL_JIT_AB: 'on' }, () => assert.equal(toolJitExperimentEnabled(), true));
 });
 
 test('MANDATED ⊆ CORE: every mandated tool is in the always-loaded core', () => {

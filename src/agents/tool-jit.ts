@@ -28,9 +28,57 @@ import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/e
 
 const logger = pino({ name: 'clementine-next.tool-jit' });
 
-/** DEFAULT OFF — opt-in for the A/B. 'on'/'1'/'true'/'yes' enable. */
+/** DEFAULT OFF — global on/off switch. 'on'/'1'/'true'/'yes' enable. */
 export function toolJitEnabled(): boolean {
   return /^(1|true|on|yes)$/i.test((process.env.CLEMMY_TOOL_JIT ?? '').trim());
+}
+
+// --- Live A/B: per-session bucketing -------------------------------------
+// The global flag flips JIT for EVERYONE. To compare on real traffic we instead
+// bucket each SESSION deterministically into an arm and attribute outcomes. Default
+// OFF (CLEMMY_TOOL_JIT_AB) → the global flag governs, byte-identical to before.
+export type ToolJitArm = 'jit' | 'control';
+
+export function toolJitExperimentEnabled(): boolean {
+  return /^(1|true|on|yes)$/i.test((process.env.CLEMMY_TOOL_JIT_AB ?? '').trim());
+}
+
+/** Fraction of sessions assigned to the JIT arm (rest = control). Default 0.5. */
+function abRatio(): number {
+  const r = Number.parseFloat(process.env.CLEMMY_TOOL_JIT_AB_RATIO ?? '');
+  return Number.isFinite(r) && r >= 0 && r <= 1 ? r : 0.5;
+}
+
+/** Deterministic, stable arm for a session: same sessionId → same arm for the whole
+ *  conversation (no flapping mid-session). Pure hash, no state. */
+export function assignToolJitArm(sessionId: string): ToolJitArm {
+  const digest = createHash('sha1').update(`tool_jit_ab::${sessionId}`).digest();
+  const frac = digest.readUInt32BE(0) / 0xffffffff;
+  return frac < abRatio() ? 'jit' : 'control';
+}
+
+export interface ToolJitDecision {
+  /** Whether JIT actually runs this turn. */
+  active: boolean;
+  /** The assigned arm when the A/B is running; null otherwise. */
+  arm: ToolJitArm | null;
+  /** True when the per-session A/B governs the decision (vs the global flag). */
+  experiment: boolean;
+}
+
+/**
+ * The single source of truth for "does JIT run this turn?". When the A/B is on and
+ * we have a session, the per-session ARM governs (control = off, jit = on),
+ * regardless of the global CLEMMY_TOOL_JIT. Otherwise the global flag governs.
+ * Always respects the lane gate (interactive chat only) — autonomous lanes never JIT.
+ */
+export function resolveToolJitDecision(opts: { allowLane: boolean; sessionId?: string | null }): ToolJitDecision {
+  if (!opts.allowLane) return { active: false, arm: null, experiment: false };
+  if (toolJitExperimentEnabled() && opts.sessionId) {
+    const arm = assignToolJitArm(opts.sessionId);
+    return { active: arm === 'jit', arm, experiment: true };
+  }
+  return { active: toolJitEnabled(), arm: null, experiment: false };
 }
 
 /**

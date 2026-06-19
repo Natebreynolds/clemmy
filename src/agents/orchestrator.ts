@@ -27,7 +27,7 @@ import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
-import { toolJitEnabled, selectToolsForTurn } from './tool-jit.js';
+import { resolveToolJitDecision, selectToolsForTurn } from './tool-jit.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
@@ -971,16 +971,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     return true;
   });
 
-  // Phase 1 Tool-RAG (default OFF via CLEMMY_TOOL_JIT): retrieve only the built-in
-  // discovery tools this turn plausibly needs (CORE + semantic top-K). Structural
-  // tools (planner/approval/question/worker) are ALWAYS kept (added below). Gated to
-  // INTERACTIVE chat lanes only (options.allowToolJit) — autonomous lanes can't
-  // recover a dropped built-in (no mid-run acquisition yet) and have no user. Off /
-  // not-allowed / no-query / no-embeddings / no-signal → full surface (byte-identical).
-  // The ranking query folds in recent prior-turn texts so bare follow-ups inherit
-  // the conversation's intent. Never throws into construction.
+  // Phase 1 Tool-RAG: retrieve only the built-in discovery tools this turn plausibly
+  // needs (CORE + semantic top-K). Structural tools (planner/approval/question/worker)
+  // are ALWAYS kept (added below). Gated to INTERACTIVE chat lanes only
+  // (options.allowToolJit) — autonomous lanes can't recover a dropped built-in (no
+  // mid-run acquisition yet) and have no user. The decision is the global flag OR, when
+  // the live A/B is on, the session's deterministic arm (control = full surface, jit =
+  // reduced) — so both arms are attributable. Off / no-query / no-embeddings / no-signal
+  // → full surface (byte-identical). The ranking query folds in recent prior-turn texts
+  // so bare follow-ups inherit intent. Never throws into construction.
+  const jitDecision = resolveToolJitDecision({ allowLane: options.allowToolJit === true, sessionId: options.sessionId });
   let jitDiscoveryTools = dedupedDiscoveryTools;
-  if (toolJitEnabled() && options.allowToolJit === true && typeof options.userInput === 'string' && options.userInput.trim()) {
+  let jitDropped = 0;
+  let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
+  if (jitDecision.active && typeof options.userInput === 'string' && options.userInput.trim()) {
     try {
       const jitQuery = [options.userInput, ...priorUserInputs.slice(0, 3)]
         .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
@@ -992,31 +996,39 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           description: (t as { description?: string }).description ?? '',
         })),
       });
+      jitReason = selection.reason;
       if (selection.reduced) {
         jitDiscoveryTools = dedupedDiscoveryTools.filter((t) =>
           selection.exposed.has((t as { name?: string }).name ?? ''),
         );
-        if (options.sessionId) {
-          try {
-            appendEvent({
-              sessionId: options.sessionId,
-              turn: 0,
-              role: 'system',
-              type: 'tool_jit_scope',
-              data: {
-                droppedCount: selection.droppedCount,
-                exposedCount: selection.exposed.size,
-                reason: selection.reason,
-              },
-            });
-          } catch {
-            // JIT telemetry should never block agent construction.
-          }
-        }
+        jitDropped = selection.droppedCount;
       }
     } catch {
       // JIT selection must never break construction — fall back to the full surface.
       jitDiscoveryTools = dedupedDiscoveryTools;
+      jitReason = 'jit-error-fellback';
+    }
+  }
+  // Telemetry. Emit when there was a real reduction (legacy behavior) OR whenever the
+  // A/B is running (so the CONTROL arm — which never reduces — is still attributable).
+  if (options.sessionId && (jitDropped > 0 || jitDecision.experiment)) {
+    try {
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'tool_jit_scope',
+        data: {
+          arm: jitDecision.arm,
+          experiment: jitDecision.experiment,
+          jitActive: jitDecision.active,
+          droppedCount: jitDropped,
+          exposedCount: jitDiscoveryTools.length,
+          reason: jitReason,
+        },
+      });
+    } catch {
+      // JIT telemetry should never block agent construction.
     }
   }
 
