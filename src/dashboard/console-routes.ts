@@ -7142,30 +7142,20 @@ export function registerConsoleRoutes(
         // run the turn through the official Anthropic Agent SDK on the user's Claude
         // subscription. The SDK owns its own tool loop; mutations route through the
         // harness gate chain (gated-mutating-tools) + the async approval gate
-        // (claude-agent-approval). The brain does not emit harness events itself, so
-        // deliver the final reply via conversation_completed — that is what the
-        // desktop SSE stream + session history read. Flag-gated + auth-gated, so
-        // Codex / API-key users are byte-identical (branch never taken).
+        // (claude-agent-approval). The brain emits its OWN terminal events —
+        // conversation_completed (desktop SSE stream + session history) and
+        // runtime.completed (Tasks board / report-back / watchdog) — so we do NOT
+        // emit conversation_completed here. A second one double-renders the reply on
+        // reopen, since reconstructHarnessTranscript maps each conversation_completed
+        // to its own assistant turn. Flag-gated + auth-gated, so Codex / API-key
+        // users are byte-identical (branch never taken).
         if (!intent && claudeAgentSdkBrainEnabled('home')) {
           try {
-            const brainResp = await respondViaClaudeAgentSdkBrain('home', {
+            await respondViaClaudeAgentSdkBrain('home', {
               message: effectiveInput,
               sessionId,
               channel: 'desktop',
               userId: 'desktop',
-            });
-            const reply = (brainResp.text ?? '').trim() || '(no reply produced)';
-            appendHarnessEvent({
-              sessionId,
-              turn: 0,
-              role: 'Clem',
-              type: 'conversation_completed',
-              data: {
-                reason: 'claude_agent_sdk_brain',
-                reply,
-                summary: reply,
-                steps: brainResp.turnsUsed ?? 0,
-              },
             });
           } catch (err) {
             appendHarnessEvent({

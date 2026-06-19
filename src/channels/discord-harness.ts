@@ -31,6 +31,7 @@ import {
   type SessionRow,
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
+import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
@@ -2069,8 +2070,25 @@ export async function runDiscordHarnessConversation(opts: {
         if (preflight.surfaced) return;
       }
       const effectiveInput = goalRunInput ?? prompt;
-      const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId: session.id });
-      await runConversation({ agent, sessionId: session.id, input: effectiveInput, judgeCompletion: true, onChunk });
+      // Desktop↔Discord continuity: when the agentic Claude brain is enabled
+      // (claude_oauth + CLEMMY_CLAUDE_AGENT_SDK_BRAIN), Discord runs the SAME
+      // brain as desktop instead of the harness loop's text-only headless Claude.
+      // The brain emits conversation_completed + runtime.completed via appendEvent
+      // → actionBus 'harness.event' → this handler's subscriber delivers them
+      // identically to runConversation (the brain is the single terminal-event
+      // emitter, so we do NOT also flush — no double-render). Flag off ⇒ the
+      // harness path is byte-identical. Kill-switch = set the brain flag off.
+      if (claudeAgentSdkBrainEnabled('discord')) {
+        await respondViaClaudeAgentSdkBrain('discord', {
+          message: effectiveInput,
+          sessionId: session.id,
+          channel: `discord:${channelId}`,
+          userId,
+        });
+      } else {
+        const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId: session.id });
+        await runConversation({ agent, sessionId: session.id, input: effectiveInput, judgeCompletion: true, onChunk });
+      }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       try {

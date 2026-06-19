@@ -15,20 +15,25 @@ const {
   renderClaudeAgentBrainSystemAppend,
   respondViaClaudeAgentSdkBrain,
   setClaudeAgentSdkBrainRunForTest,
+  setClaudeAgentSdkBrainJudgeForTest,
 } = brain;
-const { getSession, resetEventLog } = await import('./eventlog.js');
+const { getSession, listEvents, resetEventLog } = await import('./eventlog.js');
 
 beforeEach(() => {
   resetEventLog();
   setClaudeAgentSdkBrainRunForTest(null);
+  setClaudeAgentSdkBrainJudgeForTest(null);
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS;
+  delete process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE;
+  delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
   process.env.AUTH_MODE = 'api_key';
 });
 
 after(() => {
   setClaudeAgentSdkBrainRunForTest(null);
+  setClaudeAgentSdkBrainJudgeForTest(null);
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -107,6 +112,63 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('composio_execute_tool'), false);
+});
+
+test('full mode: completion judge bounces a not-done turn into ONE continuation, then returns the finished answer', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const prompts: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    prompts.push(options.prompt);
+    return {
+      text: prompts.length === 1 ? "I'll send the emails next." : 'Sent all 3 emails — here are the message links.',
+      sessionId: 'sdk', model: 'claude-opus-4-8',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'],
+    };
+  });
+  let judged = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judged += 1;
+    return judged === 1 ? { done: false, reason: 'no message links shown' } : { done: true, reason: 'links present' };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-judge' });
+
+  assert.equal(prompts.length, 2, 'one continuation fired after the not-done verdict');
+  assert.match(prompts[1], /Continue now and FINISH it/);
+  assert.match(res.text, /Sent all 3 emails/);
+});
+
+test('full mode: completion-judge kill-switch off ⇒ no judge call, no continuation', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runs += 1;
+    return { text: "I'll do it next", sessionId: 's', toolUses: ['mcp__clementine-local__run_shell_command'] };
+  });
+  let judged = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => { judged += 1; return { done: false, reason: 'x' }; });
+
+  await respondViaClaudeAgentSdkBrain('home', { message: 'do the thing', sessionId: 'brain-nojudge' });
+
+  assert.equal(runs, 1, 'no continuation when the judge is off');
+  assert.equal(judged, 0, 'judge not called when off');
+});
+
+test('turn-budget stop surfaces as max-turns-with-grace and writes user_input + lifecycle events', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only'; // read_only ⇒ judge skipped (full-only)
+  setClaudeAgentSdkBrainRunForTest(async () => ({ text: 'partial work so far', sessionId: 's', toolUses: [], limitHit: true }));
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'a long multi-step task', sessionId: 'brain-limit' });
+
+  assert.equal(res.stoppedReason, 'max-turns-with-grace');
+  assert.equal(res.raw?.limitHit, true);
+  const types = listEvents('brain-limit').map((e) => (e as { type?: string }).type);
+  assert.ok(types.includes('user_input_received'), 'user_input_received written for the SDK brain');
+  assert.ok(types.includes('conversation_completed'), 'conversation_completed emitted');
 });
 
 test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local authoring tools but not broad execution', async () => {

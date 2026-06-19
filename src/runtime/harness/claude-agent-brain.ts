@@ -2,7 +2,14 @@ import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
 import { ORCHESTRATOR_BEHAVIOR_NATIVE } from '../../agents/orchestrator.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
-import { clearKill, createSession, getSession } from './eventlog.js';
+import { appendEvent, clearKill, createSession, getSession } from './eventlog.js';
+import { actionBus } from '../action-bus.js';
+import {
+  judgeObjectiveComplete,
+  composeJudgedObjective,
+  isPromiseShapedReply,
+  type ObjectiveJudgeFn,
+} from './objective-judge.js';
 import { resolveRoleModel } from './model-roles.js';
 import {
   type ClaudeAgentSdkToolProfile,
@@ -19,7 +26,22 @@ export function setClaudeAgentSdkBrainRunForTest(fn: ClaudeAgentSdkRunFn | null)
   runClaudeAgentSdkImpl = fn ?? runClaudeAgentSdk;
 }
 
-export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home';
+let judgeImpl: ObjectiveJudgeFn = judgeObjectiveComplete;
+export function setClaudeAgentSdkBrainJudgeForTest(fn: ObjectiveJudgeFn | null): void {
+  judgeImpl = fn ?? judgeObjectiveComplete;
+}
+
+/** Completion-judge kill-switch (default ON). Off ⇒ the SDK brain trusts its own
+ *  "done" (legacy). On ⇒ parity with the harness loop's objective judge. */
+function completionJudgeEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+function judgeMaxContinuations(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS', '1') ?? '1', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1;
+}
+
+export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' | 'discord';
 export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring' | 'full';
 
 function configuredMode(): ClaudeAgentBrainMode | null {
@@ -48,7 +70,7 @@ export function claudeAgentSdkBrainMode(): ClaudeAgentBrainMode | null {
 }
 
 export function isClaudeAgentBrainSurface(surface: string): surface is ClaudeAgentBrainSurface {
-  return surface === 'webhook' || surface === 'cli' || surface === 'dashboard' || surface === 'home';
+  return surface === 'webhook' || surface === 'cli' || surface === 'dashboard' || surface === 'home' || surface === 'discord';
 }
 
 export function claudeAgentSdkBrainEnabled(surface: string): surface is ClaudeAgentBrainSurface {
@@ -157,6 +179,14 @@ export async function respondViaClaudeAgentSdkBrain(
 
   try { clearKill(sessionId); } catch { /* best effort */ }
 
+  // Record the user's turn so the SDK brain is a proper session citizen: the
+  // workflow-run boundary guard, session history, recall, and report-back all
+  // read `user_input_received`. Without it the brain's tools (e.g. workflow_run)
+  // can't see what the user actually asked for.
+  try {
+    appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: request.message } });
+  } catch { /* best effort — never block the turn */ }
+
   if (request.shouldCancel && await request.shouldCancel()) {
     return {
       text: 'Run was cancelled.',
@@ -169,22 +199,78 @@ export async function respondViaClaudeAgentSdkBrain(
   const modelId = request.model && request.model.startsWith('claude-')
     ? request.model
     : resolveRoleModel('brain').modelId;
-  const result = await runClaudeAgentSdkImpl({
-    prompt: request.message,
+  const runOptions = {
     sessionId,
     modelId,
     systemAppend: renderClaudeAgentBrainSystemAppend(surface, request, mode),
     allowedLocalMcpTools: allowedToolsForRequest(request, mode),
     agentic: mode === 'full',
     maxTurns: maxTurns(),
-  });
+  };
+  let result = await runClaudeAgentSdkImpl({ prompt: request.message, ...runOptions });
+
+  // Objective-completion judge (parity with the harness loop): on an agentic
+  // action turn that produced a reply, verify the objective is actually
+  // satisfied with evidence — not just claimed ("I sent the emails" with no
+  // artifact). On a "not done" verdict, do ONE bounded continuation. Fail-open
+  // (a judge error ⇒ treat as done; never wedge). Kill-switch
+  // CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE.
+  if (
+    completionJudgeEnabled() &&
+    mode === 'full' &&
+    !result.limitHit &&
+    (result.toolUses.length > 0 || isPromiseShapedReply(result.text))
+  ) {
+    const objective = composeJudgedObjective(request.message, []);
+    const maxCont = judgeMaxContinuations();
+    for (let i = 0; i < maxCont; i += 1) {
+      let done = true;
+      let reason = '';
+      try {
+        const verdict = await judgeImpl(objective, result.text || '');
+        done = verdict.done;
+        reason = verdict.reason;
+      } catch { break; } // fail-open — a flaky judge must never wedge the turn
+      if (done) break;
+      const contResult = await runClaudeAgentSdkImpl({
+        prompt:
+          `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
+          `Original request: "${request.message}". Continue now and FINISH it — produce the concrete ` +
+          `artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
+        ...runOptions,
+      });
+      result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
+      if (contResult.limitHit) break;
+    }
+  }
 
   const text = result.text.trim() || '(no reply produced)';
   if (request.onChunk) await request.onChunk(text);
+  // Long-running parity: a turn-budget stop surfaces as a graceful
+  // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
+  const stoppedReason: AssistantResponse['stoppedReason'] = result.limitHit ? 'max-turns-with-grace' : 'success';
+  // Report-back / observability parity (gap analysis): the harness loop emits
+  // conversation_completed + runtime.completed on a clean terminal so the Tasks
+  // board, report-back, and watchdog see the run. The Agent SDK lane runs its
+  // own loop, so emit the same terminal events here.
+  try {
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'conversation_completed',
+      data: {
+        reason: result.limitHit ? 'limit_exceeded' : 'claude_agent_sdk_brain',
+        summary: text.slice(0, 400),
+        reply: text,
+      },
+    });
+  } catch { /* telemetry best-effort — never block the reply */ }
+  try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
   return {
     text,
     sessionId,
-    stoppedReason: 'success',
+    stoppedReason,
     turnsUsed: result.toolUses.length > 0 ? result.toolUses.length : 1,
     raw: {
       transport: 'claude_agent_sdk_brain',
@@ -194,6 +280,7 @@ export async function respondViaClaudeAgentSdkBrain(
       toolUses: result.toolUses,
       usage: result.usage,
       modelUsage: result.modelUsage,
+      limitHit: result.limitHit ?? false,
     },
   };
 }

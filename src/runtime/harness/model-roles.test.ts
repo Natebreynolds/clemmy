@@ -7,7 +7,18 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Isolate from the host's ~/.clementine-next/.env: getRuntimeEnv() falls back to
+// BASE_DIR/.env, so the per-test withEnv() permutations below must not inherit
+// the operator's live AUTH_MODE / OPENAI_MODEL_PRIMARY / MODEL_ROUTING_MODE / BYO
+// config (which made these characterization assertions fail on a configured dev
+// box while passing in clean CI). Point BASE_DIR at an empty temp dir BEFORE
+// config.js loads — hence the dynamic import (matches debate-model.test.ts).
+process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-model-roles-test-'));
+const {
   getActiveAuthMode,
   getClaudeBrainModel,
   getDebateCheckerModel,
@@ -15,9 +26,9 @@ import {
   getModelRoutingMode,
   judgeChoice,
   MODELS,
-} from '../../config.js';
-import { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled } from './model-roles.js';
-import { resolveProvider } from './model-wire-registry.js';
+} = await import('../../config.js');
+const { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled } = await import('./model-roles.js');
+const { resolveProvider } = await import('./model-wire-registry.js');
 
 /** Set env keys for a permutation, run fn, restore. */
 function withEnv(over: Record<string, string | undefined>, fn: () => void): void {

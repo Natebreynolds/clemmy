@@ -6,6 +6,7 @@ import { getComputerTools } from './computer-tools.js';
 import { getComposioRuntimeTools } from './composio-tools.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
+import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { textResult } from './shared.js';
 
 function previewArgs(input: unknown): Record<string, unknown> {
@@ -139,7 +140,13 @@ export function registerGatedMutatingTools(server: McpServer): void {
           try {
             appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: name, callId, ok: true, preview: text.slice(0, 400) } });
           } catch { /* best-effort */ }
-          return textResult(text);
+          // Token efficiency (parity with the Codex lane, computer-tools.ts): digest a
+          // large result + park the full payload in tool_outputs keyed by this
+          // sessionId/callId, so Claude gets a structure-aware summary + a recall
+          // pointer (recall_tool_result / tool_output_query) instead of a 76KB body
+          // flooding its context. Without sessionId/callId this falls back to plain
+          // truncation — both are present here, so the digest path fires.
+          return textResult(formatRecallableToolText(text, { toolName: name, sessionId, callId }));
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           try {
