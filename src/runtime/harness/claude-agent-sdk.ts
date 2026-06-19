@@ -159,6 +159,7 @@ function localNodeCommand(): string {
 export function buildClaudeAgentSdkLocalMcpServers(
   sessionId?: string,
   gatedMutations = false,
+  mcpToolAllowlist?: string[],
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
   const srcEntry = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
@@ -166,10 +167,15 @@ export function buildClaudeAgentSdkLocalMcpServers(
   // MCP surface, each run through the full harness gate chain (see
   // gated-mutating-tools.ts). Set only for the agentic brain/worker profiles —
   // a read-only run leaves it off so those tools never appear.
+  // mcpToolAllowlist (JIT tool-RAG): when non-empty, the server advertises ONLY
+  // those tools — fewer schemas sent to the model = fewer input tokens. Absent →
+  // every tool registers (byte-identical to before).
+  const allowlist = (mcpToolAllowlist ?? []).map((t) => t.trim()).filter(Boolean);
   const env = mergedSpawnEnv({
     CLEMENTINE_HOME: BASE_DIR,
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
+    ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
   });
   if (existsSync(distEntry)) {
     return {
@@ -243,6 +249,14 @@ export interface ClaudeAgentSdkRunOptions {
    * log); silently falls back to the read-only allowlist without one.
    */
   agentic?: boolean;
+  /**
+   * JIT tool-RAG (Claude-brain port). When set, the in-process MCP server is
+   * spawned advertising ONLY these tools, so the model receives only their schemas
+   * (fewer input tokens). The brain computes it per turn via selectToolsForTurn;
+   * absent → the server advertises every tool (byte-identical). Should be a SUPERSET
+   * of whatever the model is permitted to call (allowedLocalMcpTools).
+   */
+  mcpToolAllowlist?: string[];
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -393,7 +407,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     settingSources: [],
     skills: [],
     tools: [],
-    mcpServers: buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic),
+    mcpServers: buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
     allowedTools: sdkToolNamesForLocalMcp(allowed),
     // Agentic: the async approval gate (read/local fast-allow, everything else
     // → decideToolApproval → register/surface/await). permissionMode 'default'

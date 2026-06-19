@@ -72,6 +72,32 @@ function installAmbientToolContext(): void {
 
 installAmbientToolContext();
 
+// JIT tool-RAG for the Claude Agent SDK lane (Phase 1, Claude-brain port). When the
+// brain decides to JIT-reduce the per-turn tool surface, it spawns THIS server with
+// CLEMENTINE_MCP_ALLOWED_TOOLS=<comma-list> so only those tools are ADVERTISED — and
+// since the SDK sends the schema of every advertised tool to the model, fewer
+// advertised tools = fewer input tokens (allowedTools/canUseTool gate calls but do
+// NOT shrink the schema payload — verified against the SDK). Unset (default) → no
+// filtering, every tool registers exactly as before (byte-identical). Installed
+// AFTER the ambient-context wrap so it's the OUTERMOST check (skips before wrapping).
+function installToolAllowlistFilter(): void {
+  const raw = process.env.CLEMENTINE_MCP_ALLOWED_TOOLS?.trim();
+  if (!raw) return;
+  const allowed = new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
+  // Floor: a health tool that must always exist so the surface is never empty.
+  const FLOOR = new Set(['ping']);
+  const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
+  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+    const toolName = typeof args[0] === 'string' ? args[0] : undefined;
+    if (toolName && !allowed.has(toolName) && !FLOOR.has(toolName)) {
+      return undefined; // not in the JIT set → don't advertise it (schema not sent)
+    }
+    return wrapped(...args);
+  };
+}
+
+installToolAllowlistFilter();
+
 registerMemoryTools(server);
 registerFocusTools(server);
 registerVaultTools(server);
