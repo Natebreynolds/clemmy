@@ -1,5 +1,5 @@
 import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
-import { ORCHESTRATOR_INSTRUCTIONS } from '../../agents/orchestrator.js';
+import { ORCHESTRATOR_BEHAVIOR_NATIVE } from '../../agents/orchestrator.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { clearKill, createSession, getSession } from './eventlog.js';
@@ -130,8 +130,10 @@ export function renderClaudeAgentBrainSystemAppend(
     '',
     persistentContext,
     '',
+    'HOW YOU OPERATE HERE — you are a native tool-calling agent. When the work needs a tool, CALL it directly and let the result come back, then reply to the user in plain language once the work is done. There is no decision JSON, output schema, or reply/done/nextAction envelope to produce on this lane — just do the work with real tool calls and answer naturally.',
+    '',
     'Core Clementine operating rubric:',
-    ORCHESTRATOR_INSTRUCTIONS,
+    ORCHESTRATOR_BEHAVIOR_NATIVE,
   ].filter(Boolean).join('\n\n');
 }
 

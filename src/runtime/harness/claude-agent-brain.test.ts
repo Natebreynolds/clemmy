@@ -58,6 +58,8 @@ test('renderClaudeAgentBrainSystemAppend carries Clementine context and the read
   assert.match(prompt, /READ-ONLY\/local-context/);
   assert.match(prompt, /Core Clementine operating rubric/);
   assert.match(prompt, /You are Clementine/);
+  assert.match(prompt, /native tool-calling agent/);
+  assert.doesNotMatch(prompt, /Return an OrchestratorDecision/);
 });
 
 test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/model-role capability', () => {
