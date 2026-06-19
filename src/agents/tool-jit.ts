@@ -25,12 +25,16 @@
 import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
+import { getRuntimeEnv } from '../config.js';
 
 const logger = pino({ name: 'clementine-next.tool-jit' });
 
+// All flags read via getRuntimeEnv (not raw process.env) so an operator can flip the
+// A/B / tuning in BASE_DIR/.env and have it apply LIVE on the next turn — no daemon
+// restart — and to match the codebase convention.
 /** DEFAULT OFF — global on/off switch. 'on'/'1'/'true'/'yes' enable. */
 export function toolJitEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((process.env.CLEMMY_TOOL_JIT ?? '').trim());
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_TOOL_JIT', '') || '').trim());
 }
 
 // --- Live A/B: per-session bucketing -------------------------------------
@@ -40,12 +44,12 @@ export function toolJitEnabled(): boolean {
 export type ToolJitArm = 'jit' | 'control';
 
 export function toolJitExperimentEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((process.env.CLEMMY_TOOL_JIT_AB ?? '').trim());
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_TOOL_JIT_AB', '') || '').trim());
 }
 
 /** Fraction of sessions assigned to the JIT arm (rest = control). Default 0.5. */
 function abRatio(): number {
-  const r = Number.parseFloat(process.env.CLEMMY_TOOL_JIT_AB_RATIO ?? '');
+  const r = Number.parseFloat(getRuntimeEnv('CLEMMY_TOOL_JIT_AB_RATIO', '') || '');
   return Number.isFinite(r) && r >= 0 && r <= 1 ? r : 0.5;
 }
 
@@ -146,11 +150,11 @@ const DEFAULT_TOP_K = 16;
 const DEFAULT_MIN_SCORE = 0.25;
 
 function topK(): number {
-  const raw = Number.parseInt(process.env.CLEMMY_TOOL_JIT_TOPK ?? '', 10);
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_TOOL_JIT_TOPK', '') || '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TOP_K;
 }
 function minScore(): number {
-  const raw = Number.parseFloat(process.env.CLEMMY_TOOL_JIT_MIN_SCORE ?? '');
+  const raw = Number.parseFloat(getRuntimeEnv('CLEMMY_TOOL_JIT_MIN_SCORE', '') || '');
   return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : DEFAULT_MIN_SCORE;
 }
 
