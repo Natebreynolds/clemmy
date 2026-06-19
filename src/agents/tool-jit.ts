@@ -73,6 +73,11 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   'read_file', 'write_file', 'list_files', 'run_shell_command',
   // profile READ (cheaper than asking the user).
   'user_profile_read',
+  // the user's REAL browser. MEASURED (measure-tool-jit-accuracy.ts): "log into my
+  // LinkedIn…" scores these at NOISE level (0.155 / 0.19 cosine) — the canonical
+  // "log into my X" trigger doesn't semantically match the browser-harness tool
+  // text, so retrieval can't be trusted to surface them. CORE is the reliable fix.
+  'browser_harness_status', 'browser_harness_run',
   // conversation primitives (also added structurally outside JIT — belt-and-suspenders).
   'ask_user_question', 'request_approval', 'run_worker',
 ]);
@@ -86,7 +91,11 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
 export const TOOL_JIT_CORE: ReadonlySet<string> = TOOL_JIT_MANDATED;
 
 const DEFAULT_TOP_K = 16;
-const DEFAULT_MIN_SCORE = 0.18;
+// MEASURED (measure-tool-jit-accuracy.ts, text-embedding-3-small): real domain-named
+// intents score their needed tool ≥0.33 (median 0.44); noise/weak matches sit ≤0.19.
+// 0.25 is the clean separating floor — keeps every real hit, drops the weak matches
+// that bloated negative-control turns at the old 0.18.
+const DEFAULT_MIN_SCORE = 0.25;
 
 function topK(): number {
   const raw = Number.parseInt(process.env.CLEMMY_TOOL_JIT_TOPK ?? '', 10);

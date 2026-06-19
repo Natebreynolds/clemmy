@@ -42,6 +42,8 @@ const INTENTS: Array<{ msg: string; expect: string[] }> = [
   { msg: 'set a goal to book 50 product demos this quarter', expect: ['goal_update'] },
   { msg: 'what background tasks are still running right now?', expect: ['background_tasks_recent', 'background_task_status'] },
   { msg: 'show me my recent agent runs and how they went', expect: ['agent_runs_recent'] },
+  // browser_harness_* moved to CORE after this corpus measured them at noise-level
+  // cosine (0.155/0.19) — kept here as a coverage check (now satisfied via CORE).
   { msg: 'log into my LinkedIn and pull my recent connection requests', expect: ['browser_harness_status', 'browser_harness_run'] },
   { msg: "what's the git status of this repo and any uncommitted changes?", expect: ['git_status'] },
   { msg: 'update my profile timezone to US Pacific', expect: ['user_profile_update'] },
@@ -65,7 +67,7 @@ const embeddingsOn = isEmbeddingsEnabled();
 console.log('\n══════════════════════════════════════════════════════════════');
 console.log('  PHASE 1.2 — JIT tool-selection ACCURACY + RECALL');
 console.log('══════════════════════════════════════════════════════════════');
-console.log(`  surface: ${tools.length} tools (${jitableCount} JIT-able) · TOPK=${process.env.CLEMMY_TOOL_JIT_TOPK ?? 16} MIN_SCORE=${process.env.CLEMMY_TOOL_JIT_MIN_SCORE ?? 0.18}`);
+console.log(`  surface: ${tools.length} tools (${jitableCount} JIT-able) · TOPK=${process.env.CLEMMY_TOOL_JIT_TOPK ?? '16(default)'} MIN_SCORE=${process.env.CLEMMY_TOOL_JIT_MIN_SCORE ?? '0.25(default)'}`);
 if (!embeddingsOn) {
   console.log('\n  ⚠️  EMBEDDINGS UNAVAILABLE in this environment — selectToolsForTurn will fall');
   console.log('     back to the FULL surface (no reduction). This run validates the harness but');
@@ -77,6 +79,7 @@ let recallDen = 0;
 let reductionSum = 0;
 let reductionRuns = 0;
 const misses: Array<{ msg: string; tool: string; score: number | null }> = [];
+const hitScores: Array<{ tool: string; score: number | null; hit: boolean }> = [];
 let negControlClean = 0;
 let negControlTotal = 0;
 
@@ -112,6 +115,8 @@ for (const intent of INTENTS) {
   recallDen += present.length;
   const missed = present.filter((t) => !sel.exposed.has(t));
   for (const m of missed) misses.push({ msg: intent.msg, tool: m, score: await scoreOf(intent.msg, m) });
+  // record the score of EVERY expected tool (hit or miss) for the distribution
+  for (const t of present) hitScores.push({ tool: t, score: await scoreOf(intent.msg, t), hit: hit.includes(t) });
   const mark = missed.length === 0 ? '✅' : '❌';
   console.log(`  ${mark} "${intent.msg.slice(0, 52)}" → hit [${hit.join(', ')}]${missed.length ? ` MISS [${missed.join(', ')}]` : ''}`);
 }
@@ -126,8 +131,16 @@ if (misses.length > 0) {
   console.log('\n  MISSES (tune MIN_SCORE/TOPK from these cosines):');
   for (const m of misses) console.log(`    ${m.tool.padEnd(24)} score=${m.score ?? 'n/a'}  ← "${m.msg.slice(0, 44)}"`);
 }
+if (embeddingsOn && hitScores.length > 0) {
+  const withScore = hitScores.filter((h) => h.score != null) as Array<{ tool: string; score: number; hit: boolean }>;
+  const hits = withScore.filter((h) => h.hit).map((h) => h.score).sort((a, b) => a - b);
+  const missed = withScore.filter((h) => !h.hit).map((h) => h.score).sort((a, b) => a - b);
+  console.log('\n  EXPECTED-TOOL SCORE DISTRIBUTION (pick MIN_SCORE between the miss and hit bands):');
+  console.log(`    hits   (n=${hits.length}): min=${hits[0] ?? 'n/a'}  median=${hits[Math.floor(hits.length / 2)] ?? 'n/a'}  max=${hits[hits.length - 1] ?? 'n/a'}`);
+  console.log(`    missed (n=${missed.length}): ${missed.length ? missed.join(', ') : '(none)'}`);
+}
 if (embeddingsOn) {
-  const verdict = recallPct >= 90 ? '✅ recall ≥90%' : '⚠️ recall <90% — raise TOPK or lower MIN_SCORE, or move misses to CORE';
+  const verdict = recallPct >= 90 ? '✅ recall ≥90%' : '⚠️ recall <90% — raise TOPK or lower MIN_SCORE, or improve descriptions / move misses to CORE';
   console.log(`\n  VERDICT: ${verdict}`);
 }
 

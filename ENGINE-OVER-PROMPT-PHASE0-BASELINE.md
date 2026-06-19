@@ -48,6 +48,28 @@ chars/tok) so the surface is likely under-counted; the 12K memory figure is a do
 Phase-0 datapoint, not re-measured here; JIT currently targets the @openai/agents (Codex)
 lane only, not the Claude Agent SDK brain.
 
+## Phase 1.2 — LIVE accuracy (measured with real embeddings, text-embedding-3-small)
+Run `npx tsx scripts/measure-tool-jit-accuracy.ts` (needs an OpenAI key reachable via
+the vault/env). First live run over a 17-intent labeled corpus:
+
+- **Recall (needed JIT tool survived top-K): 100% (17/17)** after tuning.
+- **Avg JIT-able reduction per turn: 71%.**
+- **Score separation is clean:** real domain-named intents score their needed tool
+  **≥0.33 (median 0.44, max 0.68)**; noise/weak matches sit **≤0.19**.
+
+Two data-driven tunings from the first run (which scored 88% / one miss class):
+1. **`MIN_SCORE` 0.18 → 0.25** — sits in the gap between the miss band (≤0.19) and the
+   hit band (≥0.33); keeps every real hit, drops the weak matches that bloated
+   broad/negative-control turns (hard negative "what's the weather" now retrieves 0).
+2. **`browser_harness_status` / `_run` → CORE** — "log into my LinkedIn…" (the canonical
+   trigger) scored these at noise level (0.155 / 0.19); the phrase doesn't match the
+   browser-harness tool text, so retrieval can't be trusted. CORE is the reliable fix.
+   (This is also concrete evidence FOR Phase 2: a better description would raise that cosine.)
+
+Remaining soft spot: a broad query ("summarize the last meeting transcript") still hits
+the TOPK=16 cap — acceptable (it's a no-specific-tool turn; correctness unaffected) and a
+candidate for a lower TOPK later. Default-on still gated on a live A/B + mid-run acquisition.
+
 ## Implication for the plan
 1. **Phase 1 (Tool RAG) confirmed as #1 lever.** Phase 1.1 ships the safe split:
    42 JIT-able tools behind semantic top-K retrieval, 50-tool mandated core always
