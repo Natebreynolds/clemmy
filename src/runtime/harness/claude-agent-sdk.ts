@@ -13,6 +13,7 @@ import type {
 import { BASE_DIR, PKG_DIR } from '../../config.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg } from './claude-headless-model.js';
+import { buildGatedToolPermission } from './claude-agent-approval.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -177,6 +178,14 @@ export interface ClaudeAgentSdkRunOptions {
   allowedLocalMcpTools?: string[];
   maxTurns?: number;
   outputSchema?: Record<string, unknown>;
+  /**
+   * Agentic lane: expose the gated mutating tools on MCP, run the async
+   * approval gate (buildGatedToolPermission) instead of deny-only allowlisting,
+   * and use permissionMode 'default' so non-allowlisted tools reach our gate.
+   * Requires a sessionId (the gates + approval read/write the session's event
+   * log); silently falls back to the read-only allowlist without one.
+   */
+  agentic?: boolean;
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -214,6 +223,9 @@ function extractInit(message: SDKMessage): SDKSystemMessage | null {
 export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Promise<ClaudeAgentSdkRunResult> {
   const env = await buildClaudeHeadlessEnv();
   const allowed = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
+  // Agentic lane requires a session id (the gate chain + approval read/write the
+  // session's event log). Without one, fall back to the read-only allowlist.
+  const agentic = Boolean(options.agentic && options.sessionId?.trim());
   const sdkOptions: ClaudeAgentOptions = {
     env,
     model: options.modelId ? claudeCliModelArg(options.modelId) : undefined,
@@ -222,10 +234,15 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     settingSources: [],
     skills: [],
     tools: [],
-    mcpServers: buildClaudeAgentSdkLocalMcpServers(options.sessionId),
+    mcpServers: buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic),
     allowedTools: sdkToolNamesForLocalMcp(allowed),
-    canUseTool: buildAllowOnlyToolsPermission(allowed),
-    permissionMode: 'dontAsk',
+    // Agentic: the async approval gate (read/local fast-allow, everything else
+    // → decideToolApproval → register/surface/await). permissionMode 'default'
+    // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.
+    canUseTool: agentic
+      ? buildGatedToolPermission(options.sessionId as string, allowed)
+      : buildAllowOnlyToolsPermission(allowed),
+    permissionMode: agentic ? 'default' : 'dontAsk',
     maxTurns: options.maxTurns ?? 3,
     includePartialMessages: false,
     systemPrompt: {
