@@ -582,6 +582,30 @@ function stripAnsi(input: string): string {
   return input.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 }
 
+function eventFieldText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function joinedEventText(...values: unknown[]): string {
+  return values.map(eventFieldText).filter(Boolean).join('\n');
+}
+
+function publishCreateSucceeded(resultText: string): boolean {
+  const text = resultText.toLowerCase();
+  if (/exit_code:\s*[1-9]\d*/.test(text)) return false;
+  if (/\b(error|jsonhttperror|unknown option|not found|no such team)\b/.test(text)) return false;
+  return /exit_code:\s*0/.test(text)
+    || /\b(project|site)\s+created\b/i.test(resultText)
+    || /"(?:id|site_id)"\s*:\s*"/i.test(resultText)
+    || /\.netlify\.app\b/i.test(resultText);
+}
+
 /**
  * Wrap a tool so its execute fires the three reliability checks at the
  * entry edge. Gated by HARNESS_TOOL_BRACKETS (default ON; =off kill-switch).
@@ -611,14 +635,14 @@ function buildPublishProvenance(sessionId: string): (target: string) => boolean 
   let userBlob = '';
   try {
     const events = listEvents(sessionId, { types: ['user_input_received', 'tool_called', 'tool_returned'] });
-    const createCallIds = new Set<string>();
+    const createCallNames = new Map<string, string[]>();
     const userParts: string[] = [];
     for (const e of events) {
       const d = e.data as Record<string, unknown> | undefined;
       if (e.type === 'user_input_received') {
         userParts.push(String(d?.text ?? '').toLowerCase());
       } else if (e.type === 'tool_called') {
-        const args = String(d?.arguments ?? '');
+        const args = joinedEventText(d?.arguments, d?.args, d?.rawArgs);
         // Recognize ANY site-creation path, not just one command:
         // `netlify sites:create`, the API `netlify api createSite`,
         // `create-site`. (2026-06-15 Fernwood false-positive: she self-recovered
@@ -627,14 +651,18 @@ function buildPublishProvenance(sessionId: string): (target: string) => boolean 
         // captured from `--name X` OR a `--data '{"name":"X"}'` JSON body.
         if (/sites?:create|projects?:create|create-?sites?\b/i.test(args)) {
           const callId = String(d?.callId ?? '');
-          if (callId) createCallIds.add(callId);
+          const names: string[] = [];
           const nm = args.match(/--name(?:=|\s+)["']?([\w.-]+)/i) ?? args.match(/"name"\s*:\s*"([\w.-]+)"/i);
-          if (nm) created.add(nm[1].toLowerCase());
+          if (nm) names.push(nm[1].toLowerCase());
+          if (callId) createCallNames.set(callId, names);
         }
       } else if (e.type === 'tool_returned') {
         const callId = String(d?.callId ?? '');
-        if (createCallIds.has(callId)) {
-          const res = stripAnsi(String(d?.result ?? ''));
+        const names = createCallNames.get(callId);
+        if (names) {
+          const res = stripAnsi(joinedEventText(d?.result, d?.preview, d?.output));
+          if (!publishCreateSucceeded(res)) continue;
+          for (const name of names) created.add(name);
           for (const m of res.matchAll(/"(?:id|site_id|name|site_name)"\s*:\s*"([\w.-]+)"/gi)) created.add(m[1].toLowerCase());
           for (const m of res.matchAll(/\b(?:project|site)\s+id\s*:\s*([A-Za-z0-9][\w.-]*)/gi)) created.add(m[1].toLowerCase());
           for (const m of res.matchAll(/([\w-]+)\.netlify\.app/gi)) created.add(m[1].toLowerCase());

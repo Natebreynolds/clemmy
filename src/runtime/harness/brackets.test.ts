@@ -829,6 +829,42 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     });
     assert.equal(await shell('npx netlify-cli deploy --dir "/x/site" --prod --site 9fce1eaf-84db-4d7c-911e-fb9bd4d92498 --json'), 'deployed');
     await assert.rejects(() => Promise.resolve(shell('npx netlify-cli deploy --dir "/x/site" --prod --site ai-agent-loop-site --json')), /UNVERIFIED_DESTINATION/);
+    // 8. PROVENANCE via the Claude Agent SDK gated-MCP trace shape. That lane
+    //    logs `args` + `preview` instead of the legacy `arguments` + `result`;
+    //    the destination gate must still see the CLI-created project id.
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
+      data: { tool: 'run_shell_command', callId: 'cs3', args: { command: 'npx netlify-cli sites:create --name sdk-agent-site --account-slug natebreynolds' } },
+    });
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'tool', type: 'tool_returned',
+      data: {
+        tool: 'run_shell_command',
+        callId: 'cs3',
+        ok: true,
+        preview: [
+          'exit_code: 0',
+          '',
+          'stdout:',
+          '',
+          'Project Created',
+          '\x1B[32mURL: \x1B[39m       https://sdk-agent-site.netlify.app',
+          '\x1B[32mProject ID: \x1B[39msdk-agent-site-id-123',
+        ].join('\n'),
+      },
+    });
+    assert.equal(await shell('npx netlify-cli deploy --dir "/x/site" --prod --site sdk-agent-site-id-123 --json'), 'deployed');
+    // A failed create attempt must not prove a target merely because the
+    // command carried `--name`.
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'Clem', type: 'tool_called',
+      data: { tool: 'run_shell_command', callId: 'cs4', args: { command: 'npx netlify-cli sites:create --name failed-site --account-slug missing-team' } },
+    });
+    appendEvent({
+      sessionId: sess.id, turn: 0, role: 'tool', type: 'tool_returned',
+      data: { tool: 'run_shell_command', callId: 'cs4', ok: false, preview: 'exit_code: 1\n\nstderr:\nError: no such team' },
+    });
+    await assert.rejects(() => Promise.resolve(shell('npx netlify-cli deploy --dir "/x/site" --prod --site failed-site --json')), /UNVERIFIED_DESTINATION/);
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
