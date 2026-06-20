@@ -105,11 +105,30 @@ export interface ConfigureResult {
 export async function configureHarnessRuntime(): Promise<ConfigureResult> {
   if (configured) return { ok: true };
 
-  // Claude brain (subscription OAuth) — when AUTH_MODE=claude_oauth, every role
-  // runs on Claude via the user's Max/Pro subscription, peer to Codex. Fail
-  // closed unless a valid `oat01` SUBSCRIPTION token is present: the preflight
-  // throws on a missing/expired token OR an `api03` API key, so a subscription
-  // user can never be silently pay-per-token billed.
+  const mode = getModelRoutingMode();
+  const byo = getByoBackendConfig();
+
+  // All-in (BYO brain) takes PRECEDENCE over the stored AUTH_MODE. When a user
+  // has explicitly enabled all_in with a configured BYO backend, EVERY role —
+  // including the brain — runs on the BYO model (e.g. GLM), and no Codex/Claude
+  // token is required (the BYO key is the credential). This MUST win over a
+  // leftover AUTH_MODE=claude_oauth/codex_oauth: otherwise a stale oauth mode
+  // (e.g. set before switching to a GLM brain via the old backend form) silently
+  // hijacks the brain and makes it depend on an expired OAuth token the user no
+  // longer wants — the exact "settings says GLM but it's actually Claude (token
+  // expired)" trap. effectiveBrain() mirrors this precedence so UI == runtime.
+  if (mode === 'all_in' && byo.configured) {
+    setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
+    configured = true;
+    return { ok: true };
+  }
+
+  // Claude brain (subscription OAuth) — when AUTH_MODE=claude_oauth (and not the
+  // all_in BYO-brain case above), every role runs on Claude via the user's
+  // Max/Pro subscription, peer to Codex. Fail closed unless a valid `oat01`
+  // SUBSCRIPTION token is present: the preflight throws on a missing/expired
+  // token OR an `api03` API key, so a subscription user can never be silently
+  // pay-per-token billed.
   if (getActiveAuthMode() === 'claude_oauth') {
     try {
       loadClaudeAccessToken();
@@ -121,24 +140,14 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
     return { ok: true };
   }
 
-  const mode = getModelRoutingMode();
-  const byo = getByoBackendConfig();
-
-  // All-in (no Codex): route every role to the user's BYO backend. No
-  // Codex OAuth token is required — this is the path for users who don't
-  // have (or don't want) a ChatGPT/Codex subscription.
+  // all_in requested but no BYO backend configured → clear, actionable error.
   if (mode === 'all_in') {
-    if (!byo.configured) {
-      return {
-        ok: false,
-        reason:
-          'all_in mode is enabled but no BYO backend is configured. ' +
-          'Set a backend (e.g., DeepSeek, MiniMax) in Settings → Model backend.',
-      };
-    }
-    setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
-    configured = true;
-    return { ok: true };
+    return {
+      ok: false,
+      reason:
+        'all_in mode is enabled but no BYO backend is configured. ' +
+        'Set a backend (e.g., DeepSeek, MiniMax) in Settings → Model backend.',
+    };
   }
 
   const tokens = getStoredCodexOAuthTokens();
