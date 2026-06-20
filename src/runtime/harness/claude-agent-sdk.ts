@@ -126,6 +126,10 @@ export const CLAUDE_AGENT_SDK_FULL_TOOLS = [
   'execution_update_step',
   'execution_mark_blocked',
   'execution_complete',
+  // Fan-out (CLEMMY_CLAUDE_SDK_FANOUT). Listed so the permission layer fast-allows
+  // run_worker; the tool is only ADVERTISED when the brain mounts the fan-out server,
+  // so this is a no-op when the flag is off. NOT in the WORKER profile (no nested fan-out).
+  'run_worker',
 ] as const;
 
 /** Scoped agentic surface for a Claude WORKER (one parent-planned item). The
@@ -257,6 +261,14 @@ export interface ClaudeAgentSdkRunOptions {
    * of whatever the model is permitted to call (allowedLocalMcpTools).
    */
   mcpToolAllowlist?: string[];
+  /**
+   * Extra in-process MCP servers (e.g. the fan-out run_worker server) merged into
+   * query()'s mcpServers, with their SDK-namespaced tool ids added to allowedTools.
+   * Supplied by the BRAIN (which sits above this module in the dep graph, avoiding a
+   * cycle); workers never pass these. Absent → unchanged.
+   */
+  extraMcpServers?: Record<string, McpServerConfig>;
+  extraAllowedTools?: string[];
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -407,8 +419,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     settingSources: [],
     skills: [],
     tools: [],
-    mcpServers: buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
-    allowedTools: sdkToolNamesForLocalMcp(allowed),
+    mcpServers: {
+      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
+      ...(options.extraMcpServers ?? {}),
+    },
+    allowedTools: [...sdkToolNamesForLocalMcp(allowed), ...(options.extraAllowedTools ?? [])],
     // Agentic: the async approval gate (read/local fast-allow, everything else
     // → decideToolApproval → register/surface/await). permissionMode 'default'
     // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.

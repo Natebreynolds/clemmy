@@ -2,6 +2,7 @@ import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn } from '../../agents/tool-jit.js';
 import { getCoreToolsAsync } from '../../tools/registry.js';
+import { claudeSdkFanoutEnabled, buildClaudeSdkFanoutServer, CLAUDE_SDK_FANOUT_SERVER, CLAUDE_SDK_FANOUT_TOOL, CLAUDE_SDK_FANOUT_TOOL_FQN } from './claude-sdk-fanout.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents } from './eventlog.js';
@@ -312,6 +313,12 @@ export async function respondViaClaudeAgentSdkBrain(
     } catch { /* JIT telemetry must never block the turn */ }
   }
 
+  // Fan-out (CLEMMY_CLAUDE_SDK_FANOUT, default off): mount the in-process run_worker
+  // server so the agentic brain can fan items out to parallel workers (Phase 1: Claude
+  // workers) instead of serializing them in its own loop. Full agentic mode + a session
+  // only (workers + gates aggregate under the parent session). Off → not mounted, the
+  // brain never sees run_worker, byte-identical sequential behavior.
+  const fanoutOn = mode === 'full' && claudeSdkFanoutEnabled() && Boolean(sessionId);
   const runOptions = {
     sessionId,
     modelId,
@@ -320,6 +327,12 @@ export async function respondViaClaudeAgentSdkBrain(
     mcpToolAllowlist,
     agentic: mode === 'full',
     maxTurns: maxTurns(),
+    ...(fanoutOn
+      ? {
+          extraMcpServers: { [CLAUDE_SDK_FANOUT_SERVER]: buildClaudeSdkFanoutServer(sessionId) },
+          extraAllowedTools: [CLAUDE_SDK_FANOUT_TOOL_FQN, CLAUDE_SDK_FANOUT_TOOL],
+        }
+      : {}),
   };
   let result = await runClaudeAgentSdkImpl({ prompt: request.message, ...runOptions });
 
