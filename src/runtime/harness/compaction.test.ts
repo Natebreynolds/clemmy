@@ -327,6 +327,72 @@ test('forceLayer2 triggers Layer 1 even with abundant token headroom (the stage-
   assert.equal(result.layer3.applied, false, 'Layer 3 fork is suppressed during a forced checkpoint');
 });
 
+test('compactSessionIfNeeded — idle gap + real weight triggers L1+L2 below token pressure (no fork)', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'idle test' });
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 16; i++) {
+    const callId = `call_idle${i}`;
+    items.push(userMessage(`turn ${i}`));
+    items.push(toolCall(callId, 'dataforseo.serp', `{"q":"q-${i}"}`));
+    items.push(toolResult(callId, `serp ${i} ${'z'.repeat(1000)}`));
+    writeToolOutput({ sessionId: session.id, callId, tool: 'dataforseo.serp', output: `serp ${i} ${'z'.repeat(1000)}` });
+  }
+  session.updateConversationSnapshot(items);
+  // Big budget (no token pressure) + a 1h idle gap over the 6k-token floor → idle
+  // trigger fires L1+L2 anyway, and suppresses the Layer-3 fork (summarize in place).
+  const { result, forkRequest } = await compactSessionIfNeeded(session, items, {
+    inputBudgetTokens: 200_000, layer1ItemThreshold: 15,
+    idleMs: 60 * 60 * 1000, idleCompactionThresholdMs: 30 * 60 * 1000, idleCompactionMinTokens: 3000,
+  });
+  assert.ok(result.beforeTokens < 200_000 * 0.3, 'precondition: no token pressure');
+  assert.ok(result.beforeTokens > 3000, 'precondition: real weight (over the idle floor)');
+  assert.equal(result.layer1.applied, true, 'idle gap runs Layer 1 below token pressure');
+  assert.equal(result.layer3.applied, false, 'idle summarize never forks (in-place reset)');
+  assert.equal(forkRequest, undefined);
+});
+
+test('compactSessionIfNeeded — idle does NOT fire on a short gap, a tiny session, or with the kill-switch off', async () => {
+  resetEventLog();
+  const big = (title: string) => {
+    const s = HarnessSession.create({ kind: 'chat', title });
+    const items: AgentInputItem[] = [];
+    for (let i = 0; i < 16; i++) {
+      const callId = `${title}_${i}`;
+      items.push(userMessage(`turn ${i}`));
+      items.push(toolCall(callId, 'dataforseo.serp', `{"q":"q-${i}"}`));
+      items.push(toolResult(callId, `serp ${i} ${'z'.repeat(1000)}`));
+    }
+    s.updateConversationSnapshot(items);
+    return { s, items };
+  };
+  // min 3000 so the ~4.5k fixture clears the floor — the gap / kill-switch gates
+  // are what we're testing, not the size floor (which the tiny case covers).
+  const base = { inputBudgetTokens: 200_000, layer1ItemThreshold: 15, idleCompactionThresholdMs: 30 * 60 * 1000, idleCompactionMinTokens: 3000 };
+
+  // Short gap (10 min < 30 min) → no idle trigger.
+  const a = big('short-gap');
+  const ra = await compactSessionIfNeeded(a.s, a.items, { ...base, idleMs: 10 * 60 * 1000 });
+  assert.equal(ra.result.layer1.applied, false, 'short idle gap → no idle compaction');
+
+  // Long gap but a TINY session (under the token floor) → no idle trigger.
+  const tiny = HarnessSession.create({ kind: 'chat', title: 'tiny-idle' });
+  const tinyItems = [userMessage('hi there'), userMessage('how are you')];
+  tiny.updateConversationSnapshot(tinyItems);
+  const rt = await compactSessionIfNeeded(tiny, tinyItems, { ...base, idleMs: 60 * 60 * 1000 });
+  assert.equal(rt.result.layer1.applied, false, 'idle but tiny → nothing to summarize');
+
+  // Kill-switch off → no idle trigger even on a big, long-idle session.
+  const k = big('idle-killswitch');
+  process.env.CLEMMY_IDLE_COMPACT = 'off';
+  try {
+    const rk = await compactSessionIfNeeded(k.s, k.items, { ...base, idleMs: 60 * 60 * 1000 });
+    assert.equal(rk.result.layer1.applied, false, 'kill-switch makes idle compaction inert');
+  } finally {
+    delete process.env.CLEMMY_IDLE_COMPACT;
+  }
+});
+
 test('checkpointGoalStage no-ops on a tiny session and when the kill-switch is off', async () => {
   resetEventLog();
   const tiny = HarnessSession.create({ kind: 'chat', title: 'tiny' });
