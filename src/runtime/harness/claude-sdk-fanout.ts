@@ -43,6 +43,48 @@ export function claudeSdkFanoutEnabled(): boolean {
   return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_CLAUDE_SDK_FANOUT', '') || '').trim());
 }
 
+// Concurrency cap (review FANOUT-1). The SDK invokes all tool_use handlers from one
+// assistant turn CONCURRENTLY, and each run_worker spawns a headless `claude`
+// subprocess — so an unbounded fan-out could spawn dozens at once. Mirror the Codex
+// lane's maxFunctionToolConcurrency:8 with a module-level (daemon-wide) semaphore so
+// excess workers serialize into WAVES instead of all spawning at once. Env-overridable.
+function fanoutConcurrency(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_FANOUT_CONCURRENCY', '') || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 8;
+}
+let fanoutInFlight = 0;
+const fanoutWaiters: Array<() => void> = [];
+function acquireFanoutSlot(): Promise<void> {
+  if (fanoutInFlight < fanoutConcurrency()) {
+    fanoutInFlight += 1;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => fanoutWaiters.push(resolve));
+}
+function releaseFanoutSlot(): void {
+  fanoutInFlight -= 1;
+  if (fanoutWaiters.length > 0 && fanoutInFlight < fanoutConcurrency()) {
+    fanoutInFlight += 1;
+    const next = fanoutWaiters.shift();
+    if (next) next();
+  }
+}
+/** Run `fn` holding a fan-out slot — at most fanoutConcurrency() run at once;
+ *  excess await a freed slot. Exported so the cap is directly testable. */
+export async function withFanoutSlot<T>(fn: () => Promise<T>): Promise<T> {
+  await acquireFanoutSlot();
+  try {
+    return await fn();
+  } finally {
+    releaseFanoutSlot();
+  }
+}
+/** Test-only: reset the semaphore between cases. */
+export function _resetFanoutConcurrencyForTest(): void {
+  fanoutInFlight = 0;
+  fanoutWaiters.length = 0;
+}
+
 const RUN_WORKER_DESCRIPTION =
   'Fan out ONE independent item of a same-shape batch to an isolated worker that runs it end-to-end and returns a ' +
   'tight result you aggregate. Call it MULTIPLE TIMES IN PARALLEL (one per item) for 3+ independent items — ' +
@@ -66,27 +108,30 @@ export function buildClaudeSdkFanoutServer(sessionId: string) {
       const configured = resolveRoleModel('worker', input.intent ?? undefined).modelId;
       const isClaude = typeof configured === 'string' && configured.startsWith('claude-');
       const workerModel = isClaude ? configured : PHASE1_FALLBACK_CLAUDE_WORKER;
-      try {
-        const result = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
+      // Cap concurrent worker subprocesses (waves of N); excess awaits a free slot.
+      return withFanoutSlot(async () => {
         try {
-          appendEvent({
-            sessionId, turn: 0, role: 'system', type: 'worker_model_routed',
-            data: {
-              seam: 'claude_sdk_fanout', item: input.item, attemptedIntent: input.intent ?? null,
-              modelId: workerModel, provider: 'claude', transport: 'claude_agent_sdk_worker',
-              codexFallbackPending: !isClaude, configuredWorker: configured,
-              sdkSessionId: result.sdkSessionId ?? null, toolUses: result.toolUses,
-            },
-          });
-        } catch { /* routing telemetry must never block fan-out */ }
-        return { content: [{ type: 'text' as const, text: result.text || `(worker for "${input.item}" returned no text)` }] };
-      } catch (err) {
-        logger.warn({ err, item: input.item }, 'claude-sdk fan-out worker failed');
-        return {
-          content: [{ type: 'text' as const, text: `Worker for "${input.item}" failed: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
+          const result = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
+          try {
+            appendEvent({
+              sessionId, turn: 0, role: 'system', type: 'worker_model_routed',
+              data: {
+                seam: 'claude_sdk_fanout', item: input.item, attemptedIntent: input.intent ?? null,
+                modelId: workerModel, provider: 'claude', transport: 'claude_agent_sdk_worker',
+                codexFallbackPending: !isClaude, configuredWorker: configured,
+                sdkSessionId: result.sdkSessionId ?? null, toolUses: result.toolUses,
+              },
+            });
+          } catch { /* routing telemetry must never block fan-out */ }
+          return { content: [{ type: 'text' as const, text: result.text || `(worker for "${input.item}" returned no text)` }] };
+        } catch (err) {
+          logger.warn({ err, item: input.item }, 'claude-sdk fan-out worker failed');
+          return {
+            content: [{ type: 'text' as const, text: `Worker for "${input.item}" failed: ${(err as Error).message}` }],
+            isError: true,
+          };
+        }
+      });
     },
   );
   return createSdkMcpServer({ name: CLAUDE_SDK_FANOUT_SERVER, version: '0.1.0', tools: [runWorker] });
