@@ -3,19 +3,23 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
 const tmpHome = mkdtempSync(path.join(os.tmpdir(), 'clemmy-computer-tools-test-'));
 process.env.HOME = tmpHome;
 process.env.CLEMENTINE_HOME = path.join(tmpHome, '.clementine-next');
+// In production the app always creates its home dir; mirror that so the
+// existence-checked default cwd resolves to a real directory under test.
+mkdirSync(process.env.CLEMENTINE_HOME, { recursive: true });
 
 let getComputerTools: typeof import('./computer-tools.js').getComputerTools;
 let annotateShellStderr: typeof import('./computer-tools.js').annotateShellStderr;
+let resolveAllowedCwd: typeof import('./computer-tools.js').resolveAllowedCwd;
 
 before(async () => {
-  ({ getComputerTools, annotateShellStderr } = await import('./computer-tools.js'));
+  ({ getComputerTools, annotateShellStderr, resolveAllowedCwd } = await import('./computer-tools.js'));
 });
 
 // ─── Recoverable-failure self-recovery hints (2026-06-15) ───
@@ -35,6 +39,27 @@ test('annotateShellStderr: a GENUINE command-not-found still gets the install hi
   const out = annotateShellStderr('bash: foo: command not found', 'foo --bar');
   assert.match(out, /not on PATH/i);
   assert.match(out, /brew install foo|npm install -g foo/);
+});
+
+// ─── resolveAllowedCwd: a stringified-null cwd must not ENOENT-loop ───
+// Live failure 2026-06-20: a BYO (GLM) brain emitted cwd:"null" (the literal
+// string) for `netlify sites:create`; it resolved to a non-existent dir → every
+// spawn failed with ENOENT → the model retried identically 7× → loop-guardrail
+// ended the turn. "null"/"undefined"/"None" must degrade to the safe default.
+test('resolveAllowedCwd: stringified-null cwd falls back to the default, never a bogus path', () => {
+  const def = resolveAllowedCwd(undefined);
+  for (const bogus of ['null', 'undefined', 'None', '', '   ']) {
+    assert.equal(resolveAllowedCwd(bogus), def, `cwd "${bogus}" → default`);
+    assert.doesNotMatch(resolveAllowedCwd(bogus), /\/(null|undefined|None)$/, `cwd "${bogus}" never resolves to a literal dir`);
+  }
+});
+
+test('resolveAllowedCwd: a real but NON-EXISTENT in-root cwd throws a self-correcting error (not an ENOENT loop)', () => {
+  const def = resolveAllowedCwd(undefined); // an existing root (BASE_DIR)
+  const missing = path.join(def, 'definitely-does-not-exist-xyz');
+  assert.throws(() => resolveAllowedCwd(missing), /does not exist/i);
+  // an existing dir is returned unchanged
+  assert.equal(resolveAllowedCwd(def), def);
 });
 
 test('annotateShellStderr: an interactive-prompt hang nudges a non-interactive re-run', () => {

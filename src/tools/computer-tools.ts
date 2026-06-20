@@ -280,7 +280,7 @@ function ensureTrailingNewline(content: string): string {
   return content.endsWith('\n') ? content : `${content}\n`;
 }
 
-function resolveAllowedCwd(input?: string): string {
+export function resolveAllowedCwd(input?: string): string {
   // Default to BASE_DIR (~/.clementine-next) rather than process.cwd() or
   // os.homedir(). The daemon writes to BASE_DIR constantly, so macOS App
   // Management TCC has already granted access — child shells spawned there
@@ -288,7 +288,25 @@ function resolveAllowedCwd(input?: string): string {
   // (Desktop, Documents, Downloads) causes child Node CLIs to throw
   // EPERM on uv_cwd. The model can still pass an explicit `cwd` that's
   // inside any allowed workspaceRoots() entry.
-  return resolveAllowedPath(input?.trim() || BASE_DIR);
+  const raw = input?.trim();
+  // A model (esp. a BYO backend) can serialize a null cwd as the LITERAL string
+  // "null"/"undefined" — which is truthy, so it would resolve to a non-existent
+  // dir and make spawn fail with ENOENT on EVERY retry: an unrecoverable loop
+  // (the live GLM `cwd:"null"` site-host failure). Treat those as "no cwd".
+  if (!raw || raw === 'null' || raw === 'undefined' || raw === 'None') {
+    return resolveAllowedPath(BASE_DIR);
+  }
+  const resolved = resolveAllowedPath(raw); // throws (self-correcting) if outside roots
+  // An in-root but NON-EXISTENT cwd (typo, deleted dir) would also ENOENT-loop.
+  // Throw a clear, self-correcting error instead — mirrors the outside-roots msg
+  // so the model omits cwd or fixes it rather than retrying the same dead path.
+  if (!existsSync(resolved)) {
+    throw new Error(
+      `cwd does not exist: ${resolved}. Omit cwd to use the safe default (~/.clementine-next), `
+      + `or pass an existing directory inside an allowed workspace root.`,
+    );
+  }
+  return resolved;
 }
 
 function appendCapturedOutput(current: string, chunk: string): string {
