@@ -49,11 +49,26 @@ const OPENAI_ONLY_FIELDS = ['store', 'prompt_cache_retention', 'reasoning_effort
  *  reasoning_content); low/medium/high → enabled. GATED to GLM model ids — other
  *  compat backends 400 on an unknown `thinking` param. No-op if the caller
  *  already set `thinking`, or if the harness sent no effort (leave GLM's
- *  default). Mutates `body` in place. Exported for unit tests. */
+ *  default). Mutates `body` in place. Exported for unit tests.
+ *
+ *  STRUCTURED-OUTPUT OVERRIDE: when the request asks for structured output
+ *  (json_schema / json_object — i.e. the orchestrator decision, judges, every
+ *  contract-bound call), thinking is forced DISABLED regardless of effort.
+ *  GLM extended thinking + structured output corrupt each other — the thinking
+ *  stream bleeds into the answer and yields malformed JSON (the live
+ *  "reply: expected string, received …" failure → repair/re-ask/degraded turn)
+ *  AND adds latency to every decision. This mirrors the Claude
+ *  `withThinkingDisabled` fix on the verify/judge path. Free-form turns (no
+ *  structured contract) keep effort-driven thinking, where it actually helps. */
 export function applyGlmThinking(body: Record<string, unknown>, effort: string | undefined): void {
   const modelId = typeof body.model === 'string' ? body.model : '';
   if (!/glm/i.test(modelId)) return;
   if (body.thinking != null) return;
+  const rfType = (body.response_format as { type?: string } | undefined)?.type;
+  if (rfType === 'json_schema' || rfType === 'json_object') {
+    body.thinking = { type: 'disabled' }; // structured output — never think
+    return;
+  }
   if (!effort) return;
   body.thinking = effort === 'none' || effort === 'minimal'
     ? { type: 'disabled' }
