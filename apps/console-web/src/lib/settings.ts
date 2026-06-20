@@ -75,6 +75,7 @@ export interface SettingsSnapshot {
   };
   models?: ModelsSnapshot;
   modelBackend?: ModelBackend;
+  modelProviders?: ModelProvider[];
   claudeAuth?: ClaudeAuth;
   activeBrain?: ActiveBrain;
   fusion?: FusionSettings;
@@ -103,6 +104,10 @@ export interface ModelRolesSnapshot {
     worker: { provider: string; label: string; models: { id: string; label: string }[] }[];
     judge: { provider: string; label: string; models: { id: string; label: string }[] }[];
   };
+  // The brain picker: Codex / Claude / a BYO model, each flagged by availability.
+  brainOptions?: { id: ActiveBrain; label: string; available: boolean; modelId?: string }[];
+  // The brain the wire actually uses (all-in BYO → 'api_key' regardless of AUTH_MODE).
+  effectiveBrain?: ActiveBrain;
   activeBrain: ActiveBrain;
 }
 // Set (or clear) a worker/judge role model. Brain is a provider login switch
@@ -125,6 +130,36 @@ export const patchModels = (p: Partial<ModelTriple>) =>
   patch<{ models: ModelsSnapshot }>('/api/console/settings/models', p);
 export const patchModelBackend = (p: ModelBackendPatch) =>
   patch<{ modelBackend: ModelBackend; models: ModelsSnapshot }>('/api/console/settings/model-backend', p);
+
+// Multi-provider BYO registry. Each connected provider routes its own model ids
+// to its own key+endpoint, so the brain/worker/judge picker is the source of
+// truth across every added model. 'default' is the legacy single-backend slot;
+// the first provider you add becomes it. Connecting one returns the full list +
+// the routing mode (a fresh connect bumps mode 'off' → 'worker' so it's live).
+export interface ModelProvider {
+  id: string;
+  label: string;
+  baseURL: string;
+  modelIds: string[];
+  hasKey: boolean;
+  configured: boolean;
+  isDefault: boolean;
+}
+export interface ModelProvidersSnapshot { providers: ModelProvider[]; mode: ModelRoutingMode }
+export interface AddModelProviderInput {
+  id?: string;
+  label: string;
+  baseURL: string;
+  apiKey?: string;
+  modelIds: string[];
+  mode?: ModelRoutingMode;
+}
+export const listModelProviders = () =>
+  apiGet<ModelProvidersSnapshot>('/api/console/settings/model-providers');
+export const addModelProvider = (p: AddModelProviderInput) =>
+  api<ModelProvidersSnapshot>('/api/console/settings/model-providers', { method: 'POST', body: JSON.stringify(p) });
+export const removeModelProvider = (id: string) =>
+  api<ModelProvidersSnapshot>(`/api/console/settings/model-providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
 
 // Claude (Anthropic) subscription OAuth login.
 export interface ClaudeAuth { configured: boolean; reason?: string; plan?: string; expiresAt?: string }

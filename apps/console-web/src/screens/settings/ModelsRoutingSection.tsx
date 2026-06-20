@@ -6,8 +6,7 @@ import { getSettings } from '@/lib/settings';
 import { ModelRolesCard } from './ModelRolesCard';
 import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { CodexLoginForm } from './CodexLoginForm';
-import { ModelBackendForm } from './ModelBackendForm';
-import { FusionForm } from './FusionForm';
+import { ConnectedModelsStrip } from './ConnectedModelsStrip';
 
 /**
  * The ONE model section. Everything model-related lives here so the Settings
@@ -58,14 +57,14 @@ export function ModelsRoutingSection() {
 
       <ModelRolesCard embedded />
 
-      <div className="mt-5 space-y-3">
-        <Disclosure summary="Connect more models" hint="Codex · Claude login · alternative provider backend">
+      <div className="mt-5 space-y-4">
+        {/* API-key models, surfaced (no longer buried in a disclosure) — add one
+            and it lands in the pickers above with instant status feedback. */}
+        <ConnectedModelsStrip />
+
+        <Disclosure summary="Sign in to Codex / Claude" hint="subscription logins (OAuth)">
           <CodexLoginForm embedded />
           <ClaudeLoginForm embedded />
-          <ModelBackendForm embedded />
-        </Disclosure>
-        <Disclosure summary="Fusion / second opinion" hint="when two models collaborate on a turn">
-          <FusionForm embedded />
         </Disclosure>
       </div>
     </Card>
