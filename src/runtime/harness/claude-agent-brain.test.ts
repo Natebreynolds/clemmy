@@ -138,6 +138,42 @@ test('JIT default-off: the SDK brain passes the FULL profile + no mcpToolAllowli
   // full profile still present (e.g. the agentic execution tools), unfiltered.
   assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'));
   assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'));
+  // fan-out off by default → no extra MCP servers / run_worker not mounted.
+  assert.equal(captured.extraMcpServers, undefined, 'fan-out off → run_worker not exposed');
+});
+
+test('fan-out: CLEMMY_CLAUDE_SDK_FANOUT on (full mode) mounts the run_worker server + allows it', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_SDK_FANOUT = 'on';
+  let captured: any;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    captured = options;
+    return { text: 'ok', sessionId: 'sdk', model: 'claude-opus-4-8', toolUses: [], usage: { input_tokens: 1, output_tokens: 1 } };
+  });
+  try {
+    await respondViaClaudeAgentSdkBrain('home', { message: 'research these 3 prospects', sessionId: 'fanout-run' });
+    assert.ok(captured.extraMcpServers && captured.extraMcpServers['clementine-fanout'], 'fan-out server mounted');
+    assert.ok((captured.extraAllowedTools ?? []).some((t: string) => t.includes('run_worker')), 'run_worker allowed');
+  } finally {
+    delete process.env.CLEMMY_CLAUDE_SDK_FANOUT;
+  }
+});
+
+test('fan-out off in read_only/local_authoring mode even if the flag is on (full agentic only)', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_CLAUDE_SDK_FANOUT = 'on';
+  let captured: any;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    captured = options;
+    return { text: 'ok', sessionId: 'sdk', model: 'claude-sonnet-4-6', toolUses: [], usage: { input_tokens: 1, output_tokens: 1 } };
+  });
+  try {
+    await respondViaClaudeAgentSdkBrain('home', { message: 'do a thing', sessionId: 'fanout-ro' });
+    assert.equal(captured.extraMcpServers, undefined, 'no fan-out outside full agentic mode');
+  } finally {
+    delete process.env.CLEMMY_CLAUDE_SDK_FANOUT;
+  }
 });
 
 test('full mode: completion judge bounces a not-done turn into ONE continuation, then returns the finished answer', async () => {
