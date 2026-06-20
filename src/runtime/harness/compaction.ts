@@ -98,6 +98,19 @@ export interface CompactionOptions {
    * (fork) is suppressed — the checkpoint IS the reset.
    */
   forceLayer2?: boolean;
+  /**
+   * Age/idle-aware compaction (Phase 4a). Milliseconds since the session's last
+   * turn (the caller reads session.lastActivityAt() BEFORE this turn writes
+   * back). When the gap exceeds idleCompactionThresholdMs AND the transcript
+   * carries real weight (> idleCompactionMinTokens), proactively run Layer 1 +
+   * Layer 2 so a stale thread summarizes its old turns instead of dragging the
+   * full transcript into the return turn — even when it's below token pressure.
+   * Like forceLayer2, it summarizes IN PLACE (no Layer-3 fork). Omitted → no
+   * idle trigger (byte-identical to today).
+   */
+  idleMs?: number;
+  idleCompactionThresholdMs?: number;
+  idleCompactionMinTokens?: number;
   /** Test injection. */
   now?: () => string;
 }
@@ -725,8 +738,21 @@ export async function compactSessionIfNeeded(
   // multi-tool run while 85-99% of context was free. Token pressure is the real
   // signal; item count only matters when those items are actually filling the
   // window.
+  // Age/idle trigger (Phase 4a): a long-idle thread with real weight proactively
+  // summarizes so the return turn isn't dragged by the full stale transcript.
+  // Disabled by CLEMMY_IDLE_COMPACT=off. Default threshold 30 min idle, 6k tokens.
+  const idleDisabled = (process.env.CLEMMY_IDLE_COMPACT ?? 'on').toLowerCase() === 'off';
+  const idleThresholdMs = opts.idleCompactionThresholdMs ?? 30 * 60 * 1000;
+  const idleMinTokens = opts.idleCompactionMinTokens ?? 6000;
+  const idleTrigger =
+    !idleDisabled
+    && typeof opts.idleMs === 'number'
+    && opts.idleMs > idleThresholdMs
+    && beforeTokens > idleMinTokens;
+
   const layer1Trigger =
     opts.forceLayer2
+    || idleTrigger
     || beforeTokens > budget * l1Frac
     || (items.length > itemThreshold && beforeTokens > budget * l1ItemMinFrac);
   if (layer1Trigger) {
@@ -751,7 +777,7 @@ export async function compactSessionIfNeeded(
   }
 
   // Layer 2
-  if (opts.forceLayer2 || postL1Tokens > budget * l2Frac) {
+  if (opts.forceLayer2 || idleTrigger || postL1Tokens > budget * l2Frac) {
     const l2 = await summarizeOlderMessages(nextItems, session.id, retainMessages);
     result.layer2 = {
       applied: l2.applied,
@@ -770,10 +796,12 @@ export async function compactSessionIfNeeded(
     postL1Tokens = result.afterTokens;
   }
 
-  // Layer 3 — fork. Suppressed during a forced stage checkpoint: that pass IS
-  // the reset, so we never also recommend a session fork on the same boundary.
+  // Layer 3 — fork. Suppressed during a forced stage checkpoint OR an idle
+  // summarize: those passes reset IN PLACE, so we never also recommend a session
+  // fork on the same pass (idle summarizing shouldn't yank the user into a new
+  // session; if it's still huge, the next active turn's token pressure forks).
   let forkRequest: ForkRequest | undefined;
-  if (!opts.forceLayer2 && postL1Tokens > budget * l3Frac) {
+  if (!opts.forceLayer2 && !idleTrigger && postL1Tokens > budget * l3Frac) {
     forkRequest = buildForkRequest(nextItems, session.id);
     result.layer3 = { applied: true, forkRequested: true };
   }

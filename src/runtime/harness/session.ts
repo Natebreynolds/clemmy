@@ -124,6 +124,14 @@ export class HarnessSession {
     return this.conversation().lastResponseId;
   }
 
+  /** ISO timestamp the conversation snapshot was last written (i.e. the previous
+   *  turn's completion). Read BEFORE this turn writes back, it gives the idle gap
+   *  since the last turn — used by age/idle-aware compaction. Falls back to the
+   *  session createdAt for a brand-new session. */
+  lastActivityAt(): string {
+    return this.conversation().updatedAt;
+  }
+
   /** Append a raw user turn input event. */
   recordUserInput(text: string, turn: number): EventRow {
     return appendEvent({

@@ -2709,8 +2709,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const sessionItems = session.toInputItems();
   let compactedItems = sessionItems;
   let layer3WarningInjected = false;
+  // Idle gap since the last turn (read BEFORE this turn writes back, so it's the
+  // previous turn's completion → now). Feeds age/idle-aware compaction so a stale
+  // thread summarizes its old turns instead of dragging the full transcript in.
+  let idleMs: number | undefined;
   try {
-    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems);
+    const last = Date.parse(session.lastActivityAt());
+    if (Number.isFinite(last)) idleMs = Math.max(0, Date.now() - last);
+  } catch { /* no idle signal → no idle trigger (byte-identical to before) */ }
+  try {
+    const { result, nextItems, forkRequest } = await compactSessionIfNeeded(session, sessionItems, { idleMs });
     compactedItems = nextItems;
     if (result.modified) {
       session.updateConversationSnapshot(compactedItems);
