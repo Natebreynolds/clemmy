@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { relaxRequestForCompatBackend, wrapCompletionsCreate, liftReasoning } from './byo-model.js';
+import { relaxRequestForCompatBackend, wrapCompletionsCreate, liftReasoning, applyGlmThinking, repairToolCallArguments } from './byo-model.js';
 
 // --- test helpers for the wrapped-create repair layer ---------------------
 type AnyObj = Record<string, unknown>;
@@ -222,4 +222,80 @@ test('wrap: a structured streaming turn carries reasoning + repaired JSON', asyn
   const delta = (chunks[0].choices as AnyObj[])[0].delta as AnyObj;
   assert.match(delta.reasoning as string, /let me answer/);
   assert.deepEqual(JSON.parse(delta.content as string), { done: true });
+});
+
+// --- GLM (Z.ai) thinking control: effort -> `thinking` switch --------------
+
+test('applyGlmThinking: GLM id + reasoning effort enables/disables thinking by tier', () => {
+  const high: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(high, 'high');
+  assert.deepEqual(high.thinking, { type: 'enabled' });
+  const low: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(low, 'low');
+  assert.deepEqual(low.thinking, { type: 'enabled' });
+  const minimal: AnyObj = { model: 'glm-4.6' }; applyGlmThinking(minimal, 'minimal');
+  assert.deepEqual(minimal.thinking, { type: 'disabled' });
+  const none: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(none, 'none');
+  assert.deepEqual(none.thinking, { type: 'disabled' });
+});
+
+test('applyGlmThinking: non-GLM backend never gets a `thinking` field (would 400)', () => {
+  const ds: AnyObj = { model: 'deepseek-chat' }; applyGlmThinking(ds, 'high');
+  assert.equal('thinking' in ds, false);
+  const mm: AnyObj = { model: 'MiniMax-M3' }; applyGlmThinking(mm, 'low');
+  assert.equal('thinking' in mm, false);
+});
+
+test('applyGlmThinking: no effort, or pre-set thinking, is left alone', () => {
+  const noEffort: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(noEffort, undefined);
+  assert.equal('thinking' in noEffort, false, 'no effort -> leave GLM default');
+  const preset: AnyObj = { model: 'glm-5.2', thinking: { type: 'enabled', clear_thinking: false } };
+  applyGlmThinking(preset, 'none');
+  assert.deepEqual(preset.thinking, { type: 'enabled', clear_thinking: false }, 'caller-set thinking wins');
+});
+
+test('relax: GLM request translates stripped reasoning_effort into `thinking`', () => {
+  const out = relaxRequestForCompatBackend({
+    model: 'glm-5.2', reasoning_effort: 'high',
+    messages: [{ role: 'user', content: 'hi' }],
+  }) as Record<string, unknown>;
+  assert.equal('reasoning_effort' in out, false, 'OpenAI-only field still stripped');
+  assert.deepEqual(out.thinking, { type: 'enabled' }, 'effort survives as GLM thinking');
+});
+
+test('relax: non-GLM request strips reasoning_effort and adds no `thinking`', () => {
+  const out = relaxRequestForCompatBackend({
+    model: 'deepseek-chat', reasoning_effort: 'high',
+    messages: [{ role: 'user', content: 'hi' }],
+  }) as Record<string, unknown>;
+  assert.equal('reasoning_effort' in out, false);
+  assert.equal('thinking' in out, false);
+});
+
+// --- tool-call argument repair (reliability net) --------------------------
+
+test('repairToolCallArguments: fenced/prose-wrapped args are recovered', () => {
+  const c = completionWith('', [{ id: 't1', type: 'function', function: { name: 'f', arguments: '```json\n{"q":"acme"}\n```' } }]);
+  assert.equal(repairToolCallArguments(c), true);
+  const args = ((c.choices as AnyObj[])[0].message as AnyObj).tool_calls as AnyObj[];
+  assert.deepEqual(JSON.parse((args[0].function as AnyObj).arguments as string), { q: 'acme' });
+});
+
+function firstToolArgs(c: AnyObj): unknown {
+  const tc = ((c.choices as AnyObj[])[0].message as AnyObj).tool_calls as AnyObj[];
+  return (tc[0].function as AnyObj).arguments;
+}
+
+test('repairToolCallArguments: valid or empty args are left byte-identical', () => {
+  const valid = completionWith('', [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{"q":"x"}' } }]);
+  assert.equal(repairToolCallArguments(valid), false);
+  assert.equal(firstToolArgs(valid), '{"q":"x"}', 'healthy args untouched');
+  const empty = completionWith('', [{ id: 't1', type: 'function', function: { name: 'f', arguments: '' } }]);
+  assert.equal(repairToolCallArguments(empty), false, 'empty (no-arg call) untouched');
+  assert.equal(firstToolArgs(empty), '');
+});
+
+test('wrap: a tool-call turn with malformed args is repaired (non-stream)', async () => {
+  const fake = makeFake([() => completionWith('', [{ id: 't1', type: 'function', function: { name: 'f', arguments: 'here you go: {"q":"acme"}' } }])]);
+  const res = (await wrapCompletionsCreate(fake.fn)(structuredParams())) as AnyObj;
+  const tc = ((res.choices as AnyObj[])[0].message as AnyObj).tool_calls as AnyObj[];
+  assert.deepEqual(JSON.parse((tc[0].function as AnyObj).arguments as string), { q: 'acme' });
 });

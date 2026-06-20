@@ -41,6 +41,25 @@ const logger = pino({ name: 'clementine.byo-model' });
 // OpenAI-only request fields many compatible backends reject with a 400.
 const OPENAI_ONLY_FIELDS = ['store', 'prompt_cache_retention', 'reasoning_effort', 'verbosity'] as const;
 
+/** Map the harness's per-turn reasoning-effort tier onto GLM (Z.ai)'s
+ *  OpenAI-compatible `thinking` switch, so a GLM brain/worker actually responds
+ *  to Clementine's dynamic effort instead of running at the backend default.
+ *  `reasoning_effort` is otherwise stripped as an OpenAI-only field and silently
+ *  lost. none/minimal → disabled (fast; don't burn the output budget on
+ *  reasoning_content); low/medium/high → enabled. GATED to GLM model ids — other
+ *  compat backends 400 on an unknown `thinking` param. No-op if the caller
+ *  already set `thinking`, or if the harness sent no effort (leave GLM's
+ *  default). Mutates `body` in place. Exported for unit tests. */
+export function applyGlmThinking(body: Record<string, unknown>, effort: string | undefined): void {
+  const modelId = typeof body.model === 'string' ? body.model : '';
+  if (!/glm/i.test(modelId)) return;
+  if (body.thinking != null) return;
+  if (!effort) return;
+  body.thinking = effort === 'none' || effort === 'minimal'
+    ? { type: 'disabled' }
+    : { type: 'enabled' };
+}
+
 // Marks request bodies whose strict json_schema we downgraded to json_object,
 // so the response interceptor only repairs OUR structured calls — never a
 // tool-call turn, free-text worker output, or a pre-existing json_object
@@ -55,9 +74,16 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
   if (!body || typeof body !== 'object') return body;
   const next: Record<string, unknown> = { ...(body as Record<string, unknown>) };
 
+  // Capture the harness's per-turn reasoning effort BEFORE stripping it, so a
+  // backend with its own thinking switch (GLM) can honor it (below).
+  const requestedEffort = typeof next.reasoning_effort === 'string' ? next.reasoning_effort : undefined;
+
   for (const field of OPENAI_ONLY_FIELDS) {
     if (field in next) delete next[field];
   }
+
+  // GLM (Z.ai): drive its `thinking` switch from the (now-stripped) effort tier.
+  applyGlmThinking(next, requestedEffort);
 
   // Restore legacy (dynamic-first) order in system message(s) — a BYO backend
   // never caches via breakpoints, so its wire stays BYTE-IDENTICAL to pre-parity.
@@ -223,6 +249,33 @@ async function repairStructuredContent(original: CreateFn, relaxed: Record<strin
   logger.debug({ repaired, reAsked, kind: 'structured' }, 'byo json repair');
 }
 
+/** Repair malformed tool-call ARGUMENTS in place (strip fences / extract the
+ *  balanced JSON object) — the tool-turn analogue of repairStructuredContent.
+ *  A weaker compat backend can wrap function-call args in prose/fences, which
+ *  then fail the SDK's downstream JSON.parse with NO recovery (unlike structured
+ *  content). Only touches args that DON'T already parse, so a healthy tool call
+ *  stays byte-identical. No re-ask — a tool turn can't be cheaply re-elicited;
+ *  this recovers the common wrapping case. Returns true if anything changed.
+ *  Mutates the completion. Exported for unit tests. */
+export function repairToolCallArguments(completion: CompatCompletion): boolean {
+  const calls = completion?.choices?.[0]?.message?.tool_calls;
+  if (!Array.isArray(calls) || calls.length === 0) return false;
+  let changed = false;
+  for (const tc of calls) {
+    const fn = tc?.function;
+    const args = fn?.arguments;
+    // Skip absent / empty (no-arg call) / already-valid args.
+    if (!fn || typeof args !== 'string' || args === '' || isParseableJson(args)) continue;
+    const { text, repaired } = repairToParseableJson(args);
+    if (repaired && isParseableJson(text)) {
+      fn.arguments = text;
+      changed = true;
+    }
+  }
+  if (changed) logger.debug({ kind: 'tool_args' }, 'byo json repair');
+  return changed;
+}
+
 /** Re-emit a completion as a single SDK-legal stream chunk, carrying content +
  *  reasoning so the SDK preserves the thinking trace across turns. */
 async function* synthContentStream(completion: CompatCompletion): AsyncGenerator<unknown> {
@@ -291,7 +344,10 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
       }
       liftReasoning(completion);
       const msg = completion?.choices?.[0]?.message;
-      if (isToolOrEmpty(msg)) return synthFaithfulStream(completion);
+      if (isToolOrEmpty(msg)) {
+        repairToolCallArguments(completion);
+        return synthFaithfulStream(completion);
+      }
       if (structured) await repairStructuredContent(original, relaxed, options, completion);
       return synthContentStream(completion);
     }
@@ -299,7 +355,11 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
     const completion = (await original(relaxed, options)) as CompatCompletion;
     liftReasoning(completion);
     const msg = completion?.choices?.[0]?.message;
-    if (structured && !isToolOrEmpty(msg)) await repairStructuredContent(original, relaxed, options, completion);
+    if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {
+      repairToolCallArguments(completion);
+    } else if (structured && !isToolOrEmpty(msg)) {
+      await repairStructuredContent(original, relaxed, options, completion);
+    }
     return completion;
   };
 }
