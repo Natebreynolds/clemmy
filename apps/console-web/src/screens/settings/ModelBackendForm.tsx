@@ -24,6 +24,7 @@ type FormState = {
 const PROVIDER_PRESETS: { id: string; label: string; baseURL: string; workerModel: string; modelHint: string }[] = [
   { id: 'deepseek', label: 'DeepSeek', baseURL: 'https://api.deepseek.com', workerModel: 'deepseek-chat', modelHint: 'deepseek-chat (fast, non-thinking) is best for worker grunt work. deepseek-reasoner for hard reasoning. (New aliases: deepseek-v4-flash / deepseek-v4-pro.)' },
   { id: 'minimax', label: 'MiniMax', baseURL: 'https://api.minimax.io/v1', workerModel: 'MiniMax-M3', modelHint: 'MiniMax-M3 — current flagship (1M context, multimodal, agentic). Alternatives: MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.' },
+  { id: 'glm', label: 'GLM (Z.ai)', baseURL: 'https://api.z.ai/api/paas/v4', workerModel: 'glm-5.2', modelHint: 'glm-5.2 — Z.ai flagship (1M context, strong coding & agentic). Lighter alternatives: glm-4.6, glm-4.5-air. (GLM Coding Plan users: swap the base URL to https://api.z.ai/api/coding/paas/v4.)' },
   { id: 'custom', label: 'Custom (any OpenAI-compatible)', baseURL: '', workerModel: '', modelHint: 'Any OpenAI-compatible Chat Completions endpoint.' },
 ];
 

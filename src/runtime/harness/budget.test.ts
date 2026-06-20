@@ -108,6 +108,16 @@ test('modelContextLimit: prefix match for variants (longest-prefix wins)', () =>
   assert.equal(modelContextLimit('gpt-5.4-2026-04-snapshot'), 200_000);
 });
 
+test('modelContextLimit: BYO providers (MiniMax / DeepSeek / GLM) resolve, longest-prefix wins', () => {
+  assert.equal(modelContextLimit('MiniMax-M3'), 1_000_000);
+  assert.equal(modelContextLimit('MiniMax-M2.7'), 200_000); // generic MiniMax
+  assert.equal(modelContextLimit('deepseek-chat'), 128_000);
+  // GLM 5.2 is a 1M-context flagship; lighter glm-* variants take the safe 128K floor.
+  assert.equal(modelContextLimit('glm-5.2'), 1_000_000);
+  assert.equal(modelContextLimit('glm-4.6'), 128_000); // generic glm
+  assert.equal(modelContextLimit('glm-4.5-air'), 128_000); // generic glm
+});
+
 test('modelContextLimit: unknown model falls back to conservative default', () => {
   assert.equal(modelContextLimit('totally-made-up-model-xyz'), 128_000);
 });

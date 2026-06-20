@@ -149,6 +149,9 @@ const MODEL_CONTEXT_LIMITS: ReadonlyMap<string, number> = new Map([
   ['MiniMax-M3', 1_000_000],
   ['MiniMax', 200_000],
   ['deepseek', 128_000],
+  // GLM (Z.ai). Longest-prefix match resolves "glm-5.2" before the generic "glm".
+  ['glm-5.2', 1_000_000],
+  ['glm', 128_000],
 ]);
 
 /** Hard floor for the budget threshold. Smaller models with tiny
