@@ -200,6 +200,19 @@ export function isClaudeSubscriptionReady(): boolean {
   try { loadClaudeAccessToken(); return true; } catch { return false; }
 }
 
+/** Cheap, side-effect-free check (the vault FILE only — never the macOS keychain
+ *  or the network): is there a Clem-owned Claude token usable or refreshable as a
+ *  FALLBACK brain? The brain-fallback probe (codex-client) must not block on a
+ *  keychain prompt, so it uses THIS rather than loadFreshClaudeAccessToken. Only
+ *  vault tokens qualify — a Claude Code keychain token can't be auto-refreshed by
+ *  Clem (source !== 'vault'), so it's not a reliable unattended fallback. */
+export function claudeVaultFallbackReady(): boolean {
+  const t = getVaultClaudeTokens();
+  if (!t?.accessToken?.startsWith(OAT_PREFIX)) return false;
+  if (t.refreshToken) return true; // refreshable
+  return !t.expiresAt || t.expiresAt > Date.now() + 60_000; // or currently valid
+}
+
 /** Diagnostic snapshot (never includes the token value). */
 export function getClaudeAuthSnapshot(): { configured: boolean; reason?: string; plan?: string; expiresAt?: string } {
   try {
