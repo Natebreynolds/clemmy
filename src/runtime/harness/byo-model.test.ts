@@ -244,6 +244,31 @@ test('applyGlmThinking: non-GLM backend never gets a `thinking` field (would 400
   assert.equal('thinking' in mm, false);
 });
 
+test('applyGlmThinking: structured output (json_schema/json_object) forces thinking OFF regardless of effort', () => {
+  // The orchestrator decision + judges are structured; GLM thinking corrupts
+  // them ("reply: expected string") and adds latency — disable it there.
+  const schemaHigh: AnyObj = { model: 'glm-5.2', response_format: { type: 'json_schema' } };
+  applyGlmThinking(schemaHigh, 'high');
+  assert.deepEqual(schemaHigh.thinking, { type: 'disabled' }, 'json_schema + high effort → disabled');
+  const jsonObj: AnyObj = { model: 'glm-5.2', response_format: { type: 'json_object' } };
+  applyGlmThinking(jsonObj, 'medium');
+  assert.deepEqual(jsonObj.thinking, { type: 'disabled' }, 'json_object + medium effort → disabled');
+  // free-form (no structured contract) keeps effort-driven thinking
+  const freeform: AnyObj = { model: 'glm-5.2' };
+  applyGlmThinking(freeform, 'high');
+  assert.deepEqual(freeform.thinking, { type: 'enabled' }, 'free-form + high → enabled (unchanged)');
+});
+
+test('relax: a GLM structured (json_schema) request ends up with thinking disabled', () => {
+  const out = relaxRequestForCompatBackend({
+    model: 'glm-5.2', reasoning_effort: 'high',
+    response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object' } } },
+    messages: [{ role: 'user', content: 'decide' }],
+  }) as Record<string, unknown>;
+  assert.deepEqual(out.thinking, { type: 'disabled' }, 'structured GLM call → no thinking');
+  assert.equal((out.response_format as AnyObj).type, 'json_object', 'still downgraded for the wire');
+});
+
 test('applyGlmThinking: no effort, or pre-set thinking, is left alone', () => {
   const noEffort: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(noEffort, undefined);
   assert.equal('thinking' in noEffort, false, 'no effort -> leave GLM default');
