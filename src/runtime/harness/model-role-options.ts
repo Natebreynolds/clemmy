@@ -189,8 +189,15 @@ export function brainOptions(): BrainOption[] {
 }
 
 /** The brain the wire actually uses, for the picker's selected value: all-in BYO
- *  routing means the BYO model is the brain regardless of the stored AUTH_MODE. */
+ *  routing means the BYO model is the brain regardless of the stored AUTH_MODE.
+ *  Never returns a value the brain picker has no option for: 'api_key' is only a
+ *  real brain when a BYO backend is configured (brainOptions gates it the same
+ *  way) — otherwise getActiveAuthMode()'s default-'api_key' (unset AUTH_MODE, the
+ *  common Codex-only case) is clamped to Codex so the Select value stays in-list. */
 export function effectiveBrain(): BrainChoice {
-  if (getModelRoutingMode() === 'all_in' && getByoBackendConfig().configured) return 'api_key';
-  return getActiveAuthMode();
+  const byoConfigured = getByoBackendConfig().configured;
+  if (getModelRoutingMode() === 'all_in' && byoConfigured) return 'api_key';
+  const mode = getActiveAuthMode();
+  if (mode === 'api_key' && !byoConfigured) return 'codex_oauth';
+  return mode;
 }
