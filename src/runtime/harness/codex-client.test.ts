@@ -145,6 +145,39 @@ test('configureHarnessRuntime: claude_oauth FAILS CLOSED on an api03 API key (bi
   }
 });
 
+// REGRESSION GUARD: all_in (BYO brain) takes PRECEDENCE over a stale
+// AUTH_MODE=claude_oauth. A user who set a GLM brain via the old backend form
+// could be left with claude_oauth + all_in; the brain must run on GLM (no Claude
+// token needed) — NOT fail closed on an expired/invalid Claude token. We prove
+// the Claude preflight is SKIPPED by writing an api03 token (which would FAIL
+// CLOSED if the claude_oauth branch were taken) and asserting ok:true.
+test('configureHarnessRuntime: all_in + configured BYO wins over a stale claude_oauth (no Claude preflight)', async () => {
+  const prev = {
+    mode: process.env.AUTH_MODE, routing: process.env.MODEL_ROUTING_MODE,
+    base: process.env.BYO_MODEL_BASE_URL, id: process.env.BYO_MODEL_ID,
+    key: process.env.BYO_MODEL_API_KEY, debate: process.env.CLEMMY_DEBATE_MODE,
+  };
+  process.env.AUTH_MODE = 'claude_oauth';            // stale oauth mode
+  process.env.MODEL_ROUTING_MODE = 'all_in';
+  process.env.BYO_MODEL_BASE_URL = 'https://api.z.ai/api/paas/v4';
+  process.env.BYO_MODEL_ID = 'glm-5.2';
+  process.env.BYO_MODEL_API_KEY = 'fake-byo-key';    // → byo.configured = true
+  process.env.CLEMMY_DEBATE_MODE = 'off';
+  writeClaudeVault({ accessToken: 'sk-ant-api03-would-fail-closed' }); // invalid for Claude brain
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, true, result.reason); // BYO brain wins; Claude preflight skipped
+  } finally {
+    clearClaudeVault();
+    for (const [k, envk] of [['mode','AUTH_MODE'],['routing','MODEL_ROUTING_MODE'],['base','BYO_MODEL_BASE_URL'],['id','BYO_MODEL_ID'],['key','BYO_MODEL_API_KEY'],['debate','CLEMMY_DEBATE_MODE']] as const) {
+      const v = (prev as Record<string, string | undefined>)[k];
+      if (v === undefined) delete process.env[envk]; else process.env[envk] = v;
+    }
+    resetHarnessRuntimeConfig();
+  }
+});
+
 // A token with no decodable JWT exp → shouldRefresh falls back to the
 // lastRefresh wall-clock heuristic. `undefined` accessToken hits that path too.
 const NO_EXP = undefined;
