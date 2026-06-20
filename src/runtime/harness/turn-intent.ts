@@ -26,9 +26,11 @@ export type TurnIntent = 'qa' | 'action';
 
 // Irreversible/high-stakes action verbs in free-text user input. Deliberately
 // NARROW (irreversible shapes only) so it aligns with the gates' irreversible
-// focus and does NOT over-fire on reversible chatter. This is the vocabulary the
-// fusion layer already used (STAKES_ACTION_RE), lifted here as the shared truth.
-const ACTION_VERB_RE = /\b(send|sends|sending|sent|publish|publishes|published|deploy|deploys|deployed|launch|launches|launched|delete|deletes|deleting|migrate|migrates|wire|wires|charge|charges|charged|refund|refunds|production|irreversible)\b/i;
+// focus and does NOT over-fire on reversible chatter. Superset of the fusion
+// layer's old STAKES_ACTION_RE (no old match is dropped), lifted here as the
+// shared truth. UPCOMING tense only (base/-s/-ing) — NOT past tense: "I sent
+// the email" describes a COMPLETED action and should not read as action-intent.
+const ACTION_VERB_RE = /\b(send|sends|sending|publish|publishes|publishing|deploy|deploys|deploying|launch|launches|launching|delete|deletes|deleting|migrate|migrates|migrating|wire|wires|wiring|charge|charges|charging|refund|refunds|refunding|production|irreversible)\b/i;
 
 /** Classify a turn's text as a consequential 'action' or a light 'qa'.
  *  Pure + cheap. Empty/whitespace → 'qa'. */

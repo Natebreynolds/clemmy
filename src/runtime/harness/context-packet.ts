@@ -412,8 +412,9 @@ export function buildAgentContextPacket(
   // Everything that affects capability — skills, workflows, fan-out detection,
   // tool scope — is ALWAYS computed, so lightening can never drop a capability
   // hint (the regression that a narrow action-verb classifier would otherwise
-  // risk). Honors a kill-switch; default-on. Continuation turns arrive with the
-  // goal-grounded classifier input, so they classify 'action' and stay full.
+  // risk). Honors a kill-switch; default-on. A continuation turn may classify
+  // 'qa' and be lightened too — that's safe, since lightening drops ONLY
+  // health-probe telemetry, never anything the turn's work depends on.
   const turnIntent: 'qa' | 'action' = classifyTurnIntent(input);
   const lightenQa = lightQaTurnsEnabled() && turnIntent === 'qa';
   const skills = rankSkills(input);
