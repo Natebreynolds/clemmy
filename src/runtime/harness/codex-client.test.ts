@@ -61,11 +61,20 @@ test.after(() => {
   }
 });
 
-test('configureHarnessRuntime returns ok:false when no OAuth tokens are stored', async () => {
-  const result = await configureHarnessRuntime();
-  assert.equal(result.ok, false);
-  assert.match(result.reason ?? '', /No codex OAuth tokens/);
-  assert.match(result.reason ?? '', /clementine auth login-native/);
+test('configureHarnessRuntime returns ok:false when NO provider is connected', async () => {
+  // Block the host's real Claude keychain login so the brain-fallback chain
+  // (codex → claude → byo) finds nothing — the "truly nothing connected" path.
+  writeClaudeVault({ accessToken: 'sk-ant-api03-block-keychain-fallback' });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, false);
+    assert.match(result.reason ?? '', /No codex OAuth tokens/);
+    assert.match(result.reason ?? '', /Settings|login-native/);
+  } finally {
+    clearClaudeVault();
+    resetHarnessRuntimeConfig();
+  }
 });
 
 test('configureHarnessRuntime returns ok:true once tokens exist', async () => {
@@ -174,6 +183,27 @@ test('configureHarnessRuntime: all_in + configured BYO wins over a stale claude_
       const v = (prev as Record<string, string | undefined>)[k];
       if (v === undefined) delete process.env[envk]; else process.env[envk] = v;
     }
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('configureHarnessRuntime: dead Claude brain FALLS BACK to an available Codex (session-only)', async () => {
+  const prev = { mode: process.env.AUTH_MODE, routing: process.env.MODEL_ROUTING_MODE };
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' }); // Claude unusable (api03)
+  writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(result.fallback?.to, 'codex_oauth');
+    assert.match(result.fallback?.note ?? '', /Claude/);
+    assert.equal(process.env.AUTH_MODE, 'codex_oauth', 'session override applied (process.env only)');
+  } finally {
+    clearClaudeVault(); clearAuth();
+    if (prev.mode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prev.mode;
+    if (prev.routing === undefined) delete process.env.MODEL_ROUTING_MODE; else process.env.MODEL_ROUTING_MODE = prev.routing;
     resetHarnessRuntimeConfig();
   }
 });

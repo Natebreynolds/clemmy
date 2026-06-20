@@ -26,12 +26,19 @@
  * path. pi-ai (@earendil-works/pi-ai) and the v0.2 codex-native-runtime
  * both do the same thing.
  */
+import { randomUUID } from 'node:crypto';
 import { setDefaultModelProvider } from '@openai/agents';
 import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs } from '../auth-store.js';
 import { RouterModelProvider } from './router-model.js';
 import { maybeWrapDebate } from './debate-model.js';
-import { loadClaudeAccessToken } from '../claude-oauth.js';
+import { loadFreshClaudeAccessToken, claudeVaultFallbackReady } from '../claude-oauth.js';
+import { addNotification } from '../notifications.js';
 import { getModelRoutingMode, getByoBackendConfig, getActiveAuthMode } from '../../config.js';
+import pino from 'pino';
+
+const logger = pino({ name: 'clementine.codex-client' });
+
+type BrainMode = 'codex_oauth' | 'claude_oauth' | 'api_key';
 
 // Codex access tokens last ~1 hour. Prefer the token's REAL JWT `exp` and
 // refresh a skew before it; only fall back to this wall-clock guess off
@@ -91,6 +98,54 @@ let configured = false;
 export interface ConfigureResult {
   ok: boolean;
   reason?: string;
+  /** Set when the user's chosen brain couldn't authenticate and the harness
+   *  fell back to an available provider FOR THIS SESSION (so a restart retries
+   *  the real choice). Callers surface `note` to the user. */
+  fallback?: { from: string; to: BrainMode; note: string };
+}
+
+/**
+ * Find the first AVAILABLE alternative brain when the desired one can't
+ * authenticate. Order: Codex (subscription OAuth) → Claude (subscription OAuth,
+ * refreshed) → BYO (the user's own API key). Every option is a subscription
+ * login or the user's own key — never a silent pay-per-token fallback. Returns
+ * the fallback mode, or null when nothing usable is connected.
+ */
+function pickAvailableBrainFallback(skip: BrainMode): BrainMode | null {
+  // Every probe is cheap + side-effect-free: codex reads auth.json, claude reads
+  // the vault FILE only (claudeVaultFallbackReady — NEVER the keychain, which can
+  // surface a blocking GUI prompt), byo reads env/vault file. The actual Claude
+  // token refresh still happens at dispatch (claude-model uses loadFresh).
+  if (skip !== 'codex_oauth') {
+    try { if (getStoredCodexOAuthTokens()?.accessToken) return 'codex_oauth'; } catch { /* none */ }
+  }
+  if (skip !== 'claude_oauth') {
+    try { if (claudeVaultFallbackReady()) return 'claude_oauth'; } catch { /* none */ }
+  }
+  if (skip !== 'api_key') {
+    try { if (getByoBackendConfig().configured) return 'api_key'; } catch { /* none */ }
+  }
+  return null;
+}
+
+/** Apply a brain fallback for THIS SESSION ONLY (process.env override, NOT .env),
+ *  so a restart retries the user's real choice once they reconnect. Registers the
+ *  router, logs loudly, and notifies the user. */
+function applyBrainFallback(from: string, to: BrainMode): ConfigureResult {
+  process.env.AUTH_MODE = to;
+  if (to === 'api_key') process.env.MODEL_ROUTING_MODE = 'all_in';
+  setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
+  configured = true;
+  const label = to === 'codex_oauth' ? 'Codex' : to === 'claude_oauth' ? 'Claude' : 'your BYO model';
+  const note = `Your ${from} login isn't available, so I switched the brain to ${label} for now so I can keep working. Reconnect ${from} in Settings → Models to switch back.`;
+  logger.warn({ from, to }, `brain fallback engaged — ${note}`);
+  try {
+    addNotification({
+      id: randomUUID(), kind: 'system', title: 'Brain switched (login unavailable)',
+      body: note, createdAt: new Date().toISOString(), read: false,
+    });
+  } catch { /* notification is best-effort */ }
+  return { ok: true, fallback: { from, to, note } };
 }
 
 /**
@@ -125,19 +180,27 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
 
   // Claude brain (subscription OAuth) — when AUTH_MODE=claude_oauth (and not the
   // all_in BYO-brain case above), every role runs on Claude via the user's
-  // Max/Pro subscription, peer to Codex. Fail closed unless a valid `oat01`
-  // SUBSCRIPTION token is present: the preflight throws on a missing/expired
-  // token OR an `api03` API key, so a subscription user can never be silently
-  // pay-per-token billed.
+  // Max/Pro subscription. We REFRESH the token at the gate (loadFresh, not the
+  // sync loader) — a refreshable-but-expired access token is renewed here instead
+  // of throwing "expired", which was the recurring "Claude login keeps expiring"
+  // bug: the gate threw before the request-path refresher ever ran. Still fails
+  // closed on a missing token or an `api03` API key (billing guard). If Claude
+  // genuinely can't authenticate, fall back to another connected model.
   if (getActiveAuthMode() === 'claude_oauth') {
     try {
-      loadClaudeAccessToken();
+      await loadFreshClaudeAccessToken();
+      setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
+      configured = true;
+      return { ok: true };
     } catch (err) {
-      return { ok: false, reason: err instanceof Error ? err.message : 'Claude subscription auth is not ready.' };
+      const fb = pickAvailableBrainFallback('claude_oauth');
+      if (fb) return applyBrainFallback('Claude', fb);
+      return {
+        ok: false,
+        reason: (err instanceof Error ? err.message : 'Claude subscription auth is not ready.')
+          + ' No other model is connected — set one up in Settings → Models.',
+      };
     }
-    setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
-    configured = true;
-    return { ok: true };
   }
 
   // all_in requested but no BYO backend configured → clear, actionable error.
@@ -152,11 +215,15 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
 
   const tokens = getStoredCodexOAuthTokens();
   if (!tokens?.accessToken) {
+    // Codex is the default brain but isn't logged in — fall back to any other
+    // connected model (Claude / BYO) before surfacing a hard error.
+    const fb = pickAvailableBrainFallback('codex_oauth');
+    if (fb) return applyBrainFallback('Codex', fb);
     return {
       ok: false,
       reason:
         'No codex OAuth tokens are stored. Run `clementine auth login-native` ' +
-        '(or `clementine auth import-codex` if you already use the Codex CLI).',
+        '(or connect Claude or a BYO model in Settings → Models).',
     };
   }
 
