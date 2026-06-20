@@ -41,6 +41,7 @@ import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
 import { resolveByoProviderForModel } from './byo-providers.js';
+import { classifyTurnIntent } from './turn-intent.js';
 import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
@@ -160,7 +161,8 @@ function isWorkerScope(): boolean {
  *  high-stakes enough to spend the Claude checker on. Word-boundary,
  *  case-insensitive. (Bare nouns like "proposal"/"invoice" are deliberately NOT
  *  triggers — they fire on pure drafting/research; only the action verbs do.) */
-const STAKES_ACTION_RE = /\b(send|sends|sending|publish|publishes|deploy|launch|delete|migrate|wire|charge|refund|production|irreversible)\b/i;
+// Irreversible-action keyword detection now lives in the shared turn-intent
+// classifier (the single source of truth, reused by the context packet too).
 /** The CONTINUATION_INPUT sentinel (loop.ts) — a mid-execution re-loop nudge, not
  *  a fresh ask; a continuation falls to the goal signal, not the nudge text. */
 const CONTINUATION_PREFIX_RE = /^Continue with the next step of your plan/;
@@ -232,13 +234,13 @@ function isHighStakes(request: ModelRequest): boolean {
   const userText = renderLatestUserText(request);
   const isContinuation = CONTINUATION_PREFIX_RE.test(userText.trim());
   if (!isContinuation) {
-    if (STAKES_ACTION_RE.test(userText)) return true;
+    if (classifyTurnIntent(userText) === 'action') return true;
     if (userText.length >= 800) return true;
     const tools = (request as { tools?: unknown[] }).tools;
     if (Array.isArray(tools) && tools.length > 0 && userText.length >= 200) return true;
   }
   // continuation OR no user-text hit → judge by the pending goal's Objective.
-  return STAKES_ACTION_RE.test(renderActiveGoalObjective(request));
+  return classifyTurnIntent(renderActiveGoalObjective(request)) === 'action';
 }
 
 export function shouldDebate(request: ModelRequest): boolean {
