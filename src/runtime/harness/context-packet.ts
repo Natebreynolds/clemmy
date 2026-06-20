@@ -7,6 +7,7 @@ import { listWorkflows } from '../../memory/workflow-store.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
+import { classifyTurnIntent } from './turn-intent.js';
 
 export interface MemoryPrimerSummary {
   enabled: boolean;
@@ -40,6 +41,10 @@ export interface MultiItemIntent {
 export interface AgentContextPacket {
   inputPreview: string;
   complexity: 'simple' | 'moderate' | 'complex';
+  /** Shared "is this turn consequential" signal (turn-intent.ts). 'qa' turns
+   *  skip the safe-to-skip preflight I/O (health probes, fan-out detection);
+   *  capability hints (skills/workflows) are always kept. Advisory only. */
+  turnIntent: 'qa' | 'action';
   memory: MemoryPrimerSummary;
   skills: RankedContextCandidate[];
   workflows: RankedContextCandidate[];
@@ -210,6 +215,12 @@ const STATIC_PARALLELISM_LINE =
 
 function fanoutDirectiveEnabled(): boolean {
   return (process.env.CLEMMY_FANOUT_DIRECTIVE ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Lighten pure-Q&A turns (skip health probes + fan-out detection). Validated
+ *  behavior is the default; CLEMMY_LIGHT_QA_TURNS=off restores the full preflight. */
+function lightQaTurnsEnabled(): boolean {
+  return (process.env.CLEMMY_LIGHT_QA_TURNS ?? 'on').toLowerCase() !== 'off';
 }
 
 function clip(text: string, max: number): string {
@@ -396,11 +407,20 @@ export function buildAgentContextPacket(
   opts?: { sessionKind?: string; sessionId?: string },
 ): AgentContextPacket {
   const complexity = classifyComplexity(input);
+  // Pure-Q&A turns skip ONLY the health probes (disk + MCP I/O) — pure telemetry
+  // that never changes what the model CAN do, so it's safe to drop on a question.
+  // Everything that affects capability — skills, workflows, fan-out detection,
+  // tool scope — is ALWAYS computed, so lightening can never drop a capability
+  // hint (the regression that a narrow action-verb classifier would otherwise
+  // risk). Honors a kill-switch; default-on. Continuation turns arrive with the
+  // goal-grounded classifier input, so they classify 'action' and stay full.
+  const turnIntent: 'qa' | 'action' = classifyTurnIntent(input);
+  const lightenQa = lightQaTurnsEnabled() && turnIntent === 'qa';
   const skills = rankSkills(input);
   const workflows = rankWorkflows(input);
   const toolScope = summarizeToolScope(input);
-  const mcp = mcpHealth();
-  const healthWarnings = [
+  const mcp = lightenQa ? [] : mcpHealth();
+  const healthWarnings = lightenQa ? [] : [
     ...diskHealthWarnings(),
     ...mcp.map((server) => `MCP ${server.slug} is ${server.state}${server.lastError ? `: ${server.lastError}` : ''}`),
   ];
@@ -413,6 +433,9 @@ export function buildAgentContextPacket(
   // steps can't restructure their own pipeline (forEach is an authoring-time
   // decision) and workers are already a fanned-out unit, so non-chat kinds keep
   // the static line byte-identical (zero-regression). Honors the kill-switch.
+  // Fan-out detection always runs — a multi-item request ("research these 8
+  // companies") has no action verb but is NOT light; dropping it would lose the
+  // parallelism directive. Only the health probes (below) are safe to skip on qa.
   const fanoutEnabled = fanoutDirectiveEnabled();
   const multiItem = fanoutEnabled ? detectMultiItemIntent(input) : NO_MULTI_ITEM;
   const offerFanout = fanoutEnabled && multiItem.isMultiItem && opts?.sessionKind === 'chat';
@@ -435,6 +458,7 @@ export function buildAgentContextPacket(
   return {
     inputPreview: clip(input, 200),
     complexity,
+    turnIntent,
     memory,
     skills,
     workflows,
