@@ -83,15 +83,20 @@ export function getByoProviders(): ByoProvider[] {
 }
 
 /** Build the per-call ByoBackendConfig getByoModel wants for a provider,
- *  pulling its key from the vault/env. `modelId` is cosmetic here (getByoModel
- *  takes the real id separately) — kept for parity with getByoBackendConfig. */
-export function providerToBackendConfig(p: ByoProvider, modelId?: string): ByoBackendConfig {
+ *  pulling its key from the vault/env. `primaryId` is the provider's OWN primary
+ *  model (its first declared id) — NOT the requested model id. The router's
+ *  all_in codex-collapse (`resolveProvider(name)==='codex' ? backend.primaryId
+ *  : name`) reads primaryId to remap a stray gpt-* id onto the BYO model, so it
+ *  MUST be the provider's real model (e.g. glm-5.2), never the gpt-* id that was
+ *  requested — otherwise a gpt-* id gets sent verbatim to the BYO endpoint. The
+ *  model actually sent on the wire is passed to getByoModel separately. */
+export function providerToBackendConfig(p: ByoProvider): ByoBackendConfig {
   const apiKey = getByoProviderApiKey(p.id);
   return {
     configured: Boolean(p.baseURL && apiKey),
     baseURL: p.baseURL,
     apiKey,
-    primaryId: modelId || p.modelIds[0] || '',
+    primaryId: p.modelIds[0] || '',
     judgeId: p.modelIds[0] || '',
     providerLabel: p.label,
   };
@@ -115,13 +120,13 @@ export function resolveByoProviderForModel(modelId: string): ByoBackendConfig | 
   // Explicit, non-default ownership wins (newer connected providers beat the
   // migrated legacy 'default' for a shared id).
   const explicit = providers.find((p) => p.id !== 'default' && p.modelIds.includes(id));
-  if (explicit) return providerToBackendConfig(explicit, id);
+  if (explicit) return providerToBackendConfig(explicit);
 
   const anyOwner = providers.find((p) => p.modelIds.includes(id));
-  if (anyOwner) return providerToBackendConfig(anyOwner, id);
+  if (anyOwner) return providerToBackendConfig(anyOwner);
 
   // Single provider owns everything (byte-identical single-backend behavior).
-  if (providers.length === 1) return providerToBackendConfig(providers[0], id);
+  if (providers.length === 1) return providerToBackendConfig(providers[0]);
 
   return undefined;
 }

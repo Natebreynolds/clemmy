@@ -3911,9 +3911,11 @@ export function registerConsoleRoutes(
       }
 
       // A freshly-connected provider must be routable: bump 'off' → 'worker'.
+      // Write BOTH .env and process.env (getRuntimeEnv reads process.env first,
+      // so a stale process value from the active-brain route would mask .env).
       const mode = body.mode === 'worker' || body.mode === 'all_in' ? body.mode : undefined;
-      if (mode) updateEnvKey('MODEL_ROUTING_MODE', mode);
-      else if (getModelRoutingMode() === 'off') updateEnvKey('MODEL_ROUTING_MODE', 'worker');
+      const nextMode = mode ?? (getModelRoutingMode() === 'off' ? 'worker' : undefined);
+      if (nextMode) { updateEnvKey('MODEL_ROUTING_MODE', nextMode); process.env.MODEL_ROUTING_MODE = nextMode; }
 
       resetHarnessRuntimeConfig();
       resetByoModelCache();
@@ -3935,6 +3937,14 @@ export function registerConsoleRoutes(
         const extras = getByoProviders().filter((p) => p.id !== 'default' && p.id !== id);
         updateEnvKey('BYO_PROVIDERS', serializeExtraProviders(extras));
         updateEnvKey(byoProviderKeyEnvKey(id), '');
+      }
+      // Never strand the user on an unusable brain: if removing this provider
+      // leaves all_in (BYO-brain) mode with no configured backend, step the brain
+      // down to 'off' and revert an api_key auth to Codex — mirrors the
+      // active-brain route's all_in→off guard (which the DELETE path must match).
+      if (getModelRoutingMode() === 'all_in' && !getByoBackendConfig().configured) {
+        updateEnvKey('MODEL_ROUTING_MODE', 'off'); process.env.MODEL_ROUTING_MODE = 'off';
+        if (getActiveAuthMode() === 'api_key') { updateEnvKey('AUTH_MODE', 'codex_oauth'); process.env.AUTH_MODE = 'codex_oauth'; }
       }
       resetHarnessRuntimeConfig();
       resetByoModelCache();

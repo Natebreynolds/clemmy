@@ -73,6 +73,28 @@ test('a single provider owns everything (byte-identical single-backend behavior)
   });
 });
 
+test('primaryId is the PROVIDER\'s own model, never the requested id (all_in codex-collapse safety)', () => {
+  // REGRESSION GUARD: the router's all_in branch does
+  //   id = resolveProvider(name)==='codex' ? (backend.primaryId || name) : name
+  // so backend.primaryId MUST be the BYO model (glm-5.2), NOT the requested gpt-*
+  // id — else a gpt-* id is sent verbatim to the GLM endpoint and the call fails
+  // (this breaks the grounding/goal-fidelity gates, which request MODELS.fast).
+  withEnv({ BYO_MODEL_BASE_URL: ZAI, BYO_MODEL_ID: 'glm-5.2', BYO_MODEL_API_KEY: 'zai-key' }, () => {
+    // a stray codex-shaped id resolves to the single provider, but primaryId
+    // stays the provider's own model so the collapse remaps correctly
+    assert.equal(resolveByoProviderForModel('gpt-5.4-mini')?.primaryId, 'glm-5.2');
+    assert.equal(resolveByoProviderForModel('glm-5.2')?.primaryId, 'glm-5.2');
+  });
+  // multi-provider: a model's OWN provider config still reports that provider's primary
+  withEnv({
+    ...DEFAULT_ENV, BYO_PROVIDERS: EXTRAS,
+    BYO_PROVIDER_MINIMAX_API_KEY: 'mm', BYO_PROVIDER_DEEPSEEK_API_KEY: 'ds',
+  }, () => {
+    assert.equal(resolveByoProviderForModel('MiniMax-M3')?.primaryId, 'MiniMax-M3');
+    assert.equal(resolveByoProviderForModel('deepseek-chat')?.primaryId, 'deepseek-chat');
+  });
+});
+
 test('an unclaimed id with multiple providers returns undefined (caller falls back to legacy)', () => {
   withEnv({
     ...DEFAULT_ENV, BYO_PROVIDERS: EXTRAS,
