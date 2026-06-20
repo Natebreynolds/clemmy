@@ -92,12 +92,31 @@ export async function completeClaudeLogin(rawCode: string, verifier: string, fal
 
 /** Refresh using the (rotating) refresh token. Returns a NEW token set whose
  *  refresh_token MUST be persisted (Anthropic rotates it). */
+// Bound the refresh network call. Anthropic's token endpoint can HANG (not 529)
+// under load; without a deadline a near-expiry refresh on the startup gate or
+// request path would block on undici's multi-minute default. 15s is plenty for a
+// token exchange; on timeout we throw, and callers degrade (loadFresh falls back
+// to the current token; configure falls back to another brain).
+const REFRESH_TIMEOUT_MS = 15_000;
+
 export async function refreshClaudeTokens(refreshToken: string): Promise<ClaudeTokenSet> {
-  const res = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: CLIENT_ID }),
-  });
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), REFRESH_TIMEOUT_MS);
+  (timer as { unref?: () => void }).unref?.();
+  let res: Response;
+  try {
+    res = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: CLIENT_ID }),
+      signal: ctl.signal,
+    });
+  } catch (err) {
+    if (ctl.signal.aborted) throw new Error(`Claude token refresh timed out after ${REFRESH_TIMEOUT_MS}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   const text = await res.text();
   if (!res.ok) throw new Error(`Claude token refresh failed (${res.status}): ${text.slice(0, 200)}`);
   return parseTokenResponse(JSON.parse(text) as Record<string, unknown>);

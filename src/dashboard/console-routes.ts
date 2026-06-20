@@ -3795,18 +3795,20 @@ export function registerConsoleRoutes(
       const explicitWorker = cleanId(body.workerModel);
       const providerLabel = typeof body.providerLabel === 'string' ? body.providerLabel.trim().slice(0, 40) : '';
 
+      const prevMode = getModelRoutingMode(); // capture BEFORE the overwrite below
       updateEnvKey('MODEL_ROUTING_MODE', mode);
       process.env.MODEL_ROUTING_MODE = mode; // getRuntimeEnv reads process.env first
       // Keep AUTH_MODE and MODEL_ROUTING_MODE from drifting — the root cause of
       // the "settings says GLM but the brain is actually Claude (token expired)"
       // trap. all_in means the BYO model IS the brain, so the auth mode must be
-      // api_key; leaving a stale codex/claude_oauth here makes configure pick the
-      // wrong (oauth) brain. Conversely, leaving all_in for off/worker hands the
-      // brain back to Codex/Claude, so an api_key auth mode must revert. (The new
-      // active-brain picker already does this; this closes the legacy form's leak.)
+      // api_key. Conversely, LEAVING all_in (prevMode was all_in) hands the brain
+      // back to Codex — but ONLY then: we must not flip a user who was already on
+      // api_key for some other reason (e.g. a legacy OpenAI-key install) just
+      // because they saved the form in off/worker. (The active-brain picker keeps
+      // these consistent too; this closes the legacy form's leak without overreach.)
       if (mode === 'all_in') {
         updateEnvKey('AUTH_MODE', 'api_key'); process.env.AUTH_MODE = 'api_key';
-      } else if (getActiveAuthMode() === 'api_key') {
+      } else if (prevMode === 'all_in' && getActiveAuthMode() === 'api_key') {
         updateEnvKey('AUTH_MODE', 'codex_oauth'); process.env.AUTH_MODE = 'codex_oauth';
       }
       updateEnvKey('BYO_MODEL_BASE_URL', baseURL);
