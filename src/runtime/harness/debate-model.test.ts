@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
@@ -22,8 +22,20 @@ const {
   heartbeatsUntil,
   streamResponseAsEvents,
   setJudgeOrderCoinForTest,
+  resolveDebateBrains,
+  verifyJudgeAvailable,
 } = await import('./debate-model.js');
 const { getDebateCheckerModel } = await import('../../config.js');
+
+// Codex logged in, Claude NOT (a non-oat01 token blocks the host-keychain fallback
+// so claudeAvailable() can't see the operator's real Claude login). Verify-judge tests.
+function writeCodexAuth(): void {
+  const state = path.join(process.env.CLEMENTINE_HOME as string, 'state');
+  mkdirSync(state, { recursive: true });
+  writeFileSync(path.join(state, 'auth.json'), JSON.stringify({ codexOauth: { accessToken: 'codex-access', refreshToken: 'codex-refresh' } }), 'utf-8');
+  writeFileSync(path.join(state, 'claude-auth.json'), JSON.stringify({ accessToken: 'sk-ant-api03-not-a-subscription-token' }), 'utf-8');
+}
+const fakeProvider = (m: Model): import('@openai/agents-core').ModelProvider => ({ getModel: () => m }) as import('@openai/agents-core').ModelProvider;
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -758,4 +770,53 @@ test('heartbeatsUntil: intervalMs<=0 disables heartbeats entirely', async () => 
   const first = await gen.next();
   assert.equal(first.done, true);
   resolve!(null);
+});
+
+// --- verify-strategy brain assembly: GLM brain + Codex judge -----------------
+
+const GLM_BRAIN_ENV = {
+  MODEL_ROUTING_MODE: 'all_in',
+  BYO_MODEL_BASE_URL: 'https://api.z.ai/api/paas/v4',
+  BYO_MODEL_ID: 'glm-5.2',
+  BYO_MODEL_API_KEY: 'zai-key',
+  BYO_MODEL_PROVIDER: 'GLM (Z.ai)',
+  BYO_PROVIDERS: '',
+  CLEMMY_MODEL_ROLES: '',
+};
+
+test('resolveDebateBrains (verify): GLM brain + Codex judge engages without two flagships', async () => {
+  writeCodexAuth(); // Codex available; Claude NOT
+  await withEnv({ ...GLM_BRAIN_ENV, CLEMMY_FUSION_STRATEGY: 'verify', CLEMMY_DEBATE_JUDGE: 'codex' }, () => {
+    const pass = model({});
+    const b = resolveDebateBrains(fakeProvider(pass));
+    assert.notEqual(b, null, 'verify fusion engages with a BYO brain + Codex judge');
+    // verify signature: the executor IS the passthrough (no second flagship draft)
+    assert.equal(b!.draftA, b!.passthrough);
+    assert.equal(b!.draftB, b!.passthrough);
+    assert.notEqual(b!.judge, b!.passthrough, 'the judge is a distinct (Codex) model');
+  });
+});
+
+test('resolveDebateBrains (verify): no DIFFERENT judge available → null (no self-check)', async () => {
+  writeCodexAuth();
+  // judge control points at Claude, which is NOT logged in → cannot field a judge
+  await withEnv({ ...GLM_BRAIN_ENV, CLEMMY_FUSION_STRATEGY: 'verify', CLEMMY_DEBATE_JUDGE: 'claude' }, () => {
+    const b = resolveDebateBrains(fakeProvider(model({})));
+    assert.equal(b, null);
+  });
+});
+
+test('verifyJudgeAvailable reflects the GLM-brain + Codex-judge pairing', async () => {
+  writeCodexAuth();
+  await withEnv({ ...GLM_BRAIN_ENV, CLEMMY_FUSION_STRATEGY: 'verify', CLEMMY_DEBATE_JUDGE: 'codex' }, () => {
+    assert.equal(verifyJudgeAvailable(), true);
+  });
+  // debate strategy uses the two-flagship path, not this helper
+  await withEnv({ ...GLM_BRAIN_ENV, CLEMMY_FUSION_STRATEGY: 'debate', CLEMMY_DEBATE_JUDGE: 'codex' }, () => {
+    assert.equal(verifyJudgeAvailable(), false);
+  });
+  // verify + judge=claude but Claude not logged in → not available
+  await withEnv({ ...GLM_BRAIN_ENV, CLEMMY_FUSION_STRATEGY: 'verify', CLEMMY_DEBATE_JUDGE: 'claude' }, () => {
+    assert.equal(verifyJudgeAvailable(), false);
+  });
 });

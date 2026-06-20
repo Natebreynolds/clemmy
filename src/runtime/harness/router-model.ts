@@ -18,6 +18,7 @@
 import type { Model, ModelProvider } from '@openai/agents-core';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
+import { resolveByoProviderForModel } from './byo-providers.js';
 import { ClaudeModelProvider } from './claude-model.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { codexModelsAvailable } from './model-role-options.js';
@@ -37,10 +38,13 @@ export class RouterModelProvider implements ModelProvider {
     const name = requested || MODELS.primary;
 
     if (mode === 'all_in') {
-      if (!byo.configured) throw new Error('BYO all-in mode is enabled, but no BYO backend is configured.');
-      const id = resolveProvider(name) === 'codex' ? (byo.primaryId || name) : name;
+      // Multi-provider: route to the provider that OWNS this id; fall back to
+      // the legacy single backend (byte-identical when one provider exists).
+      const backend = resolveByoProviderForModel(name) ?? byo;
+      if (!backend.configured) throw new Error('BYO all-in mode is enabled, but no BYO backend is configured.');
+      const id = resolveProvider(name) === 'codex' ? (backend.primaryId || name) : name;
       logger.debug({ requested: name, routedTo: id, backend: 'byo' }, 'route (all_in)');
-      return getByoModel(id, byo);
+      return getByoModel(id, backend);
     }
 
     switch (resolveProvider(name)) {
@@ -48,11 +52,14 @@ export class RouterModelProvider implements ModelProvider {
         logger.debug({ requested: name, backend: 'claude' }, 'route');
         return this.claude.getModel(name);
       case 'byo': {
-        if (!byo.configured) {
+        // Multi-provider: dispatch to the model's owning provider (its own
+        // baseURL+key); fall back to the legacy single backend.
+        const backend = resolveByoProviderForModel(name) ?? byo;
+        if (!backend.configured) {
           throw new Error(`Model ${name} resolves to a BYO/OpenAI-compatible backend, but no BYO backend is configured.`);
         }
         logger.debug({ requested: name, backend: 'byo' }, 'route');
-        return getByoModel(name, byo);
+        return getByoModel(name, backend);
       }
       case 'codex':
       default:

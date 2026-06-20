@@ -36,11 +36,12 @@
  */
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getByoBackendConfig, judgeChoice } from '../../config.js';
+import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getDebateCheckerModel, getByoBackendConfig, judgeChoice, MODELS } from '../../config.js';
 import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
-import { resolveRoleModel } from './model-roles.js';
+import { resolveByoProviderForModel } from './byo-providers.js';
+import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -764,6 +765,30 @@ export function debateBrainsAvailable(): { claude: boolean; codex: boolean } {
   return { claude: claudeAvailable(), codex: codexAvailable() };
 }
 
+/**
+ * Whether the 'verify' fusion strategy can actually run right now: the judge role
+ * resolves to an AVAILABLE provider that is DIFFERENT from the active brain (e.g.
+ * GLM brain + Codex judge). Used so the settings UI can show fusion as active even
+ * without two flagships. Returns false in 'debate' strategy (that needs both
+ * flagships — debateBrainsAvailable covers it).
+ */
+export function verifyJudgeAvailable(): boolean {
+  if (fusionStrategy() !== 'verify') return false;
+  const brain = resolveRoleModel('brain');
+  const checker = resolveRoleModel('judge');
+  if (checker.provider === brain.provider && checker.modelId === brain.modelId) {
+    // Same as brain → fall back to the legacy Fusion judge control (must be a
+    // DIFFERENT, available provider — mirrors resolveDebateBrains).
+    const choice = judgeChoice();
+    if (choice === 'codex') return codexAvailable() && brain.provider !== 'codex';
+    return claudeAvailable() && brain.provider !== 'claude';
+  }
+  if (checker.provider === 'codex') return codexAvailable();
+  if (checker.provider === 'claude') return claudeAvailable();
+  const byo = resolveByoProviderForModel(checker.modelId) ?? getByoBackendConfig();
+  return byo.configured;
+}
+
 let lastDebateActive: boolean | null = null;
 /** Log ONCE when debate flips active<->inactive. A flagship login lapsing (e.g.
  *  Claude's OAuth token expiring) makes debate fall back to single-brain — which
@@ -786,42 +811,72 @@ function logDebateAvailabilityTransition(active: boolean): void {
  * through). The "passthrough" brain is the harness's normal default for the
  * active auth mode — non-debate turns run on it, byte-identical to today.
  */
+/**
+ * Build the judge Model for the resolved 'judge' role, or null when that
+ * provider isn't available. Shared by the debate and verify paths. Routes a BYO
+ * judge to the provider that OWNS its model id (its own key+endpoint) — so a
+ * MiniMax judge hits MiniMax, not whatever single backend is configured.
+ */
+function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, haveCodex: boolean): Model | null {
+  if (checker.provider === 'codex') {
+    return haveCodex ? new CodexModelProvider().getModel(checker.modelId) : null;
+  }
+  if (checker.provider === 'byo') {
+    const byo = resolveByoProviderForModel(checker.modelId) ?? getByoBackendConfig();
+    return byo.configured ? getByoModel(checker.modelId, byo) : null;
+  }
+  // claude
+  if (!haveClaude) return null;
+  return checker.modelId && checker.modelId !== getClaudeBrainModel()
+    ? new ClaudeModelProvider().getModel(checker.modelId)
+    : new ClaudeModelProvider().getModel();
+}
+
 export function resolveDebateBrains(passthrough: ModelProvider, modelName?: string): DebateBrains | null {
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
-  if (!haveClaude || !haveCodex) return null;
 
-  // Build the Claude brain through the PROVIDER (not bare getClaudeModel) so it
-  // carries the overload fallback chain Opus -> Sonnet -> Codex. Without it, an
-  // Anthropic 529 on the checker exhausts retries and THROWS — failing the whole
-  // fusion run with "Overloaded" instead of falling back. The checker (and the
-  // Claude drafter) now degrade gracefully under Anthropic capacity pressure
-  // rather than taking the turn down. (CLEMMY_CLAUDE_OVERLOAD_FALLBACK=off opts out.)
+  // VERIFY strategy needs only ONE executor (the active brain = passthrough) plus
+  // a checker (the judge role) — draftA/draftB are unused in verify. So it can run
+  // for a BYO brain (e.g. GLM 5.2) + a Codex/Claude/other-BYO judge with NO
+  // two-flagship requirement, as long as the judge is available AND a DIFFERENT
+  // model than the brain (a same-model self-check adds nothing). This is what makes
+  // "GLM 5.2 brain with Codex as the judge" work.
+  if (fusionStrategy() === 'verify') {
+    const brain = resolveRoleModel('brain');
+    let checker = resolveRoleModel('judge');
+    // If the judge role collapses to the SAME model as the brain (e.g. all_in BYO
+    // defaults judge→the BYO primary), fall back to the legacy Fusion judge control
+    // (CLEMMY_DEBATE_JUDGE = claude|codex) so "GLM brain + Codex judge" engages from
+    // the Fusion control alone, without needing an explicit judge-role pin.
+    if (checker.provider === brain.provider && checker.modelId === brain.modelId) {
+      const choice = judgeChoice();
+      if (choice === 'codex' && codexAvailable() && brain.provider !== 'codex') {
+        checker = { modelId: MODELS.primary, provider: 'codex', source: 'default' };
+      } else if (choice === 'claude' && claudeAvailable() && brain.provider !== 'claude') {
+        checker = { modelId: getDebateCheckerModel(), provider: 'claude', source: 'default' };
+      } else {
+        return null; // no DIFFERENT-provider judge available — a self-check adds nothing
+      }
+    }
+    const judge = buildJudgeForRole(checker, haveClaude, haveCodex);
+    if (!judge) return null;
+    const pass = resolveSync(passthrough.getModel(modelName));
+    return { passthrough: pass, draftA: pass, draftB: pass, judge };
+  }
+
+  // DEBATE strategy: two distinct flagships draft, the judge reconciles. Needs
+  // BOTH Claude and Codex (the two drafters). Build the Claude brain through the
+  // PROVIDER so it carries the overload fallback chain Opus -> Sonnet -> Codex.
+  if (!haveClaude || !haveCodex) return null;
   const claude: Model = new ClaudeModelProvider().getModel();
   const codex: Model = new CodexModelProvider().getModel();
-  // The CHECKER/judge runs on a fast, low-contention Claude tier (Sonnet by
-  // default) — a verify pass refines an already-drafted answer and does not need
-  // the flagship's depth, and Opus-as-checker hung past the deadline so the check
-  // shipped the unchecked draft. The DEBATE DRAFTER (draftA) keeps the full
-  // flagship brain. Override the checker via CLEMMY_DEBATE_CHECKER_MODEL.
-  // The CHECKER model id comes from the role→model registry (a UI/chat binding
-  // wins; else the provider-derived default = getDebateCheckerModel(), so this is
-  // byte-identical when unbound). A binding can now point at Claude, Codex, or a
-  // configured BYO model; dispatch by the derived provider so the role snapshot
-  // and the actual judge cannot diverge.
+  // The judge comes from the role→model registry (a UI/chat binding wins; else the
+  // provider-derived default), dispatched by its provider so the role snapshot and
+  // the actual judge cannot diverge. A byo judge with no configured backend → null.
   const checker = resolveRoleModel('judge');
-  let judge: Model;
-  if (checker.provider === 'codex') {
-    judge = codex;
-  } else if (checker.provider === 'byo') {
-    const byo = getByoBackendConfig();
-    if (!byo.configured) return null;
-    judge = getByoModel(checker.modelId, byo);
-  } else {
-    judge = checker.modelId && checker.modelId !== getClaudeBrainModel()
-      ? new ClaudeModelProvider().getModel(checker.modelId)
-      : claude;
-  }
+  const judge = buildJudgeForRole(checker, haveClaude, haveCodex);
+  if (!judge) return null;
 
   return {
     passthrough: resolveSync(passthrough.getModel(modelName)),

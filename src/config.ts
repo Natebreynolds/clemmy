@@ -313,6 +313,26 @@ export function getByoBackendConfig(): ByoBackendConfig {
   };
 }
 
+/** Read a BYO provider's API key (vault-first, then env) for the multi-provider
+ *  registry. The 'default' provider REUSES the legacy single-backend slot
+ *  (byo_model_api_key / BYO_MODEL_API_KEY) so a migrated single-BYO user keeps
+ *  working with zero re-entry. Other providers use a per-id slot
+ *  (byo_provider_<id>_api_key / BYO_PROVIDER_<ID>_API_KEY). */
+export function getByoProviderApiKey(providerId: string): string {
+  const id = (providerId || 'default').trim();
+  if (id === 'default') {
+    return (readSecretFromFileVaultSync('byo_model_api_key') || getRuntimeEnv('BYO_MODEL_API_KEY', '') || '').trim();
+  }
+  // Sanitize to a valid env-var token (hyphens → underscores) — MUST match
+  // byoProviderKeyEnvKey() so reads and writes hit the same slot.
+  const slug = id.replace(/[^A-Za-z0-9]/g, '_');
+  return (
+    readSecretFromFileVaultSync(`byo_provider_${slug}_api_key`)
+    || getRuntimeEnv(`BYO_PROVIDER_${slug.toUpperCase()}_API_KEY`, '')
+    || ''
+  ).trim();
+}
+
 export const VAULT_DIR = path.join(BASE_DIR, 'vault');
 export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() === 'true';
 export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);

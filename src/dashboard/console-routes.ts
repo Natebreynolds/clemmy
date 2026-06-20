@@ -189,11 +189,19 @@ import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-ha
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
+import {
+  getByoProviders,
+  getByoProviderSnapshots,
+  byoProviderKeyEnvKey,
+  slugifyProviderId,
+  serializeExtraProviders,
+  type ByoProvider,
+} from '../runtime/harness/byo-providers.js';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { slugifyIntent } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
-import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
+import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain } from '../runtime/harness/model-role-options.js';
+import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
@@ -3473,6 +3481,8 @@ export function registerConsoleRoutes(
         worker: connectedModelGroupsForRole('worker'),
         judge: connectedModelGroupsForRole('judge'),
       },
+      brainOptions: brainOptions(),
+      effectiveBrain: effectiveBrain(),
       activeBrain: getActiveAuthMode(),
     };
   };
@@ -3504,9 +3514,9 @@ export function registerConsoleRoutes(
         judgeRole: resolveRoleModel('judge'),
         strategy: fusionStrategy(),
         brainsAvailable: fusionBrains,
-        active: debateMode() !== 'off' && fusionBrains.claude && fusionBrains.codex,
+        active: debateMode() !== 'off' && ((fusionBrains.claude && fusionBrains.codex) || verifyJudgeAvailable()),
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot() });
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: getByoProviderSnapshots(), claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -3842,6 +3852,94 @@ export function registerConsoleRoutes(
         },
         models: getModelSettingsSnapshot(),
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ── Multi-provider BYO registry ────────────────────────────────────────
+  // 'default' IS the legacy BYO_MODEL_* slot; extras live in BYO_PROVIDERS.
+  // Adding the FIRST provider (no default yet) writes the legacy slot so
+  // getByoBackendConfig stays valid for the all_in check. Each provider's key
+  // lives in its own env/vault slot. Every mutation runs the cache-reset trio.
+  const normalizeProviderModelIds = (raw: unknown): string[] => {
+    const items = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : [];
+    const out: string[] = [];
+    for (const item of items) {
+      const s = typeof item === 'string' ? item.trim() : '';
+      if (s && /^[A-Za-z0-9._:/-]+$/.test(s) && !out.includes(s)) out.push(s);
+    }
+    return out;
+  };
+
+  app.get('/api/console/settings/model-providers', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ providers: getByoProviderSnapshots(), mode: getModelRoutingMode() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/settings/model-providers', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as { id?: string; label?: string; baseURL?: string; apiKey?: string; modelIds?: unknown; mode?: string };
+      const baseURL = typeof body.baseURL === 'string' ? body.baseURL.trim() : '';
+      const label = typeof body.label === 'string' ? body.label.trim().slice(0, 40) : '';
+      const modelIds = normalizeProviderModelIds(body.modelIds);
+      const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+      if (!baseURL) { res.status(400).json({ error: 'baseURL is required.' }); return; }
+      if (modelIds.length === 0) { res.status(400).json({ error: 'At least one model id is required.' }); return; }
+
+      // First provider (no legacy default) or an explicit 'default' → legacy slot.
+      const legacy = getByoBackendConfig();
+      const wantsDefault = body.id === 'default' || !(legacy.configured || Boolean(legacy.baseURL));
+      if (wantsDefault) {
+        updateEnvKey('BYO_MODEL_BASE_URL', baseURL);
+        updateEnvKey('BYO_MODEL_ID', modelIds[0]);
+        updateEnvKey('BYO_MODEL_PROVIDER', label);
+        if (modelIds.length > 1) updateEnvKey('BYO_MODEL_JUDGE_ID', modelIds[1]);
+        if (apiKey) updateEnvKey('BYO_MODEL_API_KEY', apiKey);
+      } else {
+        const id = body.id && body.id.trim() ? slugifyProviderId(body.id) : slugifyProviderId(label || baseURL);
+        const extras = getByoProviders().filter((p) => p.id !== 'default');
+        const next: ByoProvider = { id, label, baseURL, modelIds };
+        const merged = extras.some((p) => p.id === id) ? extras.map((p) => (p.id === id ? next : p)) : [...extras, next];
+        updateEnvKey('BYO_PROVIDERS', serializeExtraProviders(merged));
+        if (apiKey) updateEnvKey(byoProviderKeyEnvKey(id), apiKey);
+      }
+
+      // A freshly-connected provider must be routable: bump 'off' → 'worker'.
+      const mode = body.mode === 'worker' || body.mode === 'all_in' ? body.mode : undefined;
+      if (mode) updateEnvKey('MODEL_ROUTING_MODE', mode);
+      else if (getModelRoutingMode() === 'off') updateEnvKey('MODEL_ROUTING_MODE', 'worker');
+
+      resetHarnessRuntimeConfig();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+      res.json({ providers: getByoProviderSnapshots(), mode: getModelRoutingMode() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/console/settings/model-providers/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const id = (req.params.id || '').trim();
+      if (!id) { res.status(400).json({ error: 'provider id is required.' }); return; }
+      if (id === 'default') {
+        for (const k of ['BYO_MODEL_BASE_URL', 'BYO_MODEL_ID', 'BYO_MODEL_JUDGE_ID', 'BYO_MODEL_PROVIDER', 'BYO_MODEL_API_KEY']) updateEnvKey(k, '');
+      } else {
+        const extras = getByoProviders().filter((p) => p.id !== 'default' && p.id !== id);
+        updateEnvKey('BYO_PROVIDERS', serializeExtraProviders(extras));
+        updateEnvKey(byoProviderKeyEnvKey(id), '');
+      }
+      resetHarnessRuntimeConfig();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+      res.json({ providers: getByoProviderSnapshots(), mode: getModelRoutingMode() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6541,8 +6639,23 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const raw = typeof req.body?.brain === 'string' ? req.body.brain : '';
-      const brain = raw === 'claude_oauth' ? 'claude_oauth' : raw === 'codex_oauth' ? 'codex_oauth' : '';
-      if (!brain) { res.status(400).json({ error: 'brain must be "codex_oauth" or "claude_oauth".' }); return; }
+      const brain = raw === 'claude_oauth' ? 'claude_oauth' : raw === 'codex_oauth' ? 'codex_oauth' : raw === 'api_key' ? 'api_key' : '';
+      if (!brain) { res.status(400).json({ error: 'brain must be "codex_oauth", "claude_oauth", or "api_key" (a BYO model).' }); return; }
+
+      // A BYO brain runs all-in (every role on the BYO backend unless a role is
+      // bound elsewhere); a Codex/Claude brain cannot coexist with all-in, so step
+      // it down to 'off' (BYO providers stay connected and routable via role pins).
+      if (brain === 'api_key') {
+        if (!getByoBackendConfig().configured) {
+          res.status(409).json({ error: 'No BYO model is configured. Add one under Settings → Models → Connected models first.', needsLogin: true });
+          return;
+        }
+        updateEnvKey('MODEL_ROUTING_MODE', 'all_in');
+        process.env.MODEL_ROUTING_MODE = 'all_in';
+      } else if (getModelRoutingMode() === 'all_in') {
+        updateEnvKey('MODEL_ROUTING_MODE', 'off');
+        process.env.MODEL_ROUTING_MODE = 'off';
+      }
 
       if (brain === 'claude_oauth') {
         // Preflight BEFORE persisting; refresh a near-expiry vault token so the
@@ -6700,7 +6813,7 @@ export function registerConsoleRoutes(
           judgeRole: resolveRoleModel('judge'),
           strategy: fusionStrategy(),
           brainsAvailable: brains,
-          active: mode !== 'off' && brains.claude && brains.codex,
+          active: mode !== 'off' && ((brains.claude && brains.codex) || verifyJudgeAvailable()),
         },
       });
     } catch (err) {
@@ -6725,7 +6838,7 @@ export function registerConsoleRoutes(
           judgeRole: resolveRoleModel('judge'),
           strategy: fusionStrategy(),
           brainsAvailable: brains,
-          active: debateMode() !== 'off' && brains.claude && brains.codex,
+          active: debateMode() !== 'off' && ((brains.claude && brains.codex) || verifyJudgeAvailable()),
         },
         traces: readRecentDebateTraces(limit),
       });

@@ -9,6 +9,7 @@ import {
   getSettings,
   setActiveBrain,
   patchModelRole,
+  patchFusion,
   type ActiveBrain,
   type ResolvedRole,
 } from '@/lib/settings';
@@ -76,6 +77,26 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   const judgeFlat = judgeOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
   const connected = (prov: string) => mr.available.some((p) => p.provider === prov);
 
+  // ── Second opinion (fusion) — folded onto the Judge row. The Judge dropdown
+  // picks WHO checks; this picks WHETHER + HOW (verify = brain drafts, judge
+  // refines; debate = two flagships draft, judge reconciles).
+  const fusion = settings.data?.fusion;
+  const bothFlagships = Boolean(fusion?.brainsAvailable.claude && fusion?.brainsAvailable.codex);
+  const secondOpinion: 'off' | 'verify' | 'debate' =
+    !fusion || fusion.mode === 'off' ? 'off' : fusion.strategy === 'debate' ? 'debate' : 'verify';
+  const fusionWhen: 'high' | 'all' = fusion?.mode === 'all' ? 'all' : 'high';
+  // The legacy claude/codex reconcile field — derive from the judge role's
+  // provider so it tracks the picker (a BYO judge keeps its role binding, which
+  // the fusion route never drops).
+  const deriveJudgeKind = (): 'claude' | 'codex' =>
+    mr.roles.judge.provider === 'codex' ? 'codex' : mr.roles.judge.provider === 'claude' ? 'claude' : (fusion?.judge ?? 'claude');
+  const onSecondOpinion = (v: 'off' | 'verify' | 'debate') =>
+    run('fusion', () => patchFusion({ mode: v === 'off' ? 'off' : fusionWhen, judge: deriveJudgeKind(), strategy: v === 'debate' ? 'debate' : 'verify' }));
+  const onFusionWhen = (when: 'high' | 'all') =>
+    run('fusion', () => patchFusion({ mode: when, judge: deriveJudgeKind(), strategy: secondOpinion === 'debate' ? 'debate' : 'verify' }));
+  // Verify with the judge == the brain is a self-check (no real second opinion).
+  const judgeSameAsBrain = mr.roles.judge.provider === mr.roles.brain.provider && mr.roles.judge.modelId === mr.roles.brain.modelId;
+
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key); setError(null); setSaved(null);
     try { await fn(); setSaved(key); refresh(); }
@@ -122,13 +143,17 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
       )}
 
       <div className="space-y-3">
-        <RoleRow icon={BrainCircuit} label="Brain" hint="Runs every turn (a provider login switch)." resolved={mr.roles.brain}>
+        <RoleRow icon={BrainCircuit} label="Brain" hint="Orchestrates every turn — Codex, Claude, or a BYO model (all-in)." resolved={mr.roles.brain}>
           {(id) => (
             <Select id={id} disabled={busy === 'brain'}
-              value={mr.activeBrain === 'claude_oauth' ? 'claude_oauth' : 'codex_oauth'}
+              value={mr.effectiveBrain ?? (mr.activeBrain === 'claude_oauth' ? 'claude_oauth' : 'codex_oauth')}
               onChange={(e) => onBrain(e.target.value as ActiveBrain)}>
-              <option value="codex_oauth" disabled={!connected('codex')}>Codex — GPT-5.x{connected('codex') ? '' : ' (not connected)'}</option>
-              <option value="claude_oauth" disabled={!connected('claude')}>Claude — Opus{connected('claude') ? '' : ' (not connected)'}</option>
+              {(mr.brainOptions ?? [
+                { id: 'codex_oauth' as ActiveBrain, label: 'Codex — GPT-5.x', available: connected('codex') },
+                { id: 'claude_oauth' as ActiveBrain, label: 'Claude — Opus', available: connected('claude') },
+              ]).map((o) => (
+                <option key={o.id} value={o.id} disabled={!o.available}>{o.label}{o.available ? '' : ' (not connected)'}</option>
+              ))}
             </Select>
           )}
         </RoleRow>
@@ -143,7 +168,7 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
           )}
         </RoleRow>
 
-        <RoleRow icon={Scale} label="Judge / checker" hint="Verifies the fusion turn." resolved={mr.roles.judge}>
+        <RoleRow icon={Scale} label="Judge / checker" hint="The model that checks the work (when Second opinion is on)." resolved={mr.roles.judge}>
           {(id) => (
             <Select id={id} disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
               onChange={(e) => onRole('judge', e.target.value)}>
@@ -152,6 +177,45 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
             </Select>
           )}
         </RoleRow>
+
+        {/* Second opinion — whether/how the judge above checks the work. Replaces
+            the old standalone Fusion card; one place to read "who + whether". */}
+        <div className="rounded-lg border border-border bg-canvas p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-label text-fg">Second opinion</span>
+            <Select className="h-8 w-auto" disabled={busy === 'fusion'} value={secondOpinion}
+              onChange={(e) => onSecondOpinion(e.target.value as 'off' | 'verify' | 'debate')}>
+              <option value="off">Off — brain answers alone</option>
+              <option value="verify">Verify — the judge double-checks (2 calls)</option>
+              <option value="debate" disabled={!bothFlagships}>
+                Debate — two brains draft, judge picks {bothFlagships ? '(3 calls)' : '(needs Claude + Codex)'}
+              </option>
+            </Select>
+            {secondOpinion !== 'off' && (
+              <Select className="h-8 w-auto" disabled={busy === 'fusion'} value={fusionWhen}
+                onChange={(e) => onFusionWhen(e.target.value as 'high' | 'all')}>
+                <option value="high">on high-stakes turns</option>
+                <option value="all">on every turn (2–3× cost)</option>
+              </Select>
+            )}
+          </div>
+          <p className="mt-1.5 text-caption text-muted">
+            {secondOpinion === 'off'
+              ? 'Your brain answers every turn alone — cheapest.'
+              : secondOpinion === 'debate'
+                ? 'Claude and Codex each draft independently, then the judge above reconciles them into one answer.'
+                : 'Your brain drafts the answer, then the judge above verifies and refines it.'}
+            {' '}{fusion?.active
+              ? <span className="text-success">Active now.</span>
+              : (secondOpinion !== 'off' && <span className="text-warning">Configured but inactive — the judge/flagship isn’t available yet.</span>)}
+          </p>
+          {secondOpinion === 'verify' && judgeSameAsBrain && (
+            <p className="mt-1 flex items-center gap-1.5 text-caption text-warning">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+              The judge is the same model as the brain — it would check its own work. Pick a different judge above.
+            </p>
+          )}
+        </div>
       </div>
 
       <div className="mt-5 border-t border-border pt-4">
@@ -205,7 +269,7 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
       <div className="mt-4 flex items-center gap-3">
         {saved && <span className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies on the next message</span>}
         {error && <span className="text-small text-danger">{error}</span>}
-        {mr.available.length === 0 && <span className="text-small text-muted">No models connected yet — open “Connect more models” below.</span>}
+        {mr.available.length === 0 && <span className="text-small text-muted">No models connected yet — add one under “Connected models” below, or sign in to Codex / Claude.</span>}
       </div>
     </>
   );
