@@ -3796,6 +3796,19 @@ export function registerConsoleRoutes(
       const providerLabel = typeof body.providerLabel === 'string' ? body.providerLabel.trim().slice(0, 40) : '';
 
       updateEnvKey('MODEL_ROUTING_MODE', mode);
+      process.env.MODEL_ROUTING_MODE = mode; // getRuntimeEnv reads process.env first
+      // Keep AUTH_MODE and MODEL_ROUTING_MODE from drifting — the root cause of
+      // the "settings says GLM but the brain is actually Claude (token expired)"
+      // trap. all_in means the BYO model IS the brain, so the auth mode must be
+      // api_key; leaving a stale codex/claude_oauth here makes configure pick the
+      // wrong (oauth) brain. Conversely, leaving all_in for off/worker hands the
+      // brain back to Codex/Claude, so an api_key auth mode must revert. (The new
+      // active-brain picker already does this; this closes the legacy form's leak.)
+      if (mode === 'all_in') {
+        updateEnvKey('AUTH_MODE', 'api_key'); process.env.AUTH_MODE = 'api_key';
+      } else if (getActiveAuthMode() === 'api_key') {
+        updateEnvKey('AUTH_MODE', 'codex_oauth'); process.env.AUTH_MODE = 'codex_oauth';
+      }
       updateEnvKey('BYO_MODEL_BASE_URL', baseURL);
       updateEnvKey('BYO_MODEL_ID', modelId);
       updateEnvKey('BYO_MODEL_JUDGE_ID', judgeId);
