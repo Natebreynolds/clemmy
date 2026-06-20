@@ -117,6 +117,27 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('composio_execute_tool'), false);
+  // JIT off by default → no MCP tool-allowlist passed (server advertises all tools).
+  assert.equal(captured.mcpToolAllowlist, undefined, 'JIT default-off must not filter the MCP surface');
+});
+
+test('JIT default-off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {
+  // Guards the default path: with CLEMMY_TOOL_JIT unset the brain must not reduce
+  // the tool surface (no mcpToolAllowlist → MCP server advertises every tool).
+  delete process.env.CLEMMY_TOOL_JIT;
+  delete process.env.CLEMMY_TOOL_JIT_AB;
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.AUTH_MODE = 'claude_oauth';
+  let captured: any;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    captured = options;
+    return { text: 'ok', sessionId: 'sdk', model: 'claude-opus-4-8', toolUses: [], usage: { input_tokens: 1, output_tokens: 1 } };
+  });
+  await respondViaClaudeAgentSdkBrain('home', { message: 'create a workflow that emails me daily', sessionId: 'jit-off-run' });
+  assert.equal(captured.mcpToolAllowlist, undefined, 'no allowlist when JIT is off');
+  // full profile still present (e.g. the agentic execution tools), unfiltered.
+  assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'));
+  assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'));
 });
 
 test('full mode: completion judge bounces a not-done turn into ONE continuation, then returns the finished answer', async () => {

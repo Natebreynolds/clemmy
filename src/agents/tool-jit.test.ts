@@ -211,6 +211,24 @@ test('MANDATED ⊆ CORE: every mandated tool is in the always-loaded core', () =
   }
 });
 
+test('Claude SDK brain: the agentic profile execution tools survive a worst-case JIT (strand-protection)', async () => {
+  // jit-claude-3: the Claude SDK brain reduces its tool surface to CORE + top-K of the
+  // AGENTIC profile. Even when NOTHING ranks (zero-score), the execution tools the
+  // agentic brain depends on must survive — else JIT would brick real work.
+  const { CLAUDE_AGENT_SDK_FULL_TOOLS } = await import('../runtime/harness/claude-agent-sdk.js');
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5' }, async () => {
+    const profile = [...new Set(CLAUDE_AGENT_SDK_FULL_TOOLS)] as string[];
+    const tools: JitTool[] = profile.map((name) => ({ name, description: name }));
+    const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
+    const sel = await selectToolsForTurn({ userInput: 'anything', tools, rankFn: zero });
+    for (const must of ['run_shell_command', 'composio_execute_tool', 'write_file', 'execution_create', 'execution_complete', 'memory_recall']) {
+      if (profile.includes(must)) {
+        assert.ok(sel.exposed.has(must), `agentic execution tool ${must} must survive worst-case JIT`);
+      }
+    }
+  });
+});
+
 test('worst-case ranker (every candidate scores 0): all MANDATED tools still survive', async () => {
   // The real safety guarantee: even if semantic retrieval surfaces NOTHING, no
   // mandated tool is ever dropped. Build a surface of all mandated tools + some

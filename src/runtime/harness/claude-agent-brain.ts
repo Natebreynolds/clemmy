@@ -1,8 +1,10 @@
 import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
+import { resolveToolJitDecision, selectToolsForTurn } from '../../agents/tool-jit.js';
+import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
-import { appendEvent, clearKill, createSession, getSession } from './eventlog.js';
+import { appendEvent, clearKill, createSession, getSession, listEvents } from './eventlog.js';
 import { actionBus } from '../action-bus.js';
 import {
   judgeObjectiveComplete,
@@ -121,6 +123,42 @@ function allowedToolsForRequest(request: AssistantRequest, mode: ClaudeAgentBrai
   return defaultClaudeAgentSdkAllowedLocalTools(toolProfileForMode(mode)).filter((toolName) => !excluded.has(toolName));
 }
 
+// JIT tool-RAG helpers (Claude-brain port).
+// Tool descriptions are static (code-defined), so build the name→description map
+// ONCE per daemon lifetime instead of rebuilding every zod tool object each JIT turn.
+let coreToolDescCache: Map<string, string> | null = null;
+async function coreToolDescriptions(): Promise<Map<string, string>> {
+  if (coreToolDescCache) return coreToolDescCache;
+  const core = await getCoreToolsAsync({ includeDynamicComposioTools: false });
+  coreToolDescCache = new Map(
+    core.map((t) => [(t as { name?: string }).name ?? '', (t as { description?: string }).description ?? '']),
+  );
+  return coreToolDescCache;
+}
+
+// Recent prior user messages in this session, newest-first (excluding the current).
+// Folded into the JIT ranking query so a bare follow-up ("do it", "make it weekly")
+// inherits the intent the conversation built toward — parity with the Codex lane's
+// recentPriorUserInputsForScope. Minimal (this session only); best-effort.
+function recentPriorBrainInputs(sessionId: string, current: string, limit = 3): string[] {
+  const cur = (current ?? '').trim();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  try {
+    const rows = listEvents(sessionId, { types: ['user_input_received'], desc: true, limit: 8 });
+    for (const ev of [...rows].reverse()) {
+      const text = typeof (ev.data as { text?: unknown })?.text === 'string'
+        ? ((ev.data as { text?: string }).text ?? '').trim()
+        : '';
+      if (!text || text === cur || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+      if (out.length >= limit) break;
+    }
+  } catch { /* best effort */ }
+  return out;
+}
+
 function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
   if (mode === 'read_only') {
     return [
@@ -223,11 +261,63 @@ export async function respondViaClaudeAgentSdkBrain(
   const modelId = request.model && request.model.startsWith('claude-')
     ? request.model
     : resolveRoleModel('brain').modelId;
+
+  // JIT tool-RAG for the Claude Agent SDK brain (Phase 1, Claude-brain port). The
+  // brain runs the SAME decision as the Codex lane (resolveToolJitDecision — global
+  // flag OR the per-session A/B arm). When active, retrieve only the tools this turn
+  // plausibly needs (CORE + semantic top-K of the profile tools) and advertise ONLY
+  // those on the MCP surface, so the model receives fewer tool schemas. Brain lanes
+  // are interactive (a user is present), so allowLane=true. Off / no-signal / no
+  // embeddings → the full profile (byte-identical). Never throws into the turn.
+  const fullAllowed = allowedToolsForRequest(request, mode);
+  const jitDecision = resolveToolJitDecision({ allowLane: true, sessionId });
+  let jitAllowed = fullAllowed;
+  let mcpToolAllowlist: string[] | undefined;
+  let jitDropped = 0;
+  let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
+  if (jitDecision.active && request.message.trim()) {
+    try {
+      const descByName = await coreToolDescriptions();
+      // Fold recent prior-turn messages into the ranking query so bare follow-ups
+      // inherit the conversation's intent (parity with the Codex lane).
+      const jitQuery = [request.message, ...recentPriorBrainInputs(sessionId, request.message)]
+        .filter((s) => s.trim().length > 0)
+        .join('\n');
+      const selection = await selectToolsForTurn({
+        userInput: jitQuery,
+        tools: fullAllowed.map((name) => ({ name, description: descByName.get(name) ?? '' })),
+      });
+      jitReason = selection.reason;
+      if (selection.reduced) {
+        jitAllowed = fullAllowed.filter((n) => selection.exposed.has(n));
+        mcpToolAllowlist = jitAllowed;
+        jitDropped = fullAllowed.length - jitAllowed.length;
+      }
+    } catch {
+      jitAllowed = fullAllowed; mcpToolAllowlist = undefined; jitReason = 'jit-error-fellback';
+    }
+  }
+  // Telemetry — emit on a real reduction OR whenever the A/B is running (so the
+  // control arm is attributable too). Tagged lane:'claude_sdk' to distinguish from
+  // the Codex orchestrator lane in the readout.
+  if (sessionId && (jitDropped > 0 || jitDecision.experiment)) {
+    try {
+      appendEvent({
+        sessionId, turn: 0, role: 'system', type: 'tool_jit_scope',
+        data: {
+          lane: 'claude_sdk', arm: jitDecision.arm, experiment: jitDecision.experiment,
+          jitActive: jitDecision.active, droppedCount: jitDropped, exposedCount: jitAllowed.length, reason: jitReason,
+        },
+      });
+    } catch { /* JIT telemetry must never block the turn */ }
+  }
+
   const runOptions = {
     sessionId,
     modelId,
     systemAppend: renderClaudeAgentBrainSystemAppend(surface, request, mode),
-    allowedLocalMcpTools: allowedToolsForRequest(request, mode),
+    allowedLocalMcpTools: jitAllowed,
+    mcpToolAllowlist,
     agentic: mode === 'full',
     maxTurns: maxTurns(),
   };
