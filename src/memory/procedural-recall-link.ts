@@ -9,20 +9,36 @@
  * them by their bare binary identifier (`netlify`) is unsafe — a `netlify status`
  * blip would penalize a good DEPLOY memo.
  *
- * The safe fill: correlate the SPECIFIC intent the agent RECALLED with the tool
- * call it then runs. The agent's flow is recall(intent) → immediately use the
- * returned invocation, so the first matching tool result after a recall is that
- * recall's outcome. We note each CLI/MCP recall in a small session-scoped buffer
- * and, on the next matching tool result, credit THAT intent and consume the
- * entry (one recall → at most one credit). Bounded + TTL'd so a stale recall can
- * never mis-credit a much-later call. Composio recalls are NOT correlated here
- * (their slug path already credits them — avoids double-counting).
+ * TWO crediting paths, tried in order (both safe, neither bare-binary):
+ *
+ *  1. EXPLICIT RECALL (precise). When the agent calls `tool_choice_recall`, we
+ *     note that SPECIFIC intent in a small session-scoped buffer; the next
+ *     matching tool result credits it and consumes the entry (one recall → at
+ *     most one credit). Bounded + TTL'd so a stale recall can't mis-credit a
+ *     much-later call.
+ *
+ *  2. STORE FALLBACK (the 0%-coverage fix). The dominant path is NOT an explicit
+ *     recall — proven choices are INJECTED into context every turn (the rubric
+ *     tells the agent to read those and SKIP `tool_choice_recall`), so the buffer
+ *     is usually empty and path 1 never fires (the precise cause of the measured
+ *     0% CLI/MCP coverage). When no noted recall matches, we match the executed
+ *     command against the STORE itself — but ONLY on a precise, operation-
+ *     confirmed, UNIQUE winner: a CLI memo whose binary AND a distinctive
+ *     operation token (from its intent slug or invocation template) both appear,
+ *     or an MCP memo whose tool-name matches exactly. Binary-only or ambiguous
+ *     (two same-binary memos the command can't disambiguate) credits NOTHING —
+ *     the `netlify status` hazard the bare-binary approach couldn't avoid. This
+ *     fires for EVERY surface (chat, harness, worker) because it lives at the
+ *     shared tool-result boundary, no per-turn assembly threading required.
+ *
+ * Composio is NOT correlated here either way (its slug path already credits it —
+ * avoids double-counting).
  *
  * Best-effort: every function swallows errors; a correlation failure never
- * perturbs a tool call. Gated transitively by CLEMMY_PROCEDURAL_OUTCOMES (the
- * updateToolChoiceOutcome it calls is a no-op when that's off).
+ * perturbs a tool call. Gated by CLEMMY_PROCEDURAL_OUTCOMES (the store fallback
+ * checks it up front; the updateToolChoiceOutcome it calls is also a no-op off).
  */
-import { updateToolChoiceOutcome } from './tool-choice-store.js';
+import { updateToolChoiceOutcome, listToolChoices, isProceduralOutcomesEnabled, type ToolChoiceRecord } from './tool-choice-store.js';
 
 interface PendingRecall {
   intent: string;
@@ -34,6 +50,14 @@ const TTL_MS = 5 * 60 * 1000;
 const MAX_PER_SESSION = 16;
 const MAX_SESSIONS = 500;
 const pending = new Map<string, PendingRecall[]>();
+
+/** A failure that is TRANSIENT (rate-limit, overload, network blip) rather than a
+ *  real tool rejection. CLI/MCP failure signal flows into proven-path scores now,
+ *  and a single flaky window must NOT teach a good path a failure (3 strikes
+ *  auto-invalidate it). Shared by every credit site so the rule lives once. */
+export function isTransientFailure(text: string): boolean {
+  return /\b(?:429|502|503|rate.?limit(?:ed)?|overloaded|temporarily unavailable|timed?\s?out|etimedout|econnreset|econnrefused|enotfound|socket hang up)\b/i.test(text);
+}
 
 export function _resetProceduralRecallLinkForTests(): void {
   pending.clear();
@@ -86,6 +110,21 @@ function intentOpTokens(intent: string, identifier: string): string[] {
   return intent.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !idToks.has(t));
 }
 
+/** Distinctive operation tokens for a memo, unioned from its intent slug AND its
+ *  invocation template (so a memo with a vague intent like "my netlify thing" but
+ *  a concrete invocation `netlify deploy --prod` still contributes `deploy`).
+ *  Identifier tokens are excluded — they're the binary, not the operation. */
+function opTokensForMemo(intent: string, identifier: string, invocationTemplate?: string): Set<string> {
+  const idToks = new Set(identifier.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+  const out = new Set(intentOpTokens(intent, identifier));
+  if (invocationTemplate) {
+    for (const t of invocationTemplate.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (t.length >= 3 && !idToks.has(t)) out.add(t);
+    }
+  }
+  return out;
+}
+
 /**
  * Record that the agent RECALLED a CLI/MCP proven path, so the next matching
  * tool result can be attributed to it. No-op for composio (its slug path already
@@ -115,6 +154,58 @@ function identifierMatches(identifier: string, haystackLower: string): boolean {
   return tokenPresent(identifier, haystackLower) || tokenPresent(identifier.split(/\s+/)[0], haystackLower);
 }
 
+/** Score a stored CLI/MCP memo against an executed command / tool name. Returns
+ *  a POSITIVE score only on a precise match (CLI: binary present AND ≥1 operation
+ *  token; MCP: tool-name present, 2 when it's the whole haystack). 0 = not a
+ *  precise candidate (binary-only, or no match) → never credited. composio is
+ *  skipped (its slug path credits it). */
+function scoreStoreCandidate(rec: ToolChoiceRecord, haystackLower: string): number {
+  const choice = rec.choice;
+  if (!choice) return 0;
+  const id = choice.identifier.toLowerCase();
+  if (choice.kind === 'mcp') {
+    if (!tokenPresent(id, haystackLower)) return 0;
+    return id === haystackLower.trim() ? 2 : 1;
+  }
+  if (choice.kind === 'cli') {
+    if (!identifierMatches(id, haystackLower)) return 0;
+    let ops = 0;
+    for (const t of opTokensForMemo(rec.intent, id, choice.invocationTemplate)) {
+      if (tokenPresent(t, haystackLower)) ops++;
+    }
+    return ops; // binary-only (ops===0) is NOT enough — avoids `netlify status` → deploy
+  }
+  return 0; // composio handled by its slug path
+}
+
+/**
+ * STORE FALLBACK: with no noted recall to consume, attribute this tool result to
+ * the one stored CLI/MCP memo it precisely and UNAMBIGUOUSLY represents. Credits
+ * only a unique positive-scoring winner; a tie (two same-binary memos the command
+ * can't tell apart) or a binary-only brush credits nothing. Gated up front by the
+ * outcomes kill-switch so it does zero store I/O when the feature is off.
+ * Returns the credited intent, or null.
+ */
+function creditFromStore(executed: string, succeeded: boolean): string | null {
+  try {
+    if (!isProceduralOutcomesEnabled()) return null;
+    const haystack = executed.toLowerCase();
+    let best: { intent: string; score: number } | null = null;
+    let tied = false;
+    for (const rec of listToolChoices()) {
+      const score = scoreStoreCandidate(rec, haystack);
+      if (score <= 0) continue;
+      if (!best || score > best.score) { best = { intent: rec.intent, score }; tied = false; }
+      else if (score === best.score) { tied = true; }
+    }
+    if (!best || tied) return null; // nothing precise, or ambiguous → never mis-credit
+    updateToolChoiceOutcome(best.intent, succeeded ? 'success' : 'failure');
+    return best.intent;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Credit the buffered CLI/MCP recall that this tool result belongs to, then
  * CONSUME it (one recall → one credit). `succeeded` drives success vs failure on
@@ -136,10 +227,10 @@ export function creditMatchingRecall(
   try {
     if (!sessionId || !executed) return null;
     const list = prune(pending.get(sessionId) ?? [], nowMs);
-    if (list.length === 0) { storeSession(sessionId, list); return null; }
+    if (list.length === 0) { storeSession(sessionId, list); return creditFromStore(executed, succeeded); }
     const haystack = executed.toLowerCase();
     const matches = list.map((r, i) => ({ r, i })).filter((m) => identifierMatches(m.r.identifier, haystack));
-    if (matches.length === 0) { storeSession(sessionId, list); return null; }
+    if (matches.length === 0) { storeSession(sessionId, list); return creditFromStore(executed, succeeded); }
 
     let chosen = matches[matches.length - 1].i; // default: most-recent (recall→immediate-use)
     if (matches.length > 1) {

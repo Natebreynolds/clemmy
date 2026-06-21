@@ -44,7 +44,7 @@ import {
   classifyShellCommand,
 } from './destination-gate.js';
 import { establishedTargetsFor, recordPublishedDestination } from './published-destinations.js';
-import { creditMatchingRecall } from '../../memory/procedural-recall-link.js';
+import { creditMatchingRecall, isTransientFailure } from '../../memory/procedural-recall-link.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -798,9 +798,16 @@ function recordPublishIfSucceeded(toolName: string, parsedInput: unknown, result
 function creditRecallFromToolResult(sessionId: string | undefined, toolName: string, parsedInput: unknown, result: unknown): void {
   try {
     if (!sessionId) return;
-    const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+    // Only a shell command (CLI memo) or a native MCP tool (`server__tool`, which
+    // IS the stored MCP identifier) can ever match a CLI/MCP proven path. Skip the
+    // (file-backed) store read for the many internal/composio tool results that
+    // never could — keeps the per-tool-result hot path cheap. composio is credited
+    // by its own slug path, not here.
+    const isShell = toolName === 'run_shell_command';
+    if (!isShell && !toolName.includes('__')) return;
+    const command = isShell && typeof (parsedInput as { command?: unknown })?.command === 'string'
       ? (parsedInput as { command: string }).command : '';
-    const haystack = toolName === 'run_shell_command' ? command : toolName;
+    const haystack = isShell ? command : toolName;
     if (!haystack) return;
     const resultStr = typeof result === 'string' ? result : '';
     // Failure shapes the harness already recognizes (computer-tools exit_code,
@@ -808,6 +815,12 @@ function creditRecallFromToolResult(sessionId: string | undefined, toolName: str
     const failed = /(?:^|\s)exit_code:\s*[1-9]/.test(resultStr)
       || /^ERROR:/.test(resultStr)
       || resultStr.startsWith('⚠️ composio_execute_tool FAILED');
+    // CLI/MCP failure signal starts flowing here (it never did before the store
+    // fallback). A TRANSIENT blip — rate-limit, overload, network timeout — is not
+    // the proven path's fault, so don't teach a good memo a failure from it
+    // (auto-invalidate after 3 strikes could otherwise blacklist a working tool on
+    // a flaky window). Skip crediting entirely; success crediting is unaffected.
+    if (failed && isTransientFailure(resultStr)) return;
     creditMatchingRecall(sessionId, haystack, !failed);
   } catch { /* learning is best-effort — never break the tool result */ }
 }

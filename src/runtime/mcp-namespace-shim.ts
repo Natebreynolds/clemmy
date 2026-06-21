@@ -29,6 +29,7 @@ import {
   mcpErrorCorrectiveEnabled,
   toolFailureCorrective,
 } from './harness/tool-error-corrective.js';
+import { creditMatchingRecall, isTransientFailure } from '../memory/procedural-recall-link.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -192,6 +193,29 @@ function appendMcpFanoutAdvisory(
   } catch {
     return result; // a nudge must never break a tool call
   }
+}
+
+/** Credit an MCP proven path's outcome into procedural memory. Native MCP calls
+ *  bypass wrapToolForHarness (where CLI/composio outcomes credit), so this shim is
+ *  the ONLY place an MCP result is observable — without it MCP memos sit
+ *  permanently at the neutral 0.5 prior (the measured 0% MCP coverage). The store
+ *  fallback in creditMatchingRecall matches the native `server__tool` name to its
+ *  memo. Transient failures are skipped so a flaky window can't penalize a good
+ *  path. Best-effort: never alters the tool result. */
+function creditMcpOutcome(toolName: string, failed: boolean, text: string): void {
+  try {
+    const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+    if (!sessionId) return;
+    if (failed && isTransientFailure(text)) return;
+    creditMatchingRecall(sessionId, toolName, !failed);
+  } catch { /* learning is best-effort — never affect the tool result */ }
+}
+
+/** Flatten an MCP result's text blocks for failure detection / crediting. */
+function mcpResultText(result: unknown): string {
+  return Array.isArray(result)
+    ? result.map((b) => (typeof (b as { text?: unknown } | null)?.text === 'string' ? (b as { text: string }).text : '')).join('\n')
+    : '';
 }
 
 /**
@@ -945,6 +969,10 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Forward to the underlying server with the ORIGINAL tool name.
         const rawResult = await server.callTool(parsed.toolName, args);
         finish('success');
+        // Credit the MCP proven path's outcome (success, or a structured failure
+        // envelope) — the ONLY place native MCP results reach procedural memory.
+        const rawText = mcpResultText(rawResult);
+        creditMcpOutcome(toolName, detectStructuredToolFailure(rawText).failed, rawText);
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
         const result = clipMcpResultForRecall(toolName, rawResult);
@@ -977,6 +1005,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
+        // Credit a thrown MCP failure to the proven path (transient blips and
+        // BoundaryError approval/unavailable states are NOT the path's fault →
+        // skipped by creditMcpOutcome / the guard here).
+        if (!(err instanceof BoundaryError)) {
+          creditMcpOutcome(toolName, true, err instanceof Error ? err.message : String(err));
+        }
         // The THROWN MCP failure channel (network / 5xx / bad-param servers that
         // throw): wrap the raw error with a self-correcting corrective so the
         // model adapts instead of seeing a dead-end "MCP tool failed". Preserve

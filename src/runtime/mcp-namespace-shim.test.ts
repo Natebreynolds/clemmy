@@ -436,3 +436,46 @@ test('shim: after a transport death + backoff window, the server actually reconn
   assert.equal(state.connects, 2, 'server.connect() must re-run after the backoff window — a real reconnect');
   assert.equal(listMcpServerHealth().find((s) => s.slug === 'flaky-reconnect-probe')?.state, 'connected');
 });
+
+test('shim: a native MCP call credits its proven-path memo (closes the 0% MCP coverage)', async () => {
+  // Native MCP bypasses wrapToolForHarness, so this shim is the ONLY place an MCP
+  // outcome can reach procedural memory. Prove a successful native call scores the
+  // matching memo end-to-end (it sat permanently at the 0.5 prior before).
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+  const pathMod = (await import('node:path')).default;
+  const osMod = (await import('node:os')).default;
+  const home = mkdtempSync(pathMod.join(osMod.tmpdir(), 'clemmy-mcp-credit-'));
+  const prevHome = process.env.CLEMENTINE_HOME;
+  const prevOutcomes = process.env.CLEMMY_PROCEDURAL_OUTCOMES;
+  process.env.CLEMENTINE_HOME = home;
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  mkdirSync(pathMod.join(home, 'state'), { recursive: true });
+  writeFileSync(pathMod.join(home, 'state', 'machine-id'), 'machine-mcp-credit\n');
+  const { resetMachineIdCacheForTests } = await import('./machine-id.js');
+  resetMachineIdCacheForTests?.();
+  const { rememberToolChoice, peekToolChoice } = await import('../memory/tool-choice-store.js');
+  const { harnessRunContextStorage, ToolCallsCounter } = await import('./harness/brackets.js');
+  try {
+
+  // Unique intent + identifier so this is collision-proof against whatever else
+  // lives in the shared store, and assert a DELTA rather than an absolute count.
+  const INTENT = 'seo.mcp_credit_probe.unique';
+  // `get_`-prefixed so it classifies as a READ (a bare verb falls to the
+  // conservative write default and would trip the approval gate, not routing).
+  rememberToolChoice({ intent: INTENT, choice: { kind: 'mcp', identifier: 'mcpcredit__get_rank_probe', testEvidence: 'worked' } });
+  const before = peekToolChoice(INTENT)!.choice!.successCount ?? 0;
+
+  const b = makeFakeServer({ name: 'mcpcredit', tools: [{ name: 'get_rank_probe' }] });
+  const shim = createMcpNamespaceShim({ servers: [b], cacheToolsList: false });
+  await shim.listTools();
+  await harnessRunContextStorage.run(
+    { sessionId: 'mcp-credit-sess', counter: new ToolCallsCounter() },
+    () => shim.callTool('mcpcredit__get_rank_probe', { q: 'x' }),
+  );
+  assert.equal(peekToolChoice(INTENT)!.choice!.successCount ?? 0, before + 1, 'the native MCP call scored the memo (was bypassing the credit boundary entirely)');
+  } finally {
+    if (prevHome === undefined) delete process.env.CLEMENTINE_HOME; else process.env.CLEMENTINE_HOME = prevHome;
+    if (prevOutcomes === undefined) delete process.env.CLEMMY_PROCEDURAL_OUTCOMES; else process.env.CLEMMY_PROCEDURAL_OUTCOMES = prevOutcomes;
+    resetMachineIdCacheForTests?.();
+  }
+});

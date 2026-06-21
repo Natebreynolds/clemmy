@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 
 const { resetMachineIdCacheForTests } = await import('../runtime/machine-id.js');
 resetMachineIdCacheForTests?.();
-const { rememberToolChoice, peekToolChoice } = await import('./tool-choice-store.js');
+const { rememberToolChoice, peekToolChoice, listToolChoices, deleteToolChoice } = await import('./tool-choice-store.js');
 const {
   noteRecalledIntent,
   creditMatchingRecall,
@@ -33,7 +33,14 @@ function freshCliMemo(intent: string, identifier: string): void {
   rememberToolChoice({ intent, choice: { kind: 'cli', identifier, invocationTemplate: `${identifier} ...`, testEvidence: 'worked' } });
 }
 
-test.beforeEach(() => _resetProceduralRecallLinkForTests());
+// Isolate BOTH the in-memory recall buffer AND the on-disk store before each
+// test — the store now participates in crediting (the store fallback), so a memo
+// left over from an earlier test could otherwise legitimately credit and make
+// assertions order-dependent.
+test.beforeEach(() => {
+  _resetProceduralRecallLinkForTests();
+  for (const r of listToolChoices()) deleteToolChoice(r.intent);
+});
 
 test('a CLI recall + matching shell result credits THAT intent success (closes the 0% gap)', () => {
   freshCliMemo('netlify.deploy.local_site', 'netlify');
@@ -75,11 +82,13 @@ test('no matching recall → no credit (a tool result with no prior recall is ig
   assert.equal(creditMatchingRecall(SID, 'gh pr create', true), null);
 });
 
-test('a recall older than the TTL is not credited (no stale mis-credit)', () => {
-  freshCliMemo('netlify.deploy.ttl', 'netlify');
+test('a recall older than the TTL is not credited (no stale buffer mis-credit)', () => {
+  // No store memo here on purpose — this isolates the BUFFER's TTL guard from the
+  // store fallback (which would legitimately credit a matching stored memo).
   const t0 = 1_000_000;
   noteRecalledIntent(SID, 'netlify.deploy.ttl', 'netlify', 'cli', t0);
-  // ~6 minutes later
+  // ~6 minutes later the buffered recall is pruned, and with no stored memo to
+  // match either, nothing is credited.
   const credited = creditMatchingRecall(SID, 'netlify deploy --site x', true, t0 + 6 * 60 * 1000);
   assert.equal(credited, null);
 });
@@ -119,6 +128,69 @@ test('Map does not leak: consuming the last recall deletes the session key', () 
   freshCliMemo('sf.q', 'sf');
   noteRecalledIntent(SID, 'sf.q', 'sf', 'cli');
   creditMatchingRecall(SID, 'sf data query --query "x"', true);
-  // After consuming the only recall, a credit on an empty session is a clean no-op
-  assert.equal(creditMatchingRecall(SID, 'sf data query', true), null);
+  // After consuming the only recall, a credit on a bare binary (no operation to
+  // confirm) is a clean no-op — neither the buffer nor the store mis-credits.
+  assert.equal(creditMatchingRecall(SID, 'sf', true), null);
+});
+
+// ─── STORE FALLBACK: the actual 0%-coverage fix ───
+// The dominant path is NOT an explicit tool_choice_recall — proven choices are
+// injected into context and used directly, so the recall buffer is empty. The
+// store fallback credits the precise, unique memo the executed command
+// represents, with NO prior recall noted.
+
+test('store fallback: an injected CLI proven path is credited on use with NO explicit recall', () => {
+  freshCliMemo('netlify.deploy.local_site', 'netlify');
+  // NOTE: no noteRecalledIntent — this is the injected-context path that produced 0% coverage
+  const credited = creditMatchingRecall(SID, 'cd site && netlify deploy --prod --site x', true);
+  assert.equal(credited, 'netlify.deploy.local_site');
+  assert.equal(peekToolChoice('netlify.deploy.local_site')!.choice!.successCount, 1, 'CLI memo now scores from ordinary use, not just explicit recall');
+});
+
+test('store fallback: an MCP tool-name match credits with no recall', () => {
+  rememberToolChoice({ intent: 'seo.rank_overview', choice: { kind: 'mcp', identifier: 'dataforseo__rank_overview', testEvidence: 'worked' } });
+  assert.equal(creditMatchingRecall(SID, 'dataforseo__rank_overview', false), 'seo.rank_overview');
+  assert.equal(peekToolChoice('seo.rank_overview')!.choice!.failureCount, 1);
+});
+
+test('store fallback: binary-only brush (no operation token) credits NOTHING', () => {
+  freshCliMemo('netlify.deploy.x', 'netlify');
+  // `netlify status` shares the binary but not the deploy operation → must not penalize the deploy memo
+  assert.equal(creditMatchingRecall(SID, 'netlify status', false), null);
+  assert.equal(peekToolChoice('netlify.deploy.x')!.choice!.failureCount ?? 0, 0, 'deploy memo untouched by an unrelated netlify command');
+});
+
+test('store fallback: two same-binary memos the command cannot disambiguate → NOTHING', () => {
+  freshCliMemo('netlify.deploy.x', 'netlify');
+  freshCliMemo('netlify.rollback.x', 'netlify');
+  // bare `netlify` has no operation token to pick deploy vs rollback → ambiguous → skip
+  assert.equal(creditMatchingRecall(SID, 'netlify', true), null);
+});
+
+test('store fallback: a vague intent slug is rescued by the invocation-template operation token', () => {
+  rememberToolChoice({ intent: 'my netlify thing', choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod', testEvidence: 'worked' } });
+  // intent slug has no operation word, but the invocation template contributes `deploy`
+  assert.equal(creditMatchingRecall(SID, 'netlify deploy --prod --site x', true), 'my netlify thing');
+});
+
+test('store fallback: an explicit pending recall takes PRIORITY (no double-credit)', () => {
+  freshCliMemo('netlify.deploy.a', 'netlify');
+  noteRecalledIntent(SID, 'netlify.deploy.a', 'netlify', 'cli');
+  assert.equal(creditMatchingRecall(SID, 'netlify deploy --site x', true), 'netlify.deploy.a');
+  assert.equal(peekToolChoice('netlify.deploy.a')!.choice!.successCount, 1, 'credited exactly once via the buffer, not also via the store');
+});
+
+test('store fallback: composio store memos are never credited here (slug path owns them)', () => {
+  rememberToolChoice({ intent: 'salesforce.query', choice: { kind: 'composio', identifier: 'SALESFORCE_QUERY', testEvidence: 'worked' } });
+  assert.equal(creditMatchingRecall(SID, 'SALESFORCE_QUERY', true), null);
+});
+
+test('store fallback: kill-switch off → no store crediting', () => {
+  freshCliMemo('netlify.deploy.k', 'netlify');
+  process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'off';
+  try {
+    assert.equal(creditMatchingRecall(SID, 'netlify deploy --prod', true), null);
+  } finally {
+    process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
+  }
 });
