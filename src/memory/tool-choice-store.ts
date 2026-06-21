@@ -323,9 +323,65 @@ export function stripBakedConnectionId(template: string | undefined): string | u
     .trim();
 }
 
+/**
+ * Detect when a tool-choice's OWN evidence says the attempt FAILED or was
+ * BLOCKED by a gate — so we never persist a failure as a PROVEN choice.
+ *
+ * The 2026-06-21 poisoning: a `netlify deploy` was hard-blocked by the
+ * destination gate, after which the model called `tool_choice_remember` with
+ * evidence "refused by harness UNVERIFIED_DESTINATION gate … must run manually"
+ * — and the store saved it as the proven path, so the NEXT deploy would recall
+ * "must run manually" instead of the real working memo (`netlify.deploy.local_site`).
+ * A proven choice must represent something that WORKED. This is a code-level
+ * guard (not a prompt rule), general across gates/CLIs/vendors. Conservative:
+ * requires a STRONG failure/refusal marker, so a memo that merely *mentions*
+ * handling failures ("retries on a 5xx") is not dropped.
+ */
+export function evidenceLooksFailedOrBlocked(text: string | undefined): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const t = text.toLowerCase();
+  return (
+    // Harness gate refusals — the exact poisoning vector (any gate, not netlify).
+    /\b(unverified_destination|implicit_destination|execution_wrap_required|confirm_first_required|grounding_check_failed|duplicate_external_write)\b/.test(t)
+    || /refused by (?:the )?harness|tool call refused|blocked by (?:the )?(?:harness|gate|guardrail)/.test(t)
+    // Punted to the human — the choice did NOT complete programmatically.
+    || /run (?:it|this) manually|(?:must|need to|have to) (?:be )?run\b[^.]{0,20}\bmanual|deploy (?:it )?manually|do (?:it|this) manually/.test(t)
+    // Unambiguous failure of the action this memo is supposed to encode.
+    || /\b(?:could not|couldn't|cannot|can't|unable to|failed to)\s+(?:deploy|publish|run|send|create|upload|complete|execute|connect|authenticate)/.test(t)
+    || /\b(?:was|were|got) (?:blocked|refused|rejected|denied)\b/.test(t)
+  );
+}
+
 export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRecord {
   const existing = parseRecord(filePathFor(input.intent));
   const now = new Date().toISOString();
+  // Write-back guard (2026-06-21 poisoned-memo class): if the model's OWN
+  // evidence/description says this attempt was BLOCKED by a gate or FAILED, never
+  // promote it to the active proven choice. Record it as a fallback (preserving
+  // the "what was tried" history) and KEEP any existing proven choice — so recall
+  // surfaces the real working memo (or triggers clean rediscovery), never "must
+  // run manually". General + code-level; emits its own telemetry action.
+  if (evidenceLooksFailedOrBlocked(input.choice.testEvidence) || evidenceLooksFailedOrBlocked(input.description)) {
+    const reason = (input.choice.testEvidence || input.description || 'attempt blocked/failed').slice(0, 300);
+    const failedFallback: ToolChoiceRecordFallback = {
+      kind: input.choice.kind,
+      identifier: input.choice.identifier,
+      failedAt: now,
+      reason,
+    };
+    const saved = writeRecord({
+      intent: input.intent,
+      description: input.description ?? existing?.description,
+      // Keep an EXISTING proven choice; never overwrite it with a failure. If
+      // none exists, leave choice null so recall won't serve a poisoned path.
+      choice: existing?.choice ?? null,
+      fallbacks: mergeFallbacks(existing?.fallbacks ?? [], [failedFallback]),
+      body: input.body ?? existing?.body ?? defaultBodyFor(input.intent, input.description ?? existing?.description),
+      filePath: existing?.filePath,
+    });
+    emitToolChoiceEvent('remember_rejected_failed', input.intent, input.choice.identifier);
+    return saved;
+  }
   const merged = mergeFallbacks(existing?.fallbacks ?? [], input.fallbacks ?? []);
   // Thread 2: carry the outcome track record forward when re-remembering the
   // SAME tool (a re-validation shouldn't wipe its history); reset when the
@@ -745,7 +801,7 @@ export function boundCommandForChoice(choice: ToolChoiceRecordChoice): string {
  * perturb a recall/remember path. The CONTEXT INJECTION (behavior change)
  * is what's flag-gated, not this measurement.
  */
-type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'invalidate' | 'auto_invalidate' | 'forget' | 'outcome_pos' | 'outcome_neg';
+type ToolChoiceAction = 'recall_hit' | 'recall_hit_fuzzy' | 'recall_miss' | 'remember' | 'remember_rejected_failed' | 'invalidate' | 'auto_invalidate' | 'forget' | 'outcome_pos' | 'outcome_neg';
 function emitToolChoiceEvent(action: ToolChoiceAction, intent: string, identifier?: string): void {
   try {
     recordToolEvent({

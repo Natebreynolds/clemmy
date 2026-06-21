@@ -45,6 +45,7 @@ const {
   computeChoiceScore,
   peekToolChoice,
   matchToolChoicesForStep,
+  evidenceLooksFailedOrBlocked,
 } = await import('./tool-choice-store.js');
 
 test('recallToolChoice returns null when there is no record', () => {
@@ -527,6 +528,60 @@ test('matchToolChoicesForStep: a Facebook-scrape step does NOT match a Salesforc
 test('matchToolChoicesForStep: a genuine Salesforce step STILL matches the SOQL choice (no regression)', () => {
   const sfPrompt = 'Query Salesforce for my market-leader accounts that need follow-up and list their names and websites.';
   assert.ok(matchToolChoicesForStep(sfPrompt, { choices: [sfSoqlChoice] }).length >= 1);
+});
+
+// ─── Write-back guard: a gate-blocked / failed attempt must never become a proven choice ───
+
+test('evidenceLooksFailedOrBlocked: recognizes gate refusals + manual-fallback + failure phrasing', () => {
+  assert.equal(evidenceLooksFailedOrBlocked('netlify deploy refused by harness UNVERIFIED_DESTINATION gate; must run manually'), true);
+  assert.equal(evidenceLooksFailedOrBlocked('Blocked by the destination gate on every path; deploy it manually'), true);
+  assert.equal(evidenceLooksFailedOrBlocked('could not deploy — token not readable for raw API upload'), true);
+  assert.equal(evidenceLooksFailedOrBlocked('the write was refused by the grounding gate'), true);
+  // …but a genuinely-working memo (even one that MENTIONS handling failures) is NOT dropped.
+  assert.equal(evidenceLooksFailedOrBlocked('netlify deploy returned production url https://x.netlify.app for site id 449cd146'), false);
+  assert.equal(evidenceLooksFailedOrBlocked('npx netlify-cli deploy succeeded; retries on a transient 5xx'), false);
+  assert.equal(evidenceLooksFailedOrBlocked(undefined), false);
+});
+
+test('rememberToolChoice: a BLOCKED attempt is NOT persisted as the active choice (poisoned-memo guard)', () => {
+  const intent = 'netlify.deploy.guard.fresh';
+  // The exact 2026-06-21 poisoning shape: the model tries to remember a deploy
+  // that the destination gate hard-blocked.
+  rememberToolChoice({
+    intent,
+    description: 'Deploy clementine-onepager — blocked by UNVERIFIED_DESTINATION gate; must run manually.',
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod --dir . --site clementine-onepager.netlify.app', testEvidence: 'refused by harness UNVERIFIED_DESTINATION gate' },
+  });
+  const rec = peekToolChoice(intent);
+  assert.ok(rec, 'a record exists (the failed attempt is kept as history)');
+  assert.equal(rec!.choice, null, 'the failed attempt must NOT be the active proven choice');
+  assert.ok(rec!.fallbacks.some((f) => f.identifier === 'netlify'), 'the failed attempt is recorded as a fallback');
+  // …so recall does not serve a poisoned "must run manually" path (no active choice).
+  assert.equal(recallToolChoice(intent)?.choice ?? null, null);
+});
+
+test('rememberToolChoice: a blocked re-remember NEVER overwrites an existing PROVEN choice', () => {
+  const intent = 'netlify.deploy.guard.proven';
+  rememberToolChoice({
+    intent,
+    choice: { kind: 'cli', identifier: 'npx', invocationTemplate: 'npx netlify-cli deploy --dir "{{dir}}" --prod --site {{site_id}}', testEvidence: 'returned production url https://x.netlify.app' },
+  });
+  // A later gate-blocked attempt must leave the proven choice intact.
+  rememberToolChoice({
+    intent,
+    choice: { kind: 'cli', identifier: 'netlify', invocationTemplate: 'netlify deploy --prod --site x.netlify.app', testEvidence: 'blocked by the gate; run it manually' },
+  });
+  const rec = peekToolChoice(intent);
+  assert.equal(rec!.choice?.identifier, 'npx', 'the proven npx choice survives the blocked re-remember');
+});
+
+test('rememberToolChoice: a normal SUCCESSFUL remember still works (no regression)', () => {
+  const intent = 'netlify.deploy.guard.ok';
+  rememberToolChoice({
+    intent,
+    choice: { kind: 'cli', identifier: 'npx', invocationTemplate: 'npx netlify-cli deploy --site {{site_id}}', testEvidence: 'deployed; returned production URL' },
+  });
+  assert.equal(peekToolChoice(intent)!.choice?.identifier, 'npx');
 });
 
 test('matchToolChoicesForStep: an embedded command still binds (already-bound short-circuit unaffected)', () => {

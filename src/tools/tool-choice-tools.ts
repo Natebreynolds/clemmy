@@ -8,6 +8,8 @@ import {
   forgetMatching,
   type ToolChoiceKind,
 } from '../memory/tool-choice-store.js';
+import { noteRecalledIntent } from '../memory/procedural-recall-link.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
 
 /**
@@ -44,6 +46,13 @@ function formatChoiceRecall(intent: string): string {
     rec.description ? `Description: ${rec.description}` : '',
   ].filter(Boolean);
   if (rec.choice) {
+    // Note this CLI/MCP recall so the next matching tool result credits THIS
+    // intent's outcome (the per-recalled-intent loop — closes the measured 0%
+    // CLI/MCP outcome-coverage gap). composio recalls are skipped (their slug
+    // path already credits them). Best-effort; sessionId from the run context.
+    try {
+      noteRecalledIntent(harnessRunContextStorage.getStore()?.sessionId, rec.intent, rec.choice.identifier, rec.choice.kind);
+    } catch { /* never break a recall */ }
     lines.push(
       `Active choice: kind=${rec.choice.kind}, identifier=${rec.choice.identifier}`,
       rec.choice.invocationTemplate ? `  invocationTemplate: ${rec.choice.invocationTemplate}` : '',

@@ -30,6 +30,7 @@ import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, listC
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
+import { renderEstablishedDestinationsForContext } from '../runtime/harness/published-destinations.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
 import { listActiveGoalSummaries } from '../memory/goals-list.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
@@ -206,7 +207,7 @@ function renderActiveGoals(): string {
  * message+focus, harness uses the active focus). Returns the two SECTION strings
  * separately so each caller keeps its own block ordering. Best-effort.
  */
-export function renderLearnedBlocks(objective?: string): { recentlyLearned: string; toolChoices: string } {
+export function renderLearnedBlocks(objective?: string): { recentlyLearned: string; toolChoices: string; establishedDestinations: string } {
   let recentlyLearned = '';
   try {
     recentlyLearned = section('Recently Learned (last 24h)', renderRecentlyLearnedForInstructions(24, 15));
@@ -219,7 +220,18 @@ export function renderLearnedBlocks(objective?: string): { recentlyLearned: stri
   } catch {
     toolChoices = '';
   }
-  return { recentlyLearned, toolChoices };
+  // Established deploy targets for the project under active focus — the AGENT
+  // side of the destination gate↔recall unification (2026-06-21): surface WHERE
+  // this project deploys so the agent updates the same site explicitly instead
+  // of re-discovering / minting a new one / tripping the provenance gate.
+  let establishedDestinations = '';
+  try {
+    const focusRef = getFocusSnapshot().active?.resource_ref;
+    establishedDestinations = section('Established Deploy Targets', renderEstablishedDestinationsForContext(focusRef));
+  } catch {
+    establishedDestinations = '';
+  }
+  return { recentlyLearned, toolChoices, establishedDestinations };
 }
 
 export function renderHarnessMemoryContext(): string {
@@ -245,7 +257,7 @@ export function renderHarnessMemoryContext(): string {
   // the chat assembler via renderLearnedBlocks so both surfaces see the same
   // learned tools/facts. Scoped to the active focus objective. Returns
   // SECTION-wrapped strings, placed below at their existing positions.
-  const { recentlyLearned, toolChoices } = renderLearnedBlocks(getActiveObjective());
+  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(getActiveObjective());
 
   // Source-map / landscape memory — a pointer-first index of WHERE the user's
   // data lives, scoped to the active objective. Off (flag) → ''.
@@ -293,6 +305,7 @@ export function renderHarnessMemoryContext(): string {
     recentlyLearned,
     section('Data Landscape', dataLandscape),
     toolChoices,
+    establishedDestinations,
     section('Working Memory', memContext.workingMemory),
     section('Identity', memContext.identity),
     section('Core Personality', memContext.soul),

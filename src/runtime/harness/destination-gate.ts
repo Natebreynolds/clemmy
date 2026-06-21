@@ -416,6 +416,26 @@ const PUBLISH_TARGET_FLAG_RE =
  *  lowercased + de-duped. Empty when the command names no explicit target.
  *  Shell-var placeholders and the literal "current" are ignored (they route
  *  through the implicit gate, not provenance). Pure. */
+/**
+ * The comparison forms a published target can take, so provenance matching is
+ * IDENTITY-aware instead of exact-string (Defect A, 2026-06-21 recurrence): a
+ * site created as the slug `foo` is the SAME resource as a deploy to
+ * `foo.netlify.app` / `foo.vercel.app` / `foo.pages.dev` / `https://foo…`.
+ * General — derives the forms STRUCTURALLY (lowercased host + the first DNS
+ * label of a dotted host), with NO vendor/domain list. Pure.
+ * e.g. "https://Foo-Bar.netlify.app/" → ["foo-bar.netlify.app", "foo-bar"].
+ */
+export function destinationIdentityForms(target: string): string[] {
+  if (!target || typeof target !== 'string') return [];
+  const host = target.trim().toLowerCase().replace(/^[a-z][\w+.-]*:\/\//, '').replace(/[/?#].*$/, '');
+  if (!host) return [];
+  const forms = new Set<string>([host]);
+  const dot = host.indexOf('.');
+  // First DNS label of a dotted host IS the project/site slug (foo.netlify.app → foo).
+  if (dot > 0) forms.add(host.slice(0, dot));
+  return [...forms];
+}
+
 export function extractExplicitPublishTargets(command: string): string[] {
   if (!command || typeof command !== 'string') return [];
   const out = new Set<string>();

@@ -20,6 +20,7 @@ import {
   classifyShellNetworkMutation,
   evaluateDestinationProvenance,
   extractExplicitPublishTargets,
+  destinationIdentityForms,
   UnverifiedDestinationError,
   _resetDestinationStateForTests,
 } from './destination-gate.js';
@@ -264,4 +265,38 @@ test('UnverifiedDestinationError is recoverable and directs discover-then-retry,
   assert.match(e.message, /only STOP and report the blocker AFTER/i);
   assert.match(e.message, /do not give up before you have actually tried/i);
   assert.equal(e.hardBlock, true);
+});
+
+// ─── Defect A: identity-aware provenance (slug vs subdomain vs url), no vendor list ───
+
+test('destinationIdentityForms: a host yields both the full host and its first DNS label', () => {
+  assert.deepEqual(destinationIdentityForms('clementine-agent-v2.netlify.app'), ['clementine-agent-v2.netlify.app', 'clementine-agent-v2']);
+  // general across providers — no domain list
+  assert.deepEqual(destinationIdentityForms('Foo-Bar.vercel.app'), ['foo-bar.vercel.app', 'foo-bar']);
+  assert.deepEqual(destinationIdentityForms('https://my-site.pages.dev/'), ['my-site.pages.dev', 'my-site']);
+  // a bare slug or UUID has a single form
+  assert.deepEqual(destinationIdentityForms('clementine-agent-v2'), ['clementine-agent-v2']);
+  assert.deepEqual(destinationIdentityForms('48efadea-de48-42e3-894b-0da7deb3c6f6'), ['48efadea-de48-42e3-894b-0da7deb3c6f6']);
+});
+
+test('THE 2026-06-21 RECURRENCE: a site created in-session is provenanced when deployed by its subdomain', () => {
+  // Provenance set holds the BARE slug (from `sites:create --name clementine-agent-v2`).
+  const created = new Set(['clementine-agent-v2']);
+  const hasProvenance = (target: string): boolean =>
+    destinationIdentityForms(target).some((f) => created.has(f));
+  // Deploying to the FULL subdomain must now resolve to the same resource (was a hard block).
+  const cmd = 'cd site && netlify deploy --prod --dir . --site clementine-agent-v2.netlify.app --message "x"';
+  const prov = evaluateDestinationProvenance(cmd, hasProvenance);
+  assert.equal(prov.action, 'allow', 'a site created this session must be provenanced even via its .netlify.app subdomain');
+});
+
+test('cross-project clobber STILL blocked: an unrelated site is not provenanced by a different project', () => {
+  const created = new Set(['my-coffee-shop']); // created for the coffee project
+  const hasProvenance = (target: string): boolean =>
+    destinationIdentityForms(target).some((f) => created.has(f));
+  // A deploy to an UNRELATED law-firm site must still be refused (the original incident).
+  const cmd = 'netlify deploy --prod --dir . --site revill-law-firm.netlify.app';
+  const prov = evaluateDestinationProvenance(cmd, hasProvenance);
+  assert.equal(prov.action, 'flag');
+  assert.equal(prov.hardBlock, true);
 });

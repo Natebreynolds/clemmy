@@ -339,7 +339,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     return pointer;
   }
   const objective = getRecallObjective(message);
-  const { recentlyLearned, toolChoices } = renderLearnedBlocks(objective);
+  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(objective);
   // CANON-SELFASM: Now/date + Current Focus are DYNAMIC, so in tiered mode they
   // ride the per-turn tail (Autonomy + Available Skills are stable → Tier-1).
   const parityOn = chatContextParityEnabled();
@@ -350,6 +350,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     recentlyLearned,
     section('Data Landscape', renderSourceMapForContext(24, undefined, objective)),
     toolChoices,
+    establishedDestinations,
     section('Session Continuity', context.sessionBrief),
     section('Working Memory', context.workingMemory),
     section('Active Goals', buildGoalsContext()),

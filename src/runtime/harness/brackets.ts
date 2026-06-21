@@ -35,12 +35,16 @@ import {
   evaluateShellDestination,
   evaluateDestinationProvenance,
   extractExplicitPublishTargets,
+  destinationIdentityForms,
   wasDestinationNudged,
   markDestinationNudged,
   ImplicitDestinationError,
   UnverifiedDestinationError,
   classifyShellNetworkMutation,
+  classifyShellCommand,
 } from './destination-gate.js';
+import { establishedTargetsFor, recordPublishedDestination } from './published-destinations.js';
+import { creditMatchingRecall } from '../../memory/procedural-recall-link.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -630,9 +634,14 @@ function publishCreateSucceeded(resultText: string): boolean {
  * Fail-open: any error yields an empty predicate, which only makes the gate
  * stricter (never crashes a tool call).
  */
-function buildPublishProvenance(sessionId: string): (target: string) => boolean {
+function buildPublishProvenance(sessionId: string, projectKey?: string): (target: string) => boolean {
   const created = new Set<string>();
   let userBlob = '';
+  // Part 2 (2026-06-21): destinations THIS project has successfully published to
+  // before — durable, cross-session, project-keyed. A target the project has
+  // deliberately deployed to is not an "unrelated live site". Keyed by project
+  // so it can never confer provenance across unrelated projects (no clobber).
+  const established = establishedTargetsFor(projectKey);
   try {
     const events = listEvents(sessionId, { types: ['user_input_received', 'tool_called', 'tool_returned'] });
     const createCallNames = new Map<string, string[]>();
@@ -672,10 +681,13 @@ function buildPublishProvenance(sessionId: string): (target: string) => boolean 
     userBlob = userParts.join(' \n ');
   } catch { /* fail-open: empty provenance = stricter gate, never a crash */ }
   return (target: string) => {
-    const t = target.toLowerCase();
-    if (created.has(t)) return true;
+    // Identity-aware (Defect A): a site created as `foo` IS `foo.netlify.app` —
+    // match on the structural forms (host + first DNS label), not exact string.
+    const forms = destinationIdentityForms(target);
+    if (forms.length === 0) return false;
+    if (forms.some((f) => created.has(f) || established.has(f))) return true;
     // The user explicitly named this site (id/slug) in a message this session.
-    if (t.length >= 4 && userBlob.includes(t)) return true;
+    if (forms.some((f) => f.length >= 4 && userBlob.includes(f))) return true;
     return false;
   };
 }
@@ -742,6 +754,56 @@ function compensateFailedExternalWrite(
       }
     }
   } catch { /* compensation must never break the tool result */ }
+}
+
+/**
+ * After a `run_shell_command` returns, if it was a PUBLISH to an explicit target
+ * that demonstrably SUCCEEDED, record (project → destination) durably (Part 2,
+ * 2026-06-21). projectKey = the command's cwd, so a future redeploy of THIS
+ * project to the SAME site is provenanced cross-session — turning a one-time
+ * success into learned, reusable knowledge (the ever-learning fix for the
+ * "deploy blocked because it's a new session" recurrence). Only fires on a clear
+ * success; best-effort (never perturbs the tool result).
+ */
+function recordPublishIfSucceeded(toolName: string, parsedInput: unknown, result: unknown): void {
+  try {
+    if (toolName !== 'run_shell_command') return;
+    const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+      ? (parsedInput as { command: string }).command : '';
+    if (!command || !classifyShellCommand(command).isPublish) return;
+    const targets = extractExplicitPublishTargets(command);
+    if (targets.length === 0) return;
+    if (!publishCreateSucceeded(stripAnsi(typeof result === 'string' ? result : ''))) return;
+    const projectKey = typeof (parsedInput as { cwd?: unknown })?.cwd === 'string'
+      ? (parsedInput as { cwd: string }).cwd : undefined;
+    recordPublishedDestination(projectKey, targets);
+  } catch { /* learning is best-effort — never break the tool result */ }
+}
+
+/**
+ * Per-recalled-intent outcome correlation (2026-06-21 keystone): if the agent
+ * recalled a CLI/MCP proven path and THIS tool result is the matching use of it,
+ * credit that specific intent's outcome — closing the measured 0% CLI/MCP
+ * outcome-coverage gap, precisely (per-operation, not per-binary). Haystack is
+ * the shell command (so `netlify deploy …` matches a `netlify` recall) or the
+ * tool name (so an MCP tool result matches its own recalled identifier).
+ * Composio is skipped upstream (noteRecalledIntent ignores it). Best-effort.
+ */
+function creditRecallFromToolResult(sessionId: string | undefined, toolName: string, parsedInput: unknown, result: unknown): void {
+  try {
+    if (!sessionId) return;
+    const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+      ? (parsedInput as { command: string }).command : '';
+    const haystack = toolName === 'run_shell_command' ? command : toolName;
+    if (!haystack) return;
+    const resultStr = typeof result === 'string' ? result : '';
+    // Failure shapes the harness already recognizes (computer-tools exit_code,
+    // run_worker ERROR stub, composio FAILED banner); otherwise treat as success.
+    const failed = /(?:^|\s)exit_code:\s*[1-9]/.test(resultStr)
+      || /^ERROR:/.test(resultStr)
+      || resultStr.startsWith('⚠️ composio_execute_tool FAILED');
+    creditMatchingRecall(sessionId, haystack, !failed);
+  } catch { /* learning is best-effort — never break the tool result */ }
 }
 
 export function wrapToolForHarness<T extends WrappableTool>(
@@ -1075,7 +1137,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
           // Chat only, so recurring workflows reusing a stable site id are exempt.
           const sessionRow = getSession(ctx.sessionId);
           if (sessionRow?.kind === 'chat') {
-            const prov = evaluateDestinationProvenance(command, buildPublishProvenance(ctx.sessionId));
+            // Project key = the command's working dir, so provenance is scoped to
+            // THIS project (a destination established for one project can't
+            // provenance another — preserves the cross-project clobber guard).
+            const projectKey = typeof (parsedInput as { cwd?: unknown })?.cwd === 'string'
+              ? (parsedInput as { cwd: string }).cwd : undefined;
+            const prov = evaluateDestinationProvenance(command, buildPublishProvenance(ctx.sessionId, projectKey));
             if (prov.action === 'flag' && prov.shapeKey) {
               try {
                 appendEvent({
@@ -1408,6 +1475,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           : invokeOnce();
       invokePromise = invokePromise.then((result) => {
         compensateFailedExternalWrite(ctx?.sessionId, tool.name, parsedInput, result);
+        recordPublishIfSucceeded(tool.name, parsedInput, result);
+        creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, result);
         return result;
       });
       // run_worker (Agent.asTool fan-out leaf) MUST return something into the
@@ -1474,6 +1543,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
       { isPaused: isPausedFactory(ctx?.sessionId) },
     );
     compensateFailedExternalWrite(ctx?.sessionId, tool.name, input, result);
+    recordPublishIfSucceeded(tool.name, input, result);
+    creditRecallFromToolResult(ctx?.sessionId, tool.name, input, result);
     if (fanoutNudge && typeof result === 'string') return `${result}\n\n${fanoutNudge}`;
     return result;
     // NOTE: A tool-return truncator used to live here as part of
