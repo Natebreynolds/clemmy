@@ -26,7 +26,7 @@ export type ToolFailureKind =
   | 'unknown';
 
 const PERMISSION_RE = /\b401\b|\b403\b|permission|forbidden|unauthor|access\s+denied|not\s+authoriz/i;
-const NOT_FOUND_RE = /\b404\b|not\s+found|does\s+not\s+exist|no\s+such|invalid[^.]{0,20}(?:id|name|key|table|record|field|voice|base|slug|model)/i;
+const NOT_FOUND_RE = /\b404\b|not\s+found|does\s+not\s+exist|no\s+such|invalid[^.]{1,20}(?:id|name|key|table|record|field|voice|base|slug|model)/i;
 const RATE_RE = /\b429\b|rate[\s-]?limit|quota|too\s+many\s+requests/i;
 const TIMEOUT_RE = /timeout|timed\s+out|deadline|took\s+too\s+long/i;
 const PAGINATION_RE = /\boffset\b|opaque token|pagination|next[\s-]?page/i;

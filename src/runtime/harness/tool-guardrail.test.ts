@@ -178,6 +178,27 @@ test('evaluateToolCall: CLEMMY_GUARDRAIL_EXACT_HARDSTOP tunes the terminal thres
   }
 });
 
+test('evaluateToolCall: an inverted hardStop env (<= blockAt) is clamped — a soft block always precedes the kill', () => {
+  // Pre-tag review hardening: CLEMMY_GUARDRAIL_EXACT_HARDSTOP set below blockAt
+  // must NOT make escalate fire before any soft block exists. The clamp keeps
+  // hardStop > blockAt so the corrective-then-terminal invariant always holds.
+  _resetAllTrackersForTests();
+  const prev = process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP;
+  process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP = '3'; // below the default blockAt=5
+  try {
+    const args = { workflow_id: 'wf-clamp' };
+    const call = () => evaluateToolCall('sess-clamp', 'workflow_run', args);
+    let d;
+    for (let i = 0; i < 5; i += 1) d = call();         // count 5 = blockAt
+    assert.equal(d?.action, 'block', 'count 5 is a soft block, NOT a premature escalate');
+    d = call();                                         // count 6 = blockAt+1 = clamped hardStop
+    assert.equal(d?.action, 'escalate', 'escalate fires at the clamped blockAt+1, never below blockAt');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP;
+    else process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP = prev;
+  }
+});
+
 test('evaluateToolCall: read slugs with SET/ADD SUBSTRINGS are not misclassified as writes (token match)', () => {
   // Guard for the 2026-06-01 review finding: classification must be TOKEN-based
   // (split on '_', match canonical MUTATING_VERBS), not a substring regex.

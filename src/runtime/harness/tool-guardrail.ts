@@ -286,8 +286,11 @@ function readThresholds(): Thresholds {
     exactArgsBlockAt: blockAt,
     // Default = blockAt + 7 (12 by default). Gives ~7 soft-refusal chances to
     // self-correct before the terminal stop, vs the old blockAt+2 (=7) which
-    // hard-killed the turn after only two soft blocks.
-    exactArgsHardStopAt: num('CLEMMY_GUARDRAIL_EXACT_HARDSTOP', blockAt + 7),
+    // hard-killed the turn after only two soft blocks. Clamped to > blockAt so an
+    // inverted env override (hardStop <= blockAt) can never make escalate fire
+    // before the soft-block window exists — the corrective-then-terminal
+    // invariant always holds (at minimum one soft block precedes the kill).
+    exactArgsHardStopAt: Math.max(num('CLEMMY_GUARDRAIL_EXACT_HARDSTOP', blockAt + 7), blockAt + 1),
     sameMutToolWarnAt: num('CLEMMY_GUARDRAIL_MUT_WARN', 3),
     sameMutToolHaltAt: num('CLEMMY_GUARDRAIL_MUT_HALT', 8),
     recentWindowSize: num('CLEMMY_GUARDRAIL_WINDOW', 100),

@@ -566,7 +566,7 @@ export interface WrapToolOptions {
 }
 
 // Tool reliability brackets — per-tool wall-clock timeout + identical-args
-// loop-guard (block@5/escalate@7) + counter cap. DEFAULT-ON (2026-06-07): the
+// loop-guard (soft block@5 through 11, terminal escalate@12) + counter cap. DEFAULT-ON (2026-06-07): the
 // 24/7 audit proved these are the live wedge — a hung external tool had no
 // timeout and a runaway reached 77-81x identical calls because this block was
 // off by default. Timeouts are generous (mcp/shell 10min, externalApi 5min;

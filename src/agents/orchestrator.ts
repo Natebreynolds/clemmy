@@ -655,7 +655,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // an anti-pattern the structured one-item packet now prevents. 8 sits above
   // legit single-item work (1–3, complex sequential ≤~7) and below 10, catching
   // mis-scoped/runaway workers ~2 turns earlier. The precise thrash control is
-  // the per-worker loop-guard (identical-call block@5/escalate@7), not this cap;
+  // the per-worker loop-guard (identical-call soft block@5..11, escalate@12), not this cap;
   // the cap is the outer runaway bound. `worker_capped` telemetry (hooks.ts)
   // records cap-hits so this can be recalibrated from real data.
   const workerMaxTurns = (() => {
