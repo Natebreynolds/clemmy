@@ -478,19 +478,23 @@ export const RUBRIC_INSTRUCTIONS_BY_VARIANT: Record<string, string> = {
 
 /** Resolve the Codex-lane rubric (instructions string) + the chosen variant for
  *  telemetry. Bounded by what RUBRIC_INSTRUCTIONS_BY_VARIANT actually implements. */
-export function selectOrchestratorRubric(): {
+export function selectOrchestratorRubric(sessionId?: string | null): {
   variant: string;
   requested: string;
   fellBack: boolean;
+  experiment: boolean;
+  arm: 'lean' | 'legacy' | null;
   instructions: string;
 } {
-  const choice = resolveRubricVariant(Object.keys(RUBRIC_INSTRUCTIONS_BY_VARIANT));
+  // sessionId enables the per-session live A/B (CLEMMY_RUBRIC_VARIANT_AB) — without
+  // it, the global CLEMMY_RUBRIC_VARIANT governs (byte-identical to before).
+  const choice = resolveRubricVariant(Object.keys(RUBRIC_INSTRUCTIONS_BY_VARIANT), sessionId);
   const mapped = RUBRIC_INSTRUCTIONS_BY_VARIANT[choice.variant];
   // fellBack reflects "did we actually serve the proven legacy rubric instead of
   // the requested one" — true if resolveRubricVariant fell back OR the resolved
   // variant has no real instructions registered (a future mis-registration).
   if (mapped == null) {
-    return { variant: DEFAULT_RUBRIC_VARIANT, requested: choice.requested, fellBack: true, instructions: ORCHESTRATOR_INSTRUCTIONS };
+    return { variant: DEFAULT_RUBRIC_VARIANT, requested: choice.requested, fellBack: true, experiment: choice.experiment, arm: choice.arm, instructions: ORCHESTRATOR_INSTRUCTIONS };
   }
   return { ...choice, instructions: mapped };
 }
@@ -626,7 +630,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // (i.e. PER TURN, like mcp_tool_scope) — A/B aggregation should dedupe to one row
   // per session. Default 'legacy' → byte-identical to before. The extra row on the
   // default path is intended telemetry. Must never block construction.
-  const rubricChoice = selectOrchestratorRubric();
+  const rubricChoice = selectOrchestratorRubric(options.sessionId);
   if (options.sessionId) {
     try {
       appendEvent({
@@ -638,6 +642,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           variant: rubricChoice.variant,
           requested: rubricChoice.requested,
           fellBack: rubricChoice.fellBack,
+          // A/B attribution: `arm` + `experiment` let scripts/measure-rubric-ab.ts
+          // segment real traffic; `lane` scopes the readout (this is the codex/
+          // native orchestrator lane — the Claude brain runs its own lean rubric).
+          experiment: rubricChoice.experiment,
+          arm: rubricChoice.arm,
+          lane: 'codex',
         },
       });
     } catch {
