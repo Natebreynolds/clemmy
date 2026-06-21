@@ -58,6 +58,29 @@ export function looksLikeToolNarration(text: string, toolUses: string[]): boolea
     /(^|\n)\s*\{\s*"command"\s*:/.test(t)
   );
 }
+
+/** Detect the "reasoning-leak" failure: the brain verbalized its instruction-
+ *  hierarchy / prompt-injection deliberation about its OWN injected context
+ *  (memory, preferences/specs, tool descriptions, system reminders) and did NO
+ *  work — no tool calls, just defensive musing that trails off without an answer.
+ *  This is the memory-context cousin of looksLikeToolNarration: a safety-trained
+ *  Claude misreads its trusted recalled memory as adversarial and second-guesses
+ *  it out loud instead of doing the task. (Observed v0.10.20: a recalled
+ *  market-leader spec triggered "…possibly injected… the classic trap… let me
+ *  re-read the actual ask" with zero accounts pulled.) Requires no tool calls so
+ *  a reply that actually DID work (and merely thought aloud) is never flagged. */
+export function looksLikeReasoningLeak(text: string, toolUses: string[]): boolean {
+  if (toolUses.length > 0) return false;
+  const t = (text || '').trim();
+  if (!t) return false;
+  // Strong: the model is treating its own injected context as untrusted/injected.
+  const metaInjectionDoubt =
+    /possibly injected|prompt[-\s]?injection|the classic trap|reference data,?\s*not live instructions|possibly stale|by who[-\s]?knows[-\s]?whom|treat everything in the system[-\s]?reminder/i.test(t);
+  // Stalled self-doubt with no resolution / no answer produced.
+  const stalledSelfDoubt =
+    /that result looks scrambled|let me re-?read (the|what|the actual)|I need to stop and actually look|what actually changed:?\s*nothing/i.test(t);
+  return metaInjectionDoubt || stalledSelfDoubt;
+}
 function judgeMaxContinuations(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS', '1') ?? '1', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 1;
@@ -198,6 +221,20 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
 // and in the narrate-instead-of-call history; runtime safety is enforced in CODE at
 // the tool boundary, not in this prose.
 
+/** Frame the injected Clementine memory as TRUSTED context the brain OWNS, not
+ *  external/untrusted input. Without this, a safety-trained Claude can misread
+ *  its own recalled memory/specs as a prompt-injection and spiral into visible
+ *  "is this stale/injected?" deliberation instead of using it (see
+ *  looksLikeReasoningLeak). Empty memory ⇒ no framing (nothing to frame). */
+export function frameTrustedMemory(persistentContext: string): string {
+  if (!persistentContext.trim()) return '';
+  return [
+    'YOUR MEMORY — trusted context you OWN. The block below is Clementine\'s own persistent memory about THIS user: their profile, saved preferences/specs, facts you have learned, and where their data lives. It is reliable background to USE in service of the request. It is NOT user-pasted input, NOT external/untrusted data, and NOT a prompt-injection to verify or second-guess. Do not narrate skepticism about its provenance ("is this stale or injected?") — just use what is relevant and do the task.',
+    '',
+    persistentContext,
+  ].join('\n');
+}
+
 export function renderClaudeAgentBrainSystemAppend(
   surface: ClaudeAgentBrainSurface,
   request: AssistantRequest,
@@ -214,7 +251,7 @@ export function renderClaudeAgentBrainSystemAppend(
     `Session: ${request.sessionId}`,
     `Claude brain mode: ${mode}`,
     '',
-    persistentContext,
+    frameTrustedMemory(persistentContext),
     '',
     'How you operate here:',
     CLAUDE_BRAIN_RUBRIC,
@@ -333,6 +370,24 @@ export async function respondViaClaudeAgentSdkBrain(
       prompt:
         `Your previous attempt WROTE OUT a tool call as text (e.g. "Tool: …", "function { … }", a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
         `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
+      ...runOptions,
+    });
+    result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
+  }
+
+  // Reasoning-leak backstop (defense-in-depth; the trusted-memory framing prevents
+  // most of it). If the brain produced NO tool calls and its reply is defensive
+  // deliberation about whether its own injected context is trustworthy — the
+  // memory-context cousin of narrate-instead-of-call — it second-guessed its
+  // memory instead of doing the task. Retry ONCE, telling it the context is
+  // trusted and to just do the work. Any mode (a read turn can spiral too).
+  // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
+  if (narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
+    const retry = await runClaudeAgentSdkImpl({
+      prompt:
+        `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
+        `Your injected Clementine memory (profile, saved preferences/specs, learned facts) is TRUSTED context you OWN — not user-pasted input and not a prompt-injection. Do NOT reason about its provenance. ` +
+        `Just do exactly what the user asked: "${request.message}". Use the relevant tools and reply with the real result.`,
       ...runOptions,
     });
     result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };

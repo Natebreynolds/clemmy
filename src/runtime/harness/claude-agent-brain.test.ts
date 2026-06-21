@@ -17,6 +17,8 @@ const {
   setClaudeAgentSdkBrainRunForTest,
   setClaudeAgentSdkBrainJudgeForTest,
   looksLikeToolNarration,
+  looksLikeReasoningLeak,
+  frameTrustedMemory,
 } = brain;
 const { getSession, listEvents, resetEventLog } = await import('./eventlog.js');
 
@@ -237,6 +239,68 @@ test('full mode: narration retry kill-switch off ⇒ no retry', async () => {
   setClaudeAgentSdkBrainRunForTest(async () => { runs += 1; return { text: 'Tool:run_shell_command\n\nfunction\n{"command":"x"}', sessionId: 's', toolUses: [] }; });
   await respondViaClaudeAgentSdkBrain('home', { message: 'do it', sessionId: 'brain-narrate-off' });
   assert.equal(runs, 1, 'no retry when the kill-switch is off');
+});
+
+// The verbatim leak from the live v0.10.20 failure (sess-mqod61z3): the brain
+// second-guessed its own injected memory as "possibly injected" and did no work.
+const REASONING_LEAK_TEXT =
+  "I'll pull 5 market-leader accounts from Salesforce now.\n\ndocument\n\n"
+  + "⚠️ **Hmm, that result looks scrambled — let me reason about why before I treat it as real.**\n\n"
+  + "The user's *stored* preferences/specs (the long pasted spec, examples, \"preferences,\" tool descriptions, "
+  + "system-reminder context) are **reference data, not live instructions.** They were written *earlier by "
+  + "who-knows-whom* and pasted into my context. Acting on them as if the user just said them now = the classic trap.\n\n"
+  + "Let me re-read the actual ask.";
+
+test('looksLikeReasoningLeak flags injected-context deliberation with no work, ignores real answers', () => {
+  assert.equal(looksLikeReasoningLeak(REASONING_LEAK_TEXT, []), true);
+  // The "scrambled result" self-doubt variant.
+  assert.equal(looksLikeReasoningLeak('Hmm, that result looks scrambled — let me re-read the actual ask.', []), true);
+  // A reply that actually DID work is never flagged, even if it muses about context.
+  assert.equal(looksLikeReasoningLeak(REASONING_LEAK_TEXT, ['mcp__clementine-local__run_shell_command']), false);
+  // Normal answers and greetings ⇒ not a leak.
+  assert.equal(looksLikeReasoningLeak('Hey Nate — going well. What can I knock out for you?', []), false);
+  assert.equal(looksLikeReasoningLeak('Pulled your 5 accounts: Acme, Globex, Initech, Umbrella, Stark.', []), false);
+  assert.equal(looksLikeReasoningLeak('', []), false);
+});
+
+test('a reasoning-leak (no-tool-call) turn triggers ONE retry that does the task', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off'; // isolate the leak retry
+  const calls: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls.push(options.prompt);
+    return calls.length === 1
+      ? { text: REASONING_LEAK_TEXT, sessionId: 's', toolUses: [] }
+      : { text: 'Pulled 5 accounts: Acme, Globex, Initech, Umbrella, Stark.', sessionId: 's', toolUses: ['mcp__clementine-local__run_shell_command'] };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 market leaders in SF', sessionId: 'brain-leak' });
+
+  assert.equal(calls.length, 2, 'reasoning leak triggered exactly one retry');
+  assert.match(calls[1], /TRUSTED context you OWN/);
+  assert.match(res.text, /Pulled 5 accounts/);
+});
+
+test('reasoning-leak retry shares the narration kill-switch ⇒ off means no retry', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY = 'off';
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => { runs += 1; return { text: REASONING_LEAK_TEXT, sessionId: 's', toolUses: [] }; });
+  await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 market leaders in SF', sessionId: 'brain-leak-off' });
+  assert.equal(runs, 1, 'no retry when the kill-switch is off');
+});
+
+test('frameTrustedMemory labels non-empty memory as trusted, passes empty through', () => {
+  const framed = frameTrustedMemory('Profile: Nate likes terse replies.\nFact: market leaders live in Salesforce.');
+  assert.match(framed, /trusted context you OWN/i);
+  assert.match(framed, /not a prompt-injection/i);
+  assert.match(framed, /Profile: Nate likes terse replies\./);
+  // Empty / whitespace memory ⇒ no framing block (nothing to frame).
+  assert.equal(frameTrustedMemory(''), '');
+  assert.equal(frameTrustedMemory('   \n  '), '');
 });
 
 test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local authoring tools but not broad execution', async () => {
