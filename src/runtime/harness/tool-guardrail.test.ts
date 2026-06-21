@@ -130,6 +130,54 @@ test('evaluateToolCall: a looping composio READ slug never escalates to a turn-k
   assert.equal(lastWrite?.action, 'escalate');
 });
 
+test('evaluateToolCall: corrective-then-terminal — a mutating exact-args loop stays SOFT block through the advisory window, escalates only at hardStop', () => {
+  // 2026-06-20: the bar is "inform, rarely block; hard-stop only on budget
+  // abuse." A repeating identical mutating call now gets a LONG advisory window
+  // of soft 'block' refusals (which the model sees + can recover from) before
+  // the terminal escalate fires at hardStopAt (= blockAt+7 = 12 by default).
+  // Previously escalate hard-killed the turn at blockAt+2 (=7) — the blunt
+  // turn-ender that cut off the live site-host run.
+  _resetAllTrackersForTests();
+  const args = { workflow_id: 'wf-ladder' };
+  const call = () => evaluateToolCall('sess-ladder', 'workflow_run', args); // workflow_run is mutating
+  let d;
+  for (let i = 0; i < 5; i += 1) d = call();          // counts 1..5
+  assert.equal(d?.action, 'block', 'count 5 → soft block (advisory)');
+  for (let i = 6; i <= 11; i += 1) d = call();         // counts 6..11
+  assert.equal(d?.count, 11);
+  assert.equal(d?.action, 'block', 'count 11 → STILL soft block (advisory window), not a turn-kill');
+  d = call();                                          // count 12 = hardStopAt
+  assert.equal(d?.count, 12);
+  assert.equal(d?.action, 'escalate', 'count 12 (hardStop) → terminal escalate, the runaway backstop');
+});
+
+test('evaluateToolCall: the soft-block message hardens to "provably stuck" past blockAt+2', () => {
+  _resetAllTrackersForTests();
+  const args = { workflow_id: 'wf-msg' };
+  const call = () => evaluateToolCall('sess-msg', 'workflow_run', args);
+  let d;
+  for (let i = 0; i < 5; i += 1) d = call();          // count 5
+  assert.match(d!.reason, /STOP/i);
+  assert.doesNotMatch(d!.reason, /provably stuck/i);  // milder at the start of the window
+  for (let i = 6; i <= 7; i += 1) d = call();          // count 7 = blockAt+2
+  assert.match(d!.reason, /provably stuck/i);          // hardened, terminal-toned
+});
+
+test('evaluateToolCall: CLEMMY_GUARDRAIL_EXACT_HARDSTOP tunes the terminal threshold', () => {
+  _resetAllTrackersForTests();
+  const prev = process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP;
+  process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP = '6';
+  try {
+    const args = { workflow_id: 'wf-tune' };
+    let d;
+    for (let i = 0; i < 6; i += 1) d = evaluateToolCall('sess-tune', 'workflow_run', args);
+    assert.equal(d?.action, 'escalate', 'with hardStop=6, the 6th identical call escalates');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP;
+    else process.env.CLEMMY_GUARDRAIL_EXACT_HARDSTOP = prev;
+  }
+});
+
 test('evaluateToolCall: read slugs with SET/ADD SUBSTRINGS are not misclassified as writes (token match)', () => {
   // Guard for the 2026-06-01 review finding: classification must be TOKEN-based
   // (split on '_', match canonical MUTATING_VERBS), not a substring regex.

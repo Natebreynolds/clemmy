@@ -428,6 +428,44 @@ export function annotateShellStderr(stderr: string, command: string): string {
   return `${stderr}\n\n${hints.join('\n')}`;
 }
 
+/**
+ * Map a spawn-LEVEL failure to an actionable, self-correcting message.
+ *
+ * This is distinct from annotateShellStderr (which annotates the stderr of a
+ * command that actually RAN). A spawn-level failure is emitted on the child's
+ * `error` event — the process could not even start. The two get conflated at
+ * the cost of self-correction: the model only ever saw the raw `spawn /bin/sh
+ * ENOENT`, which names NEITHER the cwd nor the binary as the cause, so it could
+ * not tell what to change and re-issued the identical call until the loop
+ * guardrail ended the turn (the live 2026-06-20 site-host failure). Every branch
+ * names the likely cause AND tells the model not to repeat the call unchanged.
+ */
+export function annotateSpawnError(error: unknown, command: string, cwd?: string): string {
+  const err = error as NodeJS.ErrnoException | undefined;
+  const base = err?.message ? String(err.message) : String(error);
+  const code = err?.code;
+  const firstWord = command.trim().split(/\s+/)[0] || 'the command';
+  if (code === 'ENOENT') {
+    return `${base}\n\n`
+      + `CLEMENTINE HINT (recoverable): the process could not be spawned (ENOENT). The two likely causes are `
+      + `(1) the working directory does not exist${cwd ? ` — cwd was "${cwd}"` : ''}, or `
+      + `(2) the binary "${firstWord}" is not on PATH. `
+      + `Fix the cause before retrying: omit \`cwd\` to use the safe default (~/.clementine-next) or pass an existing directory inside an allowed workspace root; `
+      + `if it's the binary, install it (\`brew install ${firstWord}\` / \`npm install -g ${firstWord}\`) or pick another tool. `
+      + `Do NOT re-issue the identical command — it will fail the same way.`;
+  }
+  if (code === 'EACCES' || code === 'EPERM') {
+    return `${base}\n\n`
+      + `CLEMENTINE HINT (recoverable): permission denied (${code}) starting the process. `
+      + `The binary may not be executable, or the cwd/file is in a protected location. `
+      + `Omit \`cwd\` to fall back to the safe default, make the file executable (\`chmod +x\`), or use the equivalent Composio tool. `
+      + `Do NOT re-issue the identical command unchanged.`;
+  }
+  // Unknown spawn error — still run the message through the stderr annotator in
+  // case it matches a known recoverable pattern; otherwise return it plainly.
+  return annotateShellStderr(base, command);
+}
+
 function runCommand(command: string, cwd: string, timeoutMs: number): Promise<string> {
   assertCommandAllowed(command);
   const stubMessage = developerToolStubBlockMessage(command);
@@ -457,7 +495,10 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<st
     });
     child.on('error', (error) => {
       clearTimeout(timeout);
-      reject(error);
+      // A spawn-level failure (ENOENT/EACCES/…) never reaches the close handler
+      // and so never hit annotateShellStderr — the model saw the raw error and
+      // could not self-correct. Annotate it here so the cause + fix ride back.
+      reject(new Error(annotateSpawnError(error, command, cwd)));
     });
     child.on('close', (code) => {
       clearTimeout(timeout);
@@ -498,7 +539,7 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
     });
     child.on('error', (error) => {
       clearTimeout(timeout);
-      reject(error);
+      reject(new Error(annotateSpawnError(error, command, cwd)));
     });
     child.on('close', (code) => {
       clearTimeout(timeout);

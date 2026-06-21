@@ -256,6 +256,11 @@ interface Thresholds {
   exactArgsWarnAt: number;
   /** Same (tool, args) hash repeats: block at this count (strict mode). */
   exactArgsBlockAt: number;
+  /** Same (tool, args) hash repeats on a MUTATING tool: HARD-stop (end the
+   *  turn) at this count. Set generously above blockAt so the model gets a
+   *  long advisory window of soft refusals to self-correct first; the hard
+   *  stop is only the runaway/budget backstop, not the first response. */
+  exactArgsHardStopAt: number;
   /** Same tool, different args (mutating only): warn at this count. */
   sameMutToolWarnAt: number;
   /** Same tool, different args (mutating only): halt at this count (strict mode). */
@@ -275,9 +280,14 @@ function readThresholds(): Thresholds {
     const parsed = Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   };
+  const blockAt = num('CLEMMY_GUARDRAIL_EXACT_BLOCK', 5);
   return {
     exactArgsWarnAt: num('CLEMMY_GUARDRAIL_EXACT_WARN', 2),
-    exactArgsBlockAt: num('CLEMMY_GUARDRAIL_EXACT_BLOCK', 5),
+    exactArgsBlockAt: blockAt,
+    // Default = blockAt + 7 (12 by default). Gives ~7 soft-refusal chances to
+    // self-correct before the terminal stop, vs the old blockAt+2 (=7) which
+    // hard-killed the turn after only two soft blocks.
+    exactArgsHardStopAt: num('CLEMMY_GUARDRAIL_EXACT_HARDSTOP', blockAt + 7),
     sameMutToolWarnAt: num('CLEMMY_GUARDRAIL_MUT_WARN', 3),
     sameMutToolHaltAt: num('CLEMMY_GUARDRAIL_MUT_HALT', 8),
     recentWindowSize: num('CLEMMY_GUARDRAIL_WINDOW', 100),
@@ -290,12 +300,15 @@ function readThresholds(): Thresholds {
 // ─────────────────────────────────────────────────────────────────
 
 export type GuardrailMode = 'off' | 'warn' | 'strict';
-// 'escalate' = a MUTATING tool called with byte-identical args so many times
-// that the agent is provably stuck in an unrecoverable loop (e.g. a tool whose
-// schema the model can't satisfy). Unlike 'block' (a SOFT, retryable refusal),
-// 'escalate' ENDS the turn — it is never downgraded to warn, even in warn mode,
-// because letting the model retry a call it cannot vary just spins (the live
-// 84×/3-min workflow_run hang). See brackets.ts ToolGuardrailEscalated.
+// 'escalate' = a MUTATING tool repeated byte-identical past the GENEROUS
+// hardStopAt threshold — i.e. the model ignored a long window of soft 'block'
+// refusals (which it sees and can recover from) and is now in a runaway loop
+// burning budget. Only THEN does 'escalate' END the turn; it is never
+// downgraded to warn (that's its whole job — the runaway/budget backstop that
+// stops the live 84×/3-min workflow_run hang). The earlier counts are soft
+// 'block's so the model gets every chance to self-correct first (the
+// corrective-then-terminal ladder, 2026-06-20). See brackets.ts
+// ToolGuardrailEscalated.
 export type GuardrailAction = 'allow' | 'warn' | 'block' | 'halt' | 'escalate';
 
 export interface GuardrailDecision {
@@ -544,30 +557,39 @@ export function evaluateToolCall(
   const isMut = isMutatingCall(toolName, args);
   const isIdem = isIdempotentCall(toolName, args);
 
-  // Exact-args repeat rule.
-  // ESCALATE (mutating only): a few soft blocks give the model a chance to
-  // vary the call; if it STILL repeats byte-identical args past blockAt+2,
-  // the loop is unrecoverable (e.g. a schema it can't satisfy) — return a
-  // TERMINAL action so the harness ends the turn instead of spinning. This
-  // is the fix for the 84×/3-min workflow_run hang that a soft block could
-  // not stop. Read/idempotent tools never escalate (polling is legitimate).
-  if (isMut && exactCount >= thresholds.exactArgsBlockAt + 2) {
+  // Exact-args repeat rule — CORRECTIVE-THEN-TERMINAL (2026-06-20).
+  // The governing bar is "inform, rarely block; hard-stop only on an
+  // irreversible-write-without-approval or token ≫ ceiling." A repeating
+  // identical call wastes budget but causes no NEW harm, so it should be
+  // ADVISED, not summarily killed. So:
+  //   - blockAt .. hardStopAt-1  → SOFT block (refused, the model SEES the
+  //     reason as the tool's output and can self-correct in-turn). The message
+  //     hardens in tone once we pass blockAt+2 ("provably stuck").
+  //   - >= hardStopAt            → TERMINAL escalate (end the turn). This is
+  //     the runaway/budget backstop that still stops the 84×/3-min hang; it
+  //     just fires far later, after a long advisory window. Read/idempotent
+  //     tools NEVER escalate (polling is legitimate).
+  if (isMut && exactCount >= thresholds.exactArgsHardStopAt) {
     return {
       action: 'escalate',
       signature,
       toolName,
-      reason: `${toolName} called ${exactCount}× with IDENTICAL arguments — stuck in an unrecoverable loop. Ending the turn.`,
+      reason: `${toolName} called ${exactCount}× with IDENTICAL arguments despite repeated soft warnings — a runaway loop burning budget. Ending the turn.`,
       rule: 'exact_args_repeat',
       count: exactCount,
       mutating: isMut,
     };
   }
   if (exactCount >= thresholds.exactArgsBlockAt) {
+    const provablyStuck = exactCount >= thresholds.exactArgsBlockAt + 2;
+    const reason = provablyStuck
+      ? `${toolName} has now been called ${exactCount}× with IDENTICAL arguments and keeps failing — you are provably stuck. Read the specific error above: change the call materially (different args, tool, or approach) or report the exact blocker to the user and move on. Do NOT call ${toolName} with these same arguments again — continuing to repeat it will end the turn.`
+      : `Loop detected: ${toolName} has been called ${exactCount}× with IDENTICAL arguments and keeps failing/returning the same result. Repeating it will not help. STOP — do something different: change the arguments, try another tool/approach, or if you're blocked, report the specific blocker to the user. Do NOT call ${toolName} with these same arguments again.`;
     return {
       action: 'block',
       signature,
       toolName,
-      reason: `Loop detected: ${toolName} has been called ${exactCount}× with IDENTICAL arguments and keeps failing/returning the same result. Repeating it will not help. STOP — do something different: change the arguments, try another tool/approach, or if you're blocked, report the specific blocker to the user. Do NOT call ${toolName} with these same arguments again.`,
+      reason,
       rule: 'exact_args_repeat',
       count: exactCount,
       mutating: isMut,

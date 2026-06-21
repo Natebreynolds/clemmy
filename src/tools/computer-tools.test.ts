@@ -16,10 +16,11 @@ mkdirSync(process.env.CLEMENTINE_HOME, { recursive: true });
 
 let getComputerTools: typeof import('./computer-tools.js').getComputerTools;
 let annotateShellStderr: typeof import('./computer-tools.js').annotateShellStderr;
+let annotateSpawnError: typeof import('./computer-tools.js').annotateSpawnError;
 let resolveAllowedCwd: typeof import('./computer-tools.js').resolveAllowedCwd;
 
 before(async () => {
-  ({ getComputerTools, annotateShellStderr, resolveAllowedCwd } = await import('./computer-tools.js'));
+  ({ getComputerTools, annotateShellStderr, annotateSpawnError, resolveAllowedCwd } = await import('./computer-tools.js'));
 });
 
 // ─── Recoverable-failure self-recovery hints (2026-06-15) ───
@@ -60,6 +61,34 @@ test('resolveAllowedCwd: a real but NON-EXISTENT in-root cwd throws a self-corre
   assert.throws(() => resolveAllowedCwd(missing), /does not exist/i);
   // an existing dir is returned unchanged
   assert.equal(resolveAllowedCwd(def), def);
+});
+
+// ─── annotateSpawnError: a spawn-LEVEL failure must be self-describing ───
+// Before 2026-06-20 the child 'error' event rejected with the RAW error
+// (`spawn /bin/sh ENOENT`), which never hit annotateShellStderr and named
+// neither the cwd nor the binary — so the model couldn't self-correct and
+// re-issued the identical call until the loop guardrail killed the turn.
+test('annotateSpawnError: ENOENT names the likely causes (cwd / binary) and says do not repeat', () => {
+  const err = Object.assign(new Error('spawn /bin/sh ENOENT'), { code: 'ENOENT' });
+  const out = annotateSpawnError(err, 'netlify sites:create --json', '/nope/null');
+  assert.match(out, /ENOENT/);
+  assert.match(out, /working directory/i);            // names the cwd cause
+  assert.match(out, /\/nope\/null/);                   // quotes the offending cwd
+  assert.match(out, /not on PATH|binary/i);            // names the binary cause too
+  assert.match(out, /do not re-issue the identical command/i); // breaks the loop
+});
+
+test('annotateSpawnError: EACCES/EPERM gives a permission hint, not a raw error', () => {
+  const out = annotateSpawnError(Object.assign(new Error('spawn EACCES'), { code: 'EACCES' }), 'foo');
+  assert.match(out, /permission denied/i);
+  assert.match(out, /do not re-issue the identical command/i);
+});
+
+test('annotateSpawnError: an unknown spawn error still routes through the stderr annotator', () => {
+  // A spawn error whose message looks like a recoverable config error should
+  // still get the discover-and-retry hint via the stderr annotator fallback.
+  const out = annotateSpawnError(new Error('403 Forbidden'), 'gh api /orgs/x');
+  assert.match(out, /recoverable/i);
 });
 
 test('annotateShellStderr: an interactive-prompt hang nudges a non-interactive re-run', () => {
