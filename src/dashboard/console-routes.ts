@@ -158,7 +158,7 @@ import {
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
-import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks, resumeBackgroundTask, findSoleAwaitingInputTaskForOrigin, queueBackgroundTaskInputResolution } from '../execution/background-tasks.js';
+import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks, resumeBackgroundTask, findSoleAwaitingInputTaskForOrigin, queueBackgroundTaskInputResolution, archiveBackgroundTask, restoreBackgroundTask, staleTaskKind } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
@@ -908,8 +908,14 @@ interface BoardCard {
   sessionId: string | null;
   ageMs: number;
   updatedAt: string;
-  /** Drag/button actions the card allows: 'cancel' | 'resume' | 'promote'. */
+  /** Drag/button actions the card allows: 'cancel' | 'resume' | 'promote' | 'archive' | 'restore'. */
   actions: string[];
+  /** A finished/parked task idle past the stale threshold (background only) — the
+   *  board flags it and the heartbeat offers to archive it. */
+  stale?: boolean;
+  staleKind?: 'finished' | 'parked';
+  /** Soft-deleted; only present when the board was asked for ?includeArchived=1. */
+  archived?: boolean;
   raw: Record<string, unknown>;
 }
 
@@ -5134,20 +5140,31 @@ export function registerConsoleRoutes(
       const cards: BoardCard[] = [];
 
       // 1) Background tasks — the autonomous "go do this while I'm away" work.
-      for (const task of listBackgroundTasks()) {
+      //    ?includeArchived=1 surfaces soft-deleted tasks (restore-only) for a
+      //    future "Archived" view; default hides them.
+      const includeArchived = req.query.includeArchived === '1' || req.query.archived === '1';
+      for (const task of listBackgroundTasks({ includeArchived })) {
         const terminal = task.status === 'done' || task.status === 'failed'
           || task.status === 'aborted' || task.status === 'interrupted';
+        const sKind = task.archived ? null : staleTaskKind(task, now);
         const column: BoardColumnId =
           task.status === 'pending' ? 'queued'
             : task.status === 'running' || task.status === 'cancelling' ? 'running'
               : task.status === 'awaiting_approval' || task.status === 'blocked' ? 'needs_you'
                 : 'done';
         const actions: string[] = [];
-        if (task.status === 'pending') actions.push('promote', 'cancel');
-        else if (task.status === 'running' || task.status === 'cancelling'
-          || task.status === 'awaiting_approval' || task.status === 'blocked') actions.push('cancel');
-        else if (task.status === 'interrupted' || task.status === 'failed' || task.status === 'aborted') {
-          if (!task.resumedIntoTaskId) actions.push('resume');
+        if (task.archived) {
+          actions.push('restore');
+        } else {
+          if (task.status === 'pending') actions.push('promote', 'cancel');
+          else if (task.status === 'running' || task.status === 'cancelling'
+            || task.status === 'awaiting_approval' || task.status === 'blocked') actions.push('cancel');
+          else if (task.status === 'interrupted' || task.status === 'failed' || task.status === 'aborted') {
+            if (!task.resumedIntoTaskId) actions.push('resume');
+          }
+          // Archive declutters a finished task, or clears a stale forgotten-parked
+          // one — soft-delete, always restorable.
+          if (terminal || sKind) actions.push('archive');
         }
         cards.push({
           id: task.id,
@@ -5160,6 +5177,9 @@ export function registerConsoleRoutes(
           ageMs: ageMs(task.updatedAt),
           updatedAt: task.updatedAt,
           actions,
+          stale: Boolean(sKind),
+          staleKind: sKind ?? undefined,
+          archived: task.archived || undefined,
           raw: {
             pendingApprovalId: task.pendingApprovalId,
             error: task.error,
@@ -5279,6 +5299,25 @@ export function registerConsoleRoutes(
         const resumed = resumeBackgroundTask(id);
         if (!resumed) { res.status(409).json({ ok: false, reason: 'Task could not be resumed.' }); return; }
         res.json({ ok: true, task: resumed });
+        return;
+      }
+      if (action === 'archive') {
+        // Only finished or parked tasks may be archived — never an ACTIVE one
+        // (archiving a running/queued task would hide it from the drain's
+        // concurrency count + the watchdog while its worker is still live).
+        if (task.status === 'pending' || task.status === 'running' || task.status === 'cancelling') {
+          res.status(409).json({ ok: false, reason: `Cancel the ${task.status} task before archiving it.` });
+          return;
+        }
+        // Soft-delete: drops off the board + every sweep, fully restorable.
+        const archived = archiveBackgroundTask(id);
+        res.json({ ok: true, task: archived });
+        return;
+      }
+      if (action === 'restore') {
+        const restored = restoreBackgroundTask(id);
+        if (!restored) { res.status(409).json({ ok: false, reason: 'Task could not be restored.' }); return; }
+        res.json({ ok: true, task: restored });
         return;
       }
       if (action === 'promote') {

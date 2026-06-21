@@ -23,8 +23,13 @@ export interface BoardCard {
   sessionId: string | null;
   ageMs: number;
   updatedAt: string;
-  /** Allowed actions: 'cancel' | 'resume' | 'promote'. */
+  /** Allowed actions: 'cancel' | 'resume' | 'promote' | 'archive' | 'restore'. */
   actions: string[];
+  /** A finished/parked background task idle past the stale threshold (>7d). */
+  stale?: boolean;
+  staleKind?: 'finished' | 'parked';
+  /** Soft-deleted (only present when the board was fetched with ?includeArchived=1). */
+  archived?: boolean;
   raw: {
     workflowName?: string;
     runId?: string;
@@ -70,9 +75,12 @@ export function rejectReason(card: BoardCard, target: BoardColumnId): string {
   return 'That move isn’t available.';
 }
 
-export async function runBoardAction(card: BoardCard, intent: 'cancel' | 'resume' | 'promote'): Promise<{ ok: boolean; reason?: string }> {
+export type BoardActionIntent = 'cancel' | 'resume' | 'promote' | 'archive' | 'restore';
+
+export async function runBoardAction(card: BoardCard, intent: BoardActionIntent): Promise<{ ok: boolean; reason?: string }> {
   try {
     if (card.sourceKind === 'background') {
+      // archive/restore + cancel/resume/promote all route to the same per-id action endpoint.
       return await apiPost<{ ok: boolean; reason?: string }>(`/api/console/board/background/${encodeURIComponent(card.id)}/${intent}`);
     }
     if (card.sourceKind === 'execution') {

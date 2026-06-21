@@ -31,6 +31,12 @@ const {
   queueBackgroundTaskInputResolution,
   getBackgroundTaskByQuestionId,
   findSoleAwaitingInputTaskForOrigin,
+  updateBackgroundTask,
+  archiveBackgroundTask,
+  restoreBackgroundTask,
+  staleTaskKind,
+  findStaleBackgroundTasks,
+  STALE_TASK_AGE_MS,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -265,4 +271,90 @@ test('enqueueDurableChatTask uses a composedPrompt verbatim + sets originSession
   assert.equal(task.originSessionId, 'console:home', 'report-back wired to the origin chat');
   assert.equal(task.status, 'pending');
   assert.match(task.title, /redesign|landing/i, 'title derived from the objective, not the composed prompt');
+});
+
+// ─── Stale-task detection + archive/restore (2026-06-21 "auto-expire" spin) ───
+// Staleness is measured by passing a future `now` to the predicate, so we never
+// have to fabricate an old updatedAt.
+
+const DAY = 24 * 60 * 60 * 1000;
+
+test('staleTaskKind: a finished task past the threshold is "finished"; a fresh one is not', () => {
+  const t = createBackgroundTask({ title: 'old done task', prompt: 'x' });
+  markBackgroundTaskDone(t.id, 'finished');
+  const done = getBackgroundTask(t.id)!;
+  assert.equal(staleTaskKind(done, Date.parse(done.updatedAt) + STALE_TASK_AGE_MS + DAY), 'finished');
+  assert.equal(staleTaskKind(done, Date.parse(done.updatedAt) + 1000), null, 'a day-old finished task is not stale');
+});
+
+test('staleTaskKind: a parked (awaiting_input/approval) task past the threshold is "parked"', () => {
+  const t = createBackgroundTask({ title: 'forgotten parked task', prompt: 'x' });
+  updateBackgroundTask(t.id, { status: 'awaiting_input' });
+  const parked = getBackgroundTask(t.id)!;
+  assert.equal(staleTaskKind(parked, Date.parse(parked.updatedAt) + STALE_TASK_AGE_MS + DAY), 'parked');
+});
+
+test('staleTaskKind: active states (pending/running) are NEVER stale, however old', () => {
+  const t = createBackgroundTask({ title: 'long pending', prompt: 'x' }); // status pending
+  assert.equal(staleTaskKind(t, Date.parse(t.updatedAt) + 100 * DAY), null);
+  updateBackgroundTask(t.id, { status: 'running' });
+  const running = getBackgroundTask(t.id)!;
+  assert.equal(staleTaskKind(running, Date.parse(running.updatedAt) + 100 * DAY), null);
+});
+
+test('archive: drops a task off the active list, keeps it restorable, and is idempotent', () => {
+  const t = createBackgroundTask({ title: 'to archive', prompt: 'x' });
+  markBackgroundTaskDone(t.id, 'done');
+  const archived = archiveBackgroundTask(t.id)!;
+  assert.equal(archived.archived, true);
+  assert.ok(archived.archivedAt, 'archivedAt stamped');
+  assert.equal(listBackgroundTasks().some((x) => x.id === t.id), false, 'gone from the active list');
+  assert.equal(listBackgroundTasks({ includeArchived: true }).some((x) => x.id === t.id), true, 'still on disk');
+  // idempotent
+  assert.equal(archiveBackgroundTask(t.id)!.archivedAt, archived.archivedAt, 're-archive is a no-op');
+});
+
+test('archive: an archived task is never stale (already cleared)', () => {
+  const t = createBackgroundTask({ title: 'archived old', prompt: 'x' });
+  markBackgroundTaskDone(t.id, 'done');
+  archiveBackgroundTask(t.id);
+  const a = getBackgroundTask(t.id)!;
+  assert.equal(staleTaskKind(a, Date.parse(a.updatedAt) + 100 * DAY), null);
+});
+
+test('restore: brings an archived task back and bumps updatedAt so it is not instantly re-stale', () => {
+  const t = createBackgroundTask({ title: 'to restore', prompt: 'x' });
+  markBackgroundTaskDone(t.id, 'done');
+  archiveBackgroundTask(t.id);
+  const restored = restoreBackgroundTask(t.id)!;
+  assert.equal(restored.archived, false);
+  assert.equal(restored.archivedAt, undefined, 'archivedAt cleared');
+  assert.equal(listBackgroundTasks().some((x) => x.id === t.id), true, 'back on the active list');
+  // freshly restored → not stale against "now"
+  assert.equal(staleTaskKind(restored, Date.parse(restored.updatedAt) + 1000), null);
+});
+
+test('findStaleBackgroundTasks: returns finished + parked, excludes active + archived', () => {
+  // clear any tasks left by earlier tests so the counts are deterministic
+  for (const x of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(x.id);
+
+  const finished = createBackgroundTask({ title: 'stale finished', prompt: 'x' });
+  markBackgroundTaskDone(finished.id, 'done');
+  const parked = createBackgroundTask({ title: 'stale parked', prompt: 'x' });
+  updateBackgroundTask(parked.id, { status: 'awaiting_approval' });
+  const active = createBackgroundTask({ title: 'still pending', prompt: 'x' }); // pending → active, never stale
+  const archivedTask = createBackgroundTask({ title: 'already archived', prompt: 'x' });
+  markBackgroundTaskDone(archivedTask.id, 'done');
+  archiveBackgroundTask(archivedTask.id);
+
+  const base = Date.parse(getBackgroundTask(finished.id)!.updatedAt);
+  const stale = findStaleBackgroundTasks(base + STALE_TASK_AGE_MS + DAY); // age-based: everything below is 8d old
+  const ids = new Set(stale.map((s) => s.task.id));
+
+  assert.equal(ids.has(finished.id), true);
+  assert.equal(ids.has(parked.id), true);
+  assert.equal(stale.find((s) => s.task.id === finished.id)?.kind, 'finished');
+  assert.equal(stale.find((s) => s.task.id === parked.id)?.kind, 'parked');
+  assert.equal(ids.has(active.id), false, 'pending is active, not stale — even when old');
+  assert.equal(ids.has(archivedTask.id), false, 'archived is already cleared, never stale');
 });

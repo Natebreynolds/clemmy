@@ -14,12 +14,14 @@ export function BoardColumn({
   cards,
   activeCard,
   onOpen,
+  onArchive,
 }: {
   id: BoardColumnId;
   label: string;
   cards: BoardCardT[];
   activeCard: BoardCardT | null;
   onOpen: (card: BoardCardT) => void;
+  onArchive?: (card: BoardCardT) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id });
   const validHover = activeCard && isOver ? intentForDrop(activeCard, id) !== null : null;
@@ -42,7 +44,7 @@ export function BoardColumn({
         {cards.length === 0 ? (
           <p className="px-1 py-6 text-center text-caption text-faint">Nothing here</p>
         ) : (
-          cards.map((card) => <BoardCard key={card.id} card={card} onOpen={onOpen} />)
+          cards.map((card) => <BoardCard key={card.id} card={card} onOpen={onOpen} onArchive={onArchive} />)
         )}
       </div>
     </div>

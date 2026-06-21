@@ -15,7 +15,7 @@ import {
   useSensor, useSensors, closestCorners,
   type DragStartEvent, type DragEndEvent,
 } from '@dnd-kit/core';
-import { X } from 'lucide-react';
+import { X, Archive } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -40,6 +40,9 @@ export function BackgroundTasks() {
   const [active, setActive] = useState<BoardCard | null>(null);
   const [open, setOpen] = useState<BoardCard | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
+  const [keptStale, setKeptStale] = useState(false); // "Keep them" dismisses the banner for this view
+
+  const staleCards = useMemo(() => cards.filter((c) => c.stale), [cards]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -72,12 +75,52 @@ export function BackgroundTasks() {
     void qc.invalidateQueries({ queryKey: ['board'] });
   };
 
+  const onArchive = async (card: BoardCard) => {
+    flash({ tone: 'success', text: `Archived “${card.title}”.` });
+    const res = await runBoardAction(card, 'archive');
+    if (!res.ok) flash({ tone: 'danger', text: res.reason || 'Couldn’t archive that task.' });
+    void qc.invalidateQueries({ queryKey: ['board'] });
+  };
+
+  const onArchiveAll = async (tasks: BoardCard[]) => {
+    const results = await Promise.all(tasks.map((t) => runBoardAction(t, 'archive')));
+    const failed = results.filter((r) => !r.ok).length;
+    flash(failed
+      ? { tone: 'danger', text: `Archived ${tasks.length - failed} of ${tasks.length}; ${failed} couldn’t be archived.` }
+      : { tone: 'success', text: `Archived ${tasks.length} old task${tasks.length > 1 ? 's' : ''}.` });
+    void qc.invalidateQueries({ queryKey: ['board'] });
+  };
+
   return (
     <Page
       title="Tasks"
       subtitle="Everything Clementine is working on — drag to cancel or start, click a card to watch it live."
       actions={<Button variant="secondary" onClick={() => void board.refetch()}>Refresh</Button>}
     >
+      {!board.isLoading && staleCards.length > 0 && !keptStale && (
+        <div className="mb-4 flex flex-col gap-2 rounded-lg border border-warning/40 bg-warning-tint/50 p-4">
+          <div className="flex items-start gap-2">
+            <Archive className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
+            <div className="min-w-0 flex-1">
+              <p className="text-body font-semibold text-fg">
+                {staleCards.length} old task{staleCards.length > 1 ? 's' : ''} — archive {staleCards.length > 1 ? 'them' : 'it'}?
+              </p>
+              <p className="mt-0.5 text-caption text-muted">
+                {staleCards.some((c) => c.staleKind === 'parked')
+                  ? 'Some have been waiting on you, others just finished — all idle for over a week. Archiving is recoverable.'
+                  : 'These finished over a week ago and are still on the board. Archiving is recoverable.'}
+              </p>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Button onClick={() => void onArchiveAll(staleCards)}>
+              <Archive className="h-4 w-4" aria-hidden /> Archive all
+            </Button>
+            <Button variant="secondary" onClick={() => setKeptStale(true)}>Keep them</Button>
+          </div>
+        </div>
+      )}
+
       {board.isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
           {COLUMNS.map((c) => <Skeleton key={c.id} className="h-64" />)}
@@ -103,6 +146,7 @@ export function BackgroundTasks() {
                 cards={byColumn(col.id)}
                 activeCard={active}
                 onOpen={setOpen}
+                onArchive={(card) => void onArchive(card)}
               />
             ))}
           </div>

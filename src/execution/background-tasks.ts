@@ -97,6 +97,12 @@ export interface BackgroundTaskRecord {
   progressCheckIns?: number;
   cancellationRequestedAt?: string;
   cancellationReason?: string;
+  /** Soft-delete: an archived task drops off the active board and out of every
+   *  active sweep (drain/resume/watchdog) but its record is KEPT and restorable.
+   *  Recoverable by design — a misclick or a wrong heartbeat call never loses a
+   *  task. Set by archiveBackgroundTask, cleared by restoreBackgroundTask. */
+  archived?: boolean;
+  archivedAt?: string;
 }
 
 export interface CreateBackgroundTaskInput {
@@ -308,16 +314,70 @@ export function getBackgroundTask(id: string): BackgroundTaskRecord | null {
   return loadTaskFile(filePath);
 }
 
-export function listBackgroundTasks(filter: { status?: BackgroundTaskStatus; userId?: string; channel?: string } = {}): BackgroundTaskRecord[] {
+export function listBackgroundTasks(filter: { status?: BackgroundTaskStatus; userId?: string; channel?: string; includeArchived?: boolean } = {}): BackgroundTaskRecord[] {
   ensureTaskDir();
   return readdirSync(BACKGROUND_TASK_DIR)
     .filter((entry) => entry.endsWith('.json'))
     .map((entry) => loadTaskFile(path.join(BACKGROUND_TASK_DIR, entry)))
     .filter((task): task is BackgroundTaskRecord => Boolean(task))
+    // Archived tasks are soft-removed from ALL active consideration (board,
+    // drain, resume, watchdog) unless a caller explicitly asks for them.
+    .filter((task) => filter.includeArchived || !task.archived)
     .filter((task) => !filter.status || task.status === filter.status)
     .filter((task) => !filter.userId || task.userId === filter.userId)
     .filter((task) => !filter.channel || task.channel === filter.channel)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+/** Age threshold past which an idle finished/parked task is flagged STALE and the
+ *  heartbeat offers to archive it. 7 days = a week of no activity. */
+export const STALE_TASK_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+const STALE_FINISHED_STATUSES: readonly BackgroundTaskStatus[] = ['done', 'failed', 'aborted', 'blocked', 'interrupted'];
+const STALE_PARKED_STATUSES: readonly BackgroundTaskStatus[] = ['awaiting_input', 'awaiting_approval'];
+
+/** 'finished' = a terminal task lingering on the board; 'parked' = a task that
+ *  has waited on the user (input/approval) and gone unanswered. */
+export type StaleTaskKind = 'finished' | 'parked';
+
+/** Classify a task's staleness, or null when it is NOT stale. Age is measured
+ *  from updatedAt (last activity), so a live task that keeps moving never trips
+ *  this. Archived tasks are never stale (already cleared). Active states
+ *  (pending/running/cancelling) are never stale — only finished clutter and
+ *  forgotten-parked tasks. Shared by the board flag AND the heartbeat so "stale"
+ *  has exactly ONE definition. */
+export function staleTaskKind(task: BackgroundTaskRecord, now: number = Date.now(), thresholdMs: number = STALE_TASK_AGE_MS): StaleTaskKind | null {
+  if (task.archived) return null;
+  const ageMs = now - Date.parse(task.updatedAt);
+  if (!Number.isFinite(ageMs) || ageMs < thresholdMs) return null;
+  if (STALE_FINISHED_STATUSES.includes(task.status)) return 'finished';
+  if (STALE_PARKED_STATUSES.includes(task.status)) return 'parked';
+  return null;
+}
+
+/** Every stale (non-archived) task with its kind, newest first. Powers both the
+ *  board's STALE flag and the heartbeat's "archive these?" prompt. */
+export function findStaleBackgroundTasks(now: number = Date.now(), thresholdMs: number = STALE_TASK_AGE_MS): Array<{ task: BackgroundTaskRecord; kind: StaleTaskKind }> {
+  return listBackgroundTasks()
+    .map((task) => { const kind = staleTaskKind(task, now, thresholdMs); return kind ? { task, kind } : null; })
+    .filter((entry): entry is { task: BackgroundTaskRecord; kind: StaleTaskKind } => entry !== null);
+}
+
+/** Soft-delete a task: drop it off the active board + every sweep, keep the
+ *  record (restorable). The single irreversible-feeling action made reversible. */
+export function archiveBackgroundTask(id: string): BackgroundTaskRecord | null {
+  const task = getBackgroundTask(id);
+  if (!task || task.archived) return task; // idempotent — re-archiving is a no-op
+  return updateBackgroundTask(id, { archived: true, archivedAt: nowIso() });
+}
+
+/** Restore an archived task back onto the board. Its updatedAt is bumped (by
+ *  updateBackgroundTask) so it does not immediately re-flag as stale. */
+export function restoreBackgroundTask(id: string): BackgroundTaskRecord | null {
+  const task = getBackgroundTask(id);
+  if (!task) return null;
+  if (!task.archived) return task;
+  return updateBackgroundTask(id, { archived: false, archivedAt: undefined });
 }
 
 export function getBackgroundTaskByApprovalId(approvalId: string): BackgroundTaskRecord | null {

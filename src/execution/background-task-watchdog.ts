@@ -1,7 +1,7 @@
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
-import { listBackgroundTasks, type BackgroundTaskRecord } from './background-tasks.js';
+import { listBackgroundTasks, staleTaskKind, STALE_TASK_AGE_MS, type BackgroundTaskRecord, type StaleTaskKind } from './background-tasks.js';
 import { ApprovalStore } from '../runtime/approval-store.js';
 
 /**
@@ -236,5 +236,52 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
   if (stalled.length > 0) {
     logger.warn({ stalled: stalled.length, ids: stalled.map((s) => s.id) }, 'Background tasks went silent');
   }
+  // Proactive housekeeping: surface finished/parked tasks idle past the stale
+  // threshold so the user is asked to archive them (reuses the snapshot above —
+  // no extra store read).
+  runStaleTaskHeartbeat(tasks, now);
   return { stalled: stalled.length };
+}
+
+/** Independent kill-switch for the stale-task nudge (distinct from the watchdog
+ *  itself, though it only runs while the watchdog is enabled). */
+function staleHeartbeatEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_STALE_TASK_HEARTBEAT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * The heartbeat half of the auto-expire spin: surface ONE nudge listing
+ * finished/parked tasks idle past the stale threshold, so the user is proactively
+ * asked to archive them instead of the board silently reaping. The notification
+ * id is bucketed into 7-day windows, so it re-asks at most ~once a week (not a
+ * daily nag) and naturally re-asks next week if still ignored — dismissing it
+ * ("keep") snoozes until the next window. Archiving from the board clears the
+ * staleness. Pure but for the addNotification side effect; operates on a task
+ * snapshot the caller already loaded. Exported for tests.
+ */
+export function runStaleTaskHeartbeat(tasks: BackgroundTaskRecord[], now: number = Date.now()): { stale: number } {
+  if (!staleHeartbeatEnabled()) return { stale: 0 };
+  const stale = tasks
+    .map((task) => ({ task, kind: staleTaskKind(task, now) }))
+    .filter((entry): entry is { task: BackgroundTaskRecord; kind: StaleTaskKind } => entry.kind !== null);
+  if (stale.length === 0) return { stale: 0 };
+  const parked = stale.filter((s) => s.kind === 'parked').length;
+  const finished = stale.length - parked;
+  const weekIndex = Math.floor(now / STALE_TASK_AGE_MS); // 7-day buckets → at most one nudge per window
+  const preview = stale.slice(0, 5).map((s) => `• ${s.task.title}`).join('\n');
+  const more = stale.length > 5 ? `\n…and ${stale.length - 5} more` : '';
+  addNotification({
+    id: `bgtask-stale-prompt-${weekIndex}`,
+    kind: 'execution',
+    title: `${stale.length} old background task${stale.length > 1 ? 's' : ''} — archive them?`,
+    body:
+      `${stale.length} background task${stale.length > 1 ? 's have' : ' has'} been idle over a week`
+      + (parked > 0 ? ` (${parked} still waiting on you, ${finished} finished)` : '')
+      + `. Review & archive them on the Tasks board.\n${preview}${more}`,
+    createdAt: new Date(now).toISOString(),
+    read: false,
+    metadata: { staleTaskPrompt: true, staleCount: stale.length, finished, parked, staleTaskIds: stale.map((s) => s.task.id) },
+  });
+  logger.info({ stale: stale.length, finished, parked }, 'Stale background tasks surfaced for review');
+  return { stale: stale.length };
 }

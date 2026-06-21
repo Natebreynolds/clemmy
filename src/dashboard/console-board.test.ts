@@ -87,8 +87,57 @@ test('GET /api/console/board normalizes every background-task status into the ri
     expect(running.id, 'running', ['cancel']);
     expect(awaiting.id, 'needs_you', ['cancel']);
     expect(blocked.id, 'needs_you', ['cancel']);
-    expect(done.id, 'done', []);
-    expect(interrupted.id, 'done', ['resume']);
+    // Terminal tasks now also offer `archive` (declutter the Done column).
+    expect(done.id, 'done', ['archive']);
+    expect(interrupted.id, 'done', ['resume', 'archive']);
+  } finally {
+    await h.close();
+  }
+});
+
+test('board archive → drops the task off the board; ?includeArchived restores it', async () => {
+  const task = createBackgroundTask({ title: 'to archive', prompt: 'p' });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskDone(task.id, 'finished');
+  const authorized = { v: true };
+  const h = await boot(authorized);
+  try {
+    // Archive → 200, task soft-deleted.
+    const arch = await fetch(`${h.url}/api/console/board/background/${task.id}/archive`, { method: 'POST' });
+    assert.equal(arch.status, 200);
+    assert.equal((await arch.json() as { ok: boolean }).ok, true);
+    assert.equal(getBackgroundTask(task.id)!.archived, true, 'record marked archived (kept on disk)');
+
+    // Default board hides it.
+    const board = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
+    assert.equal(board.cards.some((c) => c.id === task.id), false, 'archived task hidden from the default board');
+
+    // ?includeArchived=1 surfaces it with a restore-only action.
+    const withArchived = await (await fetch(`${h.url}/api/console/board?includeArchived=1`)).json() as { cards: BoardCard[] };
+    const card = withArchived.cards.find((c) => c.id === task.id);
+    assert.ok(card, 'archived task visible when explicitly requested');
+    assert.deepEqual(card!.actions, ['restore']);
+
+    // Restore → back on the default board.
+    const rest = await fetch(`${h.url}/api/console/board/background/${task.id}/restore`, { method: 'POST' });
+    assert.equal(rest.status, 200);
+    assert.equal(getBackgroundTask(task.id)!.archived, false, 'restored');
+    const after = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
+    assert.equal(after.cards.some((c) => c.id === task.id), true, 'restored task back on the default board');
+  } finally {
+    await h.close();
+  }
+});
+
+test('board archive is rejected for an ACTIVE task (its worker is still live)', async () => {
+  const task = createBackgroundTask({ title: 'still running', prompt: 'p' });
+  markBackgroundTaskRunning(task.id);
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board/background/${task.id}/archive`, { method: 'POST' });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json() as { ok: boolean }).ok, false);
+    assert.notEqual(getBackgroundTask(task.id)!.archived, true, 'running task left un-archived');
   } finally {
     await h.close();
   }
