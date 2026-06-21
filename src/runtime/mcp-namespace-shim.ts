@@ -23,6 +23,12 @@ import {
 import { appendEvent, listEvents } from './harness/eventlog.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
+import {
+  classifyToolError,
+  detectStructuredToolFailure,
+  mcpErrorCorrectiveEnabled,
+  toolFailureCorrective,
+} from './harness/tool-error-corrective.js';
 
 // Bound MCP startup below the SDK's default (~60s), but leave enough
 // room for `npx`/`uvx` based servers on fresh machines. 5s/8s was too
@@ -138,6 +144,31 @@ function clipMcpResultForRecall(toolName: string, result: CallToolResultContent)
     return [{ type: 'text', text: clipped }, ...nonText] as CallToolResultContent;
   } catch {
     return result; // clipping must NEVER break a tool call
+  }
+}
+
+// Bring MCP failures to PARITY with shell + Composio: a returned error envelope
+// (isError:true / {error} / successful:false) gets a loud, self-correcting
+// header so the model adapts on failure #1 instead of retrying identically.
+// Conservative — only fires on a parseable JSON error shape — and fail-open, so
+// a normal success result is byte-identical. (The THROWN channel is handled in
+// callTool's catch.) Default-on; CLEMMY_MCP_ERROR_CORRECTIVE=off disables.
+function annotateMcpResultFailure(toolName: string, result: CallToolResultContent): CallToolResultContent {
+  try {
+    if (!mcpErrorCorrectiveEnabled() || !Array.isArray(result)) return result;
+    const combined = result
+      .map((block) => {
+        const text = (block as { text?: unknown } | null)?.text;
+        return typeof text === 'string' ? text : '';
+      })
+      .join('\n');
+    if (!combined) return result;
+    const { failed, summary } = detectStructuredToolFailure(combined);
+    if (!failed) return result;
+    const corrective = toolFailureCorrective(summary, { toolName });
+    return [{ type: 'text', text: corrective }, ...result] as CallToolResultContent;
+  } catch {
+    return result; // a corrective must NEVER break a tool call
   }
 }
 
@@ -937,12 +968,28 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             });
           } catch { /* telemetry write must never block */ }
         }
+        // Parity with shell/Composio: prepend a self-correcting header when the
+        // result is a failure envelope (best-effort; success is byte-identical).
+        const flagged = annotateMcpResultFailure(toolName, result);
         // Global fan-out trigger: native MCP calls bypass wrapToolForHarness,
         // so this is where serial same-shape MCP work (N>=3 distinct items) gets
         // the run_worker advisory appended. Best-effort; no-op when not looping.
-        return appendMcpFanoutAdvisory(toolName, args, result);
+        return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
+        // The THROWN MCP failure channel (network / 5xx / bad-param servers that
+        // throw): wrap the raw error with a self-correcting corrective so the
+        // model adapts instead of seeing a dead-end "MCP tool failed". Preserve
+        // BoundaryError untouched — the runtime routes approval_blocked /
+        // server_unavailable through their own state machines (must keep .kind /
+        // .userMessage). Fail-open + flag-gated.
+        if (mcpErrorCorrectiveEnabled() && !(err instanceof BoundaryError)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new Error(toolFailureCorrective(msg.slice(0, 240), {
+            toolName,
+            kind: classifyToolError(msg, err),
+          }));
+        }
         throw err;
       }
     },
