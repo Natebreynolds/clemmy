@@ -2472,9 +2472,16 @@ function modelStreamStallRetries(): number {
  *  retryable pre-content stall from a real failure. */
 class ModelStreamStalledError extends Error {
   constructor(public readonly seconds: number, public readonly preContent: boolean) {
+    // User-facing message: name the REAL cause (the model provider/brain didn't
+    // respond), not internal stream-watchdog env-var jargon. A pre-content hang
+    // (no first byte) is almost always the provider being overloaded or a
+    // transient network issue on their end — not the user's request.
     super(
-      `model stream stalled — no stream events for ${seconds}s; the model call timed out ` +
-        `(CLEMMY_MODEL_STREAM_STALL_MS / CLEMMY_MODEL_FIRST_BYTE_STALL_MS to tune)`,
+      preContent
+        ? `Your model provider didn't start responding within ${seconds}s, so the request timed out before any output. `
+          + `This is almost always the provider being overloaded or a transient network hiccup on their end — not your request. Re-send to retry.`
+        : `Your model provider stopped responding mid-answer (no output for ${seconds}s) and the call timed out. `
+          + `This is usually a provider or network hiccup. Re-send to retry.`,
     );
     this.name = 'ModelStreamStalledError';
   }
