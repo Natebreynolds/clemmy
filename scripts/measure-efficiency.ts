@@ -42,11 +42,15 @@ function loadEvents(): UsageEvent[] {
     const date = new Date(`${d}T12:00:00Z`);
     out.push(...readUsageEventsForDate(date));
   }
-  // Re-derive `kind` from the source (sessionId) under the CURRENT classifier so
-  // the readout segments consistently — including historical events written
-  // before a classifier change (e.g. the new `warmup` kind). The stored kind is
-  // left untouched on disk; this is a read-side view only.
-  return out.map((e) => ({ ...e, kind: classifyUsageKind(e.source, undefined) }));
+  // TRUST the stored kind (it was classified at WRITE time WITH the channel —
+  // which isn't persisted, so re-deriving from source alone would lose chat
+  // events classified purely by channel, e.g. cli/electron with a prefix-less
+  // sessionId, mis-bucketing them as 'other'). The ONLY read-side override is
+  // reclassifying historical `warmup-*` events to the `warmup` kind (added after
+  // some were already written as 'other'). Read-side view only; disk untouched.
+  return out.map((e) => (e.source?.startsWith('warmup') && e.kind !== 'warmup'
+    ? { ...e, kind: classifyUsageKind(e.source, undefined) }
+    : e));
 }
 
 const pct = (a: number, b: number): string => (b > 0 ? `${((100 * a) / b).toFixed(1)}%` : '—');

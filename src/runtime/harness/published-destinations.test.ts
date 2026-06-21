@@ -96,3 +96,14 @@ test('full loop: record-on-success → established → identity-matched provenan
   // agent side: the binding is surfaced so it deploys explicitly first-try
   assert.match(renderEstablishedDestinationsForContext(project), /clementine-onepager\.netlify\.app/);
 });
+
+test('agent hint resolves a URL/host focus ref (fixes the cwd-vs-resource_ref key mismatch)', () => {
+  // Recorded keyed by the deploy cwd (a filesystem path) …
+  recordPublishedDestination('/Users/nate/onepager-proj', ['onepager-proj.netlify.app']);
+  // … but the agent reads by focus.resource_ref, which is usually the deployed
+  // URL/host, NOT the cwd. That lookup must still resolve (was dead before).
+  assert.match(renderEstablishedDestinationsForContext('https://onepager-proj.netlify.app/'), /onepager-proj\.netlify\.app/);
+  assert.match(renderEstablishedDestinationsForContext('onepager-proj.netlify.app'), /onepager-proj\.netlify\.app/);
+  // and the cwd lookup (the gate's path) still works
+  assert.match(renderEstablishedDestinationsForContext('/Users/nate/onepager-proj'), /onepager-proj\.netlify\.app/);
+});

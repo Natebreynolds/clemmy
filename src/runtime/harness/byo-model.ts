@@ -399,8 +399,11 @@ function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): 
     if (!u || typeof u !== 'object') return;
     const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
     const details = u.prompt_tokens_details as Record<string, unknown> | undefined;
-    const inputTokens = n(u.prompt_tokens) || n(u.input_tokens);
-    const outputTokens = n(u.completion_tokens) || n(u.output_tokens);
+    // Presence check, not `||`: chat-completions (prompt/completion_tokens) and
+    // Responses (input/output_tokens) are mutually-exclusive shapes, so a real
+    // 0 must not fall through to the other shape's field.
+    const inputTokens = 'prompt_tokens' in u ? n(u.prompt_tokens) : n(u.input_tokens);
+    const outputTokens = 'completion_tokens' in u ? n(u.completion_tokens) : n(u.output_tokens);
     if (inputTokens === 0 && outputTokens === 0) return;
     const cached = n(details?.cached_tokens) || n(u.cached_tokens);
     const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? 'unknown';

@@ -541,6 +541,13 @@ test('evidenceLooksFailedOrBlocked: recognizes gate refusals + manual-fallback +
   assert.equal(evidenceLooksFailedOrBlocked('netlify deploy returned production url https://x.netlify.app for site id 449cd146'), false);
   assert.equal(evidenceLooksFailedOrBlocked('npx netlify-cli deploy succeeded; retries on a transient 5xx'), false);
   assert.equal(evidenceLooksFailedOrBlocked(undefined), false);
+  // …and a SUCCESS that merely mentions a manual ALTERNATIVE is not a failure
+  // (the review false-positive: "manually" without a necessity/failure cue).
+  assert.equal(evidenceLooksFailedOrBlocked('deploy works via CLI; you can also deploy it manually from the UI if needed'), false);
+  assert.equal(evidenceLooksFailedOrBlocked('X works, but you can also deploy it manually'), false);
+  // …while a genuine manual PUNT (necessity cue near "manual") is still caught.
+  assert.equal(evidenceLooksFailedOrBlocked('the CLI was blocked so I had to deploy it manually'), true);
+  assert.equal(evidenceLooksFailedOrBlocked('could not authenticate; must run it manually'), true);
 });
 
 test('rememberToolChoice: a BLOCKED attempt is NOT persisted as the active choice (poisoned-memo guard)', () => {

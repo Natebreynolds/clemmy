@@ -78,19 +78,40 @@ export function recordPublishedDestination(projectKey: string | undefined, targe
   const incoming = new Set<string>();
   for (const t of targets) for (const f of destinationIdentityForms(t)) incoming.add(f);
   if (incoming.size === 0) return;
+  // Key the SAME forms under the project cwd AND under each target HOST. The gate
+  // looks up by cwd; the agent hint looks up by focus.resource_ref — which is
+  // usually the deployed URL/host, NOT a cwd path (the key-space mismatch that
+  // made the agent hint dead). Host keys are filesystem-path-disjoint from cwd
+  // keys, so they never widen the cwd-scoped gate.
+  const keys = new Set<string>([pk]);
+  for (const f of incoming) if (f.includes('.')) keys.add(f);
   const store = load();
-  const prior = store[pk]?.forms ?? [];
-  const merged = [...new Set([...prior, ...incoming])].slice(-MAX_FORMS_PER_PROJECT);
-  store[pk] = { forms: merged, lastAt: at, count: (store[pk]?.count ?? 0) + 1 };
+  for (const key of keys) {
+    const prior = store[key]?.forms ?? [];
+    store[key] = { forms: [...new Set([...prior, ...incoming])].slice(-MAX_FORMS_PER_PROJECT), lastAt: at, count: (store[key]?.count ?? 0) + 1 };
+  }
   save(store);
 }
 
 /** The identity forms of every destination `projectKey` has established. Empty
- *  when the project has never had a recorded successful publish. */
+ *  when the project has never had a recorded successful publish. EXACT key
+ *  lookup — used by the gate with the deploy's cwd. */
 export function establishedTargetsFor(projectKey: string | undefined): Set<string> {
   const pk = normalizeProjectKey(projectKey);
   if (!pk) return new Set();
   return new Set(load()[pk]?.forms ?? []);
+}
+
+/** Resolve a focus resource_ref — a cwd path, a deployed URL, or a bare host —
+ *  to the destinations established for it. Tries the ref as a key AND its host
+ *  identity forms, so a URL/host focus ref hits a host-keyed entry (the fix for
+ *  the agent-hint key-space mismatch). Used by the agent-side hint. */
+export function establishedTargetsForRef(ref: string | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!ref) return out;
+  for (const f of establishedTargetsFor(ref)) out.add(f);
+  for (const form of destinationIdentityForms(ref)) for (const f of establishedTargetsFor(form)) out.add(f);
+  return out;
 }
 
 /** Does `target` belong to a destination `projectKey` has established before?
@@ -110,7 +131,7 @@ export function isEstablishedDestination(projectKey: string | undefined, target:
  * agent how it deploys this project. Empty when the project has none. Pure read.
  */
 export function renderEstablishedDestinationsForContext(projectKey: string | undefined): string {
-  const forms = establishedTargetsFor(projectKey);
+  const forms = establishedTargetsForRef(projectKey);
   if (forms.size === 0) return '';
   // Prefer the actionable full-host forms (foo.netlify.app) over bare labels.
   const hosts = [...forms].filter((f) => f.includes('.'));

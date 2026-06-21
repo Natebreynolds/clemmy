@@ -28,6 +28,7 @@ import { isSpacesEnabled } from '../spaces/store.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
+import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { tickAuthKeepalive, isAuthKeepaliveEnabled } from '../runtime/auth-keepalive.js';
@@ -1146,12 +1147,21 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     setTimeout(() => {
       void (async () => {
         try {
-          await assistant.getRuntime().run({
-            instructions: 'Reply with the single word: ok',
-            model: MODELS.fast,
-            prompt: 'ok',
-            sessionId: `warmup-${Date.now()}`,
-          });
+          const warmupSessionId = `warmup-${Date.now()}`;
+          // Establish the harness run context so the BYO/Claude SDK usage
+          // recorders (which read sessionId from harnessRunContextStorage, not
+          // the bare ModelRequest) tag this as kind:'warmup' instead of falling
+          // back to 'unknown'/'other' — keeping warmup isolated from the
+          // interactive-chat cache-hit-rate on every lane, not just Codex.
+          await withHarnessRunContext(
+            { sessionId: warmupSessionId, counter: new ToolCallsCounter(8) },
+            () => assistant.getRuntime().run({
+              instructions: 'Reply with the single word: ok',
+              model: MODELS.fast,
+              prompt: 'ok',
+              sessionId: warmupSessionId,
+            }),
+          );
           logger.info('boot warmup: model path warmed');
         } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'boot warmup: model ping failed');

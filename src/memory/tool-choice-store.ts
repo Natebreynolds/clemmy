@@ -343,9 +343,14 @@ export function evidenceLooksFailedOrBlocked(text: string | undefined): boolean 
   return (
     // Harness gate refusals — the exact poisoning vector (any gate, not netlify).
     /\b(unverified_destination|implicit_destination|execution_wrap_required|confirm_first_required|grounding_check_failed|duplicate_external_write)\b/.test(t)
-    || /refused by (?:the )?harness|tool call refused|blocked by (?:the )?(?:harness|gate|guardrail)/.test(t)
-    // Punted to the human — the choice did NOT complete programmatically.
-    || /run (?:it|this) manually|(?:must|need to|have to) (?:be )?run\b[^.]{0,20}\bmanual|deploy (?:it )?manually|do (?:it|this) manually/.test(t)
+    // "(refused|blocked) by the [destination|grounding|…] (gate|harness|guardrail)"
+    // — allow one adjective between the article and the noun.
+    || /(?:refused|blocked) by (?:the )?(?:\w+ )?(?:harness|gate|guardrail)|tool call refused/.test(t)
+    // Punted to the human — the choice did NOT complete programmatically. Anchor
+    // to a NECESSITY/failure cue near "manual(ly)" so a success aside ("X works,
+    // but you can also deploy it manually") is NOT misread as a failure that
+    // drops a genuinely-proven choice. "can/could" are permissive, NOT cues.
+    || /\b(?:must|need(?:s|ed)? to|have to|had to|only way|only option|instead|couldn't|could not|can't|cannot|unable to|forced to|gave up and)\b[^.]{0,30}\bmanual/.test(t)
     // Unambiguous failure of the action this memo is supposed to encode.
     || /\b(?:could not|couldn't|cannot|can't|unable to|failed to)\s+(?:deploy|publish|run|send|create|upload|complete|execute|connect|authenticate)/.test(t)
     || /\b(?:was|were|got) (?:blocked|refused|rejected|denied)\b/.test(t)

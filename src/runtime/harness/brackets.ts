@@ -682,12 +682,18 @@ function buildPublishProvenance(sessionId: string, projectKey?: string): (target
   } catch { /* fail-open: empty provenance = stricter gate, never a crash */ }
   return (target: string) => {
     // Identity-aware (Defect A): a site created as `foo` IS `foo.netlify.app` —
-    // match on the structural forms (host + first DNS label), not exact string.
+    // match on the structural forms (host + first DNS label) via EXACT set
+    // membership against the created/established provenance.
     const forms = destinationIdentityForms(target);
     if (forms.length === 0) return false;
     if (forms.some((f) => created.has(f) || established.has(f))) return true;
-    // The user explicitly named this site (id/slug) in a message this session.
-    if (forms.some((f) => f.length >= 4 && userBlob.includes(f))) return true;
+    // The user explicitly named this site in a message this session. Match the
+    // FULL host/target form only (forms[0]) — NOT the bare DNS label: a label
+    // like "blog"/"docs"/"shop" is too common to confer provenance on a
+    // coincidental substring mention ("write a blog post"), which would widen
+    // the clobber gate. The full host is specific enough to be a real mention.
+    const fullForm = forms[0];
+    if (fullForm.length >= 4 && userBlob.includes(fullForm)) return true;
     return false;
   };
 }

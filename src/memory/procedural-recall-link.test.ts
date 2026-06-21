@@ -83,3 +83,42 @@ test('a recall older than the TTL is not credited (no stale mis-credit)', () => 
   const credited = creditMatchingRecall(SID, 'netlify deploy --site x', true, t0 + 6 * 60 * 1000);
   assert.equal(credited, null);
 });
+
+// ─── Review fixes: word-boundary matching + same-binary disambiguation ───
+
+test('word-boundary: a 2-char identifier does NOT match inside an unrelated word', () => {
+  freshCliMemo('github.pr.create', 'gh');
+  noteRecalledIntent(SID, 'github.pr.create', 'gh', 'cli');
+  // "gh" appears inside "highlight" but must NOT credit (was a substring false-positive)
+  assert.equal(creditMatchingRecall(SID, 'echo debugging highlight', true), null);
+  // a real `gh` command DOES credit (whole-token)
+  assert.equal(creditMatchingRecall(SID, 'gh pr create', true), 'github.pr.create');
+});
+
+test('same binary, two ops: a `netlify status` outcome is NOT credited to the deploy memo', () => {
+  freshCliMemo('netlify.deploy.x', 'netlify');
+  freshCliMemo('netlify.status.x', 'netlify');
+  noteRecalledIntent(SID, 'netlify.status.x', 'netlify', 'cli');
+  noteRecalledIntent(SID, 'netlify.deploy.x', 'netlify', 'cli'); // most-recent
+  // status command → disambiguated to the STATUS intent by operation overlap, NOT the most-recent deploy
+  assert.equal(creditMatchingRecall(SID, 'netlify status', true), 'netlify.status.x');
+  assert.equal(peekToolChoice('netlify.deploy.x')!.choice!.successCount ?? 0, 0, 'deploy memo untouched by the status outcome');
+});
+
+test('same binary, genuinely ambiguous (no operation distinction) → credits NOTHING', () => {
+  freshCliMemo('netlify.a', 'netlify');
+  freshCliMemo('netlify.b', 'netlify');
+  noteRecalledIntent(SID, 'netlify.a', 'netlify', 'cli');
+  noteRecalledIntent(SID, 'netlify.b', 'netlify', 'cli');
+  // bare `netlify` command has no op token to distinguish a from b → skip (no mis-credit)
+  assert.equal(creditMatchingRecall(SID, 'netlify', true), null);
+});
+
+test('Map does not leak: consuming the last recall deletes the session key', () => {
+  _resetProceduralRecallLinkForTests();
+  freshCliMemo('sf.q', 'sf');
+  noteRecalledIntent(SID, 'sf.q', 'sf', 'cli');
+  creditMatchingRecall(SID, 'sf data query --query "x"', true);
+  // After consuming the only recall, a credit on an empty session is a clean no-op
+  assert.equal(creditMatchingRecall(SID, 'sf data query', true), null);
+});
