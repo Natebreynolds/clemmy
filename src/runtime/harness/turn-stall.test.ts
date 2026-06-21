@@ -52,7 +52,7 @@ test('a stream that never emits is aborted with a transient timeout error', asyn
   const started = Date.now();
   await assert.rejects(
     __defaultRunRunner(runnerFor(result), {} as never, [], {} as never),
-    (err: unknown) => err instanceof Error && /stalled/.test(err.message) && isTransientStepError(err),
+    (err: unknown) => err instanceof Error && /timed out/.test(err.message) && isTransientStepError(err),
   );
   assert.ok(Date.now() - started < 5_000, 'aborts promptly, not after minutes');
 });
@@ -61,7 +61,7 @@ test('a stream wedging mid-flight (after events) is also aborted', async () => {
   const result = makeStreamResult({ events: 3, gapMs: 30, hang: true });
   await assert.rejects(
     __defaultRunRunner(runnerFor(result), {} as never, [], {} as never),
-    /stalled/,
+    /timed out/,
   );
 });
 
@@ -129,7 +129,7 @@ test('a pre-content stall that NEVER recovers still fails after exhausting retri
   const wedgedRunner = { run: async () => wedged() } as unknown as Runner;
   await assert.rejects(
     __defaultRunRunner(wedgedRunner, {} as never, [], {} as never),
-    (err: unknown) => err instanceof Error && /stalled/.test(err.message) && isTransientStepError(err),
+    (err: unknown) => err instanceof Error && /timed out/.test(err.message) && isTransientStepError(err),
   );
 });
 

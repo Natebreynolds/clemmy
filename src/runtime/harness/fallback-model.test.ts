@@ -120,3 +120,49 @@ test('getStreamedResponse: overload AFTER content yielded does NOT fall back (wo
   assert.equal(sonnetCalls, 0, 'committed stream is not switched');
   assert.ok(got.some((e) => e.type === 'output_text_delta'));
 });
+
+// ─── Universal cross-provider fallover: 429 + first-byte-timeout (2026-06-21) ───
+
+const rateLimited = () => ({ statusCode: 429, message: 'rate_limited' });
+
+test('falloverOn429: a 429 on one provider falls over to the next (cross-provider quota is independent)', async () => {
+  let nextCalls = 0;
+  const glm = model({ getStreamedResponse: async function* () { throw rateLimited(); } });
+  const codex = model({ getStreamedResponse: async function* () { nextCalls++; yield { type: 'output_text_delta', delta: 'from codex' } as any; } });
+  const out = await collect(withModelFallback([target('glm', glm), target('codex', codex)], { falloverOn429: true }).getStreamedResponse(req()));
+  assert.equal(nextCalls, 1, 'a 429 fell over to the next provider');
+  assert.ok((out as any[]).some((e) => e.delta === 'from codex'));
+});
+
+test('default (no opts): a 429 does NOT fall over (same-provider tier behavior preserved)', async () => {
+  let nextCalls = 0;
+  const opus = model({ getStreamedResponse: async function* () { throw rateLimited(); } });
+  const sonnet = model({ getStreamedResponse: async function* () { nextCalls++; yield { type: 'response_done', response: { output: [] } } as any; } });
+  await assert.rejects(async () => { for await (const _ of withModelFallback([target('opus', opus), target('sonnet', sonnet)]).getStreamedResponse(req())) { /* drain */ } });
+  assert.equal(nextCalls, 0, 'a 429 without the cross-provider opt-in does NOT switch tiers');
+});
+
+test('firstByteTimeoutMs: a brain that HANGS pre-content falls over to the next brain', async () => {
+  let nextCalls = 0;
+  // Hung brain: never yields a first event; respects the abort signal so the test cleans up fast.
+  const hung = model({ getStreamedResponse: async function* (request: any) {
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, 5_000);
+      request?.signal?.addEventListener?.('abort', () => { clearTimeout(t); reject(new Error('aborted')); }, { once: true });
+    });
+    yield { type: 'response_done', response: { output: [] } } as any;
+  } });
+  const codex = model({ getStreamedResponse: async function* () { nextCalls++; yield { type: 'output_text_delta', delta: 'rescued' } as any; } });
+  const out = await collect(withModelFallback([target('hung', hung), target('codex', codex)], { firstByteTimeoutMs: 50 }).getStreamedResponse(req()));
+  assert.equal(nextCalls, 1, 'the hung brain fell over to the next');
+  assert.ok((out as any[]).some((e) => e.delta === 'rescued'));
+});
+
+test('firstByteTimeoutMs: a brain that answers quickly is NOT falsely failed over', async () => {
+  let nextCalls = 0;
+  const fast = model({ getStreamedResponse: async function* () { yield { type: 'output_text_delta', delta: 'fast reply' } as any; } });
+  const codex = model({ getStreamedResponse: async function* () { nextCalls++; yield { type: 'output_text_delta', delta: 'should not run' } as any; } });
+  const out = await collect(withModelFallback([target('fast', fast), target('codex', codex)], { firstByteTimeoutMs: 50 }).getStreamedResponse(req()));
+  assert.equal(nextCalls, 0, 'a prompt brain is never failed over');
+  assert.ok((out as any[]).some((e) => e.delta === 'fast reply'));
+});

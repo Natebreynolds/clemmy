@@ -21,58 +21,106 @@ import { getByoModel } from './byo-model.js';
 import { resolveByoProviderForModel } from './byo-providers.js';
 import { ClaudeModelProvider } from './claude-model.js';
 import { resolveProvider } from './model-wire-registry.js';
-import { codexModelsAvailable } from './model-role-options.js';
-import { getActiveAuthMode, getByoBackendConfig, getClaudeBrainModel, getModelRoutingMode, MODELS } from '../../config.js';
+import { codexModelsAvailable, claudeModelsAvailable } from './model-role-options.js';
+import { withModelFallback, type FallbackTarget } from './fallback-model.js';
+import { getActiveAuthMode, getByoBackendConfig, getClaudeBrainModel, getModelRoutingMode, getRuntimeEnv, MODELS } from '../../config.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.router-model' });
+
+type BrainProvider = 'codex' | 'claude' | 'byo';
+
+/** Universal cross-provider brain-fallover: every turn runs through an ordered
+ *  chain of ALL connected brains, so a single provider's overload/429/hang is
+ *  invisible — Clem switches brains and finishes. Kill-switch default-on. */
+function brainFalloverEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+/** First-byte fallover budget — set BELOW the loop's stall watchdog (modelFirstByteStallMs,
+ *  default 75s) so a hung provider falls over to the next brain instead of dead-ending. */
+function brainFalloverFirstByteMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS', '') || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+}
 
 export class RouterModelProvider implements ModelProvider {
   private readonly codex = new CodexModelProvider();
   private readonly claude = new ClaudeModelProvider();
 
   getModel(modelName?: string): Model {
+    const primary = this.resolvePrimary(modelName);
+    if (!brainFalloverEnabled()) return primary.model;
+    // Wrap in a cross-provider fallover chain (primary -> other connected brains)
+    // so an overloaded/rate-limited/HUNG provider switches brains instead of
+    // dead-ending. falloverOn429: a 429 on one provider is irrelevant to the
+    // next, so switch. firstByteTimeoutMs: a silent provider falls over before
+    // the loop's stall watchdog fires.
+    const chain = this.buildBrainChain(primary);
+    return withModelFallback(chain, {
+      falloverOn429: true,
+      firstByteTimeoutMs: brainFalloverFirstByteMs(),
+    });
+  }
+
+  /** Resolve the single model the routing rules pick (no fallover) + which
+   *  provider it is, so the chain builder can append the OTHER providers. */
+  private resolvePrimary(modelName?: string): { model: Model; provider: BrainProvider; label: string } {
     const byo = getByoBackendConfig();
     const mode = getModelRoutingMode();
     const requested = typeof modelName === 'string' ? modelName.trim() : '';
     const name = requested || MODELS.primary;
 
     if (mode === 'all_in') {
-      // Multi-provider: route to the provider that OWNS this id; fall back to
-      // the legacy single backend (byte-identical when one provider exists).
       const backend = resolveByoProviderForModel(name) ?? byo;
       if (!backend.configured) throw new Error('BYO all-in mode is enabled, but no BYO backend is configured.');
       const id = resolveProvider(name) === 'codex' ? (backend.primaryId || name) : name;
       logger.debug({ requested: name, routedTo: id, backend: 'byo' }, 'route (all_in)');
-      return getByoModel(id, backend);
+      return { model: getByoModel(id, backend), provider: 'byo', label: id };
     }
 
     switch (resolveProvider(name)) {
       case 'claude':
         logger.debug({ requested: name, backend: 'claude' }, 'route');
-        return this.claude.getModel(name);
+        return { model: this.claude.getModel(name), provider: 'claude', label: name };
       case 'byo': {
-        // Multi-provider: dispatch to the model's owning provider (its own
-        // baseURL+key); fall back to the legacy single backend.
         const backend = resolveByoProviderForModel(name) ?? byo;
         if (!backend.configured) {
           throw new Error(`Model ${name} resolves to a BYO/OpenAI-compatible backend, but no BYO backend is configured.`);
         }
         logger.debug({ requested: name, backend: 'byo' }, 'route');
-        return getByoModel(name, backend);
+        return { model: getByoModel(name, backend), provider: 'byo', label: name };
       }
       case 'codex':
       default:
-        // Active Claude does not require a Codex login. Legacy helper agents
-        // still name gpt-* tiers; before the router, ClaudeModelProvider mapped
-        // those ids back to the Claude brain. Preserve that no-Codex Claude path.
         if (getActiveAuthMode() === 'claude_oauth' && !codexModelsAvailable()) {
           const id = getClaudeBrainModel();
           logger.debug({ requested: name, routedTo: id, backend: 'claude' }, 'route (active claude, no codex)');
-          return this.claude.getModel(id);
+          return { model: this.claude.getModel(id), provider: 'claude', label: id };
         }
         logger.debug({ requested: name, backend: 'codex' }, 'route');
-        return this.codex.getModel(name);
+        return { model: this.codex.getModel(name), provider: 'codex', label: name };
     }
+  }
+
+  /** Build the cross-provider fallover chain: the primary first, then every OTHER
+   *  connected brain (deduped by provider), most-reliable first. Lazy targets —
+   *  a fallback brain is only constructed if reached. */
+  private buildBrainChain(primary: { model: Model; provider: BrainProvider; label: string }): FallbackTarget[] {
+    const chain: FallbackTarget[] = [{ label: primary.label, getModel: () => primary.model }];
+    // Codex (OpenAI) — generally the steadiest fallback.
+    if (primary.provider !== 'codex' && codexModelsAvailable()) {
+      chain.push({ label: 'codex', getModel: () => this.codex.getModel(MODELS.primary) });
+    }
+    // Claude subscription.
+    if (primary.provider !== 'claude' && claudeModelsAvailable()) {
+      chain.push({ label: 'claude', getModel: () => this.claude.getModel(getClaudeBrainModel()) });
+    }
+    // The configured BYO/OpenAI-compatible backend (GLM/DeepSeek/…), if it isn't
+    // already the primary.
+    const byo = getByoBackendConfig();
+    if (primary.provider !== 'byo' && byo.configured) {
+      chain.push({ label: `byo:${byo.primaryId || 'default'}`, getModel: () => getByoModel(byo.primaryId || MODELS.primary, byo) });
+    }
+    return chain;
   }
 }
