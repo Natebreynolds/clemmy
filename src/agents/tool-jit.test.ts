@@ -34,7 +34,7 @@ test('REL-5 guard: selectToolsForTurn does NOT re-gate on the global flag (A/B j
   // Whether JIT runs is decided by resolveToolJitDecision at the call site, NOT here.
   // With the global CLEMMY_TOOL_JIT OFF but a real ranking, selection MUST still reduce —
   // otherwise the A/B jit arm (which activates without the global flag) is a silent no-op.
-  await withEnv({ CLEMMY_TOOL_JIT: undefined }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'off' }, async () => {
     assert.equal(toolJitEnabled(), false);
     const ranker: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, t.name === 'workflow_create' ? 0.9 : 0]));
     const sel = await selectToolsForTurn({ userInput: 'create a workflow', tools: TOOLS, rankFn: ranker });
@@ -172,6 +172,10 @@ test('resolveToolJitDecision: A/B off → global flag governs (no arm)', () => {
     assert.equal(d.arm, null);
   });
   withEnv({ CLEMMY_TOOL_JIT: undefined, CLEMMY_TOOL_JIT_AB: undefined }, () => {
+    // default-on: unset global flag now activates JIT.
+    assert.equal(resolveToolJitDecision({ allowLane: true, sessionId: 'sess-x' }).active, true);
+  });
+  withEnv({ CLEMMY_TOOL_JIT: 'off', CLEMMY_TOOL_JIT_AB: undefined }, () => {
     assert.equal(resolveToolJitDecision({ allowLane: true, sessionId: 'sess-x' }).active, false);
   });
 });

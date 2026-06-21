@@ -32,9 +32,12 @@ const logger = pino({ name: 'clementine-next.tool-jit' });
 // All flags read via getRuntimeEnv (not raw process.env) so an operator can flip the
 // A/B / tuning in BASE_DIR/.env and have it apply LIVE on the next turn — no daemon
 // restart — and to match the codebase convention.
-/** DEFAULT OFF — global on/off switch. 'on'/'1'/'true'/'yes' enable. */
+/** DEFAULT ON — global on/off switch. Set CLEMMY_TOOL_JIT=off (or 0/false/no) to
+ *  disable; anything else (incl. unset) is on. Safe to default-on because every
+ *  no-signal path in selectToolsForTurn falls back to the FULL tool surface
+ *  byte-identically (see exposeAll), and the 52-tool CORE set is never dropped. */
 export function toolJitEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_TOOL_JIT', '') || '').trim());
+  return !/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_TOOL_JIT', 'on') || 'on').trim());
 }
 
 // --- Live A/B: per-session bucketing -------------------------------------

@@ -85,6 +85,7 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   const chunks: string[] = [];
   let captured: any;
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off'; // pin off: this test guards the unfiltered read-only surface
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     captured = options;
     return {
@@ -117,14 +118,14 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('composio_execute_tool'), false);
-  // JIT off by default → no MCP tool-allowlist passed (server advertises all tools).
-  assert.equal(captured.mcpToolAllowlist, undefined, 'JIT default-off must not filter the MCP surface');
+  // JIT pinned off above → no MCP tool-allowlist passed (server advertises all tools).
+  assert.equal(captured.mcpToolAllowlist, undefined, 'JIT off must not filter the MCP surface');
 });
 
-test('JIT default-off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {
-  // Guards the default path: with CLEMMY_TOOL_JIT unset the brain must not reduce
+test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {
+  // Guards the kill-switch path: with CLEMMY_TOOL_JIT=off the brain must not reduce
   // the tool surface (no mcpToolAllowlist → MCP server advertises every tool).
-  delete process.env.CLEMMY_TOOL_JIT;
+  process.env.CLEMMY_TOOL_JIT = 'off';
   delete process.env.CLEMMY_TOOL_JIT_AB;
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.AUTH_MODE = 'claude_oauth';
