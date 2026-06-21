@@ -111,6 +111,44 @@ export const CLAUDE_BRAIN_RUBRIC_LINES = [
 ];
 export const CLAUDE_BRAIN_RUBRIC = CLAUDE_BRAIN_RUBRIC_LINES.join('\n\n');
 
+// --- LEAN variant: the Phase-5 surgical prune of the Codex/headless rubric ---
+//
+// The narrate-instead-of-call fix PROVED that lean beats the 34KB on the Claude
+// brain (CLAUDE_BRAIN_RUBRIC, ~3.3KB / ~830 tok, MORE reliable). This is the
+// candidate that ports that win to the Codex/headless lane (ORCHESTRATOR_
+// INSTRUCTIONS is ~34.9KB / ~8.7K tok every turn). It is built by COMPOSITION of
+// already-proven text — not freshly-written behavioral prose — to minimize
+// regression risk:
+//   - the 7 proven CLAUDE_BRAIN_RUBRIC lines (anti-narration, voice, converse-
+//     first, end-to-end+parallelize, approval-once+resource-check, memory+skills,
+//     toolset+reuse-proven-choice),
+//   - PLUS two tight Codex-lane essentials the Claude-brain rubric omits but the
+//     Codex lane's GATES rely on (execution-wrap, run_worker fan-out),
+//   - PLUS the OrchestratorDecision JSON contract VERBATIM (load-bearing — the
+//     @openai/agents loop parses it; dropping it mis-steers the model, commit
+//     437e161),
+//   - PLUS the proven TAIL (close-the-loop + compacted-context recall) verbatim.
+//
+// NOT wired as the default. It is registered in orchestrator.ts's
+// RUBRIC_INSTRUCTIONS_BY_VARIANT behind the existing CLEMMY_RUBRIC_VARIANT
+// switch (default 'legacy'); the default flips to 'lean' ONLY after a live A/B
+// (scripts measure narration/tool-call reliability + tokens, jit-style) shows
+// reliability ≥ legacy. Byte-identity is snapshot-guarded in
+// rubric-characterization.test.ts so any future edit is a reviewable diff.
+const LEAN_CODEX_ESSENTIAL_LINES = [
+  "EXECUTION LANE — before a BATCH of mutating external writes, or a mutating `composio_execute_tool` (slug with UPDATE/CREATE/INSERT/DELETE/SEND/POST/PATCH/WRITE/PUBLISH), open an execution lane: `execution_list` → if none, `execution_create({title, objective, successCriteria, nextStep})` where successCriteria records the RULE you applied (e.g. \"dropped any account with no activity in 30d\"). An `EXECUTION_WRAP_REQUIRED` error is the harness telling you HOW to comply — create the lane and immediately re-issue the exact failed call in the SAME turn; never report it as \"couldn't do the work\". Read-only calls (GETs, *_LIST_*, SEO/web reads) are never gated.",
+  "FAN OUT for 3+ independent same-shape units (50 CRM tasks, 30 drafts, 25 URL scrapes) and ESPECIALLY for independent MULTI-STEP per-item work (\"research these 10 prospects\" = per item: pull data → analyze → write the record): resolve the shared tools/slugs/schema/approval-scope ONCE, then call `run_worker` one per item in parallel waves of up to 8 — do NOT serialize them in your own context (that balloons tokens and forces the harness to clip your own freshly-fetched data mid-run). Pass each worker a structured packet with the exact slugs/commands; aggregate their tight results yourself. For external writes inside a fan-out: `execution_create` + one `request_approval` for the batch first.",
+];
+
+// Lean Codex/headless rubric: proven lean behavior + Codex essentials + the
+// decision contract + the proven tail. ~1/4 the size of ORCHESTRATOR_INSTRUCTIONS.
+export const ORCHESTRATOR_INSTRUCTIONS_LEAN = [
+  ...CLAUDE_BRAIN_RUBRIC_LINES,
+  ...LEAN_CODEX_ESSENTIAL_LINES,
+  ...ORCHESTRATOR_DECISION_CONTRACT,
+  ...ORCH_BEHAVIOR_TAIL,
+].join('\n\n');
+
 export type ClemRubricLane = 'codex' | 'native' | 'claude_brain';
 
 /** The single selector both lanes consume. Returns the rubric body for a lane;

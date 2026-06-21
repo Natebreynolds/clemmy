@@ -5,7 +5,8 @@ import crypto from 'node:crypto';
 // importer uses — so this also guards that the Phase-3 re-export stays intact).
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_BEHAVIOR_NATIVE } from './orchestrator.js';
 // The shared rubric module (Phase 3): the single source both flagship lanes consume.
-import { CLAUDE_BRAIN_RUBRIC, renderClemRubric } from './clem-rubric.js';
+import { CLAUDE_BRAIN_RUBRIC, ORCHESTRATOR_INSTRUCTIONS_LEAN, renderClemRubric } from './clem-rubric.js';
+import { RUBRIC_INSTRUCTIONS_BY_VARIANT } from './orchestrator.js';
 
 /**
  * PHASE 0b — prompt-assembly characterization (the engine-over-prompt regression net).
@@ -30,6 +31,9 @@ const GOLDEN = {
   instructions: { len: 34919, sha16: '8f32f27992f9ad5a' },
   native: { len: 33684, sha16: '62561fc10e75f519' },
   claudeBrain: { len: 3335, sha16: '3b6e995c647521c8' },
+  // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean) — captured 2026-06-20.
+  // ~1,787 tok vs 8,730 (80% smaller); composed of proven text. Default stays legacy.
+  lean: { len: 7148, sha16: '9af09145eecdf075' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -54,6 +58,29 @@ test('characterization: ORCHESTRATOR_BEHAVIOR_NATIVE is byte-stable (reviewable-
 
 test('characterization: CLAUDE_BRAIN_RUBRIC (lean) is byte-stable (reviewable-diff guard)', () => {
   snapshotGuard('claudeBrain', CLAUDE_BRAIN_RUBRIC, GOLDEN.claudeBrain);
+});
+
+test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewable-diff guard)', () => {
+  snapshotGuard('lean', ORCHESTRATOR_INSTRUCTIONS_LEAN, GOLDEN.lean);
+});
+
+test('lean variant: registered behind the variant switch, materially leaner, keeps load-bearing rules', () => {
+  // Wired into the A/B substrate (opt in via CLEMMY_RUBRIC_VARIANT=lean)…
+  assert.equal(RUBRIC_INSTRUCTIONS_BY_VARIANT.lean, ORCHESTRATOR_INSTRUCTIONS_LEAN, 'lean must be registered in the variant map');
+  // …default is unchanged (legacy), so there is zero behavior change until an A/B flips it.
+  assert.equal(RUBRIC_INSTRUCTIONS_BY_VARIANT.legacy, renderClemRubric('codex'), 'legacy stays the codex default');
+  // Genuinely a prune: well under half the legacy size.
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.length * 2 < renderClemRubric('codex').length, 'lean must be far smaller than legacy');
+  // Load-bearing rules survive the prune (composition invariants):
+  //  - the OrchestratorDecision JSON contract (the @openai/agents loop parses it),
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('Return an OrchestratorDecision'), 'lean must keep the decision contract');
+  //  - the anti-narration opener (the narrate-instead-of-call guard),
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('CALL TOOLS'), 'lean must keep the anti-narration rule');
+  //  - the execution-lane + fan-out Codex essentials the gates rely on,
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('EXECUTION LANE'), 'lean must keep the execution-wrap rule');
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('FAN OUT'), 'lean must keep the fan-out rule');
+  //  - converse-first (the most important interaction rule).
+  assert.ok(/CONVERSE FIRST/i.test(ORCHESTRATOR_INSTRUCTIONS_LEAN), 'lean must keep converse-first');
 });
 
 // --- Phase 3: ONE shared rubric source feeds every lane ---------------------

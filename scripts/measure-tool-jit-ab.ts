@@ -12,8 +12,18 @@
  *
  * Does NOT override CLEMENTINE_HOME — it must read your live event log. Read-only.
  * Run: npx tsx scripts/measure-tool-jit-ab.ts
+ *
+ * CACHE-BUST ACCOUNTING (OPP-02): JIT mutates the tool block between turns, which
+ * can invalidate the provider's cached prefix — so a naive "tools dropped × tok"
+ * win can be ERASED (or reversed) by the extra uncached tokens the next turn then
+ * pays. This readout now joins the usage log (per-session cachedInputTokens) to
+ * each arm and reports the ACTUAL cache-hit-rate per arm, so the default-on
+ * decision nets the cache-bust cost against the tool-drop savings instead of
+ * ignoring it. (Requires usage events to exist for the A/B sessions — the Codex/
+ * Claude/BYO lanes all log now.)
  */
 import { openEventLog } from '../src/runtime/harness/eventlog.js';
+import { listUsageDates, readUsageEventsForDate } from '../src/runtime/usage-log.js';
 
 const TOK_PER_TOOL = 302; // ~ JIT-able avg wire size (50,766 chars / 42 tools / 4)
 
@@ -114,16 +124,64 @@ for (const arm of ['jit', 'control'] as const) {
   console.log(`    completed: ${s.completed} (${pct(s.completed, outcomes)})  ·  failed: ${s.failed} (${pct(s.failed, outcomes)})  ·  stalled: ${s.stalled}  ·  limit: ${s.limitHit}`);
 }
 
-// 3) Verdict: jit must not be WORSE on failure/stall, and should save tokens.
+// 2b) CACHE-BUST ACCOUNTING — join the usage log to each arm by session and
+//     compute the REAL cache-hit-rate per arm. A lower hit-rate on the jit arm
+//     IS the cache-bust cost the naive tool-drop estimate ignores.
+const usageByArm: Record<'jit' | 'control', { input: number; cached: number; calls: number }> = {
+  jit: { input: 0, cached: 0, calls: 0 },
+  control: { input: 0, cached: 0, calls: 0 },
+};
+for (const day of listUsageDates()) {
+  const events = readUsageEventsForDate(new Date(`${day}T12:00:00Z`));
+  for (const ev of events) {
+    const arm = sessionArm.get(ev.source);
+    if (!arm) continue;
+    usageByArm[arm].input += ev.inputTokens || 0;
+    usageByArm[arm].cached += ev.cachedInputTokens || 0;
+    usageByArm[arm].calls += 1;
+  }
+}
+const hitRate = (a: { input: number; cached: number }): number => (a.input > 0 ? a.cached / a.input : 0);
+const jitHit = hitRate(usageByArm.jit);
+const ctlHit = hitRate(usageByArm.control);
+const haveUsage = usageByArm.jit.calls > 0 && usageByArm.control.calls > 0;
+
+console.log('\n  ── CACHE EFFICIENCY (cache-bust accounting) ──');
+if (!haveUsage) {
+  console.log('    No usage-log events matched the A/B sessions yet — cannot net cache-bust cost.');
+  console.log('    (Usage logs accumulate per model call; let the A/B sessions drive real turns, then re-run.)');
+} else {
+  console.log(`    jit:     hit-rate ${(jitHit * 100).toFixed(1)}%  over ${usageByArm.jit.calls} calls (${Math.round(usageByArm.jit.input / 1000)}k input tok)`);
+  console.log(`    control: hit-rate ${(ctlHit * 100).toFixed(1)}%  over ${usageByArm.control.calls} calls (${Math.round(usageByArm.control.input / 1000)}k input tok)`);
+  const deltaPt = (jitHit - ctlHit) * 100;
+  // Cache-bust cost ≈ the extra UNCACHED input the jit arm pays per call vs control,
+  // i.e. (control hit-rate − jit hit-rate) × avg input tokens/call. Compared against
+  // the tool-drop savings to net the real effect.
+  const jitAvgInput = usageByArm.jit.calls > 0 ? usageByArm.jit.input / usageByArm.jit.calls : 0;
+  const cacheBustCostPerCall = Math.max(0, ctlHit - jitHit) * jitAvgInput * 0.9; // cached reads ~10% price → ~0.9 effective
+  const avgDropped = arms.jit.jitTurns > 0 ? arms.jit.droppedTotal / arms.jit.jitTurns : 0;
+  const toolSavePerTurn = avgDropped * TOK_PER_TOOL;
+  console.log(`    Δ hit-rate (jit − control): ${deltaPt >= 0 ? '+' : ''}${deltaPt.toFixed(1)}pt`);
+  console.log(`    tool-drop saving ≈ ${Math.round(toolSavePerTurn)} tok/turn  vs  cache-bust cost ≈ ${Math.round(cacheBustCostPerCall)} effective tok/call`);
+  const net = toolSavePerTurn - cacheBustCostPerCall;
+  console.log(`    NET ≈ ${net >= 0 ? '+' : ''}${Math.round(net)} tok/turn ${net >= 0 ? '(JIT still ahead after cache-bust)' : '(cache-bust ERASES the tool-drop win — do NOT default-on)'}`);
+}
+
+// 3) Verdict: jit must not be WORSE on failure/stall, and should save tokens NET of cache-bust.
 const jitOut = arms.jit.completed + arms.jit.failed + arms.jit.stalled + arms.jit.limitHit;
 const ctlOut = arms.control.completed + arms.control.failed + arms.control.stalled + arms.control.limitHit;
 const jitBad = jitOut > 0 ? (arms.jit.failed + arms.jit.stalled) / jitOut : 0;
 const ctlBad = ctlOut > 0 ? (arms.control.failed + arms.control.stalled) / ctlOut : 0;
+const cacheRegresses = haveUsage && ctlHit - jitHit > 0.10; // jit ≥10pt worse hit-rate = material cache-bust
 console.log('\n══════════════════════════════════════════════════════════════');
 if (totalAbSessions < 40) {
   console.log(`  ⏳ Only ${totalAbSessions} A/B sessions — too few to decide. Keep accumulating (aim ≥40/arm).`);
+} else if (cacheRegresses) {
+  console.log(`  ⚠️ HOLD (cache-bust): jit cache-hit-rate ${(jitHit * 100).toFixed(1)}% is ≥10pt below control ${(ctlHit * 100).toFixed(1)}%.`);
+  console.log('     The per-turn tool-block mutation is invalidating the cached prefix — confirm the NET line is');
+  console.log('     still positive before default-on, or move JIT deltas AFTER the cache breakpoint first (OPP-02).');
 } else if (jitBad <= ctlBad + 0.02 && arms.jit.droppedTotal > 0) {
-  console.log(`  ✅ SHIP CANDIDATE: jit failure+stall ${(jitBad * 100).toFixed(1)}% ≤ control ${(ctlBad * 100).toFixed(1)}% (+2pt tol), and it saves tokens.`);
+  console.log(`  ✅ SHIP CANDIDATE: jit failure+stall ${(jitBad * 100).toFixed(1)}% ≤ control ${(ctlBad * 100).toFixed(1)}% (+2pt tol), saves tokens NET of cache-bust${haveUsage ? ` (jit hit ${(jitHit * 100).toFixed(1)}% vs control ${(ctlHit * 100).toFixed(1)}%)` : ''}.`);
   console.log('     Soak one more release, then flip CLEMMY_TOOL_JIT default-on and retire the A/B flag.');
 } else {
   console.log(`  ⚠️ HOLD: jit failure+stall ${(jitBad * 100).toFixed(1)}% vs control ${(ctlBad * 100).toFixed(1)}% — investigate the regressions before default-on.`);

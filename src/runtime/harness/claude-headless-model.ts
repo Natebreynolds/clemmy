@@ -8,6 +8,8 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { getRuntimeEnv } from '../../config.js';
 import { augmentPath } from '../spawn-env.js';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
+import { recordModelUsage } from '../usage-log.js';
+import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-headless-model' });
@@ -311,8 +313,38 @@ export function normalizeClaudeHeadlessOutputText(text: string, outputType: Mode
   return end > start ? out.slice(start, end + 1).trim() : out;
 }
 
+/**
+ * Record this Claude-headless call into the usage log so the dashboard + the
+ * efficiency readout can see cache-hit-rate on the Claude brain (the SDK lanes
+ * recorded NOTHING before — only the Codex native runtime did, so non-Codex
+ * brains had unmeasurable caching). cachedInputTokens = cache_read_input_tokens
+ * (the prompt-cache subset of the total prompt tokens). Session id comes from
+ * the harness run context; fails silently — telemetry never breaks a turn.
+ */
+function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
+  try {
+    const u = state.usage;
+    if (!u) return;
+    const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    const inputTokens = n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens);
+    const outputTokens = n(u.output_tokens);
+    if (inputTokens === 0 && outputTokens === 0) return;
+    const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? state.sessionId ?? 'unknown';
+    recordModelUsage({
+      sessionId,
+      model: state.model || 'claude-headless',
+      inputTokens,
+      cachedInputTokens: n(u.cache_read_input_tokens),
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+      responseId: state.requestId || state.responseId,
+    });
+  } catch { /* observability must never break the response path */ }
+}
+
 function modelResponseFromState(state: HeadlessRunState, outputType: ModelRequest['outputType']): ModelResponse {
   const text = normalizeClaudeHeadlessOutputText(state.text || state.emittedText, outputType);
+  recordClaudeHeadlessUsage(state);
   return {
     output: text ? [assistantMessage(text)] : [],
     usage: usageFromClaude(state.usage),

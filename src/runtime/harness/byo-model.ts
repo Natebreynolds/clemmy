@@ -34,6 +34,8 @@ import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson } from './json-repair.js';
 import { withResilience } from './resilient-model.js';
 import { resolveModelCapability, modelParityEnabled, restoreLegacyInstructionOrder } from './model-wire-registry.js';
+import { recordModelUsage } from '../usage-log.js';
+import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-model' });
@@ -358,6 +360,7 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
         return original(relaxed, options); // backend rejects stream:false → real (unmodified) stream
       }
       liftReasoning(completion);
+      recordByoUsage(completion, relaxed.model);
       const msg = completion?.choices?.[0]?.message;
       if (isToolOrEmpty(msg)) {
         repairToolCallArguments(completion);
@@ -369,6 +372,7 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
 
     const completion = (await original(relaxed, options)) as CompatCompletion;
     liftReasoning(completion);
+    recordByoUsage(completion, relaxed.model);
     const msg = completion?.choices?.[0]?.message;
     if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {
       repairToolCallArguments(completion);
@@ -377,6 +381,38 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
     }
     return completion;
   };
+}
+
+/**
+ * Record a BYO (GLM/DeepSeek/MiniMax/…) completion into the usage log so the
+ * dashboard + efficiency readout can see token spend AND cache-hit-rate on the
+ * user's actual brain. Before this, ONLY the Codex native runtime logged usage,
+ * so a GLM-brain user (the common `all_in` setup) had ZERO usage visibility and
+ * an unmeasurable cache-hit-rate. Chat-completions shape: prompt_tokens already
+ * includes the cached subset, reported under prompt_tokens_details.cached_tokens
+ * (absent on backends that don't cache → 0). Session id from the harness run
+ * context. Fails silently — telemetry must never break the model call path.
+ */
+function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): void {
+  try {
+    const u = (completion as { usage?: Record<string, unknown> })?.usage;
+    if (!u || typeof u !== 'object') return;
+    const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    const details = u.prompt_tokens_details as Record<string, unknown> | undefined;
+    const inputTokens = n(u.prompt_tokens) || n(u.input_tokens);
+    const outputTokens = n(u.completion_tokens) || n(u.output_tokens);
+    if (inputTokens === 0 && outputTokens === 0) return;
+    const cached = n(details?.cached_tokens) || n(u.cached_tokens);
+    const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? 'unknown';
+    recordModelUsage({
+      sessionId,
+      model: (completion as { model?: string })?.model || (typeof fallbackModel === 'string' ? fallbackModel : 'byo'),
+      inputTokens,
+      cachedInputTokens: cached,
+      outputTokens,
+      totalTokens: n(u.total_tokens) || inputTokens + outputTokens,
+    });
+  } catch { /* never break the call path */ }
 }
 
 const clientCache = new Map<string, OpenAI>();

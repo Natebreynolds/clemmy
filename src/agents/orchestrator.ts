@@ -26,7 +26,7 @@ import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope }
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
-import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
+import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn } from './tool-jit.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
@@ -469,6 +469,11 @@ export { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_BEHAVIOR_NATIVE };
 // resolveRubricVariant() falls back to legacy (observably) on any unknown value.
 export const RUBRIC_INSTRUCTIONS_BY_VARIANT: Record<string, string> = {
   legacy: ORCHESTRATOR_INSTRUCTIONS,
+  // Phase-5 surgical prune (~1/4 the tokens) — composed of proven text (the
+  // lean Claude-brain rubric + Codex essentials + the decision contract +
+  // tail). Opt in with CLEMMY_RUBRIC_VARIANT=lean to A/B; default stays legacy
+  // until a live A/B shows reliability ≥ legacy. See clem-rubric.ts.
+  lean: ORCHESTRATOR_INSTRUCTIONS_LEAN,
 };
 
 /** Resolve the Codex-lane rubric (instructions string) + the chosen variant for

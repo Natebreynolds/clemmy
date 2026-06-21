@@ -25,17 +25,24 @@ import { BASE_DIR } from '../config.js';
 
 const USAGE_DIR = path.join(BASE_DIR, 'state', 'token-usage');
 
+export type UsageKind =
+  | 'chat' | 'cron' | 'autonomy' | 'workflow' | 'background'
+  | 'embedding' | 'controller' | 'warmup' | 'other';
+
 export interface UsageEvent {
   /** ISO-8601 timestamp when the model response finished. */
   at: string;
   /** Where the call came from: session ID, cron name, "embedding-backfill", etc. */
   source: string;
   /** Higher-level category for grouping in the UI. */
-  kind: 'chat' | 'cron' | 'autonomy' | 'workflow' | 'background' | 'embedding' | 'controller' | 'other';
+  kind: UsageKind;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
-  /** Cached input tokens are split out when the API reports them. */
+  /** Total prompt (input) tokens for the call, INCLUDING any cached subset —
+   *  matching the OpenAI Responses convention (input_tokens ⊇ cached_tokens). */
   inputTokens: number;
+  /** The cached-read subset of inputTokens (prompt-cache hits). cacheHitRate =
+   *  cachedInputTokens / inputTokens. Split out when the API reports it. */
   cachedInputTokens?: number;
   outputTokens: number;
   reasoningTokens?: number;
@@ -44,6 +51,71 @@ export interface UsageEvent {
   durationMs?: number;
   /** Optional response ID for cross-reference with provider logs. */
   responseId?: string;
+  /** Approx token share of the assembled prompt by component (instructions =
+   *  rubric+context, tools = tool schemas, history = input items). Answers
+   *  "where do my tokens go each turn?". Estimated from wire bytes (≈chars/4)
+   *  at assembly time; the efficiency readout averages it across turns. */
+  promptComponents?: Record<string, number>;
+}
+
+/**
+ * Classify a usage event by sessionId/channel into a UI-friendly kind, so the
+ * dashboard "Usage" panel and the efficiency readout can group spend by source
+ * category (chat vs cron vs autonomy vs workflow vs boot warmup) without parsing
+ * the raw sessionId on the read side. Pure — string inspection only.
+ *
+ * Shared home (was private to codex-native-runtime). Every model lane that
+ * records usage classifies the SAME way, so segmented cache-hit-rate is
+ * comparable across the Codex / Claude / BYO brains. Boot warmups
+ * (`warmup-<ts>`, daemon/runner.ts) get their OWN `warmup` kind so their
+ * one-shot, near-zero-output traffic never pollutes the interactive-chat
+ * cache-hit-rate number.
+ */
+export function classifyUsageKind(sessionId: string, channel?: string): UsageKind {
+  if (sessionId.startsWith('warmup')) return 'warmup';
+  if (channel === 'cron' || sessionId.startsWith('cron:')) return 'cron';
+  if (channel === 'workflow' || sessionId.startsWith('workflow:')) return 'workflow';
+  if (channel === 'background' || sessionId.startsWith('background:') || sessionId.startsWith('bg-')) return 'background';
+  if (channel === 'controller' || sessionId.startsWith('execution-controller:')) return 'controller';
+  if (sessionId.startsWith('agent:')) return 'autonomy';
+  if (sessionId === 'console:home' || sessionId.startsWith('console:') || sessionId.startsWith('discord:') || channel === 'cli' || channel === 'discord' || channel === 'electron') return 'chat';
+  return 'other';
+}
+
+/**
+ * Convenience recorder shared by every model lane. Derives `source`/`kind`/`at`
+ * from the session so the Codex, Claude, and BYO brains all log usage the SAME
+ * way (today only the Codex native runtime logged; the Claude/BYO lanes were
+ * invisible, so cache-hit-rate was unmeasurable for non-Codex brains). Fails
+ * silently — observability must never break the model call path.
+ */
+export function recordModelUsage(args: {
+  sessionId: string;
+  channel?: string;
+  model: string;
+  inputTokens: number;
+  cachedInputTokens?: number;
+  outputTokens: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+  durationMs?: number;
+  responseId?: string;
+  promptComponents?: Record<string, number>;
+}): void {
+  recordUsage({
+    at: new Date().toISOString(),
+    source: args.sessionId || 'unknown',
+    kind: classifyUsageKind(args.sessionId || 'unknown', args.channel),
+    model: args.model,
+    inputTokens: args.inputTokens,
+    cachedInputTokens: args.cachedInputTokens,
+    outputTokens: args.outputTokens,
+    reasoningTokens: args.reasoningTokens,
+    totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
+    durationMs: args.durationMs,
+    responseId: args.responseId,
+    promptComponents: args.promptComponents,
+  });
 }
 
 function ensureDir(): void {
@@ -94,12 +166,20 @@ export interface UsageRollup {
   totalCalls: number;
   totalInputTokens: number;
   totalOutputTokens: number;
-  /** Tokens grouped by `kind` (chat/cron/autonomy/...). */
-  byKind: Record<string, { tokens: number; calls: number }>;
+  /** Cached-read input tokens across the window, and the derived hit-rate
+   *  (cachedInputTokens / inputTokens). The single largest economic lever —
+   *  segment via byKind below to read the INTERACTIVE-chat rate in isolation
+   *  (boot `warmup` traffic otherwise dominates and skews it). */
+  totalCachedInputTokens: number;
+  cacheHitRate: number;
+  /** Tokens grouped by `kind` (chat/cron/autonomy/...). `tokens`/`calls` are
+   *  unchanged; `inputTokens`/`cachedInputTokens` are additive so each kind's
+   *  cache-hit-rate is derivable (cachedInputTokens / inputTokens). */
+  byKind: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }>;
   /** Tokens grouped by `source`. Surfaces "cron:morning-briefing", "console:home", etc. */
   bySource: Array<{ source: string; tokens: number; calls: number; kind: string }>;
   /** Tokens grouped by model. */
-  byModel: Record<string, { tokens: number; calls: number }>;
+  byModel: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }>;
   /** Per-hour buckets for the chart (24 entries, 00:00–23:00, current day local time). */
   byHour: Array<{ hour: string; tokens: number; calls: number }>;
   /** When the underlying log was last updated. */
@@ -116,9 +196,10 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
   let totalTokens = 0;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
-  const byKind: Record<string, { tokens: number; calls: number }> = {};
+  let totalCachedInputTokens = 0;
+  const byKind: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }> = {};
   const bySourceMap = new Map<string, { tokens: number; calls: number; kind: string }>();
-  const byModel: Record<string, { tokens: number; calls: number }> = {};
+  const byModel: Record<string, { tokens: number; calls: number; inputTokens: number; cachedInputTokens: number }> = {};
   const hourBuckets = new Map<string, { tokens: number; calls: number }>();
   // Seed 24 hour buckets for the local day so the chart has stable x-axis.
   const dayStart = new Date(windowDate);
@@ -132,11 +213,15 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     totalTokens += ev.totalTokens;
     totalInputTokens += ev.inputTokens;
     totalOutputTokens += ev.outputTokens;
+    const cached = ev.cachedInputTokens ?? 0;
+    totalCachedInputTokens += cached;
 
     const k = ev.kind || 'other';
-    if (!byKind[k]) byKind[k] = { tokens: 0, calls: 0 };
+    if (!byKind[k]) byKind[k] = { tokens: 0, calls: 0, inputTokens: 0, cachedInputTokens: 0 };
     byKind[k].tokens += ev.totalTokens;
     byKind[k].calls += 1;
+    byKind[k].inputTokens += ev.inputTokens;
+    byKind[k].cachedInputTokens += cached;
 
     const srcKey = ev.source;
     const existing = bySourceMap.get(srcKey);
@@ -148,9 +233,11 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     }
 
     const m = ev.model || 'unknown';
-    if (!byModel[m]) byModel[m] = { tokens: 0, calls: 0 };
+    if (!byModel[m]) byModel[m] = { tokens: 0, calls: 0, inputTokens: 0, cachedInputTokens: 0 };
     byModel[m].tokens += ev.totalTokens;
     byModel[m].calls += 1;
+    byModel[m].inputTokens += ev.inputTokens;
+    byModel[m].cachedInputTokens += cached;
 
     try {
       const ts = new Date(ev.at);
@@ -178,6 +265,8 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     totalCalls: events.length,
     totalInputTokens,
     totalOutputTokens,
+    totalCachedInputTokens,
+    cacheHitRate: totalInputTokens > 0 ? totalCachedInputTokens / totalInputTokens : 0,
     byKind,
     bySource,
     byModel,

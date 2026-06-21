@@ -10,7 +10,7 @@ import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
 import { classifyTool, decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent, recordPendingApproval, recordToolEvent } from '../agents/tool-observability.js';
-import { recordUsage, type UsageEvent } from './usage-log.js';
+import { recordModelUsage } from './usage-log.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
 import { checkpointWorkingMemory } from '../memory/working-memory.js';
 import { withToolOutputContext } from './harness/tool-output-context.js';
@@ -571,20 +571,28 @@ export function parseCodexUsage(usage: Record<string, unknown> | undefined): {
   return { inputTokens, cachedInputTokens, outputTokens, reasoningTokens, totalTokens };
 }
 
+// classifyUsageKind moved to ./usage-log.ts (shared across all model lanes so
+// segmented cache-hit-rate is comparable across Codex / Claude / BYO brains).
+
 /**
- * Classify a usage event by sessionId/channel into a UI-friendly kind.
- * Lets the dashboard "Usage" panel group spend by source category
- * (chat vs cron vs autonomy vs workflow) without having to parse the
- * raw sessionId on the read side.
+ * Estimate the token share of an assembled Codex request by component, so the
+ * efficiency readout can answer "where do my tokens go each turn?". Token est.
+ * ≈ utf8 bytes / 4 (good enough for a relative breakdown; exact billing comes
+ * from the wire usage). `instructions` lumps the rubric + harness context (they
+ * arrive as one assembled string on this lane); `tools` is the tool schemas;
+ * `history` is the input items. Pure, never throws.
  */
-function classifyUsageKind(sessionId: string, channel?: string): UsageEvent['kind'] {
-  if (channel === 'cron' || sessionId.startsWith('cron:')) return 'cron';
-  if (channel === 'workflow' || sessionId.startsWith('workflow:')) return 'workflow';
-  if (channel === 'background' || sessionId.startsWith('background:') || sessionId.startsWith('bg-')) return 'background';
-  if (channel === 'controller' || sessionId.startsWith('execution-controller:')) return 'controller';
-  if (sessionId.startsWith('agent:')) return 'autonomy';
-  if (sessionId === 'console:home' || sessionId.startsWith('console:') || sessionId.startsWith('discord:') || channel === 'cli' || channel === 'discord' || channel === 'electron') return 'chat';
-  return 'other';
+function estimatePromptComponents(body: Record<string, unknown>): Record<string, number> {
+  try {
+    const tok = (v: unknown): number => Math.round(Buffer.byteLength(typeof v === 'string' ? v : JSON.stringify(v ?? '') || '', 'utf8') / 4);
+    return {
+      instructions: tok(body.instructions),
+      tools: tok(body.tools),
+      history: tok(body.input),
+    };
+  } catch {
+    return {};
+  }
 }
 
 async function performCodexRequest(
@@ -835,11 +843,9 @@ async function performCodexRequest(
 	            const usage = responseObj && (responseObj.usage as Record<string, unknown> | undefined);
 	            if (usage && typeof usage === 'object') {
 	              const { inputTokens, outputTokens, totalTokens, cachedInputTokens, reasoningTokens } = parseCodexUsage(usage);
-	              const sessionId = request.sessionId ?? 'unknown';
-	              recordUsage({
-	                at: new Date().toISOString(),
-	                source: sessionId,
-	                kind: classifyUsageKind(sessionId, request.channel),
+	              recordModelUsage({
+	                sessionId: request.sessionId ?? 'unknown',
+	                channel: request.channel,
 	                model: resolveCodexModel(request.model),
 	                inputTokens,
 	                cachedInputTokens,
@@ -848,6 +854,7 @@ async function performCodexRequest(
 	                totalTokens,
 	                durationMs: Date.now() - startedAt,
 	                responseId,
+	                promptComponents: estimatePromptComponents(body),
 	              });
 	            }
 	          } catch { /* ignore */ }

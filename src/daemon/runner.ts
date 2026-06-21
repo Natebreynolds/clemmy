@@ -1131,11 +1131,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     authKeepaliveTimer.unref?.();
   }
 
-  // Boot warmup: one tiny model call + one embed ping shortly after boot so
-  // the FIRST real user turn doesn't pay the cold-start tax (observed live
-  // on the 0.9.1 update: a 35s model call + hybrid-recall timeout on the
-  // first post-restart greeting). Best-effort and non-blocking — failures
-  // only log. Disable with CLEMMY_BOOT_WARMUP=off.
+  // Boot warmup: one model call + one embed ping shortly after boot so the
+  // FIRST real user turn doesn't pay the cold-start tax (observed live on the
+  // 0.9.1 update: a 35s model call + hybrid-recall timeout on the first
+  // post-restart greeting). NOTE: the prompt below is trivial ("ok") but the
+  // runtime still assembles the FULL system prefix (rubric + tools + context),
+  // so this is a ~50K-token call, not a "tiny" one — that's intentional, it
+  // primes the provider prompt cache with a representative prefix. It fires
+  // ONCE per boot, so it is a bounded cold-start cost, not a per-turn leak;
+  // confirm/track it via `npx tsx scripts/measure-efficiency.ts` (the `warmup`
+  // kind row). Best-effort and non-blocking — failures only log. Disable with
+  // CLEMMY_BOOT_WARMUP=off.
   if ((getRuntimeEnv('CLEMMY_BOOT_WARMUP', 'on') ?? 'on').toLowerCase() !== 'off') {
     setTimeout(() => {
       void (async () => {
