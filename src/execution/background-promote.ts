@@ -67,6 +67,13 @@ export interface EnqueueDurableChatTaskInput {
   /** The user's message (a leading background prefix is stripped automatically). */
   message: string;
   /**
+   * A fully-composed worker prompt (the AGREED objective + plan), used VERBATIM
+   * as the task prompt when present — skips the keyword-prefix stripping. This is
+   * the path the `dispatch_background_task` tool uses to hand the conversation's
+   * agreed plan to the runner; `message` then serves only as the title source.
+   */
+  composedPrompt?: string;
+  /**
    * The interactive session that spawned this task. REQUIRED for report-back —
    * the daemon feeds the result back into this session's transcript on
    * completion. Without it the result is notification-only.
@@ -90,9 +97,13 @@ export interface EnqueueDurableChatTaskInput {
  * it appears on the Tasks board immediately.
  */
 export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): BackgroundTaskRecord {
-  const prompt = stripBackgroundPrefix(input.message) || input.message;
+  // A composed prompt (the agreed plan from dispatch_background_task) is used
+  // verbatim; otherwise strip a keyword prefix from the raw user message.
+  const prompt = input.composedPrompt?.trim()
+    || stripBackgroundPrefix(input.message)
+    || input.message;
   return createBackgroundTask({
-    title: deriveTitle(prompt),
+    title: deriveTitle(input.message) || deriveTitle(prompt),
     prompt,
     originSessionId: input.sessionId,
     userId: input.userId,

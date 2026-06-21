@@ -28,12 +28,13 @@ const TOK = (chars: number): number => Math.round(chars / 4);
 // --- GOLDEN SNAPSHOT (captured 2026-06-19 @ main 0758e46) ------------------
 // Update these — and only these — when a rubric edit is intentional.
 const GOLDEN = {
-  instructions: { len: 34919, sha16: '8f32f27992f9ad5a' },
-  native: { len: 33684, sha16: '62561fc10e75f519' },
-  claudeBrain: { len: 3335, sha16: '3b6e995c647521c8' },
-  // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean) — captured 2026-06-20.
-  // ~1,787 tok vs 8,730 (80% smaller); composed of proven text. Default stays legacy.
-  lean: { len: 7148, sha16: '9af09145eecdf075' },
+  // 2026-06-21: +OFFER BACKGROUND AFTER ALIGNMENT (dispatch_background_task) on
+  // both lanes (HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
+  instructions: { len: 36053, sha16: '054c62ead97075c0' },
+  native: { len: 34818, sha16: '7e4a9b83ab846055' },
+  claudeBrain: { len: 3653, sha16: '412b4d641023c956' },
+  // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
+  lean: { len: 7466, sha16: 'b92bf9d90295c0c9' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

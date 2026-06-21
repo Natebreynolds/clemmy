@@ -59,6 +59,12 @@ export interface ToolActivity {
 export type RunStoppedReason =
   | 'success'
   | 'pending-approval'
+  // The run completed its turn by asking the user a clarifying question
+  // (ask_user_question → nextAction 'awaiting_user_input'). DISTINCT from
+  // 'success' so a background run parks for the answer instead of being marked
+  // done with the question silently swallowed. Forward-only: callers that don't
+  // know this member treat it as success (the prior behavior).
+  | 'awaiting-input'
   | 'max-turns-with-grace'
   | 'cancelled'
   | 'error';

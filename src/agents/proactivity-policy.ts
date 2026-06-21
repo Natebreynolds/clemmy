@@ -84,7 +84,11 @@ export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   checkInMinutes: 3,
   briefCadenceMinutes: 60,
   defaultLongTaskMinutes: 90,
-  maxConcurrentBackgroundTasks: 1,
+  // 2026-06-21: raised 1→3 so a user can fire several dispatched background
+  // tasks and have a few drain at once (each dispatch returns instantly, so
+  // firing many was already non-blocking; this lets more than one run per tick).
+  // Still clamp-bounded to [1,5]; tunable via the policy file / Settings.
+  maxConcurrentBackgroundTasks: 3,
   batchConfirmThreshold: 5,
   inboxWatchEnabled: true,
   inboxWatchMinutes: 15,

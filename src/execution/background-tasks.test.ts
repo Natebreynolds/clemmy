@@ -27,7 +27,12 @@ const {
   resumeInterruptedBackgroundTasks,
   processBackgroundTasks,
   classifyBackgroundTaskOutcome,
+  markBackgroundTaskAwaitingInput,
+  queueBackgroundTaskInputResolution,
+  getBackgroundTaskByQuestionId,
+  findSoleAwaitingInputTaskForOrigin,
 } = await import('./background-tasks.js');
+const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 const { SessionStore } = await import('../memory/session-store.js');
 
@@ -211,4 +216,53 @@ test('classifyBackgroundTaskOutcome: a genuinely-complete run still reports done
     'Finished the export and saved it to your vault.',
   );
   assert.equal(doneNoReason.outcome, 'done', 'clean text with no stoppedReason stays done');
+});
+
+// ─── needs_input check-in round-trip (the judge-gated pause/resume) ───
+
+test('markBackgroundTaskAwaitingInput parks the task with the question', () => {
+  const task = createBackgroundTask({ title: 'Draft the emails', prompt: 'draft', originSessionId: 'console:home' });
+  const parked = markBackgroundTaskAwaitingInput(task.id, 'q-1', 'Which segment — all leads, or just market-leaders?');
+  assert.equal(parked?.status, 'awaiting_input');
+  assert.equal(parked?.pendingQuestionId, 'q-1');
+  assert.match(parked?.pendingQuestion ?? '', /market-leaders/);
+});
+
+test('queueBackgroundTaskInputResolution re-queues with the freeform answer', () => {
+  const task = createBackgroundTask({ title: 'Pull accounts', prompt: 'pull', originSessionId: 'console:home' });
+  markBackgroundTaskAwaitingInput(task.id, 'q-2', 'How many?');
+  const resumed = queueBackgroundTaskInputResolution('q-2', 'just my market-leader accounts');
+  assert.equal(resumed?.status, 'pending', 're-queued for the daemon to resume');
+  assert.equal(resumed?.inputResolution?.answer, 'just my market-leader accounts');
+  // resolving a non-parked / unknown question is a no-op
+  assert.equal(queueBackgroundTaskInputResolution('q-nope', 'x'), null);
+});
+
+test('getBackgroundTaskByQuestionId + findSoleAwaitingInputTaskForOrigin resolve the parked task', () => {
+  const task = createBackgroundTask({ title: 'Build the report', prompt: 'build', originSessionId: 'console:alpha' });
+  markBackgroundTaskAwaitingInput(task.id, 'q-3', 'Need a decision.');
+  assert.equal(getBackgroundTaskByQuestionId('q-3')?.id, task.id);
+  assert.equal(findSoleAwaitingInputTaskForOrigin('console:alpha')?.id, task.id);
+  // a different origin session does not match
+  assert.equal(findSoleAwaitingInputTaskForOrigin('console:other'), null);
+  // two parked on the same origin → ambiguous → null (caller must disambiguate)
+  const task2 = createBackgroundTask({ title: 'Second task', prompt: 'second', originSessionId: 'console:alpha' });
+  markBackgroundTaskAwaitingInput(task2.id, 'q-4', 'Another decision.');
+  assert.equal(findSoleAwaitingInputTaskForOrigin('console:alpha'), null);
+});
+
+// ─── dispatch tool: agreed plan flows into the worker prompt verbatim ───
+
+test('enqueueDurableChatTask uses a composedPrompt verbatim + sets originSessionId for report-back', () => {
+  const composed = 'Objective: redesign the landing page\n\nAgreed plan:\n- audit current\n- rebuild hero';
+  const task = enqueueDurableChatTask({
+    message: 'redesign the landing page',
+    composedPrompt: composed,
+    sessionId: 'console:home',
+    source: 'desktop',
+  });
+  assert.equal(task.prompt, composed, 'the agreed plan reaches the worker prompt verbatim');
+  assert.equal(task.originSessionId, 'console:home', 'report-back wired to the origin chat');
+  assert.equal(task.status, 'pending');
+  assert.match(task.title, /redesign|landing/i, 'title derived from the objective, not the composed prompt');
 });

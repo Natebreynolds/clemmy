@@ -173,6 +173,12 @@ const ALWAYS_READ = new Set<string>([
   'agent_run_get',
   'background_tasks_recent',
   'background_task_status',
+  // dispatch_background_task is a WRITE (it queues autonomous work), but the
+  // user just AGREED to it in conversation — the conversation IS the consent, so
+  // it must not re-prompt for approval (same rationale as execution_create /
+  // task_add below). The work it dispatches is still gated normally inside the
+  // background run.
+  'dispatch_background_task',
   'memory_list_facts',
   'memory_search_facts',
   'memory_read',

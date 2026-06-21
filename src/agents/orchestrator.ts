@@ -917,6 +917,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'agent_runs_recent',
       'background_task_status',
       'background_tasks_recent',
+      'dispatch_background_task',
       // Profile writes
       'user_profile_update',
       // ── Instructed-but-omitted repair, 2026-06-11 ──────────────────

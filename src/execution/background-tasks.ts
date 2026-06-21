@@ -41,6 +41,13 @@ export type BackgroundTaskStatus =
   // Google Sheet because the Salesforce pull came back empty yet the run
   // still marked itself 'done'.
   | 'blocked'
+  // 'awaiting_input' = the run paused to ask the user a CLARIFYING QUESTION
+  // (ask_user_question, e.g. a judge/gate decided it needs validation) — it can
+  // RESUME from the answer, like 'awaiting_approval' but carrying freeform text
+  // instead of approve/reject. Distinct so a needed question is never swallowed
+  // as 'done' (the 2026-06-21 "tasks get lost" root cause). Not terminal; not
+  // auto-resumed until the user answers.
+  | 'awaiting_input'
   | 'failed'
   | 'aborted'
   | 'interrupted';
@@ -68,6 +75,15 @@ export interface BackgroundTaskRecord {
   approvalResolution?: {
     approvalId: string;
     approved: boolean;
+    queuedAt: string;
+  };
+  /** Parked clarifying question (status 'awaiting_input'), twin of
+   *  pendingApprovalId/approvalResolution but carrying freeform Q&A. */
+  pendingQuestionId?: string;
+  pendingQuestion?: string;
+  inputResolution?: {
+    questionId: string;
+    answer: string;
     queuedAt: string;
   };
   resumedFromTaskId?: string;
@@ -309,6 +325,22 @@ export function getBackgroundTaskByApprovalId(approvalId: string): BackgroundTas
   return listBackgroundTasks().find((task) => task.pendingApprovalId === approvalId) ?? null;
 }
 
+export function getBackgroundTaskByQuestionId(questionId: string): BackgroundTaskRecord | null {
+  if (!questionId) return null;
+  return listBackgroundTasks().find((task) => task.pendingQuestionId === questionId) ?? null;
+}
+
+/** The single background task awaiting input on this origin chat session, if
+ *  exactly one is parked there (so a freeform chat reply can be routed to it
+ *  without an explicit questionId). Returns null when zero or >1 are parked —
+ *  the caller must then disambiguate by questionId. */
+export function findSoleAwaitingInputTaskForOrigin(originSessionId: string): BackgroundTaskRecord | null {
+  if (!originSessionId) return null;
+  const parked = listBackgroundTasks({ status: 'awaiting_input' })
+    .filter((task) => task.originSessionId === originSessionId);
+  return parked.length === 1 ? parked[0] : null;
+}
+
 export function updateBackgroundTask(id: string, patch: Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>>): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task) return null;
@@ -331,6 +363,10 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     startedAt: nowIso(),
     error: undefined,
     pendingApprovalId: undefined,
+    // Clear the parked-question MARKER but preserve inputResolution — the drain
+    // reads inputResolution to resume with the answer (mirrors how
+    // approvalResolution survives markBackgroundTaskRunning).
+    pendingQuestionId: undefined,
   });
 }
 
@@ -353,7 +389,7 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
  * Tasks with no `originSessionId` (cron / autonomous spawns with no session to
  * wake) are a no-op, by design.
  */
-type BackgroundTaskOutcome = 'done' | 'failed' | 'blocked';
+type BackgroundTaskOutcome = 'done' | 'failed' | 'blocked' | 'needs_input';
 
 function enqueueBackgroundTaskOutcomeTurn(
   task: BackgroundTaskRecord,
@@ -372,6 +408,9 @@ function enqueueBackgroundTaskOutcomeTurn(
       title: task.title,
       statusHint: `background_task_status('${task.id}')`,
       maxDetailChars: RESULT_TRUNCATE_CHARS,
+      // A clarifying question must surface in the chat NOW (not wait for the
+      // user's next unrelated message) so they can answer it.
+      proactiveTurn: outcome === 'needs_input',
     },
   );
 }
@@ -402,6 +441,43 @@ export function markBackgroundTaskDone(id: string, result: string): BackgroundTa
     // Async report-back: also feed the result into the origin session's
     // context so Clementine resumes from it, not just a notification.
     enqueueBackgroundTaskOutcomeTurn(updated, 'done', result);
+  }
+  return updated;
+}
+
+/**
+ * Park a background task that asked the user a CLARIFYING QUESTION (the
+ * judge-gated check-in). Twin of markBackgroundTaskAwaitingApproval, but the
+ * question is surfaced TWO ways: a needs-you notification (kind 'approval' so it
+ * rides the loud delivery path) AND a synthetic turn in the ORIGIN chat via
+ * deliverOutcome(needs_input) — so the user sees the question where they're
+ * talking, and can just answer there (the answer is routed back to resume).
+ */
+export function markBackgroundTaskAwaitingInput(id: string, questionId: string, question: string): BackgroundTaskRecord | null {
+  const updated = updateBackgroundTask(id, {
+    status: 'awaiting_input',
+    pendingQuestionId: questionId,
+    pendingQuestion: question.slice(0, RESULT_TRUNCATE_CHARS),
+    inputResolution: undefined,
+    result: question.slice(0, RESULT_TRUNCATE_CHARS),
+  });
+  if (updated) {
+    addNotification({
+      id: `${Date.now()}-background-${updated.id}-needs-input`,
+      kind: 'approval',
+      title: `Background task needs your input: ${updated.title}`,
+      body: question.slice(0, 2000),
+      createdAt: nowIso(),
+      read: false,
+      metadata: {
+        ...taskNotificationMetadata(updated, { status: 'awaiting_input' }),
+        questionId,
+        needsInput: true,
+      },
+    });
+    // Surface the question into the origin chat too, so the user can answer in
+    // the conversation (the answer is routed back via queueBackgroundTaskInputResolution).
+    enqueueBackgroundTaskOutcomeTurn(updated, 'needs_input', question);
   }
   return updated;
 }
@@ -714,6 +790,39 @@ export function queueBackgroundTaskApprovalResolution(approvalId: string, approv
   return updated;
 }
 
+/**
+ * Re-queue a task parked on a clarifying question, carrying the user's FREEFORM
+ * answer. Twin of queueBackgroundTaskApprovalResolution, but the next drain
+ * resumes via an ordinary background turn (respondPreferHarness) that injects
+ * the answer — NOT resolveApproval (an ask_user_question turn completed
+ * normally, so there is no serialized SDK state to replay; the run session holds
+ * the full history and re-enters cleanly with the answer).
+ */
+export function queueBackgroundTaskInputResolution(questionId: string, answer: string): BackgroundTaskRecord | null {
+  const task = getBackgroundTaskByQuestionId(questionId);
+  if (!task || task.status !== 'awaiting_input') return null;
+  const now = nowIso();
+  const updated = updateBackgroundTask(task.id, {
+    status: 'pending',
+    pendingQuestionId: questionId,
+    inputResolution: { questionId, answer: clean(answer, RESULT_TRUNCATE_CHARS), queuedAt: now },
+    lastCheckInAt: now,
+    lastCheckInMessage: `Answer received for ${questionId}; queued daemon continuation.`,
+  });
+  if (updated) {
+    addNotification({
+      id: `${Date.now()}-background-${updated.id}-input-resolution-queued`,
+      kind: 'execution',
+      title: `Background task resuming: ${updated.title}`,
+      body: `Task ${updated.id} will resume in the daemon with your answer.`,
+      createdAt: now,
+      read: false,
+      metadata: taskNotificationMetadata(updated, { questionId, status: 'pending' }),
+    });
+  }
+  return updated;
+}
+
 export function interruptStaleRunningBackgroundTasks(): number {
   let interrupted = 0;
   for (const task of listBackgroundTasks()) {
@@ -723,6 +832,70 @@ export function interruptStaleRunningBackgroundTasks(): number {
     }
   }
   return interrupted;
+}
+
+/**
+ * Classify + record a finished worker turn. Shared by the fresh-run path AND the
+ * input-resume path (both produce an AssistantResponse from respondPreferHarness),
+ * so the pendingApproval / awaiting-input / coverage / classify / done sequence
+ * lives in ONE place. Order matters: the awaiting-input park MUST come before the
+ * coverage/classify checks so a clarifying question is never misread as
+ * blocked/done.
+ */
+function finishWorkerRun(
+  task: BackgroundTaskRecord,
+  run: { id: string },
+  response: { text: string; pendingApprovalId?: string; stoppedReason?: RunStoppedReason },
+): void {
+  if (response.pendingApprovalId) {
+    markBackgroundTaskAwaitingApproval(task.id, response.pendingApprovalId, response.text);
+    finishRun(run.id, {
+      status: 'awaiting_approval',
+      message: `Background task paused for approval ${response.pendingApprovalId}.`,
+      pendingApprovalId: response.pendingApprovalId,
+      outputPreview: response.text,
+    });
+    logger.info({ taskId: task.id, approvalId: response.pendingApprovalId }, 'Background task paused for approval');
+    return;
+  }
+  if (response.stoppedReason === 'awaiting-input') {
+    // Judge-gated check-in: the run asked the user a clarifying question. Park as
+    // needs_input (surfaced to origin chat + needs-you card) and resume on the
+    // answer. The question text IS response.text. MUST precede coverage/classify.
+    const questionId = `bgq-${task.id}-${Date.now().toString(36)}`;
+    markBackgroundTaskAwaitingInput(task.id, questionId, response.text || 'I need your input to continue.');
+    finishRun(run.id, {
+      status: 'awaiting_approval', // run-record paused state (the task status is 'awaiting_input')
+      message: 'Background task paused for your input.',
+      outputPreview: response.text,
+    });
+    logger.info({ taskId: task.id, questionId }, 'Background task paused for clarifying input');
+    return;
+  }
+  const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+  if (coverageBlock) {
+    markBackgroundTaskBlocked(task.id, coverageBlock.reason, response.text);
+    finishRun(run.id, { status: 'failed', message: `Background task ${task.id} ${coverageBlock.reason}`, outputPreview: response.text });
+    clearLedger(task.runSessionId);
+    logger.warn({ taskId: task.id, reason: coverageBlock.reason }, 'Background task partial fan-out coverage (blocked, not done)');
+    return;
+  }
+  const outcome = classifyBackgroundTaskOutcome(task, response.text, response.stoppedReason);
+  if (outcome.outcome === 'blocked') {
+    markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text);
+    finishRun(run.id, {
+      status: 'failed',
+      message: `Background task ${task.id} did not complete: ${outcome.reason ?? 'run did not finish cleanly'}`,
+      outputPreview: response.text,
+    });
+    clearLedger(task.runSessionId);
+    logger.warn({ taskId: task.id, reason: outcome.reason, stoppedReason: response.stoppedReason }, 'Background task did not complete cleanly (blocked, not done)');
+    return;
+  }
+  markBackgroundTaskDone(task.id, response.text);
+  finishRun(run.id, { status: 'completed', message: `Background task ${task.id} completed.`, outputPreview: response.text });
+  clearLedger(task.runSessionId);
+  logger.info({ taskId: task.id }, 'Background task completed');
 }
 
 export async function processBackgroundTasks(assistant: ClementineAssistant, limit?: number): Promise<number> {
@@ -890,6 +1063,15 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      // unwind via AgentRuntimeCancelledError. The catch handler
 	      // reads cancellationReason and marks the task aborted with a
 	      // user-readable message.
+	      // Resume-with-answer vs fresh run: if this task was re-queued with the
+	      // user's answer to a clarifying question (needs_input round-trip), inject
+	      // the answer instead of the original prompt — the run session holds the
+	      // full history, so it re-enters cleanly. Consume the resolution once.
+	      const resume = task.inputResolution;
+	      const workerMessage = resume
+	        ? `The user answered your question: "${resume.answer}". Continue the task with this answer.`
+	        : buildWorkerPrompt(task);
+	      if (resume) task = updateBackgroundTask(task.id, { inputResolution: undefined }) ?? task;
 	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
 	      // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
 	      // gated harness loop; legacy fallback only pre-run. The shouldCancel
@@ -908,7 +1090,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          BACKGROUND_STEP_WALL_CLOCK_MS,
 	          Math.floor((task.maxMinutes * 60_000) / 2),
 	        ),
-	        message: buildWorkerPrompt(task),
+	        message: workerMessage,
 	        runId: run.id,
 	        shouldCancel: () => {
 	          if (Date.now() > wallClockDeadlineMs) {
@@ -953,64 +1135,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      }, (req) => assistant.respond(req));
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);
 
-      if (response.pendingApprovalId) {
-        markBackgroundTaskAwaitingApproval(task.id, response.pendingApprovalId, response.text);
-        finishRun(run.id, {
-          status: 'awaiting_approval',
-          message: `Background task paused for approval ${response.pendingApprovalId}.`,
-          pendingApprovalId: response.pendingApprovalId,
-          outputPreview: response.text,
-        });
-        logger.info({ taskId: task.id, approvalId: response.pendingApprovalId }, 'Background task paused for approval');
-        continue;
-      }
-
-      // FIX 7 — partial fan-out coverage reports honestly instead of a hollow
-      // done. Flag-gated; when off this is a no-op and the run marks done
-      // exactly as before (byte-identical).
-      const coverageBlock = fanoutCoverageBlock(task.runSessionId);
-      if (coverageBlock) {
-        markBackgroundTaskBlocked(task.id, coverageBlock.reason, response.text);
-        finishRun(run.id, {
-          status: 'failed',
-          message: `Background task ${task.id} ${coverageBlock.reason}`,
-          outputPreview: response.text,
-        });
-        clearLedger(task.runSessionId);
-        logger.warn({ taskId: task.id, reason: coverageBlock.reason }, 'Background task partial fan-out coverage (blocked, not done)');
-        continue;
-      }
-
-      // P0-C — the main drain previously marked done after only the pending-
-      // approval + fan-out checks, so a wall-clock abort (which respond()
-      // converts to a typed error RESULT, not a throw, so it never reaches the
-      // catch below) slipped through as a hollow "done". Run the full outcome
-      // classifier — it also adds the blocked-execution + blocked-text signals
-      // the main drain otherwise lacked.
-      const outcome = classifyBackgroundTaskOutcome(task, response.text, response.stoppedReason);
-      if (outcome.outcome === 'blocked') {
-        markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text);
-        finishRun(run.id, {
-          status: 'failed',
-          message: `Background task ${task.id} did not complete: ${outcome.reason ?? 'run did not finish cleanly'}`,
-          outputPreview: response.text,
-        });
-        clearLedger(task.runSessionId);
-        logger.warn(
-          { taskId: task.id, reason: outcome.reason, stoppedReason: response.stoppedReason },
-          'Background task did not complete cleanly (blocked, not done)',
-        );
-        continue;
-      }
-
-      markBackgroundTaskDone(task.id, response.text);
-      finishRun(run.id, {
-        status: 'completed',
-        message: `Background task ${task.id} completed.`,
-        outputPreview: response.text,
-      });
-      clearLedger(task.runSessionId);
-      logger.info({ taskId: task.id }, 'Background task completed');
+	      // Classify + record the result: pending-approval / awaiting-input (the
+	      // judge-gated check-in) / partial-coverage / blocked / done — all in the
+	      // shared helper so the fresh-run and input-resume paths agree.
+	      finishWorkerRun(task, run, response);
 	    } catch (error) {
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);
 	      const message = error instanceof Error ? error.message : String(error);

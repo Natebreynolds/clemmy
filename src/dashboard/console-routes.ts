@@ -158,7 +158,7 @@ import {
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
-import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks, resumeBackgroundTask } from '../execution/background-tasks.js';
+import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks, resumeBackgroundTask, findSoleAwaitingInputTaskForOrigin, queueBackgroundTaskInputResolution } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
@@ -7641,6 +7641,19 @@ export function registerConsoleRoutes(
       return;
     }
     const sessionId = requestedId || 'console:home';
+    // Background needs_input round-trip: if exactly one background task is parked
+    // on a clarifying question for THIS chat, route the user's reply as the
+    // answer and resume it (mirrors how an approval button short-circuits). Only
+    // fires while a task is parked here, so the mis-route window is narrow.
+    const parkedTask = findSoleAwaitingInputTaskForOrigin(sessionId);
+    if (parkedTask?.pendingQuestionId) {
+      queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, message);
+      res.json({
+        sessionId,
+        text: `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`,
+      });
+      return;
+    }
     try {
       // FORK collapse (staged): interactive console home chat through the gated
       // harness loop (judgeCompletion ON for desktop/Discord parity). Default-OFF

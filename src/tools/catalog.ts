@@ -74,6 +74,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'agent_run_get',
   'background_tasks_recent',
   'background_task_status',
+  'dispatch_background_task',
   'notify_user',
   'ask_user_question',
   'list_pending_check_ins',

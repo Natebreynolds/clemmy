@@ -200,11 +200,23 @@ export async function respondViaHarness(
 
     switch (result.status) {
       case 'completed':
-      case 'awaiting_user_input':
         return {
           text: replyText || '(no reply produced)',
           sessionId,
           stoppedReason: 'success',
+          turnsUsed: result.lastTurn,
+        };
+      case 'awaiting_user_input':
+        // The run asked the user a clarifying question (ask_user_question). It is
+        // NOT done — surface a DISTINCT stop reason so a BACKGROUND run parks for
+        // the answer instead of being marked done with the question swallowed
+        // (the root cause of "tasks get lost" + "she can't pause for validation").
+        // Foreground/chat callers treat any non-success reason as a normal reply,
+        // so this is forward-only for them — only the background drain branches on it.
+        return {
+          text: replyText || '(no reply produced)',
+          sessionId,
+          stoppedReason: 'awaiting-input',
           turnsUsed: result.lastTurn,
         };
       case 'awaiting_approval': {
