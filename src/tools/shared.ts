@@ -319,6 +319,16 @@ export function updateEnvKey(key: string, value: string): void {
   }
 
   writeFileSync(envPath, `${lines.join('\n').replace(/\n+$/, '')}\n`, 'utf-8');
+
+  // Mirror into the live process env. getRuntimeEnv() reads process.env BEFORE
+  // the .env file (config.ts), so a file-only write is INVISIBLE this session
+  // whenever the key was already present in process.env at boot — the next
+  // getRuntimeEnv() keeps returning the stale value. That made settings writes
+  // (e.g. the worker/judge role picker via CLEMMY_MODEL_ROLES) appear to "revert"
+  // in the UI: the file got the new value but the running snapshot didn't. A
+  // handful of call sites worked around this by manually setting process.env[key]
+  // after the call; doing it here fixes the whole class once, for every caller.
+  process.env[key] = value;
 }
 
 export function getWorkspaceDirs(): string[] {

@@ -8,7 +8,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_TOOL_RESULT_MAX_CHARS, textResult, truncateToolText } from './shared.js';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import { BASE_DIR, DEFAULT_TOOL_RESULT_MAX_CHARS, textResult, truncateToolText, updateEnvKey } from './shared.js';
+import { getRuntimeEnv } from '../config.js';
 
 test('truncateToolText: passes through short strings unchanged', () => {
   const s = 'hello world';
@@ -52,4 +55,29 @@ test('truncateToolText: marker mentions the total length', () => {
   const out = truncateToolText(big, 1000);
   // Total length is 20,000; output mentions both.
   assert.match(out, /20,000/);
+});
+
+test('updateEnvKey: a write takes effect LIVE even when the key was already in process.env', () => {
+  // Regression: getRuntimeEnv() reads process.env BEFORE the .env file, so a
+  // file-only write was invisible this session — the worker/judge role picker
+  // (CLEMMY_MODEL_ROLES) appeared to "revert" because the running snapshot kept
+  // the stale boot value. updateEnvKey must mirror into process.env so the next
+  // getRuntimeEnv() returns the new value with no restart.
+  const key = 'CLEMMY_TEST_UPDATE_ENV_KEY_LIVE';
+  const prev = process.env[key];
+  // Snapshot the real .env so the write (which appends a line) leaves no trace.
+  const envPath = path.join(BASE_DIR, '.env');
+  const hadFile = existsSync(envPath);
+  const original = hadFile ? readFileSync(envPath, 'utf-8') : null;
+  try {
+    process.env[key] = 'stale-boot-value'; // simulate the value present at boot
+    updateEnvKey(key, 'fresh-value');
+    assert.equal(process.env[key], 'fresh-value', 'process.env mirrors the write');
+    assert.equal(getRuntimeEnv(key), 'fresh-value', 'getRuntimeEnv returns the new value live (no restart)');
+  } finally {
+    if (prev === undefined) delete process.env[key];
+    else process.env[key] = prev;
+    if (original !== null) writeFileSync(envPath, original, 'utf-8');
+    else if (!hadFile && existsSync(envPath)) rmSync(envPath);
+  }
 });
