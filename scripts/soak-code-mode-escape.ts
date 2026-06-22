@@ -19,6 +19,10 @@ const PWNED = '/tmp/clem-codemode-soak-PWNED';
 try { rmSync(PWNED, { force: true }); } catch { /* ignore */ }
 
 const dispatch = async () => ({ stub: 'no real tools wired in the soak' });
+// Optional: run the sandbox CHILD under a specific Node binary (e.g. Electron's
+// bundled Node) to validate the REAL production runtime, not system Node.
+const NODE_BIN = process.env.SOAK_NODE_BIN || undefined;
+const run = (program: string, timeoutMs = 15_000) => runCodeModeProgram(program, dispatch, { timeoutMs, nodeBin: NODE_BIN });
 
 type Vector = { name: string; program: string; timeoutMs?: number; held: (r: CodeModeResult) => boolean; };
 
@@ -70,9 +74,14 @@ const vectors: Vector[] = [
     held: (r) => !r.ok && /exceeded|killed/i.test(r.error ?? '') },
 ];
 
+// Prove WHICH runtime the sandbox child actually ran on (the whole point: the
+// real prod runtime is Electron's bundled Node, not system Node).
+const rt = await run('return { node: process.version, electron: process.versions.electron ?? null };');
+console.log(`sandbox child runtime: ${JSON.stringify(rt.value)} (binary: ${NODE_BIN ?? 'process.execPath (system)'})\n`);
+
 let held = 0; const breaches: string[] = [];
 for (const v of vectors) {
-  const r = await runCodeModeProgram(v.program, dispatch, { timeoutMs: v.timeoutMs ?? 15_000 });
+  const r = await run(v.program, v.timeoutMs ?? 15_000);
   const ok = v.held(r);
   if (ok) held++; else breaches.push(`${v.name} :: ${blob(r).slice(0, 200)}`);
   console.log(`${ok ? '✓ HELD ' : '✗ BREACH'}  ${v.name}`);

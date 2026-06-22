@@ -38,28 +38,57 @@ export interface CodeModeOptions {
   timeoutMs?: number;
   maxRpcCalls?: number;
   maxReturnChars?: number;
+  /** Node binary to run the sandbox child. Defaults to process.execPath (the
+   *  daemon's own runtime). Overridable so the escape soak can validate the
+   *  child under the REAL production runtime (Electron's bundled Node) rather
+   *  than system Node. Production never passes it. */
+  nodeBin?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_RPC = 200;
 const DEFAULT_MAX_RETURN = 16_000;
 
+// The blocked module set — shared by both blocker mechanisms below.
+const BLOCKED_RE = `/^(node:)?(fs|fs\\/promises|child_process|net|http|https|http2|dns|dns\\/promises|tls|dgram|cluster|worker_threads|module|vm|inspector|repl|v8|wasi|perf_hooks|trace_events|diagnostics_channel|os|readline|tty)$/`;
+
+// The off-thread loader (Node 20.6+ path): registered via module.register, runs in
+// a worker thread, and THROWS for a blocked specifier so the import rejects. This
+// is the production path under Electron's bundled Node 20.x (no registerHooks).
+const BLOCKER_LOADER_SRC = `
+const BLOCKED = ${BLOCKED_RE};
+export async function resolve(specifier, context, nextResolve) {
+  if (BLOCKED.test(specifier)) throw new Error('code-mode sandbox: module "' + specifier + '" is blocked');
+  return nextResolve(specifier, context);
+}
+`;
+
 // The --import blocker: blocks dangerous module loads (import / import() / require)
-// and removes the no-import network/internal escape hatches. Written into the
-// sandbox temp dir at runtime (so it ships without a .mjs build step).
+// and removes the no-import network/internal escape hatches. DUAL-MECHANISM so the
+// sandbox works on BOTH Node 22 (dev: synchronous registerHooks) and Node 20.6+
+// (Electron's bundled Node: off-thread module.register loader). Fails CLOSED if
+// neither is available. Written into the sandbox temp dir at runtime.
 const BLOCKER_SRC = `
 import module from 'node:module';
-const BLOCKED = /^(node:)?(fs|fs\\/promises|child_process|net|http|https|http2|dns|dns\\/promises|tls|dgram|cluster|worker_threads|module|vm|inspector|repl|v8|wasi|perf_hooks|trace_events|diagnostics_channel|os|readline|tty)$/;
-try {
-  module.registerHooks({
-    resolve(specifier, context, nextResolve) {
-      if (BLOCKED.test(specifier)) throw new Error('code-mode sandbox: module "' + specifier + '" is blocked');
-      return nextResolve(specifier, context);
-    },
-  });
-} catch (e) {
-  // If registerHooks is unavailable, fail CLOSED: refuse to run rather than run unsandboxed.
-  process.stderr.write('code-mode sandbox: registerHooks unavailable (' + ((e && e.message) || e) + ')\\n');
+const BLOCKED = ${BLOCKED_RE};
+let __blocked = false;
+if (typeof module.registerHooks === 'function') {
+  try {
+    module.registerHooks({
+      resolve(specifier, context, nextResolve) {
+        if (BLOCKED.test(specifier)) throw new Error('code-mode sandbox: module "' + specifier + '" is blocked');
+        return nextResolve(specifier, context);
+      },
+    });
+    __blocked = true;
+  } catch {}
+}
+if (!__blocked && typeof module.register === 'function') {
+  try { module.register('./blocker-loader.mjs', import.meta.url); __blocked = true; } catch {}
+}
+if (!__blocked) {
+  // Fail CLOSED: no blocker available → refuse to run rather than run unsandboxed.
+  process.stderr.write('code-mode sandbox: no module blocker (registerHooks/register) — refused to run unsandboxed\\n');
   process.exit(73);
 }
 for (const g of ['fetch', 'WebSocket', 'XMLHttpRequest', 'EventSource', 'navigator']) {
@@ -120,8 +149,10 @@ export async function runCodeModeProgram(
   const maxReturn = opts.maxReturnChars ?? DEFAULT_MAX_RETURN;
   const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-codemode-'));
   const blockerPath = path.join(dir, 'blocker.mjs');
+  const loaderPath = path.join(dir, 'blocker-loader.mjs');
   const progPath = path.join(dir, 'program.mjs');
   writeFileSync(blockerPath, BLOCKER_SRC, 'utf8');
+  writeFileSync(loaderPath, BLOCKER_LOADER_SRC, 'utf8'); // off-thread loader for the Node 20.6+ path
   writeFileSync(progPath, buildProgramSource(program), 'utf8');
 
   const logs: string[] = [];
@@ -129,10 +160,13 @@ export async function runCodeModeProgram(
   let result: CodeModeResult | null = null;
 
   return await new Promise<CodeModeResult>((resolve) => {
-    const child = spawn(process.execPath, ['--no-warnings', '--import', blockerPath, progPath], {
+    const child = spawn(opts.nodeBin ?? process.execPath, ['--no-warnings', '--import', blockerPath, progPath], {
       cwd: dir,
       // Minimal env — NO inherited secrets/tokens. Only what Node needs to boot.
-      env: { PATH: process.env.PATH ?? '', NODE_OPTIONS: '' },
+      // ELECTRON_RUN_AS_NODE=1 makes process.execPath run as Node in the packaged
+      // app (where execPath is the Electron binary — without it, it would launch a
+      // GUI instead of the sandbox). No-op under plain Node. (Mirrors spaces/runner.ts.)
+      env: { PATH: process.env.PATH ?? '', NODE_OPTIONS: '', ELECTRON_RUN_AS_NODE: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
