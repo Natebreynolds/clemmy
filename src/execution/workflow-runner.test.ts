@@ -1287,6 +1287,27 @@ test('P0-3 does NOT halt a read step, a completed step, or the targeted re-run p
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState(undefined)), null);
 });
 
+test('CHARACTERIZATION (Lane B, bug #8): a crashed forEach SEND step is EXEMPT from the resume-halt — the double-send exposure', () => {
+  // forEach steps are item-tracked, so resume is SUPPOSED to skip already-done
+  // items. But if an item's send fired and the process crashed BEFORE its
+  // item_completed event was written, the forEach re-runs that item → DOUBLE
+  // SEND. shouldHaltResumeForSideEffect exempts forEach (`crashed.forEach →
+  // return null`), so a crashed forEach SEND does NOT halt. This pins that
+  // exposure; the Lane B fix (per-item idempotency key keyed by run+step+item)
+  // makes a crashed forEach safe to auto-resume WITHOUT re-sending a claimed
+  // item — at which point this expectation changes to the idempotent behavior.
+  const wf = wfWith([
+    { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
+    { id: 'blast', prompt: 'Email each lead.', sideEffect: 'send', forEach: 'pull', dependsOn: ['pull'] },
+  ]);
+  // A plain send halts (asserted above); the forEach send does NOT — the gap.
+  assert.equal(
+    shouldHaltResumeForSideEffect(wf, resumeState('blast', ['pull'])),
+    null,
+    'KNOWN GAP #8: crashed forEach send auto-resumes (no halt) → double-send window until per-item idempotency lands',
+  );
+});
+
 test('P0-3 approval-gated step is exempt (parking emits step_started before the gate)', () => {
   const wf = wfWith([
     { id: 'send', prompt: 'Email the batch.', sideEffect: 'send', requiresApproval: true },
