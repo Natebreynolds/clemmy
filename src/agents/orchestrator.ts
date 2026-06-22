@@ -874,6 +874,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'space_refresh',
       // Shell (approval-gated by taxonomy for mutating commands)
       'run_shell_command',
+      // Code Mode (Lane C) — programmatic tool calling. byName no-ops to undefined
+      // (→ filtered out) when CLEMMY_CODE_MODE is off (the tool isn't in
+      // getCoreTools then), so this is safe + byte-identical with the flag off.
+      // Without this the curated surface omitted it and the model self-reported
+      // "run_tool_program is not in my tool surface" even with the flag on.
+      'run_tool_program',
       // Tasks (writes)
       'task_add',
       'task_update',
