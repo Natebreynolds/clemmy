@@ -27,6 +27,24 @@ export function codeModeEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CODE_MODE', 'off') || 'off').trim().toLowerCase() === 'on';
 }
 
+/** Phase 2: allow GATED WRITES inside code-mode programs. Separate opt-in (default
+ *  off) so enabling code-mode (read-only) never silently enables writes. When on,
+ *  a program may call the mutating tools — and because every clem call routes
+ *  through wrapToolForHarness, the full gate chain (execution-wrap / grounding /
+ *  duplicate / goal-fidelity / destination / confirm-first) fires per in-program
+ *  write exactly as on a discrete call. DELETE-WHEN-VALIDATED: fold into
+ *  CLEMMY_CODE_MODE once gate-parity holds across a release. */
+export function codeModeWritesEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CODE_MODE_WRITES', 'off') || 'off').trim().toLowerCase() === 'on';
+}
+
+/** Phase 2 mutating surface. Each routes through wrapToolForHarness, so the
+ *  write-boundary gates cover it with NO new gate code. run_worker is excluded
+ *  (worker-of-worker recursion is out of scope for v1). */
+export const WRITE_TOOLS = new Set<string>([
+  'composio_execute_tool', 'write_file', 'run_shell_command',
+]);
+
 /** The Phase-1 read-only surface a code-mode program may call. Every name here is
  *  non-mutating; a write/send tool (composio_execute_tool, write_file, …) is
  *  DELIBERATELY excluded until Phase 2 routes its gates through this path. */
@@ -54,48 +72,73 @@ async function realToolsByName(): Promise<Map<string, InvokableTool>> {
   return m;
 }
 
+/** Test seam: inject the tools-by-name map (fake gated tools) so gate-parity can
+ *  be exercised through the REAL bracket chain without real sends. null resets. */
+export function _setCodeModeToolsForTests(map: Map<string, InvokableTool> | null): void {
+  toolsByName = map;
+}
+
+/** Whether a clem.<method> is reachable: read-only always; mutating only when
+ *  writes are enabled (Phase 2). Everything else is refused (the safety boundary). */
+export function isCodeModeToolAllowed(method: string): boolean {
+  if (READ_ONLY_TOOLS.has(method)) return true;
+  if (codeModeWritesEnabled() && WRITE_TOOLS.has(method)) return true;
+  return false;
+}
+
 /** Dispatch ONE clem.<method>(args) call through the gated tool path. Refuses
- *  anything outside the read-only allowlist (the Phase-1 safety boundary).
- *  Returns the tool's result parsed to a value (JSON when possible, else text).
+ *  anything outside the allowlist. A mutating call routes through the SAME
+ *  wrapToolForHarness gate battery as a discrete call (gate-parity), so a gate
+ *  block surfaces here as a thrown error the program/model can recover from.
+ *  Shares `counter` across the program's calls (loop-guard + batch parity).
  *  Exported for tests. */
-export async function dispatchReadOnlyTool(method: string, args: unknown, sessionId: string): Promise<unknown> {
-  if (!READ_ONLY_TOOLS.has(method)) {
-    throw new Error(`code-mode: tool "${method}" is not available — Phase 1 exposes read-only tools only`);
+export async function dispatchCodeModeTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter): Promise<unknown> {
+  if (!isCodeModeToolAllowed(method)) {
+    const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
+    throw new Error(`code-mode: tool "${method}" is not available — ${why}`);
   }
   const real = (await realToolsByName()).get(method);
   if (!real || typeof real.invoke !== 'function') {
     throw new Error(`code-mode: unknown tool "${method}"`);
   }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
-  const counter = new ToolCallsCounter(1000);
   const callId = `codemode-${randomUUID()}`;
   const runContext = { context: { sessionId } };
   const details = { toolCall: { callId } };
-  const out = await withHarnessRunContext({ sessionId, counter }, () =>
+  const out = await withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000) }, () =>
     wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
   );
   if (typeof out !== 'string') return out ?? null;
   try { return JSON.parse(out); } catch { return out; }
 }
 
-/** Run a code-mode program for a session against the read-only surface. */
+/** Run a code-mode program for a session. ONE counter spans all in-program calls
+ *  so loop-guard + batch gates see the program as a single turn (gate-parity). */
 export async function runCodeModeForSession(program: string, sessionId: string): Promise<CodeModeResult> {
-  return runCodeModeProgram(program, (method, args) => dispatchReadOnlyTool(method, args, sessionId));
+  const counter = new ToolCallsCounter(1000);
+  return runCodeModeProgram(program, (method, args) => dispatchCodeModeTool(method, args, sessionId, counter));
 }
 
-const CODE_MODE_DESCRIPTION = [
-  'Run ONE short JavaScript program (the body of an async function — use `return` for the result) against the `clem` API instead of emitting many separate tool calls.',
-  'Use this for DATA-HEAVY or MULTI-STEP read work — loop/filter/paginate/aggregate over many items and `return` only the distilled result, so the large intermediate tool outputs never enter the conversation.',
-  'The API is `clem.<tool>(args)` returning a Promise; available (read-only, Phase 1): ' + [...READ_ONLY_TOOLS].join(', ') + '.',
-  'Example: `let n=0; const r = await clem.memory_search({query:"acme"}); return { matches: r.length };`',
-  'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Bounded time + tool-call budget.',
-].join(' ');
+function codeModeDescription(): string {
+  const writes = codeModeWritesEnabled();
+  const surface = [...READ_ONLY_TOOLS, ...(writes ? WRITE_TOOLS : [])].join(', ');
+  return [
+    'Run ONE short JavaScript program (the body of an async function — use `return` for the result) against the `clem` API instead of emitting many separate tool calls.',
+    'Use this for DATA-HEAVY or MULTI-STEP work — loop/filter/paginate/aggregate over many items and `return` only the distilled result, so the large intermediate tool outputs never enter the conversation.',
+    'The API is `clem.<tool>(args)` returning a Promise; available: ' + surface + '.',
+    writes
+      ? 'Writes ARE allowed and pass the SAME approval/grounding/destination gates as a normal tool call — a blocked write throws inside your program (catch it or let it surface).'
+      : 'Read-only: no writes/sends from a program.',
+    'Example: `const r = await clem.memory_search({query:"acme"}); return { matches: r.length };`',
+    'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Bounded time + tool-call budget.',
+  ].join(' ');
+}
 
 /** The run_tool_program tool def. Only meaningful when codeModeEnabled(). */
 export function buildCodeModeTool() {
   return tool({
     name: 'run_tool_program',
-    description: CODE_MODE_DESCRIPTION,
+    description: codeModeDescription(),
     parameters: z.object({
       program: z.string().min(1).describe('A JavaScript program body (async). Call `clem.<tool>(args)` and `return` a small distilled value.'),
     }),

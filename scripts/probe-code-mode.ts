@@ -33,4 +33,23 @@ if (r.ok) {
   console.log('  error:     ', r.error);
   if (r.logs.length) console.log('  logs:      ', r.logs.join('').slice(0, 400));
 }
+
+// Phase 2: a REAL gated WRITE through code-mode (only when writes are enabled).
+// write_file to a workspace path is a local write that passes the gates and
+// actually creates the file — proving in-program writes work end-to-end.
+if ((process.env.CLEMMY_CODE_MODE_WRITES || '').toLowerCase() === 'on') {
+  const { existsSync, readFileSync, rmSync } = await import('node:fs');
+  const target = `${process.env.HOME}/.clementine-next/cm-write-probe.txt`;
+  try { rmSync(target, { force: true }); } catch { /* ignore */ }
+  const writeProgram = `
+    const stamp = 'CODE-MODE-WRITE ' + (await clem.workspace_roots({})).slice(0,8);
+    await clem.write_file({ path: ${JSON.stringify(target)}, content: stamp, mode: 'overwrite' });
+    return { wrote: true };
+  `;
+  const w = await runCodeModeForSession(writeProgram, 'probe:code-mode-write');
+  console.log('\n  Code Mode live WRITE probe (gated write_file through the sandbox)\n');
+  console.log('  ok:           ', w.ok, w.ok ? '' : `(${w.error})`);
+  console.log('  file created: ', existsSync(target));
+  if (existsSync(target)) console.log('  contents:     ', JSON.stringify(readFileSync(target, 'utf8').slice(0, 80)));
+}
 console.log('');

@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { READ_ONLY_TOOLS, dispatchReadOnlyTool, buildCodeModeTool } from './code-mode-tool.js';
+import { READ_ONLY_TOOLS, dispatchCodeModeTool, buildCodeModeTool } from './code-mode-tool.js';
 
 test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () => {
   for (const writeTool of ['composio_execute_tool', 'write_file', 'run_shell_command', 'request_approval', 'execution_create', 'memory_remember']) {
@@ -20,12 +20,18 @@ test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () =
   }
 });
 
-test('dispatchReadOnlyTool refuses a non-allowlisted (mutating) tool BEFORE any dispatch', async () => {
-  await assert.rejects(
-    () => dispatchReadOnlyTool('composio_execute_tool', { tool_slug: 'X_SEND', arguments: '{}' }, 'sess'),
-    /not available|read-only/,
-  );
-  await assert.rejects(() => dispatchReadOnlyTool('write_file', { path: '/tmp/x', content: 'y' }, 'sess'), /not available|read-only/);
+test('dispatchCodeModeTool refuses a mutating tool when writes are OFF (default boundary)', async () => {
+  const prev = process.env.CLEMMY_CODE_MODE_WRITES;
+  delete process.env.CLEMMY_CODE_MODE_WRITES; // default = writes off
+  try {
+    await assert.rejects(
+      () => dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'X_SEND', arguments: '{}' }, 'sess'),
+      /not available|writes are disabled/,
+    );
+    await assert.rejects(() => dispatchCodeModeTool('write_file', { path: '/tmp/x', content: 'y' }, 'sess'), /not available|writes are disabled/);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prev;
+  }
 });
 
 test('buildCodeModeTool exposes run_tool_program with a program parameter', () => {
