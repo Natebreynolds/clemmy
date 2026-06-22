@@ -20,6 +20,7 @@
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-gate-benchmark-'));
 process.env.CLEMENTINE_HOME = TMP;
@@ -64,7 +65,7 @@ function blockKindsFor(sessionId: string): string[] {
     .filter((k): k is string => typeof k === 'string' && k !== 'fanout_nudge');
 }
 
-interface Trap {
+export interface Trap {
   id: string;
   kind: string; // expected guardrail_tripped data.kind
   reversibility: 'irreversible' | 'recoverable';
@@ -87,7 +88,7 @@ function invoker(sessionId: string) {
     withHarnessRunContext({ sessionId, counter }, () => (wrapped as { execute: (a: unknown) => Promise<unknown> }).execute(args));
 }
 
-const TRAPS: Trap[] = [
+export const TRAPS: Trap[] = [
   {
     id: 'implicit-destination',
     kind: 'implicit_destination',
@@ -304,7 +305,7 @@ const TRAPS: Trap[] = [
   },
 ];
 
-interface Scored {
+export interface Scored {
   trap: Trap;
   prevented: boolean; // gate ON blocked it
   committed: boolean; // gate OFF let it through
@@ -313,7 +314,7 @@ interface Scored {
   error?: string;
 }
 
-async function scoreTrap(trap: Trap): Promise<Scored> {
+export async function scoreTrap(trap: Trap): Promise<Scored> {
   try {
     const on = await trap.run('on');
     const off = await trap.run('off');
@@ -377,4 +378,11 @@ async function main(): Promise<void> {
   console.log('  ✓ every gate prevented its trap.\n');
 }
 
-await main();
+// Run the gates-ON-vs-OFF table only when invoked directly (tsx scripts/...).
+// When IMPORTED (e.g. by scripts/eval-passk.ts to reuse TRAPS + scoreTrap), the
+// top-level temp-dir/env setup above runs but main() does NOT — the importer
+// drives the pass^k suite instead. The TMP dir + CLEMENTINE_HOME the importer
+// inherits is exactly the isolated env the traps need.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  await main();
+}
