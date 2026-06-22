@@ -199,10 +199,10 @@ test('composioThrownErrorOutput: a THROWN composio error (not-found/auth/APIErro
 const { noteComposioSearchIntent, maybeAutoRememberComposioChoice } = await import('./composio-tools.js');
 const { recallToolChoice } = await import('../memory/tool-choice-store.js');
 
-test('auto-remember: a successful execute after a search memorizes intent→slug', () => {
+test('auto-remember: a successful execute after a search memorizes intent→slug', async () => {
   const intent = 'get google serp organic rankings';
   noteComposioSearchIntent('sess-auto-1', intent);
-  maybeAutoRememberComposioChoice(
+  await maybeAutoRememberComposioChoice(
     'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
     { keyword: 'criminal defense lawyer', location_name: 'Chattanooga' },
     { successful: true, data: { items: [] } },
@@ -215,10 +215,10 @@ test('auto-remember: a successful execute after a search memorizes intent→slug
   assert.ok(!(rec?.choice?.invocationTemplate ?? '').includes('connected_account_id'));
 });
 
-test('auto-remember: a FAILED execute memorizes nothing', () => {
+test('auto-remember: a FAILED execute memorizes nothing', async () => {
   const intent = 'send an outlook email failing';
   noteComposioSearchIntent('sess-auto-2', intent);
-  maybeAutoRememberComposioChoice(
+  await maybeAutoRememberComposioChoice(
     'OUTLOOK_SEND_EMAIL',
     { to: 'x@y.com' },
     { successful: false, error: 'Invalid request data provided' },
@@ -227,20 +227,20 @@ test('auto-remember: a FAILED execute memorizes nothing', () => {
   assert.equal(recallToolChoice(intent), null, 'a failed call must not be memorized');
 });
 
-test('auto-remember: an execute with NO prior search learns nothing (slug was already known/recalled)', () => {
+test('auto-remember: an execute with NO prior search learns nothing (slug was already known/recalled)', async () => {
   const intent = 'intent-with-no-search';
   // No noteComposioSearchIntent for this session.
-  maybeAutoRememberComposioChoice('SOME_KNOWN_SLUG', {}, { successful: true }, 'sess-auto-3');
+  await maybeAutoRememberComposioChoice('SOME_KNOWN_SLUG', {}, { successful: true }, 'sess-auto-3');
   assert.equal(recallToolChoice(intent), null);
 });
 
-test('auto-remember: a search query is single-use (a later unrelated execute is not mis-keyed)', () => {
+test('auto-remember: a search query is single-use (a later unrelated execute is not mis-keyed)', async () => {
   const intent = 'one-shot search intent';
   noteComposioSearchIntent('sess-auto-4', intent);
   // First execute consumes the pending search.
-  maybeAutoRememberComposioChoice('FIRST_SLUG', {}, { successful: true }, 'sess-auto-4');
+  await maybeAutoRememberComposioChoice('FIRST_SLUG', {}, { successful: true }, 'sess-auto-4');
   // Second execute in the same session has no pending search → must not re-key.
-  maybeAutoRememberComposioChoice('SECOND_SLUG', {}, { successful: true }, 'sess-auto-4');
+  await maybeAutoRememberComposioChoice('SECOND_SLUG', {}, { successful: true }, 'sess-auto-4');
   const rec = recallToolChoice(intent);
   assert.equal(rec?.choice?.identifier, 'FIRST_SLUG', 'only the first execute after the search is keyed');
 });
@@ -251,7 +251,7 @@ test('auto-remember is ADDITIVE: it does not overwrite an existing active choice
   // A curated/active choice already exists for this intent.
   rememberToolChoice({ intent, choice: { kind: 'composio', identifier: 'CURATED_SLUG' } });
   noteComposioSearchIntent('sess-additive', intent);
-  maybeAutoRememberComposioChoice('DIFFERENT_SLUG', {}, { successful: true }, 'sess-additive');
+  await maybeAutoRememberComposioChoice('DIFFERENT_SLUG', {}, { successful: true }, 'sess-additive');
   // The active choice is untouched — a "better option" routes through a model proposal, not a silent clobber.
   assert.equal(recallToolChoice(intent)?.choice?.identifier, 'CURATED_SLUG');
 });
@@ -263,24 +263,43 @@ test('auto-remember RE-LEARNS after a choice was invalidated (choice cleared →
   invalidateToolChoice(intent, 'failed', { automatic: true });
   assert.equal(peekToolChoice(intent)?.choice, null, 'precondition: choice invalidated');
   noteComposioSearchIntent('sess-relearn', intent);
-  maybeAutoRememberComposioChoice('NEW_WORKING_SLUG', {}, { successful: true }, 'sess-relearn');
+  await maybeAutoRememberComposioChoice('NEW_WORKING_SLUG', {}, { successful: true }, 'sess-relearn');
   assert.equal(peekToolChoice(intent)?.choice?.identifier, 'NEW_WORKING_SLUG', 'auto-commit re-fills an invalidated intent');
 });
 
-test('auto-remember (v0.5.64 membership gate): a slug the search did NOT surface is NOT cached', () => {
+test('auto-remember (v0.5.64 membership gate): a slug the search did NOT surface is NOT cached', async () => {
   const intent = 'outlook send email message';
   // Search surfaced only draft/list/forward tools — never a real send slug.
   noteComposioSearchIntent('sess-gate-1', intent, ['OUTLOOK_CREATE_DRAFT', 'OUTLOOK_FORWARD_MESSAGE', 'OUTLOOK_LIST_MESSAGES']);
   // The model executed an UNRELATED slug (a stale cache / cross-intent call).
-  maybeAutoRememberComposioChoice('AIRTABLE_LIST_RECORDS', {}, { successful: true }, 'sess-gate-1');
+  await maybeAutoRememberComposioChoice('AIRTABLE_LIST_RECORDS', {}, { successful: true }, 'sess-gate-1');
   assert.equal(recallToolChoice(intent), null, 'a slug not in the search candidates must not poison the intent');
 });
 
-test('auto-remember (v0.5.64 membership gate): a slug the search DID surface is cached normally', () => {
+test('auto-remember (v0.5.64 membership gate): a slug the search DID surface is cached normally', async () => {
   const intent = 'get dataforseo ranked keywords for site';
   noteComposioSearchIntent('sess-gate-2', intent, ['DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', 'DATAFORSEO_SERP']);
-  maybeAutoRememberComposioChoice('DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', {}, { successful: true }, 'sess-gate-2');
+  await maybeAutoRememberComposioChoice('DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', {}, { successful: true }, 'sess-gate-2');
   assert.equal(recallToolChoice(intent)?.choice?.identifier, 'DATAFORSEO_LABS_GOOGLE_RANKED_KEYWORDS', 'a surfaced slug is learned');
+});
+
+// ── Cross-service mis-binding guard (2026-06-22) — the pure decision ──────────
+// The fan-out "DataForSEO hard-errored" failures traced to a polluted store: a
+// "DataForSEO ranked keywords" query bound to AIRTABLE_LIST_RECORDS via the
+// no-candidate fallback. This guard refuses such cross-service binds.
+test('isCrossServiceToolkitMismatch: refuses a DataForSEO query bound to an Airtable slug', async () => {
+  const { isCrossServiceToolkitMismatch } = await import('./composio-tools.js');
+  const known = ['airtable', 'dataforseo', 'salesforce', 'outlook'];
+  // The exact observed pollution: query about dataforseo, slug from airtable.
+  assert.equal(isCrossServiceToolkitMismatch('dataforseo ranked keywords domain organic traffic live', 'AIRTABLE_LIST_RECORDS', known), true);
+  // Consistent: query names the slug's own toolkit.
+  assert.equal(isCrossServiceToolkitMismatch('dataforseo ranked keywords for site', 'DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE', known), false);
+  // Query names NO known toolkit (describes the task) → learning unchanged.
+  assert.equal(isCrossServiceToolkitMismatch('send an email to the client', 'OUTLOOK_SEND_EMAIL', known), false);
+  // Multi-toolkit query that names the slug's own toolkit too → allowed.
+  assert.equal(isCrossServiceToolkitMismatch('pull from dataforseo then save to airtable', 'AIRTABLE_LIST_RECORDS', known), false);
+  // No known toolkits supplied (e.g. test/offline) → never blocks.
+  assert.equal(isCrossServiceToolkitMismatch('dataforseo ranked keywords', 'AIRTABLE_LIST_RECORDS', []), false);
 });
 
 test('fan-out advisory fires ONCE on the 3rd distinct-item call of the same slug', async () => {

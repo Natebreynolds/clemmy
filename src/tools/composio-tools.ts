@@ -332,14 +332,36 @@ export function noteComposioSearchIntent(sessionId: string | undefined, query: s
   });
 }
 
+/** Cross-service mis-binding guard. A (possibly stale/loose) search query about
+ *  toolkit X must never be bound to a slug from a DIFFERENT toolkit Y. Observed
+ *  2026-06-22: a "DataForSEO ranked keywords" search whose auto-remember window
+ *  caught an AIRTABLE_LIST_RECORDS execute bound the DataForSEO intent to the
+ *  Airtable slug — workers then honored it and "hard-errored." Returns true (=
+ *  refuse the bind) when the slug's OWN toolkit is not named in the query AND a
+ *  different KNOWN toolkit IS named (an explicit contradiction). A query that
+ *  names the slug's own toolkit — including a multi-toolkit query — is allowed;
+ *  a query that names NO known toolkit falls through (learning unchanged).
+ *  knownToolkits are runtime-discovered (connected accounts), never hardcoded.
+ *  Exported for tests. */
+export function isCrossServiceToolkitMismatch(query: string, slug: string, knownToolkits: string[]): boolean {
+  const slugToolkit = (slug.split('_')[0] ?? '').toLowerCase();
+  if (!slugToolkit) return false;
+  const q = query.toLowerCase();
+  if (q.includes(slugToolkit)) return false; // names its own toolkit → consistent
+  return knownToolkits.some((t) => {
+    const tk = (t ?? '').toLowerCase();
+    return tk.length > 0 && tk !== slugToolkit && q.includes(tk);
+  });
+}
+
 /** On a SUCCESSFUL execute that followed a fresh discovery, memorize the choice.
  *  Exported for tests. */
-export function maybeAutoRememberComposioChoice(
+export async function maybeAutoRememberComposioChoice(
   toolSlug: string,
   args: Record<string, unknown>,
   result: unknown,
   sessionId: string | undefined,
-): void {
+): Promise<void> {
   try {
     const failed = detectComposioFailure(result).failed;
     // Thread 2 — close the outcome loop: credit (success) or blame (failure)
@@ -363,6 +385,17 @@ export function maybeAutoRememberComposioChoice(
     // search recorded candidates (legacy/no-candidate path falls back to prior
     // behavior so existing learning still works).
     if (pending.slugs && pending.slugs.length > 0 && !pending.slugs.includes(toolSlug)) return;
+    // (A2) Cross-service guard — closes the no-candidate fallback hole: even when
+    // the search recorded no candidates, never bind a query about toolkit X to a
+    // slug from toolkit Y (the 2026-06-22 "DataForSEO intent → AIRTABLE_LIST_RECORDS"
+    // pollution). Runtime-discovered toolkits; fail-open so a lookup error never
+    // blocks legitimate learning.
+    try {
+      const known = (await listConnectedToolkits()).map((t) => t.slug).filter((s): s is string => Boolean(s));
+      if (isCrossServiceToolkitMismatch(pending.query, toolSlug, known)) return;
+    } catch {
+      // fail-open: a guard error must never break learning
+    }
     const intent = pending.query.trim();
     if (!intent) return;
     // Additive only (north star: "propose before update"). Never silently
