@@ -479,7 +479,17 @@ export function expandParallelHallucination(toolCalls: CodexFunctionCall[]): Cod
   return expanded;
 }
 
-function functionCallInput(toolCall: CodexFunctionCall): CodexInputMessage {
+/** A genuine Codex-issued function_call item id begins with 'fc'. History
+ *  replayed from another provider (GLM/Claude) or a harness-synthesized id (a
+ *  timestamp/uuid, or a parallel-expansion `<base>_p<n>`) is NOT a valid Codex
+ *  item id, and Codex /responses 400s on it ("Invalid input[n].id: Expected an
+ *  ID that begins with 'fc'"). The `id` is OPTIONAL on input — call_id does the
+ *  function_call↔output correlation — so we include it ONLY when it is real. */
+export function isCodexFunctionCallItemId(id: string | undefined): boolean {
+  return typeof id === 'string' && id.startsWith('fc') && !/_p\d+$/.test(id);
+}
+
+export function functionCallInput(toolCall: CodexFunctionCall): CodexInputMessage {
   const callId = toolCall.call_id ?? toolCall.id ?? randomUUID();
   const item: CodexInputMessage = {
     type: 'function_call',
@@ -488,7 +498,9 @@ function functionCallInput(toolCall: CodexFunctionCall): CodexInputMessage {
     arguments: toolCall.arguments ?? '{}',
     status: 'completed',
   };
-  if (toolCall.id) {
+  // Only forward a genuine Codex item id; a non-fc id (cross-provider history,
+  // synthetic) makes Codex reject the whole request with a 400.
+  if (isCodexFunctionCallItemId(toolCall.id)) {
     item.id = toolCall.id;
   }
   return item;
