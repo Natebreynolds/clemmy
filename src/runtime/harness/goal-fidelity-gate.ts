@@ -62,6 +62,22 @@ export function isGoalFidelityGateEnabled(): boolean {
   return raw !== 'off' && raw !== 'false' && raw !== '0';
 }
 
+/** CLEMMY_GOAL_ALIGNMENT_GATE (default on). Widens the goal-fidelity gate to also
+ *  judge GOAL ALIGNMENT on an irreversible write when a GOAL is recovered but NO
+ *  skill is loaded — the ad-hoc-send gap (2026-06-22 sess-mqplaw0l: a YOLO send
+ *  fired with ZERO goal-alignment judging because the skill-less branch
+ *  short-circuited to allow; only mechanical guards + the autonomy_note ran).
+ *  YOLO still auto-approves; this just makes a cheap cross-family judge vet that
+ *  the irreversible action serves the goal first (aligned → silent proceed,
+ *  misaligned → bounce before the write). OFF = byte-identical legacy skip
+ *  (skills.length===0 → allow). DELETE-WHEN-VALIDATED: fold the widening in
+ *  unconditionally once a few live YOLO re-fires show aligned sends proceed +
+ *  misaligned bounce with no false-positive on legit skill-less sends. */
+export function isGoalAlignmentGateEnabled(): boolean {
+  const raw = (getRuntimeEnv('CLEMMY_GOAL_ALIGNMENT_GATE', 'on') ?? 'on').toLowerCase();
+  return raw !== 'off' && raw !== 'false' && raw !== '0';
+}
+
 /** Draft-only-skill INFORM behavior (2026-06-17). When a send is blocked because
  *  the loaded skill is draft-only / present-for-approval (a SCOPE statement, not a
  *  prohibition), tell the model to PRESENT the drafts and ASK "good to send?"
@@ -286,6 +302,9 @@ export function buildGoalFidelityPrompt(input: GoalFidelityJudgeInput): string {
     '- the goal says do ONLY X and this action also does Y;',
     '- the skill requires a produced/rendered artifact and this action ships raw or unprocessed data.',
     'Vague dissatisfaction, style, "could be better", or anything you cannot put a name to → fulfills=true (FAIL OPEN). When in doubt, fulfills=true. A pure-advice/persona skill with no concrete per-item requirement has nothing to enforce → fulfills=true.',
+    ...(input.skills.length === 0
+      ? ['', 'NO SKILL IS LOADED for this run — judge ONLY goal-alignment: mark fulfills=false ONLY for a concrete, NAMEABLE mismatch — (a) the action targets a recipient/record the GOAL never names, (b) the goal asked for X and this does an unrelated/contradictory Y, or (c) the content is plainly off-topic from the stated goal. Anything vague/stylistic/uncertain, or an action that plausibly serves the goal → fulfills=true (FAIL OPEN).']
+      : []),
     '',
     'SCOPE vs PROHIBITION: a skill that says "this skill does not send", "present for approval", or "never claim the email was sent" is describing its OWN SCOPE (it drafts; it does not itself send). That is NOT a prohibition on the user sending the approved draft. If the ONLY gap is that this present-for-approval step has not happened yet, set fulfills=false AND blockKind="present_for_approval" — the recovery is to present the draft to the user and ask "good to send?", NOT to rebuild the payload. Reserve blockKind="other" for a genuine violation (wrong target, off-goal, un-rendered artifact, per-item research skipped).',
     '',
@@ -408,12 +427,19 @@ export async function evaluateGoalFidelity(
     }
   }
 
-  // 3a-iii. Nothing to check: with no goal AND no enforceable skill there is
-  // nothing to verify against → allow, skip the judge (the §3 latency floor:
-  // never add an unconditional second judge call).
+  // 3a-iii. Nothing to verify WITHOUT a goal → allow (the gate never invents a
+  // goal). With a goal but NO skill, the CLEMMY_GOAL_ALIGNMENT_GATE widening
+  // (default on) proceeds to the judge for a pure GOAL-ALIGNMENT verdict — this
+  // closes the ad-hoc-irreversible-send gap (a YOLO send that loaded no skill
+  // previously fired with zero goal-alignment judging). Flag off → legacy
+  // skill-less skip (byte-identical). Still irreversible-only + a single cheap
+  // cross-family fail-open call, so the §3 latency floor holds.
   const goal = gatherGoalText(sessionId);
-  if (!goal || skills.length === 0) {
-    return { action: 'allow', mode: 'allow', reason: 'no goal + skill to verify against — gate stays out of the way', targets };
+  if (!goal) {
+    return { action: 'allow', mode: 'allow', reason: 'no goal to verify against — gate stays out of the way', targets };
+  }
+  if (skills.length === 0 && !isGoalAlignmentGateEnabled()) {
+    return { action: 'allow', mode: 'allow', reason: 'no skill to verify against (alignment gate off) — gate stays out of the way', targets };
   }
 
   // 3a-ii. Batch-uniformity evidence (the emails class). Computed from the

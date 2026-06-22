@@ -1126,6 +1126,25 @@ export function wrapToolForHarness<T extends WrappableTool>(
               failureCount: verdict.failureCount ?? 1,
               blockKind: verdict.blockKind,
             });
+          } else if (verdict.mode === 'judge') {
+            // Aligned-proceed via the judge — otherwise silent. Emit a trace so a
+            // YOLO silent-proceed is provably judge-vetted (the goal-alignment
+            // fix: an irreversible write with a goal but no skill is now judged).
+            // `reason` distinguishes a real pass from a fail-open. Telemetry only.
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'goal_alignment_judged',
+                data: {
+                  toolName: tool.name,
+                  fulfills: true,
+                  targets: verdict.targets.slice(0, 5),
+                  reason: verdict.reason,
+                },
+              });
+            } catch { /* telemetry write must never block */ }
           }
         }
       }

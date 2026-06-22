@@ -162,6 +162,11 @@ export const EVENT_TYPES = [
   // surface and an A/B can attribute token/accuracy deltas. Sibling of
   // mcp_tool_scope; only emitted when a reduction occurred.
   'tool_jit_scope',
+  // The goal-alignment judge ran on an irreversible write and PASSED
+  // (fulfills=true) — the aligned-proceed case is otherwise silent, so this
+  // proves the judge fired BEFORE a YOLO silent-proceed (the 2026-06-22
+  // CLEMMY_GOAL_ALIGNMENT_GATE fix). Pure telemetry; never alters behavior.
+  'goal_alignment_judged',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

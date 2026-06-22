@@ -24,6 +24,7 @@ import assert from 'node:assert/strict';
 const { resetEventLog, createSession, appendEvent, writeToolOutput } = await import('./eventlog.js');
 const {
   isGoalFidelityGateEnabled,
+  isGoalAlignmentGateEnabled,
   gatherGoalText,
   extractMessageBody,
   personalizationRegion,
@@ -297,20 +298,23 @@ test('evaluateGoalFidelity: payload contradicts a goal scope constraint → bloc
 
 // ─── §7.4 fail-open paths ──────────────────────────────────────────────────
 
-test('evaluateGoalFidelity: no skill loaded → allow, judge never called', async () => {
+test('evaluateGoalFidelity: no skill but a GOAL → now JUDGED (2026-06-22 alignment widening; legacy silent-skip is flag-off, see T4)', async () => {
   resetEventLog();
   _resetGoalFidelityStateForTests();
+  const prev = process.env.CLEMMY_GOAL_ALIGNMENT_GATE;
+  delete process.env.CLEMMY_GOAL_ALIGNMENT_GATE; // default on
   const sess = createSession({ kind: 'chat' });
   seedGoal(sess.id, 'Email this firm a note.');
   let judged = false;
-  _setGoalFidelityJudgeForTests(async () => { judged = true; return { fulfills: false, gap: 'x' }; });
+  _setGoalFidelityJudgeForTests(async () => { judged = true; return { fulfills: true, gap: 'aligns', blockKind: 'other' }; });
   try {
     const r = await evaluateGoalFidelity(sess.id, 'composio_execute_tool', sendArgs(SEND, 'a@firm.com', GENERIC_OPENING));
     assert.equal(r.action, 'allow');
-    assert.equal(r.mode, 'allow');
-    assert.equal(judged, false, 'no skill → nothing to enforce → no judge call');
+    assert.equal(r.mode, 'judge', 'a goal with no skill now routes to the goal-alignment judge (was a silent skip before)');
+    assert.equal(judged, true, 'the widening: the judge RAN where it used to short-circuit');
   } finally {
     _setGoalFidelityJudgeForTests(null);
+    if (prev === undefined) delete process.env.CLEMMY_GOAL_ALIGNMENT_GATE; else process.env.CLEMMY_GOAL_ALIGNMENT_GATE = prev;
   }
 });
 
@@ -433,4 +437,127 @@ test('isGoalFidelityGateEnabled: default on; CLEMMY_GOAL_FIDELITY_GATE=off disab
     if (prev === undefined) delete process.env.CLEMMY_GOAL_FIDELITY_GATE;
     else process.env.CLEMMY_GOAL_FIDELITY_GATE = prev;
   }
+});
+
+// ── Goal-ALIGNMENT widening (2026-06-22): judge ad-hoc skill-less irreversible
+// writes against the GOAL so a YOLO send is goal-vetted before it fires. The gap
+// was the skill-conditioning short-circuit (skills.length===0 → allow, no judge).
+const ALIGN = 'CLEMMY_GOAL_ALIGNMENT_GATE';
+function withAlign<T>(value: string | undefined, fn: () => Promise<T> | T): Promise<T> | T {
+  const prev = process.env[ALIGN];
+  if (value === undefined) delete process.env[ALIGN]; else process.env[ALIGN] = value;
+  const restore = () => { if (prev === undefined) delete process.env[ALIGN]; else process.env[ALIGN] = prev; };
+  try { const r = fn(); return r instanceof Promise ? r.finally(restore) : (restore(), r); }
+  catch (e) { restore(); throw e; }
+}
+
+test('goal-alignment flag: default on, kill-switchable', () => {
+  withAlign(undefined, () => assert.equal(isGoalAlignmentGateEnabled(), true, 'default on'));
+  withAlign('off', () => assert.equal(isGoalAlignmentGateEnabled(), false));
+  withAlign('0', () => assert.equal(isGoalAlignmentGateEnabled(), false));
+});
+
+test('T1 skill-less ALIGNED: a recovered goal with NO skill PASSES via the judge (the keystone gap)', async () => {
+  await withAlign('on', async () => {
+    _resetGoalFidelityStateForTests();
+    const sess = createSession({ kind: 'chat' });
+    seedGoal(sess.id, 'Email a short organic-search summary for Rubenstein Law to nathan@breakthroughcoaching.ai.');
+    let called = 0;
+    _setGoalFidelityJudgeForTests(async () => { called++; return { fulfills: true, gap: 'aligns with the goal', blockKind: 'other' }; });
+    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'nathan@breakthroughcoaching.ai', 'Summary: organic traffic up 25% QoQ; recommend X.'));
+    _setGoalFidelityJudgeForTests(null);
+    assert.equal(r.action, 'allow');
+    assert.equal(r.mode, 'judge', 'the judge RAN (not the old skill-less short-circuit)');
+    assert.equal(called, 1, 'judge invoked exactly once');
+  });
+});
+
+test('T2 skill-less MISALIGNED: an off-goal recipient BOUNCES before the write', async () => {
+  await withAlign('on', async () => {
+    _resetGoalFidelityStateForTests();
+    const sess = createSession({ kind: 'chat' });
+    seedGoal(sess.id, 'Email a summary to nathan@breakthroughcoaching.ai.');
+    _setGoalFidelityJudgeForTests(async () => ({ fulfills: false, gap: 'recipient boss@rival.com is not named in the goal', blockKind: 'other' }));
+    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'boss@rival.com', 'leaking the summary off-goal'));
+    _setGoalFidelityJudgeForTests(null);
+    assert.equal(r.action, 'block');
+    assert.equal(r.failureCount, 1);
+    assert.match(r.gap ?? '', /not named in the goal/);
+  });
+});
+
+test('T3 NO goal → allow, judge NEVER called (gate never invents a goal)', async () => {
+  await withAlign('on', async () => {
+    _resetGoalFidelityStateForTests();
+    const sess = createSession({ kind: 'chat' });
+    let called = 0;
+    _setGoalFidelityJudgeForTests(async () => { called++; return { fulfills: false, gap: 'x', blockKind: 'other' }; });
+    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'a@b.com', 'hi'));
+    _setGoalFidelityJudgeForTests(null);
+    assert.equal(r.action, 'allow');
+    assert.equal(r.mode, 'allow', 'short-circuit, not the judge');
+    assert.equal(called, 0, 'no goal → never invoke the judge');
+  });
+});
+
+test('T4 FLAG OFF: a skill-less send skips the judge (byte-identical legacy)', async () => {
+  await withAlign('off', async () => {
+    _resetGoalFidelityStateForTests();
+    const sess = createSession({ kind: 'chat' });
+    seedGoal(sess.id, 'Email a summary to nathan@breakthroughcoaching.ai.');
+    let called = 0;
+    _setGoalFidelityJudgeForTests(async () => { called++; return { fulfills: false, gap: 'x', blockKind: 'other' }; });
+    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'a@b.com', 'hi'));
+    _setGoalFidelityJudgeForTests(null);
+    assert.equal(r.action, 'allow');
+    assert.equal(r.mode, 'allow');
+    assert.equal(called, 0, 'flag off → skill-less short-circuit, judge never called');
+  });
+});
+
+test('T5 FAIL-OPEN: a skill-less judge error allows (never hard-stall)', async () => {
+  await withAlign('on', async () => {
+    _resetGoalFidelityStateForTests();
+    const sess = createSession({ kind: 'chat' });
+    seedGoal(sess.id, 'Email a summary to nathan@breakthroughcoaching.ai.');
+    _setGoalFidelityJudgeForTests(async () => { throw new Error('judge infra down'); });
+    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'a@b.com', 'hi'));
+    _setGoalFidelityJudgeForTests(null);
+    assert.equal(r.action, 'allow', 'fail-open, not a hard stall');
+  });
+});
+
+test('T6 UNCHANGED with a skill loaded: a misaligned per-firm send still BLOCKS', async () => {
+  await withAlign('on', async () => {
+    _resetGoalFidelityStateForTests();
+    const sess = createSession({ kind: 'chat' });
+    seedGoal(sess.id, 'Email each firm a personalized note referencing our per-firm SEO research.');
+    seedSkill(sess.id, 'scorpion-outbound', '## Per-firm research (REQUIRED)\nResearch each firm before writing; never reuse a generic opening across firms.');
+    _setGoalFidelityJudgeForTests(async () => ({ fulfills: false, gap: 'generic opening reused across distinct firms', blockKind: 'other' }));
+    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'a@firm.com', GENERIC_OPENING));
+    _setGoalFidelityJudgeForTests(null);
+    assert.equal(r.action, 'block', 'skill-loaded behavior is unchanged by the widening');
+  });
+});
+
+test('T7 ESCALATION: repeated skill-less misaligned blocks increment failureCount', async () => {
+  await withAlign('on', async () => {
+    _resetGoalFidelityStateForTests();
+    const sess = createSession({ kind: 'chat' });
+    seedGoal(sess.id, 'Email a summary to nathan@breakthroughcoaching.ai.');
+    _setGoalFidelityJudgeForTests(async () => ({ fulfills: false, gap: 'off-goal recipient', blockKind: 'other' }));
+    const r1 = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'boss@rival.com', 'x'));
+    const r2 = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'boss@rival.com', 'x'));
+    _setGoalFidelityJudgeForTests(null);
+    assert.equal(r1.action, 'block');
+    assert.equal(r2.action, 'block');
+    assert.ok((r2.failureCount ?? 0) >= 2, 'second consecutive block escalates');
+  });
+});
+
+test('T8 prompt: skill-less includes (no skill loaded) + the goal-alignment rubric + FAIL OPEN', () => {
+  const p = buildGoalFidelityPrompt({ goal: 'Email a summary to nathan@breakthroughcoaching.ai', skills: [], payload: 'send to nathan@breakthroughcoaching.ai', evidence: '(none)' });
+  assert.match(p, /\(no skill loaded\)/);
+  assert.match(p, /judge ONLY goal-alignment/);
+  assert.match(p, /FAIL OPEN/);
 });
