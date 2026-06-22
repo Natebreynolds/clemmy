@@ -1171,6 +1171,14 @@ function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResu
         error: err,
         surface: 'both',
       });
+      // Auto-promote the failed run into the eval corpus (Lane A Phase 4b) —
+      // fire-and-forget, best-effort, gated on failure so clean runs pay nothing.
+      // Dynamic import keeps the eval layer off loop.ts's module graph.
+      if ((process.env.CLEMMY_EVAL_AUTO_PROMOTE ?? 'on').toLowerCase() !== 'off') {
+        void import('../eval/eval-corpus-promote.js')
+          .then((m) => { try { m.snapshotFailureTrajectory(sessionId); } catch { /* best-effort */ } })
+          .catch(() => { /* best-effort */ });
+      }
     } else {
       actionBus.emit({ kind: 'runtime.completed', sessionId });
     }
