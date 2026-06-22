@@ -135,6 +135,11 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   'browser_harness_status', 'browser_harness_run',
   // conversation primitives (also added structurally outside JIT — belt-and-suspenders).
   'ask_user_question', 'request_approval', 'run_worker',
+  // CODE MODE — when present (CLEMMY_CODE_MODE=on), the programmatic-tool-calling
+  // entry must stay reachable every turn; its value is data-heavy/multi-tool work
+  // the message text won't always semantically match. No-op when off (JIT only
+  // keeps tools that are in the surface).
+  'run_tool_program',
 ]);
 
 /**

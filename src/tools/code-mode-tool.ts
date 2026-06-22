@@ -17,6 +17,7 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { appendEvent } from '../runtime/harness/eventlog.js';
 import { runCodeModeProgram, type CodeModeResult } from './code-mode-sandbox.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
 // import would form a registry ↔ code-mode-tool cycle (registry exposes
@@ -105,11 +106,21 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
   const callId = `codemode-${randomUUID()}`;
   const runContext = { context: { sessionId } };
   const details = { toolCall: { callId } };
-  const out = await withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000) }, () =>
-    wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
-  );
-  if (typeof out !== 'string') return out ?? null;
-  try { return JSON.parse(out); } catch { return out; }
+  // Observability: emit tool_called/tool_returned for each in-program call so the
+  // trace drawer / Tasks board shows what a code-mode program did (parity with
+  // discrete calls; `codeMode:true` tags them for adoption measurement).
+  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, codeMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
+  try {
+    const out = await withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000) }, () =>
+      wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
+    );
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, codeMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    if (typeof out !== 'string') return out ?? null;
+    try { return JSON.parse(out); } catch { return out; }
+  } catch (err) {
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, codeMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
+    throw err;
+  }
 }
 
 /** Run a code-mode program for a session. ONE counter spans all in-program calls
@@ -119,7 +130,7 @@ export async function runCodeModeForSession(program: string, sessionId: string):
   return runCodeModeProgram(program, (method, args) => dispatchCodeModeTool(method, args, sessionId, counter));
 }
 
-function codeModeDescription(): string {
+export function codeModeDescription(): string {
   const writes = codeModeWritesEnabled();
   const surface = [...READ_ONLY_TOOLS, ...(writes ? WRITE_TOOLS : [])].join(', ');
   return [

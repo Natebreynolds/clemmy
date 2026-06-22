@@ -27,6 +27,7 @@ import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
 import { registerRecallTools } from './recall-tools.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
+import { codeModeEnabled, codeModeDescription, runCodeModeForSession } from './code-mode-tool.js';
 import { ensureToolDirectories, textResult } from './shared.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
@@ -130,6 +131,27 @@ registerDynamicTools(server);
 // tools (shell/composio/write) through the full harness gate chain so the Claude
 // Agent SDK can execute them safely. No-op for the Codex/OpenAI MCP wiring.
 registerGatedMutatingTools(server);
+
+// Code Mode (Lane C) — expose run_tool_program on the Claude SDK lane too, so
+// BOTH brains can run a sandboxed program. Flag-gated (CLEMMY_CODE_MODE); the
+// in-program clem calls dispatch through the same gated path under this MCP
+// session. No-op when off.
+if (codeModeEnabled()) {
+  const codeModeSessionId = process.env.CLEMENTINE_MCP_SESSION_ID?.trim() || '';
+  server.tool(
+    'run_tool_program',
+    codeModeDescription(),
+    { program: z.string() },
+    async (input: { program: string }) => {
+      const r = await runCodeModeForSession(input.program, codeModeSessionId);
+      return textResult(
+        r.ok
+          ? `code-mode program returned (${r.rpcCalls} tool call${r.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(r.value)}`
+          : `code-mode program failed: ${r.error}`,
+      );
+    },
+  );
+}
 
 server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
 

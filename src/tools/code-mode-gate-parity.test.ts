@@ -81,6 +81,20 @@ test('GATE-PARITY: a wrong/implicit-destination publish inside a program hard-bl
   _setCodeModeToolsForTests(null);
 });
 
+test('TELEMETRY: each in-program call emits codeMode-tagged tool_called/tool_returned (trace visibility)', async () => {
+  setBaselineEnv(); // gates off + writes on → the send executes cleanly
+  resetEventLog();
+  injectFakes();
+  const sess = createSession({ kind: 'chat' });
+  await dispatchCodeModeTool('composio_execute_tool', send('a@b.com'), sess.id);
+  const called = listEvents(sess.id, { types: ['tool_called'] }).filter((e) => (e.data as { codeMode?: boolean }).codeMode);
+  const returned = listEvents(sess.id, { types: ['tool_returned'] }).filter((e) => (e.data as { codeMode?: boolean }).codeMode);
+  assert.ok(called.length >= 1, 'an in-program clem call emits a codeMode-tagged tool_called');
+  assert.ok(returned.length >= 1, 'and a codeMode-tagged tool_returned');
+  assert.equal((returned[0].data as { tool?: string }).tool, 'composio_execute_tool');
+  _setCodeModeToolsForTests(null);
+});
+
 test('SAFETY: with writes OFF, a program cannot reach a mutating tool at all (refused pre-gate)', async () => {
   setBaselineEnv();
   process.env.CLEMMY_CODE_MODE_WRITES = 'off';
