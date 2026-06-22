@@ -39,6 +39,7 @@
     "test": "tsx --test 'src/**/*.test.ts'",
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
     "eval:passk": "tsx scripts/eval-passk.ts",
+    "eval:spans": "tsx scripts/eval-spans.ts",
     "probe:judge": "tsx scripts/probe-boundary-judge.ts",
     "probe:judge:live": "tsx scripts/probe-judge-live.ts",
     "stress:memory": "tsx scripts/memory-roundtrip-stress.ts",
