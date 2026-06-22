@@ -472,17 +472,17 @@ test('T1 skill-less ALIGNED: a recovered goal with NO skill PASSES via the judge
   });
 });
 
-test('T2 skill-less MISALIGNED: an off-goal recipient BOUNCES before the write', async () => {
+test('T2 skill-less MISALIGNED: ADVISORY — informs, does NOT hard-block the send (north-star: inform, rarely block)', async () => {
   await withAlign('on', async () => {
     _resetGoalFidelityStateForTests();
     const sess = createSession({ kind: 'chat' });
     seedGoal(sess.id, 'Email a summary to nathan@breakthroughcoaching.ai.');
-    _setGoalFidelityJudgeForTests(async () => ({ fulfills: false, gap: 'recipient boss@rival.com is not named in the goal', blockKind: 'other' }));
-    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'boss@rival.com', 'leaking the summary off-goal'));
+    _setGoalFidelityJudgeForTests(async () => ({ fulfills: false, gap: 'recipient boss@rival.com contradicts the goal', blockKind: 'other' }));
+    const r = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'boss@rival.com', 'off-goal'));
     _setGoalFidelityJudgeForTests(null);
-    assert.equal(r.action, 'block');
-    assert.equal(r.failureCount, 1);
-    assert.match(r.gap ?? '', /not named in the goal/);
+    assert.equal(r.action, 'allow', 'a skill-less goal-alignment miss does NOT hard-block — it informs (advisory)');
+    assert.equal(r.mode, 'advisory');
+    assert.match(r.gap ?? '', /contradicts the goal/, 'the gap is recorded for the review surface');
   });
 });
 
@@ -540,7 +540,7 @@ test('T6 UNCHANGED with a skill loaded: a misaligned per-firm send still BLOCKS'
   });
 });
 
-test('T7 ESCALATION: repeated skill-less misaligned blocks increment failureCount', async () => {
+test('T7 skill-less ADVISORY never escalates: repeated misses stay advisory (never blocks, no failureCount)', async () => {
   await withAlign('on', async () => {
     _resetGoalFidelityStateForTests();
     const sess = createSession({ kind: 'chat' });
@@ -549,9 +549,9 @@ test('T7 ESCALATION: repeated skill-less misaligned blocks increment failureCoun
     const r1 = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'boss@rival.com', 'x'));
     const r2 = await evaluateGoalFidelity(sess.id, SEND, sendArgs(SEND, 'boss@rival.com', 'x'));
     _setGoalFidelityJudgeForTests(null);
-    assert.equal(r1.action, 'block');
-    assert.equal(r2.action, 'block');
-    assert.ok((r2.failureCount ?? 0) >= 2, 'second consecutive block escalates');
+    assert.equal(r1.mode, 'advisory');
+    assert.equal(r2.mode, 'advisory');
+    assert.equal(r2.action, 'allow', 'advisory informs every time — it never escalates to a hard block');
   });
 });
 

@@ -303,7 +303,7 @@ export function buildGoalFidelityPrompt(input: GoalFidelityJudgeInput): string {
     '- the skill requires a produced/rendered artifact and this action ships raw or unprocessed data.',
     'Vague dissatisfaction, style, "could be better", or anything you cannot put a name to → fulfills=true (FAIL OPEN). When in doubt, fulfills=true. A pure-advice/persona skill with no concrete per-item requirement has nothing to enforce → fulfills=true.',
     ...(input.skills.length === 0
-      ? ['', 'NO SKILL IS LOADED for this run — judge ONLY goal-alignment: mark fulfills=false ONLY for a concrete, NAMEABLE mismatch — (a) the action targets a recipient/record the GOAL never names, (b) the goal asked for X and this does an unrelated/contradictory Y, or (c) the content is plainly off-topic from the stated goal. Anything vague/stylistic/uncertain, or an action that plausibly serves the goal → fulfills=true (FAIL OPEN).']
+      ? ['', 'NO SKILL IS LOADED for this run — judge ONLY goal-alignment, and FAIL OPEN AGGRESSIVELY. The bar to bounce is a CONTRADICTION you can name, NOT mere under-specification. Mark fulfills=false ONLY when: (a) the goal named a SPECIFIC recipient/destination and this action targets a DIFFERENT one, OR the goal said do-not-contact X and this contacts X; (b) the goal asked for X and this action does an unrelated or contradictory Y; or (c) the content is plainly off-topic from the stated goal. CRITICAL — an UNDERSPECIFIED goal that does not spell out a recipient ("reply to them", "send it", "follow up", "email a summary", "let them know") is NOT a mismatch: the agent resolving a sensible recipient/content PLAUSIBLY serves the goal → fulfills=true. If the goal is vague or generic, or you are at all uncertain whether the action serves it → fulfills=true (FAIL OPEN). Only a clear, nameable contradiction blocks; everything else proceeds.']
       : []),
     '',
     'SCOPE vs PROHIBITION: a skill that says "this skill does not send", "present for approval", or "never claim the email was sent" is describing its OWN SCOPE (it drafts; it does not itself send). That is NOT a prohibition on the user sending the approved draft. If the ONLY gap is that this present-for-approval step has not happened yet, set fulfills=false AND blockKind="present_for_approval" — the recovery is to present the draft to the user and ask "good to send?", NOT to rebuild the payload. Reserve blockKind="other" for a genuine violation (wrong target, off-goal, un-rendered artifact, per-item research skipped).',
@@ -378,8 +378,10 @@ export function _resetGoalFidelityStateForTests(): void { failureCounts.clear();
 export interface GoalFidelityGateResult {
   action: 'allow' | 'block';
   reason: string;
-  /** How the verdict was reached (telemetry / tests). */
-  mode: 'renderer' | 'judge' | 'allow';
+  /** How the verdict was reached (telemetry / tests). 'advisory' = the skill-less
+   *  goal-alignment widening found a miss but INFORMS rather than blocks (the send
+   *  proceeds; brackets records + surfaces the verdict). */
+  mode: 'renderer' | 'judge' | 'allow' | 'advisory';
   /** The skill whose requirement was missed (renderer mode) / consulted. */
   skill?: string;
   /** The single specific gap (block) — fed to the reroute error. */
@@ -472,6 +474,17 @@ export async function evaluateGoalFidelity(
   if (verdict.fulfills) {
     failureCounts.delete(`${sessionId}::${targetKey}`);
     return { action: 'allow', mode: 'judge', reason: verdict.gap, targets };
+  }
+
+  // Goal-ALIGNMENT widening (skill-less): a fuzzy goal-alignment MISS must INFORM,
+  // not hard-block (north-star: guardrails inform, rarely block — and live
+  // 2026-06-22 a hard block false-positived a legit self-send to the user's own
+  // other address). The send PROCEEDS; brackets records the verdict + surfaces it
+  // for review. The skill-LOADED fidelity path below stays a hard block — that is
+  // the validated per-item-requirement behavior (per-firm research, renderer skip).
+  if (skills.length === 0) {
+    failureCounts.delete(`${sessionId}::${targetKey}`);
+    return { action: 'allow', mode: 'advisory', reason: verdict.gap, gap: verdict.gap, targets, blockKind: verdict.blockKind };
   }
 
   // Draft-only-skill block: the skill scoped itself out of sending (it drafts +

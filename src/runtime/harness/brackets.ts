@@ -1126,6 +1126,24 @@ export function wrapToolForHarness<T extends WrappableTool>(
               failureCount: verdict.failureCount ?? 1,
               blockKind: verdict.blockKind,
             });
+          } else if (verdict.mode === 'advisory') {
+            // Skill-less goal-alignment MISS → INFORM, do not block (north-star:
+            // guardrails inform, rarely block; a hard block here false-positived a
+            // legit self-send live 2026-06-22). The send PROCEEDS; record the
+            // verdict (fulfills:false, advisory) + a warn-level guardrail so it
+            // surfaces for review without breaking the send.
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged',
+                data: { toolName: tool.name, fulfills: false, advisory: true, targets: verdict.targets.slice(0, 5), reason: verdict.reason },
+              });
+            } catch { /* telemetry write must never block */ }
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                data: { kind: 'goal_alignment_advisory', action: 'warn', toolName: tool.name, targets: verdict.targets.slice(0, 5), reason: verdict.reason },
+              });
+            } catch { /* telemetry write must never block */ }
           } else if (verdict.mode === 'judge') {
             // Aligned-proceed via the judge — otherwise silent. Emit a trace so a
             // YOLO silent-proceed is provably judge-vetted (the goal-alignment
