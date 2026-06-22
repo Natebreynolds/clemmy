@@ -364,6 +364,10 @@ export interface DistilledSkillInput {
   description: string;
   body: string;
   origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string };
+  /** Lane D Phase 2: machine-checkable applicability — which tool families the
+   *  procedure touches + which entity-class slots it is parameterized over. The
+   *  retrieval filter surfaces a procedure only when these match the live task. */
+  applicability?: { toolFamilies: string[]; entitySlots: string[] };
 }
 
 /**
@@ -384,6 +388,7 @@ export function writeDistilledSkill(input: DistilledSkillInput): string | null {
     origin: { ...input.origin, distilledAt: new Date().toISOString() },
     useCount: 0,
     failureCount: 0,
+    ...(input.applicability ? { applicability: input.applicability } : {}),
   };
   const file = matter.stringify(`\n${input.body.trim()}\n`, frontmatter);
   writeFileSync(path.join(dir, 'SKILL.md'), file, 'utf-8');

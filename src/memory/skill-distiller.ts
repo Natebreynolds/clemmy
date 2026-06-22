@@ -130,6 +130,59 @@ export function deriveRecoveryTip(
   return null;
 }
 
+// Lane D Phase 2: slot-parameterize concrete IDs so a distilled procedure is
+// reusable across clients/runs, and derive machine-checkable applicability.
+//
+// GLOBAL-ONLY by design: we reuse the entity REGEX CLASSES from memory-merge's
+// extractAnchors (table/app ids, emails, domains) but DELIBERATELY NOT its
+// hardcoded client-name patterns (Revill/Aldous/Scorpion/Market Leader) — those
+// are user-specific and must never be baked into the global distiller (binding:
+// "global, never user-specific").
+const SLOT_RULES: Array<{ re: RegExp; slot: string }> = [
+  { re: /tbl[a-zA-Z0-9]{12,}/g, slot: 'table_id' },
+  { re: /app[a-zA-Z0-9]{12,}/g, slot: 'app_id' },
+  // email BEFORE domain so the domain inside an address isn't separately slotted.
+  { re: /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g, slot: 'email' },
+  { re: /\b[\w-]+\.(?:com|ai|io|org|net|co\.uk|dev)\b/gi, slot: 'domain' },
+];
+
+/** Replace concrete global entity ids with {{slot}} placeholders. Pure,
+ *  deterministic, GLOBAL (no user-specific names). Returns the rewritten text +
+ *  the distinct slot kinds found. */
+export function slotParameterize(text: string): { text: string; slots: string[] } {
+  let out = text ?? '';
+  const slots = new Set<string>();
+  for (const { re, slot } of SLOT_RULES) {
+    const next = out.replace(re, `{{${slot}}}`);
+    if (next !== out) slots.add(slot);
+    out = next;
+  }
+  return { text: out, slots: [...slots] };
+}
+
+/** Coarse family for a proven tool: a composio UPPER_SNAKE slug → its toolkit
+ *  prefix (GMAIL_SEND_EMAIL → gmail); any other tool → its lowercased name. */
+function familyOfProvenTool(tool: string): string {
+  const m = (tool ?? '').match(/^([A-Z][A-Z0-9]+)_/);
+  return (m ? m[1] : tool ?? '').toLowerCase();
+}
+
+/** Machine-checkable applicability for a distilled procedure: which tool
+ *  families it touches + which entity-class slots it is parameterized over. The
+ *  retrieval filter (Phase 3) surfaces a procedure only when these match the
+ *  live task. Pure. */
+export function deriveApplicability(
+  provenTools: Array<{ tool: string }>,
+  entitySlots: string[],
+): { toolFamilies: string[]; entitySlots: string[] } {
+  const fams = new Set<string>();
+  for (const t of provenTools) {
+    const f = familyOfProvenTool(t.tool);
+    if (f) fams.add(f);
+  }
+  return { toolFamilies: [...fams], entitySlots: [...new Set(entitySlots)] };
+}
+
 const DistilledSchema = z.object({
   name: z.string().min(3).max(60).describe('kebab-case skill name, e.g. "law-firm-seo-brief". No spaces.'),
   description: z.string().min(8).max(200).describe('One line: what this skill does and when to use it.'),
@@ -254,12 +307,26 @@ async function distillFromCalls(
       return { status: 'skipped_duplicate', detail: `matches existing skill "${dup.name}"`, name: dup.name };
     }
 
+    // Lane D Phase 2: slot-parameterize concrete ids out of the procedure + each
+    // proven call (global slots only), and derive applicability from the result.
+    const allSlots = new Set<string>();
+    const pm = slotParameterize(draft.procedureMarkdown);
+    pm.slots.forEach((s) => allSlots.add(s));
+    draft.procedureMarkdown = pm.text;
+    draft.provenTools = draft.provenTools.map((t) => {
+      const r = slotParameterize(t.argsShape);
+      r.slots.forEach((s) => allSlots.add(s));
+      return { ...t, argsShape: r.text };
+    });
+    const applicability = deriveApplicability(draft.provenTools, [...allSlots]);
+
     const body = renderSkillBody(draft);
     const name = writeDistilledSkill({
       name: draft.name,
       description: draft.description,
       body,
       origin: context.origin,
+      applicability,
     });
     if (!name) return { status: 'failed', detail: 'write failed' };
 
