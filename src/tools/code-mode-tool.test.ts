@@ -2,9 +2,9 @@
  * Run: npx tsx --test src/tools/code-mode-tool.test.ts
  *
  * Code Mode tool surface + read-only dispatcher (Lane C Phase 1). The safety
- * boundary: a code-mode program can ONLY reach read-only tools — a write/send
- * tool is refused before any dispatch. And the tool is off the surface unless
- * CLEMMY_CODE_MODE=on (byte-identical default).
+ * boundary: with writes OFF, a code-mode program can ONLY reach read-only tools —
+ * a write/send tool is refused before any dispatch. Code Mode is DEFAULT-ON since
+ * v0.11.0 (sandbox escape-soaked); CLEMMY_CODE_MODE=off is the kill-switch.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,9 +20,9 @@ test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () =
   }
 });
 
-test('dispatchCodeModeTool refuses a mutating tool when writes are OFF (default boundary)', async () => {
+test('dispatchCodeModeTool refuses a mutating tool when writes are OFF (kill-switch)', async () => {
   const prev = process.env.CLEMMY_CODE_MODE_WRITES;
-  delete process.env.CLEMMY_CODE_MODE_WRITES; // default = writes off
+  process.env.CLEMMY_CODE_MODE_WRITES = 'off'; // writes kill-switch (default is now on)
   try {
     await assert.rejects(
       () => dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'X_SEND', arguments: '{}' }, 'sess'),
@@ -39,7 +39,7 @@ test('buildCodeModeTool exposes run_tool_program with a program parameter', () =
   assert.equal(t.name, 'run_tool_program');
 });
 
-test('run_tool_program is OFF the core surface by default, ON only under CLEMMY_CODE_MODE=on', async () => {
+test('run_tool_program surface follows CLEMMY_CODE_MODE: absent when off, present when on (default on)', async () => {
   const { getCoreTools } = await import('./registry.js');
   const prev = process.env.CLEMMY_CODE_MODE;
   try {

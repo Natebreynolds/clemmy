@@ -25,18 +25,21 @@ import { runCodeModeProgram, type CodeModeResult } from './code-mode-sandbox.js'
 // registry module is fully loaded.
 
 export function codeModeEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CODE_MODE', 'off') || 'off').trim().toLowerCase() === 'on';
+  // DEFAULT-ON since v0.11.0: the sandbox containment was adversarially soaked
+  // (2026-06-22, scripts/soak-code-mode-escape.ts — 14/14 escapes contained incl.
+  // secret-exfil + file-write). Kill-switch CLEMMY_CODE_MODE=off.
+  return (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
-/** Phase 2: allow GATED WRITES inside code-mode programs. Separate opt-in (default
- *  off) so enabling code-mode (read-only) never silently enables writes. When on,
- *  a program may call the mutating tools — and because every clem call routes
- *  through wrapToolForHarness, the full gate chain (execution-wrap / grounding /
+/** Phase 2: allow GATED WRITES inside code-mode programs. When on, a program may
+ *  call the mutating tools — and because every clem call routes through
+ *  wrapToolForHarness, the full gate chain (execution-wrap / grounding /
  *  duplicate / goal-fidelity / destination / confirm-first) fires per in-program
- *  write exactly as on a discrete call. DELETE-WHEN-VALIDATED: fold into
- *  CLEMMY_CODE_MODE once gate-parity holds across a release. */
+ *  write exactly as on a discrete call (gate-parity-proven). DEFAULT-ON since
+ *  v0.11.0 alongside CLEMMY_CODE_MODE (sandbox escape-soaked + writes route
+ *  through the same gates). Kill-switch CLEMMY_CODE_MODE_WRITES=off. */
 export function codeModeWritesEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CODE_MODE_WRITES', 'off') || 'off').trim().toLowerCase() === 'on';
+  return (getRuntimeEnv('CLEMMY_CODE_MODE_WRITES', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
 /** Phase 2 mutating surface. Each routes through wrapToolForHarness, so the
