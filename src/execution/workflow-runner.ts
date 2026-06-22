@@ -6,7 +6,7 @@ import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
-import { appendEvent as appendHarnessEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
@@ -919,7 +919,7 @@ interface StepExecutionContext {
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow';
+  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip';
   note: string;
 }
 
@@ -2187,6 +2187,29 @@ export async function executeStep(
       if (ctx.completedItems.has(key)) {
         return { itemKey: key, output: ctx.completedItems.get(key) };
       }
+      // Bug #8 (Lane B): a SEND-class item whose send already fired on a prior
+      // pass (external_write under the item's deterministic session) but never
+      // recorded completion (the crash window) must NOT be re-sent — re-running
+      // would DOUBLE-SEND. Skip + reconcile + advise (favor no-duplicate, report
+      // back). Only bites on resume: a fresh pass has no prior external_write.
+      if (idempotentForEachEnabled() && stepSideEffectClass(step) === 'send'
+        && itemSendAlreadyFired(ctx.runId, step.id, key)) {
+        const skipNote = '[skipped on resume — a prior send for this item already fired; not re-sent to avoid a duplicate. Verify it landed.]';
+        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+          kind: 'item_completed',
+          stepId: step.id,
+          itemKey: key,
+          output: skipNote,
+        });
+        bumpWorkflowRunItemProgress(ctx.runId, step.id, 'completed');
+        ctx.qualityAdvisories.push({
+          stepId: step.id,
+          itemKey: key,
+          kind: 'idempotent_skip',
+          note: `forEach item "${key}"'s send fired on a prior attempt but the run crashed before recording completion — SKIPPED on resume to avoid a duplicate send. Verify that send landed.`,
+        });
+        return { itemKey: key, output: skipNote };
+      }
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'item_started',
         stepId: step.id,
@@ -2503,6 +2526,37 @@ export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' |
  *
  * Pure + exported so the predicate is unit-tested.
  */
+/** off ⇒ a crashed forEach SEND re-runs every item on resume (legacy bug #8
+ *  behavior). Default on: an item whose send already fired on a prior pass is
+ *  skipped on resume (favor no-duplicate; surfaced for verify). DELETE-WHEN-
+ *  VALIDATED once an injected-crash forEach-send eval shows 0 double-sends. */
+function idempotentForEachEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_IDEMPOTENT_FOREACH', 'on') || 'on').toLowerCase() !== 'off';
+}
+
+/** PURE: did a forEach item's send already CLAIM (an external_write) without
+ *  being netted by a failure compensation? More writes than failures ⇒ a send
+ *  fired. Separated from the event read so it is deterministically testable. */
+export function sendAlreadyClaimed(externalWriteCount: number, failedCount: number): boolean {
+  return externalWriteCount > failedCount;
+}
+
+/** Bug #8 guard: on resume, has THIS forEach item's send already fired? Its
+ *  external_write events live under the item's DETERMINISTIC session id
+ *  (`workflow:<runId>:<stepId>:<itemKey>`), so we reconstruct it and net writes
+ *  against failure compensations — no new threading. Fail-open (a read error
+ *  must never block a legitimate re-run). */
+function itemSendAlreadyFired(runId: string, stepId: string, itemKey: string): boolean {
+  try {
+    const sid = `workflow:${runId}:${stepId}:${itemKey}`;
+    const writes = listHarnessEvents(sid, { types: ['external_write'] }).length;
+    const fails = listHarnessEvents(sid, { types: ['external_write_failed'] }).length;
+    return sendAlreadyClaimed(writes, fails);
+  } catch {
+    return false;
+  }
+}
+
 export function shouldHaltResumeForSideEffect(
   workflow: WorkflowDefinition,
   resume: { inFlightStepId?: string; completedSteps: Map<string, unknown>; failedSteps?: Set<string> },

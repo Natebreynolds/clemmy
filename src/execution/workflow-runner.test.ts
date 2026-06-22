@@ -54,6 +54,7 @@ const {
   shouldHaltResumeForSideEffect,
   stepSideEffectClass,
   finalizeStepOutput,
+  sendAlreadyClaimed,
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
@@ -1287,25 +1288,31 @@ test('P0-3 does NOT halt a read step, a completed step, or the targeted re-run p
   assert.equal(shouldHaltResumeForSideEffect(wf, resumeState(undefined)), null);
 });
 
-test('CHARACTERIZATION (Lane B, bug #8): a crashed forEach SEND step is EXEMPT from the resume-halt — the double-send exposure', () => {
-  // forEach steps are item-tracked, so resume is SUPPOSED to skip already-done
-  // items. But if an item's send fired and the process crashed BEFORE its
-  // item_completed event was written, the forEach re-runs that item → DOUBLE
-  // SEND. shouldHaltResumeForSideEffect exempts forEach (`crashed.forEach →
-  // return null`), so a crashed forEach SEND does NOT halt. This pins that
-  // exposure; the Lane B fix (per-item idempotency key keyed by run+step+item)
-  // makes a crashed forEach safe to auto-resume WITHOUT re-sending a claimed
-  // item — at which point this expectation changes to the idempotent behavior.
+test('Lane B (bug #8 FIXED): a crashed forEach SEND auto-resumes (no halt) — now SAFE via per-item dedup', () => {
+  // forEach steps are item-tracked, so a crashed forEach SHOULD auto-resume
+  // (skip done items, retry the rest) rather than halt-for-a-human. The bug was
+  // the crash WINDOW: an item whose send fired but whose item_completed wasn't
+  // recorded got re-sent. The fix is NOT to halt forEach (that loses the
+  // auto-resume) — it's the runner-level per-item guard (itemSendAlreadyFired:
+  // an item with a prior external_write under its deterministic session is
+  // skipped on resume). So shouldHaltResumeForSideEffect STILL returns null for
+  // forEach (auto-resume), and that is now correct + safe.
   const wf = wfWith([
     { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
     { id: 'blast', prompt: 'Email each lead.', sideEffect: 'send', forEach: 'pull', dependsOn: ['pull'] },
   ]);
-  // A plain send halts (asserted above); the forEach send does NOT — the gap.
   assert.equal(
     shouldHaltResumeForSideEffect(wf, resumeState('blast', ['pull'])),
     null,
-    'KNOWN GAP #8: crashed forEach send auto-resumes (no halt) → double-send window until per-item idempotency lands',
+    'forEach send auto-resumes (no halt); the per-item dedup, not a halt, prevents the double-send',
   );
+});
+
+test('Lane B (bug #8): sendAlreadyClaimed — more external_writes than failures ⇒ a send fired', () => {
+  assert.equal(sendAlreadyClaimed(1, 0), true, 'one send, no failure → claimed');
+  assert.equal(sendAlreadyClaimed(1, 1), false, 'one send fully netted by a failure → not claimed');
+  assert.equal(sendAlreadyClaimed(0, 0), false, 'nothing fired → not claimed');
+  assert.equal(sendAlreadyClaimed(2, 1), true, '2 writes, 1 failed → 1 net send claimed');
 });
 
 test('P0-3 approval-gated step is exempt (parking emits step_started before the gate)', () => {
