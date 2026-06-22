@@ -31,7 +31,8 @@ import { resolveToolJitDecision, selectToolsForTurn } from './tool-jit.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { buildWorkerJobPrompt, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
+import { buildWorkerJobPrompt, resolveWorkerMaxTurns, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
+import { workerItemAlreadyCapped } from './worker-respawn-guard.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -722,6 +723,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // Routing telemetry should never block worker fan-out.
         }
       };
+      // HARD respawn guard (covers BOTH worker lanes — placed before the route
+      // branch). If THIS item already hit its turn cap (worker_capped) earlier in
+      // this run, refuse to re-spawn it: a re-run with the same packet just caps
+      // again, which is the non-converging loop observed live 2026-06-22 (N=3
+      // research fan-out, 12+ min, manual cancel). The ERROR: prefix routes the
+      // item into the EXISTING fanout-ledger ok=false -> N-of-M honest-partial
+      // path (hooks.ts:362, background-tasks.ts fanoutCoverageBlock). The wording
+      // MUST NOT contain "hit its turn cap" / "MaxTurnsExceeded" or hooks.ts:380
+      // would self-fire a spurious worker_capped. Gated under the existing thrash
+      // guard; workerItemAlreadyCapped is fail-open so it can never block fan-out.
+      if (workerThrashGuardEnabled() && sessionId && workerItemAlreadyCapped(sessionId, input.item)) {
+        return `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
+      }
       if (claudeAgentSdkWorkerEnabled(workerModel)) {
         // Pass the PARENT chat session so the Claude SDK worker's gates +
         // plan-scope + execution lane aggregate across the fan-out (one batch
@@ -748,7 +762,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       }
       if (route.trace) appendWorkerRoute(route.trace);
       const workerForCall = route.model ? worker.clone({ model: route.model }) : worker;
-      const nestedWorkerTool = workerForCall.asTool(runWorkerAsToolOptions);
+      // Intent-aware cap on the nested lane too (non-Claude worker setups). asTool
+      // captures runOptions at BUILD time, so rebuild per-call with the resolved
+      // cap rather than reusing the build-time-baked runWorkerAsToolOptions.
+      const nestedAsToolOptions = workerThrashGuardEnabled()
+        ? { ...runWorkerAsToolOptions, runOptions: { maxTurns: resolveWorkerMaxTurns(input.intent, workerMaxTurns) } }
+        : runWorkerAsToolOptions;
+      const nestedWorkerTool = workerForCall.asTool(nestedAsToolOptions);
       if (!runContext) throw new Error('run_worker requires an SDK run context');
       return nestedWorkerTool.invoke(runContext, JSON.stringify(input), details);
     },

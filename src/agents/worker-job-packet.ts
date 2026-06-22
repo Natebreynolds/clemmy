@@ -35,6 +35,28 @@ export const WorkerToolInputSchema = z.object({
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
 
+const HEAVY_WORKER_INTENTS = ['research', 'analysis', 'analyze', 'code', 'coding', 'design'];
+
+/**
+ * Intent-aware worker turn ceiling. Heavy, multi-step intents (e.g. a DataForSEO
+ * discover -> per-keyword pull -> synthesize research item) need headroom to
+ * FINISH on the first attempt instead of capping and triggering a respawn loop
+ * (observed live 2026-06-22: an N=3 per-client research fan-out where every
+ * worker hit the 8/12-turn cap and the orchestrator re-spawned them forever).
+ * `intent` is free-form (z.string().min(1).nullable()), so match by
+ * case-insensitive substring, never an enum switch. Pure + total: an unknown or
+ * null intent keeps `base`; widening only ever RAISES, never lowers, so the env
+ * knob (CLEMMY_WORKER_MAX_TURNS / CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS) still
+ * floors the value. The loop-guard + duplicate gates bound runaways inside the
+ * larger budget; this is the outer ceiling, not the precise thrash control.
+ */
+export function resolveWorkerMaxTurns(intent: string | null | undefined, base: number): number {
+  const word = (intent ?? '').trim().toLowerCase();
+  if (!word) return base;
+  const heavy = HEAVY_WORKER_INTENTS.some((k) => word.includes(k));
+  return heavy ? Math.max(base, 18) : base;
+}
+
 type WorkerToolInputBuilderOptions = {
   params: WorkerToolInput;
 };

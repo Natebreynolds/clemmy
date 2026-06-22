@@ -81,10 +81,79 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
   assert.equal(result.sdkSessionId, 'sdk-worker-session');
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__skill_read']);
   assert.equal(captured.modelId, 'claude-sonnet-4-6');
-  assert.equal(captured.maxTurns, 12);
+  // intent:'design' is a HEAVY (multi-step) intent → intent-aware cap widens the
+  // base 12 to 18 so it finishes on the first attempt (the 2026-06-22 fan-out fix,
+  // default-on under CLEMMY_WORKER_THRASH_GUARD).
+  assert.equal(captured.maxTurns, 18);
   assert.match(captured.prompt, /\[WORKER JOB PACKET\]/);
   assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
+});
+
+// ── 2026-06-22 fan-out fix: SDK-lane cap visibility + intent-aware cap ─────────
+// This is the lane Nathan's claude_oauth workers take. Both behaviors gated under
+// CLEMMY_WORKER_THRASH_GUARD (default on). Asserted via the injected-run seam.
+
+const researchPacket = {
+  objective: 'analyze one client', item: 'Nova Legal Group — novalegalgroup.com',
+  resolvedTools: 'dataforseo', context: 'x', instructions: 'x', expectedOutput: 'x',
+  intent: 'research',
+};
+const ordinaryPacket = { ...researchPacket, intent: null };
+
+function withThrashGuard<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.CLEMMY_WORKER_THRASH_GUARD;
+  if (value === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
+  else process.env.CLEMMY_WORKER_THRASH_GUARD = value;
+  return fn().finally(() => {
+    if (prev === undefined) delete process.env.CLEMMY_WORKER_THRASH_GUARD;
+    else process.env.CLEMMY_WORKER_THRASH_GUARD = prev;
+  });
+}
+
+test('guard ON: a turn-cap (limitHit) becomes an ERROR: envelope the ledger + worker_capped can see', async () => {
+  await withThrashGuard('on', async () => {
+    setClaudeAgentSdkWorkerRunForTest(async () => ({
+      text: 'I reached the turn budget. Say "continue" to keep going.', limitHit: true, toolUses: [],
+    }));
+    const r = await runClaudeAgentSdkWorker(researchPacket, 'claude-opus-4-8', 'sess-cap');
+    assert.match(r.text, /^ERROR:/, 'capped worker returns an ERROR: result');
+    assert.match(r.text, /hit its turn cap/i, 'contains the phrase hooks.ts:380 keys worker_capped on');
+    assert.match(r.text, /Partial:/, 'preserves the partial work for context');
+  });
+});
+
+test('guard ON: the SDK receives the INTENT-AWARE cap (research widens to 18, null keeps base 12)', async () => {
+  await withThrashGuard('on', async () => {
+    let captured: any;
+    setClaudeAgentSdkWorkerRunForTest(async (options) => { captured = options; return { text: 'done', toolUses: [] }; });
+    await runClaudeAgentSdkWorker(researchPacket, 'claude-opus-4-8', 'sess-r');
+    assert.equal(captured.maxTurns, 18, 'research intent gets the widened ceiling');
+    await runClaudeAgentSdkWorker(ordinaryPacket, 'claude-opus-4-8', 'sess-o');
+    assert.equal(captured.maxTurns, 12, 'ordinary worker keeps the base cap (default 12)');
+  });
+});
+
+test('guard OFF: byte-identical rollback — friendly text verbatim + base cap regardless of intent', async () => {
+  await withThrashGuard('off', async () => {
+    let captured: any;
+    setClaudeAgentSdkWorkerRunForTest(async (options) => {
+      captured = options;
+      return { text: 'I reached the turn budget. Say "continue" to keep going.', limitHit: true, toolUses: [] };
+    });
+    const r = await runClaudeAgentSdkWorker(researchPacket, 'claude-opus-4-8', 'sess-off');
+    assert.equal(r.text, 'I reached the turn budget. Say "continue" to keep going.', 'friendly text verbatim');
+    assert.doesNotMatch(r.text, /^ERROR:/);
+    assert.equal(captured.maxTurns, 12, 'no intent widening when the guard is off');
+  });
+});
+
+test('empty output still normalizes to an ERROR: (unchanged pre-existing behavior)', async () => {
+  await withThrashGuard('on', async () => {
+    setClaudeAgentSdkWorkerRunForTest(async () => ({ text: '   ', limitHit: false, toolUses: [] }));
+    const r = await runClaudeAgentSdkWorker(ordinaryPacket, 'claude-opus-4-8', 'sess-empty');
+    assert.match(r.text, /^ERROR: Claude SDK worker produced no output/);
+  });
 });

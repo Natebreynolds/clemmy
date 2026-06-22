@@ -1,4 +1,4 @@
-import { buildWorkerJobPrompt, type WorkerToolInput } from '../../agents/worker-job-packet.js';
+import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from '../../agents/worker-job-packet.js';
 import { getRuntimeEnv } from '../../config.js';
 import {
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -30,6 +30,14 @@ function maxTurns(): number {
   // runaways). Parent fan-out breadth is unchanged — this is per-item depth.
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS', '12') ?? '12', 10);
   return Number.isFinite(raw) && raw >= 1 ? raw : 12;
+}
+
+// Single source of truth is the flag string CLEMMY_WORKER_THRASH_GUARD (same as
+// brackets.ts:workerThrashGuardEnabled). Inlined here to avoid importing the
+// heavy brackets module from this leaf worker file. `=off` reverts the
+// intent-aware cap + the limitHit→ERROR transform to prior SDK-default behavior.
+function thrashGuardOn(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKER_THRASH_GUARD', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agentic = false): string {
@@ -80,6 +88,12 @@ export async function runClaudeAgentSdkWorker(
   // read-only worker (safe; mutations return ERROR rather than running ungated).
   const sid = sessionId?.trim();
   const agentic = Boolean(sid);
+  const guard = thrashGuardOn();
+  // Intent-aware ceiling: a heavy multi-step item (research/analysis/code/design)
+  // gets headroom to finish on the FIRST attempt instead of capping + looping.
+  // Falls back to the base CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS when the guard
+  // is off or the intent is ordinary.
+  const resolvedMaxTurns = guard ? resolveWorkerMaxTurns(input.intent, maxTurns()) : maxTurns();
   const result = await runClaudeAgentSdkImpl({
     prompt: buildWorkerJobPrompt(input),
     sessionId: sid,
@@ -87,10 +101,23 @@ export async function runClaudeAgentSdkWorker(
     systemAppend: renderClaudeAgentWorkerSystemAppend(input, agentic),
     allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(agentic ? 'worker' : 'read_only'),
     agentic,
-    maxTurns: maxTurns(),
+    maxTurns: resolvedMaxTurns,
   });
+  // Cap-visibility: on a turn-cap the SDK returns limitHit:true + FRIENDLY "say
+  // continue" text. Returning that verbatim made the fan-out ledger record the
+  // capped worker as ok=true (hooks.ts:362) and worker_capped never fired
+  // (hooks.ts:380 regex) — so the model saw "success" with no real output and
+  // re-spawned forever. Surface the cap as an ERROR: envelope CONTAINING "hit
+  // its turn cap" so the ledger marks it failed AND worker_capped fires, bringing
+  // this lane to parity with the nested lane and letting the respawn-guard SEE it.
+  // (Gated: =off restores the prior friendly text verbatim for clean rollback.)
+  const cappedText = guard && result.limitHit === true
+    ? `ERROR: worker hit its turn cap before finishing this item (turn budget exhausted). Treat as failed / needs-attention; do not blindly re-spawn the same item.${
+        result.text.trim() ? ` Partial: ${result.text.trim()}` : ''
+      }`
+    : (result.text.trim() || 'ERROR: Claude SDK worker produced no output.');
   return {
-    text: result.text.trim() || 'ERROR: Claude SDK worker produced no output.',
+    text: cappedText,
     sdkSessionId: result.sessionId,
     model: result.model,
     toolUses: result.toolUses,
