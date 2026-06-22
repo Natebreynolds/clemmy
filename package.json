@@ -41,6 +41,7 @@
     "eval:passk": "tsx scripts/eval-passk.ts",
     "eval:spans": "tsx scripts/eval-spans.ts",
     "eval:promote": "tsx scripts/eval-promote.ts",
+    "measure:code-mode": "tsx scripts/measure-code-mode-opportunity.ts",
     "probe:judge": "tsx scripts/probe-boundary-judge.ts",
     "probe:judge:live": "tsx scripts/probe-judge-live.ts",
     "stress:memory": "tsx scripts/memory-roundtrip-stress.ts",
