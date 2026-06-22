@@ -23,6 +23,7 @@ import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { executeComposioTool, listConnectedToolkits } from '../integrations/composio/client.js';
 import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
+import { decideSurface, shouldSurface, surfaceDecisionV2Enabled, type SurfaceDecision } from './surface-decision.js';
 
 const logger = pino({ name: 'clementine-next.calendar-monitor' });
 
@@ -161,7 +162,7 @@ const GOOGLE: CalProvider = {
 const PROVIDERS: Record<string, CalProvider> = { outlook: OUTLOOK, googlecalendar: GOOGLE };
 
 // ── scoring: "does this event need the user?" ───────────────────────────────
-export interface EventScore { needsYou: boolean; reasons: string[]; score: number }
+export interface EventScore { needsYou: boolean; reasons: string[]; score: number; decision?: SurfaceDecision }
 function overlaps(a: CalEvent, b: CalEvent): boolean {
   return a.startMs < b.endMs && b.startMs < a.endMs;
 }
@@ -199,7 +200,25 @@ export function scoreEvent(ev: CalEvent, all: CalEvent[], nowMs: number): EventS
   }
   // Starting soon, with OTHER people (a real multi-person meeting heads-up).
   const untilStart = ev.startMs - nowMs;
-  if (untilStart > 0 && untilStart <= SOON_MS && ev.attendeeCount >= 2) reasons.push('starts soon');
+  const soon = untilStart > 0 && untilStart <= SOON_MS && ev.attendeeCount >= 2;
+  if (soon) reasons.push('starts soon');
+
+  // V2: multi-axis surface decision (shared with the inbox monitor). risk=0.4 →
+  // surface (ask/escalate) vs stay-silent (watch/ignore), never autonomous 'act'.
+  if (surfaceDecisionV2Enabled()) {
+    const awaiting = reasons.includes('awaiting your response');
+    const overlap = reasons.includes('overlaps another event');
+    const v = decideSurface({
+      urgency: soon ? 0.8 : 0.2,
+      impact: awaiting ? 0.6 : overlap ? 0.7 : 0.4,
+      specificity: 0.7,        // calendar items are concrete
+      novelty: 0.8,
+      risk: 0.4,
+      confidence: 0.7,
+      conflict: overlap ? 0.9 : 0,
+    });
+    return { needsYou: shouldSurface(v.decision), reasons, score: reasons.length, decision: v.decision };
+  }
   return { needsYou: reasons.length > 0, reasons, score: reasons.length };
 }
 
