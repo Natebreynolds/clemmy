@@ -335,6 +335,25 @@ export function recordSkillUpdateCheck(
  * Returns '' when no skills are installed so the prompt isn't bloated
  * with an empty section.
  */
+/** Format one skill's index line, appending its applicability (Lane D P2/P3) when
+ *  present — "best for <families>; over <slots>" — so the model can judge a
+ *  procedure's relevance to the live task WITHOUT a speculative deterministic
+ *  filter (NL objective → toolkit family is too fuzzy to gate on). Pure. */
+export function formatSkillLine(
+  name: string,
+  description: string,
+  applicability?: { toolFamilies?: string[]; entitySlots?: string[] } | null,
+): string {
+  const base = `- \`${name}\`: ${description || '(no description)'}`;
+  const fams = applicability?.toolFamilies ?? [];
+  const slots = applicability?.entitySlots ?? [];
+  if (fams.length === 0 && slots.length === 0) return base;
+  const bits: string[] = [];
+  if (fams.length > 0) bits.push(`best for ${fams.join(', ')}`);
+  if (slots.length > 0) bits.push(`over ${slots.map((s) => `{{${s}}}`).join('/')}`);
+  return `${base} — ${bits.join('; ')}`;
+}
+
 export function renderSkillsIndex(): string {
   const skills = listSkills();
   if (skills.length === 0) return '';
@@ -342,7 +361,11 @@ export function renderSkillsIndex(): string {
   const visible = skills.filter((s) => !s.frontmatter.quarantined);
   const approved = visible.filter((s) => (s.frontmatter.tier ?? 'approved') !== 'draft');
   const drafts = visible.filter((s) => s.frontmatter.tier === 'draft');
-  const line = (s: Skill) => `- \`${s.name}\`: ${s.frontmatter.description || '(no description)'}`;
+  const line = (s: Skill) => formatSkillLine(
+    s.name,
+    s.frontmatter.description || '(no description)',
+    s.frontmatter.applicability as { toolFamilies?: string[]; entitySlots?: string[] } | undefined,
+  );
   const out: string[] = [];
   if (approved.length > 0) {
     out.push('Installed skills (call `skill_read("<name>")` to load the full instructions when relevant):');
