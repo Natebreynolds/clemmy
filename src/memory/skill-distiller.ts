@@ -19,11 +19,13 @@ import { z } from 'zod';
 import { Agent, Runner } from '@openai/agents';
 import { getRuntimeEnv, MODELS } from '../config.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
-import { readSessionTrace, type TraceToolCall } from '../execution/trace-to-workflow.js';
+import { readSessionTrace, readSessionToolReturns, type TraceToolCall } from '../execution/trace-to-workflow.js';
 import {
   listSkills, loadSkill, writeDistilledSkill, isSafeSkillName,
   updateSkillFrontmatter, appendSkillPitfall, type Skill,
 } from './skill-store.js';
+import { evidenceLooksFailedOrBlocked } from './tool-choice-store.js';
+import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
 
 const logger = pino({ name: 'clementine-next.skill-distiller' });
@@ -78,6 +80,54 @@ export function assessNovelty(calls: TraceToolCall[]): NoveltyAssessment {
     families: families.size,
     hadDiscovery,
   };
+}
+
+/** Compress a failed result into a one-line error SIGNATURE for a recovery tip:
+ *  collapse whitespace, strip volatile ids/quotes, cap length. */
+function errorSignature(text: string): string {
+  return text.replace(/\s+/g, ' ').replace(/["'`]/g, '').trim().slice(0, 120);
+}
+
+/**
+ * Recovery procedure from a FAILED-then-CORRECTED trajectory (Lane D Phase 1).
+ * Today only successes distill; this closes the asymmetry. When the SAME tool
+ * slug was invoked ≥2× with DIFFERENT args (the assessNovelty trial-and-error
+ * signal) AND an EARLIER invocation's RESULT looks failed/blocked, the later
+ * call IS the figured-out recovery — so mint a tip keyed to the error signature
+ * ("hit X → don't repeat; retry with corrected args"), not a flat "FAILED".
+ *
+ * Returns null when there's no corrected retry, or when the failure is TRANSIENT
+ * (429/timeout/5xx) — a transient blip is not a reusable lesson and would poison
+ * the draft with a bogus "recovery". Pure: caller supplies calls + results.
+ */
+export function deriveRecoveryTip(
+  calls: TraceToolCall[],
+  returnsByCallId: Map<string, string>,
+): string | null {
+  // Group invocations by slug, preserving order, with each call's result text.
+  const bySlug = new Map<string, Array<{ args: string; result: string }>>();
+  for (const c of calls) {
+    if (!c.slug) continue; // composio actions only — the rot-prone, retry-worthy class
+    const result = returnsByCallId.get(c.callId) ?? '';
+    if (!bySlug.has(c.slug)) bySlug.set(c.slug, []);
+    bySlug.get(c.slug)!.push({ args: c.args, result });
+  }
+  for (const [slug, invocations] of bySlug) {
+    if (invocations.length < 2) continue; // no retry → nothing was figured out
+    const distinctArgs = new Set(invocations.map((i) => i.args));
+    if (distinctArgs.size < 2) continue; // identical re-fire (a loop), not a corrected retry
+    // An EARLIER invocation that genuinely failed/blocked (non-transient) and was
+    // followed by a later attempt = the recovery we want to remember.
+    for (let i = 0; i < invocations.length - 1; i += 1) {
+      const failed = invocations[i].result;
+      if (!evidenceLooksFailedOrBlocked(failed)) continue;
+      if (isTransientFailure(failed)) continue; // a blip, not a lesson
+      const sig = errorSignature(failed);
+      if (!sig) continue;
+      return `${slug}: hit "${sig}" — don't repeat the same call; retry with corrected args.`;
+    }
+  }
+  return null;
 }
 
 const DistilledSchema = z.object({
@@ -274,8 +324,18 @@ export function reinforceDraftSkills(
   skillNames: string[],
   outcome: 'success' | 'failure',
   reason?: string,
+  sessionId?: string,
 ): void {
   if (!distillerEnabled()) return;
+  // On failure, prefer a STRUCTURED recovery tip mined from the session's
+  // failed-then-corrected trajectory (error signature → corrective retry) over
+  // the flat judge reason. Computed ONCE per call, shared across the drafts.
+  let recoveryTip: string | null = null;
+  if (outcome === 'failure' && sessionId) {
+    try {
+      recoveryTip = deriveRecoveryTip(readSessionTrace(sessionId), readSessionToolReturns(sessionId));
+    } catch { /* best-effort — fall back to the flat reason */ }
+  }
   for (const name of new Set(skillNames)) {
     try {
       const skill = loadSkill(name);
@@ -285,7 +345,8 @@ export function reinforceDraftSkills(
         updateSkillFrontmatter(name, useCount >= 2 ? { useCount, tier: 'approved' } : { useCount });
       } else {
         const failureCount = (skill.frontmatter.failureCount ?? 0) + 1;
-        appendSkillPitfall(name, (reason ? `FAILED: ${reason}` : 'FAILED (unspecified)').slice(0, 200));
+        const line = recoveryTip ?? (reason ? `FAILED: ${reason}` : 'FAILED (unspecified)');
+        appendSkillPitfall(name, line.slice(0, 200));
         updateSkillFrontmatter(name, failureCount >= 2 ? { failureCount, quarantined: true } : { failureCount });
       }
     } catch { /* reinforcement is best-effort */ }

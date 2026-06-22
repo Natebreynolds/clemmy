@@ -1929,7 +1929,7 @@ async function runConversationCore(
             void (async () => {
               try {
                 const { reinforceDraftSkills } = await import('../../memory/skill-distiller.js');
-                reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', judgeReason);
+                reinforceDraftSkills(loadedSkills.map((s) => s.name), 'failure', judgeReason, options.sessionId);
               } catch { /* best-effort */ }
             })();
           }

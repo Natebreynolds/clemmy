@@ -296,6 +296,25 @@ export function readSessionTrace(sessionId: string): TraceToolCall[] {
     .filter((c) => c.tool);
 }
 
+/**
+ * Pair each tool call's RESULT text back to its callId from the event log — the
+ * other half of readSessionTrace (which reads only the calls). Used by the skill
+ * distiller's recovery-tip path (Lane D) to see WHICH call failed and how it was
+ * corrected. Results are the event log's write-time-clipped payloads (≤8KB),
+ * which is plenty for an error signature. */
+export function readSessionToolReturns(sessionId: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const e of listEvents(sessionId, { types: ['tool_returned'] })) {
+    const callId = typeof e.data.callId === 'string' ? e.data.callId : '';
+    if (!callId) continue;
+    const result = typeof e.data.result === 'string'
+      ? e.data.result
+      : JSON.stringify(e.data.result ?? '');
+    out.set(callId, result);
+  }
+  return out;
+}
+
 export function draftWorkflowFromSession(sessionId: string): WorkflowDraft {
   const calls = readSessionTrace(sessionId);
   // getToolOutput is available for a future data-flow pass (match an upstream
