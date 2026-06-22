@@ -43,6 +43,7 @@ import { getByoModel } from './byo-model.js';
 import { resolveByoProviderForModel } from './byo-providers.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
+import type { ModelProviderClass } from './model-wire-registry.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -832,6 +833,93 @@ function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, have
   return checker.modelId && checker.modelId !== getClaudeBrainModel()
     ? new ClaudeModelProvider().getModel(checker.modelId)
     : new ClaudeModelProvider().getModel();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Cross-family BOUNDARY judge (Lane A Phase 1 — eval-as-harness).
+//
+// The per-turn completion / grounding / goal-fidelity checkers run on MOST
+// action turns, so they stay on a CHEAP tier (Haiku / gpt-fast), NOT the
+// flagship fusion-reconciler judge role. But a checker that shares the active
+// brain's model family is the textbook correlated-error "self-judging" case (a
+// Codex brain graded by a Codex judge; GLM graded by GLM under all_in) — the
+// 2026 research's "coherence trap". This resolves a cheap judge from a family
+// DIFFERENT than the brain, and fails OPEN to the brain's own family
+// (selfJudge:true, tagged) when no other family is logged in — it never wedges.
+// Kill-switch CLEMMY_JUDGE_CROSS_FAMILY (default on; off ⇒ byte-identical to the
+// prior MODELS.fast judges). DELETE-WHEN-VALIDATED: once judge-calibration shows
+// κ≥0.6 for the cross-family pairing and bench pass^k does not regress for two
+// releases (Lane A Phase 3), the route becomes unconditional and the flag drops.
+// ─────────────────────────────────────────────────────────────────
+
+/** off ⇒ boundary judges keep MODELS.fast exactly as before (byte-identical). */
+export function judgeCrossFamilyEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_JUDGE_CROSS_FAMILY', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+/** The cheap Claude id for a cross-family boundary judge — the lightest pass,
+ *  since these run on most action turns. Tunable; defaults to Haiku. */
+function boundaryClaudeJudgeModel(): string {
+  return (getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_CLAUDE_MODEL', '') || '').trim() || 'claude-haiku-4-5';
+}
+
+/** The cheap Codex (gpt) id for a cross-family boundary judge. A code-level
+ *  family DEFAULT, NOT MODELS.fast — the "fast" tier can be env-overridden to a
+ *  BYO/GLM model (e.g. glm-5.2), which would mis-route a "codex" judge onto the
+ *  wrong provider. Tunable; defaults to the canonical cheap gpt id. */
+function boundaryCodexJudgeModel(): string {
+  return (getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL', '') || '').trim() || 'gpt-5.4-mini';
+}
+
+export interface BoundaryJudgeRouting {
+  /** A Model forced onto a family DISTINCT from the brain when one is available;
+   *  null ⇒ the caller keeps its existing MODELS.fast string (fail-open). */
+  model: Model | null;
+  /** The judge model id actually used (telemetry). */
+  modelId: string;
+  judgeFamily: ModelProviderClass;
+  brainFamily: ModelProviderClass;
+  /** true ⇒ no different family was available, so the judge shares the brain's
+   *  family (the correlated-error case — now OBSERVABLE, never silent). */
+  selfJudge: boolean;
+}
+
+/** PURE family decision: the cheapest model+provider from a family DIFFERENT than
+ *  the brain, or null when none is available (caller fails open same-family).
+ *  Separated from the provider-heavy build so it is deterministically testable. */
+export function chooseBoundaryJudgeFamily(
+  brainFamily: ModelProviderClass,
+  haveClaude: boolean,
+  haveCodex: boolean,
+): { provider: ModelProviderClass; modelId: string } | null {
+  if (brainFamily !== 'claude' && haveClaude) return { provider: 'claude', modelId: boundaryClaudeJudgeModel() };
+  if (brainFamily !== 'codex' && haveCodex) return { provider: 'codex', modelId: boundaryCodexJudgeModel() };
+  return null;
+}
+
+/** Resolve a cheap boundary judge whose family differs from the active brain.
+ *  Returns model:null (and selfJudge:true) when no different family is available
+ *  or the kill-switch is off — the caller then dispatches MODELS.fast unchanged. */
+export function resolveBoundaryJudge(): BoundaryJudgeRouting {
+  const brainFamily = resolveRoleModel('brain').provider;
+  if (!judgeCrossFamilyEnabled()) {
+    return { model: null, modelId: MODELS.fast, judgeFamily: brainFamily, brainFamily, selfJudge: true };
+  }
+  const haveClaude = claudeAvailable();
+  const haveCodex = codexAvailable();
+  const target = chooseBoundaryJudgeFamily(brainFamily, haveClaude, haveCodex);
+  if (target) {
+    const model = buildJudgeForRole(
+      { modelId: target.modelId, provider: target.provider, source: 'default' },
+      haveClaude,
+      haveCodex,
+    );
+    if (model) {
+      return { model, modelId: target.modelId, judgeFamily: target.provider, brainFamily, selfJudge: false };
+    }
+  }
+  // Fail-open: no guaranteed different family → keep MODELS.fast (current behavior), tagged.
+  return { model: null, modelId: MODELS.fast, judgeFamily: brainFamily, brainFamily, selfJudge: true };
 }
 
 export function resolveDebateBrains(passthrough: ModelProvider, modelName?: string): DebateBrains | null {

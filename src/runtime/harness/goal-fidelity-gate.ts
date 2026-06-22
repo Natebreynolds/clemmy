@@ -313,11 +313,12 @@ export function buildGoalFidelityPrompt(input: GoalFidelityJudgeInput): string {
  *  (caller converts to fail-open). Dynamic imports keep brackets.ts free of an
  *  SDK dependency at module load — same pattern as the grounding judge. */
 async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<GoalFidelityVerdict> {
-  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }] = await Promise.all([
+  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }] = await Promise.all([
     import('@openai/agents'),
     import('zod'),
     import('../../config.js'),
     import('../schema-normalizer.js'),
+    import('./debate-model.js'),
   ]);
   const VerdictSchema = z.object({
     fulfills: z.boolean().describe('False ONLY on a concrete, nameable gap between this action and the goal\'s intent or the skill\'s defining requirement. Vague/style/uncertain → true (fail open).'),
@@ -327,7 +328,9 @@ async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<Goal
   const agent = new Agent({
     name: 'GoalFidelityJudge',
     instructions: 'Verify an about-to-fire irreversible external action against the run\'s goal and the loaded skill\'s defining requirement. Output only the structured verdict.',
-    model: MODELS.fast,
+    // Cross-family boundary judge (avoids same-family self-grading); falls open to
+    // MODELS.fast when no different family is logged in.
+    model: resolveBoundaryJudge().model ?? MODELS.fast,
     // Binary verdict against an explicit rubric — low reasoning effort trims the
     // largest chunk of per-call latency on this hot path (same as the
     // completion judge).

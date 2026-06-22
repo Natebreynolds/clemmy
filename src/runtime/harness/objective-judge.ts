@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { MODELS } from '../../config.js';
 import type { RuntimeContextValue } from '../../types.js';
 import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
+import type { BoundaryJudgeRouting } from './debate-model.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -187,11 +188,13 @@ const VerdictSchema = z.object({
   reason: z.string().describe('One short sentence naming the missing evidence, or the artifact that satisfied the objective.'),
 });
 
-function buildJudgeAgent(): Agent<RuntimeContextValue, typeof VerdictSchema> {
+function buildJudgeAgent(routing?: BoundaryJudgeRouting): Agent<RuntimeContextValue, typeof VerdictSchema> {
   return new Agent<RuntimeContextValue, typeof VerdictSchema>({
     name: 'ObjectiveCompletionJudge',
     instructions: JUDGE_SYSTEM_PROMPT,
-    model: MODELS.fast,
+    // Cross-family boundary judge (avoids the brain self-grading); falls open to
+    // the cheap default model when no different family is available.
+    model: routing?.model ?? MODELS.fast,
     // A binary done/not-done verdict against an explicit rubric does not need
     // deep chain-of-thought — low reasoning effort cuts the largest chunk of
     // per-call latency on this hot path (the judge runs on most action turns).
@@ -277,8 +280,9 @@ export async function judgeObjectiveCompleteStrict(
   if (!objective.trim() || !assistantResponse.trim()) {
     throw new Error('insufficient text to judge');
   }
+  const { resolveBoundaryJudge } = await import('./debate-model.js');
   const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-  const result = await runner.run(buildJudgeAgent(), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
+  const result = await runner.run(buildJudgeAgent(resolveBoundaryJudge()), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
     maxTurns: 1,
   });
   const parsed = VerdictSchema.safeParse(result.finalOutput);
@@ -300,8 +304,9 @@ export async function judgeObjectiveComplete(
     return { done: true, reason: 'insufficient text to judge — accepting completion' };
   }
   try {
+    const { resolveBoundaryJudge } = await import('./debate-model.js');
     const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-    const result = await runner.run(buildJudgeAgent(), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
+    const result = await runner.run(buildJudgeAgent(resolveBoundaryJudge()), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
       maxTurns: 1,
     });
     const parsed = VerdictSchema.safeParse(result.finalOutput);
