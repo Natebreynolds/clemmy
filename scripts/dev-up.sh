@@ -3,7 +3,11 @@
 # Safe build harness:
 #   - installed Clementine.app quit (single owner of port + Codex auth → no race)
 #   - runs against your REAL home (real auth/data) BUT:
-#       * Discord OFF (no external chat posting / no leftover cards)
+#       * Discord ON by default so you can TEST via Discord (the parity surface).
+#         Opt out for pure automated smokes with: DEV_DISCORD=false ./scripts/dev-up.sh.
+#         Safe to leave on: proactivity is off (below) so the daemon won't post
+#         unsolicited — it just connects the bot so DMs/@mentions hit the dev build.
+#         (The installed app is quit above, so only this daemon owns the bot token.)
 #       * proactivity DISABLED (autonomy/briefs/check-ins won't fire) — original
 #         policy backed up to state/proactivity-policy.json.devbak, restored by dev-down.sh
 #   - the 3 staged FORK surfaces ON so smokes exercise the converted paths
@@ -52,13 +56,35 @@ node -e '
   fs.writeFileSync(dst, JSON.stringify(merged, null, 2) + "\n");
 ' "$POL_SRC" "$POL"
 
-echo "→ starting dev daemon from source (Discord off, FORK surfaces on, proactivity off)"
-( cd "$ROOT" && CLEMENTINE_HOME="$HOME_DIR" DISCORD_ENABLED="${DEV_DISCORD:-false}" \
+# Discord ON by default so Nathan can test via the Discord surface; DEV_DISCORD=false
+# suppresses it for pure automated smoke runs.
+DEV_DISCORD="${DEV_DISCORD:-true}"
+echo "→ starting dev daemon from source (Discord $DEV_DISCORD, FORK surfaces on, proactivity off)"
+( cd "$ROOT" && CLEMENTINE_HOME="$HOME_DIR" DISCORD_ENABLED="$DEV_DISCORD" \
     CLEMMY_HARNESS_DASHBOARD=on CLEMMY_HARNESS_HOME=on CLEMMY_HARNESS_WORKFLOW=on \
+    CLEMMY_CODE_MODE=on CLEMMY_CODE_MODE_WRITES=on \
     npx tsx src/index.ts daemon --foreground > /tmp/clem-dev-daemon.log 2>&1 ) &
 for _ in $(seq 1 60); do lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1 && break; sleep 1; done
 if lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
   echo "✓ dev daemon up on $PORT (source: $ROOT, home: $HOME_DIR)"
 else
   echo "✗ dev daemon failed to bind $PORT — see /tmp/clem-dev-daemon.log"; tail -25 /tmp/clem-dev-daemon.log; exit 1
+fi
+
+# When Discord is on, prove the bot actually CONNECTED (login happens async after
+# the port binds). "Discord bot ready" logs the bot tag + guild count; surface it
+# so a token/intents failure is obvious instead of a silently-dark test surface.
+if [ "$DEV_DISCORD" = "true" ]; then
+  printf '→ waiting for Discord to connect'
+  READY=""
+  for _ in $(seq 1 30); do
+    if grep -q "Discord bot ready" /tmp/clem-dev-daemon.log 2>/dev/null; then READY=1; break; fi
+    printf '.'; sleep 1
+  done
+  if [ -n "$READY" ]; then
+    TAG="$(grep -m1 "Discord bot ready" /tmp/clem-dev-daemon.log | sed -E 's/.*"user":"([^"]+)".*/\1/')"
+    printf '\r✓ Discord live as %s — DM the bot or @mention it to test           \n' "$TAG"
+  else
+    printf '\r⚠ Discord did not report ready in 30s — check /tmp/clem-dev-daemon.log (token/intents?)\n'
+  fi
 fi
