@@ -40,6 +40,7 @@
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
     "eval:passk": "tsx scripts/eval-passk.ts",
     "probe:judge": "tsx scripts/probe-boundary-judge.ts",
+    "probe:judge:live": "tsx scripts/probe-judge-live.ts",
     "stress:memory": "tsx scripts/memory-roundtrip-stress.ts",
     "smoke:fusion-readiness": "tsx scripts/smoke-fusion-readiness.ts",
     "test:smoke": "node scripts/smoke-fresh-install.mjs && node scripts/smoke-fresh-install-e2e.mjs",
