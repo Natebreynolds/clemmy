@@ -70,7 +70,8 @@
     "init-home": "tsx src/index.ts init-home",
     "auth": "tsx src/index.ts auth",
     "mcp": "tsx src/tools/mcp-server.ts",
-    "plugin": "tsx src/index.ts plugin"
+    "plugin": "tsx src/index.ts plugin",
+    "probe:code-mode": "tsx scripts/probe-code-mode.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.82",

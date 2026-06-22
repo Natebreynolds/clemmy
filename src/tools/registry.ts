@@ -4,6 +4,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { getComputerTools } from './computer-tools.js';
 import { getComposioRuntimeTools, getDynamicComposioRuntimeTools } from './composio-tools.js';
 import { getLocalRuntimeTools } from './local-runtime-tools.js';
+import { codeModeEnabled, buildCodeModeTool } from './code-mode-tool.js';
 
 export function getCoreTools(): Tool<RuntimeContextValue>[] {
   const request_destructive_action = tool({
@@ -24,6 +25,9 @@ export function getCoreTools(): Tool<RuntimeContextValue>[] {
     ...getLocalRuntimeTools(),
     ...getComputerTools(),
     ...getComposioRuntimeTools(),
+    // Code Mode (Lane C) — programmatic tool calling, behind CLEMMY_CODE_MODE.
+    // Off by default → the surface is byte-identical until validated.
+    ...(codeModeEnabled() ? [buildCodeModeTool()] : []),
   ];
 }
 
