@@ -95,9 +95,13 @@ function inRanges(idx: number, ranges: Array<[number, number]>): boolean {
 }
 
 // A figure: optional currency prefix, a digit core (with comma groups + decimals),
-// optional scale/percent/x suffix. Classification + noise-filtering happen after.
+// optional scale/percent/x suffix. The trailing `(?![A-Za-z])` forces the suffix
+// to a word boundary so "7 months" is not read as "7M" (7,000,000) and "5 boxes"
+// is not "5B" — the K/M/B/x letters only count when not glued to a word. The
+// engine backtracks `\s?`/the suffix to land on the bare number in those cases.
+// Classification + further noise-filtering happen after.
 const FIGURE_RE =
-  /([$€£])?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?(%|percent|pp|bn|mn|[KMBkmb]|x)?/g;
+  /([$€£])?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?(%|percent|pp|bn|mn|[KMBkmb]|x)?(?![A-Za-z])/g;
 
 function extractLabels(context: string): string[] {
   const out: string[] = [];

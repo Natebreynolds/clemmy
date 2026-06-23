@@ -72,7 +72,9 @@
     "mcp": "tsx src/tools/mcp-server.ts",
     "plugin": "tsx src/index.ts plugin",
     "probe:code-mode": "tsx scripts/probe-code-mode.ts",
-    "smoke:all": "bash scripts/smoke-all.sh"
+    "smoke:all": "bash scripts/smoke-all.sh",
+    "eval:jobs": "tsx scripts/eval-jobs.ts",
+    "job:capture": "tsx scripts/capture-job-fixture.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.82",

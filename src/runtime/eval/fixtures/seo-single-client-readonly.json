@@ -1,0 +1,18 @@
+{
+  "id": "seo-single-client-readonly",
+  "objective": "Pull a client's organic SEO metrics for the last 7 months and summarize what's working — read-only, no changes.",
+  "maxToolCalls": 40,
+  "events": [
+    { "type": "user_input_received", "role": "user", "data": { "text": "Pull D'Amore Law's organic SEO metrics for the last 7 months and summarize. Read only." } },
+    { "type": "tool_called", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_sf", "arguments": "sf data query --query \"SELECT Name, Website FROM Account WHERE Name LIKE '%D''Amore%'\"" } },
+    { "type": "tool_returned", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_sf", "output": "D'Amore Law Group | damorelaw.com | PPC spend on file: $0" } },
+    { "type": "tool_called", "role": "orchestrator", "data": { "tool": "composio_execute_tool", "callId": "c_dfs", "arguments": "DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE damorelaw.com" } },
+    { "type": "tool_returned", "role": "orchestrator", "data": { "tool": "composio_execute_tool", "callId": "c_dfs", "output": "ok (status 20000)" } },
+    { "type": "conversation_completed", "role": "Clem", "data": { "reply": "D'Amore Law (damorelaw.com) — last 7 months, organic only: estimated organic traffic ~6,461 visits/mo across 1,204 ranking keywords, average position 12.4. No paid search spend detected ($0). Read-only pull; nothing was changed.", "summary": "Summarized D'Amore Law organic SEO (read-only)." } }
+  ],
+  "toolOutputs": [
+    { "callId": "c_sf", "tool": "run_shell_command", "output": "Account: D'Amore Law Group | Website: damorelaw.com | PPC spend on file: $0" },
+    { "callId": "c_dfs", "tool": "composio_execute_tool", "output": "damorelaw.com 7-month organic estimate: organic_etv 6460.78; organic_keywords_count 1204; avg_position 12.4; paid_spend 0" }
+  ],
+  "finalAnswerText": "D'Amore Law (damorelaw.com) — last 7 months, organic only: estimated organic traffic ~6,461 visits/mo across 1,204 ranking keywords, average position 12.4. No paid search spend detected ($0). Read-only pull; nothing was changed."
+}
