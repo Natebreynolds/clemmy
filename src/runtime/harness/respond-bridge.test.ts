@@ -24,6 +24,8 @@ const {
 const { getSession, resetEventLog } = await import('./eventlog.js');
 // eslint-disable-next-line import/first
 const { AgentRuntimeCancelledError } = await import('../provider.js');
+// eslint-disable-next-line import/first
+const { ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
 
 const FAKE_AGENT = {} as never;
 const okConfigure = (async () => ({ ok: true })) as never;
@@ -227,6 +229,62 @@ test('respondPreferHarness: Claude SDK brain opt-in does not route execution sur
   assert.equal(res.text, 'harness');
   assert.equal(runConversationCalled, 1);
   assert.equal(claudeBrainCalled, 0, 'workflow stays on the guarded harness until mutation parity is ported');
+});
+
+test('Claude SDK brain overload (uncommitted) falls the turn over to the harness brain (Codex→GLM)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string }) => {
+      runConversationCalled += 1;
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, lastDecision: { reply: 'harness-fallover', summary: 's', done: true, nextAction: 'completed' } };
+    }) as never,
+    // Overloaded with NOTHING committed (no tool, no stream) → safe to re-run elsewhere.
+    claudeAgentBrain: (async () => { throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', false); }) as never,
+  });
+
+  const res = await respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-ok' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+  assert.equal(res.text, 'harness-fallover', 'turn ran on the harness brain after Claude overloaded');
+  assert.equal(runConversationCalled, 1);
+});
+
+test('Claude SDK brain overload AFTER committing surfaces the error (no double-act)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => { runConversationCalled += 1; return { status: 'completed' }; }) as never,
+    // committed=true (a tool ran / text streamed) → must NOT re-run on another brain.
+    claudeAgentBrain: (async () => { throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', true); }) as never,
+  });
+
+  await assert.rejects(
+    respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-unsafe' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId })),
+    /529 Overloaded/,
+  );
+  assert.equal(runConversationCalled, 0, 'no fallover once the turn committed work');
+});
+
+test('CLEMMY_BRAIN_FALLOVER=off disables the chat-brain fallover (overload surfaces)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'off';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => ({ status: 'completed' })) as never,
+    claudeAgentBrain: (async () => { throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', false); }) as never,
+  });
+  await assert.rejects(
+    respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-off' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId })),
+    /529 Overloaded/,
+  );
+  delete process.env.CLEMMY_BRAIN_FALLOVER;
 });
 
 test('respondPreferHarness: harness run errors PROPAGATE — no post-start legacy retry', async () => {

@@ -33,6 +33,60 @@ export function setClaudeAgentSdkReflectionForTest(fn: ReflectFn | null): void {
   reflectImpl = fn ?? scheduleReflection;
 }
 
+// -------- In-lane provider-overload retry (first-byte-safe) --------
+// The Claude Code SDK has no retry/fallover of its own: a 529 Overloaded / 5xx
+// from `query()` throws "Claude Code returned an error result: API Error: …"
+// terminally. This made an Anthropic overload dead-end EVERY raw-SDK caller
+// (workflow steps, chat brain, run_worker) — none of which pass through
+// RouterModelProvider's withModelFallback. We retry the WHOLE query with backoff,
+// but ONLY when it's safe: no tool executed and nothing streamed to the user yet,
+// so a re-run can't double-act or duplicate visible output. A mid-run overload
+// (after tools) is left to the CALLER's step/turn-boundary cross-provider switch.
+
+/**
+ * Thrown when the Claude SDK lane gives up on a provider overload/5xx (after
+ * the first-byte retries). `committed` tells a caller whether anything was
+ * already done this turn (a tool ran OR text streamed to the user) — when it's
+ * FALSE the turn never progressed, so a caller that can run on another provider
+ * may safely re-dispatch the WHOLE turn/step without double-acting. When TRUE,
+ * the caller must surface the error (re-running could double-send / duplicate).
+ * `.message` is the SDK's verbatim message, so existing message-based checks
+ * (isTransientStepError) keep working unchanged.
+ */
+export class ClaudeSdkProviderOverloadError extends Error {
+  readonly overloaded = true;
+  constructor(message: string, readonly committed: boolean) {
+    super(message);
+    this.name = 'ClaudeSdkProviderOverloadError';
+  }
+}
+
+/** Anthropic/Codex SDK overloads embed the status in the message text. */
+export function isProviderOverloadMessage(msg: string): boolean {
+  if (!msg) return false;
+  return /\boverloaded\b/i.test(msg)
+    || /internal server error/i.test(msg)
+    || /service unavailable|bad gateway|gateway timeout|temporarily unavailable/i.test(msg)
+    || /\b(?:api error|http|status)\s*[:#]?\s*(?:429|500|502|503|504|529)\b/i.test(msg);
+}
+
+function overloadRetryEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_OVERLOAD_RETRY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+function maxOverloadRetries(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_OVERLOAD_RETRIES', '2') || '2', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+}
+/** Bounded exponential backoff with jitter: ~1.5s, ~3.5s. Base tunable
+ *  (CLEMMY_CLAUDE_SDK_OVERLOAD_BACKOFF_MS) so tests don't pay real seconds. */
+function overloadBackoffMs(attempt: number): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_OVERLOAD_BACKOFF_MS', '') || '', 10);
+  const baseUnit = Number.isFinite(raw) && raw >= 0 ? raw : 1500;
+  const base = baseUnit * Math.pow(2, attempt);
+  return Math.min(15_000, base) + Math.floor(Math.random() * 500);
+}
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'ping',
   'memory_search',
@@ -467,10 +521,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ? `[CONVERSATION SO FAR — prior turns in THIS session; treat as authoritative, do NOT re-ask decisions already made]\n${renderTranscriptTurns(options.priorTurns)}\n\n[Latest message]\n${options.prompt}`
     : options.prompt;
 
-  const stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
   let result: SDKResultMessage | null = null;
   let init: SDKSystemMessage | null = null;
-  const toolUses: string[] = [];
+  let toolUses: string[] = [];
   // Learning OUT (brain continuity). The Agent SDK runs its tool loop OUTSIDE
   // the @openai/agents RunHooks, so the onToolEnd → scheduleReflection path the
   // Codex loop uses (hooks.ts) never fires here. Without this, a Claude
@@ -482,7 +535,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // with Codex, not a second pipeline.
   const reflectSessionId = options.sessionId?.trim();
   const reflectLearning = Boolean(reflectSessionId) && claudeSdkReflectionEnabled();
-  const toolById = new Map<string, { name: string; input: unknown }>();
   // Keep the latest assistant text so a turn-budget stop can surface the partial
   // answer (error results carry no `result` field).
   let lastAssistantText = '';
@@ -492,36 +544,63 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // That bypasses the clean-result grace below, so a workflow step hard-failed.
   // Catch it here and fall through to the same limitHit handling.
   let threwTurnLimit = false;
-  try {
-    for await (const message of stream) {
-      init = init ?? extractInit(message);
-      if (options.onDelta) {
-        const delta = extractTextDelta(message);
-        if (delta) { try { await options.onDelta(delta); } catch { /* a delta-sink error must never break the run */ } }
-      }
-      const atext = extractAssistantText(message);
-      if (atext) lastAssistantText = atext;
-      if (reflectLearning) for (const use of extractToolUseIds(message)) toolById.set(use.id, { name: use.name, input: use.input });
-      toolUses.push(...extractAssistantToolUses(message));
-      if (reflectLearning) {
-        for (const tr of extractToolResults(message)) {
-          if (!tr.output) continue;
-          const source = toolById.get(tr.callId);
-          const tool = source ? reflectionToolName(source.name, source.input) : null;
-          reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
+  // FIRST-BYTE-SAFE overload retry: re-run the whole query on an Anthropic
+  // overload/5xx ONLY while nothing has been committed yet (no tool executed,
+  // nothing streamed to the user) — so a retry can't double-act or duplicate
+  // visible output. Once tools run or deltas stream, the error propagates and
+  // the caller decides (workflow step re-dispatch / chat turn-boundary switch).
+  let streamedAny = false;
+  for (let attempt = 0; ; attempt++) {
+    result = null;
+    init = null;
+    toolUses = [];
+    lastAssistantText = '';
+    threwTurnLimit = false;
+    const toolById = new Map<string, { name: string; input: unknown }>();
+    const stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
+    try {
+      for await (const message of stream) {
+        init = init ?? extractInit(message);
+        if (options.onDelta) {
+          const delta = extractTextDelta(message);
+          if (delta) { streamedAny = true; try { await options.onDelta(delta); } catch { /* a delta-sink error must never break the run */ } }
         }
+        const atext = extractAssistantText(message);
+        if (atext) lastAssistantText = atext;
+        if (reflectLearning) for (const use of extractToolUseIds(message)) toolById.set(use.id, { name: use.name, input: use.input });
+        toolUses.push(...extractAssistantToolUses(message));
+        if (reflectLearning) {
+          for (const tr of extractToolResults(message)) {
+            if (!tr.output) continue;
+            const source = toolById.get(tr.callId);
+            const tool = source ? reflectionToolName(source.name, source.input) : null;
+            reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
+          }
+        }
+        result = extractResult(message) ?? result;
       }
-      result = extractResult(message) ?? result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && (result?.subtype ?? 'success') !== 'success') {
+        threwTurnLimit = true;
+      } else if (isProviderOverloadMessage(msg)) {
+        const committed = toolUses.length > 0 || streamedAny;
+        // Safe first-byte retry: nothing committed yet and budget remains.
+        if (overloadRetryEnabled() && !committed && attempt < maxOverloadRetries()) {
+          try { stream.close?.(); } catch { /* ignore */ }
+          await sleep(overloadBackoffMs(attempt));
+          continue;
+        }
+        // Give up — surface a TYPED error so a caller that can switch providers
+        // re-dispatches when it's safe (committed=false), else surfaces it.
+        throw new ClaudeSdkProviderOverloadError(msg, committed);
+      } else {
+        throw err;
+      }
+    } finally {
+      try { stream.close?.(); } catch { /* ignore */ }
     }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && (result?.subtype ?? 'success') !== 'success') {
-      threwTurnLimit = true;
-    } else {
-      throw err;
-    }
-  } finally {
-    try { stream.close?.(); } catch { /* ignore */ }
+    break; // success (or a turn-limit stop) → leave the retry loop
   }
 
   if (threwTurnLimit) {

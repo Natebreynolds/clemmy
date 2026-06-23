@@ -39,8 +39,10 @@ import { configureHarnessRuntime } from './codex-client.js';
 import { clearKill, createSession, getSession, requestKill } from './eventlog.js';
 import { listPending } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from './claude-agent-brain.js';
+import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { getRuntimeEnv } from '../../config.js';
+import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 
@@ -284,7 +286,28 @@ export async function respondPreferHarness(
   }
   if (!auth.ok) return legacyRespond(request);
   if (claudeAgentSdkBrainEnabled(surface)) {
-    return claudeAgentBrainImpl(surface, request);
+    try {
+      return await claudeAgentBrainImpl(surface, request);
+    } catch (err) {
+      // Claude SDK brain gave up on a provider overload BEFORE committing
+      // anything this turn (no tool ran, nothing streamed) → fall the WHOLE turn
+      // over to the standard harness brain (Codex→GLM via RouterModelProvider,
+      // which has its own first-byte fallover). committed=true → surface it (a
+      // re-run could double-act / duplicate the partial reply). This brings the
+      // Claude SDK chat lane to parity with how the Codex/GLM brains already
+      // fall over. Kill-switch: CLEMMY_BRAIN_FALLOVER=off.
+      if (chatBrainFalloverEnabled() && err instanceof ClaudeSdkProviderOverloadError && !err.committed) {
+        bridgeLogger.warn({ surface }, 'Claude brain overloaded at turn start — falling the turn over to the harness brain (Codex→GLM)');
+        return respondViaHarness(surface, request);
+      }
+      throw err;
+    }
   }
   return respondViaHarness(surface, request);
+}
+
+const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
+
+function chatBrainFalloverEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
 }

@@ -16,6 +16,7 @@ const {
   validateRoleModelBinding,
   brainOptions,
   effectiveBrain,
+  falloverBrainModelIds,
 } = await import('./model-role-options.js');
 
 function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
@@ -207,5 +208,37 @@ test('brainOptions hides BYO when no backend; effectiveBrain follows AUTH_MODE o
   }, () => {
     assert.equal(brainOptions().some((o) => o.id === 'api_key'), false, 'no BYO brain option without a backend');
     assert.equal(effectiveBrain(), 'codex_oauth');
+  });
+});
+
+test('falloverBrainModelIds — Claude→Codex→GLM order, excludes current, [] in all_in', () => {
+  writeAuthFiles(); // codex + claude OAuth present
+  const byoEnv = {
+    BYO_MODEL_BASE_URL: 'https://api.z.ai/api/paas/v4',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'glm-5.2',
+  };
+
+  // Brain = Claude, overload → next targets are Codex then GLM (claude excluded).
+  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'claude_oauth' }, () => {
+    const chain = falloverBrainModelIds('claude');
+    assert.deepEqual(chain.map((c) => c.provider), ['codex', 'byo'], 'Claude falls to Codex then GLM');
+    assert.equal(chain.find((c) => c.provider === 'byo')?.modelId, 'glm-5.2');
+    assert.equal(chain.some((c) => c.provider === 'claude'), false, 'never includes the current brain');
+  });
+
+  // Brain = Codex → Claude then GLM.
+  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'codex_oauth' }, () => {
+    assert.deepEqual(falloverBrainModelIds('codex').map((c) => c.provider), ['claude', 'byo']);
+  });
+
+  // all_in (BYO-only) → no cross-provider targets.
+  withEnv({ ...byoEnv, MODEL_ROUTING_MODE: 'all_in', AUTH_MODE: 'codex_oauth' }, () => {
+    assert.deepEqual(falloverBrainModelIds('byo'), []);
+  });
+
+  // No BYO configured → Claude falls to Codex only.
+  withEnv({ BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '', MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'claude_oauth' }, () => {
+    assert.deepEqual(falloverBrainModelIds('claude').map((c) => c.provider), ['codex']);
   });
 });

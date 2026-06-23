@@ -289,3 +289,64 @@ test('learning-OUT is skipped without a session id and when kill-switched off', 
     else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = prior;
   }
 });
+
+// --- In-lane provider-overload retry (first-byte-safe) -----------------------
+
+process.env.CLEMMY_CLAUDE_SDK_OVERLOAD_BACKOFF_MS = '1'; // keep retries instant in tests
+
+function stubsFor(gen: AsyncGenerator<SDKMessage>): Query {
+  return Object.assign(gen, {
+    close() {}, interrupt: async () => {}, setPermissionMode: async () => {},
+    setModel: async () => {}, setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+    streamInput: async () => {}, stopTask: async () => false, backgroundTasks: async () => false,
+  }) as Query;
+}
+function throwingQuery(msg: string): Query {
+  return stubsFor((async function* () { throw new Error(msg); })());
+}
+function successQuery(text: string): Query {
+  return stubsFor((async function* () {
+    yield { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 's', uuid: 'i', apiKeySource: 'none', claude_code_version: '2', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any;
+    yield { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: text, duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] } as any;
+  })());
+}
+function toolThenThrowQuery(msg: string): Query {
+  return stubsFor((async function* () {
+    yield { type: 'assistant', session_id: 's', uuid: 'a', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', name: 'mcp__clementine-local__ping' }] } } as any;
+    throw new Error(msg);
+  })());
+}
+
+test('overload at first byte is retried and then succeeds (no tools ran yet)', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    calls++;
+    return calls === 1
+      ? throwingQuery('Claude Code returned an error result: API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.')
+      : successQuery('recovered');
+  }) as any);
+  const r = await runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' });
+  assert.equal(calls, 2, 'retried once');
+  assert.equal(r.text, 'recovered');
+});
+
+test('overload AFTER a tool ran is NOT retried (would double-act) — it throws', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => { calls++; return toolThenThrowQuery('API Error: 529 Overloaded'); }) as any);
+  await assert.rejects(runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' }), /529 Overloaded/);
+  assert.equal(calls, 1, 'no retry once a tool executed');
+});
+
+test('a deterministic (non-overload) error is never retried', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => { calls++; return throwingQuery('API Error: 400 Bad Request: invalid schema'); }) as any);
+  await assert.rejects(runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' }), /400/);
+  assert.equal(calls, 1, 'no retry on a 4xx');
+});
+
+test('retries are bounded and then the overload surfaces', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => { calls++; return throwingQuery('API Error: 529 Overloaded'); }) as any);
+  await assert.rejects(runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' }), /529/);
+  assert.equal(calls, 3, '1 initial + 2 retries (default cap), then throws');
+});

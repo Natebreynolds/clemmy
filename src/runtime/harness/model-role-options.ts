@@ -55,6 +55,26 @@ export function codexModelsAvailable(): boolean {
   }
 }
 
+export type BrainProviderClass = 'codex' | 'claude' | 'byo';
+
+/**
+ * Ordered cross-provider fallover targets (model ids) EXCLUDING `current` —
+ * the SAME order RouterModelProvider.buildBrainChain uses (codex, then claude,
+ * then the configured BYO backend), restricted to brains that are actually
+ * connected. Used for STEP-BOUNDARY re-dispatch when a brain's provider is down
+ * mid-run, where in-stream fallover can't fire (FallbackModel only switches
+ * before the first byte). `all_in` mode returns [] (one provider, nowhere to go).
+ */
+export function falloverBrainModelIds(current: BrainProviderClass): Array<{ provider: BrainProviderClass; modelId: string }> {
+  if (getModelRoutingMode() === 'all_in') return [];
+  const out: Array<{ provider: BrainProviderClass; modelId: string }> = [];
+  if (current !== 'codex' && codexModelsAvailable()) out.push({ provider: 'codex', modelId: MODELS.primary });
+  if (current !== 'claude' && claudeModelsAvailable()) out.push({ provider: 'claude', modelId: getClaudeBrainModel() });
+  const byo = getByoBackendConfig();
+  if (current !== 'byo' && byo.configured) out.push({ provider: 'byo', modelId: byo.primaryId || MODELS.primary });
+  return out;
+}
+
 export function claudeModelsAvailable(): boolean {
   try {
     const t = getStoredClaudeTokens();

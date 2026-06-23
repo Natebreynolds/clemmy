@@ -6,6 +6,8 @@ import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
+import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs } from './step-binding.js';
@@ -1829,7 +1831,83 @@ export async function runWithContractLoop<T>(
   }
 }
 
+/** Brain-fallover kill-switch — shared with the harness's CLEMMY_BRAIN_FALLOVER
+ *  (default on). Off → a step runs on its resolved brain only (prior behavior). */
+function workflowBrainFalloverEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Step-boundary cross-provider fallover. Runs the step on its resolved brain
+ *  first (with the normal transient-retry budget); if that brain's PROVIDER is
+ *  still failing transiently after retries, re-runs the WHOLE step on the next
+ *  connected brain (Codex → Claude → BYO order, minus the current one). This is
+ *  the only safe place to switch providers: a 529 thrown mid-stream (21 min into
+ *  an agentic run) can't be transplanted to another model, but a fresh step
+ *  attempt can. Guarded for write/send steps: never re-run a step that already
+ *  recorded an external write (would double-act) — surface the original error.
+ *  Healthy runs and read steps are unaffected; the extra attempts only fire on a
+ *  post-retry transient (provider-overload) failure. */
 async function executeStepVerified(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+): Promise<unknown> {
+  if (!workflowBrainFalloverEnabled() || step.deterministic) {
+    return runStepVerifiedAttempt(step, ctx);
+  }
+  const currentProvider = resolveProvider(resolveWorkflowStepModel(step).model ?? MODELS.primary) as BrainProviderClass;
+  const nextBrains = falloverBrainModelIds(currentProvider);
+  if (nextBrains.length === 0) return runStepVerifiedAttempt(step, ctx);
+
+  let lastErr: unknown;
+  // Attempt 0 = the step's own brain; 1..N = each fallover brain.
+  for (let i = 0; i <= nextBrains.length; i++) {
+    const target = i === 0 ? null : nextBrains[i - 1];
+    if (target) {
+      // Side-effect guard (only matters once we're SWITCHING, i>0): a write/send
+      // step that already claimed an external write must not re-run on a new
+      // brain. Read steps re-run freely.
+      if (!canSwitchBrainForStep(step, ctx)) {
+        logger.warn({ stepId: step.id, to: target.provider }, 'workflow step failed on its brain but already wrote externally — not re-dispatching (would double-act)');
+        break;
+      }
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_advisory',
+        stepId: step.id,
+        meta: { reason: 'brain_fallover', from: currentProvider, to: target.provider, toModel: target.modelId },
+      });
+      logger.warn({ stepId: step.id, from: currentProvider, to: target.provider, model: target.modelId }, 'workflow step provider failing — switching brain at step boundary');
+    }
+    const attemptStep = target ? { ...step, model: target.modelId } : step;
+    try {
+      return await runStepVerifiedAttempt(attemptStep, ctx);
+    } catch (err) {
+      if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
+      // Only a transient PROVIDER failure justifies switching brains; a real
+      // deterministic error (bad input, contract, 4xx) repeats identically on
+      // any model — fail fast, don't burn the whole chain.
+      if (!isTransientStepError(err)) throw err;
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+/** Read steps (and steps that have not yet recorded an external write) are safe
+ *  to re-run on another brain. A write/send step that ALREADY recorded an
+ *  external_write under its deterministic session is NOT — re-running could
+ *  double-send. Mirrors the forEach crash-resume reconciliation. */
+function canSwitchBrainForStep(step: WorkflowStepInput, ctx: StepExecutionContext): boolean {
+  if (stepSideEffectClass(step) === 'read') return true;
+  try {
+    const sid = getWorkflowHarnessSession(ctx.workflow.name, step.id, ctx.runId, `${ctx.runId}:${step.id}`).id;
+    return listHarnessEvents(sid, { types: ['external_write'] }).length === 0;
+  } catch {
+    // If we can't prove it's clean, be conservative: don't re-run a mutating step.
+    return false;
+  }
+}
+
+async function runStepVerifiedAttempt(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {

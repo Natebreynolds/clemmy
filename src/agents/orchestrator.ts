@@ -39,6 +39,8 @@ import {
 } from '../runtime/harness/guardrails.js';
 import { DEFAULT_MAX_TURNS, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
+import { ClaudeSdkProviderOverloadError } from '../runtime/harness/claude-agent-sdk.js';
+import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -147,6 +149,13 @@ export interface BuildOrchestratorAgentOptions {
  *  optional packet intent and uses the role-wide Worker binding. */
 function workerIntentRoutingEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_INTENT_ROUTING', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+/** Cross-provider worker fallover (shares the brain-fallover kill-switch,
+ *  default on): a Claude SDK worker that overloads before committing re-runs
+ *  the item on the next connected brain. */
+function workerBrainFalloverEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 interface ChatWorkerModelRoute {
@@ -740,25 +749,47 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // Pass the PARENT chat session so the Claude SDK worker's gates +
         // plan-scope + execution lane aggregate across the fan-out (one batch
         // approval covers all workers).
-        const sdkResult = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
-        appendWorkerRoute({
-          ...(route.trace ?? {
-            seam: 'chat',
-            attemptedIntent: input.intent ?? null,
-            matchedIntent: null,
-            item: input.item,
+        try {
+          const sdkResult = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
+          appendWorkerRoute({
+            ...(route.trace ?? {
+              seam: 'chat',
+              attemptedIntent: input.intent ?? null,
+              matchedIntent: null,
+              item: input.item,
+              modelId: workerModel,
+              provider: 'claude',
+              source: 'default',
+            }),
             modelId: workerModel,
             provider: 'claude',
-            source: 'default',
-          }),
-          modelId: workerModel,
-          provider: 'claude',
-          transport: 'claude_agent_sdk_worker',
-          sdkSessionId: sdkResult.sdkSessionId ?? null,
-          sdkModel: sdkResult.model ?? null,
-          toolUses: sdkResult.toolUses,
-        });
-        return sdkResult.text;
+            transport: 'claude_agent_sdk_worker',
+            sdkSessionId: sdkResult.sdkSessionId ?? null,
+            sdkModel: sdkResult.model ?? null,
+            toolUses: sdkResult.toolUses,
+          });
+          return sdkResult.text;
+        } catch (err) {
+          // Claude SDK worker overloaded BEFORE committing anything (no tool ran,
+          // nothing streamed) → fall THIS item over to the nested worker lane on
+          // the next brain (Codex→GLM via RouterModelProvider, which handles any
+          // further hop). committed=true → rethrow (a re-run could double-act).
+          // Kill-switch CLEMMY_BRAIN_FALLOVER.
+          const next = (workerBrainFalloverEnabled() && err instanceof ClaudeSdkProviderOverloadError && !err.committed)
+            ? falloverBrainModelIds('claude')[0]
+            : undefined;
+          if (!next) throw err;
+          appendWorkerRoute({
+            seam: 'chat', item: input.item, attemptedIntent: input.intent ?? null,
+            modelId: next.modelId, provider: next.provider,
+            transport: 'worker_fallover_from_claude', source: 'fallover', toolUses: [],
+          });
+          const fbOptions = workerThrashGuardEnabled()
+            ? { ...runWorkerAsToolOptions, runOptions: { maxTurns: resolveWorkerMaxTurns(input.intent, workerMaxTurns) } }
+            : runWorkerAsToolOptions;
+          if (!runContext) throw new Error('run_worker requires an SDK run context');
+          return worker.clone({ model: next.modelId }).asTool(fbOptions).invoke(runContext, JSON.stringify(input), details);
+        }
       }
       if (route.trace) appendWorkerRoute(route.trace);
       const workerForCall = route.model ? worker.clone({ model: route.model }) : worker;
