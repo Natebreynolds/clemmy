@@ -67,3 +67,53 @@ test('a data source with no schedule never fires', async () => {
   assert.equal(res.fired, 0);
   assert.deepEqual(data.readData(slug), {});
 });
+
+test('E2: a runner _reengage signal fires a threshold re-engage once, dedupes, and re-fires after it clears', async () => {
+  const slug = 'sched-rg';
+  store.spaceStore.save({
+    id: slug, title: 'Reengage',
+    dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: '* * * * *' }],
+    reengage: { triggers: ['threshold'] },
+  });
+  const emit = (re: string) => writeRunner(slug, 'r.mjs', `process.stdout.write(JSON.stringify({rows:[{a:1}],_reengage:${re}}))`);
+  const fires = () => data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length;
+
+  // T1: condition A crosses → fires once. (1-minute catch-up windows step by step.)
+  emit('{"fire":true,"key":"cold-A","message":"3 deals cold"}');
+  await sched.processSpaceSchedules(new Date('2026-06-08T10:01:00.000Z'));
+  assert.equal(fires(), 1);
+
+  // T2: same condition (key A) persists → deduped, no new fire.
+  await sched.processSpaceSchedules(new Date('2026-06-08T10:02:00.000Z'));
+  assert.equal(fires(), 1);
+
+  // T3: a NEW condition (key B) → fires again.
+  emit('{"fire":true,"key":"cold-B","message":"5 deals cold"}');
+  await sched.processSpaceSchedules(new Date('2026-06-08T10:03:00.000Z'));
+  assert.equal(fires(), 2);
+
+  // T4: condition clears (fire:false) → no re-engage, dedup reset.
+  emit('{"fire":false}');
+  await sched.processSpaceSchedules(new Date('2026-06-08T10:04:00.000Z'));
+  assert.equal(fires(), 2);
+
+  // T5: condition A returns → re-fires (the cleared dedup allows it).
+  emit('{"fire":true,"key":"cold-A","message":"back cold"}');
+  await sched.processSpaceSchedules(new Date('2026-06-08T10:05:00.000Z'));
+  assert.equal(fires(), 3);
+
+  store.spaceStore.archive(slug);
+});
+
+test('E2: a source with no _reengage signal never fires a re-engage', async () => {
+  const slug = 'sched-norg';
+  store.spaceStore.save({
+    id: slug, title: 'NoRe',
+    dataSources: [{ id: 'pull', runner: 'r.mjs', schedule: '* * * * *' }],
+    reengage: { triggers: ['threshold'] },
+  });
+  writeRunner(slug, 'r.mjs', 'process.stdout.write(JSON.stringify({rows:[{a:1}]}))');
+  await sched.processSpaceSchedules(new Date('2026-06-08T10:06:00.000Z'));
+  assert.equal(data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length, 0);
+  store.spaceStore.archive(slug);
+});

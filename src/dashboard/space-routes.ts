@@ -27,16 +27,9 @@ import {
   spaceActionApprovalEnabled, spaceActionNeedsApproval,
   enqueueSpaceActionApproval, initSpaceActionApprovals,
 } from '../spaces/space-action-gate.js';
-import { deliverOutcome } from '../runtime/outcome.js';
+import { reengageSpace } from '../spaces/reengage.js';
 
 type IsAuthorized = (req: Request) => boolean;
-
-/** The dedicated chat thread for a Workspace's floating "Ask Clem" dock +
- *  re-engage wakes. Stable + deterministic so the dock and the callback share
- *  one continuous per-workspace conversation. */
-export function spaceSessionId(slug: string): string {
-  return `space-${slug}`;
-}
 
 const CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -351,55 +344,13 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
   app.post('/api/console/spaces/:id/reengage', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = String(req.params.id ?? '');
-    const rec = spaceStore.get(slug);
-    if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
-    if (rec.status === 'archived') { res.status(423).json({ error: 'workspace is archived' }); return; }
-
+    if (!isValidSpaceSlug(slug)) { res.status(404).json({ error: 'not found' }); return; }
     const trigger: 'note' | 'ask' | 'threshold' =
       req.body?.trigger === 'ask' || req.body?.trigger === 'threshold' ? req.body.trigger : 'note';
-    const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
-    const actionId = typeof req.body?.actionId === 'string' && req.body.actionId.trim()
-      ? req.body.actionId.trim()
-      : `${trigger}-${message.slice(0, 24)}`;
-
-    // Always record the interaction durably (notes are the audit of what
-    // happened in the surface, even if we don't wake Clem for it).
-    if (message) appendNote(slug, { text: message, kind: trigger, meta: req.body?.meta });
-    appendAudit(slug, { method: 'POST', path: `/reengage/${trigger}`, outcome: 'ok' });
-
-    // A configured-but-unlisted, non-'ask' trigger is recorded only (no wake) —
-    // 'ask' is an explicit user request and always wakes.
-    const configured = rec.reengage?.triggers ?? [];
-    const shouldWake = trigger === 'ask' || configured.includes(trigger);
-    if (!shouldWake) { res.status(202).json({ ok: true, reengaged: false, reason: 'trigger not configured' }); return; }
-
-    try {
-      const guidance = rec.reengage?.guidance;
-      await deliverOutcome(
-        {
-          status: 'needs_input',
-          summary: message
-            ? `In your "${rec.title}" workspace: ${message}`
-            : `Activity in your "${rec.title}" workspace (${trigger}) needs a look.`,
-          detail: [
-            message ? `User: ${message}` : `Trigger: ${trigger}`,
-            guidance ? `What you set up to do here: ${guidance}` : '',
-            `Inspect the current state with space_get('${slug}').`,
-            `If the user wants to change the DATA (better/different rows, a tighter filter, fewer/more fields, one row per entity), edit the data runner then call space_refresh('${slug}') and report the new row count — do NOT say it's done while the surface still shows the old data. For layout/copy tweaks use space_edit_view.`,
-          ].filter(Boolean).join('\n\n'),
-        },
-        {
-          originSessionId: spaceSessionId(slug),
-          sourceLabel: 'workspace',
-          sourceId: `${slug}:${actionId}`,
-          title: rec.title,
-          statusHint: `space_get('${slug}')`,
-        },
-      );
-      res.status(202).json({ ok: true, reengaged: true, sessionId: spaceSessionId(slug) });
-    } catch (err) {
-      res.status(202).json({ ok: true, reengaged: false, error: err instanceof Error ? err.message : String(err) });
-    }
+    const message = typeof req.body?.message === 'string' ? req.body.message : '';
+    const actionId = typeof req.body?.actionId === 'string' ? req.body.actionId : undefined;
+    const { status, body } = await reengageSpace(slug, { trigger, message, actionId, meta: req.body?.meta });
+    res.status(status).json(body);
   });
 
   // Quiet helper so a stray directory under SPACES_DIR never 500s the list.

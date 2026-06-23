@@ -19,6 +19,8 @@ import { BASE_DIR } from '../config.js';
 import { cronMatches, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
 import { spaceStore } from './store.js';
 import { refreshSpaceData } from './runner.js';
+import { readData } from './data-store.js';
+import { reengageSpace } from './reengage.js';
 
 const STATE_FILE = path.join(BASE_DIR, 'state', 'space-schedule-state.json');
 const PRUNE_AFTER_MS = 2 * 24 * 60 * 60 * 1000;
@@ -26,6 +28,9 @@ const PRUNE_AFTER_MS = 2 * 24 * 60 * 60 * 1000;
 interface SpaceScheduleState {
   lastEvaluatedAtMs?: number;
   lastRunByMinute: Record<string, string>;
+  /** E2 dedup: per "space:source" → last fired re-engage condition key, so a
+   *  persistent threshold pings ONCE (not every scheduled refresh). */
+  lastReengageByKey: Record<string, string>;
 }
 
 function loadState(): SpaceScheduleState {
@@ -35,10 +40,31 @@ function loadState(): SpaceScheduleState {
       return {
         lastEvaluatedAtMs: typeof parsed.lastEvaluatedAtMs === 'number' ? parsed.lastEvaluatedAtMs : undefined,
         lastRunByMinute: (parsed.lastRunByMinute && typeof parsed.lastRunByMinute === 'object') ? parsed.lastRunByMinute : {},
+        lastReengageByKey: (parsed.lastReengageByKey && typeof parsed.lastReengageByKey === 'object') ? parsed.lastReengageByKey : {},
       };
     }
   } catch { /* fresh */ }
-  return { lastRunByMinute: {} };
+  return { lastRunByMinute: {}, lastReengageByKey: {} };
+}
+
+/**
+ * E2 — a scheduled runner may emit a reserved `_reengage` signal in its JSON
+ * output ({ fire:true, message?, key? }) to proactively wake Clem. A sandboxed
+ * runner can't authenticate to the /reengage route itself, so the scheduler
+ * (in-process) harvests it after a successful refresh and fires the canonical
+ * re-engage. Returns the firing condition's dedup key, or null when the source
+ * isn't asking to wake.
+ */
+function reengageSignalFor(slug: string, sourceId: string): { message: string; key: string } | null {
+  const data = readData(slug);
+  const src = (data && typeof data === 'object') ? (data as Record<string, unknown>)[sourceId] : undefined;
+  const sig = (src && typeof src === 'object') ? (src as Record<string, unknown>)._reengage : undefined;
+  if (!sig || typeof sig !== 'object') return null;
+  const s = sig as Record<string, unknown>;
+  if (s.fire !== true) return null;
+  const message = typeof s.message === 'string' ? s.message : '';
+  const key = (typeof s.key === 'string' && s.key.trim()) ? s.key.trim() : (message || 'fire');
+  return { message, key };
 }
 
 function saveState(state: SpaceScheduleState): void {
@@ -73,6 +99,7 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
   const state = loadState();
   const minutes = scheduleCatchupWindow(state.lastEvaluatedAtMs, now.getTime());
   const lastRun = state.lastRunByMinute;
+  const reengageKeys = state.lastReengageByKey;
   let evaluated = 0;
   let fired = 0;
   let errors = 0;
@@ -90,7 +117,29 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
         lastRun[key] = mk;
         try {
           const results = await refreshSpaceData(space.id, ds.id);
-          if (results.some((r) => !r.ok)) errors += 1; else fired += 1;
+          if (results.some((r) => !r.ok)) {
+            errors += 1;
+          } else {
+            fired += 1;
+            // E2: harvest a proactive re-engage signal, deduped by condition key
+            // (reusing `key` = "space:source") so a persistent threshold pings once.
+            const sig = reengageSignalFor(space.id, ds.id);
+            if (sig) {
+              if (reengageKeys[key] !== sig.key) {
+                reengageKeys[key] = sig.key;
+                try {
+                  await reengageSpace(space.id, {
+                    trigger: 'threshold', message: sig.message,
+                    // include the firing minute so a condition that CLEARS and
+                    // returns wakes again (deliverOutcome is idempotent by sourceId).
+                    actionId: `${ds.id}:${sig.key}:${mk}`, meta: { source: ds.id },
+                  });
+                } catch { /* best-effort; a wake must never break the tick */ }
+              }
+            } else if (reengageKeys[key]) {
+              delete reengageKeys[key]; // condition cleared → a recurrence can re-fire
+            }
+          }
         } catch {
           errors += 1;
         }
