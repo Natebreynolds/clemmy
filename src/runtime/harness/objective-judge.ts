@@ -126,16 +126,30 @@ export function isPromiseShapedReply(reply?: string | null): boolean {
 }
 
 /** Harness-injected inputs recorded as user_input_received that are NOT real
- *  user messages — continuation drips, judge retries, prose-corrections. Used
- *  to filter conversation history when composing the judged objective. */
+ *  user messages — continuation drips, judge retries, prose-corrections,
+ *  parse re-issues, grounding/YOLO/outcome re-prompts. Used to (a) filter
+ *  conversation history when composing the judged objective, and (b) keep
+ *  auto-memory from learning these as "user" facts (the 2026-06-23 pollution:
+ *  judge/stall/grounding re-prompts were stored as pinned "Standing prohibition"
+ *  facts injected into every chat + voice prompt). Every prefix is harness-
+ *  unique — a real user message never starts with one. */
 export const HARNESS_INJECTED_INPUT_PREFIXES = [
   'Continue with the next step of your plan.',
   'You marked this objective complete,',
   'Your previous response was prose, not an action.',
+  'Your previous response could not be parsed into the required structured decision',
+  'You already auto-resolved that approval question under YOLO',
+  'Before you deliver this:',
 ] as const;
 
 export function isHarnessInjectedInput(text: string): boolean {
-  return HARNESS_INJECTED_INPUT_PREFIXES.some((p) => text.startsWith(p));
+  const t = (text ?? '').trimStart();
+  if (HARNESS_INJECTED_INPUT_PREFIXES.some((p) => t.startsWith(p))) return true;
+  // Outcome-relay turns are injected with the durable `[<sourceLabel> <id> …]`
+  // marker (outcome.ts outcomePrefix) — a report-back from a background/workflow
+  // run, never a user message.
+  if (/^\[(?:background|workflow|cron|execution|task|run)\b[^\]]{0,80}\]/i.test(t)) return true;
+  return false;
 }
 
 /** Below this length, a user message is likely a bare follow-up ("just mine

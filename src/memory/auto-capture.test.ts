@@ -207,3 +207,47 @@ test('extractAutoMemoryCandidates still captures a genuine requirement that mere
   assert.equal(candidates[0]?.kind, 'project');
   assert.match(candidates[0]?.content ?? '', /Clementine requirement/i);
 });
+
+// ── Harness-injected input must NEVER become a "user" fact (2026-06-23 fix) ──
+// Judge/stall/parse/grounding/YOLO/outcome re-prompts were stored as pinned
+// "Standing prohibition" facts injected into every chat + voice prompt.
+import { isHarnessInjectedInput } from '../runtime/harness/objective-judge.js';
+
+test('isHarnessInjectedInput: recognizes harness re-prompts incl. the outcome marker', () => {
+  for (const t of [
+    'You marked this objective complete, but an independent verification check found it is NOT finished: do NOT retry.',
+    'Your previous response could not be parsed into the required structured decision. Re-issue it now.',
+    'You already auto-resolved that approval question under YOLO standing approval — do NOT wait.',
+    'Before you deliver this: $24.5K in your report does not match your captured data.',
+    'Continue with the next step of your plan.',
+    '[background bg-mq9 just finished — continue from here.]',
+  ]) {
+    assert.equal(isHarnessInjectedInput(t), true, `should flag harness input: ${t.slice(0, 40)}`);
+  }
+});
+
+test('isHarnessInjectedInput: does NOT flag genuine user messages', () => {
+  for (const t of [
+    'Always send Outlook mail from billing@acme.co — never the default account.',
+    'do not email the prod list under any circumstances',
+    'Pull a deal-risk workspace for Darrin Sennott',
+    'No, hold off on that for now',
+  ]) {
+    assert.equal(isHarnessInjectedInput(t), false, `should NOT flag user msg: ${t.slice(0, 40)}`);
+  }
+});
+
+test('extractAutoMemoryCandidates: harness re-prompts produce ZERO candidates (no Standing prohibition pollution)', () => {
+  // These contain "do not / NOT" and previously became pinned Standing prohibitions.
+  assert.deepEqual(
+    extractAutoMemoryCandidates('You marked this objective complete, but verification found it NOT finished — do NOT retry the send.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Before you deliver this: the figure does not match your captured tool results; recompute it.'),
+    [],
+  );
+  // A genuine standing prohibition from the USER still captures.
+  const real = extractAutoMemoryCandidates('Never email the test distribution list.');
+  assert.ok(real.length > 0, 'a real user prohibition is still captured');
+});

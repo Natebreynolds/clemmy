@@ -624,6 +624,10 @@ export interface RunTurnOptions {
   runRunner?: RunRunnerFn;
   /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. */
   onChunk?: (delta: string) => void | Promise<void>;
+  /** Set on continuation steps (step > 1) so auto-memory never learns from the
+   *  harness's own synthetic re-prompts (judge/stall/grounding/YOLO). Only the
+   *  first turn carries a real user message. (2026-06-23 fact-pollution fix.) */
+  suppressMemoryCapture?: boolean;
 }
 
 export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
@@ -1360,6 +1364,9 @@ async function runConversationCore(
       agent: options.agent,
       sessionId: options.sessionId,
       input: nextInput,
+      // Only the first step carries the real user message; every later step is a
+      // harness continuation (judge/stall/grounding re-prompt) → don't learn it.
+      suppressMemoryCapture: stepIndex > 1,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
@@ -2695,11 +2702,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // *as they're said*. The next turn's persistent-context block then
   // includes them automatically. Errors swallowed — capture failure
   // must never block the conversation.
+  // Auto-memory learns ONLY from a genuine first-turn user message in a chat
+  // session. Continuation steps (suppressMemoryCapture) carry the harness's own
+  // synthetic re-prompts, and workflow/execution/agent sessions carry machine
+  // input — neither should become durable "user" facts (2026-06-23 pollution).
+  // captureInteractionSignals also self-guards harness-injected text.
+  const shouldCapture = !options.suppressMemoryCapture && row.kind === 'chat';
   try {
-    const captured = captureInteractionSignals({
-      message: options.input,
-      sessionId: options.sessionId,
-    });
+    const captured = shouldCapture
+      ? captureInteractionSignals({ message: options.input, sessionId: options.sessionId })
+      : { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
     if (captured.candidates.length > 0 || captured.profilePatch) {
       // Facts now consolidate asynchronously through the Mem0 resolver,
       // so committed row ids aren't known synchronously — record the
@@ -4068,6 +4080,8 @@ async function runConversationFromResumeCore(opts: {
       agent: opts.agent,
       sessionId: opts.sessionId,
       input: resumeContinuationInput,
+      // Resume continuations are always harness-synthetic, never a user message.
+      suppressMemoryCapture: true,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: opts.makeRunner,

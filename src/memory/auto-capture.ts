@@ -4,7 +4,17 @@ import { consolidateFact } from './reflection.js';
 import { extractNamedResource } from './focus.js';
 import { saveUserProfile, type UserProfile } from '../runtime/user-profile.js';
 import { getRuntimeEnv } from '../config.js';
+import { isHarnessInjectedInput } from '../runtime/harness/objective-judge.js';
 import pino from 'pino';
+
+/** Defense-in-depth (2026-06-23): auto-memory must learn only from REAL user
+ *  messages — never from harness/judge/stall/grounding/outcome re-prompts that
+ *  the loop records as user_input_received. Those were being stored as pinned
+ *  "Standing prohibition" facts injected into every chat + voice prompt. Kill
+ *  switch (default on); =off restores the old always-capture behavior. */
+function autoCaptureHarnessSkipEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_AUTO_CAPTURE_HARNESS_SKIP', 'on') ?? 'on').toLowerCase() !== 'off';
+}
 
 const logger = pino({ name: 'clementine.auto-capture' });
 
@@ -177,6 +187,11 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // Don't fold a pasted workflow definition into facts (it pollutes the store
   // and duplicates the workflow store).
   if (autocapSkipWorkflowTextEnabled() && looksLikeWorkflowDefinitionDump(text)) return [];
+  // Harness-injected re-prompts (judge/stall/parse/grounding/YOLO/outcome) are
+  // recorded as user_input_received but must NEVER become durable "user" facts —
+  // they were being pinned as "Standing prohibition" and injected into every
+  // chat + voice prompt (2026-06-23 fact pollution).
+  if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = isSafetyProhibition(text);
@@ -324,6 +339,12 @@ export function captureInteractionSignals(input: {
   sessionId?: string;
   maxFacts?: number;
 }): AutoCaptureResult {
+  // Harness-injected re-prompts (judge/stall/parse/grounding/YOLO/outcome) are
+  // recorded as user_input_received but are NOT user messages — never learn from
+  // them. (Defense-in-depth; the loop also gates capture to the first chat turn.)
+  if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(input.message)) {
+    return { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
+  }
   const candidates = extractAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
 
   for (const candidate of candidates) {
