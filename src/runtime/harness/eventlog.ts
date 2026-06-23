@@ -167,6 +167,14 @@ export const EVENT_TYPES = [
   // proves the judge fired BEFORE a YOLO silent-proceed (the 2026-06-22
   // CLEMMY_GOAL_ALIGNMENT_GATE fix). Pure telemetry; never alters behavior.
   'goal_alignment_judged',
+  // The numeric/output-grounding gate ran on a deliverable (a chat-delivered
+  // report or an irreversible-write payload) and reached a verdict — pass,
+  // advisory (a load-bearing figure could not be traced to a tool result), or
+  // the gate confirmed every figure traces to captured data. The bounce case
+  // emits guardrail_tripped(kind:output_grounding_blocked) instead (mirrors
+  // grounding_blocked). Pure telemetry on the non-block paths. (2026-06-23
+  // trust-layer P1.)
+  'output_grounding_judged',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
@@ -863,6 +871,31 @@ export function searchToolOutputs(
       ORDER BY created_at DESC
       LIMIT ?`,
   ).all(sessionId, ...cleaned.map((t) => `%${t}%`), Math.max(1, Math.min(opts.limit ?? 6, 20))) as Array<{
+    call_id: string; tool: string | null; output_full: string; created_at: string;
+  }>;
+  return rows.map((r) => ({ callId: r.call_id, tool: r.tool, output: r.output_full, createdAt: r.created_at }));
+}
+
+/**
+ * Most-recent stored tool outputs for a session, newest first. The numeric/
+ * output-grounding gate uses this as a fallback when label-based
+ * `searchToolOutputs` retrieval comes up thin: a reported figure often derives
+ * from a row whose label vocabulary differs from the deliverable's wording
+ * (e.g. a raw metrics blob), so the gate also looks at the latest data the
+ * figures most plausibly came from. Same row shape as `searchToolOutputs`.
+ */
+export function recentToolOutputs(
+  sessionId: string,
+  opts: { limit?: number } = {},
+): Array<{ callId: string; tool: string | null; output: string; createdAt: string }> {
+  const db = openEventLog();
+  const rows = db.prepare(
+    `SELECT call_id, tool, output_full, created_at
+       FROM tool_outputs
+      WHERE session_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?`,
+  ).all(sessionId, Math.max(1, Math.min(opts.limit ?? 8, 40))) as Array<{
     call_id: string; tool: string | null; output_full: string; created_at: string;
   }>;
   return rows.map((r) => ({ callId: r.call_id, tool: r.tool, output: r.output_full, createdAt: r.created_at }));

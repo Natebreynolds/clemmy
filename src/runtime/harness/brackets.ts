@@ -28,8 +28,14 @@ import {
 import {
   isGoalFidelityGateEnabled,
   evaluateGoalFidelity,
+  extractMessageBody,
   GoalFidelityCheckFailedError,
 } from './goal-fidelity-gate.js';
+import {
+  isOutputGroundingGateEnabled,
+  evaluateOutputGrounding,
+  OutputGroundingCheckFailedError,
+} from './output-grounding-gate.js';
 import {
   isDestinationGateEnabled,
   evaluateShellDestination,
@@ -1171,6 +1177,52 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] goal-fidelity gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
+    // 2c2.7. Output-grounding gate — NUMERIC integrity of the deliverable.
+    // Grounding (2c2) checks the TARGET's identity; this checks the FIGURES in
+    // the outgoing message body trace to the session's own captured tool
+    // results. Same irreversible-only scope; a contradiction bounces (soft,
+    // recoverable), a no-source figure proceeds with an advisory recorded.
+    // Deterministic pre-pass first → frequently no judge call at all. Fail-open.
+    try {
+      if (isOutputGroundingGateEnabled()) {
+        const shape = classifyExternalWrite(tool.name, parsedInput);
+        if (shape.mutating && shape.irreversible) {
+          const body = extractMessageBody(parsedInput);
+          if (body && body.trim().length > 0) {
+            const verdict = await evaluateOutputGrounding(ctx.sessionId, body, { kind: 'write', toolName: tool.name });
+            if (verdict.action === 'bounce') {
+              try {
+                appendEvent({
+                  sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                  data: { kind: 'output_grounding_blocked', toolName: tool.name, figures: verdict.figures.slice(0, 5), sources: verdict.sourceCallIds.slice(0, 5), reason: verdict.reason, failureCount: verdict.failureCount ?? 1 },
+                });
+              } catch { /* telemetry write must never block */ }
+              throw new OutputGroundingCheckFailedError({
+                toolName: tool.name, reason: verdict.reason, figures: verdict.figures, sourceCallIds: verdict.sourceCallIds, failureCount: verdict.failureCount ?? 1,
+              });
+            } else if (verdict.action === 'advisory') {
+              try {
+                appendEvent({
+                  sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'output_grounding_judged',
+                  data: { toolName: tool.name, grounded: false, advisory: true, figures: verdict.figures.slice(0, 5), reason: verdict.reason },
+                });
+              } catch { /* telemetry write must never block */ }
+            } else if (verdict.figures.length === 0 && verdict.reason.startsWith('every figure')) {
+              try {
+                appendEvent({
+                  sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'output_grounding_judged',
+                  data: { toolName: tool.name, grounded: true, reason: verdict.reason },
+                });
+              } catch { /* telemetry write must never block */ }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof OutputGroundingCheckFailedError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] output-grounding gate threw (fail-open)', err instanceof Error ? err.message : err);
+    }
     // 2c3. Destination gate — AMBIENT-TARGET writes (the 2026-06-13
     // wrong-site incident class). `run_shell_command` bypasses every gate
     // above (isMutatingExternalWrite only classifies composio writes), so
@@ -1332,6 +1384,44 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (err instanceof GoalFidelityCheckFailedError) throw err;
       // eslint-disable-next-line no-console
       console.warn('[harness] shell-send goal-fidelity threw (fail-open)', err instanceof Error ? err.message : err);
+    }
+    // 2c4.7. Shell SEND output-grounding — mirror of 2c2.7 for the shell
+    // external-write vector (a curl POST / gh api carrying a report payload).
+    // The command string is the deliverable text; the conservative extractor +
+    // fail-open + contradiction-only-bounce keep flags/ports/ids from
+    // false-tripping. Same contract as the composio path.
+    try {
+      if (isOutputGroundingGateEnabled() && tool.name === 'run_shell_command') {
+        const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
+          ? (parsedInput as { command: string }).command
+          : '';
+        const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
+        if (mutation.isNetworkMutation && command) {
+          const verdict = await evaluateOutputGrounding(ctx.sessionId, command, { kind: 'write', toolName: tool.name });
+          if (verdict.action === 'bounce') {
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                data: { kind: 'output_grounding_blocked', toolName: tool.name, source: 'shell_send', figures: verdict.figures.slice(0, 5), sources: verdict.sourceCallIds.slice(0, 5), reason: verdict.reason, failureCount: verdict.failureCount ?? 1 },
+              });
+            } catch { /* telemetry must never block */ }
+            throw new OutputGroundingCheckFailedError({
+              toolName: tool.name, reason: verdict.reason, figures: verdict.figures, sourceCallIds: verdict.sourceCallIds, failureCount: verdict.failureCount ?? 1,
+            });
+          } else if (verdict.action === 'advisory') {
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'output_grounding_judged',
+                data: { toolName: tool.name, source: 'shell_send', grounded: false, advisory: true, figures: verdict.figures.slice(0, 5), reason: verdict.reason },
+              });
+            } catch { /* telemetry must never block */ }
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof OutputGroundingCheckFailedError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] shell-send output-grounding threw (fail-open)', err instanceof Error ? err.message : err);
     }
     // 2d. Confirm-first gate — a BATCH of same-shape external writes
     // needs an instruction-reviewed plan scope before it proceeds. Runs
@@ -1628,6 +1718,7 @@ export function softToolError(err: unknown): string | null {
     err instanceof ToolCallsLimitExceeded ||
     err instanceof GroundingCheckFailedError ||
     err instanceof GoalFidelityCheckFailedError ||
+    err instanceof OutputGroundingCheckFailedError ||
     err instanceof DuplicateExternalWriteError ||
     err instanceof ImplicitDestinationError ||
     err instanceof UnverifiedDestinationError

@@ -53,6 +53,7 @@ import {
 } from '../../agents/plan-proposals.js';
 import { validateGoal, toGoalEvidence, type GoalValidationResult, type ValidateGoalInput } from '../../execution/goal-validate.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge, skillExecutionShortfall } from './skill-execution.js';
+import { isOutputGroundingGateEnabled, evaluateOutputGrounding, buildOutputGroundingChatRetry } from './output-grounding-gate.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -1970,6 +1971,46 @@ async function runConversationCore(
           continue;
         }
       }
+      // Output-grounding (chat deliverable). The objective judge above verifies
+      // work HAPPENED; this verifies the FIGURES in the user-facing reply trace
+      // to the session's captured tool results — the missing content-trust
+      // boundary for a chat-DELIVERED report (the write-path sibling lives in
+      // brackets.ts 2c2.7). Shares the bounded objectiveJudgeContinuations
+      // budget so it can't loop; mutually exclusive with the judge bounce above
+      // (that path `continue`d). Contradiction → recompute + re-state; no-source
+      // figure → ship with an advisory note. Fail-open: never wedge a completion.
+      let outputGroundingNote = '';
+      if (
+        isOutputGroundingGateEnabled()
+        && decision.nextAction === 'completed'
+        && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
+      ) {
+        try {
+          const deliverable = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
+          if (deliverable && deliverable.trim()) {
+            const og = await evaluateOutputGrounding(options.sessionId, deliverable, { kind: 'chat' });
+            if (og.action === 'bounce') {
+              try {
+                safeAppend({
+                  sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'guardrail_tripped',
+                  data: { kind: 'output_grounding_blocked', source: 'chat', figures: og.figures.slice(0, 5), sources: og.sourceCallIds.slice(0, 5), reason: og.reason, failureCount: og.failureCount ?? 1 },
+                });
+              } catch { /* telemetry must never block */ }
+              objectiveJudgeContinuations += 1;
+              nextInput = buildOutputGroundingChatRetry(og);
+              continue;
+            } else if (og.action === 'advisory') {
+              outputGroundingNote = `Note: I couldn't independently verify these figures against my captured data — please double-check ${og.figures.slice(0, 4).join(', ')} before relying on them.`;
+              try {
+                safeAppend({
+                  sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'output_grounding_judged',
+                  data: { source: 'chat', grounded: false, advisory: true, figures: og.figures.slice(0, 5), reason: og.reason },
+                });
+              } catch { /* telemetry must never block */ }
+            }
+          }
+        } catch { /* fail-open: never wedge a completion */ }
+      }
       // Render priority on the chat surface: prefer `reply` (the
       // natural-language message intended for the user) over `summary`
       // (an internal log entry).
@@ -1990,8 +2031,10 @@ async function runConversationCore(
           ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision.summary})`
           : decision.summary;
       // Goal contract: criteria still unmet after the attempt budget — the
-      // user must SEE that, never a silent clean-looking completion.
-      const userVisibleSummary = goalUnmetNote ? `${baseSummary}\n\n${goalUnmetNote}` : baseSummary;
+      // user must SEE that, never a silent clean-looking completion. The
+      // output-grounding advisory (an unverifiable figure) rides the same rail.
+      const completionNotes = [goalUnmetNote, outputGroundingNote].filter((n) => n && n.trim());
+      const userVisibleSummary = completionNotes.length ? `${baseSummary}\n\n${completionNotes.join('\n\n')}` : baseSummary;
 
       // Honest-completion backstop (Done? node). The objective judge above only
       // runs for opted-in ACTION objectives, so a turn that ends with an
