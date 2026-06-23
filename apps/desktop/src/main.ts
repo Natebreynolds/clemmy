@@ -347,6 +347,17 @@ function createMainWindow(url: string): BrowserWindow {
     },
   });
   guardWindow(win, ['dashboard']);
+  // Live voice needs the renderer's getUserMedia(microphone) to be granted by
+  // Electron's permission layer. The default for a `media` request is version-
+  // dependent, so make it explicit: this window only ever loads our own
+  // first-party dashboard over localhost (navigation is locked by guardWindow),
+  // and in practice the only permission it requests is the microphone. macOS
+  // still gates the actual capture behind the system mic prompt
+  // (NSMicrophoneUsageDescription), so this does not bypass the OS consent.
+  win.webContents.session.setPermissionRequestHandler((_wc, _permission, callback) => {
+    callback(true);
+  });
+  win.webContents.session.setPermissionCheckHandler((_wc, permission) => permission === 'media');
   win.loadURL(url);
   // Keep DevTools opt-in for local testing; attached DevTools changes
   // focus/click behavior enough to make the dev app feel broken.

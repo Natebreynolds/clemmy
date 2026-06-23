@@ -525,6 +525,12 @@ export interface TeamAgentRecord {
   proactive?: boolean;
   cadenceMinutes?: number;
   wakeTriggers?: string[];
+  /** Skills this agent is expert in. Their SKILL.md is injected into the
+   *  agent's instructions at build time (Slice 4). Empty = none bound. */
+  skills?: string[];
+  /** Workflows this agent owns / may trigger (Slice 4). Surfaced in the
+   *  agent's instructions so it reaches for them via workflow_run. */
+  workflows?: string[];
   personality: string;
 }
 
@@ -564,6 +570,8 @@ export function loadTeamAgents(): TeamAgentRecord[] {
         proactive: typeof data.proactive === 'boolean' ? data.proactive : true,
         cadenceMinutes: typeof data.cadenceMinutes === 'number' ? data.cadenceMinutes : 30,
         wakeTriggers: Array.isArray(data.wakeTriggers) ? data.wakeTriggers.map(String).filter(Boolean) : ['inbox', 'delegation', 'request', 'stale_tasks', 'daily_review'],
+        skills: Array.isArray(data.skills) ? data.skills.map(String).filter(Boolean) : [],
+        workflows: Array.isArray(data.workflows) ? data.workflows.map(String).filter(Boolean) : [],
         personality: parsed.content.trim(),
       });
     } catch {
@@ -593,6 +601,8 @@ export function writeTeamAgent(agent: TeamAgentRecord): void {
   if (agent.proactive !== undefined) frontmatter.proactive = agent.proactive;
   if (agent.cadenceMinutes !== undefined) frontmatter.cadenceMinutes = agent.cadenceMinutes;
   if (agent.wakeTriggers && agent.wakeTriggers.length > 0) frontmatter.wakeTriggers = agent.wakeTriggers;
+  if (agent.skills && agent.skills.length > 0) frontmatter.skills = agent.skills;
+  if (agent.workflows && agent.workflows.length > 0) frontmatter.workflows = agent.workflows;
 
   writeFileSync(filePath, matter.stringify(agent.personality || `You are ${agent.name}.`, frontmatter), 'utf-8');
 }

@@ -418,6 +418,32 @@ export function renderConsoleHtml(token: string): string {
                       <span>Wake-word</span>
                       <span class="home-live-wake-dot" data-home-voice-wake-dot aria-hidden="true"></span>
                     </label>
+                    <div class="home-live-voice-settings">
+                      <label title="Spoken voice for Clementine Live.">
+                        <span>Voice</span>
+                        <select data-home-voice-pick>
+                          <option value="">Default</option>
+                          <option value="marin">Marin</option>
+                          <option value="cedar">Cedar</option>
+                          <option value="alloy">Alloy</option>
+                          <option value="ash">Ash</option>
+                          <option value="ballad">Ballad</option>
+                          <option value="coral">Coral</option>
+                          <option value="echo">Echo</option>
+                          <option value="sage">Sage</option>
+                          <option value="shimmer">Shimmer</option>
+                          <option value="verse">Verse</option>
+                        </select>
+                      </label>
+                      <label title="How quickly Clementine takes its turn after you stop speaking.">
+                        <span>Pace</span>
+                        <select data-home-voice-sensitivity>
+                          <option value="snappy">Snappy</option>
+                          <option value="balanced">Balanced</option>
+                          <option value="patient">Patient</option>
+                        </select>
+                      </label>
+                    </div>
                   </div>
                   <audio data-home-voice-audio autoplay></audio>
                 </div>
@@ -4304,6 +4330,34 @@ body {
 }
 .home-live-wake-toggle input { accent-color: var(--accent); transform: scale(0.9); }
 .home-live-wake-toggle:hover { color: var(--fg-2); }
+.home-live-voice-settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.home-live-voice-settings label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.home-live-voice-settings select {
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--fg-2);
+  background: var(--bg-2, rgba(255,255,255,0.04));
+  border: 1px solid var(--border, rgba(255,255,255,0.12));
+  border-radius: 6px;
+  padding: 2px 4px;
+  cursor: pointer;
+}
 .home-live-wake-dot {
   width: 7px; height: 7px;
   border-radius: 50%;
@@ -20087,11 +20141,14 @@ const CONSOLE_JS = `
           setChatTurnStatus(turn, reason === 'plan_first'
             ? 'awaiting plan approval'
             : reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
+          // Speakable final reply for the one-loop voice surface.
+          if (summary && options && options.onReplyText) options.onReplyText(summary, { final: true });
           finish();
         } else if (ev.type === 'run_failed') {
           const msg = (ev.data && ev.data.error) || 'failed';
           setChatTurnText(turn, 'Error: ' + msg);
           setChatTurnStatus(turn, 'failed');
+          if (options && options.onPrompt) options.onPrompt({ kind: 'error', text: msg });
           finish();
         } else if (ev.type === 'conversation_limit_exceeded') {
           const reason = (ev.data && ev.data.reason) || 'limit';
@@ -20101,6 +20158,8 @@ const CONSOLE_JS = `
           const q = (ev.data && ev.data.question) || 'waiting on your reply';
           setChatTurnText(turn, q);
           setChatTurnStatus(turn, 'awaiting reply');
+          // Voice should ask the question aloud, not go silent.
+          if (options && options.onPrompt) options.onPrompt({ kind: 'input', text: q });
           finish();
         } else if (ev.type === 'approval_requested') {
           // Render an actual approval control in the BODY (not just a
@@ -20112,6 +20171,8 @@ const CONSOLE_JS = `
           const apr = ev.data && typeof ev.data.approvalId === 'string' ? ev.data.approvalId : null;
           setChatTurnApproval(turn, { subject: subj, reason, approvalId: apr }, sessionId, options);
           setChatTurnStatus(turn, 'awaiting approval');
+          // Voice tells the user it needs approval (parity with chat).
+          if (options && options.onPrompt) options.onPrompt({ kind: 'approval', text: reason ? (subj + ': ' + reason) : subj });
           finish();
         }
       };
@@ -20331,6 +20392,9 @@ const CONSOLE_JS = `
           }
           setChatTurnText(turn, stepText);
           setChatTurnStatus(turn, 'step ' + (ev.data.step || '?'));
+          // Speakable signal for the one-loop voice surface: the running reply
+          // text grew. No-op when no listener is attached.
+          if (options && options.onReplyText) options.onReplyText(stepText, { final: false });
         }
         return;
       }
@@ -20663,6 +20727,7 @@ const CONSOLE_JS = `
           setChatTurnText(assistantTurn, streamedText);
           setChatTurnStatus(assistantTurn, 'streaming response');
           options.onChunk?.(event.delta, streamedText);
+          options.onReplyText?.(streamedText, { final: false });
           return;
         }
         if (event.type === 'tool') {
@@ -20680,6 +20745,8 @@ const CONSOLE_JS = `
           finalText = event.text || streamedText || '(no reply)';
           pendingApprovalId = event.pendingApprovalId || null;
           setChatTurnText(assistantTurn, finalText);
+          options.onReplyText?.(finalText, { final: true });
+          if (pendingApprovalId) options.onPrompt?.({ kind: 'approval', text: finalText });
           // Status label varies by why the run ended. The grace-turn
           // case carries a real model-written summary; we just need
           // to add a [Continue] button below the message so the user
@@ -20717,6 +20784,7 @@ const CONSOLE_JS = `
           setChatTurnText(assistantTurn, finalText);
           setChatTurnStatus(assistantTurn, 'failed');
           options.onStatus?.(finalText, 'error');
+          options.onPrompt?.({ kind: 'error', text: event.error || 'unknown' });
         }
       }, {
         idleMs: 150000,
@@ -20781,6 +20849,33 @@ const CONSOLE_JS = `
     wakeRecognizer: null,
     wakeActive: false,
     wakeRestartTimer: 0,
+    // Server-honored feature flags (kill-switches), delivered in the
+    // /api/console/realtime/session response. Defaults are conservative so
+    // a missing field never enables new audible behavior.
+    features: { progressUpdates: false, reconnect: true, oneLoop: false },
+    // Spoken-progress (Track 1): suppress chatter while the user is talking
+    // or a response is already generating, and throttle interim updates.
+    userSpeaking: false,
+    responseInFlight: false,
+    handoffActive: false,
+    lastProgressSpokenAt: 0,
+    // Reliability (Track 2): reconnect/swap bookkeeping. intentionalStop
+    // guards against auto-reconnecting after a user-initiated stop.
+    intentionalStop: false,
+    reconnecting: false,
+    reconnectAttempts: 0,
+    reconnectTimer: 0,
+    swapTimer: 0,
+    // Rolling recent transcript used to seed a re-established session so it
+    // knows what was just being discussed.
+    rollingTranscript: [],
+    // One-loop voice surface: the realtime model is ears+mouth only and the
+    // real chat brain drives every reply. We queue the brain's sentences and
+    // speak them one at a time via out-of-band response.create.
+    speakQueue: [],
+    speaking: false,
+    spokenCount: 0,
+    handoffRunning: false,
   };
 
   /**
@@ -21030,6 +21125,28 @@ const CONSOLE_JS = `
     });
   }
 
+  function bindVoiceSettings() {
+    const settings = currentVoiceSettings();
+    const voiceSel = document.querySelector('[data-home-voice-pick]');
+    if (voiceSel && voiceSel.dataset.bound !== '1') {
+      voiceSel.dataset.bound = '1';
+      voiceSel.value = settings.voice || '';
+      voiceSel.addEventListener('change', () => {
+        try { localStorage.setItem('clemmy.voice', voiceSel.value || ''); } catch {}
+        maybeReapplyVoiceSettings();
+      });
+    }
+    const paceSel = document.querySelector('[data-home-voice-sensitivity]');
+    if (paceSel && paceSel.dataset.bound !== '1') {
+      paceSel.dataset.bound = '1';
+      paceSel.value = settings.pace || 'balanced';
+      paceSel.addEventListener('change', () => {
+        try { localStorage.setItem('clemmy.voicePace', paceSel.value || 'balanced'); } catch {}
+        maybeReapplyVoiceSettings();
+      });
+    }
+  }
+
   function stopMouthDriver() {
     cancelAnimationFrame(liveVoiceState.mouthRaf);
     liveVoiceState.mouthRaf = 0;
@@ -21057,6 +21174,7 @@ const CONSOLE_JS = `
     const layout = document.querySelector('[data-home-layout]');
     const takeoverChrome = document.querySelector('[data-home-live-takeover]');
     bindWakeWordToggle();
+    bindVoiceSettings();
 
     function setHomeTakeover(active) {
       if (!layout) return;
@@ -21229,6 +21347,355 @@ const CONSOLE_JS = `
     requestRealtimeResponse('Say one short sentence that Clementine Live is online and listening. Do not ask a long follow-up.');
   }
 
+  // --- One-loop voice (ears+mouth) ---------------------------------------
+  // The realtime model is NOT a brain here: it transcribes (VAD+STT) and
+  // speaks text the REAL chat brain produces. Browser mirror of
+  // src/dashboard/spoken-text.ts (that module is the tested spec — keep in
+  // sync). Strips markdown so the model never reads asterisks/bullets/URLs.
+  function stripMarkdownForSpeechJS(md) {
+    if (!md) return '';
+    var s = md;
+    s = s.replace(/\`\`\`[\\s\\S]*?\`\`\`/g, ' ');
+    s = s.replace(/\`([^\`]+)\`/g, '$1');
+    s = s.replace(/!\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1');
+    s = s.replace(/\\[([^\\]]+)\\]\\([^)]*\\)/g, '$1');
+    s = s.replace(/(\\*\\*|__)(.*?)\\1/g, '$2');
+    s = s.replace(/(\\*|_)(.*?)\\1/g, '$2');
+    s = s.replace(/^\\s{0,3}#{1,6}\\s+/gm, '');
+    s = s.replace(/^\\s{0,3}>\\s?/gm, '');
+    s = s.replace(/^\\s{0,3}[-*+]\\s+/gm, '');
+    s = s.replace(/^\\s{0,3}\\d+\\.\\s+/gm, '');
+    s = s.replace(/^\\s{0,3}([-*_])\\1{2,}\\s*$/gm, ' ');
+    s = s.replace(/https?:\\/\\/\\S+/g, 'the link');
+    s = s.replace(/\\s+/g, ' ').trim();
+    return s;
+  }
+  function toSpokenSentencesJS(md) {
+    var plain = stripMarkdownForSpeechJS(md);
+    if (!plain) return [];
+    return plain.split(/(?<=[.!?])\\s+/).map(function (x) { return x.trim(); }).filter(function (x) { return x.length > 0; });
+  }
+
+  // Speak queue: one out-of-band response at a time so sentences don't overlap.
+  function resetSpeech() { liveVoiceState.speakQueue = []; liveVoiceState.spokenCount = 0; }
+  function pumpSpeech() {
+    if (liveVoiceState.speaking) return;
+    var next = liveVoiceState.speakQueue.shift();
+    if (!next) return;
+    liveVoiceState.speaking = true;
+    sendRealtimeEvent({
+      type: 'response.create',
+      response: {
+        conversation: 'none',
+        output_modalities: ['audio'],
+        instructions: 'Say exactly this to the user, with a natural spoken delivery and nothing added or removed: ' + next,
+      },
+    });
+  }
+  function enqueueSpeech(text) {
+    if (!text) return;
+    liveVoiceState.speakQueue.push(text);
+    pumpSpeech();
+  }
+  function speakText(text) {
+    var sentences = toSpokenSentencesJS(text);
+    for (var i = 0; i < sentences.length; i++) enqueueSpeech(sentences[i]);
+  }
+  // Barge-in: user started talking → stop speaking immediately and drop the
+  // rest of the queued reply (mirrors the persona's interrupt_response).
+  function bargeInStop() {
+    liveVoiceState.speakQueue = [];
+    liveVoiceState.speaking = false;
+    sendRealtimeEvent({ type: 'response.cancel' });
+    sendRealtimeEvent({ type: 'output_audio_buffer.clear' });
+  }
+
+  // The user finished an utterance → run it through the SAME chat loop the
+  // Chat Dock uses (shared console:home session), then speak the reply.
+  async function handleUserUtterance(transcript) {
+    var text = String(transcript || '').trim();
+    if (!text) return;
+    resetSpeech();
+    liveVoiceState.handoffRunning = true;
+    setLiveVoiceStatus('Thinking…', true, 'thinking');
+    // Immediate ack so first audio is fast while the brain works.
+    speakText('One moment.');
+    try {
+      await sendHomeChat(text, {
+        onStatus: function (label, kind) {
+          setLiveVoiceStatus(label || 'Working…', true, kind === 'tool' ? 'routing' : 'thinking');
+        },
+        // v1 speaks the FINAL reply (robust against multi-step text changing
+        // mid-stream); the ack masks latency. Incremental first-sentence
+        // speaking is a future refinement.
+        onReplyText: function (fullText, meta) {
+          if (!meta || !meta.final) return;
+          speakText(fullText);
+        },
+        onPrompt: function (p) {
+          if (!p || !p.text) return;
+          if (p.kind === 'approval') speakText('I need your approval to ' + p.text + '. You can approve it in the dashboard or in Discord.');
+          else if (p.kind === 'error') speakText('Something went wrong. ' + p.text);
+          else speakText(p.text);
+        },
+      });
+    } finally {
+      liveVoiceState.handoffRunning = false;
+      setLiveVoiceStatus('Listening. Speak naturally.', true, 'listening');
+    }
+  }
+
+  // --- Voice settings (Track 3) ------------------------------------------
+  // Voice + turn-taking pace are persisted in localStorage and injected into
+  // the session request body. The pace preset maps to clamped VAD numbers.
+  function currentVoiceSettings() {
+    let voice = '';
+    let pace = 'balanced';
+    try { voice = localStorage.getItem('clemmy.voice') || ''; } catch {}
+    try { pace = localStorage.getItem('clemmy.voicePace') || 'balanced'; } catch {}
+    return { voice, pace };
+  }
+
+  function paceToVad(pace) {
+    if (pace === 'snappy') return { silenceMs: 300, vadThreshold: 0.5 };
+    if (pace === 'patient') return { silenceMs: 700, vadThreshold: 0.6 };
+    return { silenceMs: 430, vadThreshold: 0.55 };
+  }
+
+  // Silently hand the new session a short summary of the conversation so far,
+  // so a reconnect/swap continues naturally without a spoken "I'm back" beat.
+  function seedContinuitySession() {
+    const recent = (liveVoiceState.rollingTranscript || []).slice(-6).join('\\n');
+    if (!recent) return;
+    sendRealtimeEvent({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: 'Context from the voice conversation so far (do not read aloud, just continue naturally):\\n' + recent,
+        }],
+      },
+    });
+  }
+
+  // --- Reliability (Track 2) ---------------------------------------------
+  function clearVoiceTimers() {
+    if (liveVoiceState.swapTimer) { clearTimeout(liveVoiceState.swapTimer); liveVoiceState.swapTimer = 0; }
+    if (liveVoiceState.reconnectTimer) { clearTimeout(liveVoiceState.reconnectTimer); liveVoiceState.reconnectTimer = 0; }
+  }
+
+  // Tear down the peer connection but KEEP the mic stream so a reconnect/swap
+  // can reuse it without re-prompting / re-acquiring the microphone.
+  function teardownPeer() {
+    try { liveVoiceState.dc?.close?.(); } catch {}
+    try { liveVoiceState.pc?.close?.(); } catch {}
+    liveVoiceState.dc = null;
+    liveVoiceState.pc = null;
+    stopMouthDriver();
+  }
+
+  function armSwapTimer() {
+    if (liveVoiceState.swapTimer) clearTimeout(liveVoiceState.swapTimer);
+    // Reconnect + pre-emptive swap share one kill-switch; when it is off we
+    // leave the session exactly as before (it expires at ~600s).
+    if (!liveVoiceState.features || !liveVoiceState.features.reconnect) return;
+    // Ephemeral token lives ~600s; swap a little early to avoid an expiry gap.
+    liveVoiceState.swapTimer = setTimeout(performSessionSwap, 540000);
+  }
+
+  async function performSessionSwap() {
+    liveVoiceState.swapTimer = 0;
+    if (!liveVoiceState.connected || liveVoiceState.intentionalStop) return;
+    // Never cut over mid-utterance, mid-response, or mid-handoff — defer.
+    if (liveVoiceState.userSpeaking || liveVoiceState.responseInFlight || liveVoiceState.handoffActive) {
+      liveVoiceState.swapTimer = setTimeout(performSessionSwap, 15000);
+      return;
+    }
+    addLiveVoiceEvent('Refreshing the live voice session…', 'routing');
+    teardownPeer();
+    try {
+      await connectRealtime({ kind: 'resume' });
+    } catch (err) {
+      if (!liveVoiceState.intentionalStop && liveVoiceState.features.reconnect) scheduleReconnect();
+      else setLiveVoiceStatus('Live voice refresh failed: ' + (err.message || err), false, 'error');
+    }
+  }
+
+  function scheduleReconnect() {
+    if (liveVoiceState.intentionalStop || !liveVoiceState.features.reconnect) return;
+    if (liveVoiceState.reconnecting) return;
+    const attempt = liveVoiceState.reconnectAttempts || 0;
+    if (attempt >= 5) {
+      liveVoiceState.reconnecting = false;
+      setLiveVoiceStatus('Live voice connection lost. Tap to reconnect.', false, 'error');
+      addLiveVoiceEvent('Reconnect attempts exhausted.', 'error');
+      return;
+    }
+    liveVoiceState.reconnecting = true;
+    liveVoiceState.reconnectAttempts = attempt + 1;
+    const delay = Math.min(8000, 800 * Math.pow(2, attempt));
+    setLiveVoiceStatus('Reconnecting live voice…', true, 'connecting');
+    addLiveVoiceEvent('Reconnecting (attempt ' + (attempt + 1) + ')…', 'routing');
+    teardownPeer();
+    liveVoiceState.reconnectTimer = setTimeout(async () => {
+      liveVoiceState.reconnectTimer = 0;
+      try {
+        await connectRealtime({ kind: 'resume' });
+      } catch (err) {
+        liveVoiceState.reconnecting = false;
+        scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  // Re-establish the session to apply changed voice/pace settings mid-call.
+  function maybeReapplyVoiceSettings() {
+    if (!liveVoiceState.connected || liveVoiceState.intentionalStop) return;
+    addLiveVoiceEvent('Applying new voice settings…', 'routing');
+    performSessionSwap();
+  }
+
+  // Single connect path used by first-start, reconnect, and pre-emptive swap.
+  // Does NOT reset the feed/transcript — the caller decides that (only a fresh
+  // user-initiated start clears them). Throws on failure; the caller decides
+  // whether to surface the error or schedule a reconnect.
+  async function connectRealtime(opts) {
+    opts = opts || {};
+    const kind = opts.kind || 'start';
+    liveVoiceState.connecting = true;
+
+    const settings = currentVoiceSettings();
+    const vad = paceToVad(settings.pace);
+    const reqBody = { sessionId: 'console:home', vadThreshold: vad.vadThreshold, silenceMs: vad.silenceMs };
+    if (settings.voice) reqBody.voice = settings.voice;
+
+    const tokenResponse = await fetch(withToken('/api/console/realtime/session'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reqBody),
+    });
+    const tokenPayload = await tokenResponse.json().catch(() => ({}));
+    if (!tokenResponse.ok) {
+      throw new Error(tokenPayload.error || 'Failed to create Realtime session');
+    }
+    const ephemeralKey = realtimeClientSecret(tokenPayload);
+    if (!ephemeralKey) {
+      throw new Error('Realtime session did not return a client secret.');
+    }
+
+    // Honor server-delivered feature flags (kill-switches).
+    if (tokenPayload.features && typeof tokenPayload.features === 'object') {
+      liveVoiceState.features = {
+        progressUpdates: Boolean(tokenPayload.features.progressUpdates),
+        reconnect: tokenPayload.features.reconnect !== false,
+        oneLoop: Boolean(tokenPayload.features.oneLoop),
+      };
+    }
+
+    const pc = new RTCPeerConnection();
+    const dc = pc.createDataChannel('oai-events');
+    const audio = document.querySelector('[data-home-voice-audio]') || document.createElement('audio');
+    audio.autoplay = true;
+
+    liveVoiceState.pc = pc;
+    liveVoiceState.dc = dc;
+    liveVoiceState.handledCalls = new Set();
+
+    pc.ontrack = (event) => {
+      if (pc !== liveVoiceState.pc) return; // ignore a torn-down peer
+      audio.srcObject = event.streams[0];
+      addLiveVoiceEvent('Audio stream connected.', 'event');
+      // Spin up the amplitude analyser on the same stream so the dog
+      // mouth tracks the actual TTS output rather than a fake timer.
+      startMouthDriver(event.streams[0]);
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc !== liveVoiceState.pc) return; // stale peer from a prior session
+      if (pc.connectionState === 'connected') setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        if (!liveVoiceState.intentionalStop && liveVoiceState.features.reconnect) {
+          scheduleReconnect();
+        } else {
+          setLiveVoiceStatus('Live voice connection dropped.', false, 'error');
+          addLiveVoiceEvent('Realtime connection dropped.', 'error');
+        }
+      }
+    };
+
+    dc.addEventListener('open', () => {
+      if (pc !== liveVoiceState.pc) return;
+      setLiveVoiceStatus('Listening. Local actions will route through Clementine.', true, 'listening');
+      addLiveVoiceEvent(kind === 'start' ? 'Realtime data channel open.' : 'Realtime session re-established.', 'event');
+      if (liveVoiceState.features.oneLoop) {
+        // One-loop: the model never speaks on its own. Greet only on a fresh
+        // start, via the speak path (not by asking the model to improvise).
+        resetSpeech();
+        if (kind === 'start') speakText("I'm here. What can I do for you?");
+        return;
+      }
+      if (kind === 'start') sendRealtimeStarter();
+      else seedContinuitySession();
+    });
+    dc.addEventListener('message', (event) => {
+      try {
+        handleRealtimeEvent(JSON.parse(event.data));
+      } catch (err) {
+        console.warn('Realtime event handling failed', err);
+      }
+    });
+
+    // Reuse a still-live mic stream across reconnects; otherwise acquire one.
+    let stream = liveVoiceState.stream;
+    const streamLive = stream && stream.getAudioTracks && stream.getAudioTracks().some((t) => t.readyState === 'live');
+    if (!streamLive) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch (micErr) {
+        // Make the OS-denied case actionable instead of a raw DOMException.
+        const name = micErr && micErr.name;
+        if (name === 'NotAllowedError' || name === 'SecurityError') {
+          throw new Error('Microphone access is blocked. Enable it in System Settings → Privacy & Security → Microphone, then try again.');
+        }
+        if (name === 'NotFoundError' || name === 'NotReadableError') {
+          throw new Error('No microphone is available. Check that an input device is connected and not in use by another app.');
+        }
+        throw micErr;
+      }
+      liveVoiceState.stream = stream;
+      addLiveVoiceEvent('Microphone active with echo cancellation.', 'event');
+    }
+    for (const track of stream.getAudioTracks()) {
+      pc.addTrack(track, stream);
+    }
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const sdpResponse = await fetch('https://api.openai.com/v1/realtime/calls', {
+      method: 'POST',
+      body: offer.sdp,
+      headers: {
+        Authorization: 'Bearer ' + ephemeralKey,
+        'Content-Type': 'application/sdp',
+      },
+    });
+    const answerSdp = await sdpResponse.text();
+    if (!sdpResponse.ok) {
+      throw new Error(answerSdp || 'Realtime WebRTC offer failed');
+    }
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    liveVoiceState.connected = true;
+    liveVoiceState.connecting = false;
+    liveVoiceState.reconnecting = false;
+    liveVoiceState.reconnectAttempts = 0;
+    setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+    armSwapTimer();
+  }
+
   async function startHomeVoice() {
     if (!navigator.mediaDevices?.getUserMedia) {
       setLiveVoiceStatus('Microphone access is not available in this browser context.', false);
@@ -21242,95 +21709,17 @@ const CONSOLE_JS = `
 
     const toggle = document.querySelector('[data-home-voice-toggle]');
     if (toggle) toggle.disabled = true;
+    liveVoiceState.intentionalStop = false;
+    liveVoiceState.reconnecting = false;
+    liveVoiceState.reconnectAttempts = 0;
+    liveVoiceState.rollingTranscript = [];
     resetLiveVoiceFeed();
     liveVoiceState.assistantTranscript = '';
     setLiveVoiceStatus('Creating live voice session…', true, 'connecting');
     addLiveVoiceEvent('Creating secure Realtime session.', 'routing');
 
     try {
-      const tokenResponse = await fetch(withToken('/api/console/realtime/session'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: 'console:home' }),
-      });
-      const tokenPayload = await tokenResponse.json().catch(() => ({}));
-      if (!tokenResponse.ok) {
-        throw new Error(tokenPayload.error || 'Failed to create Realtime session');
-      }
-
-      const ephemeralKey = realtimeClientSecret(tokenPayload);
-      if (!ephemeralKey) {
-        throw new Error('Realtime session did not return a client secret.');
-      }
-
-      const pc = new RTCPeerConnection();
-      const dc = pc.createDataChannel('oai-events');
-      const audio = document.querySelector('[data-home-voice-audio]') || document.createElement('audio');
-      audio.autoplay = true;
-
-      liveVoiceState.pc = pc;
-      liveVoiceState.dc = dc;
-      liveVoiceState.handledCalls = new Set();
-
-      pc.ontrack = (event) => {
-        audio.srcObject = event.streams[0];
-        addLiveVoiceEvent('Audio stream connected.', 'event');
-        // Spin up the amplitude analyser on the same stream so the dog
-        // mouth tracks the actual TTS output rather than a fake timer.
-        startMouthDriver(event.streams[0]);
-      };
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected') setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-          setLiveVoiceStatus('Live voice connection dropped.', false, 'error');
-          addLiveVoiceEvent('Realtime connection dropped.', 'error');
-        }
-      };
-
-      dc.addEventListener('open', () => {
-        setLiveVoiceStatus('Listening. Local actions will route through Clementine.', true, 'listening');
-        addLiveVoiceEvent('Realtime data channel open.', 'event');
-        sendRealtimeStarter();
-      });
-      dc.addEventListener('message', (event) => {
-        try {
-          handleRealtimeEvent(JSON.parse(event.data));
-        } catch (err) {
-          console.warn('Realtime event handling failed', err);
-        }
-      });
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      liveVoiceState.stream = stream;
-      addLiveVoiceEvent('Microphone active with echo cancellation.', 'event');
-      for (const track of stream.getAudioTracks()) {
-        pc.addTrack(track, stream);
-      }
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const sdpResponse = await fetch('https://api.openai.com/v1/realtime/calls', {
-        method: 'POST',
-        body: offer.sdp,
-        headers: {
-          Authorization: 'Bearer ' + ephemeralKey,
-          'Content-Type': 'application/sdp',
-        },
-      });
-      const answerSdp = await sdpResponse.text();
-      if (!sdpResponse.ok) {
-        throw new Error(answerSdp || 'Realtime WebRTC offer failed');
-      }
-      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
-
-      liveVoiceState.connected = true;
-      setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
+      await connectRealtime({ kind: 'start' });
     } catch (err) {
       stopHomeVoice();
       setLiveVoiceStatus('Voice unavailable: ' + (err.message || err), false, 'error');
@@ -21341,6 +21730,15 @@ const CONSOLE_JS = `
   }
 
   function stopHomeVoice() {
+    // Mark this as a user-initiated stop so the connection-state handler does
+    // NOT auto-reconnect, and cancel any pending swap/reconnect timers.
+    liveVoiceState.intentionalStop = true;
+    clearVoiceTimers();
+    liveVoiceState.reconnecting = false;
+    liveVoiceState.reconnectAttempts = 0;
+    liveVoiceState.handoffActive = false;
+    liveVoiceState.userSpeaking = false;
+    liveVoiceState.responseInFlight = false;
     try { liveVoiceState.dc?.close?.(); } catch {}
     try { liveVoiceState.pc?.close?.(); } catch {}
     try {
@@ -21366,9 +21764,14 @@ const CONSOLE_JS = `
     if (!event || !event.type) return;
     if (event.type === 'input_audio_buffer.speech_started') {
       liveVoiceState.assistantTranscript = '';
+      liveVoiceState.userSpeaking = true;
+      // One-loop barge-in: the user cut in → stop speaking + drop the rest of
+      // the queued reply immediately.
+      if (liveVoiceState.features.oneLoop && (liveVoiceState.speaking || liveVoiceState.speakQueue.length)) bargeInStop();
       setLiveVoiceStatus('Listening to you…', true, 'listening');
       addLiveVoiceEvent('User started speaking.', 'event');
     } else if (event.type === 'input_audio_buffer.speech_stopped') {
+      liveVoiceState.userSpeaking = false;
       setLiveVoiceStatus('Thinking through the turn…', true, 'thinking');
     } else if (event.type === 'conversation.item.input_audio_transcription.delta') {
       const delta = event.delta || event.transcript || '';
@@ -21376,8 +21779,16 @@ const CONSOLE_JS = `
     } else if (event.type === 'conversation.item.input_audio_transcription.completed') {
       liveVoiceState.lastTranscript = event.transcript || '';
       setLiveVoiceTranscript(liveVoiceState.lastTranscript ? 'Heard: ' + liveVoiceState.lastTranscript : '');
-      if (liveVoiceState.lastTranscript) addLiveVoiceEvent('Heard: ' + liveVoiceState.lastTranscript, 'event');
+      if (liveVoiceState.lastTranscript) {
+        addLiveVoiceEvent('Heard: ' + liveVoiceState.lastTranscript, 'event');
+        liveVoiceState.rollingTranscript.push('You: ' + liveVoiceState.lastTranscript);
+        if (liveVoiceState.rollingTranscript.length > 12) liveVoiceState.rollingTranscript.shift();
+        // One-loop: route the utterance into the SAME chat brain and speak the
+        // reply. (Persona mode leaves this to the realtime model + send_to_clementine.)
+        if (liveVoiceState.features.oneLoop) handleUserUtterance(liveVoiceState.lastTranscript);
+      }
     } else if (event.type === 'response.created') {
+      liveVoiceState.responseInFlight = true;
       setLiveVoiceStatus('Generating voice response…', true, 'thinking');
     } else if (event.type === 'response.output_audio_transcript.delta') {
       const delta = event.delta || '';
@@ -21388,14 +21799,34 @@ const CONSOLE_JS = `
       }
     } else if (event.type === 'response.output_audio_transcript.done') {
       const transcript = event.transcript || liveVoiceState.assistantTranscript;
-      if (transcript) addLiveVoiceEvent('Said: ' + transcript, 'event');
+      if (transcript) {
+        addLiveVoiceEvent('Said: ' + transcript, 'event');
+        liveVoiceState.rollingTranscript.push('Clementine: ' + transcript);
+        if (liveVoiceState.rollingTranscript.length > 12) liveVoiceState.rollingTranscript.shift();
+      }
       liveVoiceState.assistantTranscript = '';
     } else if (event.type === 'response.done') {
+      liveVoiceState.responseInFlight = false;
+      // One-loop: a queued spoken sentence finished → speak the next one.
+      if (liveVoiceState.features.oneLoop) {
+        liveVoiceState.speaking = false;
+        pumpSpeech();
+        if (!liveVoiceState.speakQueue.length && !liveVoiceState.handoffRunning) {
+          setLiveVoiceStatus('Listening. Speak naturally.', true, 'listening');
+        }
+        return;
+      }
       const routed = handleRealtimeResponseDone(event);
       if (!routed) setLiveVoiceStatus('Live voice connected. Speak naturally.', true, 'listening');
     } else if (event.type === 'response.function_call_arguments.done') {
       handleRealtimeFunctionCall(event.name, event.arguments, event.call_id);
     } else if (event.type === 'error') {
+      // One-loop: a failed speak response must not deadlock the queue.
+      if (liveVoiceState.features.oneLoop) {
+        liveVoiceState.speaking = false;
+        liveVoiceState.responseInFlight = false;
+        pumpSpeech();
+      }
       setLiveVoiceStatus('Realtime error: ' + (event.error?.message || 'unknown'), false, 'error');
       addLiveVoiceEvent('Realtime error: ' + (event.error?.message || 'unknown'), 'error');
     }
@@ -21424,19 +21855,51 @@ const CONSOLE_JS = `
 
     setLiveVoiceStatus('Routing into the local Clementine agent…', true, 'routing');
     addLiveVoiceEvent('Local handoff: ' + request, 'routing');
-    const result = await sendHomeChat('[Voice command] ' + request, {
-      onStatus: (text, kind) => {
-        const label = text || 'Local agent is working.';
-        setLiveVoiceStatus(label, true, kind === 'tool' ? 'routing' : 'thinking');
-        addLiveVoiceEvent(label, kind === 'tool' ? 'tool' : 'routing');
-      },
-      onChunk: (_delta, fullText) => {
-        setLiveVoiceStatus('Local agent is streaming a response…', true, 'routing');
-        if (fullText && fullText.length < 180) {
-          setLiveVoiceTranscript('Local reply: ' + fullText);
-        }
-      },
-    });
+
+    // --- Spoken progress (Track 1) ---------------------------------------
+    // Without this, the user hears one bridge phrase then SILENCE until the
+    // whole agent run finishes. When CLEMMY_VOICE_PROGRESS is on, speak an
+    // immediate ack and throttled, barge-in-aware progress while it works.
+    const progressOn = liveVoiceState.features && liveVoiceState.features.progressUpdates;
+    liveVoiceState.handoffActive = true;
+    // Suppress progress speech while the user is talking or a response is
+    // already generating, so we never talk over them; throttle to one update
+    // per PROGRESS_MIN_GAP_MS.
+    const PROGRESS_MIN_GAP_MS = 7000;
+    function speakProgress(milestone) {
+      if (!progressOn) return;
+      if (liveVoiceState.userSpeaking || liveVoiceState.responseInFlight) return;
+      const now = Date.now();
+      if (now - (liveVoiceState.lastProgressSpokenAt || 0) < PROGRESS_MIN_GAP_MS) return;
+      liveVoiceState.lastProgressSpokenAt = now;
+      const ctx = milestone ? ' Context: ' + String(milestone).slice(0, 120) + '.' : '';
+      requestRealtimeResponse('Briefly reassure the user you are still working on their request.' + ctx + ' One short, natural sentence. Do not read the context verbatim.');
+    }
+
+    if (progressOn) {
+      liveVoiceState.lastProgressSpokenAt = Date.now();
+      requestRealtimeResponse('Give one short, natural acknowledgement that you are on it and looking into this now. One short sentence.');
+    }
+
+    let result;
+    try {
+      result = await sendHomeChat('[Voice command] ' + request, {
+        onStatus: (text, kind) => {
+          const label = text || 'Local agent is working.';
+          setLiveVoiceStatus(label, true, kind === 'tool' ? 'routing' : 'thinking');
+          addLiveVoiceEvent(label, kind === 'tool' ? 'tool' : 'routing');
+          speakProgress(text);
+        },
+        onChunk: (_delta, fullText) => {
+          setLiveVoiceStatus('Local agent is streaming a response…', true, 'routing');
+          if (fullText && fullText.length < 180) {
+            setLiveVoiceTranscript('Local reply: ' + fullText);
+          }
+        },
+      });
+    } finally {
+      liveVoiceState.handoffActive = false;
+    }
     const output = JSON.stringify({
       ok: Boolean(result?.ok),
       text: result?.text || '',

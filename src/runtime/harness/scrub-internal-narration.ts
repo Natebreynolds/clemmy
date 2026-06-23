@@ -47,7 +47,7 @@ function isNarrationSentence(sentence: string): boolean {
 }
 
 /** Split a paragraph into sentences, keeping terminal punctuation attached. */
-function splitSentences(paragraph: string): string[] {
+export function splitSentences(paragraph: string): string[] {
   return paragraph.split(/(?<=[.!?])\s+/).filter((s) => s.length > 0);
 }
 
