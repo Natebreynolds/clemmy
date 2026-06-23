@@ -209,12 +209,22 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('<invoke name="run_shell_command">\n<parameter name="command">sf data query</parameter>\n</invoke>', []), true);
   assert.equal(looksLikeToolNarration('<invoke name="space_save">', []), true);
   assert.equal(looksLikeToolNarration('Fields 40-89:\n<invoke name="run_shell_command"><parameter name="command">ls</parameter></invoke>', []), true);
+  // The 2026-06-23 dock failure: a markdown "**Tool call: NAME**" header + a
+  // ```json args block, on the Claude brain in FULL mode (42 tools exposed).
+  assert.equal(looksLikeToolNarration('**Tool call: skill_read**\n```json\n{\n  "name": "salesforce-deal-risk-workspace"\n}\n```', []), true);
+  assert.equal(looksLikeToolNarration('Tool call: skill_read\n{"name":"x"}', []), true);
+  assert.equal(looksLikeToolNarration('<tool_call>\n{"name":"skill_read"}', []), true);
+  assert.equal(looksLikeToolNarration('[tool_call] skill_read', []), true);
+  assert.equal(looksLikeToolNarration('{"tool_slug": "SALESFORCE_RUN_SOQL_QUERY", "arguments": {}}', []), true);
   // Real tool calls happened ⇒ not narration, even if text mentions tools / XML.
   assert.equal(looksLikeToolNarration('Tool:run_shell_command', ['mcp__clementine-local__run_shell_command']), false);
   assert.equal(looksLikeToolNarration('<invoke name="run_shell_command">', ['run_shell_command']), false);
-  // Normal prose ⇒ not narration (the bare word "invoke" must NOT false-flag).
+  assert.equal(looksLikeToolNarration('**Tool call: skill_read**', ['skill_read']), false);
+  // Normal prose ⇒ not narration (a mid-sentence "tool call" must NOT false-flag).
   assert.equal(looksLikeToolNarration('Pulled your 5 accounts — here they are.', []), false);
   assert.equal(looksLikeToolNarration('I will invoke the report generator and send it over.', []), false);
+  assert.equal(looksLikeToolNarration('Here is what each tool call does in the pipeline, summarized.', []), false);
+  assert.equal(looksLikeToolNarration('The tool call budget looks fine for this run.', []), false);
   assert.equal(looksLikeToolNarration('', []), false);
 });
 

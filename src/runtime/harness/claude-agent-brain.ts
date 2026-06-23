@@ -56,23 +56,30 @@ function narrationRetryEnabled(): boolean {
 }
 
 /** Detect the "narrate-instead-of-call" failure: the brain produced NO real tool
- *  calls, but its text reproduces the tool-call protocol — a `Tool: <name>` line,
+ *  calls, but its text reproduces the tool-call PROTOCOL in any of the shapes
+ *  models reach for instead of actually invoking — a `Tool:`/`Tool call:` header
+ *  (incl. markdown-bolded `**Tool call: x**`), a tagged `<tool_call>`/`[tool_call]`,
  *  a `function { … }` block, a fabricated `System: tool result …`, a bare
- *  `{"command": …}` payload, OR the native tool-call XML emitted AS TEXT
- *  (`<invoke name="…">` / `<function_calls>` / `<parameter name="…">`, including
- *  the `antml:`-namespaced variants). That last shape is the one that silently
- *  broke a real Workspace build (2026-06-22): mid-build the brain printed
- *  `<invoke name="run_shell_command">…</invoke>` instead of running it, the turn
- *  "completed" with that XML as the reply, and nothing was built. */
+ *  tool-call-shaped JSON payload, OR the native tool-call XML
+ *  (`<invoke name="…">` / `<parameter name="…">`, incl. `antml:` variants).
+ *  Two REAL failures fed this: 2026-06-22 a Workspace build printed
+ *  `<invoke name="run_shell_command">…</invoke>`; 2026-06-23 a dock turn (mode=full,
+ *  42 tools exposed) printed `**Tool call: skill_read**` + a ```json args block.
+ *  Detect the CLASS, not one format. Headers are line-anchored so a mid-sentence
+ *  "…what each tool call does…" never trips it. */
 export function looksLikeToolNarration(text: string, toolUses: string[]): boolean {
   if (toolUses.length > 0) return false;
   const t = (text || '').trim();
   if (!t) return false;
   return (
-    /(^|\n)\s*Tool:\s*[a-z_][a-z0-9_]*/i.test(t) ||
+    // "Tool: x", "Tool call: x", "**Tool call: x**", "Tool_call: x" at line start.
+    /(^|\n)\s*\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
+    // Tagged markers some models emit: "<tool_call>", "[tool_call]".
+    /(^|\n)\s*[<\[]\s*tool[\s_-]*call\b/i.test(t) ||
     /(^|\n)\s*function\s*\n?\s*\{/.test(t) ||
     /System:\s*tool result/i.test(t) ||
-    /(^|\n)\s*\{\s*"command"\s*:/.test(t) ||
+    // A bare tool-call-shaped JSON payload (command / tool_slug / tool_name / arguments).
+    /(^|\n)\s*\{\s*"(command|tool_slug|tool_name|arguments)"\s*:/i.test(t) ||
     /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t)
   );
 }
@@ -411,7 +418,7 @@ export async function respondViaClaudeAgentSdkBrain(
   if (mode === 'full' && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
     const retry = await runClaudeAgentSdkImpl({
       prompt:
-        `Your previous attempt WROTE OUT a tool call as text (e.g. "Tool: …", "function { … }", a fake "System: tool result …", or a "<invoke name=…>…</invoke>" block) instead of running it — so nothing actually happened. ` +
+        `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
         `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
       ...runOptions,
     });
