@@ -57,9 +57,13 @@ function narrationRetryEnabled(): boolean {
 
 /** Detect the "narrate-instead-of-call" failure: the brain produced NO real tool
  *  calls, but its text reproduces the tool-call protocol — a `Tool: <name>` line,
- *  a `function { … }` block, a fabricated `System: tool result …`, or a bare
- *  `{"command": …}` payload. That means it DESCRIBED a tool call instead of making
- *  one, so nothing actually ran. */
+ *  a `function { … }` block, a fabricated `System: tool result …`, a bare
+ *  `{"command": …}` payload, OR the native tool-call XML emitted AS TEXT
+ *  (`<invoke name="…">` / `<function_calls>` / `<parameter name="…">`, including
+ *  the `antml:`-namespaced variants). That last shape is the one that silently
+ *  broke a real Workspace build (2026-06-22): mid-build the brain printed
+ *  `<invoke name="run_shell_command">…</invoke>` instead of running it, the turn
+ *  "completed" with that XML as the reply, and nothing was built. */
 export function looksLikeToolNarration(text: string, toolUses: string[]): boolean {
   if (toolUses.length > 0) return false;
   const t = (text || '').trim();
@@ -68,7 +72,8 @@ export function looksLikeToolNarration(text: string, toolUses: string[]): boolea
     /(^|\n)\s*Tool:\s*[a-z_][a-z0-9_]*/i.test(t) ||
     /(^|\n)\s*function\s*\n?\s*\{/.test(t) ||
     /System:\s*tool result/i.test(t) ||
-    /(^|\n)\s*\{\s*"command"\s*:/.test(t)
+    /(^|\n)\s*\{\s*"command"\s*:/.test(t) ||
+    /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t)
   );
 }
 
@@ -406,7 +411,7 @@ export async function respondViaClaudeAgentSdkBrain(
   if (mode === 'full' && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
     const retry = await runClaudeAgentSdkImpl({
       prompt:
-        `Your previous attempt WROTE OUT a tool call as text (e.g. "Tool: …", "function { … }", a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
+        `Your previous attempt WROTE OUT a tool call as text (e.g. "Tool: …", "function { … }", a fake "System: tool result …", or a "<invoke name=…>…</invoke>" block) instead of running it — so nothing actually happened. ` +
         `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
       ...runOptions,
     });

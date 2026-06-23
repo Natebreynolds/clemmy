@@ -204,10 +204,17 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   // The exact shape from the live failure (sess-mql8hb50): narrated, zero tool calls.
   assert.equal(looksLikeToolNarration('Tool:run_shell_command\n\nSystem: tool result is empty\n\nfunction\n{"command":"sf data query"}', []), true);
   assert.equal(looksLikeToolNarration('{"command": "sf data query --json"}', []), true);
-  // Real tool calls happened ⇒ not narration, even if text mentions tools.
+  // The 2026-06-22 Workspace-build failure (space-new-workspace-2): the native
+  // tool-call XML emitted AS TEXT — nothing ran, so the workspace was never built.
+  assert.equal(looksLikeToolNarration('<invoke name="run_shell_command">\n<parameter name="command">sf data query</parameter>\n</invoke>', []), true);
+  assert.equal(looksLikeToolNarration('<invoke name="space_save">', []), true);
+  assert.equal(looksLikeToolNarration('Fields 40-89:\n<invoke name="run_shell_command"><parameter name="command">ls</parameter></invoke>', []), true);
+  // Real tool calls happened ⇒ not narration, even if text mentions tools / XML.
   assert.equal(looksLikeToolNarration('Tool:run_shell_command', ['mcp__clementine-local__run_shell_command']), false);
-  // Normal prose ⇒ not narration.
+  assert.equal(looksLikeToolNarration('<invoke name="run_shell_command">', ['run_shell_command']), false);
+  // Normal prose ⇒ not narration (the bare word "invoke" must NOT false-flag).
   assert.equal(looksLikeToolNarration('Pulled your 5 accounts — here they are.', []), false);
+  assert.equal(looksLikeToolNarration('I will invoke the report generator and send it over.', []), false);
   assert.equal(looksLikeToolNarration('', []), false);
 });
 
