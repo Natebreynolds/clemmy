@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   ArrowLeft, RefreshCw, Pause, Play, ExternalLink, PanelRightOpen, X,
   MessageCircle, RotateCcw, AlertCircle,
@@ -13,8 +13,9 @@ import { useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
 import {
   getSpace, refreshSpace, patchSpace, rollbackSpace,
-  spaceViewUrl, spaceSessionId, type SpaceStatus,
+  spaceViewUrl, spaceSessionId, openApprovalCount, gapQuestions, type SpaceStatus,
 } from '@/lib/spaces';
+import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -27,11 +28,13 @@ type DetailTab = 'code' | 'history' | 'audit';
 export function WorkspaceView() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const detail = usePoll(['space', id], () => getSpace(id), 5000, { enabled: !!id });
   const chat = useChat({ initialSessionId: spaceSessionId(id) });
 
   const [iframeKey, setIframeKey] = useState(0);
   const lastMtimeRef = useRef<number | null>(null);
+  const seededRef = useRef(false);
 
   // Auto-reload the view when its file changes — keyed on the view's mtime so it
   // catches ANY edit (Clem's space_edit_view, a write_file rewrite, a rollback).
@@ -49,6 +52,18 @@ export function WorkspaceView() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [tab, setTab] = useState<DetailTab>('code');
   const [error, setError] = useState<string | null>(null);
+
+  // Seed the dock with the build request passed from the creation modal, so a
+  // brand-new workspace starts building immediately (no cold context-switch).
+  useEffect(() => {
+    const build = (location.state as { build?: string } | null)?.build;
+    if (!build || seededRef.current) return;
+    seededRef.current = true;
+    setDockOpen(true);
+    void chat.send({ text: build });
+    navigate(location.pathname, { replace: true, state: null });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const space = detail.data?.space;
 
@@ -80,6 +95,12 @@ export function WorkspaceView() {
     );
   }
 
+  const notes = detail.data?.notes ?? [];
+  const openApprovals = openApprovalCount(notes);
+  const gaps = gapQuestions(notes);
+  const refreshFailures = (detail.data?.audit ?? [])
+    .filter((a) => a.method === 'REFRESH' && a.outcome === 'error').slice(-3).reverse();
+
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
@@ -89,6 +110,7 @@ export function WorkspaceView() {
         </Button>
         <h2 className="truncate text-h3 text-fg">{space.title}</h2>
         <StatusPill tone={statusTone(space.status)}>{space.status}</StatusPill>
+        {openApprovals > 0 && <StatusPill tone="warning">{openApprovals} waiting</StatusPill>}
         {space.lastRefreshedAt && (
           <span className="hidden text-caption text-faint sm:inline">
             refreshed {new Date(space.lastRefreshedAt).toLocaleTimeString()}
@@ -120,6 +142,16 @@ export function WorkspaceView() {
           <AlertCircle className="h-4 w-4" aria-hidden /> {error}
         </p>
       )}
+
+      <BuildStatusBanner
+        paused={space.status === 'paused'}
+        gaps={gaps}
+        openApprovals={openApprovals}
+        failures={refreshFailures}
+        busy={busy}
+        onResume={() => act(() => patchSpace(id, { status: 'active' }))}
+        onAskClem={() => setDockOpen(true)}
+      />
 
       {/* Body: the agent-authored view + overlays */}
       <div className="relative min-h-0 flex-1 bg-canvas">

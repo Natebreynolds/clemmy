@@ -25,7 +25,7 @@ import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
 import { refreshSpaceData } from '../spaces/runner.js';
-import { readData, listNotes, listAudit } from '../spaces/data-store.js';
+import { readData, listNotes, listAudit, appendNote } from '../spaces/data-store.js';
 
 function expandHome(p: string): string {
   if (p === '~') return os.homedir();
@@ -244,7 +244,16 @@ export function registerSpaceTools(server: McpServer): void {
       // wrong/empty surface (incl. zero-row sources from the smoke).
       let installedView = '';
       try { installedView = readFileSync(resolveInSpace(slug, record.viewEntry), 'utf-8'); } catch { /* no view */ }
-      const gapQuestions = renderSpaceGapQuestions(analyzeSpaceGaps(record, installedView, smoke?.empty ?? []));
+      const gaps = analyzeSpaceGaps(record, installedView, smoke?.empty ?? []);
+      // Record the gaps as a durable note so the desktop build panel can surface
+      // them (not only in this tool result). Always recorded — an empty set on a
+      // later clean save clears the panel (the UI reads the latest gap note).
+      appendNote(slug, {
+        text: gaps.length > 0 ? `Gap test flagged ${gaps.length} item${gaps.length === 1 ? '' : 's'} to confirm.` : 'Gap test: clean.',
+        kind: 'gap',
+        meta: { gaps: gaps.map((g) => ({ question: g.question, why: g.why })) },
+      });
+      const gapQuestions = renderSpaceGapQuestions(gaps);
       return textResult(
         `${verb} workspace "${record.title}" (${slug}) — status ${record.status}. Open it at /workspaces/${slug} in the desktop.${dsNote}`
         + ` The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`,

@@ -1,13 +1,14 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Clock, AlertCircle } from 'lucide-react';
+import { Plus, Clock } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
-import { listSpaces, createSpace, spaceViewUrl, type SpaceRecord } from '@/lib/spaces';
+import { listSpaces, spaceViewUrl, type SpaceRecord } from '@/lib/spaces';
 import { humanizeCron } from '@/lib/cron';
+import { CreateWorkspaceModal } from '@/components/workspaces/CreateWorkspaceModal';
 
 function statusTone(status: SpaceRecord['status']): Tone {
   if (status === 'active') return 'success';
@@ -64,20 +65,13 @@ function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => vo
 export function Workspaces() {
   const navigate = useNavigate();
   const spaces = usePoll(['spaces'], listSpaces, 8000);
-  const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
 
-  const handleCreate = async () => {
-    setCreating(true);
-    setError(null);
-    try {
-      const space = await createSpace('New workspace');
-      navigate(`/workspaces/${space.id}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not create a workspace.');
-    } finally {
-      setCreating(false);
-    }
+  // On create, carry the build request to the view as route state so the dock
+  // seeds Clem with it immediately (no cold context-switch to chat).
+  const openCreated = (id: string, build?: string) => {
+    setModalOpen(false);
+    navigate(`/workspaces/${id}`, build ? { state: { build } } : undefined);
   };
 
   const items = spaces.data ?? [];
@@ -87,17 +81,11 @@ export function Workspaces() {
       title="Workspaces"
       subtitle="Live, interactive surfaces Clem builds for you — reports, trackers, planners"
       actions={
-        <Button onClick={handleCreate} disabled={creating}>
-          <Plus className="h-4 w-4" aria-hidden /> {creating ? 'Creating…' : 'New workspace'}
+        <Button onClick={() => setModalOpen(true)}>
+          <Plus className="h-4 w-4" aria-hidden /> New workspace
         </Button>
       }
     >
-      {error && (
-        <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-small text-danger">
-          <AlertCircle className="h-4 w-4" aria-hidden /> {error}
-        </p>
-      )}
-
       {spaces.isLoading ? (
         <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {[0, 1, 2].map((i) => (
@@ -110,7 +98,7 @@ export function Workspaces() {
           description={
             <>Ask Clem to build one — “make me a live dashboard for my pipeline” — or start a blank one and tell her what you want.</>
           }
-          action={<Button onClick={handleCreate} disabled={creating}><Plus className="h-4 w-4" aria-hidden /> New workspace</Button>}
+          action={<Button onClick={() => setModalOpen(true)}><Plus className="h-4 w-4" aria-hidden /> New workspace</Button>}
         />
       ) : (
         <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
@@ -119,6 +107,7 @@ export function Workspaces() {
           ))}
         </div>
       )}
+      <CreateWorkspaceModal open={modalOpen} onClose={() => setModalOpen(false)} onCreated={openCreated} />
     </Page>
   );
 }

@@ -40,7 +40,7 @@ export interface SpaceRecord {
   lastRefreshedAt?: string;
   recipe?: string;
 }
-export interface SpaceNote { id: string; text: string; kind?: string; createdAt: string }
+export interface SpaceNote { id: string; text: string; kind?: string; meta?: Record<string, unknown>; createdAt: string }
 export interface SpaceAudit { ts: string; method: string; path: string; outcome: string; note?: string }
 export interface SpaceDetail {
   space: SpaceRecord;
@@ -83,6 +83,40 @@ export const reengageSpace = (id: string, body: { trigger?: 'note' | 'ask' | 'th
   apiPost<{ ok: boolean; reengaged: boolean; sessionId?: string }>(
     `/api/console/spaces/${encodeURIComponent(id)}/reengage`, body,
   );
+
+/** Count actions still WAITING on approval (E1): a 'pending' action note whose
+ *  approvalId hasn't been resolved by a later note (ran → meta.ok set, or
+ *  rejected → meta.status 'rejected'). Drives the toolbar "N waiting" badge. */
+export function openApprovalCount(notes: SpaceNote[]): number {
+  const resolved = new Set<string>();
+  for (const n of notes) {
+    const m = n.meta;
+    const aid = m && typeof m.approvalId === 'string' ? m.approvalId : null;
+    if (aid && (m!.ok !== undefined || m!.status === 'rejected')) resolved.add(aid);
+  }
+  let open = 0;
+  for (const n of notes) {
+    const m = n.meta;
+    if (n.kind !== 'action' || !m || m.status !== 'pending') continue;
+    const aid = typeof m.approvalId === 'string' ? m.approvalId : null;
+    if (aid && !resolved.has(aid)) open += 1;
+  }
+  return open;
+}
+
+export interface GapQuestion { question: string; why?: string }
+
+/** The clarifying questions Clem's gap-test flagged at save time (the LATEST
+ *  gap note wins, so a later clean save clears them). Surfaced in the build panel. */
+export function gapQuestions(notes: SpaceNote[]): GapQuestion[] {
+  const gapNotes = notes.filter((n) => n.kind === 'gap');
+  const latest = gapNotes[gapNotes.length - 1];
+  const gaps = latest?.meta?.gaps;
+  if (!Array.isArray(gaps)) return [];
+  return gaps
+    .filter((g): g is { question: string; why?: string } => !!g && typeof (g as { question?: unknown }).question === 'string')
+    .map((g) => ({ question: g.question, why: typeof g.why === 'string' ? g.why : undefined }));
+}
 
 /** Absolute URL the daemon serves the view at (same-origin → cookie-authed). */
 export const spaceViewUrl = (id: string) => `/console/spaces/${encodeURIComponent(id)}/view`;
