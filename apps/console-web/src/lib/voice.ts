@@ -33,6 +33,11 @@ export class RealtimeVoice {
   private audio: HTMLAudioElement | null = null;
   private assistant = '';
   private stopped = false;
+  // Session features returned by /api/console/realtime/session.
+  private features: { oneLoop?: boolean; progressUpdates?: boolean; reconnect?: boolean } = {};
+  // Idempotency: a re-emitted function_call must not run twice (duplicate brain
+  // runs / sends). Mirrors the legacy console handledCalls guard.
+  private handledCalls = new Set<string>();
 
   constructor(private handlers: VoiceHandlers) {}
 
@@ -57,6 +62,7 @@ export class RealtimeVoice {
     if (!res.ok) throw new Error(payload.error || 'Could not start a voice session.');
     const key = clientSecret(payload);
     if (!key) throw new Error('Voice session did not return a client secret.');
+    this.features = (payload && payload.features) || {};
 
     const pc = new RTCPeerConnection();
     this.pc = pc;
@@ -123,10 +129,118 @@ export class RealtimeVoice {
         if (ev.transcript) this.handlers.onAssistantText?.(ev.transcript);
         this.assistant = '';
         break;
-      case 'response.done':
-        this.handlers.onStatus('listening', 'Listening — speak naturally');
+      // THE ROUTING FIX (2026-06-23): when gpt-realtime decides real work is
+      // needed it emits a `send_to_clementine` function call. Previously the
+      // React client ignored it, so the realtime model self-answered and the
+      // user's actual brain (Claude/Codex/GLM) + tools + gates were bypassed.
+      // Relay it to /api/console/home/chat/stream (= assistant.respond → the
+      // configured brain), then speak the result.
+      case 'response.function_call_arguments.done':
+        void this.routeToClementine(ev.name, ev.arguments, ev.call_id);
         break;
+      case 'response.done': {
+        // A function_call can also arrive in the response output sweep.
+        let routed = false;
+        for (const item of (ev.response?.output ?? [])) {
+          if (item?.type === 'function_call') {
+            routed = true;
+            void this.routeToClementine(item.name, item.arguments, item.call_id);
+          }
+        }
+        if (!routed) this.handlers.onStatus('listening', 'Listening — speak naturally');
+        break;
+      }
     }
+  }
+
+  /** Relay a spoken request into the local Clementine agent (the configured
+   *  brain + tools + gates + memory + Tasks/Discord visibility), then hand the
+   *  result back to gpt-realtime to speak. Persona path (default). */
+  private async routeToClementine(name: string, rawArguments: string, callId?: string): Promise<void> {
+    if (name !== 'send_to_clementine' || !callId || this.handledCalls.has(callId) || this.stopped) return;
+    this.handledCalls.add(callId);
+
+    let args: { request?: string } = {};
+    try { args = JSON.parse(rawArguments || '{}'); } catch { /* ignore */ }
+    const request = String(args.request || '').trim();
+    if (!request) return;
+
+    this.handlers.onStatus('thinking', 'Routing into the local Clementine agent…');
+
+    // Optional immediate spoken ack so there's no dead air while the brain runs
+    // (gated on the server feature flag CLEMMY_VOICE_PROGRESS; off by default).
+    if (this.features.progressUpdates) {
+      this.send({
+        type: 'response.create',
+        response: { output_modalities: ['audio'], instructions: 'Give one short, natural acknowledgement that you are on it and looking into this now.' },
+      });
+    }
+
+    let result: { ok: boolean; text: string; pendingApprovalId: string | null } = { ok: false, text: '', pendingApprovalId: null };
+    try {
+      result = await this.streamHomeChat(`[Voice command] ${request}`);
+    } catch (err) {
+      result = { ok: false, text: `The local agent could not be reached: ${err instanceof Error ? err.message : String(err)}`, pendingApprovalId: null };
+    }
+    if (this.stopped) return;
+
+    // Hand the structured result back so gpt-realtime can speak the summary.
+    this.send({
+      type: 'conversation.item.create',
+      item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(result) },
+    });
+    this.send({
+      type: 'response.create',
+      response: {
+        output_modalities: ['audio'],
+        instructions: result.pendingApprovalId
+          ? 'In one short sentence, tell the user the request needs their approval in the Clementine dashboard or Discord before it can proceed.'
+          : 'Summarize the local Clementine result in one or two short spoken sentences. Do not read it verbatim.',
+      },
+    });
+  }
+
+  /** POST to the same streaming chat endpoint the dashboard chat uses and parse
+   *  the NDJSON to the final {ok,text,pendingApprovalId}. Routes through the
+   *  user's configured brain — all gates/approvals/memory apply automatically. */
+  private async streamHomeChat(message: string): Promise<{ ok: boolean; text: string; pendingApprovalId: string | null }> {
+    const t = getAuthToken();
+    const url = `/api/console/home/chat/stream${t ? `?token=${encodeURIComponent(t)}` : ''}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message, sessionId: 'console:voice' }),
+    });
+    if (!res.ok || !res.body) {
+      const e = await res.json().catch(() => ({}));
+      throw new Error((e as { error?: string }).error || `voice relay HTTP ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let out: { ok: boolean; text: string; pendingApprovalId: string | null } = { ok: false, text: '', pendingApprovalId: null };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev: any;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === 'status' || ev.type === 'tool') {
+          this.handlers.onStatus('thinking', ev.text || (ev.toolName ? `Using ${ev.toolName}…` : 'Working…'));
+        } else if (ev.type === 'done') {
+          out = { ok: (ev.stoppedReason ?? 'success') === 'success', text: ev.text || '', pendingApprovalId: ev.pendingApprovalId ?? null };
+        } else if (ev.type === 'error') {
+          throw new Error(ev.error || 'voice relay stream error');
+        }
+      }
+    }
+    return out;
   }
 
   stop(): void {
