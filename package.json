@@ -74,7 +74,8 @@
     "probe:code-mode": "tsx scripts/probe-code-mode.ts",
     "smoke:all": "bash scripts/smoke-all.sh",
     "eval:jobs": "tsx scripts/eval-jobs.ts",
-    "job:capture": "tsx scripts/capture-job-fixture.ts"
+    "job:capture": "tsx scripts/capture-job-fixture.ts",
+    "measure:judge-calibration": "tsx scripts/measure-judge-calibration.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.82",
