@@ -14,7 +14,7 @@
 import { spaceStore } from './store.js';
 import { refreshSpaceData } from './runner.js';
 import { readData } from './data-store.js';
-import { listConnectedToolkits } from '../integrations/composio/client.js';
+import { listConnectedToolkits, listComposioToolkitTools } from '../integrations/composio/client.js';
 
 /** Heuristic "did this source return anything usable?" — empty array, empty
  *  object, or null/undefined all count as empty; any non-empty array or scalar
@@ -91,10 +91,27 @@ export async function runSpaceCreationSmoke(slug: string): Promise<SpaceSmokeRes
       const activeToolkits = new Set(
         connected.filter((c) => /active/i.test(c.status)).map((c) => c.slug.toLowerCase()),
       );
+      // Cache each toolkit's known tool slugs once, so a TYPO'd action slug is
+      // caught now (it otherwise only fails when the button is clicked). Best-
+      // effort: if the tool list can't be fetched, fall back to toolkit-only.
+      const slugsByToolkit = new Map<string, Set<string> | null>();
       for (const a of composioActions) {
         const tk = toolkitSlugForTool(a.composioSlug!);
         if (!activeToolkits.has(tk)) {
           actionWarnings.push(`Action "${a.id}" calls "${a.composioSlug}" but the "${tk}" app isn't connected/active in Composio — authorize it in Connect, or the action will fail when fired.`);
+          continue;
+        }
+        if (!slugsByToolkit.has(tk)) {
+          try {
+            const tools = await listComposioToolkitTools(tk);
+            slugsByToolkit.set(tk, new Set(tools.map((t) => t.slug.toUpperCase())));
+          } catch {
+            slugsByToolkit.set(tk, null); // couldn't list — skip the existence check
+          }
+        }
+        const known = slugsByToolkit.get(tk);
+        if (known && !known.has(a.composioSlug!.toUpperCase())) {
+          actionWarnings.push(`Action "${a.id}" calls "${a.composioSlug}" but that exact slug isn't in the connected "${tk}" toolkit — verify it with composio_search_tools (a typo only fails when the button is fired).`);
         }
       }
     }

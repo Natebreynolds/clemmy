@@ -40,6 +40,43 @@ function templateHasRecipient(a: SpaceRecord['actions'][number]): boolean {
 }
 
 /**
+ * Compile (NEVER execute) each inline classic <script> to catch a JS SYNTAX
+ * error — the cheapest, safest slice of "does the view actually run". A genuine
+ * syntax error means the page renders blank or half-built; valid JS always
+ * compiles, so this can't false-flag a good view. External/JSON scripts and ES
+ * modules are skipped (import/export can't compile via Function without a
+ * parser). Top-level await/return is tolerated via an async-wrapper retry.
+ * Returns the first error message found, if any.
+ */
+export function findScriptSyntaxError(html: string): string | undefined {
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const attrs = m[1] ?? '';
+    const body = m[2] ?? '';
+    if (/\bsrc\s*=/i.test(attrs)) continue; // external script — nothing inline to compile
+    if (/\btype\s*=/i.test(attrs)
+      && !/\btype\s*=\s*["']?(text\/javascript|application\/javascript|module)\b/i.test(attrs)) continue; // json/template/etc
+    if (/\btype\s*=\s*["']?module/i.test(attrs)) continue; // ESM — import/export needs a real parser
+    if (!body.trim()) continue;
+    try {
+      // eslint-disable-next-line no-new-func
+      new Function(body); // compiles, does NOT run
+    } catch (e1) {
+      if (!(e1 instanceof SyntaxError)) continue;
+      try {
+        // eslint-disable-next-line no-new-func
+        new Function(`return (async () => {\n${body}\n});`); // tolerate top-level await/return
+        continue;
+      } catch (e2) {
+        if (e2 instanceof SyntaxError) return e1.message;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
  * Run the gap test over a saved Workspace + its installed view HTML. Returns
  * clarifying questions (possibly empty). Deterministic, side-effect free.
  * `zeroRowSourceIds` is fed from the creation smoke (space-smoke.ts) so a source
@@ -53,6 +90,16 @@ export function analyzeSpaceGaps(
   const gaps: SpaceGap[] = [];
   const html = viewHtml ?? '';
   const sources = record.dataSources ?? [];
+
+  // 0: the view's JS doesn't even parse (pushed FIRST so the cap never drops it).
+  const syntaxErr = findScriptSyntaxError(html);
+  if (syntaxErr) {
+    gaps.push({
+      severity: 'clarify',
+      question: `The view has a JavaScript syntax error (${syntaxErr}) — fix it before relying on the Workspace, or the surface renders blank/half-built.`,
+      why: 'A script that does not parse means the page never runs its logic.',
+    });
+  }
 
   // 1: the view never fetches its data at all.
   if (sources.length > 0 && !/\/data\b/.test(html) && !/\/refresh\b/.test(html)) {
@@ -74,6 +121,31 @@ export function analyzeSpaceGaps(
         question: `The view never references source "${s.id}" — confirm it reads the rows from data["${s.id}"] (the /refresh route nests each source's output under its id, so the array is at data["${s.id}"].<yourKey>).`,
         why: 'Reading the wrong key renders an empty table even though the data is there — the most common Workspace bug.',
       });
+    }
+  }
+
+  // 2b/2c: a declared action the view never wires can never run (closes the
+  // "action-id verification" gap). 2b = the view fires NO action at all; 2c =
+  // it fires actions but never references THIS id. The bridge's canonical shape
+  // is clem.action('<id>', …); a hand-rolled view POSTs …/action directly.
+  const actions = record.actions ?? [];
+  const firesActions = /clem\.action\b/.test(html) || /\/action\b/.test(html);
+  if (html && actions.length > 0 && !firesActions) {
+    gaps.push({
+      severity: 'clarify',
+      question: `The view declares ${actions.length} action${actions.length === 1 ? '' : 's'} but never fires one — add a control that calls clem.action('<id>', {…}).`,
+      why: 'A declared action with no control is dead weight — the user can never trigger it.',
+    });
+  } else if (html && firesActions) {
+    for (const a of actions) {
+      if (!html.includes(a.id)) {
+        gaps.push({
+          severity: 'clarify',
+          actionId: a.id,
+          question: `The view fires actions but never references "${a.id}" — confirm a control calls clem.action('${a.id}', {…}).`,
+          why: 'A declared action the view never wires can never run.',
+        });
+      }
     }
   }
 

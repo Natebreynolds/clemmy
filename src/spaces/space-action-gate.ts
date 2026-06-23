@@ -1,0 +1,187 @@
+/**
+ * Workspace action gate (E1) — the trust layer that lets Clem build a one-click
+ * "Send email / update the CRM" button you can actually rely on.
+ *
+ * A Space action that MUTATES an external system (a send, a CRM write) must not
+ * fire silently from a button click: it routes through the canonical approval
+ * registry, so the user approves ONCE (in the same inbox/board as every other
+ * approval) and only then does it run. READ-class actions (refresh a list, pull
+ * rows) still fire instantly — guardrails inform, they don't get in the way.
+ *
+ * Why this module (not the action route inline): a Space click has NO agent
+ * turn to resume, so the work must happen WHEN THE USER APPROVES. We subscribe
+ * to approval-registry's generic `onApprovalResolved` hook, which fires for
+ * every approve path (desktop, mobile, chat-dock) by construction — no surgery
+ * in the 7k-line console-routes, and no new approval UI (register() writes the
+ * row the existing /approvals + board listings already read).
+ *
+ * Classification reuses the SAME `classifyExternalWrite` the rest of the
+ * harness uses, so a Space send gates identically to an agent send.
+ *
+ * Kill-switch: `CLEMMY_SPACE_ACTION_APPROVAL` — default ON (the safe behavior).
+ * Set to off/0/false/no to restore instant execution while debugging.
+ */
+import { getRuntimeEnv } from '../config.js';
+import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
+import {
+  onApprovalResolved, register, type PendingApprovalRow,
+} from '../runtime/harness/approval-registry.js';
+import { getSession, createSession } from '../runtime/harness/eventlog.js';
+import { spaceStore, type SpaceAction, type SpaceRecord } from './store.js';
+import { appendNote, appendAudit } from './data-store.js';
+import { runSpaceAction } from './runner.js';
+
+/** Synthetic tool name stamped on the approval row so the resolve listener can
+ *  recognise a Space-action approval (and tell it apart from agent tool calls). */
+export const SPACE_ACTION_TOOL = 'space_execute_action';
+
+/** Same send-like heuristic as space-enforce's auto-repair, for runner actions
+ *  (which can't be statically classified by slug). */
+const SEND_LIKE_RE = /\b(send|reply|email|message|publish|post|tweet|dm|invite|sms|notify)\b/i;
+function actionLooksLikeSend(a: SpaceAction): boolean {
+  const hay = `${a.composioSlug ?? ''} ${a.runner ?? ''} ${a.label ?? ''} ${a.id}`.replace(/_/g, ' ');
+  return SEND_LIKE_RE.test(hay);
+}
+
+export function spaceActionApprovalEnabled(): boolean {
+  const raw = (getRuntimeEnv('CLEMMY_SPACE_ACTION_APPROVAL', 'on') ?? 'on').trim().toLowerCase();
+  return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
+}
+
+/**
+ * Does this action mutate an external system (→ needs one approval)?
+ *  - confirm:true → ALWAYS gates (explicit author intent; space-enforce already
+ *    auto-repairs this onto send-like actions at save time).
+ *  - Composio action → the shared harness classifier (CREATE/UPDATE/DELETE/SEND/
+ *    POST… gate; GET/LIST/SEARCH stay instant).
+ *  - Runner action → can't classify statically; gate only if it looks like a send.
+ */
+export function spaceActionNeedsApproval(action: SpaceAction): boolean {
+  if (action.confirm === true) return true;
+  if (action.composioSlug && action.composioSlug.trim()) {
+    try {
+      return classifyExternalWrite('composio_execute_tool', { tool_slug: action.composioSlug.trim() }).mutating;
+    } catch {
+      return false; // can't classify → don't block (fail-open, matches the harness)
+    }
+  }
+  return actionLooksLikeSend(action);
+}
+
+/** A short human preview of what the action will do, for the approval card. */
+function actionPreview(action: SpaceAction, callerArgs: Record<string, unknown>): string {
+  const args = { ...(action.argsTemplate ?? {}), ...(callerArgs ?? {}) };
+  const pick = (keys: string[]): string | undefined => {
+    for (const k of keys) { const v = args[k]; if (typeof v === 'string' && v.trim()) return v; }
+    return undefined;
+  };
+  const recipient = pick(['to', 'to_email', 'toEmail', 'recipient', 'recipients', 'email', 'address']);
+  const subject = pick(['subject', 'title', 'summary']);
+  const bits = [recipient ? `to ${recipient}` : '', subject ? `“${subject}”` : ''].filter(Boolean).join(' ');
+  return bits || action.composioSlug || action.runner || action.id;
+}
+
+export interface EnqueueResult { approvalId: string; subject: string; }
+
+/** The dedicated session id for a Workspace (shared with the dock + re-engage
+ *  thread, spaceSessionId() in space-routes). pending_approvals references
+ *  sessions(id), so the row must exist before we can register an approval. */
+function ensureSpaceSession(rec: SpaceRecord): string {
+  const sessionId = `space-${rec.id}`;
+  if (!getSession(sessionId)) {
+    // Idempotent-by-intent: a concurrent click could create it first → ignore
+    // the resulting PK conflict (single-user loopback makes this near-impossible).
+    try { createSession({ id: sessionId, kind: 'chat', title: rec.title }); } catch { /* already created */ }
+  }
+  return sessionId;
+}
+
+/** Register a pending approval for a gated Space action; record it on the
+ *  surface as a note + audit so the dock + the user see it's waiting. */
+export function enqueueSpaceActionApproval(
+  rec: SpaceRecord,
+  action: SpaceAction,
+  callerArgs: Record<string, unknown>,
+): EnqueueResult {
+  const verb = actionLooksLikeSend(action) ? 'Send' : 'Run';
+  const subject = `${verb} “${action.label ?? action.id}” in workspace “${rec.title}”`;
+  const row = register({
+    sessionId: ensureSpaceSession(rec),
+    subject,
+    tool: SPACE_ACTION_TOOL,
+    args: {
+      spaceSlug: rec.id,
+      actionId: action.id,
+      callerArgs,
+      composioSlug: action.composioSlug ?? null,
+      preview: actionPreview(action, callerArgs),
+    },
+  });
+  appendAudit(rec.id, { method: 'ACTION_PENDING', path: `/action/${action.id}`, outcome: 'ok', note: row.approvalId });
+  appendNote(rec.id, {
+    text: `“${action.label ?? action.id}” is awaiting your approval (${row.approvalId}).`,
+    kind: 'action',
+    meta: { actionId: action.id, approvalId: row.approvalId, status: 'pending' },
+  });
+  return { approvalId: row.approvalId, subject };
+}
+
+/** Execute a Space action whose approval was just APPROVED. Best-effort; records
+ *  the outcome so the dock's Clem + the user see what happened. */
+export async function executeApprovedSpaceAction(row: PendingApprovalRow): Promise<void> {
+  const args = row.args ?? {};
+  const slug = typeof args.spaceSlug === 'string' ? args.spaceSlug : '';
+  const actionId = typeof args.actionId === 'string' ? args.actionId : '';
+  const callerArgs = (args.callerArgs && typeof args.callerArgs === 'object')
+    ? args.callerArgs as Record<string, unknown> : {};
+  if (!slug || !actionId) return;
+  const rec = spaceStore.get(slug);
+  if (!rec) return;
+  const action = rec.actions.find((a) => a.id === actionId);
+  if (!action) return;
+  const result = await runSpaceAction(slug, action, callerArgs);
+  appendAudit(slug, {
+    method: 'ACTION', path: `/action/${actionId}`,
+    outcome: result.ok ? 'ok' : 'error', note: result.ok ? row.approvalId : result.error,
+  });
+  appendNote(slug, {
+    text: result.ok
+      ? `Approved and ran “${action.label ?? actionId}”.`
+      : `“${action.label ?? actionId}” failed after approval: ${result.error}`,
+    kind: 'action',
+    meta: { actionId, ok: result.ok, approvalId: row.approvalId },
+  });
+}
+
+/** Record a rejected/expired/cancelled Space action so the surface reflects it. */
+function recordUnapproved(row: PendingApprovalRow): void {
+  const args = row.args ?? {};
+  const slug = typeof args.spaceSlug === 'string' ? args.spaceSlug : '';
+  const actionId = typeof args.actionId === 'string' ? args.actionId : '';
+  if (!slug || !actionId) return;
+  const status = row.resolution ?? 'rejected';
+  appendAudit(slug, { method: 'ACTION_REJECTED', path: `/action/${actionId}`, outcome: 'rejected', note: row.approvalId });
+  appendNote(slug, {
+    text: `“${actionId}” was not run (${status}).`,
+    kind: 'action',
+    meta: { actionId, approvalId: row.approvalId, status },
+  });
+}
+
+let initialized = false;
+/**
+ * Wire the resolve listener once (idempotent). Called from registerSpaceRoutes
+ * at daemon boot so an approved Space action actually runs.
+ */
+export function initSpaceActionApprovals(): void {
+  if (initialized) return;
+  initialized = true;
+  onApprovalResolved((row) => {
+    if (row.tool !== SPACE_ACTION_TOOL) return;
+    if (row.resolution === 'approved') {
+      void executeApprovedSpaceAction(row).catch(() => { /* outcome already audited inside */ });
+    } else {
+      recordUnapproved(row);
+    }
+  });
+}

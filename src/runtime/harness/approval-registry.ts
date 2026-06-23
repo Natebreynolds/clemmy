@@ -77,6 +77,30 @@ export function isActionable(row: PendingApprovalRow, now: Date = new Date()): b
   return row.status === 'pending' && !isExpired(row, now);
 }
 
+/**
+ * Generic post-resolution hook. A subsystem can react to an approval being
+ * resolved WITHOUT this data layer importing it — keeps the registry
+ * dependency-free (the comment at the top: "routing lives in their own
+ * modules"). Workspaces use this to EXECUTE a gated Space action the moment the
+ * user approves it: a button click has no agent turn to resume, so the work
+ * must happen on resolve. Fires for every resolution (approved/rejected/
+ * expired/cancelled) across every approve path — desktop, mobile, chat-dock —
+ * because they all funnel through resolve(). Best-effort: a listener throwing
+ * must never break resolution.
+ */
+export type ApprovalResolvedListener = (row: PendingApprovalRow) => void;
+const resolvedListeners: ApprovalResolvedListener[] = [];
+
+export function onApprovalResolved(listener: ApprovalResolvedListener): void {
+  if (!resolvedListeners.includes(listener)) resolvedListeners.push(listener);
+}
+
+function emitResolved(row: PendingApprovalRow): void {
+  for (const fn of resolvedListeners) {
+    try { fn(row); } catch { /* a listener must never break resolution */ }
+  }
+}
+
 export interface RegisterApprovalInput {
   sessionId: string;
   channel?: string | null;
@@ -331,7 +355,9 @@ export function resolve(
       /* best-effort */
     }
   }
-  return { ok: true, row: rowToPublic(row) };
+  const publicRow = rowToPublic(row);
+  emitResolved(publicRow);
+  return { ok: true, row: publicRow };
 }
 
 /**

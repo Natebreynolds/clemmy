@@ -59,6 +59,23 @@ test('POST creates a workspace with a placeholder view; GET list shows it', asyn
   assert.match(await view.text(), /Test Board/);
 });
 
+test('C2: served view injects the window.clem bridge (slug baked in) + keeps the link shim', async () => {
+  const slug = 'bridge-rt';
+  store.spaceStore.save({ id: slug, title: 'Bridge RT' });
+  const viewFile = store.resolveInSpace(slug, 'view/index.html');
+  mkdirSync(path.dirname(viewFile), { recursive: true });
+  writeFileSync(viewFile, '<html><body><h1>Hi</h1></body></html>', 'utf-8');
+  const html = await (await fetch(`${base}/console/spaces/${slug}/view`)).text();
+  // Bridge present, slug baked into the base path, action helper wired.
+  assert.match(html, /window\.clem=/);
+  assert.match(html, new RegExp(`/api/console/spaces/${slug}`));
+  assert.match(html, /action:async function/);
+  // The external-link shim is still injected (capture-phase click handler).
+  assert.match(html, /addEventListener\('click'/);
+  // Injection lands inside the document body.
+  assert.ok(html.indexOf('window.clem') < html.indexOf('</body>'));
+});
+
 test('PUT/GET data round-trips; size cap rejects with 413', async () => {
   const slug = 'data-rt';
   store.spaceStore.save({ id: slug, title: 'Data RT' });
@@ -130,11 +147,13 @@ test('paused workspace rejects data writes (423) but still serves the view', asy
   assert.equal(view.status, 200); // read-only cached view still serves
 });
 
-test('action route runs a declared action server-side, merges args, records a note', async () => {
+test('action route runs a READ-class action immediately, merges args, records a note', async () => {
   const slug = 'action-rt';
   store.spaceStore.save({
     id: slug, title: 'Action RT',
-    actions: [{ id: 'send', label: 'Send email', runner: 'act.mjs', argsTemplate: { from: 'me@co' } }],
+    // "Refresh list" is read-class (not a send, no confirm) → fires instantly
+    // even with the E1 approval gate on (the default).
+    actions: [{ id: 'refresh-list', label: 'Refresh list', runner: 'act.mjs', argsTemplate: { scope: 'team' } }],
   });
   const scriptDir = store.resolveInSpace(slug, 'data');
   mkdirSync(scriptDir, { recursive: true });
@@ -145,16 +164,83 @@ test('action route runs a declared action server-side, merges args, records a no
 
   const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ actionId: 'send', args: { to: 'lead@acme', subject: 'Hi' } }),
+    body: JSON.stringify({ actionId: 'refresh-list', args: { limit: 10 } }),
   }));
   assert.equal(res.status, 200);
   assert.equal(res.body.ok, true);
-  // template (from) merged under caller args (to, subject).
-  assert.deepEqual(res.body.result.sent, { from: 'me@co', to: 'lead@acme', subject: 'Hi' });
+  // template (scope) merged under caller args (limit).
+  assert.deepEqual(res.body.result.sent, { scope: 'team', limit: 10 });
 
   // The action is recorded as a note so the dock's Clem has context.
   const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
-  assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Send email/.test(n.text)));
+  assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list/.test(n.text)));
+});
+
+test('E1: a SEND-class action is gated behind one approval (default on) — 202 pending, not yet run', async () => {
+  const slug = 'action-gate';
+  store.spaceStore.save({
+    id: slug, title: 'Gate RT',
+    actions: [{ id: 'email', label: 'Email lead', composioSlug: 'OUTLOOK_SEND_EMAIL', argsTemplate: { from: 'me@co' } }],
+  });
+  const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ actionId: 'email', args: { to: 'lead@acme', subject: 'Hi' } }),
+  }));
+  assert.equal(res.status, 202);
+  assert.equal(res.body.pending, true);
+  assert.match(res.body.approvalId, /^apr-/);
+
+  // Registered in the canonical approval registry (so it surfaces in the
+  // inbox/board), recorded on the surface as awaiting approval — and NOT run.
+  const { listPending } = await import('../runtime/harness/approval-registry.js');
+  assert.ok(listPending({ status: 'pending' }).some(
+    (r) => r.approvalId === res.body.approvalId && r.tool === 'space_execute_action'));
+  const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
+  assert.ok(notes.body.notes.some((n: any) => n.meta?.status === 'pending'));
+  assert.ok(!notes.body.notes.some((n: any) => /Approved and ran/.test(n.text)));
+});
+
+test('E1: confirm:true forces the gate even for a non-send runner action', async () => {
+  const slug = 'action-confirm';
+  store.spaceStore.save({
+    id: slug, title: 'Confirm RT',
+    actions: [{ id: 'wipe', label: 'Wipe cache', runner: 'act.mjs', confirm: true }],
+  });
+  const scriptDir = store.resolveInSpace(slug, 'data');
+  mkdirSync(scriptDir, { recursive: true });
+  writeFileSync(path.join(scriptDir, 'act.mjs'), 'process.stdout.write(JSON.stringify({ok:1}))', 'utf-8');
+  const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ actionId: 'wipe', args: {} }),
+  }));
+  assert.equal(res.status, 202);
+  assert.equal(res.body.pending, true);
+});
+
+test('E1: kill-switch off restores instant execution for a send action', async () => {
+  const prev = process.env.CLEMMY_SPACE_ACTION_APPROVAL;
+  process.env.CLEMMY_SPACE_ACTION_APPROVAL = 'off';
+  try {
+    const slug = 'action-killswitch';
+    store.spaceStore.save({
+      id: slug, title: 'Killswitch RT',
+      actions: [{ id: 'send', label: 'Send email', runner: 'act.mjs', argsTemplate: { from: 'me@co' } }],
+    });
+    const scriptDir = store.resolveInSpace(slug, 'data');
+    mkdirSync(scriptDir, { recursive: true });
+    writeFileSync(path.join(scriptDir, 'act.mjs'),
+      'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s);process.stdout.write(JSON.stringify({sent:p.args}))})',
+      'utf-8');
+    const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ actionId: 'send', args: { to: 'lead@acme' } }),
+    }));
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.result.sent, { from: 'me@co', to: 'lead@acme' });
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_SPACE_ACTION_APPROVAL;
+    else process.env.CLEMMY_SPACE_ACTION_APPROVAL = prev;
+  }
 });
 
 test('action route 404s an unknown action; 423 when paused', async () => {

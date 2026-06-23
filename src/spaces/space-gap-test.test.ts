@@ -20,6 +20,7 @@ function rec(partial: Partial<SpaceRecord>): SpaceRecord {
 
 const GOOD_VIEW = `<html><script>
 fetch('/api/console/spaces/x/data').then(r=>r.json()).then(j=>{const rows=j.data.contacts.contacts;render(rows)});
+function go(row){ clem.action('send_email', { to_email: row.email }); }
 </script></html>`;
 
 test('a clean Workspace emits zero questions (byte-identical save)', () => {
@@ -82,4 +83,31 @@ test('report is capped at 5 questions', () => {
   const many = Array.from({ length: 9 }, (_, i) => ({ id: `s${i}`, runner: 'r.mjs' }));
   const gaps = analyzeSpaceGaps(rec({ dataSources: many }), '<html>nothing</html>');
   assert.ok(gaps.length <= 5);
+});
+
+test('C1: a view with a JS syntax error → a question', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'contacts', runner: 'r.mjs' }] }),
+    '<html><script>const x = {;</script></html>',
+  );
+  assert.ok(gaps.some((g) => /syntax error/i.test(g.question)));
+});
+
+test('C1: valid top-level await in the view does NOT false-flag a syntax error', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({ dataSources: [{ id: 'contacts', runner: 'r.mjs' }] }),
+    "<html><script>const j = await (await fetch('/api/console/spaces/x/data')).json(); render(j.data.contacts);</script></html>",
+  );
+  assert.ok(!gaps.some((g) => /syntax error/i.test(g.question)));
+});
+
+test('C1: an action the view never wires → a question', () => {
+  const gaps = analyzeSpaceGaps(
+    rec({
+      dataSources: [{ id: 'contacts', runner: 'r.mjs' }],
+      actions: [{ id: 'send_email', composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', argsTemplate: { to_email: '' } }],
+    }),
+    "<html><script>fetch('/api/console/spaces/x/data').then(r=>r.json()).then(j=>render(j.data.contacts));</script></html>",
+  );
+  assert.ok(gaps.some((g) => /never fires one|never references "send_email"/.test(g.question)));
 });

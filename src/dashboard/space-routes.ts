@@ -23,6 +23,10 @@ import {
 } from '../spaces/data-store.js';
 import { refreshSpaceData, runSpaceAction } from '../spaces/runner.js';
 import { composeForSpace } from '../spaces/compose.js';
+import {
+  spaceActionApprovalEnabled, spaceActionNeedsApproval,
+  enqueueSpaceActionApproval, initSpaceActionApprovals,
+} from '../spaces/space-action-gate.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 
 type IsAuthorized = (req: Request) => boolean;
@@ -58,6 +62,31 @@ const CONTENT_TYPES: Record<string, string> = {
  *  the link. */
 const EXTERNAL_LINK_SHIM = `<script>(function(){document.addEventListener('click',function(e){var t=e.target;var a=t&&t.closest?t.closest('a[href]'):null;if(!a)return;var h=a.getAttribute('href')||'';if(/^(tel:|callto:|sms:|mailto:|facetime:|facetime-audio:|maps:|webcal:)/i.test(h)){e.preventDefault();try{window.open(h);}catch(_){}}},true);})();</script>`;
 
+/** Injected into every served HTML view: a tiny same-origin helper so Clem
+ *  never hand-rolls fetch() (the #1 source of broken views — wrong slug, wrong
+ *  data key). The slug is baked in at serve time, so the view just calls:
+ *    await clem.data()                       → the dataset (keyed by sourceId)
+ *    await clem.refresh(sourceId?)           → re-pull server-side, returns data
+ *    await clem.compose(instructions, ctx)   → a grounded draft (throws on error)
+ *    await clem.action(actionId, args)       → fire a declared action
+ *    await clem.note(text, kind?, meta?)     → record a note
+ *  clem.action() RESOLVES the E1 approval contract: a send/write returns
+ *  {pending:true, approvalId} (the user approves in the inbox; it fires then),
+ *  a read returns {ok:true, result}. CSP-safe (inline, same-origin). */
+const CLEM_VIEW_BRIDGE = (slug: string): string => {
+  const B = JSON.stringify(`/api/console/spaces/${slug}`);
+  const S = JSON.stringify(slug);
+  return `<script>(function(){var B=${B};`
+    + `async function j(m,p,b){var r=await fetch(B+p,{method:m,headers:b?{'content-type':'application/json'}:undefined,body:b?JSON.stringify(b):undefined});var d=null;try{d=await r.json();}catch(e){}return{status:r.status,ok:r.ok,data:d};}`
+    + `window.clem={slug:${S},`
+    + `data:async function(){var r=await j('GET','/data');return r.data&&r.data.data;},`
+    + `refresh:async function(id){var r=await j('POST','/refresh',id?{sourceId:id}:{});return r.data;},`
+    + `note:async function(t,k,meta){var r=await j('POST','/notes',{text:t,kind:k,meta:meta});return r.data;},`
+    + `compose:async function(ins,ctx,mx){var r=await j('POST','/compose',{instructions:ins,context:ctx,maxChars:mx});if(!r.ok)throw new Error((r.data&&r.data.error)||'compose failed');return r.data&&r.data.text;},`
+    + `action:async function(id,args){var r=await j('POST','/action',{actionId:id,args:args||{}});if(r.status===202&&r.data&&r.data.pending)return{pending:true,approvalId:r.data.approvalId,subject:r.data.subject};if(!r.ok)throw new Error((r.data&&r.data.error)||'action failed');return{ok:true,result:r.data&&r.data.result};}`
+    + `};})();</script>`;
+};
+
 function isLoopback(req: Request): boolean {
   const addr = req.socket?.remoteAddress ?? '';
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1' || addr === '';
@@ -82,6 +111,10 @@ const PLACEHOLDER_VIEW = (title: string) => `<!doctype html><html><head><meta ch
 <p>This workspace is empty. Ask Clem to build it — she'll write the view and wire up its data.</p></div></body></html>`;
 
 export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): void {
+  // Wire the gated-action resolve listener once, so an APPROVED one-click Space
+  // action actually runs (a button click has no agent turn to resume). Idempotent.
+  initSpaceActionApprovals();
+
   // ---- View serving (same-origin) ----------------------------------------
   const serveView = (req: Request, res: Response): void => {
     if (!isAuthorized(req)) { res.status(401).send('Unauthorized'); return; }
@@ -108,7 +141,10 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // the desktop's setWindowOpenHandler hands to the OS (the dialer/mail).
       // Same-origin inline script — allowed by the console CSP.
       const html = readFileSync(target, 'utf-8');
-      res.send(html.includes('</body>') ? html.replace('</body>', `${EXTERNAL_LINK_SHIM}</body>`) : html + EXTERNAL_LINK_SHIM);
+      // Bridge first (so the view's own scripts can call window.clem), then the
+      // external-link shim. Both are same-origin inline scripts (console CSP).
+      const injected = `${CLEM_VIEW_BRIDGE(slug)}${EXTERNAL_LINK_SHIM}`;
+      res.send(html.includes('</body>') ? html.replace('</body>', `${injected}</body>`) : html + injected);
       return;
     }
     res.send(readFileSync(target));
@@ -279,6 +315,18 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     const action = rec.actions.find((a) => a.id === actionId);
     if (!action) { res.status(404).json({ error: `no action "${actionId}"` }); return; }
     const callerArgs = (req.body?.args && typeof req.body.args === 'object') ? req.body.args as Record<string, unknown> : {};
+    // E1 — an action that MUTATES an external system (a send, a CRM write) takes
+    // ONE approval (surfaced in the inbox/board) before it fires; READ-class
+    // actions run instantly. Kill-switch: CLEMMY_SPACE_ACTION_APPROVAL.
+    if (spaceActionApprovalEnabled() && spaceActionNeedsApproval(action)) {
+      try {
+        const { approvalId, subject } = enqueueSpaceActionApproval(rec, action, callerArgs);
+        res.status(202).json({ pending: true, approvalId, subject });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
     try {
       const result = await runSpaceAction(slug, action, callerArgs);
       appendAudit(slug, { method: 'ACTION', path: `/action/${actionId}`, outcome: result.ok ? 'ok' : 'error', note: result.ok ? undefined : result.error });

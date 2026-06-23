@@ -11,6 +11,7 @@ import { renderLearnedBlocks, renderAutonomy, renderCurrentTimeForInstructions, 
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
+import { isSpacesEnabled } from '../spaces/store.js';
 import type { MessageIntent } from './message-intent.js';
 
 
@@ -260,6 +261,12 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const planner = 'Keep clarify / plan / act conversational inside the main loop. Use `draft_plan` only for explicit planning requests, genuinely large/irreversible work, complex local/multi-artifact work where the user benefits from seeing your approach, or batch external writes that need a reviewed scope. If the returned plan has open `needsUserInput` questions, ask the user the shortest necessary clarification first; do NOT call `surface_plan` and do NOT show approval buttons for an incomplete plan. If the plan is executable and SIGNIFICANT/LARGE, recommends tracked execution, or includes multiple external writes, call `surface_plan` and stop until you see "Plan approved: <objective>". If the plan is executable, moderate, and safe/local/read-only, call `share_plan` to show the working plan without approval buttons, then continue. Skip the Planner for trivial reads and natural conversation.';
   const focus = 'When the user asks to focus on one task, pause the rest, or stop working on everything except X, call `execution_focus` (id or short title substring). To bring everything back, call `execution_clear_focus`. Use `execution_pause` / `execution_resume` for ad-hoc single-execution control outside of a focus session.';
   const reportBack = 'BACKGROUND OUTCOME REPORT-BACK — the recent transcript may contain a synthetic line that starts with `[workflow run <id> …]` or `[background task <id> …]`. That is a job you dispatched to run in the background REPORTING ITS OUTCOME (completed / needs attention / FAILED) — it is NOT a user message and must NEVER be silently absorbed. The user fired it off and moved on to other work; they are relying on you to tell them when it lands. SURFACE it proactively: on a completion, give them the result + any link/IDs it produced; on a FAILED / needs-attention outcome, first finish whatever the user just asked for, then flag it in one non-blocking line ("— heads up: your <name> flow finished but needs attention / failed at <step> — want me to retry?"). Do not re-surface an outcome you have already reported to the user.';
+  // WORKSPACES — close the "Clem doesn't know WHEN/WHY to build a living surface"
+  // gap. Concise on purpose (the HOW lives in the space_save tool text she reads
+  // when building); feature-gated so it costs nothing when Spaces is off.
+  const workspaces = isSpacesEnabled()
+    ? 'WORKSPACES — when the user wants a LIVING surface (a dashboard, tracker, pipeline cockpit, prospect list, daily planner) rather than a one-off answer, offer to BUILD one with `space_save`: a persistent HTML view that refreshes its own data server-side for free (cron, no tokens), can EXECUTE on one click (send an email / update a CRM — a write takes ONE approval, a read fires at once), draft grounded text from a row (`clem.compose`), and proactively wake you when something crosses a threshold (re-engage). Offer one when the user will keep coming back to it or wants it working while they are away; for a one-time answer, just answer. Suggest it — the user owns the call, never auto-build.'
+    : '';
 
   // Pinned/standing facts are Tier-1 — ALWAYS present (even on a casual turn),
   // so a durable rule the user set never silently drops. Scored facts ride the
@@ -271,7 +278,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const standingFacts = renderFactsForInstructions(12, 2000, undefined, 'pinned');
 
   const tier1 = [
-    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack,
+    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack, workspaces,
     channelDirective, actionDirective, userPreferences, standingFacts, proposalFeedback,
     // Stable parity blocks (Now/Focus are dynamic → per-turn tail, not here).
     autonomyBlock, skillsBlock,
@@ -291,7 +298,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   return [
     // Date FIRST so the model reads it before any other context (matches harness).
     nowBlock,
-    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack,
+    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack, workspaces,
     channelDirective, actionDirective,
     autonomyBlock,
     userPreferences,
