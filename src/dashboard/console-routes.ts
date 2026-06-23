@@ -9,6 +9,7 @@ import { randomBytes } from 'node:crypto';
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { renderConsoleHtml } from './console.js';
+import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
 import {
   BASE_DIR,
   DEFAULT_MODELS,
@@ -62,6 +63,7 @@ import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
+import { resolveRealtimeVad, buildRealtimeSessionConfig, VOICE_DELIVERY_INSTRUCTIONS } from './realtime-session-config.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns, closeCheckIn } from '../agents/check-ins.js';
@@ -945,6 +947,10 @@ export function registerConsoleRoutes(
   if (opts?.serveLegacyAtRoot ?? true) {
     app.get('/console', serveLegacyConsole);
   }
+
+  // Read-only multi-agent workspace API (roster, canMessage graph, comms,
+  // per-agent runs). Shares this function's auth gate.
+  registerConsoleAgentsRoutes(app, isAuthorized);
 
   /**
    * Serve the Clementine icon for use in the dashboard / favicons.
@@ -7798,57 +7804,41 @@ export function registerConsoleRoutes(
     const voice = requestedVoice || getRuntimeEnv('OPENAI_REALTIME_VOICE', 'marin');
     const model = requestedModel || getRuntimeEnv('OPENAI_REALTIME_MODEL', 'gpt-realtime');
     const transcriptionModel = getRuntimeEnv('OPENAI_REALTIME_TRANSCRIBE_MODEL', 'gpt-4o-mini-transcribe');
-    const instructions = buildRealtimeVoiceInstructions(sessionId);
 
-    const session = {
-      session: {
-        type: 'realtime',
-        model,
-        instructions,
-        audio: {
-          input: {
-            transcription: { model: transcriptionModel },
-            turn_detection: {
-              type: 'server_vad',
-              threshold: realtimeNumberEnv('OPENAI_REALTIME_VAD_THRESHOLD', 0.55, 0.1, 0.95),
-              prefix_padding_ms: realtimeNumberEnv('OPENAI_REALTIME_PREFIX_PADDING_MS', 350, 0, 1500),
-              silence_duration_ms: realtimeNumberEnv('OPENAI_REALTIME_SILENCE_MS', 430, 150, 2000),
-              idle_timeout_ms: realtimeNumberEnv('OPENAI_REALTIME_IDLE_TIMEOUT_MS', 6500, 1000, 30000),
-              interrupt_response: true,
-              create_response: true,
-            },
-          },
-          output: { voice },
-        },
-        tools: [
-          {
-            type: 'function',
-            name: 'send_to_clementine',
-            description: 'Send a spoken user request to the local Clementine agent for tool use, local computer actions, project work, approvals, or long-running execution.',
-            parameters: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                request: {
-                  type: 'string',
-                  description: 'The exact user request to send to Clementine.',
-                },
-                reason: {
-                  type: 'string',
-                  description: 'Why this request should be handled by the local agent instead of only the realtime voice model.',
-                },
-              },
-              required: ['request', 'reason'],
-            },
-          },
-        ],
-        tool_choice: 'auto',
-      },
-      expires_after: {
-        anchor: 'created_at',
-        seconds: 600,
-      },
-    };
+    // Turn-taking (VAD) parameters: env vars are the default, but the voice
+    // settings UI may override them per-session via the request body. The
+    // shared resolver clamps every value to the same safe range as the env
+    // path so UI input can never push out-of-range numbers into the session.
+    const { vadThreshold, prefixPaddingMs, silenceMs } = resolveRealtimeVad(body, {
+      vadThreshold: realtimeNumberEnv('OPENAI_REALTIME_VAD_THRESHOLD', 0.55, 0.1, 0.95),
+      prefixPaddingMs: realtimeNumberEnv('OPENAI_REALTIME_PREFIX_PADDING_MS', 350, 0, 1500),
+      silenceMs: realtimeNumberEnv('OPENAI_REALTIME_SILENCE_MS', 430, 150, 2000),
+    });
+
+    // Client-honored feature flags (kill-switches). The renderer drives the
+    // spoken-progress, reconnect/swap, and one-loop behavior, so the server is
+    // the single source of truth and hands the resolved flags back in the
+    // session payload.
+    const voiceProgress = (getRuntimeEnv('CLEMMY_VOICE_PROGRESS', 'off') || 'off').toLowerCase() === 'on';
+    const voiceReconnect = (getRuntimeEnv('CLEMMY_VOICE_RECONNECT', 'on') || 'on').toLowerCase() !== 'off';
+    // One-loop: the realtime model becomes ears+mouth only and the REAL agent
+    // (the chat loop) does the thinking + talking. Off → the legacy persona.
+    const voiceOneLoop = (getRuntimeEnv('CLEMMY_VOICE_ONE_LOOP', 'off') || 'off').toLowerCase() === 'on';
+
+    // In one-loop mode the model decides nothing, so it gets a thin voice-
+    // delivery instruction instead of the heavy memory/goals context (the
+    // brain owns that). The persona path keeps the full injected context.
+    const instructions = voiceOneLoop ? VOICE_DELIVERY_INSTRUCTIONS : buildRealtimeVoiceInstructions(sessionId);
+
+    const session = buildRealtimeSessionConfig({
+      model,
+      voice,
+      transcriptionModel,
+      instructions,
+      vad: { vadThreshold, prefixPaddingMs, silenceMs },
+      idleTimeoutMs: realtimeNumberEnv('OPENAI_REALTIME_IDLE_TIMEOUT_MS', 6500, 1000, 30000),
+      oneLoop: voiceOneLoop,
+    });
 
     try {
       const response = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
@@ -7880,6 +7870,8 @@ export function registerConsoleRoutes(
         ...(payload && typeof payload === 'object' ? payload as Record<string, unknown> : { value: payload }),
         model,
         voice,
+        vad: { threshold: vadThreshold, silenceMs, prefixPaddingMs },
+        features: { progressUpdates: voiceProgress, reconnect: voiceReconnect, oneLoop: voiceOneLoop },
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

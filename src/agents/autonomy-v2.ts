@@ -12,6 +12,15 @@ import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityP
 import { renderOpenCheckInsForAgent } from './check-ins.js';
 import { getProposalFeedback, renderProposalFeedback } from './proposal-feedback.js';
 import { buildPlannerTool } from './planner.js';
+import { loadSkill } from '../memory/skill-store.js';
+import {
+  buildAgentCommsTools,
+  commsInstructionBlock,
+  deliverTeamCommsToInboxes,
+  logCommsDelivery,
+  peerCommsEnabled,
+  resetCommsCycle,
+} from './agent-comms.js';
 import { activeExecutionCountForSession, renderActiveExecutionsForAgent } from '../tools/execution-tools.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { defaultOrchestratorHandoffs, isOrchestratorSlug } from './sub-agents.js';
@@ -380,6 +389,36 @@ export function chooseFollowUpMinutes(
   return Math.max(base * 3, 15);
 }
 
+/**
+ * Slice 4 — inject the SKILL.md body of every skill bound to this agent,
+ * the same way a workflow step does for `usesSkill`. A specialist boots
+ * knowing its craft instead of rediscovering it via skill_read each cycle.
+ * Missing skills are noted (not silently dropped) so a stale binding is
+ * visible. Returns '' when no skills are bound (no prompt growth).
+ */
+function renderBoundSkills(agent: TeamAgentRecord): string {
+  const names = agent.skills ?? [];
+  if (names.length === 0) return '';
+  const blocks: string[] = [];
+  for (const name of names) {
+    const skill = loadSkill(name);
+    if (skill) blocks.push(`### Skill: ${name}\n${skill.body.trim()}`);
+    else blocks.push(`### Skill: ${name}\n(not installed — ask the user to install it or remove it from your skills.)`);
+  }
+  return ['Your skills (follow these as binding procedures when the task matches):', ...blocks].join('\n\n');
+}
+
+/** Slice 4 — list the workflows this agent owns so it reaches for them via
+ *  `workflow_run` instead of redoing the work ad-hoc. Returns '' when none. */
+function renderOwnedWorkflows(agent: TeamAgentRecord): string {
+  const names = agent.workflows ?? [];
+  if (names.length === 0) return '';
+  return [
+    'Workflows you own — prefer `workflow_run` with the exact name when the task matches one:',
+    ...names.map((n) => `- ${n}`),
+  ].join('\n');
+}
+
 function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolicy): string {
   const orchestrator = isOrchestratorSlug(agent.slug);
   const proposalFeedbackBlock = renderProposalFeedback(getProposalFeedback({ windowDays: 30 }));
@@ -389,6 +428,10 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
     agent.description ? `Mission: ${agent.description}` : '',
     agent.project ? `Bound project: ${agent.project}` : '',
     `Personality and operating guidance:\n${agent.personality}`,
+    // Slice 4: bound skills + owned workflows. Data-driven — empty by
+    // default, so agents without bindings are unchanged.
+    renderBoundSkills(agent),
+    renderOwnedWorkflows(agent),
     'You are proactive. If goals or tasks have stagnated, take initiative.',
     orchestrator ? [
       'You are the orchestrator. Specialized sub-agents are available via handoff:',
@@ -421,7 +464,9 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
       '- If there\'s nothing useful to do this cycle, take no action and say so in your summary.',
       '- If you receive an inbox item of type `check_in_answered`, the user just answered a question you previously asked. Pick up where you left off and use the answer to make progress.',
     ].join('\n'),
-    'Multi-agent comms (messaging, delegation, replies) is not available in v2 yet — for now, leave those to v1 by surfacing the intent in your summary so the user can act.',
+    peerCommsEnabled()
+      ? commsInstructionBlock(agent.slug)
+      : 'Multi-agent comms (messaging, delegation, replies) is not available in v2 yet — for now, leave those to v1 by surfacing the intent in your summary so the user can act.',
     proposalFeedbackBlock,
     'Output: return only `summary`, `commitments`, and optional `followUpMinutes`. Be specific and brief.',
   ].filter(Boolean).join('\n\n');
@@ -477,6 +522,9 @@ function recordHash(record: TeamAgentRecord): string {
     d: record.description,
     m: record.model,
     pr: record.project,
+    // Slice 4: skill/workflow bindings change the instructions → bust cache.
+    sk: record.skills ?? [],
+    wf: record.workflows ?? [],
   });
 }
 
@@ -493,6 +541,9 @@ function policyFingerprint(policy: ProactivityPolicy): string {
     cm: policy.allowComposioActions,
     dc: policy.allowDiscordCheckIns,
     wg: policy.requireWorkflowApprovalForExecution,
+    // Fold the peer-comms flag in so flipping it busts the agent cache and
+    // the comms tools appear/disappear on the next cycle (no restart).
+    pc: peerCommsEnabled(),
   });
 }
 
@@ -550,7 +601,10 @@ async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Pro
   // Include the Planner-as-tool so autonomy cycles can think before
   // they act, exactly like the chat path. The Planner is read-only so
   // it always passes policy filters.
-  const allTools = [...getCoreTools(), buildPlannerTool()];
+  // Peer-comms tools are bound to THIS agent's slug (correct attribution
+  // in the shared daemon). Gated default-off → tool set is unchanged.
+  const commsTools = peerCommsEnabled() ? buildAgentCommsTools(record.slug) : [];
+  const allTools = [...getCoreTools(), buildPlannerTool(), ...commsTools];
   const tools = filterToolsByPolicy(allTools, policy);
 
   // Orchestrator agents get handoffs configured so they can delegate
@@ -707,6 +761,9 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
 
   const runId = startAutonomyRun(record, wakeReasons, inboxItems.length);
 
+  // Fresh per-cycle peer-message budget (gated; no-op when disabled).
+  if (peerCommsEnabled()) resetCommsCycle(record.slug);
+
   // Read policy once per cycle so the agent build, the input text, and
   // the recorded snapshot all use the same view. Avoids the agent's
   // tools and the policy text disagreeing if the user toggles a setting
@@ -820,6 +877,14 @@ export async function processAgentAutonomyV2(): Promise<AutonomyV2RunSummary> {
   if (optIn.size === 0) {
     summary.durationMs = Date.now() - start;
     return summary;
+  }
+
+  // Deliver peer messages sent in prior cycles into recipient inboxes so
+  // this pass picks them up (the syncAutonomyInputs step v1 used to own).
+  // Gated default-off → the v2 loop is byte-identical.
+  if (peerCommsEnabled()) {
+    try { logCommsDelivery(deliverTeamCommsToInboxes()); }
+    catch (err) { logger.warn({ err }, 'peer-comms delivery failed'); }
   }
 
   const records = loadTeamAgents().filter((rec) => optIn.has(rec.slug) && rec.autonomyEnabled !== false);

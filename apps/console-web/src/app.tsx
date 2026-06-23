@@ -12,6 +12,7 @@ import { Memory } from './screens/Memory';
 import { Meetings } from './screens/Meetings';
 import { Workspaces } from './screens/Workspaces';
 import { WorkspaceView } from './screens/WorkspaceView';
+import { Agents } from './screens/Agents';
 import { Advanced } from './screens/Advanced';
 import { Settings } from './screens/Settings';
 import { Help } from './screens/Help';
@@ -40,6 +41,7 @@ export function App() {
             <Route path="/meetings" element={<Meetings />} />
             <Route path="/workspaces" element={<Workspaces />} />
             <Route path="/workspaces/:id" element={<WorkspaceView />} />
+            <Route path="/agents" element={<Agents />} />
 
             <Route path="/advanced" element={<Navigate to="/advanced/usage" replace />} />
             <Route path="/advanced/usage" element={<Advanced />} />
