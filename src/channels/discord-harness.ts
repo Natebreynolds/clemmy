@@ -35,6 +35,7 @@ import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../ru
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
+import { pullRecentTurnsForSession, renderTranscriptTurns } from '../runtime/harness/session-transcript.js';
 import {
   getActiveFocus as getActiveFocusForPrefix,
   createFocus as createFocusForPrefix,
@@ -293,8 +294,6 @@ const CROSS_SESSION_PREFIX_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 const PREFIX_LOOKBACK_SESSIONS = 4;
 const PREFIX_MAX_TURNS_PER_SESSION = 6;
 
-interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
-
 function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: number, newMessage?: string): void {
   const db = openEventLog();
   // Find the most recent N prior sessions for this channel (exclude
@@ -330,13 +329,7 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
     const turns = pullRecentTurnsForSession(db, session.id, PREFIX_MAX_TURNS_PER_SESSION);
     if (turns.length === 0) continue;
     const elapsedMin = Math.round((now - Date.parse(session.updated_at)) / 60_000);
-    const lines = [`--- Prior session ${session.id} (ended ~${elapsedMin} min ago) ---`];
-    for (const turn of turns) {
-      const label = turn.who === 'user' ? 'USER' : 'YOU';
-      const trimmed = turn.text.length > 800 ? turn.text.slice(0, 800) + '…' : turn.text;
-      lines.push(`  ${label}: ${trimmed}`);
-    }
-    const block = lines.join('\n');
+    const block = `--- Prior session ${session.id} (ended ~${elapsedMin} min ago) ---\n${renderTranscriptTurns(turns)}`;
     if (totalChars + block.length > MAX_TOTAL_CHARS) break;
     sectionBlocks.push(block);
     totalChars += block.length;
@@ -499,37 +492,6 @@ function autoPinFocusFromPriorSessions(
   } catch {
     return null;
   }
-}
-
-function pullRecentTurnsForSession(db: ReturnType<typeof openEventLog>, sessionId: string, maxTurns: number): PriorTurn[] {
-  // Read the last 2*maxTurns events (user inputs + agent completions)
-  // so we have headroom to filter and reorder chronologically.
-  const rows = db.prepare(
-    `SELECT type, data_json, created_at FROM events
-       WHERE session_id = ?
-         AND type IN ('user_input_received', 'conversation_completed')
-       ORDER BY seq DESC
-       LIMIT ?`,
-  ).all(sessionId, maxTurns * 2) as Array<{ type: string; data_json: string; created_at: string }>;
-  const turns: PriorTurn[] = [];
-  for (const row of rows) {
-    try {
-      const data = JSON.parse(row.data_json) as { text?: string; summary?: string; reply?: string };
-      if (row.type === 'user_input_received' && typeof data.text === 'string') {
-        turns.push({ who: 'user', text: data.text, at: row.created_at });
-      } else if (row.type === 'conversation_completed') {
-        // Prefer the user-facing summary (already trimmed); fall back
-        // to the reply field if summary is missing.
-        const text = typeof data.summary === 'string' && data.summary
-          ? data.summary
-          : (typeof data.reply === 'string' ? data.reply : '');
-        if (text) turns.push({ who: 'assistant', text, at: row.created_at });
-      }
-    } catch { /* skip malformed rows */ }
-  }
-  // Newest last (chronological); cap to maxTurns of each kind.
-  turns.reverse();
-  return turns.slice(-maxTurns * 2);
 }
 
 /** Exposed for tests / a future /new command — drop the channel's session. */
@@ -2084,6 +2046,16 @@ export async function runDiscordHarnessConversation(opts: {
           sessionId: session.id,
           channel: `discord:${channelId}`,
           userId,
+          // Live streaming: the brain emits PLAIN prose (not the {reply,objective,
+          // action} JSON the Codex field-streamer parses), so accumulate raw deltas
+          // and live-edit. The conversation_completed event replaces this with the
+          // authoritative final reply (settle() cancels any pending stream flush),
+          // so streaming can't garble the final message.
+          onChunk: (delta: string): void => {
+            streamBuffer += delta;
+            state.summary = streamBuffer;
+            scheduleEdit();
+          },
         });
       } else {
         const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId: session.id });

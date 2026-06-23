@@ -7333,6 +7333,10 @@ export function registerConsoleRoutes(
               sessionId,
               channel: 'desktop',
               userId: 'desktop',
+              // Stream brain text deltas to the desktop SSE (raw — the brain emits
+              // plain prose, not the {reply,…} JSON the field-streamer parses).
+              // Final reply still arrives via the conversation_completed event.
+              onChunk: emitToken,
             });
           } catch (err) {
             appendHarnessEvent({

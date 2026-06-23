@@ -16,6 +16,7 @@ import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import { buildGatedToolPermission } from './claude-agent-approval.js';
+import { renderTranscriptTurns } from './session-transcript.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -258,6 +259,21 @@ export interface ClaudeAgentSdkRunOptions {
    * of whatever the model is permitted to call (allowedLocalMcpTools).
    */
   mcpToolAllowlist?: string[];
+  /**
+   * CHAT-only multi-turn history. When set, the prior user/assistant turns of
+   * this session are prepended to the prompt as an authoritative transcript block
+   * so the Claude brain has conversation context (the Codex lane gets this from
+   * its persisted AgentInputItem snapshot; the SDK lane is stateless —
+   * persistSession:false). Worker/workflow callers omit it → byte-identical.
+   */
+  priorTurns?: Array<{ who: 'user' | 'assistant'; text: string }>;
+  /**
+   * CHAT-only streaming. When set, assistant text deltas are forwarded as they
+   * arrive (this also flips includePartialMessages on). ONLY text_delta is
+   * forwarded — thinking/tool-arg deltas are filtered out. Worker/workflow
+   * callers omit it → no partial messages, byte-identical result assembly.
+   */
+  onDelta?: (text: string) => void | Promise<void>;
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -375,6 +391,19 @@ function extractAssistantText(message: SDKMessage): string {
   return parts.join('');
 }
 
+/** Pull a streaming TEXT delta from a partial-message stream_event. Filters
+ *  STRICTLY to text_delta — thinking_delta (chain-of-thought) and input_json_delta
+ *  (raw tool-call args) are skipped so they never stream into the chat bubble. */
+function extractTextDelta(message: SDKMessage): string {
+  const m = message as { type?: unknown; event?: { type?: unknown; delta?: { type?: unknown; text?: unknown } } };
+  if (m.type !== 'stream_event') return '';
+  const ev = m.event;
+  if (!ev || ev.type !== 'content_block_delta') return '';
+  const delta = ev.delta;
+  if (!delta || delta.type !== 'text_delta' || typeof delta.text !== 'string') return '';
+  return delta.text;
+}
+
 function extractResult(message: SDKMessage): SDKResultMessage | null {
   return message.type === 'result' ? (message as SDKResultMessage) : null;
 }
@@ -418,7 +447,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       : buildAllowOnlyToolsPermission(allowed),
     permissionMode: agentic ? 'default' : 'dontAsk',
     maxTurns: options.maxTurns ?? 3,
-    includePartialMessages: false,
+    // Flip ON only when a delta sink is provided (chat surfaces). Worker/workflow
+    // callers omit onDelta → no partial-message traffic → result assembly +
+    // error_max_turns handling stay byte-identical.
+    includePartialMessages: Boolean(options.onDelta),
     systemPrompt: {
       type: 'preset',
       preset: 'claude_code',
@@ -428,7 +460,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ...(options.outputSchema ? { outputFormat: { type: 'json_schema', schema: options.outputSchema } } : {}),
   };
 
-  const stream = queryImpl({ prompt: options.prompt, options: sdkOptions }) as Query;
+  // CHAT multi-turn history: prepend the prior session turns as an authoritative
+  // transcript so the stateless SDK lane (persistSession:false) has context. Empty
+  // / absent priorTurns → byte-identical bare prompt (worker/workflow path).
+  const effectivePrompt = (options.priorTurns && options.priorTurns.length > 0)
+    ? `[CONVERSATION SO FAR — prior turns in THIS session; treat as authoritative, do NOT re-ask decisions already made]\n${renderTranscriptTurns(options.priorTurns)}\n\n[Latest message]\n${options.prompt}`
+    : options.prompt;
+
+  const stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
   let result: SDKResultMessage | null = null;
   let init: SDKSystemMessage | null = null;
   const toolUses: string[] = [];
@@ -456,6 +495,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   try {
     for await (const message of stream) {
       init = init ?? extractInit(message);
+      if (options.onDelta) {
+        const delta = extractTextDelta(message);
+        if (delta) { try { await options.onDelta(delta); } catch { /* a delta-sink error must never break the run */ } }
+      }
       const atext = extractAssistantText(message);
       if (atext) lastAssistantText = atext;
       if (reflectLearning) for (const use of extractToolUseIds(message)) toolById.set(use.id, { name: use.name, input: use.input });

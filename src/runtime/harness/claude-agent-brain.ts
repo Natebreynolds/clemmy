@@ -4,7 +4,8 @@ import { resolveToolJitDecision, selectToolsForTurn } from '../../agents/tool-ji
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
-import { appendEvent, clearKill, createSession, getSession, listEvents } from './eventlog.js';
+import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
+import { pullRecentTurnsForSession } from './session-transcript.js';
 import { actionBus } from '../action-bus.js';
 import {
   judgeObjectiveComplete,
@@ -37,6 +38,12 @@ export function setClaudeAgentSdkBrainJudgeForTest(fn: ObjectiveJudgeFn | null):
  *  "done" (legacy). On ⇒ parity with the harness loop's objective judge. */
 function completionJudgeEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+function sessionHistoryEnabled(): boolean {
+  // Inject the session's prior turns into the Claude brain prompt so multi-turn
+  // chat works (the SDK lane is stateless: persistSession:false). Kill-switch
+  // CLEMMY_CLAUDE_SDK_SESSION_HISTORY=off → byte-identical bare-message prompt.
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SESSION_HISTORY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 function narrationRetryEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NARRATION_RETRY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
@@ -282,8 +289,24 @@ export async function respondViaClaudeAgentSdkBrain(
   // workflow-run boundary guard, session history, recall, and report-back all
   // read `user_input_received`. Without it the brain's tools (e.g. workflow_run)
   // can't see what the user actually asked for.
+  // Multi-turn history: read the session's PRIOR turns BEFORE appending the
+  // current one (so the current message isn't echoed as "prior"). Threaded into
+  // runOptions below so every attempt (incl. retries/judge continuations) keeps
+  // context. The SDK lane is stateless, so without this the brain sees only the
+  // latest message — the "no chat history available" wrong-task bug.
+  let priorTurns: Array<{ who: 'user' | 'assistant'; text: string }> = [];
+  if (sessionHistoryEnabled()) {
+    try {
+      priorTurns = pullRecentTurnsForSession(openEventLog(), sessionId, 6).map((t) => ({ who: t.who, text: t.text }));
+    } catch { priorTurns = []; }
+  }
+
   try {
     appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: request.message } });
+    // Working signal: a turn_started lights the existing elapsed-time/pulse so a
+    // long turn never reads as frozen (the Codex lane emits this; the SDK lane
+    // didn't). role:'system' → no spurious agent label.
+    appendEvent({ sessionId, turn: 1, role: 'system', type: 'turn_started', data: {} });
   } catch { /* best effort — never block the turn */ }
 
   if (request.shouldCancel && await request.shouldCancel()) {
@@ -349,6 +372,11 @@ export async function respondViaClaudeAgentSdkBrain(
     } catch { /* JIT telemetry must never block the turn */ }
   }
 
+  // Streaming: forward each SDK text delta to the caller's onChunk so a long turn
+  // shows live progress (the SDK lane was silent — includePartialMessages off). The
+  // final reply still renders authoritatively (Discord: the conversation_completed
+  // event; desktop: the guarded final onChunk below) — streaming can't garble it.
+  let streamedAny = false;
   const runOptions = {
     sessionId,
     modelId,
@@ -357,6 +385,10 @@ export async function respondViaClaudeAgentSdkBrain(
     mcpToolAllowlist,
     agentic: mode === 'full',
     maxTurns: maxTurns(),
+    priorTurns,
+    onDelta: request.onChunk
+      ? async (d: string): Promise<void> => { streamedAny = true; await request.onChunk?.(d); }
+      : undefined,
   };
   let result = await runClaudeAgentSdkImpl({ prompt: request.message, ...runOptions });
 
@@ -429,7 +461,9 @@ export async function respondViaClaudeAgentSdkBrain(
   }
 
   const text = result.text.trim() || '(no reply produced)';
-  if (request.onChunk) await request.onChunk(text);
+  // Deliver the full reply via onChunk ONLY if nothing streamed (else the streamed
+  // deltas already carry it — re-sending the whole text would double-render).
+  if (request.onChunk && !streamedAny) await request.onChunk(text);
   // Long-running parity: a turn-budget stop surfaces as a graceful
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
   const stoppedReason: AssistantResponse['stoppedReason'] = result.limitHit ? 'max-turns-with-grace' : 'success';
