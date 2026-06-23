@@ -1,6 +1,9 @@
 import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn } from '../../agents/tool-jit.js';
+import {
+  buildWorkspaceContextPrimer, workspaceSlugFromSessionId, WORKSPACE_DOCK_TOOLS,
+} from '../../spaces/workspace-context.js';
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
@@ -45,11 +48,14 @@ function sessionHistoryEnabled(): boolean {
   // CLEMMY_CLAUDE_SDK_SESSION_HISTORY=off → byte-identical bare-message prompt.
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SESSION_HISTORY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
-function sdkStreamingEnabled(): boolean {
-  // Forward live text deltas to the caller's onChunk. Kill-switch
-  // CLEMMY_CLAUDE_SDK_STREAMING=off → no deltas; the full reply still delivers
-  // once via the final onChunk (streamedAny stays false). Independent of history.
-  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_STREAMING', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+export function sdkStreamingEnabled(): boolean {
+  // DEFAULT OFF: raw SDK text deltas reproduce the model's tool-call XML
+  // narration, which dumped into the dock bubble (live 2026-06-23). Clean live
+  // progress now comes from tool_called events (parity with the Codex lane); the
+  // full reply still delivers once via the final onChunk. Opt back into raw token
+  // streaming with CLEMMY_CLAUDE_SDK_STREAMING=on.
+  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_SDK_STREAMING', 'off') ?? 'off').trim().toLowerCase();
+  return raw === 'on' || raw === 'true' || raw === '1';
 }
 function narrationRetryEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NARRATION_RETRY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
@@ -266,6 +272,8 @@ export function renderClaudeAgentBrainSystemAppend(
   mode: ClaudeAgentBrainMode = claudeAgentSdkBrainMode() ?? 'read_only',
 ): string {
   const persistentContext = renderHarnessMemoryContext();
+  const spaceSlug = workspaceSlugFromSessionId(request.sessionId);
+  const workspacePrimer = spaceSlug ? buildWorkspaceContextPrimer(spaceSlug) : null;
   return [
     'You are Clementine running as the main brain through the official Claude Agent SDK inside the Clementine harness.',
     'You are using the user\'s Claude subscription auth. Stay inside Clementine\'s product identity, memory, skills, workflows, and workspace expectations.',
@@ -275,6 +283,9 @@ export function renderClaudeAgentBrainSystemAppend(
     `Surface: ${surface}`,
     `Session: ${request.sessionId}`,
     `Claude brain mode: ${mode}`,
+    // Dock chat (session "space-<slug>"): tell the brain it is EDITING this
+    // Workspace and to change it via space_* tools, never a sandbox/scratch file.
+    workspacePrimer ?? '',
     '',
     frameTrustedMemory(persistentContext),
     '',
@@ -289,6 +300,7 @@ export async function respondViaClaudeAgentSdkBrain(
 ): Promise<AssistantResponse> {
   const sessionId = request.sessionId;
   const mode = claudeAgentSdkBrainMode() ?? 'read_only';
+  const isSpaceSession = workspaceSlugFromSessionId(sessionId) != null;
   if (!getSession(sessionId)) {
     const titleSeed = request.message.trim().replace(/\s+/g, ' ');
     createSession({
@@ -365,6 +377,11 @@ export async function respondViaClaudeAgentSdkBrain(
         userInput: jitQuery,
         tools: fullAllowed.map((name) => ({ name, description: descByName.get(name) ?? '' })),
       });
+      // H1c: a dock chat IS editing a Workspace — pin the space tools so the JIT
+      // never drops them (else the model can't persist the edit and sandboxes it).
+      if (isSpaceSession) {
+        for (const t of WORKSPACE_DOCK_TOOLS) if (fullAllowed.includes(t)) selection.exposed.add(t);
+      }
       jitReason = selection.reason;
       if (selection.reduced) {
         jitAllowed = fullAllowed.filter((n) => selection.exposed.has(n));

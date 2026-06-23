@@ -124,6 +124,11 @@ export function buildGatedToolPermission(sessionId: string, fastAllowTools: stri
   const fastAllow = new Set(fastAllowTools.map(normalizeToolName).filter(Boolean));
   return (async (toolName, input, options) => {
     const bare = bareToolName(toolName);
+    // Clean live progress (parity with the Codex lane): emit a tool_called event
+    // so the dock shows "Using read_file…" — instead of streaming the model's raw
+    // text, which dumped its tool-call XML into the bubble. Fires for EVERY tool
+    // (fast-allow reads included). Best-effort: progress never blocks a tool.
+    try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: bare } }); } catch { /* progress only */ }
     if (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(bare))) {
       return { behavior: 'allow' } as PermissionResult;
     }

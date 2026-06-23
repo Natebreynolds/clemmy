@@ -78,7 +78,13 @@ test('resolving a gated approval as approved triggers execution via the listener
 
   const { approvalId } = gate.enqueueSpaceActionApproval(rec, rec.actions[0], { to: 'x@y' });
   registry.resolve(approvalId, 'approved', 'test');
-  // execution is fire-and-forget on resolve; give the echo runner a beat.
-  await new Promise((r) => setTimeout(r, 200));
-  assert.ok(dataStore.listNotes(slug).some((n) => /Approved and ran/.test(n.text)));
+  // Execution is fire-and-forget on resolve and spawns a runner subprocess —
+  // POLL for the note rather than sleeping a fixed delay (a fixed wait flaked
+  // under full-suite load when the subprocess took >200ms).
+  let ran = false;
+  for (let i = 0; i < 80 && !ran; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    ran = dataStore.listNotes(slug).some((n) => /Approved and ran/.test(n.text));
+  }
+  assert.ok(ran, 'expected the approved action to run and record an "Approved and ran" note');
 });

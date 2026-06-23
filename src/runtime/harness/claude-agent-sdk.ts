@@ -98,6 +98,10 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'workspace_roots',
   'workspace_list',
   'workspace_info',
+  // Read a Workspace (interactive surface) + list them — a dock chat runs under
+  // session "space-<slug>" and must be able to read the workspace it edits.
+  'space_get',
+  'space_list',
   'list_files',
   'read_file',
   'git_status',
@@ -150,6 +154,13 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   'workflow_run_status',
   'workflow_schedule',
   'workflow_unschedule',
+  // Editing a Workspace is LOCAL Clementine state (the view + its data runners),
+  // like workflow authoring above. space_edit_view/space_save change the local
+  // view; space_refresh re-pulls its data. Without these in the surface, a Claude
+  // dock turn can't persist a workspace edit and wrongly writes a scratch file.
+  'space_edit_view',
+  'space_save',
+  'space_refresh',
 ] as const;
 
 // Mutating tools exposed through the harness gate chain (gated-mutating-tools.ts)

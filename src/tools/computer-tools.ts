@@ -632,7 +632,13 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       const filePath = resolveAllowedPath(input.path);
       if (!existsSync(filePath)) return `File does not exist: ${filePath}`;
       if (!statSync(filePath).isFile()) return `Not a file: ${filePath}`;
-      if (isConvertibleExtension(filePath)) {
+      // HTML/HTM are TEXT — read the raw source. A Workspace view is edited AS
+      // HTML, so routing it through markitdown strips the tags (and was erroring
+      // on workspace views: "An error occurred while running the tool"). Only
+      // non-text formats (PDF/Word/Excel/audio/images) take the ingest path.
+      const readExt = path.extname(filePath).toLowerCase();
+      const isHtmlSource = readExt === '.html' || readExt === '.htm';
+      if (isConvertibleExtension(filePath) && !isHtmlSource) {
         // Route through the unified ingestion pipeline so audio→Whisper,
         // image→vision OCR, and docs→markitdown all behave identically here.
         const ingested = await ingestAttachment({ name: path.basename(filePath), sourcePath: filePath });

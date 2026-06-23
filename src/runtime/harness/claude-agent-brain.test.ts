@@ -19,6 +19,7 @@ const {
   looksLikeToolNarration,
   looksLikeReasoningLeak,
   frameTrustedMemory,
+  sdkStreamingEnabled,
 } = brain;
 const { getSession, listEvents, resetEventLog } = await import('./eventlog.js');
 
@@ -226,6 +227,26 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('Here is what each tool call does in the pipeline, summarized.', []), false);
   assert.equal(looksLikeToolNarration('The tool call budget looks fine for this run.', []), false);
   assert.equal(looksLikeToolNarration('', []), false);
+});
+
+test('sdkStreamingEnabled defaults OFF (clean dock — opt back in with =on)', () => {
+  delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
+  assert.equal(sdkStreamingEnabled(), false);
+  process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'on';
+  assert.equal(sdkStreamingEnabled(), true);
+  delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
+});
+
+test('renderClaudeAgentBrainSystemAppend injects the workspace primer for a "space-" session', async () => {
+  const { spaceStore } = await import('../../spaces/store.js');
+  spaceStore.save({ id: 'deal-risk', title: 'Deal Risk', actions: [], dataSources: [] });
+  const out = renderClaudeAgentBrainSystemAppend(
+    'dashboard', { sessionId: 'space-deal-risk', message: 'add a close-date filter' } as never, 'full');
+  assert.match(out, /space_edit_view\('deal-risk'/);
+  assert.match(out, /Deal Risk/);
+  // a plain (non-space) session gets no workspace primer
+  const plain = renderClaudeAgentBrainSystemAppend('dashboard', { sessionId: 'sess-abc', message: 'hi' } as never, 'full');
+  assert.ok(!/space_edit_view/.test(plain));
 });
 
 test('full mode: a narrated (no-tool-call) turn triggers ONE retry that actually invokes the tool', async () => {
