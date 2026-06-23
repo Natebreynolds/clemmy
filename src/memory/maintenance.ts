@@ -72,6 +72,14 @@ const AUTORESEARCH_EVERY_N_TICKS = 1440; // ~6h with a 15s tick
 const AUTORESEARCH_NIGHTLY_HOUR = 3;     // 3:00 AM local
 const AUTORESEARCH_NIGHTLY_MINUTE = 0;
 
+// Procedural-memory self-heal (Wave 2). Re-applies the cross-service / async-
+// task-post guard across the tool-choice store and invalidates (recoverable)
+// any active choice that's provably mis-bound — heals pollution that predates
+// the write-time guard or slipped through its fail-open path. One Composio
+// toolkit-list call + a store scan, so ~6h is plenty (new pollution is already
+// blocked at write time).
+const TOOLCHOICE_AUDIT_EVERY_N_TICKS = 1440; // ~6h with a 15s tick
+
 // v0.5.22 — tool_outputs reaper. The table grew unbounded (~10MB/day
 // at observed rates) because the recall_tool_result store had no TTL.
 // Runs once per hour: catches today's writes before the next tick,
@@ -305,6 +313,27 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'sessions reaper tick failed');
+    }
+  }
+
+  // Procedural-memory self-heal (Wave 2 ever-learning robustness). Sweeps the
+  // tool-choice store for cross-service / async-task-post mis-bindings and
+  // invalidates them (recoverable). Best-effort; no-ops without a known-toolkit
+  // baseline so a Composio outage can't quarantine the store.
+  if (tickCount % TOOLCHOICE_AUDIT_EVERY_N_TICKS === 0) {
+    try {
+      const { auditAndHealToolChoices, isToolChoiceAuditEnabled } = await import('./tool-choice-audit.js');
+      if (isToolChoiceAuditEnabled()) {
+        const hits = await auditAndHealToolChoices();
+        if (hits.length > 0) {
+          logger.info(
+            { healed: hits.length, hits: hits.map((h) => ({ reason: h.reason, identifier: h.identifier })) },
+            'tool-choice audit: healed polluted procedural bindings',
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'tool-choice audit tick failed');
     }
   }
 
