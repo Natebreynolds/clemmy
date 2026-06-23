@@ -45,6 +45,12 @@ function sessionHistoryEnabled(): boolean {
   // CLEMMY_CLAUDE_SDK_SESSION_HISTORY=off → byte-identical bare-message prompt.
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SESSION_HISTORY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
+function sdkStreamingEnabled(): boolean {
+  // Forward live text deltas to the caller's onChunk. Kill-switch
+  // CLEMMY_CLAUDE_SDK_STREAMING=off → no deltas; the full reply still delivers
+  // once via the final onChunk (streamedAny stays false). Independent of history.
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_STREAMING', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
 function narrationRetryEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NARRATION_RETRY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
@@ -386,7 +392,7 @@ export async function respondViaClaudeAgentSdkBrain(
     agentic: mode === 'full',
     maxTurns: maxTurns(),
     priorTurns,
-    onDelta: request.onChunk
+    onDelta: (request.onChunk && sdkStreamingEnabled())
       ? async (d: string): Promise<void> => { streamedAny = true; await request.onChunk?.(d); }
       : undefined,
   };
