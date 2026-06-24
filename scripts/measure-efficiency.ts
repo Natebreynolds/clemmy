@@ -20,6 +20,7 @@
  * Run:  npx tsx scripts/measure-efficiency.ts [--days N] [--date YYYY-MM-DD]
  */
 import { readUsageEventsForDate, listUsageDates, rollupUsage, classifyUsageKind, type UsageEvent } from '../src/runtime/usage-log.js';
+import { openEventLog } from '../src/runtime/harness/eventlog.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -121,6 +122,50 @@ if (withComponents.length > 0) {
   }
 } else {
   console.log(`\nPROMPT COMPONENTS: (none recorded — assembly instrumentation A2 not yet emitting promptComponents)`);
+}
+
+// ── JIT + Code-Mode readout (from the harness eventlog) ──────────────────────
+// The usage-log doesn't carry the JIT arm / code-mode tags — those live in the
+// harness eventlog (tool_jit_scope, codeMode-tagged tool_called). Read them
+// directly so the next data-justified flips are decided from data:
+//   - JIT: how much is it actually pruning the tool surface (drop %)? → flip to 100%
+//   - Code Mode: is the model reaching for run_tool_program (in-program calls)? → expand
+// Best-effort + read-only; a missing/locked DB never breaks the usage readout above.
+const cutoffStart = `${dates[dates.length - 1] ?? '0000-00-00'}T00:00:00`;
+const cutoffEnd = explicitDate ? `${explicitDate}T23:59:59.999` : '9999-12-31T23:59:59';
+try {
+  const db = openEventLog();
+  const jitRows = db.prepare(
+    `SELECT data_json FROM events WHERE type = 'tool_jit_scope' AND created_at >= ? AND created_at <= ?`,
+  ).all(cutoffStart, cutoffEnd) as Array<{ data_json: string }>;
+  if (jitRows.length > 0) {
+    let active = 0, dropSum = 0, expSum = 0;
+    const byArm: Record<string, number> = {};
+    for (const row of jitRows) {
+      try {
+        const d = JSON.parse(row.data_json) as { jitActive?: boolean; droppedCount?: number; exposedCount?: number; arm?: string | null };
+        if (d.jitActive) active += 1;
+        dropSum += d.droppedCount ?? 0;
+        expSum += d.exposedCount ?? 0;
+        const arm = d.arm ?? '(no A/B)';
+        byArm[arm] = (byArm[arm] ?? 0) + 1;
+      } catch { /* skip a corrupt row */ }
+    }
+    const surface = dropSum + expSum;
+    console.log(`\nTOOL JIT           turns ${jitRows.length} · active ${pct(active, jitRows.length)} · avg exposed ${Math.round(expSum / jitRows.length)} · avg dropped ${Math.round(dropSum / jitRows.length)} · surface pruned ${pct(dropSum, surface)}`);
+    console.log(`  arms: ${Object.entries(byArm).map(([a, n]) => `${a}=${n}`).join(' · ')}  (a high stable prune% with no error delta ⇒ data to flip JIT to 100%)`);
+  } else {
+    console.log(`\nTOOL JIT: (no tool_jit_scope events in window — JIT off, or no turns yet)`);
+  }
+
+  const cmRows = db.prepare(
+    `SELECT session_id FROM events WHERE type = 'tool_called' AND created_at >= ? AND created_at <= ? AND data_json LIKE '%"codeMode":true%'`,
+  ).all(cutoffStart, cutoffEnd) as Array<{ session_id: string }>;
+  const cmSessions = new Set(cmRows.map((r) => r.session_id)).size;
+  console.log(`CODE MODE          in-program calls ${cmRows.length} across ${cmSessions} session(s)  (adoption signal — 0 ⇒ the model isn't reaching for run_tool_program yet)`);
+  console.log(`  (deferred: per-turn latency-by-arm + rubric-arm correlation — the rubric A/B isn't evented and the NDJSON↔eventlog per-call join is imprecise; not built to avoid a fragile number)`);
+} catch (err) {
+  console.log(`\nTOOL JIT / CODE MODE: (eventlog unavailable — ${err instanceof Error ? err.message : String(err)})`);
 }
 
 console.log('');
