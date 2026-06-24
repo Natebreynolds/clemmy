@@ -588,6 +588,27 @@ export function harnessToolBracketsEnabled(): boolean {
   return (getRuntimeEnv('HARNESS_TOOL_BRACKETS', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+// Pre-write LATENCY: the irreversible-write/send path runs three independent,
+// fail-open model-judges (grounding, goal-fidelity, output-grounding) that today
+// await back-to-back. They share no data (none reads another's verdict), so we
+// start the two siblings CONCURRENTLY with grounding and await each in its own
+// existing block — same order, same short-circuit, same telemetry, only the model
+// calls overlap (≈ max of the three instead of the sum). Off ⇒ byte-identical
+// sequential path. Kill-switch CLEMMY_PARALLEL_PREWRITE_GATES (default on).
+export function parallelPreWriteGatesEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_PARALLEL_PREWRITE_GATES', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Start a gate's judge promise NOW (concurrently) while suppressing an
+ *  unhandled-rejection if an earlier gate blocks and this one is never awaited.
+ *  The original promise is returned so the gate's own block still awaits it and
+ *  sees the real value/rejection (handled fail-open there) — the attached no-op
+ *  catch is a separate, discarded promise purely to silence the runtime warning. */
+export function startGate<T>(p: Promise<T>): Promise<T> {
+  void p.catch(() => { /* awaited (and fail-open-handled) in the gate's own block */ });
+  return p;
+}
+
 function stripAnsi(input: string): string {
   return input.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 }
@@ -1018,6 +1039,25 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // duplicate payload is fixed before approval machinery engages, and
     // so the external_write event for THIS call (emitted by confirm-first
     // on allow) can never count against itself.
+    //
+    // PRE-WRITE LATENCY (CLEMMY_PARALLEL_PREWRITE_GATES): kick off the two sibling
+    // judges (goal-fidelity + output-grounding) NOW so all three model calls
+    // overlap. Each is still awaited + fully handled in its OWN block below (same
+    // order, short-circuit, and telemetry); startGate suppresses an unhandled
+    // rejection if grounding blocks first and these are never awaited. Grounding
+    // stays inline (its duplicate-target check must precede its own judge), so
+    // overlapping the other two collapses the trio to ≈ max-of-three latency.
+    const preGateShape = classifyExternalWrite(tool.name, parsedInput);
+    const preGateIrreversible = preGateShape.mutating && preGateShape.irreversible;
+    const parallelGates = parallelPreWriteGatesEnabled();
+    const goalFidelityPromise = (parallelGates && preGateIrreversible && isGoalFidelityGateEnabled())
+      ? startGate(evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput))
+      : null;
+    const preGateBody = (parallelGates && preGateIrreversible && isOutputGroundingGateEnabled())
+      ? extractMessageBody(parsedInput) : '';
+    const outputGroundingPromise = (preGateBody && preGateBody.trim().length > 0)
+      ? startGate(evaluateOutputGrounding(ctx.sessionId, preGateBody, { kind: 'write', toolName: tool.name }))
+      : null;
     try {
       if (isGroundingGateEnabled()) {
         const shape = classifyExternalWrite(tool.name, parsedInput);
@@ -1104,7 +1144,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (isGoalFidelityGateEnabled()) {
         const shape = classifyExternalWrite(tool.name, parsedInput);
         if (shape.mutating && shape.irreversible) {
-          const verdict = await evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput);
+          // Consume the concurrently-started judge (or run inline when the
+          // parallel flag is off) — same verdict either way.
+          const verdict = await (goalFidelityPromise ?? evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput));
           if (verdict.action === 'block') {
             try {
               appendEvent({
@@ -1189,7 +1231,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (shape.mutating && shape.irreversible) {
           const body = extractMessageBody(parsedInput);
           if (body && body.trim().length > 0) {
-            const verdict = await evaluateOutputGrounding(ctx.sessionId, body, { kind: 'write', toolName: tool.name });
+            const verdict = await (outputGroundingPromise ?? evaluateOutputGrounding(ctx.sessionId, body, { kind: 'write', toolName: tool.name }));
             if (verdict.action === 'bounce') {
               try {
                 appendEvent({
@@ -1300,6 +1342,20 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // fail-open gates, reading the target from the command string. The
     // external_write ledger is SHARED so a shell re-send to the same target
     // bumps. Fail-open on any evaluation error.
+    // PRE-WRITE LATENCY (shell vector): same concurrent-start as the composio
+    // path above — fire the shell goal-fidelity + output-grounding judges now so
+    // they overlap with shell grounding. Each is still awaited + fully handled in
+    // its own block; startGate suppresses an unhandled rejection on a grounding
+    // short-circuit. command + mutation are deterministic, recomputed identically
+    // per block (cheap), so this changes only WHEN the model calls fire.
+    const shellPreCommand = tool.name === 'run_shell_command' && typeof (parsedInput as { command?: unknown })?.command === 'string'
+      ? (parsedInput as { command: string }).command : '';
+    const shellPreMutation = shellPreCommand ? classifyShellNetworkMutation(shellPreCommand) : { isNetworkMutation: false as const };
+    const shellPreShapeKey = shellPreMutation.isNetworkMutation ? shellPreMutation.shapeKey : undefined;
+    const shellGoalFidelityPromise = (parallelGates && isGoalFidelityGateEnabled() && tool.name === 'run_shell_command' && shellPreMutation.isNetworkMutation && shellPreShapeKey)
+      ? startGate(evaluateGoalFidelity(ctx.sessionId, tool.name, shellPreCommand)) : null;
+    const shellOutputGroundingPromise = (parallelGates && isOutputGroundingGateEnabled() && tool.name === 'run_shell_command' && shellPreMutation.isNetworkMutation && shellPreCommand)
+      ? startGate(evaluateOutputGrounding(ctx.sessionId, shellPreCommand, { kind: 'write', toolName: tool.name })) : null;
     try {
       if (isGroundingGateEnabled() && tool.name === 'run_shell_command') {
         const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
@@ -1366,7 +1422,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           : '';
         const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
         if (mutation.isNetworkMutation && mutation.shapeKey) {
-          const verdict = await evaluateGoalFidelity(ctx.sessionId, tool.name, command);
+          const verdict = await (shellGoalFidelityPromise ?? evaluateGoalFidelity(ctx.sessionId, tool.name, command));
           if (verdict.action === 'block') {
             try {
               appendEvent({
@@ -1397,7 +1453,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           : '';
         const mutation = command ? classifyShellNetworkMutation(command) : { isNetworkMutation: false as const };
         if (mutation.isNetworkMutation && command) {
-          const verdict = await evaluateOutputGrounding(ctx.sessionId, command, { kind: 'write', toolName: tool.name });
+          const verdict = await (shellOutputGroundingPromise ?? evaluateOutputGrounding(ctx.sessionId, command, { kind: 'write', toolName: tool.name }));
           if (verdict.action === 'bounce') {
             try {
               appendEvent({

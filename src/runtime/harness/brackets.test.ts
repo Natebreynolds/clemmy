@@ -40,6 +40,8 @@ const {
   withHarnessRunContext,
   harnessToolBracketsEnabled,
   softToolError,
+  parallelPreWriteGatesEnabled,
+  startGate,
 } = await import('./brackets.js');
 
 test.after(() => {
@@ -63,6 +65,43 @@ async function raiseSoftRefusal<T>(p: T | Promise<T>): Promise<T> {
   }
   return v;
 }
+
+test('parallelPreWriteGatesEnabled: DEFAULT-ON with =off kill-switch', () => {
+  const prev = process.env.CLEMMY_PARALLEL_PREWRITE_GATES;
+  try {
+    delete process.env.CLEMMY_PARALLEL_PREWRITE_GATES;
+    assert.equal(parallelPreWriteGatesEnabled(), true, 'unset → ON');
+    process.env.CLEMMY_PARALLEL_PREWRITE_GATES = 'off';
+    assert.equal(parallelPreWriteGatesEnabled(), false, 'kill-switch honored');
+    process.env.CLEMMY_PARALLEL_PREWRITE_GATES = 'OFF';
+    assert.equal(parallelPreWriteGatesEnabled(), false, 'case-insensitive');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_PARALLEL_PREWRITE_GATES;
+    else process.env.CLEMMY_PARALLEL_PREWRITE_GATES = prev;
+  }
+});
+
+test('startGate: a never-awaited rejected gate does NOT surface as an unhandled rejection', async () => {
+  // The concurrent siblings (goal-fidelity / output-grounding) start before grounding;
+  // if grounding blocks first they are never awaited. startGate must swallow their
+  // rejection so it never crashes the run. Watch for an unhandledRejection.
+  let unhandled = false;
+  const onUnhandled = () => { unhandled = true; };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    startGate(Promise.reject(new Error('grounding blocked first; this judge was never awaited')));
+    await new Promise((r) => setTimeout(r, 20)); // flush microtasks + a macrotask
+    assert.equal(unhandled, false, 'startGate swallowed the never-awaited rejection');
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('startGate: the awaiter still sees the real value/rejection (the pass path)', async () => {
+  assert.equal(await startGate(Promise.resolve('verdict-ok')), 'verdict-ok');
+  // a rejection still propagates to the gate block that awaits it (handled fail-open there)
+  await assert.rejects(startGate(Promise.reject(new Error('judge errored'))), /judge errored/);
+});
 
 test('harnessToolBracketsEnabled: DEFAULT-ON (keystone flip) with =off kill-switch', () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
@@ -932,6 +971,63 @@ test('shell-send grounding: a curl POST with a contradicting payload soft-blocks
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
     if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
+
+test('parallel shell pre-write gates consume the prestarted output-grounding promise exactly once', async () => {
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  const prevDestination = process.env.CLEMMY_DESTINATION_GATE;
+  const prevGoal = process.env.CLEMMY_GOAL_FIDELITY_GATE;
+  const prevOutput = process.env.CLEMMY_OUTPUT_GROUNDING_GATE;
+  const prevParallel = process.env.CLEMMY_PARALLEL_PREWRITE_GATES;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'on';
+  process.env.CLEMMY_PARALLEL_PREWRITE_GATES = 'on';
+  resetEventLog();
+  const output = await import('./output-grounding-gate.js');
+  output._resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'analytics-source',
+    tool: 'analytics_lookup',
+    output: 'Acme campaign source rows: ad spend was $1,000 and conversions were 25.',
+  });
+  let judgeCalls = 0;
+  output._setOutputGroundingJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { verdict: 'grounded', offending: [], reason: 'plausibly derived from source rows' };
+  });
+  try {
+    const counter = new ToolCallsCounter(100);
+    const wrapped = wrapToolForHarness({
+      name: 'run_shell_command',
+      execute: async () => 'posted',
+    });
+    const command = `curl -X POST https://api.example.com/send -d '{"body":"Acme ad spend was $2,400."}'`;
+    assert.equal(
+      await withHarnessRunContext({ sessionId: sess.id, counter }, () => wrapped.execute!({ command })),
+      'posted',
+    );
+    assert.equal(judgeCalls, 1, 'one shell send must not double-call the output-grounding judge');
+  } finally {
+    output._setOutputGroundingJudgeForTests(null);
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+    if (prevDestination === undefined) delete process.env.CLEMMY_DESTINATION_GATE; else process.env.CLEMMY_DESTINATION_GATE = prevDestination;
+    if (prevGoal === undefined) delete process.env.CLEMMY_GOAL_FIDELITY_GATE; else process.env.CLEMMY_GOAL_FIDELITY_GATE = prevGoal;
+    if (prevOutput === undefined) delete process.env.CLEMMY_OUTPUT_GROUNDING_GATE; else process.env.CLEMMY_OUTPUT_GROUNDING_GATE = prevOutput;
+    if (prevParallel === undefined) delete process.env.CLEMMY_PARALLEL_PREWRITE_GATES; else process.env.CLEMMY_PARALLEL_PREWRITE_GATES = prevParallel;
   }
 });
 
