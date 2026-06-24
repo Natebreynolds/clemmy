@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { rollupUsage, classifyUsageKind } = await import('./usage-log.js');
+const { rollupUsage, classifyUsageKind, parseWorkflowSource } = await import('./usage-log.js');
 
 function ev(over: Partial<import('./usage-log.js').UsageEvent>): import('./usage-log.js').UsageEvent {
   return {
@@ -71,4 +71,30 @@ test('events without cachedInputTokens count as zero cached (no crash)', () => {
   const r = rollupUsage([ev({ cachedInputTokens: undefined })]);
   assert.equal(r.totalCachedInputTokens, 0);
   assert.equal(r.cacheHitRate, 0);
+});
+
+test('parseWorkflowSource derives runId/stepId/itemKey from a workflow session id', () => {
+  // plain step session: workflow:<runId>:<stepId>
+  assert.deepEqual(parseWorkflowSource('workflow:run-123:research'), {
+    runId: 'run-123',
+    stepId: 'research',
+  });
+  // forEach item session carries the trailing itemKey
+  assert.deepEqual(parseWorkflowSource('workflow:run-123:enrich:acme-corp'), {
+    runId: 'run-123',
+    stepId: 'enrich',
+    itemKey: 'acme-corp',
+  });
+  // an itemKey containing colons is preserved whole (rest re-joined)
+  assert.deepEqual(parseWorkflowSource('workflow:run-9:send:https://x.com/a'), {
+    runId: 'run-9',
+    stepId: 'send',
+    itemKey: 'https://x.com/a',
+  });
+});
+
+test('parseWorkflowSource returns {} for non-workflow sources (join keys absent on chat/cron)', () => {
+  assert.deepEqual(parseWorkflowSource('console:home'), {});
+  assert.deepEqual(parseWorkflowSource('cron:morning-briefing'), {});
+  assert.deepEqual(parseWorkflowSource('warmup-1781833012346'), {});
 });

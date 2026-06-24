@@ -56,6 +56,31 @@ export interface UsageEvent {
    *  "where do my tokens go each turn?". Estimated from wire bytes (≈chars/4)
    *  at assembly time; the efficiency readout averages it across turns. */
   promptComponents?: Record<string, number>;
+  /** When this call ran inside a workflow, the run/step/item it belongs to —
+   *  derived from the `workflow:<runId>:<stepId>[:<itemKey>]` source so the
+   *  State layer can JOIN token cost to a specific iteration without re-parsing
+   *  the source string on the read side. Absent for non-workflow calls. */
+  runId?: string;
+  stepId?: string;
+  itemKey?: string;
+}
+
+/**
+ * Derive {runId, stepId, itemKey} from a workflow harness session id of the form
+ * `workflow:<runId>:<stepId>[:<itemKey>]` (the deterministic id minted by
+ * getWorkflowHarnessSession in workflow-runner.ts). Returns an empty object for
+ * any non-workflow source, so the join keys are simply absent on chat/cron/etc.
+ * Pure string inspection — never throws.
+ */
+export function parseWorkflowSource(source: string): { runId?: string; stepId?: string; itemKey?: string } {
+  if (!source.startsWith('workflow:')) return {};
+  const [, runId, stepId, ...rest] = source.split(':');
+  const itemKey = rest.length > 0 ? rest.join(':') : undefined;
+  return {
+    ...(runId ? { runId } : {}),
+    ...(stepId ? { stepId } : {}),
+    ...(itemKey ? { itemKey } : {}),
+  };
 }
 
 /**
@@ -102,10 +127,11 @@ export function recordModelUsage(args: {
   responseId?: string;
   promptComponents?: Record<string, number>;
 }): void {
+  const source = args.sessionId || 'unknown';
   recordUsage({
     at: new Date().toISOString(),
-    source: args.sessionId || 'unknown',
-    kind: classifyUsageKind(args.sessionId || 'unknown', args.channel),
+    source,
+    kind: classifyUsageKind(source, args.channel),
     model: args.model,
     inputTokens: args.inputTokens,
     cachedInputTokens: args.cachedInputTokens,
@@ -115,6 +141,9 @@ export function recordModelUsage(args: {
     durationMs: args.durationMs,
     responseId: args.responseId,
     promptComponents: args.promptComponents,
+    // Join keys for the State layer — derived, so every workflow lane gets them
+    // for free (no per-model-lane call-site change). Absent for non-workflow calls.
+    ...parseWorkflowSource(source),
   });
 }
 
@@ -273,6 +302,22 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     byHour,
     generatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Total tokens recorded for a single source (session id) on a date (default
+ * today). The State layer's per-attempt metrics call this to attribute token
+ * cost to a workflow step's deterministic `workflow:<runId>:<stepId>` session —
+ * snapshotting before/after an attempt and diffing isolates that attempt's
+ * spend. Cheap: one day's NDJSON (a few hundred–thousand lines). Best-effort —
+ * an attempt straddling midnight under-counts the pre-midnight slice; never throws.
+ */
+export function sumUsageTokensForSource(source: string, date: Date = new Date()): number {
+  let total = 0;
+  for (const ev of readUsageEventsForDate(date)) {
+    if (ev.source === source) total += ev.totalTokens;
+  }
+  return total;
 }
 
 /**
