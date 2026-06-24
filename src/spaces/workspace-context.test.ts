@@ -39,6 +39,9 @@ test('buildWorkspaceContextPrimer tells the brain to edit via space_* (never a s
   // instruction was impossible (space_get never returns the view) and forced shell.
   assert.match(primer!, /space_get_view\('deal-risk'/);
   assert.doesNotMatch(primer!, /space_get\('deal-risk'\) first for the exact current text/);
+  // The DATA line names the dry-run (space_try_runner) so the model tests a runner
+  // inside the surface instead of `node data/x.mjs` in the shell.
+  assert.match(primer!, /space_try_runner\('deal-risk'/);
 });
 
 test('buildWorkspaceContextPrimer is null for a missing workspace', () => {
@@ -46,18 +49,24 @@ test('buildWorkspaceContextPrimer is null for a missing workspace', () => {
 });
 
 test('WORKSPACE_DOCK_TOOLS lists the tools a dock turn needs to edit', () => {
-  assert.deepEqual([...WORKSPACE_DOCK_TOOLS], ['space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh']);
+  assert.deepEqual([...WORKSPACE_DOCK_TOOLS], [
+    'space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
+    'space_try_runner', 'space_set_data',
+  ]);
 });
 
 test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () => {
   const full = sdk.defaultClaudeAgentSdkAllowedLocalTools('full');
-  for (const t of ['space_get', 'space_list', 'space_edit_view', 'space_save', 'space_refresh']) {
+  for (const t of ['space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh', 'space_try_runner', 'space_set_data']) {
     assert.ok(full.includes(t), `full profile missing ${t}`);
   }
   const authoring = sdk.defaultClaudeAgentSdkAllowedLocalTools('local_authoring');
   assert.ok(authoring.includes('space_save') && authoring.includes('space_edit_view'));
-  // read-only gets the reads (incl. space_get_view, the view-HTML reader) but NOT the writes
+  assert.ok(authoring.includes('space_try_runner') && authoring.includes('space_set_data'));
+  // read-only gets the reads (incl. space_get_view, the view-HTML reader) but NOT
+  // the writes/executors (space_save/edit/try_runner/set_data).
   const ro = sdk.defaultClaudeAgentSdkAllowedLocalTools('read_only');
   assert.ok(ro.includes('space_get') && ro.includes('space_get_view') && ro.includes('space_list'));
   assert.ok(!ro.includes('space_save') && !ro.includes('space_edit_view'));
+  assert.ok(!ro.includes('space_try_runner') && !ro.includes('space_set_data'));
 });

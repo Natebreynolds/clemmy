@@ -81,7 +81,12 @@ function interpreterFor(
   return null;
 }
 
-async function runScript(slug: string, runner: string, extra?: Record<string, unknown>): Promise<RunSourceResult> {
+/** Run a runner script under the workspace data/ dir and return its parsed JSON
+ *  (or an error) WITHOUT persisting. The scrubbed-env / timeout / output-cap spawn
+ *  used by both the real refresh path (runSpaceDataSource) and the dry-run tool
+ *  (space_try_runner) — exported so the dry-run is byte-identical to a real pull,
+ *  minus the write. */
+export async function runScript(slug: string, runner: string, extra?: Record<string, unknown>): Promise<RunSourceResult> {
   let target: string;
   try {
     target = resolveInSpace(slug, path.join('data', runner));

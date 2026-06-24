@@ -927,6 +927,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'space_save',
       'space_edit_view',
       'space_refresh',
+      // space_try_runner dry-runs a candidate runner (no persist) so the model
+      // stops emulating it with `node data/x.mjs` in the shell; space_set_data
+      // commits a known inline dataset. byName no-ops when spaces off.
+      'space_try_runner',
+      'space_set_data',
       // Shell (approval-gated by taxonomy for mutating commands)
       'run_shell_command',
       // Code Mode (Lane C) — programmatic tool calling. byName no-ops to undefined

@@ -186,6 +186,90 @@ test('space_get_view errors cleanly for a missing workspace', async () => {
   assert.match(text(await tools.space_get_view({ slug: 'no-such-space', grep: null, around: null })), /No workspace named/);
 });
 
+// --- space_edit_view structured feedback: precise mismatch hint on a near-miss ---
+
+test('space_edit_view surfaces a whitespace mismatch hint instead of a blind miss', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-edit-mismatch.html');
+  // The view indents the button with a TAB; the model will (wrongly) use spaces.
+  writeFileSync(draft, '<body>\n\t<button id="go">Go</button>\n</body>', 'utf-8');
+  await tools.space_save({ slug: 'mismatch', title: 'Mismatch', view_path: draft });
+  const res = text(await tools.space_edit_view({
+    slug: 'mismatch',
+    edits: [{ find: '  <button id="go">Go</button>', replace: '  <button id="go">Done</button>' }],
+  }));
+  assert.match(res, /No edits applied/);
+  assert.match(res, /matched the first \d+ char\(s\)/); // pinpoints where it diverged
+  assert.match(res, /space_get_view/); // points the model at the real fix
+  assert.match(res, /watch tabs vs spaces/);
+  // the view is untouched
+  assert.match(readFileSync(store.resolveInSpace('mismatch', 'view/index.html'), 'utf-8'), /Go<\/button>/);
+});
+
+test('space_edit_view notes when a find hit multiple occurrences', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-edit-multi.html');
+  writeFileSync(draft, '<span>x</span><span>x</span>', 'utf-8');
+  await tools.space_save({ slug: 'multi', title: 'Multi', view_path: draft });
+  const res = text(await tools.space_edit_view({ slug: 'multi', edits: [{ find: '<span>x</span>', replace: '<span>y</span>' }] }));
+  assert.match(res, /Applied 1 edit/);
+  assert.match(res, /ALL 2 occurrences/);
+});
+
+// --- space_try_runner: the no-persist dry-run (replaces shelling `node data/x.mjs`) ---
+
+test('space_try_runner runs a runner and returns its shape WITHOUT writing data.json', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-tryrunner.html');
+  writeFileSync(draft, '<html>tr</html>', 'utf-8');
+  await tools.space_save({ slug: 'tryrunner', title: 'TryRunner', view_path: draft });
+  const runnerDir = store.resolveInSpace('tryrunner', 'data');
+  mkdirSync(runnerDir, { recursive: true });
+  writeFileSync(path.join(runnerDir, 'pull.mjs'),
+    'process.stdout.write(JSON.stringify([{ firm: "Acme", risk: 9 }, { firm: "Globex", risk: 4 }]))', 'utf-8');
+
+  const res = text(await tools.space_try_runner({ slug: 'tryrunner', runner_path: 'pull.mjs', payload_json: null }));
+  assert.match(res, /Dry run of data\/pull\.mjs OK/);
+  assert.match(res, /2 rows/);
+  assert.match(res, /keys: firm, risk/);
+  assert.match(res, /NOTHING persisted/);
+  assert.match(res, /Acme/); // sample rows included
+  // the crucial invariant: data.json was NOT written by the dry run
+  assert.equal(existsSync(store.resolveInSpace('tryrunner', 'data.json')), false);
+});
+
+test('space_try_runner surfaces a runner failure verbatim (still no persist)', async () => {
+  const runnerDir = store.resolveInSpace('tryrunner', 'data');
+  writeFileSync(path.join(runnerDir, 'broken.mjs'), 'process.stdout.write("not json at all")', 'utf-8');
+  const res = text(await tools.space_try_runner({ slug: 'tryrunner', runner_path: 'broken.mjs', payload_json: null }));
+  assert.match(res, /FAILED \(nothing persisted\)/);
+  assert.match(res, /not valid JSON/);
+  assert.equal(existsSync(store.resolveInSpace('tryrunner', 'data.json')), false);
+});
+
+// --- space_set_data: the sanctioned inline-commit (replaces /tmp scrub scripts) ---
+
+test('space_set_data commits inline JSON, counts rows, and stamps _meta.provenance=manual', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-setdata.html');
+  writeFileSync(draft, '<html>sd</html>', 'utf-8');
+  await tools.space_save({ slug: 'setdata', title: 'SetData', view_path: draft });
+
+  const res = text(await tools.space_set_data({
+    slug: 'setdata', source_id: 'deals',
+    data_json: JSON.stringify([{ firm: 'Acme', stage: 'won' }, { firm: 'Globex', stage: 'lost' }]),
+  }));
+  assert.match(res, /Saved 2 rows under "deals"/);
+  assert.match(res, /marked manual/);
+
+  const dataMod = await import('../spaces/data-store.js');
+  const data = dataMod.readData('setdata') as Record<string, unknown>;
+  assert.equal((data.deals as unknown[]).length, 2);
+  const meta = data._meta as Record<string, { provenance?: string }>;
+  assert.equal(meta.deals.provenance, 'manual');
+});
+
+test('space_set_data rejects invalid JSON (no write)', async () => {
+  const res = text(await tools.space_set_data({ slug: 'setdata', source_id: 'deals', data_json: '{not json' }));
+  assert.match(res, /not valid JSON/);
+});
+
 test('isSpacesEnabled defaults ON (beta) and honors the kill-switch', () => {
   const prev = process.env.CLEMENTINE_SPACES;
   delete process.env.CLEMENTINE_SPACES;

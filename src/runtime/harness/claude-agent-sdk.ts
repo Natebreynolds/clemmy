@@ -165,6 +165,11 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   'space_edit_view',
   'space_save',
   'space_refresh',
+  // space_try_runner dry-runs a candidate data runner (no persist) so the model
+  // iterates inside the surface instead of `node data/x.mjs` in the shell;
+  // space_set_data commits a known inline dataset (the one-row-fix path).
+  'space_try_runner',
+  'space_set_data',
 ] as const;
 
 // Mutating tools exposed through the harness gate chain (gated-mutating-tools.ts)

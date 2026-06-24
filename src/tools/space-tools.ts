@@ -24,8 +24,8 @@ import {
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
-import { refreshSpaceData } from '../spaces/runner.js';
-import { readData, listNotes, listAudit, appendNote } from '../spaces/data-store.js';
+import { refreshSpaceData, runScript } from '../spaces/runner.js';
+import { readData, writeData, listNotes, listAudit, appendNote, appendAudit } from '../spaces/data-store.js';
 
 function expandHome(p: string): string {
   if (p === '~') return os.homedir();
@@ -111,6 +111,44 @@ function countRows(val: unknown): number | null {
     }
   }
   return null;
+}
+
+/** The row collection inside a runner's parsed output (mirrors countRows): the
+ *  array itself, or the first array one level down — for a dry-run summary. */
+function rowCollection(val: unknown): unknown[] | null {
+  if (Array.isArray(val)) return val;
+  if (val && typeof val === 'object') {
+    for (const k of Object.keys(val as Record<string, unknown>)) {
+      if (k === '_meta') continue;
+      const v = (val as Record<string, unknown>)[k];
+      if (Array.isArray(v)) return v;
+    }
+  }
+  return null;
+}
+
+/** On a missed space_edit_view find, pinpoint WHERE it diverged: the longest
+ *  prefix of `find` that IS in the view, and what the view has at that point.
+ *  Surfaces the trailing-space/indent bug the model otherwise re-reads blind for.
+ *  Strings are JSON-quoted so whitespace (\t vs spaces) is visible. */
+function editMismatchHint(html: string, find: string): { matchedChars: number; findHad: string; viewHad: string } | null {
+  if (!find) return null;
+  // Largest k with html.includes(find.slice(0,k)) — monotonic, so binary-search it.
+  let lo = 0;
+  let hi = find.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (html.includes(find.slice(0, mid))) lo = mid; else hi = mid - 1;
+  }
+  const k = lo;
+  if (k >= find.length) return null; // fully present (shouldn't happen on a miss)
+  const pos = html.indexOf(find.slice(0, k));
+  const quote = (s: string): string => JSON.stringify(s.slice(0, 24));
+  return {
+    matchedChars: k,
+    findHad: quote(find.slice(k)),
+    viewHad: pos >= 0 ? quote(html.slice(pos + k, pos + k + 24)) : '(prefix not located)',
+  };
 }
 
 /** Max chars of view HTML space_get_view returns in one call. Sized just under
@@ -358,21 +396,34 @@ export function registerSpaceTools(server: McpServer): void {
       const viewFile = resolveInSpace(slug, rec.viewEntry);
       if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with a view_path.`);
       let html = readFileSync(viewFile, 'utf-8');
-      const misses: string[] = [];
+      const detailLines: string[] = [];
       let applied = 0;
+      // Apply in order — a later find operates on the already-edited html (same as
+      // before). Per-edit: report occurrences + a precise mismatch hint on a miss
+      // so the model sees the whitespace divergence instead of re-reading blind.
       edits.forEach((e, i) => {
-        if (!html.includes(e.find)) { misses.push(`edit ${i + 1} (find not present)`); return; }
+        const occurrences = e.find ? html.split(e.find).length - 1 : 0;
+        if (occurrences === 0) {
+          const hint = editMismatchHint(html, e.find);
+          detailLines.push(
+            hint && hint.matchedChars > 0
+              ? `edit ${i + 1}: NOT applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the view has ${hint.viewHad}. Re-read with space_get_view and copy the exact characters (watch tabs vs spaces), then retry just this edit.`
+              : `edit ${i + 1}: NOT applied — that find string isn't in the view; re-read with space_get_view and copy an exact snippet.`,
+          );
+          return;
+        }
         html = html.split(e.find).join(e.replace);
         applied += 1;
+        if (occurrences > 1) detailLines.push(`edit ${i + 1}: applied to ALL ${occurrences} occurrences.`);
       });
+      const detail = detailLines.length ? `\n${detailLines.join('\n')}` : '';
       if (applied === 0) {
-        return textResult(`No edits applied — none of the find strings were in the view. Call space_get_view('${slug}', '<nearby text>') to read the exact current view lines, then match a find string EXACTLY (whitespace included).`);
+        return textResult(`No edits applied — none of the find strings were in the view. Call space_get_view('${slug}', '<nearby text>') to read the exact current view lines, then match a find string EXACTLY (whitespace included).${detail}`);
       }
       spaceStore.recordRevision(slug); // snapshot the prior view + bump version (revertible)
       writeFileSync(viewFile, html, 'utf-8');
       const after = spaceStore.get(slug);
-      const missNote = misses.length ? ` (${misses.length} didn't match: ${misses.join(', ')})` : '';
-      return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" view (now v${after?.version}). The open Workspace auto-refreshes — no need to space_save.${missNote}`);
+      return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" view (now v${after?.version}). The open Workspace auto-refreshes — no need to space_save.${detail}`);
     },
   );
 
@@ -472,6 +523,89 @@ export function registerSpaceTools(server: McpServer): void {
         renderViewForRead(html, { slug, grep: grep?.trim() || undefined, around: around ?? undefined }),
         { maxChars: VIEW_READ_RESULT_MAX_CHARS },
       );
+    },
+  );
+
+  server.tool(
+    'space_try_runner',
+    [
+      'DRY-RUN a data runner you wrote (a .mjs/.js/.ts/.py/.sh under the workspace data/ dir) and SEE its output — WITHOUT persisting. This is the native, sanctioned replacement for running `node data/x.mjs` in the shell or scribbling a /tmp script: it runs the runner through the SAME scrubbed-env executor a real refresh uses, then returns the row count, the column keys, and the first few rows (or the full error). Iterate here until the shape is right.',
+      'When the output looks correct, call space_refresh(slug, source_id) to actually pull + persist it (or space_set_data for a known inline fix). This tool writes NOTHING to data.json.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      runner_path: z.string().min(1).max(120).describe('Runner filename under the workspace data/ dir, e.g. "refresh.mjs".'),
+      payload_json: z.string().max(4000).nullable().describe('Optional JSON object merged into the stdin payload (test inputs). Omit to run as a scheduled refresh would.'),
+    },
+    async ({ slug, runner_path, payload_json }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const runner = runner_path.trim();
+      let extra: Record<string, unknown> | undefined;
+      if (payload_json && payload_json.trim()) {
+        let parsed: unknown;
+        try { parsed = JSON.parse(payload_json); }
+        catch (err) { return textResult(`Error: payload_json is not valid JSON: ${(err as Error).message}`); }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return textResult('Error: payload_json must be a JSON object (it is merged into the stdin payload).');
+        }
+        extra = parsed as Record<string, unknown>;
+      }
+      const run = await runScript(slug, runner, extra);
+      if (!run.ok) {
+        return textResult(`Dry run of data/${runner} FAILED (nothing persisted):\n${run.error}\n\nFix the runner and call space_try_runner again.`);
+      }
+      const rows = rowCollection(run.data);
+      const bytes = (() => { try { return Buffer.byteLength(JSON.stringify(run.data)); } catch { return 0; } })();
+      const firstRow = rows && rows.length > 0 ? rows[0] : undefined;
+      const keys = firstRow && typeof firstRow === 'object' && !Array.isArray(firstRow)
+        ? Object.keys(firstRow as Record<string, unknown>) : [];
+      const sample = rows ? rows.slice(0, 3) : run.data;
+      const sampleStr = (() => { try { return JSON.stringify(sample, null, 2).slice(0, 3000); } catch { return '(unserializable)'; } })();
+      const shape = rows
+        ? `${rows.length} row${rows.length === 1 ? '' : 's'}${keys.length ? ` · keys: ${keys.join(', ')}` : ''}`
+        : 'a non-array payload (no rows)';
+      return textResult(
+        `Dry run of data/${runner} OK — ${shape} (${bytes} bytes). NOTHING persisted.\n`
+        + `Sample (first ${rows ? Math.min(3, rows.length) : 1}):\n${sampleStr}\n\n`
+        + `If this is right, call space_refresh('${slug}', '<source_id>') to pull + persist it.`,
+      );
+    },
+  );
+
+  server.tool(
+    'space_set_data',
+    [
+      'Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id — the sanctioned path for a one-off fix (e.g. correcting one bad row) where you already know the right value. Use this INSTEAD of a /tmp scrub script.',
+      'For the normal case — pulling fresh data — write/edit a runner and use space_refresh. This tool bypasses the runner and is stamped "manual", so a scheduled refresh would later overwrite it; reserve it for fixes and inline results.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      source_id: z.string().min(1).max(120).describe('The data source id to write under (the key the view reads at data["<source_id>"]).'),
+      data_json: z.string().min(1).max(5_000_000).describe('The dataset as a JSON string (an array of rows, or an object). Replaces the current value for this source_id.'),
+    },
+    async ({ slug, source_id, data_json }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const sid = source_id.trim();
+      let parsed: unknown;
+      try { parsed = JSON.parse(data_json); }
+      catch (err) { return textResult(`Error: data_json is not valid JSON: ${(err as Error).message}`); }
+      const current = (() => {
+        const d = readData(slug);
+        return (d && typeof d === 'object') ? { ...(d as Record<string, unknown>) } : {};
+      })();
+      current[sid] = parsed;
+      const meta = (current._meta && typeof current._meta === 'object') ? { ...(current._meta as Record<string, unknown>) } : {};
+      meta[sid] = { refreshedAt: new Date().toISOString(), ok: true, provenance: 'manual' };
+      current._meta = meta;
+      const write = writeData(slug, current);
+      if (!write.ok) return textResult(`Could not save data for "${slug}": ${write.error}`);
+      appendAudit(slug, { method: 'SET_DATA', path: `/set_data/${sid}`, outcome: 'ok', bytes: write.bytes });
+      const n = countRows(parsed);
+      return textResult(`Saved ${n == null ? 'data' : `${n} row${n === 1 ? '' : 's'}`} under "${sid}" (${write.bytes} bytes, marked manual). The open Workspace auto-refreshes.`);
     },
   );
 }
