@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
@@ -327,6 +327,32 @@ function terminalRunRecordStatus(runId: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Every workflow name that has a runs/ directory — the set the self-improvement
+ *  proposer walks to mine per-workflow run history. */
+export function listWorkflowNamesWithRuns(): string[] {
+  if (!existsSync(WORKFLOWS_DIR)) return [];
+  const out: string[] = [];
+  for (const name of readdirSync(WORKFLOWS_DIR)) {
+    if (existsSync(path.join(WORKFLOWS_DIR, name, 'runs'))) out.push(name);
+  }
+  return out;
+}
+
+/** Recent run ids for a workflow, newest-first by directory mtime, capped. The
+ *  history window the workflow_step proposer mines for recurring step failures. */
+export function listWorkflowRunIds(workflowName: string, limit = 20): string[] {
+  const runsDir = path.join(WORKFLOWS_DIR, workflowName, 'runs');
+  if (!existsSync(runsDir)) return [];
+  return readdirSync(runsDir)
+    .map((id) => {
+      try { return { id, mtime: statSync(path.join(runsDir, id)).mtimeMs }; }
+      catch { return { id, mtime: 0 }; }
+    })
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, Math.max(0, limit))
+    .map((e) => e.id);
 }
 
 export function listPendingRuns(): PendingRun[] {

@@ -37,11 +37,13 @@ import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { approveEnabled, retireInternalNoise } from './memory-approve.js';
 import { appendSkillPitfall, listSkills } from '../memory/skill-store.js';
+import { listWorkflowNamesWithRuns, listWorkflowRunIds, readWorkflowEvents } from '../execution/workflow-events.js';
+import { applyStepPromptAddendum } from '../execution/workflow-step-edit.js';
 import type { ObservatoryReport } from './observatory.js';
 
 type ToolHealth = ObservatoryReport['toolHealth'][number];
 
-export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact';
+export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact' | 'workflow_step';
 export type ProposalStatus = 'pending' | 'approved' | 'applied' | 'dismissed';
 /** auto = appliable through the gated flow; manual = the human edits code, approval only acknowledges. */
 export type ApplyMode = 'auto' | 'manual';
@@ -78,8 +80,15 @@ function proposalId(kind: ImprovementKind, target: string, proposedText: string)
 function mkProposal(
   p: Pick<ImprovementProposal, 'kind' | 'target' | 'proposedText' | 'rationale' | 'evidence' | 'applyMode'>,
   proposedAt: string,
+  /** Stable id seed. Default = kind:target:proposedText. Pass an explicit seed
+   *  when the proposedText carries volatile detail (e.g. a run COUNT that grows
+   *  nightly) so the same underlying issue keeps ONE stable id and dedups. */
+  idSeed?: string,
 ): ImprovementProposal {
-  return { ...p, id: proposalId(p.kind, p.target, p.proposedText), status: 'pending', proposedAt };
+  const id = idSeed
+    ? createHash('sha1').update(idSeed).digest('hex').slice(0, 12)
+    : proposalId(p.kind, p.target, p.proposedText);
+  return { ...p, id, status: 'pending', proposedAt };
 }
 
 export interface ProposerDeps {
@@ -182,6 +191,109 @@ export function buildImprovementProposals(report: ObservatoryReport, deps: Propo
   return out.filter((p) => (seen.has(p.id) ? false : (seen.add(p.id), true)));
 }
 
+// ── workflow_step: improve a workflow's OWN steps from its run history ─────────
+//
+// The report-based detectors above improve tools/skills/memory. This one closes
+// the loop the user asked for: a workflow gets better OVER TIME by mining its own
+// run history (the attempt_records + step_failed events) for a step that keeps
+// missing its contract, and proposing a reversible prompt addendum to THAT step.
+
+/** One step's contract problems observed in one run of one workflow. */
+export interface StepFailureObservation {
+  workflow: string;
+  stepId: string;
+  runId: string;
+  problems: string[];
+}
+
+export interface WorkflowStepDeps {
+  /** Pre-collected per-run step failures. Injectable for tests; defaults to a
+   *  disk scan of recent runs. */
+  collectStepFailures?: () => StepFailureObservation[];
+  nowIso?: string;
+}
+
+/** Collapse volatile detail (digits) so "got 2, needs 10" and "got 4, needs 10"
+ *  count as the SAME recurring problem. */
+function normalizeProblem(p: string): string {
+  return p.trim().toLowerCase().replace(/\d+/g, '#').replace(/\s+/g, ' ');
+}
+
+function trimProblem(p: string, n = 160): string {
+  const c = p.replace(/\s+/g, ' ').trim();
+  return c.length > n ? c.slice(0, n) + '…' : c;
+}
+
+/** Scan recent runs of every workflow and collect each step's contract problems
+ *  (from step_failed meta + attempt_record). Best-effort; never throws. */
+function defaultCollectStepFailures(): StepFailureObservation[] {
+  const out: StepFailureObservation[] = [];
+  try {
+    for (const workflow of listWorkflowNamesWithRuns()) {
+      for (const runId of listWorkflowRunIds(workflow, 20)) {
+        const perStep = new Map<string, Set<string>>();
+        for (const ev of readWorkflowEvents(workflow, runId)) {
+          if (!ev.stepId) continue;
+          if (ev.kind === 'step_failed' && ev.meta && Array.isArray((ev.meta as { problems?: unknown }).problems)) {
+            const probs = (ev.meta as { problems: unknown[] }).problems.filter((x): x is string => typeof x === 'string');
+            if (probs.length) { const s = perStep.get(ev.stepId) ?? new Set(); probs.forEach((p) => s.add(p)); perStep.set(ev.stepId, s); }
+          } else if (ev.kind === 'attempt_record' && ev.attempt?.failedProblems?.length) {
+            const s = perStep.get(ev.stepId) ?? new Set();
+            ev.attempt.failedProblems.forEach((p) => s.add(p));
+            perStep.set(ev.stepId, s);
+          }
+        }
+        for (const [stepId, probs] of perStep) {
+          if (probs.size > 0) out.push({ workflow, stepId, runId, problems: [...probs] });
+        }
+      }
+    }
+  } catch { /* best-effort */ }
+  return out;
+}
+
+/**
+ * Pure: turn per-run step failures into proposals. A problem that recurs across
+ * ≥2 DISTINCT runs of the same step is the signal — a one-off failure is noise,
+ * a repeat is a real weakness in that step. The proposed edit is a reversible
+ * prompt addendum steering the step to address the recurring gap. The id is
+ * seeded on workflow::step::normalized-problem so the run COUNT growing nightly
+ * never spawns a duplicate.
+ */
+export function proposalsFromStepFailures(observations: StepFailureObservation[], nowIso: string): ImprovementProposal[] {
+  const recur = new Map<string, { workflow: string; stepId: string; problem: string; runs: Set<string> }>();
+  for (const o of observations) {
+    for (const p of o.problems) {
+      const norm = normalizeProblem(p);
+      if (!norm) continue;
+      const key = `${o.workflow} ${o.stepId} ${norm}`;
+      let e = recur.get(key);
+      if (!e) { e = { workflow: o.workflow, stepId: o.stepId, problem: p, runs: new Set() }; recur.set(key, e); }
+      e.runs.add(o.runId);
+    }
+  }
+  const out: ImprovementProposal[] = [];
+  for (const e of recur.values()) {
+    if (e.runs.size < 2) continue; // recurring = ≥2 distinct runs
+    const target = `${e.workflow}::${e.stepId}`;
+    out.push(mkProposal({
+      kind: 'workflow_step',
+      target,
+      applyMode: 'auto',
+      proposedText: `Recurring issue (seen in ${e.runs.size} runs): this step keeps failing its contract — "${trimProblem(e.problem)}". Before finishing, explicitly satisfy this; if the data genuinely isn't available, return {"blocked": true, "reason": "<why>"} instead of an incomplete result.`,
+      rationale: `Step "${e.stepId}" of workflow "${e.workflow}" hit the same contract problem in ${e.runs.size} separate runs — a prompt addendum steers future runs to address the recurring gap (reversible).`,
+      evidence: `same problem in ${e.runs.size} distinct runs: "${trimProblem(e.problem)}"`,
+    }, nowIso, `workflow_step:${target}:${normalizeProblem(e.problem)}`));
+  }
+  return out;
+}
+
+/** Mine run history → workflow_step proposals. */
+export function buildWorkflowStepProposals(deps: WorkflowStepDeps = {}): ImprovementProposal[] {
+  const observations = (deps.collectStepFailures ?? defaultCollectStepFailures)();
+  return proposalsFromStepFailures(observations, deps.nowIso ?? new Date().toISOString());
+}
+
 // ── persistence ──────────────────────────────────────────────────────────────
 
 function readStore(): ImprovementProposal[] {
@@ -239,7 +351,9 @@ export function listPendingProposals(): ImprovementProposal[] {
 export function proposeFromReport(report: ObservatoryReport, deps: ProposerDeps = {}): { ran: boolean; added: number; total: number } {
   if (!proposerEnabled()) return { ran: false, added: 0, total: 0 };
   try {
-    const fresh = buildImprovementProposals(report, deps);
+    // Two sources: report-based (tools/skills/memory) + run-history-based
+    // (workflow_step — a workflow's own steps improving over time).
+    const fresh = [...buildImprovementProposals(report, deps), ...buildWorkflowStepProposals()];
     const { added, total } = recordProposals(fresh);
     return { ran: true, added, total };
   } catch {
@@ -296,6 +410,17 @@ export function approveProposal(id: string, opts: { dryRun?: boolean; nowIso?: s
     const r = retireInternalNoise({ dryRun });
     applied = r.applied;
     if (dryRun) return { ok: true, status: 'pending', applied, dryRun };
+  } else if (p.kind === 'workflow_step') {
+    if (dryRun) return { ok: true, status: 'pending', applied: 0, dryRun };
+    // target = "<workflow>::<stepId>"; append the guidance as a reversible
+    // prompt addendum (validated + backed up by workflow-step-edit).
+    const sep = p.target.indexOf('::');
+    const wf = sep > 0 ? p.target.slice(0, sep) : '';
+    const stepId = sep > 0 ? p.target.slice(sep + 2) : '';
+    if (!wf || !stepId) return { ok: false, status: 'pending', applied: 0, dryRun, reason: 'apply-failed' };
+    const r = applyStepPromptAddendum(wf, stepId, p.proposedText, { description: `improvement proposal ${p.id}`, nowIso: at });
+    applied = r.ok ? 1 : 0;
+    if (!r.ok) return { ok: false, status: 'pending', applied: 0, dryRun, reason: 'apply-failed' };
   }
 
   p.status = 'applied';

@@ -27,9 +27,15 @@ const {
   listPendingProposals,
   approveProposal,
   dismissProposal,
+  proposalsFromStepFailures,
+  buildWorkflowStepProposals,
 } = await import('./improvement-proposer.js');
 const { writeDistilledSkill, loadSkill } = await import('../memory/skill-store.js');
+const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
+const { revertStepEdit, listStepEditBackups } = await import('../execution/workflow-step-edit.js');
 import type { ObservatoryReport } from './observatory.js';
+import type { StepFailureObservation } from './improvement-proposer.js';
+import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -174,6 +180,88 @@ test('approveProposal: a manual tool_desc proposal is acknowledged, not mutated'
   assert.equal(res.applied, 0);
   assert.equal(res.reason, 'manual-acknowledged');
   assert.equal(listPendingProposals().length, 0, 'acknowledged item leaves the pending list');
+});
+
+// ── workflow_step: improve a workflow's own steps from run history ───────────
+
+function obs(workflow: string, stepId: string, runId: string, problems: string[]): StepFailureObservation {
+  return { workflow, stepId, runId, problems };
+}
+
+test('proposalsFromStepFailures: a ONE-off failure is noise — no proposal', () => {
+  const out = proposalsFromStepFailures([obs('wf', 'scrape', 'run-1', ['min_items: got 2, needs 10'])], NOW);
+  assert.equal(out.length, 0);
+});
+
+test('proposalsFromStepFailures: the SAME problem across 2+ runs → a workflow_step proposal', () => {
+  const out = proposalsFromStepFailures([
+    obs('wf', 'scrape', 'run-1', ['min_items: got 2, needs 10']),
+    obs('wf', 'scrape', 'run-2', ['min_items: got 4, needs 10']), // digits normalized → same problem
+  ], NOW);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, 'workflow_step');
+  assert.equal(out[0].applyMode, 'auto');
+  assert.equal(out[0].target, 'wf::scrape');
+  assert.match(out[0].proposedText, /Recurring issue \(seen in 2 runs\)/);
+});
+
+test('proposalsFromStepFailures: id is stable as the run count grows (no nightly duplicates)', () => {
+  const two = proposalsFromStepFailures([
+    obs('wf', 'scrape', 'r1', ['min_items: got 2, needs 10']),
+    obs('wf', 'scrape', 'r2', ['min_items: got 3, needs 10']),
+  ], NOW)[0];
+  const three = proposalsFromStepFailures([
+    obs('wf', 'scrape', 'r1', ['min_items: got 2, needs 10']),
+    obs('wf', 'scrape', 'r2', ['min_items: got 3, needs 10']),
+    obs('wf', 'scrape', 'r3', ['min_items: got 5, needs 10']),
+  ], NOW)[0];
+  assert.equal(two.id, three.id, 'same step+problem keeps one id even as run count (and proposedText) changes');
+  assert.notEqual(two.proposedText, three.proposedText, 'text reflects the new count');
+});
+
+test('buildWorkflowStepProposals: uses the injected failure collector', () => {
+  const out = buildWorkflowStepProposals({
+    collectStepFailures: () => [
+      obs('wf', 'a', 'r1', ['bad']),
+      obs('wf', 'a', 'r2', ['bad']),
+    ],
+    nowIso: NOW,
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].target, 'wf::a');
+});
+
+test('approveProposal: a workflow_step proposal appends a reversible prompt addendum (dryRun never mutates)', () => {
+  const def: WorkflowDefinition = {
+    name: 'hist-wf',
+    description: 'history workflow',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'scrape', prompt: 'Scrape the directory and return rows.', sideEffect: 'read' }],
+  };
+  writeWorkflow('hist-wf', def);
+  const [p] = proposalsFromStepFailures([
+    obs('hist-wf', 'scrape', 'r1', ['min_items: got 2, needs 10']),
+    obs('hist-wf', 'scrape', 'r2', ['min_items: got 1, needs 10']),
+  ], NOW);
+  recordProposals([p]);
+
+  // dry run: previews, no write
+  const dry = approveProposal(p.id, { dryRun: true });
+  assert.equal(dry.status, 'pending');
+  assert.equal(readWorkflow('hist-wf')!.data.steps[0].prompt, 'Scrape the directory and return rows.', 'dryRun did not edit the step');
+
+  // real apply: addendum lands on the step prompt, proposal applied, reversible
+  const real = approveProposal(p.id);
+  assert.equal(real.ok, true);
+  assert.equal(real.status, 'applied');
+  assert.match(readWorkflow('hist-wf')!.data.steps[0].prompt, /Recurring issue \(seen in 2 runs\)/);
+
+  const backups = listStepEditBackups().filter((b) => b.workflow === 'hist-wf');
+  assert.ok(backups.length >= 1, 'a reversible backup was snapshotted');
+  const rev = revertStepEdit(backups[0].id);
+  assert.equal(rev.ok, true);
+  assert.equal(readWorkflow('hist-wf')!.data.steps[0].prompt, 'Scrape the directory and return rows.', 'revert restored the original prompt');
 });
 
 test('approveProposal: an auto skill_pitfall applies via appendSkillPitfall (dryRun first never mutates)', () => {
