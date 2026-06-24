@@ -23,9 +23,12 @@ const {
   loopUntilMaxAttempts,
   runWithContractLoop,
   renderLoopRetryEvidence,
+  summarizeAttemptChange,
+  attemptRecordsEnabled,
   WorkflowContractViolationError,
 } = await import('./workflow-runner.js');
 const { checkLoopUntilAuthoring } = await import('./workflow-enforce.js');
+const { appendWorkflowEvent, listAttemptRecords } = await import('./workflow-events.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 import type { WorkflowStepInput, WorkflowDefinition } from '../memory/workflow-store.js';
 
@@ -152,6 +155,98 @@ test('renderLoopRetryEvidence caps the problem list and tells the step how to ba
   const text = renderLoopRetryEvidence(1, Array.from({ length: 10 }, (_, i) => `problem ${i}`));
   assert.equal((text.match(/^- /gm) ?? []).length, 6, 'at most 6 problems listed');
   assert.match(text, /blocked/, 'offers the honest-blocker escape hatch');
+});
+
+// ─── STATE pillar: comparable per-attempt records (S1) ───────────────────────
+
+test('summarizeAttemptChange: first attempt reports the raw problem count', () => {
+  assert.equal(summarizeAttemptChange(1, ['a', 'b'], undefined), 'attempt 1: 2 contract problems');
+  assert.equal(summarizeAttemptChange(1, ['a'], undefined), 'attempt 1: 1 contract problem');
+});
+
+test('summarizeAttemptChange: later attempts diff fixed / new / still-failing vs the prior set', () => {
+  // prior = [a,b,c]; now = [b,c,d] → fixed a (1), new d (1), persisting b,c (2)
+  assert.equal(
+    summarizeAttemptChange(2, ['b', 'c', 'd'], ['a', 'b', 'c']),
+    'attempt 2: fixed 1, 1 new, 2 still failing',
+  );
+});
+
+test('runWithContractLoop: sampleMetrics snapshot-diff attributes per-attempt cost to onLoopRetry', async () => {
+  // Cumulative session counters the loop snapshots before/after each attempt.
+  let tokens = 0;
+  let toolCalls = 0;
+  const seen: Array<{ attempt: number; metrics: { durationMs: number; tokens?: number; toolCalls?: number } }> = [];
+  let calls = 0;
+  const out = await runWithContractLoop(
+    async () => {
+      calls += 1;
+      // each attempt "spends" 100 tokens + 2 tool calls cumulatively
+      tokens += 100;
+      toolCalls += 2;
+      if (calls < 3) throw violation([`fail ${calls}`]);
+      return 'done';
+    },
+    step(),
+    {
+      maxAttempts: 3,
+      sampleMetrics: () => ({ tokens, toolCalls }),
+      onLoopRetry: ({ attempt, metrics }) => seen.push({ attempt, metrics }),
+    },
+  );
+  assert.equal(out, 'done');
+  assert.equal(seen.length, 2, 'two failed-then-retried attempts recorded');
+  // each retried attempt is attributed exactly its own 100 tokens / 2 tool calls (the DIFF, not cumulative)
+  assert.equal(seen[0].metrics.tokens, 100);
+  assert.equal(seen[0].metrics.toolCalls, 2);
+  assert.equal(seen[1].metrics.tokens, 100);
+  assert.equal(seen[1].metrics.toolCalls, 2);
+  assert.ok(typeof seen[0].metrics.durationMs === 'number');
+});
+
+test('runWithContractLoop: without sampleMetrics, tokens/toolCalls are absent (durationMs still present)', async () => {
+  const seen: Array<{ metrics: { durationMs: number; tokens?: number; toolCalls?: number } }> = [];
+  let calls = 0;
+  await runWithContractLoop(
+    async () => { calls += 1; if (calls === 1) throw violation(); return 'ok'; },
+    step(),
+    { maxAttempts: 2, onLoopRetry: ({ metrics }) => seen.push({ metrics }) },
+  );
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].metrics.tokens, undefined);
+  assert.equal(seen[0].metrics.toolCalls, undefined);
+  assert.ok(typeof seen[0].metrics.durationMs === 'number');
+});
+
+test('attemptRecordsEnabled: default on; honors the CLEMMY_ATTEMPT_RECORDS kill-switch', () => {
+  const prior = process.env.CLEMMY_ATTEMPT_RECORDS;
+  delete process.env.CLEMMY_ATTEMPT_RECORDS;
+  assert.equal(attemptRecordsEnabled(), true, 'default on');
+  process.env.CLEMMY_ATTEMPT_RECORDS = 'off';
+  assert.equal(attemptRecordsEnabled(), false, 'kill-switch disables');
+  if (prior === undefined) delete process.env.CLEMMY_ATTEMPT_RECORDS;
+  else process.env.CLEMMY_ATTEMPT_RECORDS = prior;
+});
+
+test('listAttemptRecords: attempt_record events round-trip through the run log, scoped by step', () => {
+  appendWorkflowEvent('attempt-rt', 'run-1', {
+    kind: 'attempt_record',
+    stepId: 'scrape',
+    attempt: { attemptIndex: 1, maxAttempts: 3, failedProblems: ['min_items'], changeSummary: 'attempt 1: 1 contract problem', metrics: { durationMs: 12, tokens: 100, toolCalls: 2 } },
+  });
+  appendWorkflowEvent('attempt-rt', 'run-1', { kind: 'step_loop_retry', stepId: 'scrape', meta: { attempt: 1 } });
+  appendWorkflowEvent('attempt-rt', 'run-1', {
+    kind: 'attempt_record',
+    stepId: 'other',
+    attempt: { attemptIndex: 1, maxAttempts: 3, failedProblems: ['x'], changeSummary: 'attempt 1: 1 contract problem', metrics: { durationMs: 5 } },
+  });
+  const all = listAttemptRecords('attempt-rt', 'run-1');
+  assert.equal(all.length, 2, 'only attempt_record events, not the step_loop_retry');
+  const scoped = listAttemptRecords('attempt-rt', 'run-1', 'scrape');
+  assert.equal(scoped.length, 1);
+  assert.equal(scoped[0].record.metrics.tokens, 100);
+  assert.equal(scoped[0].stepId, 'scrape');
+  assert.ok(scoped[0].at, 'carries the event timestamp');
 });
 
 // ─── authoring law ───────────────────────────────────────────────────────────

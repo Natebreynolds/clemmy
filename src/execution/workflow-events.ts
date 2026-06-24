@@ -46,6 +46,7 @@ export type WorkflowEventKind =
   | 'step_failed'         // step errored
   | 'step_retry'          // step failed transiently; retrying after backoff
   | 'step_loop_retry'     // loopUntil: output contract failed; re-running with evidence
+  | 'attempt_record'      // STATE: a comparable per-attempt record (what was tried, what changed, what it cost)
   | 'step_advisory'       // step completed but a non-failing quality check flagged it (skill-execution miss)
   | 'step_skipped'        // step was a no-op (forEach over empty list, condition)
   | 'item_started'        // one iteration of a forEach step started
@@ -58,6 +59,28 @@ export type WorkflowEventKind =
   | 'approval_rejected'   // user said no
   | 'transcript_chunk';   // streaming text from LLM, for live UI
 
+/**
+ * STATE pillar (Loop Engineering): a comparable record of ONE attempt at a step,
+ * so the self-improvement phase can query "what was tried, what changed between
+ * attempts, and what each attempt cost" — instead of only "a retry happened".
+ * Emitted per FAILED-then-retried loopUntil attempt (the successful/exhausting
+ * final outcome is already captured by step_completed / step_failed).
+ */
+export interface AttemptRecord {
+  /** 1-based index of the attempt this record describes (the one that just failed). */
+  attemptIndex: number;
+  /** The loopUntil ceiling for context (e.g. "2 of 3"). */
+  maxAttempts: number;
+  /** The contract problems that failed THIS attempt (the criterion delta). */
+  failedProblems: string[];
+  /** Human/agent-readable diff vs the prior attempt: fixed / new / still-failing. */
+  changeSummary: string;
+  /** What this attempt cost. durationMs is exact; tokens/toolCalls are a
+   *  best-effort snapshot-diff over the step's deterministic session (absent if
+   *  the session couldn't be read). */
+  metrics: { durationMs?: number; tokens?: number; toolCalls?: number };
+}
+
 export interface WorkflowEvent {
   t: string;                          // ISO timestamp
   kind: WorkflowEventKind;
@@ -69,6 +92,8 @@ export interface WorkflowEvent {
   error?: string;
   /** Free-form metadata (tool name, model, attempt count, etc.). */
   meta?: Record<string, unknown>;
+  /** Structured per-attempt record (kind === 'attempt_record'). */
+  attempt?: AttemptRecord;
 }
 
 const MAX_PAYLOAD_BYTES = 32 * 1024;
@@ -169,6 +194,28 @@ export function readWorkflowEvents(workflowName: string, runId: string): Workflo
     /* unreadable; treat as empty */
   }
   return events;
+}
+
+/**
+ * STATE-pillar reader: pull every comparable attempt record for a run, optionally
+ * scoped to one step. This is the substrate the self-improvement phase queries to
+ * answer "what was tried and what worked best" — and what the dashboard/run-report
+ * renders as an attempt timeline. Cheap: replays the run's events.jsonl. Returns
+ * `{ stepId, itemKey, at, record }` so callers keep the owning step/time without
+ * re-correlating.
+ */
+export function listAttemptRecords(
+  workflowName: string,
+  runId: string,
+  stepId?: string,
+): Array<{ stepId?: string; itemKey?: string; at: string; record: AttemptRecord }> {
+  const out: Array<{ stepId?: string; itemKey?: string; at: string; record: AttemptRecord }> = [];
+  for (const ev of readWorkflowEvents(workflowName, runId)) {
+    if (ev.kind !== 'attempt_record' || !ev.attempt) continue;
+    if (stepId && ev.stepId !== stepId) continue;
+    out.push({ stepId: ev.stepId, itemKey: ev.itemKey, at: ev.t, record: ev.attempt });
+  }
+  return out;
 }
 
 /**

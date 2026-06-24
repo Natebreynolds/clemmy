@@ -37,7 +37,9 @@ import {
   listPendingRuns,
   readWorkflowEvents,
   type WorkflowEvent,
+  type AttemptRecord,
 } from './workflow-events.js';
+import { sumUsageTokensForSource } from '../runtime/usage-log.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import {
   runConversation,
@@ -1802,31 +1804,79 @@ export function renderLoopRetryEvidence(attempt: number, problems: string[]): st
   ].join('\n');
 }
 
+/** STATE pillar kill-switch: emit comparable per-attempt records (default on).
+ *  Off → the loopUntil path stays byte-identical (step_loop_retry only, no
+ *  metric sampling I/O). */
+export function attemptRecordsEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_ATTEMPT_RECORDS', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Cumulative {tokens,toolCalls} snapshot for a step's session — the loop diffs
+ *  before/after each attempt to attribute that attempt's cost. */
+export interface AttemptMetricSample { tokens: number; toolCalls: number; }
+
+/** Diff this attempt's contract problems against the prior attempt's so an
+ *  attempt_record reads as "what changed", not just "still failing". Pure. */
+export function summarizeAttemptChange(
+  attempt: number,
+  problems: string[],
+  priorProblems: string[] | undefined,
+): string {
+  if (!priorProblems) return `attempt ${attempt}: ${problems.length} contract problem${problems.length === 1 ? '' : 's'}`;
+  const prev = new Set(priorProblems);
+  const curr = new Set(problems);
+  const fixed = priorProblems.filter((p) => !curr.has(p)).length;
+  const fresh = problems.filter((p) => !prev.has(p)).length;
+  const persisting = problems.filter((p) => prev.has(p)).length;
+  return `attempt ${attempt}: fixed ${fixed}, ${fresh} new, ${persisting} still failing`;
+}
+
 /**
  * Pure contract-loop harness (goal-contract Phase 2), shaped like
  * runWithStepRetry so the loop logic is testable without the step machinery.
  * Re-runs the thunk while it throws WorkflowContractViolationError, feeding
  * each retry an amended step whose prompt carries the failure evidence.
  * Anything that is NOT a contract violation propagates immediately.
+ *
+ * When `sampleMetrics` is supplied, the loop times each attempt and diffs the
+ * cumulative snapshot before/after to attribute per-attempt tokens/toolCalls,
+ * handing them to onLoopRetry for the STATE-pillar attempt_record. Stays pure:
+ * the sampler is injected, so tests drive it without the step machinery.
  */
 export async function runWithContractLoop<T>(
   run: (attemptStep: WorkflowStepInput) => Promise<T>,
   step: WorkflowStepInput,
   opts: {
     maxAttempts: number;
-    onLoopRetry?: (info: { attempt: number; maxAttempts: number; problems: string[] }) => void;
+    sampleMetrics?: () => AttemptMetricSample;
+    onLoopRetry?: (info: {
+      attempt: number;
+      maxAttempts: number;
+      problems: string[];
+      metrics: { durationMs: number; tokens?: number; toolCalls?: number };
+    }) => void;
     beforeRetry?: () => void;
   },
 ): Promise<T> {
   let attemptStep = step;
+  let attemptStartMs = Date.now();
+  let startSample = opts.sampleMetrics?.();
   for (let attempt = 1; ; attempt++) {
     try {
       return await run(attemptStep);
     } catch (err) {
       if (!(err instanceof WorkflowContractViolationError) || attempt >= opts.maxAttempts) throw err;
-      opts.onLoopRetry?.({ attempt, maxAttempts: opts.maxAttempts, problems: err.problems });
+      const endSample = opts.sampleMetrics?.();
+      const metrics = {
+        durationMs: Date.now() - attemptStartMs,
+        tokens: startSample && endSample ? Math.max(0, endSample.tokens - startSample.tokens) : undefined,
+        toolCalls: startSample && endSample ? Math.max(0, endSample.toolCalls - startSample.toolCalls) : undefined,
+      };
+      opts.onLoopRetry?.({ attempt, maxAttempts: opts.maxAttempts, problems: err.problems, metrics });
       opts.beforeRetry?.();
       attemptStep = { ...step, prompt: `${step.prompt}\n${renderLoopRetryEvidence(attempt, err.problems)}` };
+      attemptStartMs = Date.now();
+      startSample = endSample;
     }
   }
 }
@@ -1944,14 +1994,36 @@ async function runStepVerifiedAttempt(
   // (no loopUntil, no contract, forEach/deterministic, send, unsafe write)
   // run exactly once: byte-identical to the pre-loopUntil behavior.
   if (!stepLoopUntilEnabled(step)) return runOnce(step);
+  const recordAttempts = attemptRecordsEnabled();
+  // STATE pillar: closure tracks the prior attempt's problems so each record
+  // reads as a delta. Only allocated when records are on (flag-off ⇒ no I/O).
+  let priorProblems: string[] | undefined;
   return runWithContractLoop(runOnce, step, {
     maxAttempts: loopUntilMaxAttempts(step),
-    onLoopRetry: ({ attempt, maxAttempts, problems }) => {
+    // Only sample when recording — the snapshot reads today's usage NDJSON +
+    // the step's harness events, which we must not pay for when the flag is off.
+    sampleMetrics: recordAttempts ? () => sampleStepAttemptMetrics(step, ctx) : undefined,
+    onLoopRetry: ({ attempt, maxAttempts, problems, metrics }) => {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_loop_retry',
         stepId: step.id,
         meta: { attempt, maxAttempts, problems: problems.slice(0, 6) },
       });
+      if (recordAttempts) {
+        const record: AttemptRecord = {
+          attemptIndex: attempt,
+          maxAttempts,
+          failedProblems: problems.slice(0, 6),
+          changeSummary: summarizeAttemptChange(attempt, problems, priorProblems),
+          metrics,
+        };
+        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+          kind: 'attempt_record',
+          stepId: step.id,
+          attempt: record,
+        });
+        priorProblems = problems;
+      }
       logger.info(
         { stepId: step.id, attempt, maxAttempts, problems: problems.slice(0, 3) },
         'workflow step output failed its contract — loopUntil re-running with evidence',
@@ -1959,6 +2031,22 @@ async function runStepVerifiedAttempt(
     },
     beforeRetry: () => throwIfWorkflowRunCancelled(ctx.runId),
   });
+}
+
+/** Best-effort cumulative {tokens,toolCalls} for a loopUntil step's deterministic
+ *  session — tokens from today's usage NDJSON (source-keyed), toolCalls from the
+ *  harness event log. runWithContractLoop diffs this before/after each attempt to
+ *  attribute per-attempt cost. Never throws: an unreadable session yields zeros so
+ *  the metric is simply absent rather than crashing a retry. */
+function sampleStepAttemptMetrics(step: WorkflowStepInput, ctx: StepExecutionContext): AttemptMetricSample {
+  try {
+    const sid = getWorkflowHarnessSession(ctx.workflow.name, step.id, ctx.runId, `${ctx.runId}:${step.id}`).id;
+    const toolCalls = listHarnessEvents(sid, { types: ['tool_called'] }).length;
+    const tokens = sumUsageTokensForSource(sid);
+    return { tokens, toolCalls };
+  } catch {
+    return { tokens: 0, toolCalls: 0 };
+  }
 }
 
 /**
