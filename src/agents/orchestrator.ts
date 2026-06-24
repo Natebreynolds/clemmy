@@ -919,6 +919,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // no-ops to undefined (→ filtered out) when spaces are disabled, so this
       // is safe with the flag off.
       'space_get',
+      // space_get_view returns the actual line-numbered view HTML (space_get does
+      // NOT), so the model reads a view via the sanctioned tool instead of
+      // defecting to read_file/grep in the shell. byName no-ops when spaces off.
+      'space_get_view',
       'space_list',
       'space_save',
       'space_edit_view',

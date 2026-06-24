@@ -122,7 +122,68 @@ test('space_edit_view reports when no find string matches (no write)', async () 
   await tools.space_save({ slug: 'nomatch', title: 'NoMatch', view_path: draft });
   const res = await tools.space_edit_view({ slug: 'nomatch', edits: [{ find: 'NOT THERE', replace: 'x' }] });
   assert.match(text(res), /No edits applied/);
+  // The miss-message points at space_get_view (which returns the view HTML), NOT
+  // space_get — the old instruction was impossible and forced a shell read_file/grep.
+  assert.match(text(res), /space_get_view\('nomatch'/);
+  assert.doesNotMatch(text(res), /Call space_get\('nomatch'\)/);
   assert.match(readFileSync(store.resolveInSpace('nomatch', 'view/index.html'), 'utf-8'), /hello/);
+});
+
+// --- space_get_view: the catch-22 keystone (space_get never returned view HTML) ---
+
+test('space_get_view is registered alongside the other space tools', () => {
+  assert.ok(tools.space_get_view, 'space_get_view must be registered for both lanes');
+});
+
+test('space_get_view returns the full view, line-numbered (the editable text space_get never gave)', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-getview.html');
+  writeFileSync(draft, '<html>\n<body>\n  <button id="send">Send</button>\n</body>\n</html>', 'utf-8');
+  await tools.space_save({ slug: 'getview', title: 'GetView', view_path: draft });
+
+  const out = text(await tools.space_get_view({ slug: 'getview', grep: null, around: null }));
+  // line-numbered (cat -n style: "<n>\t<line>") and contains the real view bytes
+  assert.match(out, /1\t<html>/);
+  assert.match(out, /3\t {2}<button id="send">Send<\/button>/);
+  assert.match(out, /5\t<\/html>/);
+  // space_get, by contrast, must NOT leak the view HTML (it stays manifest-only)
+  assert.doesNotMatch(text(await tools.space_get({ slug: 'getview' })), /<button id="send"/);
+});
+
+test('space_get_view with grep returns only the matching region + context, with line numbers', async () => {
+  const lines = Array.from({ length: 40 }, (_, i) => `  <div class="row-${i}">row ${i}</div>`);
+  lines[20] = '  <button id="target">Click me</button>';
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-getview-grep.html');
+  writeFileSync(draft, lines.join('\n'), 'utf-8');
+  await tools.space_save({ slug: 'getviewgrep', title: 'GetViewGrep', view_path: draft });
+
+  const out = text(await tools.space_get_view({ slug: 'getviewgrep', grep: 'target', around: 2 }));
+  assert.match(out, /1 line matching "target"/);
+  assert.match(out, /21\t {2}<button id="target">Click me<\/button>/); // the hit (1-indexed)
+  assert.match(out, /19\t/); // ±2 context above
+  assert.match(out, /23\t/); // ±2 context below
+  assert.doesNotMatch(out, /1\t {2}<div class="row-0"/); // far-away lines excluded
+});
+
+test('space_get_view grep with no match falls through to the full view (never a dead end)', async () => {
+  const out = text(await tools.space_get_view({ slug: 'getview', grep: 'NONEXISTENT_TEXT', around: null }));
+  assert.match(out, /No view line matched "NONEXISTENT_TEXT"/);
+  assert.match(out, /1\t<html>/); // still gives the model the full view to work from
+});
+
+test('space_get_view caps a large view and tells the model to grep', async () => {
+  const big = Array.from({ length: 5000 }, (_, i) => `<div>filler line number ${i} with some padding text to add bytes</div>`).join('\n');
+  assert.ok(big.length > 60_000);
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-getview-big.html');
+  writeFileSync(draft, big, 'utf-8');
+  await tools.space_save({ slug: 'getviewbig', title: 'GetViewBig', view_path: draft });
+
+  const out = text(await tools.space_get_view({ slug: 'getviewbig', grep: null, around: null }));
+  assert.ok(out.length < big.length, 'a large view must be capped, not dumped whole');
+  assert.match(out, /view is large.*pass grep/i);
+});
+
+test('space_get_view errors cleanly for a missing workspace', async () => {
+  assert.match(text(await tools.space_get_view({ slug: 'no-such-space', grep: null, around: null })), /No workspace named/);
 });
 
 test('isSpacesEnabled defaults ON (beta) and honors the kill-switch', () => {

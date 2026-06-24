@@ -113,6 +113,82 @@ function countRows(val: unknown): number | null {
   return null;
 }
 
+/** Max chars of view HTML space_get_view returns in one call. Sized just under
+ *  read_file's 50000 ceiling so (a) the model has the SAME budget the shell
+ *  read_file gives it — no reason to defect to shell to read a view — and (b) our
+ *  own "view is large, grep" note survives textResult's clip (we pass maxChars
+ *  50000 below). Above this we tell the model to grep instead of dumping the file. */
+const VIEW_READ_CHAR_CAP = 48_000;
+/** textResult's per-call clip for space_get_view — matches read_file's max_chars
+ *  ceiling so a whole typical view reads in one call (the 12000 default would cut
+ *  most views and our grep note). */
+const VIEW_READ_RESULT_MAX_CHARS = 50_000;
+
+/**
+ * Render a view's HTML for space_get_view: cat -n style line numbers so the model
+ * can craft a VERBATIM space_edit_view find string. With `grep`, returns only the
+ * matching lines plus `around` context lines (overlapping windows merged); without
+ * it, the whole view capped at VIEW_READ_CHAR_CAP. A no-match grep falls through to
+ * the full view (never a dead end). The "<n>\t" prefix is NOT part of the file.
+ */
+function renderViewForRead(html: string, opts: { slug: string; grep?: string; around?: number }): string {
+  const lines = html.split('\n');
+  const total = lines.length;
+  const width = String(total).length;
+  const fmt = (i: number): string => `${String(i + 1).padStart(width)}\t${lines[i]}`;
+  const around = Number.isFinite(opts.around as number) ? Math.max(0, Math.min(40, opts.around as number)) : 6;
+
+  if (opts.grep) {
+    const needle = opts.grep.toLowerCase();
+    const hits: number[] = [];
+    for (let i = 0; i < total; i++) if (lines[i].toLowerCase().includes(needle)) hits.push(i);
+    if (hits.length > 0) {
+      // Merge overlapping/adjacent context windows into regions.
+      const ranges: Array<[number, number]> = [];
+      for (const h of hits) {
+        const lo = Math.max(0, h - around);
+        const hi = Math.min(total - 1, h + around);
+        const last = ranges[ranges.length - 1];
+        if (last && lo <= last[1] + 1) last[1] = Math.max(last[1], hi);
+        else ranges.push([lo, hi]);
+      }
+      const out: string[] = [
+        `View of "${opts.slug}" — ${hits.length} line${hits.length === 1 ? '' : 's'} matching "${opts.grep}" (±${around} context), of ${total} total. The "<n>\\t" prefix is the line number, NOT part of the view — copy a VERBATIM snippet (whitespace included) into space_edit_view.`,
+      ];
+      let budget = VIEW_READ_CHAR_CAP;
+      for (let r = 0; r < ranges.length; r++) {
+        if (r > 0) out.push('  ⋮');
+        const [lo, hi] = ranges[r];
+        for (let i = lo; i <= hi; i++) {
+          const row = fmt(i);
+          budget -= row.length + 1;
+          if (budget < 0) { out.push('  … (more matches — narrow your grep)'); return out.join('\n'); }
+          out.push(row);
+        }
+      }
+      return out.join('\n');
+    }
+  }
+
+  // No grep, or grep matched nothing → the full view (capped).
+  const out: string[] = [
+    opts.grep
+      ? `No view line matched "${opts.grep}". Full view of "${opts.slug}" (${total} lines) follows — the "<n>\\t" prefix is the line number, NOT part of the view; copy a VERBATIM snippet into space_edit_view.`
+      : `View of "${opts.slug}" (${total} lines). The "<n>\\t" prefix is the line number, NOT part of the view — copy a VERBATIM snippet (whitespace included) into space_edit_view.`,
+  ];
+  let budget = VIEW_READ_CHAR_CAP;
+  for (let i = 0; i < total; i++) {
+    const row = fmt(i);
+    budget -= row.length + 1;
+    if (budget < 0) {
+      out.push(`  … view is large (${total} lines) — pass grep:'<nearby text>' to target the region you want to edit.`);
+      break;
+    }
+    out.push(row);
+  }
+  return out.join('\n');
+}
+
 export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_save',
@@ -265,7 +341,7 @@ export function registerSpaceTools(server: McpServer): void {
     'space_edit_view',
     [
       'Make a TARGETED edit to an existing Workspace view — FAST, for small tweaks (a button, label, color, a bit of logic). Use this instead of rewriting the whole file with write_file + space_save: it sends only the changed snippet, so it is far cheaper and quicker.',
-      'Provide one or more {find, replace} pairs; each `find` must appear VERBATIM in the current view (call space_get first if unsure of the exact text). It snapshots the prior version (revertible) and bumps the version — the open Workspace auto-refreshes, so you do NOT need to call space_save after.',
+      'Provide one or more {find, replace} pairs; each `find` must appear VERBATIM in the current view — call space_get_view first (optionally grep for the spot) to read the exact current text. It snapshots the prior version (revertible) and bumps the version — the open Workspace auto-refreshes, so you do NOT need to call space_save after.',
       'Use write_file + space_save instead only for a large rewrite, or when changing data sources / actions.',
     ].join('\n'),
     {
@@ -290,7 +366,7 @@ export function registerSpaceTools(server: McpServer): void {
         applied += 1;
       });
       if (applied === 0) {
-        return textResult(`No edits applied — none of the find strings were in the view. Call space_get('${slug}') to read the current view, then match a find string EXACTLY (whitespace included).`);
+        return textResult(`No edits applied — none of the find strings were in the view. Call space_get_view('${slug}', '<nearby text>') to read the exact current view lines, then match a find string EXACTLY (whitespace included).`);
       }
       spaceStore.recordRevision(slug); // snapshot the prior view + bump version (revertible)
       writeFileSync(viewFile, html, 'utf-8');
@@ -368,6 +444,34 @@ export function registerSpaceTools(server: McpServer): void {
         audit.length > 0 ? `Recent activity: ${audit.length} data-plane call(s).` : '',
       ].filter(Boolean);
       return textResult(parts.join('\n'));
+    },
+  );
+
+  server.tool(
+    'space_get_view',
+    [
+      'Read the CURRENT view HTML of a Workspace, line-numbered — this is the EXACT text you need to craft a space_edit_view find string. Use this BEFORE editing a view. (space_get returns the manifest + dataset, NOT the view HTML, so it can not give you an editable snippet.)',
+      'Pass `grep` to get only the matching region(s) plus a few lines of context — far cheaper than the whole file, and the right move on a large view. Omit `grep` to read the whole view (large views are capped — above the cap it tells you to grep).',
+      'The "<n>\\t" prefix on each line is the LINE NUMBER, not part of the view — strip it, then copy a VERBATIM snippet (whitespace and all) into space_edit_view({find, replace}). No need to shell out to read_file/grep — this is the sanctioned way to read a view.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      grep: z.string().max(200).nullable().describe('Optional case-insensitive substring to locate (e.g. a label or class near your edit). Returns only matching regions + context lines. Omit to read the whole view.'),
+      around: z.number().int().min(0).max(40).nullable().describe('Context lines to show around each grep match (default 6).'),
+    },
+    async ({ slug, grep, around }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const viewFile = resolveInSpace(slug, rec.viewEntry);
+      if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with a view_path.`);
+      let html: string;
+      try { html = readFileSync(viewFile, 'utf-8'); }
+      catch (err) { return textResult(`Error reading the "${slug}" view: ${(err as Error).message}`); }
+      return textResult(
+        renderViewForRead(html, { slug, grep: grep?.trim() || undefined, around: around ?? undefined }),
+        { maxChars: VIEW_READ_RESULT_MAX_CHARS },
+      );
     },
   );
 }

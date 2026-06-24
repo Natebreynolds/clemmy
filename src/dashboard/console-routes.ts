@@ -166,7 +166,7 @@ import { getBackgroundTaskStatus } from '../execution/background-task-status.js'
 import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
-import { spaceStore } from '../spaces/store.js';
+import { buildWorkspaceContextPrimer } from '../spaces/workspace-context.js';
 import {
   appendEvent as appendHarnessEvent,
   createSession as createHarnessSession,
@@ -7121,20 +7121,13 @@ export function registerConsoleRoutes(
     // app? send me the file path" instead of knowing it's this Workspace).
     if (harnessSession && /^space-[a-z0-9][a-z0-9-]*$/.test(sessionId)) {
       try {
+        // Single source of truth for BOTH lanes — buildWorkspaceContextPrimer is
+        // the same primer the Claude SDK lane appends to its system prompt. (Was a
+        // hardcoded copy here, which drifted: a primer rewrite missed the Codex
+        // lane until this was collapsed.)
         const slug = sessionId.slice('space-'.length);
-        const rec = spaceStore.get(slug);
-        if (rec) {
-          const ds = rec.dataSources.map((d) => d.id).join(', ') || 'none';
-          const acts = rec.actions.map((a) => a.label ?? a.id).join(', ') || 'none';
-          harnessSession.setContextPrimer('[workspace-context]', [
-            `[workspace-context] You are working inside the user's "${rec.title}" Workspace (slug: ${slug}) — a live interactive surface you built and maintain. This is a CONVERSATION about the user's Workspace, not a background job: talk like a colleague. NEVER show file paths, "/tmp/..." files, "Evidence produced", or "verified artifact" — those are internal plumbing, not for the user.`,
-            `It has: a view at ~/.clementine-next/spaces/${slug}/view/index.html (served at /console/spaces/${slug}/view); data source(s): ${ds}; action(s): ${acts}.`,
-            `CHANGE THE DATA (better/different rows, a tighter filter, fewer/more fields, one row per entity): edit the data runner with write_file, then call space_refresh('${slug}') to re-pull and persist. NEVER write the dataset to /tmp — the runner + space_refresh IS how data updates land. The open Workspace auto-refreshes, so never tell the user to refresh.`,
-            `CHANGE THE VIEW (layout, copy, a button, a color): ALWAYS use space_edit_view('${slug}', [{find, replace}]) — space_get('${slug}') first for the exact current text, pass ONLY the snippet that changes. Reserve write_file + space_save for a brand-new view, a from-scratch rewrite, or changing which data sources/actions exist.`,
-            `REPLY STYLE: lead with what the user asked for and what you did about it, in plain business language — no field names, slugs, file paths, or step-by-step narration. ALWAYS state the new outcome clearly, e.g. "I tightened the pull to one primary contact + best phone per firm — now 14 rows, down from 200." A sentence or two, then ask any clarifier. Never reply just "done", and never reply with an evidence/blocker dump.`,
-            `IF A SPACE TOOL YOU NEED IS UNAVAILABLE this turn (e.g. space_save / space_refresh): say in ONE plain sentence which capability is missing and stop — do NOT work around it by writing JSON to /tmp or pasting file paths and blockers.`,
-          ].join('\n\n'));
-        }
+        const primer = buildWorkspaceContextPrimer(slug);
+        if (primer) harnessSession.setContextPrimer('[workspace-context]', primer);
       } catch { /* best-effort primer */ }
     }
     const isPausedOnApproval = !!harnessSession && !!harnessSession.loadInterruptState();

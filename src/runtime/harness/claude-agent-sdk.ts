@@ -100,7 +100,11 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'workspace_info',
   // Read a Workspace (interactive surface) + list them — a dock chat runs under
   // session "space-<slug>" and must be able to read the workspace it edits.
+  // space_get_view returns the actual line-numbered view HTML (space_get does not),
+  // so the model can craft a verbatim space_edit_view find string instead of
+  // shelling out to read_file/grep the view.
   'space_get',
+  'space_get_view',
   'space_list',
   'list_files',
   'read_file',
