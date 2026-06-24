@@ -38,6 +38,15 @@ export interface GoalCriterionVerdict {
   detail?: string;
 }
 
+/** A concrete corrective instruction for ONE failed criterion — the structured
+ *  sibling of the prose `advice`, so the next attempt (or the human) gets an
+ *  actionable "fix" rather than only a restatement of the miss. */
+export interface GoalFailedDirective {
+  criterion: string;
+  method: 'deterministic' | 'judge' | 'skipped';
+  fix: string;
+}
+
 export interface GoalValidationResult {
   /** True only when EVERY criterion passed. */
   pass: boolean;
@@ -47,6 +56,50 @@ export interface GoalValidationResult {
   /** True when the judge errored and the fuzzy criteria resolved to
    *  not-passed by fail-open policy (criteria may actually be met). */
   judgeFailedOpen?: boolean;
+  /** VERIFICATION scorecard (always populated by validateGoal): the framework's
+   *  "objective goals = numeric" signal for run reports + dashboards.
+   *  successRatePercent is 0–100 rounded; 100 ⇔ pass. Optional on the type so
+   *  existing literals/test fakes stay valid (forward-only). */
+  successRatePercent?: number;
+  criteriaMet?: number;
+  criteriaTotal?: number;
+  /** Per-failed-criterion corrective directives, injected into the next
+   *  iteration's context so deterministic misses are auto-correctable. */
+  failedDirectives?: GoalFailedDirective[];
+}
+
+/** Turn one failed criterion into a concrete corrective directive. Deterministic
+ *  artifact misses become "create the missing file"; judge-unavailable becomes
+ *  "re-validate" (not a confirmed miss); fuzzy misses restate with the judge note. */
+function directiveForFailure(c: GoalCriterionVerdict): GoalFailedDirective {
+  let fix: string;
+  if (c.method === 'deterministic') {
+    const localPath = extractLocalPathFromCriterion(c.criterion);
+    fix = localPath
+      ? `Create the missing artifact at ${localPath}, then re-validate.`
+      : `Satisfy the criterion: ${c.criterion}.`;
+  } else if (c.method === 'skipped') {
+    fix = `Re-validate "${c.criterion}" — the completion judge was unavailable, so this is unverified, not a confirmed miss.`;
+  } else {
+    fix = `Satisfy: ${c.criterion}.${c.detail ? ` Judge note: ${c.detail}` : ''}`;
+  }
+  return { criterion: c.criterion, method: c.method, fix };
+}
+
+/** Compute the numeric scorecard + structured directives from per-criterion
+ *  verdicts. Pure; folded into every validateGoal return so callers always have
+ *  a percentage and an actionable fix-list. */
+export function scoreGoalVerdicts(perCriterion: GoalCriterionVerdict[]): {
+  successRatePercent: number;
+  criteriaMet: number;
+  criteriaTotal: number;
+  failedDirectives: GoalFailedDirective[];
+} {
+  const criteriaTotal = perCriterion.length;
+  const criteriaMet = perCriterion.filter((c) => c.pass).length;
+  const successRatePercent = criteriaTotal === 0 ? 0 : Math.round((criteriaMet / criteriaTotal) * 100);
+  const failedDirectives = perCriterion.filter((c) => !c.pass).map(directiveForFailure);
+  return { successRatePercent, criteriaMet, criteriaTotal, failedDirectives };
 }
 
 export interface ValidateGoalInput {
@@ -122,18 +175,22 @@ export async function validateGoal(
   if (criteria.length === 0) {
     try {
       const verdict = await judge(input.objective, input.evidenceText);
+      const perCriterion: GoalCriterionVerdict[] = [{ criterion: input.objective, pass: verdict.done, method: 'judge', detail: verdict.reason }];
       return {
         pass: verdict.done,
-        perCriterion: [{ criterion: input.objective, pass: verdict.done, method: 'judge', detail: verdict.reason }],
+        perCriterion,
         advice: verdict.done ? undefined : verdict.reason,
+        ...scoreGoalVerdicts(perCriterion),
       };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
+      const perCriterion: GoalCriterionVerdict[] = [{ criterion: input.objective, pass: false, method: 'skipped', detail: `judge unavailable: ${detail}` }];
       return {
         pass: false,
         judgeFailedOpen: true,
-        perCriterion: [{ criterion: input.objective, pass: false, method: 'skipped', detail: `judge unavailable: ${detail}` }],
+        perCriterion,
         advice: 'completion judge unavailable — retry validation or escalate',
+        ...scoreGoalVerdicts(perCriterion),
       };
     }
   }
@@ -189,5 +246,5 @@ export async function validateGoal(
       ? 'completion judge unavailable — retry validation or escalate'
       : `unmet: ${failures.map((f) => `${f.criterion}${f.detail ? ` (${f.detail})` : ''}`).slice(0, 3).join('; ')}`;
 
-  return { pass, perCriterion, advice, ...(judgeFailedOpen ? { judgeFailedOpen } : {}) };
+  return { pass, perCriterion, advice, ...(judgeFailedOpen ? { judgeFailedOpen } : {}), ...scoreGoalVerdicts(perCriterion) };
 }

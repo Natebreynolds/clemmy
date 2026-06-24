@@ -147,11 +147,33 @@ test('applyGoalFeedbackToPrompt: unchanged without feedback, appended with', () 
   assert.match(out, /UNMET: at least 10 rows/);
 });
 
-test('renderGoalFeedback: unmet criteria + guidance, passing criteria omitted', () => {
+test('renderGoalFeedback: unmet criteria + guidance, passing criteria omitted (fallback when no directives)', () => {
   const fb = renderGoalFeedback(failVerdict);
   assert.match(fb, /UNMET: at least 10 rows \(only 2 rows found\)/);
   assert.match(fb, /Guidance: unmet/);
   assert.ok(!fb.includes('report saved'));
+});
+
+test('renderGoalFeedback: leads with the numeric scorecard and concrete FIX directives (S3)', () => {
+  const scoredVerdict: GoalValidationResult = {
+    pass: false,
+    perCriterion: [
+      { criterion: 'report saved to /out/report.md', pass: false, method: 'deterministic' },
+      { criterion: 'has at least 10 rows', pass: true, method: 'judge' },
+    ],
+    advice: 'unmet: report saved',
+    successRatePercent: 50,
+    criteriaMet: 1,
+    criteriaTotal: 2,
+    failedDirectives: [
+      { criterion: 'report saved to /out/report.md', method: 'deterministic', fix: 'Create the missing artifact at /out/report.md, then re-validate.' },
+    ],
+  };
+  const fb = renderGoalFeedback(scoredVerdict);
+  assert.match(fb, /Goal score: 50% \(1\/2 criteria met\)/);
+  assert.match(fb, /- FIX: Create the missing artifact at \/out\/report\.md/);
+  // structured FIX replaces the bare UNMET restatement when directives are present
+  assert.ok(!fb.includes('UNMET:'));
 });
 
 test('workflow-store: goal + allow_sends round-trip SKILL.md; maxAttempts clamped', () => {

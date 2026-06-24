@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { validateGoal, extractLocalPathFromCriterion, toGoalEvidence } = await import('./goal-validate.js');
+const { validateGoal, extractLocalPathFromCriterion, toGoalEvidence, scoreGoalVerdicts } = await import('./goal-validate.js');
 
 function passingJudge(calls: { objective: string; evidence: string }[] = []) {
   return async (objective: string, evidence: string) => {
@@ -157,6 +157,64 @@ test('criteria-less goal falls back to judging the objective itself (and fails o
   );
   assert.equal(dead.pass, false);
   assert.equal(dead.judgeFailedOpen, true);
+});
+
+// ─── scorecard + structured directives (S3) ──────────────────────────────────
+
+test('validateGoal attaches a numeric scorecard: successRatePercent + criteriaMet/Total', async () => {
+  const result = await validateGoal(
+    {
+      objective: 'Outreach prep.',
+      successCriteria: ['The brief exists at /tmp/clemmy-gv/present.md', 'The plan exists at /tmp/clemmy-gv/absent.md'],
+      evidenceText: 'one of two artifacts written',
+    },
+    { judge: passingJudge(), fileExists: (p) => p.endsWith('present.md') },
+  );
+  assert.equal(result.pass, false);
+  assert.equal(result.criteriaTotal, 2);
+  assert.equal(result.criteriaMet, 1);
+  assert.equal(result.successRatePercent, 50);
+});
+
+test('successRatePercent is 100 on a full pass', async () => {
+  const result = await validateGoal(
+    { objective: 'Done.', successCriteria: ['The brief exists at /tmp/clemmy-gv/present.md'], evidenceText: 'x' },
+    { judge: passingJudge(), fileExists: () => true },
+  );
+  assert.equal(result.pass, true);
+  assert.equal(result.successRatePercent, 100);
+});
+
+test('failedDirectives turn a deterministic file-miss into a concrete "create the missing artifact" fix', async () => {
+  const result = await validateGoal(
+    { objective: 'Done.', successCriteria: ['The brief exists at /tmp/clemmy-gv/absent.md'], evidenceText: 'x' },
+    { judge: passingJudge(), fileExists: () => false },
+  );
+  assert.equal(result.failedDirectives?.length, 1);
+  const d = result.failedDirectives![0];
+  assert.equal(d.method, 'deterministic');
+  assert.match(d.fix, /Create the missing artifact at \/tmp\/clemmy-gv\/absent\.md/);
+});
+
+test('a judge-unavailable failure yields a "re-validate, not a confirmed miss" directive', async () => {
+  const result = await validateGoal(
+    { objective: 'Outreach.', successCriteria: ['Drafts exist for the top 3 accounts'], evidenceText: 'x' },
+    { judge: throwingJudge() },
+  );
+  assert.equal(result.failedDirectives?.[0].method, 'skipped');
+  assert.match(result.failedDirectives![0].fix, /Re-validate/);
+});
+
+test('scoreGoalVerdicts is pure and rounds the percentage', () => {
+  const s = scoreGoalVerdicts([
+    { criterion: 'a', pass: true, method: 'judge' },
+    { criterion: 'b', pass: false, method: 'judge' },
+    { criterion: 'c', pass: false, method: 'judge' },
+  ]);
+  assert.equal(s.criteriaMet, 1);
+  assert.equal(s.criteriaTotal, 3);
+  assert.equal(s.successRatePercent, 33); // round(33.33)
+  assert.equal(s.failedDirectives.length, 2);
 });
 
 // ─── evidence mapping ────────────────────────────────────────────────────────

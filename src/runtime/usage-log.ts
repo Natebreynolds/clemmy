@@ -321,6 +321,20 @@ export function sumUsageTokensForSource(source: string, date: Date = new Date())
 }
 
 /**
+ * Total tokens recorded across an entire workflow run (all its steps) on a date,
+ * using the derived `runId` join key. Leverages the S2 join so the run-level
+ * STATE record can report "this whole goal attempt cost N tokens" without
+ * re-correlating sessions. Best-effort; never throws.
+ */
+export function sumUsageTokensForRun(runId: string, date: Date = new Date()): number {
+  let total = 0;
+  for (const ev of readUsageEventsForDate(date)) {
+    if (ev.runId === runId) total += ev.totalTokens;
+  }
+  return total;
+}
+
+/**
  * Convenience — list all available usage log dates (newest first).
  * Used by the dashboard's date-picker dropdown if we add one later.
  */

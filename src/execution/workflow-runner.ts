@@ -39,7 +39,7 @@ import {
   type WorkflowEvent,
   type AttemptRecord,
 } from './workflow-events.js';
-import { sumUsageTokensForSource } from '../runtime/usage-log.js';
+import { sumUsageTokensForSource, sumUsageTokensForRun } from '../runtime/usage-log.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import {
   runConversation,
@@ -3425,11 +3425,25 @@ function buildGoalEvidenceText(finalOutput: string, stepOutputs: Record<string, 
   ].join('\n');
 }
 
-/** Render the unmet criteria as feedback for the next attempt / the human. */
+/** Render the unmet criteria as feedback for the next attempt / the human.
+ *  Leads with the numeric scorecard and concrete per-criterion FIX directives
+ *  (so a deterministic file-miss becomes "create X" the next attempt can act on),
+ *  falling back to the prose UNMET list when a verdict has no structured
+ *  directives (e.g. a hand-built test fake). */
 export function renderGoalFeedback(verdict: GoalValidationResult): string {
   const failed = verdict.perCriterion.filter((c) => !c.pass);
+  const scoreLine =
+    typeof verdict.successRatePercent === 'number' &&
+    typeof verdict.criteriaMet === 'number' &&
+    typeof verdict.criteriaTotal === 'number'
+      ? `Goal score: ${verdict.successRatePercent}% (${verdict.criteriaMet}/${verdict.criteriaTotal} criteria met)`
+      : '';
+  const fixes = (verdict.failedDirectives ?? []).map((d) => `- FIX: ${d.fix}`);
   return [
-    ...failed.map((c) => `- UNMET: ${c.criterion}${c.detail ? ` (${c.detail})` : ''}`),
+    scoreLine,
+    ...(fixes.length > 0
+      ? fixes
+      : failed.map((c) => `- UNMET: ${c.criterion}${c.detail ? ` (${c.detail})` : ''}`)),
     verdict.advice ? `Guidance: ${verdict.advice}` : '',
   ].filter(Boolean).join('\n');
 }
@@ -3805,6 +3819,27 @@ async function processOneRunFile(
             recordGoalValidation(contract.id, toGoalEvidence(goalVerdict, (run.goalAttempt ?? 0) + 1, new Date().toISOString()));
           }
         } catch { /* contract bookkeeping is best-effort */ }
+        // STATE pillar (run-scope sibling of step loopUntil): when a pinned-goal
+        // run misses, record a comparable run-level attempt — what was unmet, the
+        // numeric score, and what the whole attempt cost (via the S2 runId join) —
+        // so re-pursuits are reviewable as a series, not just "it re-ran". Gated +
+        // best-effort: a bookkeeping error never perturbs the run.
+        if (!goalVerdict.pass && attemptRecordsEnabled()) {
+          try {
+            const attemptIndex = (run.goalAttempt ?? 0) + 1;
+            const unmet = goalVerdict.perCriterion.filter((c) => !c.pass).map((c) => c.criterion);
+            appendWorkflowEvent(workflow.name, run.id, {
+              kind: 'attempt_record',
+              attempt: {
+                attemptIndex,
+                maxAttempts: runGoal.maxAttempts,
+                failedProblems: unmet.slice(0, 6),
+                changeSummary: `run attempt ${attemptIndex}: ${goalVerdict.successRatePercent ?? 0}% (${goalVerdict.criteriaMet ?? 0}/${goalVerdict.criteriaTotal ?? unmet.length} criteria met)`,
+                metrics: { tokens: sumUsageTokensForRun(run.id) },
+              },
+            });
+          } catch { /* attempt record is best-effort */ }
+        }
         goalDecision = decideGoalRunOutcome({
           verdict: goalVerdict,
           maxAttempts: runGoal.maxAttempts,
