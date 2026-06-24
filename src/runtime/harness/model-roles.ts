@@ -36,6 +36,7 @@ import {
 import { validateRoleModelBinding } from './model-role-options.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
+import { chooseBoundaryJudgeFamily, judgeCrossFamilyEnabled, debateBrainsAvailable } from './judge-family.js';
 
 /** Fixed internal role seam. brain = the active orchestrator model; worker =
  *  delegated run_worker/grunt labor; judge = the fusion verify checker / debate
@@ -108,6 +109,27 @@ export function readDurableBindings(): RoleBinding[] {
  * unbound role is byte-identical to the legacy getters. Never names a provider
  * the user isn't on (a Codex-only user resolves all-Codex).
  */
+/**
+ * Brain-aware judge DEFAULT (feedback [[feedback_judge_different_family]]: the
+ * judge should be a DIFFERENT LLM family than the brain whenever possible — never
+ * self-grade). Returns a cheap judge id from a family DIFFERENT than the brain, or
+ * '' to fall through to the legacy same-family default. PURE — availability, the
+ * kill-switch, and the explicit-pin are injected — so it's deterministically
+ * testable. Never overrides an explicit CLEMMY_DEBATE_JUDGE pin, and fails open
+ * (→ '') for single-family users, so it's a no-regression change.
+ */
+export function judgeDefaultModel(
+  brainProvider: ModelProviderClass,
+  avail: { claude: boolean; codex: boolean },
+  opts: { crossFamilyEnabled: boolean; explicitJudgeChoice: string },
+): string {
+  if (!opts.crossFamilyEnabled) return '';
+  const explicit = opts.explicitJudgeChoice.trim().toLowerCase();
+  if (explicit === 'claude' || explicit === 'codex') return ''; // honor the user's explicit pin (legacy path)
+  const cross = chooseBoundaryJudgeFamily(brainProvider, avail.claude, avail.codex);
+  return cross?.modelId ?? '';
+}
+
 export function defaultForRole(role: ModelRole): string {
   const byo = getByoBackendConfig();
   const mode = getModelRoutingMode();
@@ -134,10 +156,22 @@ export function defaultForRole(role: ModelRole): string {
       if (getActiveAuthMode() === 'claude_oauth') return getClaudeBrainModel();
       return MODELS.primary;
     }
-    case 'judge':
-      // judge=claude ⇒ the dedicated checker model (Sonnet); judge=codex ⇒ the
-      // Codex primary. Mirrors resolveDebateBrains.
+    case 'judge': {
+      // Cross-family by default (feedback: the judge should be a DIFFERENT LLM
+      // family than the brain whenever possible — never self-grade). When the
+      // cross-family flag is on, the user hasn't explicitly pinned a judge family,
+      // and a different family is logged in, default the judge to a cheap model
+      // from that other family. Otherwise fall through to the legacy choice:
+      // judge=claude ⇒ the checker model (Sonnet); judge=codex ⇒ the Codex primary.
+      const brainProvider: ModelProviderClass =
+        getActiveAuthMode() === 'claude_oauth' ? 'claude' : resolveProvider(MODELS.primary);
+      const crossFamily = judgeDefaultModel(brainProvider, debateBrainsAvailable(), {
+        crossFamilyEnabled: judgeCrossFamilyEnabled(),
+        explicitJudgeChoice: getRuntimeEnv('CLEMMY_DEBATE_JUDGE', '') || '',
+      });
+      if (crossFamily) return crossFamily;
       return judgeChoice() === 'claude' ? getDebateCheckerModel() : MODELS.primary;
+    }
     case 'worker':
     default:
       // Default workers follow the active brain unless the legacy worker-offload

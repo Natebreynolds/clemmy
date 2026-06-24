@@ -44,8 +44,19 @@ import { resolveByoProviderForModel } from './byo-providers.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
-import { getStoredCodexOAuthTokens } from '../auth-store.js';
-import { getStoredClaudeTokens } from '../claude-oauth.js';
+import {
+  claudeAvailable,
+  codexAvailable,
+  debateBrainsAvailable,
+  judgeCrossFamilyEnabled,
+  boundaryClaudeJudgeModel,
+  boundaryCodexJudgeModel,
+  chooseBoundaryJudgeFamily,
+} from './judge-family.js';
+// Re-exported from the judge-family leaf (moved out of this file) so existing
+// importers of debate-model keep working: console-routes (debateBrainsAvailable),
+// boundary-judge.test (chooseBoundaryJudgeFamily), and any judgeCrossFamilyEnabled use.
+export { debateBrainsAvailable, judgeCrossFamilyEnabled, chooseBoundaryJudgeFamily };
 import { harnessRunContextStorage } from './brackets.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -735,38 +746,9 @@ export class DebateModelProvider implements ModelProvider {
   }
 }
 
-const CLAUDE_OAT_PREFIX = 'sk-ant-oat01';
-/** Claude is "available" for debate if a SUBSCRIPTION (oat01) token is stored
- *  that is currently valid OR refreshable. The access token has an ~8h TTL and
- *  the real Claude request path AUTO-REFRESHES a vault token, so we must NOT
- *  disable debate just because the access token momentarily needs a refresh —
- *  doing so was a false-negative that silently dropped debate to single-brain
- *  (and self-perpetuated: no Claude call → no refresh → stays off). If a refresh
- *  ultimately fails, draftBoth fails open to the other brain. The oat01-only
- *  check preserves the billing guard (an api03 API key is never "available"). */
-function claudeAvailable(): boolean {
-  try {
-    const t = getStoredClaudeTokens();
-    if (!t?.accessToken?.startsWith(CLAUDE_OAT_PREFIX)) return false;
-    if (t.refreshToken) return true; // refreshable → the request path will renew it
-    return !t.expiresAt || t.expiresAt > Date.now() + 60_000; // non-refreshable → must be unexpired
-  } catch {
-    return false;
-  }
-}
-
-function codexAvailable(): boolean {
-  try {
-    return Boolean(getStoredCodexOAuthTokens()?.accessToken);
-  } catch {
-    return false;
-  }
-}
-
-/** Diagnostic: which flagships are logged in. Debate needs BOTH. */
-export function debateBrainsAvailable(): { claude: boolean; codex: boolean } {
-  return { claude: claudeAvailable(), codex: codexAvailable() };
-}
+// claudeAvailable / codexAvailable / debateBrainsAvailable moved to the
+// judge-family leaf (imported + re-exported above) so model-roles can share them
+// without importing this heavy module.
 
 /**
  * Whether the 'verify' fusion strategy can actually run right now: the judge role
@@ -852,24 +834,8 @@ function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, have
 // releases (Lane A Phase 3), the route becomes unconditional and the flag drops.
 // ─────────────────────────────────────────────────────────────────
 
-/** off ⇒ boundary judges keep MODELS.fast exactly as before (byte-identical). */
-export function judgeCrossFamilyEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_JUDGE_CROSS_FAMILY', 'on') || 'on').trim().toLowerCase() !== 'off';
-}
-
-/** The cheap Claude id for a cross-family boundary judge — the lightest pass,
- *  since these run on most action turns. Tunable; defaults to Haiku. */
-function boundaryClaudeJudgeModel(): string {
-  return (getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_CLAUDE_MODEL', '') || '').trim() || 'claude-haiku-4-5';
-}
-
-/** The cheap Codex (gpt) id for a cross-family boundary judge. A code-level
- *  family DEFAULT, NOT MODELS.fast — the "fast" tier can be env-overridden to a
- *  BYO/GLM model (e.g. glm-5.2), which would mis-route a "codex" judge onto the
- *  wrong provider. Tunable; defaults to the canonical cheap gpt id. */
-function boundaryCodexJudgeModel(): string {
-  return (getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL', '') || '').trim() || 'gpt-5.4-mini';
-}
+// judgeCrossFamilyEnabled / boundaryClaudeJudgeModel / boundaryCodexJudgeModel
+// moved to the judge-family leaf (imported above).
 
 export interface BoundaryJudgeRouting {
   /** A Model forced onto a family DISTINCT from the brain when one is available;
@@ -884,18 +850,7 @@ export interface BoundaryJudgeRouting {
   selfJudge: boolean;
 }
 
-/** PURE family decision: the cheapest model+provider from a family DIFFERENT than
- *  the brain, or null when none is available (caller fails open same-family).
- *  Separated from the provider-heavy build so it is deterministically testable. */
-export function chooseBoundaryJudgeFamily(
-  brainFamily: ModelProviderClass,
-  haveClaude: boolean,
-  haveCodex: boolean,
-): { provider: ModelProviderClass; modelId: string } | null {
-  if (brainFamily !== 'claude' && haveClaude) return { provider: 'claude', modelId: boundaryClaudeJudgeModel() };
-  if (brainFamily !== 'codex' && haveCodex) return { provider: 'codex', modelId: boundaryCodexJudgeModel() };
-  return null;
-}
+// chooseBoundaryJudgeFamily moved to the judge-family leaf (imported + re-exported above).
 
 /** Resolve a cheap boundary judge whose family differs from the active brain.
  *  Returns model:null (and selfJudge:true) when no different family is available

@@ -27,7 +27,7 @@ const {
   judgeChoice,
   MODELS,
 } = await import('../../config.js');
-const { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled } = await import('./model-roles.js');
+const { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled, judgeDefaultModel } = await import('./model-roles.js');
 const { resolveProvider } = await import('./model-wire-registry.js');
 
 /** Set env keys for a permutation, run fn, restore. */
@@ -83,6 +83,34 @@ test('worker default follows the active brain unless worker BYO offload is enabl
     assert.equal(resolveRoleModel('worker').modelId, 'deepseek-chat');
     assert.equal(resolveRoleModel('worker').provider, 'byo');
   });
+});
+
+// The judge should be a DIFFERENT LLM family than the brain when possible
+// (feedback_judge_different_family). judgeDefaultModel is the PURE decision.
+test('judgeDefaultModel: a Claude brain defaults to a cheap CODEX judge when Codex is logged in', () => {
+  const m = judgeDefaultModel('claude', { claude: true, codex: true }, { crossFamilyEnabled: true, explicitJudgeChoice: '' });
+  assert.equal(m, 'gpt-5.4-mini', 'cross-family cheap judge, not Claude-on-Claude');
+});
+
+test('judgeDefaultModel: a Codex brain defaults to a cheap CLAUDE judge when Claude is logged in', () => {
+  const m = judgeDefaultModel('codex', { claude: true, codex: true }, { crossFamilyEnabled: true, explicitJudgeChoice: '' });
+  assert.equal(m, 'claude-haiku-4-5');
+});
+
+test('judgeDefaultModel: FAILS OPEN to legacy ("") for a single-family user (no regression)', () => {
+  // Claude brain, only Claude logged in → no different family → fall through.
+  assert.equal(judgeDefaultModel('claude', { claude: true, codex: false }, { crossFamilyEnabled: true, explicitJudgeChoice: '' }), '');
+  // Codex brain, only Codex logged in → fall through.
+  assert.equal(judgeDefaultModel('codex', { claude: false, codex: true }, { crossFamilyEnabled: true, explicitJudgeChoice: '' }), '');
+});
+
+test('judgeDefaultModel: an EXPLICIT CLEMMY_DEBATE_JUDGE pin is honored (returns "" → legacy path)', () => {
+  assert.equal(judgeDefaultModel('claude', { claude: true, codex: true }, { crossFamilyEnabled: true, explicitJudgeChoice: 'codex' }), '');
+  assert.equal(judgeDefaultModel('claude', { claude: true, codex: true }, { crossFamilyEnabled: true, explicitJudgeChoice: 'claude' }), '');
+});
+
+test('judgeDefaultModel: kill-switch off → legacy ("") byte-identical', () => {
+  assert.equal(judgeDefaultModel('claude', { claude: true, codex: true }, { crossFamilyEnabled: false, explicitJudgeChoice: '' }), '');
 });
 
 test('GOLDEN: judge resolves to the checker model (claude) or codex primary', () => {
