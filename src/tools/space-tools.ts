@@ -590,6 +590,7 @@ export function registerSpaceTools(server: McpServer): void {
       const rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}".`);
       const sid = source_id.trim();
+      if (sid === '_meta') return textResult('Error: "_meta" is a reserved key (it tracks per-source provenance). Use the data source id your view reads, e.g. data["deals"].');
       let parsed: unknown;
       try { parsed = JSON.parse(data_json); }
       catch (err) { return textResult(`Error: data_json is not valid JSON: ${(err as Error).message}`); }

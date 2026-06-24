@@ -73,8 +73,8 @@ export async function reengageSpace(slug: string, input: ReengageInput): Promise
         detail: [
           message ? `User: ${message}` : `Trigger: ${trigger}`,
           guidance ? `What you set up to do here: ${guidance}` : '',
-          `Inspect the current state with space_get('${slug}').`,
-          `If the user wants to change the DATA (better/different rows, a tighter filter, fewer/more fields, one row per entity), edit the data runner then call space_refresh('${slug}') and report the new row count — do NOT say it's done while the surface still shows the old data. For layout/copy tweaks use space_edit_view.`,
+          `Inspect the current state with space_get('${slug}') (manifest + data + notes); to read the view HTML before editing it, use space_get_view('${slug}').`,
+          `If the user wants to change the DATA (better/different rows, a tighter filter, fewer/more fields, one row per entity), edit the data runner with write_file, call space_try_runner('${slug}', '<runner>') to SEE the JSON (nothing persisted), then space_refresh('${slug}') to persist — report the new row count, and do NOT say it's done while the surface still shows the old data. For layout/copy tweaks read with space_get_view then space_edit_view. Never read the view or test a runner from the shell.`,
         ].filter(Boolean).join('\n\n'),
       },
       {

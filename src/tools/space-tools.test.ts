@@ -270,6 +270,15 @@ test('space_set_data rejects invalid JSON (no write)', async () => {
   assert.match(res, /not valid JSON/);
 });
 
+test('space_set_data refuses the reserved "_meta" source id (would clobber provenance)', async () => {
+  const dataMod = await import('../spaces/data-store.js');
+  const before = JSON.stringify(dataMod.readData('setdata'));
+  const res = text(await tools.space_set_data({ slug: 'setdata', source_id: '_meta', data_json: '[{"x":1}]' }));
+  assert.match(res, /reserved key/);
+  // the existing dataset + its _meta map are untouched
+  assert.equal(JSON.stringify(dataMod.readData('setdata')), before);
+});
+
 test('isSpacesEnabled defaults ON (beta) and honors the kill-switch', () => {
   const prev = process.env.CLEMENTINE_SPACES;
   delete process.env.CLEMENTINE_SPACES;
