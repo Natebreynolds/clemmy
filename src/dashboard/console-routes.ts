@@ -1229,6 +1229,49 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Phase C — improvement proposals. GET lists pending proposals (drafted nightly
+   * when CLEMMY_IMPROVEMENT_PROPOSER=on); POST approve applies ONE proposal through
+   * the same gated, journaled, reversible flow as the memory-approve actions.
+   * ?dry=1 previews. Nothing here ever auto-mutates; apply is a human click.
+   */
+  app.get('/api/console/autoresearch/improvements', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listPendingProposals, proposerEnabled } = await import('../autoresearch/improvement-proposer.js');
+      res.json({ enabled: proposerEnabled(), proposals: listPendingProposals() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/autoresearch/improvements/approve', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { approveProposal } = await import('../autoresearch/improvement-proposer.js');
+      const body = (req.body ?? {}) as { id?: unknown };
+      const id = typeof body.id === 'string' ? body.id : '';
+      if (!id) { res.status(400).json({ error: 'id required' }); return; }
+      const dryRun = req.query.dry === '1' || req.query.dry === 'true';
+      res.json(approveProposal(id, { dryRun }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/autoresearch/improvements/dismiss', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { dismissProposal } = await import('../autoresearch/improvement-proposer.js');
+      const body = (req.body ?? {}) as { id?: unknown };
+      const id = typeof body.id === 'string' ? body.id : '';
+      if (!id) { res.status(400).json({ error: 'id required' }); return; }
+      res.json(dismissProposal(id));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Soft-delete a fact (sets active=0). Used by the panel's forget button.
    * Hard delete intentionally not exposed here — that lives in MCP tools
    * for the agent itself.

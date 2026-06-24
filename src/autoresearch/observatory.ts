@@ -618,6 +618,18 @@ export function tickAutoresearchObservatory(): void {
         'autoresearch report refreshed',
       );
     }
+    // Phase C: turn the just-built observations into human-gated improvement
+    // proposals. No-op (no model/skill reads) unless CLEMMY_IMPROVEMENT_PROPOSER
+    // is on; applying a proposal is always a separate explicit human click.
+    // Lazy import keeps observatory free of a runtime dependency on the proposer.
+    void import('./improvement-proposer.js')
+      .then(({ proposeFromReport }) => {
+        const r = proposeFromReport(report);
+        if (r.ran && r.added > 0) {
+          logger.info({ added: r.added, total: r.total }, 'autoresearch improvement proposals drafted (pending human review)');
+        }
+      })
+      .catch((err) => logger.warn({ err }, 'improvement-proposer pass failed'));
   } catch (err) {
     logger.warn({ err }, 'autoresearch observatory tick failed');
   }
