@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {
   classifyToolError,
   toolFailureCorrective,
+  asyncJobTimeoutCorrective,
   detectStructuredToolFailure,
   mcpErrorCorrectiveEnabled,
 } from './tool-error-corrective.js';
@@ -37,6 +38,24 @@ test('toolFailureCorrective: transient/rate-limit says retry ONCE (the one produ
   assert.match(out, /TRANSIENT/i);
   assert.match(out, /retry this exact call once/i);
   assert.match(out, /do not retry more than once/i);
+});
+
+test('toolFailureCorrective: a TIMEOUT steers to the ASYNC start+poll pattern, NOT "retry the same call"', () => {
+  const out = toolFailureCorrective('tool composio_execute_tool timed out after 300000ms', { toolName: 'composio_execute_tool' });
+  assert.match(out, /TIMED OUT/i);
+  assert.match(out, /ASYNC/i);
+  assert.match(out, /poll/i);
+  assert.match(out, /long-running job/i);
+  // the misleading transient advice must NOT be the headline move for a timeout
+  assert.doesNotMatch(out, /Retry this EXACT call ONCE\./);
+});
+
+test('asyncJobTimeoutCorrective: names the START + POLL moves and allows a single retry only for a blip', () => {
+  const out = asyncJobTimeoutCorrective('composio_execute_tool', 'timed out after 300000ms', ' (slug=APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS)');
+  assert.match(out, /slug=APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS/);
+  assert.match(out, /START the job/i);
+  assert.match(out, /POLL/i);
+  assert.match(out, /brief network blip/i);
 });
 
 test('toolFailureCorrective: permission says fix auth, not the id', () => {

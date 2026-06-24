@@ -18,6 +18,7 @@ import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
+import { asyncJobTimeoutCorrective } from '../runtime/harness/tool-error-corrective.js';
 import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
 import { resolveCompliantSenderConnection } from '../runtime/harness/sender-verify.js';
 import { validateComposioArgs, formatBatchValidationError } from './composio-batch-validator.js';
@@ -185,15 +186,29 @@ function composioFailureCorrective(
   const intent = opts.intent || 'accomplish this task';
   const fallbackSuggestions = formatFallbackSuggestions(intent, failedTool, failureType);
 
+  // Timeout FIRST (before the transient branch): a long-running job (an actor
+  // run, a big scrape/export, a blocking sync "get dataset items") that exceeded
+  // its window must switch to the async start+poll pattern — retrying the SAME
+  // blocking call just times out again (live 2026-06-24: two sync Apify actor
+  // calls each burned the full 5-min window). Shares the symptom with transient
+  // but needs the OPPOSITE move, so it can't ride the "retry once" copy below.
+  if (failureType === 'timeout' && !opts.notFound) {
+    return [
+      asyncJobTimeoutCorrective(label, summary, where),
+      fallbackSuggestions && `If async doesn't fit, alternatives:\n${fallbackSuggestions}`,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+  }
   if (opts.transient && !opts.notFound) {
-    // FIX 1.4 — a transient infra error (rate-limit / 5xx / network / timeout)
-    // is the ONE case where repeating the SAME call is productive. Tell the
-    // model to retry ONCE so we preserve legitimate recovery — but cap it so a
-    // persistent outage doesn't become thrash. (Distinct from the deterministic
-    // "do NOT repeat" copy below.)
+    // FIX 1.4 — a transient infra error (rate-limit / 5xx / network) is the ONE
+    // case where repeating the SAME call is productive. Tell the model to retry
+    // ONCE so we preserve legitimate recovery — but cap it so a persistent
+    // outage doesn't become thrash. (Distinct from the deterministic "do NOT
+    // repeat" copy below, and from the timeout async-steer above.)
     return [
       `⚠️ ${label} FAILED${where}: ${summary}`,
-      `This looks like a TRANSIENT infrastructure error (rate-limit / 5xx / network / timeout) — NOT a bad request. A SINGLE retry of the SAME call after a brief pause may succeed.`,
+      `This looks like a TRANSIENT infrastructure error (rate-limit / 5xx / network) — NOT a bad request. A SINGLE retry of the SAME call after a brief pause may succeed.`,
       `Retry this EXACT call ONCE. If it fails again, treat it as a hard blocker: switch approach (different action/tool) or report the specific blocker to the user. Do NOT retry more than once.`,
       fallbackSuggestions && `If retry fails, here are your alternatives:\n${fallbackSuggestions}`,
     ]

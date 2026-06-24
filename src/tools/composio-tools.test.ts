@@ -159,6 +159,18 @@ test('formatComposioExecuteOutput: prepends a do-not-retry corrective on a faile
   assert.match(out, /400 Client Error/);
 });
 
+test('formatComposioExecuteOutput: a TIMEOUT on a long-running job steers to ASYNC start+poll, not a same-call retry', () => {
+  resetEventLog();
+  // The live 2026-06-24 case: a blocking sync Apify actor run exceeded the 5-min
+  // tool window. The corrective must NOT say "retry this exact call once".
+  const timedOut = { successful: false, error: 'tool composio_execute_tool timed out after 300000ms' };
+  const out = formatComposioExecuteOutput(timedOut, { toolSlug: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS' });
+  assert.match(out, /TIMED OUT \(slug=APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS\)/);
+  assert.match(out, /ASYNC/i);
+  assert.match(out, /poll/i);
+  assert.doesNotMatch(out, /Retry this EXACT call ONCE/);
+});
+
 test('formatComposioExecuteOutput: a successful call is byte-identical to formatComposioToolOutput (no-regress)', () => {
   resetEventLog();
   const ok = { data: { display_url: 'https://docs.google.com/spreadsheets/d/abc/edit' } };

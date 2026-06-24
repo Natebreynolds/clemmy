@@ -46,6 +46,23 @@ export function classifyToolError(text: string, raw?: unknown): ToolFailureKind 
   return 'unknown';
 }
 
+/**
+ * Corrective for a TIMEOUT. A timeout is NOT a "retry the same call once"
+ * situation when the call is a LONG-RUNNING JOB (an actor/agent run, a big
+ * scrape/export, a blocking "sync get dataset items") — re-running the same
+ * blocking call just times out again (the live 2026-06-24 Apify case: two sync
+ * `APIFY_RUN_ACTOR_SYNC_*` calls each burned the full 5-min tool window before
+ * the model pivoted to the async pattern on its own). Steer to async start+poll;
+ * a brief network blip can still retry once. General — pattern names, no
+ * per-vendor slug list. */
+export function asyncJobTimeoutCorrective(label: string, summary: string, where = ''): string {
+  return [
+    `⚠️ ${label} TIMED OUT${where}: ${summary}`,
+    `A timeout means the call exceeded its time budget. If this is a LONG-RUNNING JOB — an actor/agent run, a large scrape or export, or a blocking "sync get dataset items" call — do NOT retry the SAME blocking call; it will time out again. Use the ASYNC pattern: START the job with an action that returns a run/job id (e.g. a *_RUN / *_ACT_RUNS / *_CREATE / *_START action), then POLL its status/results (e.g. *_GET / *_RUNS_GET / dataset-items) until it finishes.`,
+    `Only if this was a brief network blip (NOT a long job) should you retry the identical call ONCE.`,
+  ].join('\n\n');
+}
+
 /** A loud, self-correcting header for a failed tool call. Names the tool and
  *  tells the model the specific recovery move for the failure kind, so it adapts
  *  on failure #1 instead of retrying identically into the loop guard. */
@@ -56,10 +73,16 @@ export function toolFailureCorrective(
   const label = opts.toolName || 'the tool';
   const kind = opts.kind ?? classifyToolError(summary);
 
-  if (kind === 'transient' || kind === 'rate_limit' || kind === 'timeout') {
+  // Timeout is its OWN move: a long-running job must switch to async start+poll,
+  // not retry the blocking call (which times out again). Split out of the
+  // transient branch below — they share a symptom but need OPPOSITE advice.
+  if (kind === 'timeout') {
+    return asyncJobTimeoutCorrective(label, summary);
+  }
+  if (kind === 'transient' || kind === 'rate_limit') {
     return [
       `⚠️ ${label} FAILED: ${summary}`,
-      `This looks TRANSIENT (rate-limit / 5xx / network / timeout) — NOT a bad request. A SINGLE retry of the SAME call after a brief pause may succeed.`,
+      `This looks TRANSIENT (rate-limit / 5xx / network) — NOT a bad request. A SINGLE retry of the SAME call after a brief pause may succeed.`,
       `Retry this EXACT call ONCE. If it fails again, switch approach (different action/tool) or report the specific blocker to the user. Do NOT retry more than once.`,
     ].join('\n\n');
   }
