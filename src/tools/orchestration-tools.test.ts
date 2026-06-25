@@ -3,7 +3,7 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -614,4 +614,71 @@ test('bindDiscussedToolkitsIntoSteps: idempotent (a second pass does not double-
   const second = bindDiscussedToolkitsIntoSteps(steps, [{ slug: 'apify', name: 'Apify' }]);
   assert.equal(first.boundNotes.length, 1);
   assert.equal(second.boundNotes.length, 0); // marker present → skipped
+});
+
+// ─── Wave 1.3: workflow_get surfaces a deterministic step's RUNNER provenance ──
+
+function workflowGet(): ToolHandler {
+  const handler = handlers.get('workflow_get');
+  assert.ok(handler, 'workflow_get registered');
+  return handler;
+}
+
+test('workflow_get reads a deterministic step\'s runner SOURCE and surfaces what it reaches (Salesforce, not guessed)', async () => {
+  resetState();
+  writeWorkflow('det-prov-test', {
+    name: 'Det Prov Test',
+    description: 'A deterministic pull from Salesforce.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull_sf', prompt: 'Run the bundled puller.', deterministic: { runner: 'pull.mjs' } } as any,
+    ],
+  });
+  // The runner that BACKS the step — its source reveals the real connector.
+  const scriptsDir = path.join(WORKFLOWS_DIR, 'det-prov-test', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'pull.mjs'),
+    'import { execFileSync } from "node:child_process";\nconst out = execFileSync("sf", ["data","query","-q","SELECT Id FROM Opportunity"]);\nprocess.stdout.write(out);\n',
+    'utf-8',
+  );
+
+  const text = resultText(await workflowGet()({ name: 'Det Prov Test' }));
+  assert.match(text, /runner data:/, 'shows a runner-data provenance line');
+  assert.match(text, /shells: sf/, 'names the sf CLI it shells out to');
+  assert.match(text, /Salesforce/, 'reveals the real system behind the script');
+});
+
+test('workflow_get REFUSES to read a traversal runner path (no arbitrary-file read)', async () => {
+  resetState();
+  // A hand-edited / corrupt definition could carry a traversal runner; the parse
+  // path does not run the validator, so workflow_get must guard the read itself.
+  writeWorkflow('det-traversal-test', {
+    name: 'Det Traversal Test',
+    description: 'Deterministic step with a malicious runner path.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Run it.', deterministic: { runner: '../../../../etc/passwd' } } as any,
+    ],
+  });
+  const text = resultText(await workflowGet()({ name: 'Det Traversal Test' }));
+  assert.match(text, /runner data:.*invalid runner path/i, 'rejects the traversal path instead of reading it');
+  assert.doesNotMatch(text, /root:.*:0:0:/, 'never surfaces content derived from an escaped file');
+});
+
+test('workflow_get notes a deterministic step whose runner file is missing (does not crash)', async () => {
+  resetState();
+  writeWorkflow('det-missing-test', {
+    name: 'Det Missing Test',
+    description: 'Deterministic step with no script file on disk.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Run it.', deterministic: { runner: 'gone.mjs' } } as any,
+    ],
+  });
+  const text = resultText(await workflowGet()({ name: 'Det Missing Test' }));
+  assert.match(text, /runner data:.*missing/i, 'flags the missing script rather than throwing');
 });

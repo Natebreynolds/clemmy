@@ -1,7 +1,10 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, openSync, writeSync, fsyncSync, closeSync, renameSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync, writeFileSync, openSync, writeSync, fsyncSync, closeSync, renameSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { augmentPath } from '../runtime/spawn-env.js';
+import {
+  interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
+} from '../runtime/sandboxed-script.js';
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel } from '../config.js';
@@ -671,7 +674,7 @@ function redactProcessOutput(text: string): string {
     .replace(/([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*[=:]\s*)\S+/gi, '$1[REDACTED]');
 }
 
-function resolveDeterministicRunner(workflowSlug: string, runner: string): { command: string; args: string[]; cwd: string; target: string } {
+function resolveDeterministicRunner(workflowSlug: string, runner: string): { command: string; args: string[]; cwd: string; target: string; isElectron: boolean } {
   const raw = runner.trim();
   if (!raw) throw new Error('deterministic runner is empty');
   if (/\s/.test(raw)) {
@@ -692,22 +695,14 @@ function resolveDeterministicRunner(workflowSlug: string, runner: string): { com
     throw new Error(`deterministic runner not found: ${rel}`);
   }
 
-  const ext = path.extname(target).toLowerCase();
-  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
-    return { command: process.execPath, args: [target], cwd: workflowDir, target };
+  // Shared interpreter resolution (the spaces-runner twin): adds .ts/tsx support
+  // and resolves python3/bash to absolute paths on the augmented PATH so the
+  // packaged .app finds them. isElectron drives ELECTRON_RUN_AS_NODE below.
+  const interp = interpreterFor(target, augmentPath(process.env.PATH));
+  if (!interp) {
+    throw new Error(`unsupported deterministic runner extension for ${rel}; use .js, .mjs, .cjs, .ts, .py, .sh, or an executable file`);
   }
-  if (ext === '.py') {
-    return { command: 'python3', args: [target], cwd: workflowDir, target };
-  }
-  if (ext === '.sh' || ext === '.bash') {
-    return { command: 'bash', args: [target], cwd: workflowDir, target };
-  }
-
-  const mode = statSync(target).mode;
-  if ((mode & 0o111) !== 0) {
-    return { command: target, args: [], cwd: workflowDir, target };
-  }
-  throw new Error(`unsupported deterministic runner extension for ${rel}; use .js, .mjs, .cjs, .py, .sh, or an executable file`);
+  return { command: interp.command, args: interp.args, cwd: workflowDir, target, isElectron: interp.isElectron };
 }
 
 export async function runDeterministicWorkflowStepForTest(
@@ -750,68 +745,44 @@ async function runDeterministicWorkflowStep(
   const resolved = resolveDeterministicRunner(payload.workflowSlug, runner);
   const input = JSON.stringify(payload);
   const startedAt = Date.now();
-  return await new Promise<unknown>((resolve, reject) => {
-    const child = spawn(resolved.command, resolved.args, {
-      cwd: resolved.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        PATH: process.env.PATH ?? '',
-        HOME: process.env.HOME ?? '',
-        TMPDIR: process.env.TMPDIR ?? '',
-        CLEMENTINE_HOME: process.env.CLEMENTINE_HOME ?? '',
-        CLEMENTINE_WORKFLOW_RUN_ID: payload.runId,
-        CLEMENTINE_WORKFLOW_STEP_ID: payload.stepId,
-      },
-    });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 2_000).unref?.();
-    }, WORKFLOW_DETERMINISTIC_TIMEOUT_MS);
-    timer.unref?.();
-
-    child.stdout.setEncoding('utf-8');
-    child.stderr.setEncoding('utf-8');
-    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
-    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(explainDeterministicSpawnError(err, resolved.target));
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      const cleanStdout = redactProcessOutput(stdout.trim());
-      const cleanStderr = redactProcessOutput(stderr.trim());
-      if (timedOut) {
-        reject(new Error(`deterministic runner timed out after ${WORKFLOW_DETERMINISTIC_TIMEOUT_MS}ms`));
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error(`deterministic runner failed (${signal ?? `exit ${code}`}): ${cleanStderr || cleanStdout || 'no output'}`));
-        return;
-      }
-      logger.info({
-        workflow: payload.workflow,
-        runId: payload.runId,
-        stepId: payload.stepId,
-        runner,
-        durationMs: Date.now() - startedAt,
-      }, 'deterministic workflow step completed');
-      if (!cleanStdout) {
-        resolve({ ok: true, stdout: '', stderr: cleanStderr || undefined });
-        return;
-      }
-      try {
-        resolve(JSON.parse(cleanStdout));
-      } catch {
-        resolve(cleanStdout);
-      }
-    });
-    child.stdin.end(input);
+  // Shared sandboxed-script substrate: scrubbed env (no daemon secrets) + the
+  // two workflow-identity vars, hard timeout, output cap (no OOM), EPIPE guard.
+  const env = scrubbedChildEnv({
+    CLEMENTINE_WORKFLOW_RUN_ID: payload.runId,
+    CLEMENTINE_WORKFLOW_STEP_ID: payload.stepId,
+    ...electronNodeEnv(resolved.command, resolved.isElectron),
   });
+  const outcome = await spawnSandboxedScript({
+    command: resolved.command, args: resolved.args, cwd: resolved.cwd, env,
+    stdinPayload: input, timeoutMs: WORKFLOW_DETERMINISTIC_TIMEOUT_MS,
+  });
+  if (outcome.launchError) throw explainDeterministicSpawnError(outcome.launchError, resolved.target);
+  const cleanStdout = redactProcessOutput(outcome.stdout.trim());
+  const cleanStderr = redactProcessOutput(outcome.stderr.trim());
+  if (outcome.timedOut) {
+    throw new Error(`deterministic runner timed out after ${WORKFLOW_DETERMINISTIC_TIMEOUT_MS}ms`);
+  }
+  if (outcome.overflowed) {
+    throw new Error(`deterministic runner output exceeded ${DEFAULT_MAX_OUTPUT_BYTES} bytes (emit a single JSON document to stdout)`);
+  }
+  if (outcome.code !== 0) {
+    throw new Error(`deterministic runner failed (${outcome.signal ?? `exit ${outcome.code}`}): ${cleanStderr || cleanStdout || 'no output'}`);
+  }
+  logger.info({
+    workflow: payload.workflow,
+    runId: payload.runId,
+    stepId: payload.stepId,
+    runner,
+    durationMs: Date.now() - startedAt,
+  }, 'deterministic workflow step completed');
+  if (!cleanStdout) {
+    return { ok: true, stdout: '', stderr: cleanStderr || undefined };
+  }
+  try {
+    return JSON.parse(cleanStdout);
+  } catch {
+    return cleanStdout;
+  }
 }
 
 /**

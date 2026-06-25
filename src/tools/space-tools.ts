@@ -26,6 +26,12 @@ import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-t
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
 import { refreshSpaceData, runScript } from '../spaces/runner.js';
 import { readData, writeData, listNotes, listAudit, appendNote, appendAudit } from '../spaces/data-store.js';
+import { mismatchHint } from '../shared/edit-mismatch.js';
+import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
+
+// Re-exported for back-compat (space-tools.test.ts imports it from here); the
+// canonical definition now lives in the shared leaf so workflow_get can reuse it.
+export { deriveRunnerProvenance };
 
 function expandHome(p: string): string {
   if (p === '~') return os.homedir();
@@ -140,30 +146,6 @@ function rowCollection(val: unknown): unknown[] | null {
   return null;
 }
 
-/** On a missed space_edit_view find, pinpoint WHERE it diverged: the longest
- *  prefix of `find` that IS in the view, and what the view has at that point.
- *  Surfaces the trailing-space/indent bug the model otherwise re-reads blind for.
- *  Strings are JSON-quoted so whitespace (\t vs spaces) is visible. */
-function editMismatchHint(html: string, find: string): { matchedChars: number; findHad: string; viewHad: string } | null {
-  if (!find) return null;
-  // Largest k with html.includes(find.slice(0,k)) — monotonic, so binary-search it.
-  let lo = 0;
-  let hi = find.length;
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2);
-    if (html.includes(find.slice(0, mid))) lo = mid; else hi = mid - 1;
-  }
-  const k = lo;
-  if (k >= find.length) return null; // fully present (shouldn't happen on a miss)
-  const pos = html.indexOf(find.slice(0, k));
-  const quote = (s: string): string => JSON.stringify(s.slice(0, 24));
-  return {
-    matchedChars: k,
-    findHad: quote(find.slice(k)),
-    viewHad: pos >= 0 ? quote(html.slice(pos + k, pos + k + 24)) : '(prefix not located)',
-  };
-}
-
 /** Max chars of view HTML space_get_view returns in one call. Sized just under
  *  read_file's 50000 ceiling so (a) the model has the SAME budget the shell
  *  read_file gives it — no reason to defect to shell to read a view — and (b) our
@@ -246,52 +228,6 @@ function renderViewForRead(
     out.push(row);
   }
   return out.join('\n');
-}
-
-/** Engine/SOQL/JS tokens that look like connector slugs but aren't — excluded
- *  from runner provenance so STEP_CONTEXT / MAX_BUFFER don't read as data
- *  sources. NOT a vendor list. */
-const RUNNER_NON_CONNECTOR = new Set([
-  'STEP_CONTEXT', 'JSON', 'HTTP', 'HTTPS', 'URL', 'API', 'UTF', 'NULL', 'TRUE', 'FALSE',
-  'MAX_BUFFER', 'NODE_ENV', 'TODO', 'NOTE', 'AND', 'OR', 'NOT', 'CSV', 'PDF', 'HTML', 'ID',
-]);
-
-/**
- * Vendor-agnostic provenance for a RUNNER's source text — what external system
- * it actually reaches (the runner twin of deriveStepDataSources). Surfaces the
- * CLI it shells (e.g. `sf` → Salesforce), SOQL objects, composio/MCP/connector
- * refs, and HTTP hosts — so a reader sees "this runner queries Salesforce"
- * instead of guessing. No curated vendor list.
- */
-export function deriveRunnerProvenance(src: string): string[] {
-  const s = src || '';
-  const out: string[] = [];
-  // CLI shell-outs — the binary reveals the system (sf=Salesforce CLI, gh, curl…).
-  const clis = new Set<string>();
-  for (const m of s.matchAll(/(?:execFileSync|execSync|spawnSync|spawn|exec)\s*\(\s*['"`]([a-zA-Z0-9_.\/-]+)['"`]/g)) {
-    clis.add((m[1].split('/').pop() || m[1]));
-  }
-  if (clis.size > 0) {
-    const note = clis.has('sf') ? ' (sf = Salesforce CLI)' : '';
-    out.push(`shells: ${[...clis].join(', ')}${note}`);
-  }
-  // SOQL objects (Salesforce): FROM <Object>.
-  const objs = new Set<string>();
-  for (const m of s.matchAll(/\bFROM\s+([A-Z][A-Za-z0-9_]+)/g)) objs.add(m[1]);
-  if (objs.size > 0) out.push(`SOQL FROM: ${[...objs].slice(0, 8).join(', ')} (Salesforce)`);
-  // Connector references: composio, MCP tool names, ALL_CAPS connector slugs.
-  const refs = new Set<string>();
-  if (/\bcomposio_execute_tool\b/.test(s)) refs.add('composio_execute_tool');
-  for (const m of s.matchAll(/\bmcp__[a-zA-Z0-9_]+__[a-zA-Z0-9_]+\b/g)) refs.add(m[0]);
-  for (const m of s.matchAll(/\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g)) {
-    if (!RUNNER_NON_CONNECTOR.has(m[0])) refs.add(m[0]);
-  }
-  if (refs.size > 0) out.push(`refs: ${[...refs].slice(0, 12).join(', ')}`);
-  // HTTP endpoints.
-  const hosts = new Set<string>();
-  for (const m of s.matchAll(/https?:\/\/([a-zA-Z0-9.-]+)/g)) hosts.add(m[1]);
-  if (hosts.size > 0) out.push(`http: ${[...hosts].slice(0, 6).join(', ')}`);
-  return out;
 }
 
 export function registerSpaceTools(server: McpServer): void {
@@ -494,10 +430,10 @@ export function registerSpaceTools(server: McpServer): void {
       edits.forEach((e, i) => {
         const occurrences = e.find ? html.split(e.find).length - 1 : 0;
         if (occurrences === 0) {
-          const hint = editMismatchHint(html, e.find);
+          const hint = mismatchHint(html, e.find);
           detailLines.push(
             hint && hint.matchedChars > 0
-              ? `edit ${i + 1}: NOT applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the view has ${hint.viewHad}. Re-read with space_get_view and copy the exact characters (watch tabs vs spaces), then retry just this edit.`
+              ? `edit ${i + 1}: NOT applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the view has ${hint.haystackHad}. Re-read with space_get_view and copy the exact characters (watch tabs vs spaces), then retry just this edit.`
               : `edit ${i + 1}: NOT applied — that find string isn't in the view; re-read with space_get_view and copy an exact snippet.`,
           );
           return;
@@ -722,10 +658,10 @@ export function registerSpaceTools(server: McpServer): void {
       edits.forEach((e, i) => {
         const occurrences = e.find ? next.split(e.find).length - 1 : 0;
         if (occurrences === 0) {
-          const hint = editMismatchHint(next, e.find);
+          const hint = mismatchHint(next, e.find);
           detailLines.push(
             hint && hint.matchedChars > 0
-              ? `edit ${i + 1}: NOT applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the runner has ${hint.viewHad}. Re-read with space_get_runner and copy the exact characters (watch tabs vs spaces), then retry just this edit.`
+              ? `edit ${i + 1}: NOT applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the runner has ${hint.haystackHad}. Re-read with space_get_runner and copy the exact characters (watch tabs vs spaces), then retry just this edit.`
               : `edit ${i + 1}: NOT applied — that find string isn't in the runner; re-read with space_get_runner and copy an exact snippet.`,
           );
           return;

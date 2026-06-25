@@ -13,14 +13,15 @@
  * data.json under _meta so the view can show "couldn't refresh" without the
  * whole Workspace breaking.
  */
-import { spawn } from 'node:child_process';
-import { existsSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
-import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { resolveInSpace, runnerFilenameError, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
 import { readData, writeData, appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
 import { executeComposioTool } from '../integrations/composio/client.js';
 import { augmentPath } from '../runtime/spawn-env.js';
+import {
+  interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript,
+} from '../runtime/sandboxed-script.js';
 
 // Tunable so a heavy data pull can be given more room without a code change.
 const RUNNER_TIMEOUT_MS = (() => {
@@ -34,58 +35,11 @@ export interface RunSourceOk { ok: true; data: unknown }
 export interface RunSourceErr { ok: false; error: string }
 export type RunSourceResult = RunSourceOk | RunSourceErr;
 
-/** Resolve a bare interpreter name to an absolute path on the augmented PATH so
- *  a minimal-PATH Finder-launched .app still finds python3/bash. */
-function resolveOnPath(bin: string, augmentedPath: string): string | null {
-  if (path.isAbsolute(bin)) return existsSync(bin) ? bin : null;
-  for (const dir of augmentedPath.split(':').filter(Boolean)) {
-    const candidate = path.join(dir, bin);
-    try { accessSync(candidate, fsConstants.X_OK); return candidate; } catch { /* next */ }
-  }
-  return null;
-}
-
-/** Locate the bundled tsx CLI entry (ships in daemon/node_modules; the .bin
- *  symlink is filtered out of the packaged app, so resolve the package). */
-function resolveTsxEntry(): string | null {
-  try { return createRequire(import.meta.url).resolve('tsx/cli'); } catch { return null; }
-}
-
-/** Decide how to run a runner file. `isElectron` flags the process.execPath case
- *  (node / tsx) so the caller sets ELECTRON_RUN_AS_NODE in the packaged app —
- *  without it, process.execPath (the Electron binary) launches a GUI instance
- *  instead of running the script. python3/bash resolve to absolute paths on the
- *  augmented PATH. Returns null for unsupported shapes. */
-function interpreterFor(
-  target: string,
-  augmentedPath: string,
-): { command: string; args: string[]; isElectron: boolean } | null {
-  const ext = path.extname(target).toLowerCase();
-  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
-    return { command: process.execPath, args: [target], isElectron: true };
-  }
-  if (ext === '.ts' || ext === '.mts' || ext === '.cts') {
-    const tsx = resolveTsxEntry();
-    if (!tsx) return null; // surfaces "unsupported runner extension" — graceful
-    return { command: process.execPath, args: [tsx, target], isElectron: true };
-  }
-  if (ext === '.py') {
-    return { command: resolveOnPath('python3', augmentedPath) ?? 'python3', args: [target], isElectron: false };
-  }
-  if (ext === '.sh' || ext === '.bash') {
-    return { command: resolveOnPath('bash', augmentedPath) ?? '/bin/bash', args: [target], isElectron: false };
-  }
-  try {
-    if ((statSync(target).mode & 0o111) !== 0) return { command: target, args: [], isElectron: false };
-  } catch { /* fallthrough */ }
-  return null;
-}
-
 /** Run a runner script under the workspace data/ dir and return its parsed JSON
- *  (or an error) WITHOUT persisting. The scrubbed-env / timeout / output-cap spawn
- *  used by both the real refresh path (runSpaceDataSource) and the dry-run tool
- *  (space_try_runner) — exported so the dry-run is byte-identical to a real pull,
- *  minus the write. */
+ *  (or an error) WITHOUT persisting. Uses the shared sandboxed-script substrate
+ *  (scrubbed env / timeout / output-cap / EPIPE guard) — the same executor the
+ *  real refresh path (runSpaceDataSource) and the dry-run tool (space_try_runner)
+ *  use, so the dry-run is byte-identical to a real pull, minus the write. */
 export async function runScript(slug: string, runner: string, extra?: Record<string, unknown>): Promise<RunSourceResult> {
   const runnerError = runnerFilenameError(runner);
   if (runnerError) return { ok: false, error: runnerError };
@@ -102,84 +56,27 @@ export async function runScript(slug: string, runner: string, extra?: Record<str
 
   const spaceDir = resolveInSpace(slug, 'data');
   const payload = JSON.stringify({ ...(extra ?? {}), slug, runner });
-  return await new Promise<RunSourceResult>((resolve) => {
-    // Safe, complete-enough baseline for AGENT-AUTHORED runner code. We do NOT
-    // spread process.env (it carries the daemon's OAuth tokens / API keys); we
-    // DO carry what any generic CLI needs — binary resolution (augmented PATH),
-    // $HOME-based auth (e.g. sf → ~/.sfdx), UTF-8 I/O, XDG config dirs, and
-    // Clementine identity. None of these is a secret.
-    const home = process.env.HOME ?? '';
-    const childEnv: Record<string, string> = {
-      PATH: augmentedPath,
-      HOME: home,
-      TMPDIR: process.env.TMPDIR ?? '/tmp',
-      SHELL: process.env.SHELL ?? '/bin/bash',
-      USER: process.env.USER ?? process.env.LOGNAME ?? '',
-      LOGNAME: process.env.LOGNAME ?? process.env.USER ?? '',
-      LANG: process.env.LANG ?? 'en_US.UTF-8',
-      LC_ALL: process.env.LC_ALL ?? 'en_US.UTF-8',
-      PYTHONIOENCODING: 'utf-8',
-      PYTHONUNBUFFERED: '1',
-      NO_COLOR: '1',
-      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? (home ? path.join(home, '.config') : ''),
-      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? (home ? path.join(home, '.cache') : ''),
-      XDG_DATA_HOME: process.env.XDG_DATA_HOME ?? (home ? path.join(home, '.local', 'share') : ''),
-      CLEMENTINE_HOME: process.env.CLEMENTINE_HOME ?? '',
-      CLEMENTINE_SPACE_SLUG: slug,
-    };
-    // Make the packaged Electron binary behave as Node. Guarded on
-    // === process.execPath so it is NEVER set for python/bash/executable runners.
-    if (interp.isElectron && interp.command === process.execPath) {
-      childEnv.ELECTRON_RUN_AS_NODE = '1';
-    }
-    const child = spawn(interp.command, interp.args, {
-      cwd: spaceDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: childEnv,
-    });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    let overflowed = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 2_000).unref?.();
-    }, RUNNER_TIMEOUT_MS);
-    timer.unref?.();
-    child.stdout.setEncoding('utf-8');
-    child.stderr.setEncoding('utf-8');
-    child.stdout.on('data', (c) => {
-      if (overflowed) return;
-      stdout += String(c);
-      if (Buffer.byteLength(stdout) > RUNNER_MAX_OUTPUT_BYTES) {
-        overflowed = true;
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 2_000).unref?.();
-      }
-    });
-    child.stderr.on('data', (c) => { if (stderr.length < 100_000) stderr += String(c); });
-    child.on('error', (err) => { clearTimeout(timer); resolve({ ok: false, error: `runner failed to launch: ${err.message}` }); });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      if (overflowed) { resolve({ ok: false, error: `runner output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes (print a single JSON document to stdout)` }); return; }
-      if (timedOut) { resolve({ ok: false, error: `runner timed out after ${RUNNER_TIMEOUT_MS}ms` }); return; }
-      if (code !== 0) { resolve({ ok: false, error: `runner exited ${signal ?? code}: ${[stderr.trim(), stdout.trim()].filter(Boolean).join(' | ').slice(0, 2000)}` }); return; }
-      const out = stdout.trim();
-      if (!out) { resolve({ ok: false, error: 'runner produced no output (expected JSON on stdout)' }); return; }
-      try {
-        resolve({ ok: true, data: JSON.parse(out) });
-      } catch {
-        resolve({ ok: false, error: `runner stdout was not valid JSON: ${out.slice(0, 200)}` });
-      }
-    });
-    // A fast runner (e.g. a shell echo) can exit before we finish writing the
-    // payload, closing its stdin — that surfaces as an ASYNC 'error' (EPIPE) on
-    // the stream, which the try/catch below can't catch and would otherwise
-    // become an uncaughtException. Swallow it: stdin is optional input.
-    child.stdin.on('error', () => { /* child closed stdin early — fine */ });
-    try { child.stdin.end(payload); } catch { /* stdin optional */ }
+  const env = scrubbedChildEnv({
+    CLEMENTINE_SPACE_SLUG: slug,
+    ...electronNodeEnv(interp.command, interp.isElectron),
   });
+  const outcome = await spawnSandboxedScript({
+    command: interp.command, args: interp.args, cwd: spaceDir, env,
+    stdinPayload: payload, timeoutMs: RUNNER_TIMEOUT_MS, maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
+  });
+  if (outcome.launchError) return { ok: false, error: `runner failed to launch: ${outcome.launchError.message}` };
+  if (outcome.overflowed) return { ok: false, error: `runner output exceeded ${RUNNER_MAX_OUTPUT_BYTES} bytes (print a single JSON document to stdout)` };
+  if (outcome.timedOut) return { ok: false, error: `runner timed out after ${RUNNER_TIMEOUT_MS}ms` };
+  if (outcome.code !== 0) {
+    return { ok: false, error: `runner exited ${outcome.signal ?? outcome.code}: ${[outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join(' | ').slice(0, 2000)}` };
+  }
+  const out = outcome.stdout.trim();
+  if (!out) return { ok: false, error: 'runner produced no output (expected JSON on stdout)' };
+  try {
+    return { ok: true, data: JSON.parse(out) };
+  } catch {
+    return { ok: false, error: `runner stdout was not valid JSON: ${out.slice(0, 200)}` };
+  }
 }
 
 /** Run a single declared data source (no persistence). */

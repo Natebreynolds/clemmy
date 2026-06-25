@@ -20,6 +20,7 @@ import { createHash } from 'node:crypto';
 import { STATE_DIR } from '../memory/db.js';
 import { readWorkflow, writeWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
 import { checkWorkflowForWrite } from './workflow-enforce.js';
+import { mismatchHint } from '../shared/edit-mismatch.js';
 
 const BACKUPS_DIR = path.join(STATE_DIR, 'workflow-step-edit-backups');
 
@@ -58,29 +59,6 @@ function recordBackup(workflow: string, stepId: string, priorDefinition: Workflo
   }
 }
 
-/** On a missed `find`, pinpoint WHERE it diverged: the longest prefix of `find`
- *  that IS in the prompt, and what the prompt has at that point. Whitespace is
- *  made visible via JSON-quoting (tabs vs spaces). Local copy of space-tools'
- *  editMismatchHint so this stays a light module (no agent-runtime imports). */
-function findMismatchHint(haystack: string, find: string): { matchedChars: number; findHad: string; promptHad: string } | null {
-  if (!find) return null;
-  let lo = 0;
-  let hi = find.length;
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2);
-    if (haystack.includes(find.slice(0, mid))) lo = mid; else hi = mid - 1;
-  }
-  const k = lo;
-  if (k >= find.length) return null; // fully present (shouldn't happen on a miss)
-  const pos = haystack.indexOf(find.slice(0, k));
-  const quote = (s: string): string => JSON.stringify(s.slice(0, 24));
-  return {
-    matchedChars: k,
-    findHad: quote(find.slice(k)),
-    promptHad: pos >= 0 ? quote(haystack.slice(pos + k, pos + k + 24)) : '(prefix not located)',
-  };
-}
-
 /**
  * Make a TARGETED, reversible find/replace edit to ONE step's prompt. The
  * `find` must appear VERBATIM in the current step prompt — that verbatim
@@ -108,11 +86,11 @@ export function applyStepPromptEdit(
   const prompt = def.steps[idx].prompt ?? '';
   const occurrences = prompt.split(find).length - 1;
   if (occurrences === 0) {
-    const hint = findMismatchHint(prompt, find);
+    const hint = mismatchHint(prompt, find);
     return {
       ok: false,
       message: hint && hint.matchedChars > 0
-        ? `That find string isn't in step "${stepId}" — it matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the step has ${hint.promptHad}. Re-read with workflow_get("${workflow}", step:"${stepId}") and copy the exact characters (watch tabs vs spaces), then retry.`
+        ? `That find string isn't in step "${stepId}" — it matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the step has ${hint.haystackHad}. Re-read with workflow_get("${workflow}", step:"${stepId}") and copy the exact characters (watch tabs vs spaces), then retry.`
         : `That find string isn't in step "${stepId}". Re-read with workflow_get("${workflow}", step:"${stepId}") and copy an exact snippet.`,
     };
   }

@@ -20,6 +20,7 @@ import { workflowExecutionSurfaceChanged, prepareWorkflowForWrite, workflowNeeds
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron, deriveStepDataSources, renderWorkflowDataSources } from '../execution/workflow-describe.js';
 import { applyStepPromptEdit, revertStepEdit } from '../execution/workflow-step-edit.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
 import { listCachedToolkits } from '../integrations/composio/client.js';
@@ -1151,10 +1152,40 @@ export function registerOrchestrationTools(server: McpServer): void {
         const det = stp.deterministic ? ` deterministic=${stp.deterministic.runner}` : '';
         const sources = deriveStepDataSources(stp);
         const sourcesLine = sources.length > 0 ? `    data: ${sources.join(' · ')}` : '';
+        // For a deterministic step, READ the runner's source and surface WHAT it
+        // actually reaches (the connector/CLI/SOQL/host) — the runner twin of the
+        // step data-source line, mirroring space_get_runner. Kills the "is this
+        // script hitting Salesforce or Composio?" blind spot at edit time.
+        // The path resolution MIRRORS the runtime's resolveDeterministicRunner:
+        // stay inside this workflow's scripts/ dir (reject absolute / '..'), honor
+        // an already-"scripts/"-prefixed runner, and only the directory layout has
+        // a scripts/ dir (flat legacy workflows can't carry a runner).
+        let runnerLine = '';
+        if (stp.deterministic?.runner) {
+          const raw = stp.deterministic.runner.trim();
+          let prov: string[];
+          if (!raw || /\s/.test(raw) || path.isAbsolute(raw) || raw.split(/[\\/]/).includes('..')) {
+            prov = ['(invalid runner path)'];
+          } else if (entry.layout !== 'directory') {
+            prov = ['(script file missing)']; // flat legacy workflows have no scripts/ dir
+          } else {
+            const scriptsDir = path.resolve(entry.dir, 'scripts');
+            const rel = raw.startsWith('scripts/') || raw.startsWith('scripts\\') ? raw : path.join('scripts', raw);
+            const runnerFile = path.resolve(entry.dir, rel);
+            // Belt-and-suspenders: the resolved path must stay inside scripts/.
+            if (runnerFile !== scriptsDir && !runnerFile.startsWith(`${scriptsDir}${path.sep}`)) {
+              prov = ['(invalid runner path)'];
+            } else {
+              try { prov = existsSync(runnerFile) ? deriveRunnerProvenance(readFileSync(runnerFile, 'utf-8')) : ['(script file missing)']; }
+              catch { prov = ['(unreadable)']; }
+            }
+          }
+          runnerLine = `    runner data: ${prov.join(' · ') || '(no external calls detected)'}`;
+        }
         const promptLines = (stp.prompt ?? '').split('\n');
         const pwidth = String(promptLines.length).length;
         const numbered = promptLines.map((l, i) => `      ${String(i + 1).padStart(pwidth)}\t${l}`).join('\n');
-        return [`  ${stp.id}${deps}${model}${forEach}${det}`, sourcesLine, '    prompt:', numbered].filter(Boolean).join('\n');
+        return [`  ${stp.id}${deps}${model}${forEach}${det}`, sourcesLine, runnerLine, '    prompt:', numbered].filter(Boolean).join('\n');
       };
       // step=<id> targeting: when a workflow is large, read just one step in full.
       if (step) {

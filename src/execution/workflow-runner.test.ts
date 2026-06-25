@@ -782,6 +782,35 @@ test('deterministic workflow step runs a bundled scripts/ helper with JSON stdin
   assert.deepEqual(output, { stepId: 'script', account: 'Acme', prior: ['one'] });
 });
 
+test('deterministic workflow step now runs a .ts runner via the shared tsx interpreter', async () => {
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-ts-test', 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'echo.ts'),
+    [
+      'let input = "";',
+      'process.stdin.setEncoding("utf-8");',
+      'process.stdin.on("data", (chunk: string) => { input += chunk; });',
+      'process.stdin.on("end", () => {',
+      '  const payload = JSON.parse(input) as { stepId: string; inputs: { account: string } };',
+      '  process.stdout.write(JSON.stringify({ stepId: payload.stepId, account: payload.inputs.account }));',
+      '});',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const output = await runDeterministicWorkflowStepForTest('echo.ts', {
+    workflow: 'Det TS Test',
+    workflowSlug: 'det-ts-test',
+    runId: 'run-ts',
+    stepId: 'script',
+    inputs: { account: 'Acme' },
+    stepOutputs: {},
+  });
+
+  assert.deepEqual(output, { stepId: 'script', account: 'Acme' });
+});
+
 test('deterministic workflow step rejects runners outside scripts/', async () => {
   await assert.rejects(
     () => runDeterministicWorkflowStepForTest('../bad.sh', {
