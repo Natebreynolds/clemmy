@@ -12,6 +12,7 @@ import { BudgetsForm } from './advanced/BudgetsForm';
 import { AutonomyForm } from './advanced/AutonomyForm';
 import { DiagnosticsView } from './advanced/DiagnosticsView';
 import { EvolutionView } from './advanced/EvolutionView';
+import { DeveloperFlags } from './advanced/DeveloperFlags';
 
 function Usage() {
   const usage = usePoll(['usage'], getUsage, 15000);
@@ -112,6 +113,7 @@ export function Advanced() {
     case 'budgets': return <BudgetsForm />;
     case 'autonomy': return <AutonomyForm />;
     case 'evolution': return <EvolutionView />;
+    case 'developer': return <DeveloperFlags />;
     default: return <Usage />;
   }
 }

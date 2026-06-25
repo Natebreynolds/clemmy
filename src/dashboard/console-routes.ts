@@ -102,6 +102,7 @@ import {
 } from '../runtime/mobile-sessions.js';
 import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
+import { buildDevFlagsSnapshot, setDevFlag, clearDevFlag, setDevMode, isDevModeEnabled } from '../runtime/dev-flags.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import {
   getWorkflowImportJob,
@@ -3596,7 +3597,7 @@ export function registerConsoleRoutes(
         brainsAvailable: fusionBrains,
         active: debateMode() !== 'off' && ((fusionBrains.claude && fusionBrains.codex) || verifyJudgeAvailable()),
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: getByoProviderSnapshots(), claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot() });
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: getByoProviderSnapshots(), claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(), developerMode: isDevModeEnabled() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -3838,6 +3839,45 @@ export function registerConsoleRoutes(
       res.json({ policy: updated });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Developer feature-flags panel: read the curated CLEMMY_* kill-switch snapshot.
+  app.get('/api/console/settings/developer-flags', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ developerFlags: buildDevFlagsSnapshot() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Toggle dev mode, or set/clear a single CLEMMY_* flag. Body is one of:
+  //   { devMode: boolean }            — reveal/hide the panel
+  //   { key: 'CLEMMY_X', value: '…' } — set an override (live + persisted)
+  //   { key: 'CLEMMY_X', clear: true }— reset to the code default
+  app.patch('/api/console/settings/developer-flags', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as { devMode?: unknown; key?: unknown; value?: unknown; clear?: unknown };
+      if (typeof body.devMode === 'boolean') {
+        setDevMode(body.devMode);
+      } else if (typeof body.key === 'string') {
+        const key = body.key.trim().toUpperCase();
+        if (body.clear === true) {
+          clearDevFlag(key);
+        } else {
+          const value = typeof body.value === 'string' ? body.value.trim() : '';
+          if (!value) { res.status(400).json({ error: 'value is required (or pass clear:true)' }); return; }
+          setDevFlag(key, value);
+        }
+      } else {
+        res.status(400).json({ error: 'pass { devMode } or { key, value } or { key, clear:true }' });
+        return;
+      }
+      res.json({ developerFlags: buildDevFlagsSnapshot() });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

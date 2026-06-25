@@ -80,7 +80,38 @@ export interface SettingsSnapshot {
   activeBrain?: ActiveBrain;
   fusion?: FusionSettings;
   modelRoles?: ModelRolesSnapshot;
+  /** Whether the desktop Developer panel is revealed (CLEMMY_DEV_MODE=on). */
+  developerMode?: boolean;
 }
+
+// Developer feature-flags panel: a curated view over the CLEMMY_* kill-switches,
+// flippable at runtime (live + persisted, no restart). `value` is the effective
+// value (override or code default); `overridden` is whether an explicit override
+// exists; `custom` holds escape-hatch keys the user pinned that aren't curated.
+export type DevFlagType = 'boolean' | 'string';
+export interface DevFlag {
+  key: string;
+  label: string;
+  category: string;
+  type: DevFlagType;
+  default: string;
+  description: string;
+  options?: string[];
+  value: string;
+  overridden: boolean;
+  curated: boolean;
+}
+export interface DevFlagsSnapshot {
+  devMode: boolean;
+  flags: DevFlag[];
+  custom: DevFlag[];
+}
+export const getDeveloperFlags = () =>
+  apiGet<{ developerFlags: DevFlagsSnapshot }>('/api/console/settings/developer-flags');
+// One of: { devMode } to reveal/hide the panel; { key, value } to set an
+// override; { key, clear:true } to reset to the code default.
+export const patchDeveloperFlags = (p: { devMode?: boolean; key?: string; value?: string; clear?: boolean }) =>
+  patch<{ developerFlags: DevFlagsSnapshot }>('/api/console/settings/developer-flags', p);
 
 // Role→model registry: which model serves each role (brain/worker/judge), the
 // source of that choice, and the models available grouped by CONNECTED provider.

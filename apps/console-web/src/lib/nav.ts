@@ -1,7 +1,7 @@
 import {
   MessageCircle, Inbox, Zap, Plug, Brain, Video, LayoutDashboard,
   BarChart3, Wrench, Stethoscope, Gauge, Sliders, Sparkles,
-  Settings, HelpCircle, ListChecks, Users,
+  Settings, HelpCircle, ListChecks, Users, FlaskConical,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -35,6 +35,11 @@ export const ADVANCED_NAV: NavDest[] = [
   { path: '/advanced/autonomy', label: 'Autonomy', icon: Sliders, hint: 'When Clementine acts on its own' },
   { path: '/advanced/evolution', label: 'Evolution', icon: Sparkles, hint: 'Nightly self-research reports' },
 ];
+
+/** Shown under Advanced ONLY when developer mode is on (Settings → Developer mode). */
+export const DEVELOPER_NAV: NavDest = {
+  path: '/advanced/developer', label: 'Developer', icon: FlaskConical, hint: 'Feature flags & kill-switches',
+};
 
 /** Pinned at the bottom of the sidebar. */
 export const FOOTER_NAV: NavDest[] = [

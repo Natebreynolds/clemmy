@@ -7,6 +7,7 @@ import { useTheme, type ThemeChoice } from '@/lib/theme';
 import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ModelsRoutingSection } from './settings/ModelsRoutingSection';
+import { DeveloperModeCard } from './settings/DeveloperModeCard';
 import { cn } from '@/lib/cn';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
@@ -63,6 +64,8 @@ export function Settings() {
         <ModelsRoutingSection />
 
         <LinkRow title="Connections & API keys" desc="Composio apps, stored keys, and MCP servers. (Codex & Claude sign-in are in Models & routing above.)" to="/connect" />
+
+        <DeveloperModeCard />
       </div>
     </Page>
   );

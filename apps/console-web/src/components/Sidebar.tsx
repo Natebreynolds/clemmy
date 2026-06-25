@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { ChevronRight } from 'lucide-react';
-import { PRIMARY_NAV, ADVANCED_NAV, FOOTER_NAV, type NavDest } from '@/lib/nav';
+import { PRIMARY_NAV, ADVANCED_NAV, DEVELOPER_NAV, FOOTER_NAV, type NavDest } from '@/lib/nav';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
+import { getSettings } from '@/lib/settings';
 import { DogMark } from './DogMark';
 import { cn } from '@/lib/cn';
 
@@ -52,6 +53,11 @@ export function Sidebar({ collapsed }: { collapsed: boolean }) {
   );
   const pending = approvals.data?.count ?? approvals.data?.approvals?.length ?? 0;
 
+  // Developer panel is opt-in (Settings → Developer mode); only then does the
+  // "Developer" item appear under Advanced.
+  const settings = usePoll(['settings'], getSettings, 0);
+  const advancedNav = settings.data?.developerMode ? [...ADVANCED_NAV, DEVELOPER_NAV] : ADVANCED_NAV;
+
   return (
     <nav
       aria-label="Primary"
@@ -86,7 +92,7 @@ export function Sidebar({ collapsed }: { collapsed: boolean }) {
           </button>
           {advancedOpen && !collapsed && (
             <div className="mt-1 space-y-1">
-              {ADVANCED_NAV.map((d) => (
+              {advancedNav.map((d) => (
                 <NavRow key={d.path} dest={d} collapsed={false} />
               ))}
             </div>

@@ -331,6 +331,25 @@ export function updateEnvKey(key: string, value: string): void {
   process.env[key] = value;
 }
 
+/**
+ * Remove a key from the BASE_DIR/.env file AND the live process.env, so the
+ * next getRuntimeEnv() falls back to the code default (or a lower-precedence
+ * .env). The inverse of updateEnvKey — used by the developer flags panel to
+ * "reset to default" without writing an explicit value (which would otherwise
+ * pin the flag even after the code default changes).
+ */
+export function removeEnvKey(key: string): void {
+  const envPath = path.join(BASE_DIR, '.env');
+  if (existsSync(envPath)) {
+    const lines = readFileSync(envPath, 'utf-8').split('\n');
+    const kept = lines.filter((line) => !line.startsWith(`${key}=`));
+    if (kept.length !== lines.length) {
+      writeFileSync(envPath, `${kept.join('\n').replace(/\n+$/, '')}\n`, 'utf-8');
+    }
+  }
+  delete process.env[key];
+}
+
 export function getWorkspaceDirs(): string[] {
   const seen = new Set<string>();
   const dirs: string[] = [];

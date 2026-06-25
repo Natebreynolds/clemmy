@@ -50,6 +50,7 @@ export function App() {
             <Route path="/advanced/budgets" element={<Advanced />} />
             <Route path="/advanced/autonomy" element={<Advanced />} />
             <Route path="/advanced/evolution" element={<Advanced />} />
+            <Route path="/advanced/developer" element={<Advanced />} />
 
             <Route path="/settings" element={<Settings />} />
             <Route path="/help" element={<Help />} />
