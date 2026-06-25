@@ -1,7 +1,6 @@
-import { getRuntimeEnv } from '../../config.js';
 import { writeToolOutput } from './eventlog.js';
 import { getToolOutputContext } from './tool-output-context.js';
-import { digestToolOutput, dominantListCount } from './tool-output-digest.js';
+import { digestToolOutput } from './tool-output-digest.js';
 
 // Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
 // (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
@@ -9,12 +8,6 @@ import { digestToolOutput, dominantListCount } from './tool-output-digest.js';
 // whole while genuinely huge outputs (100KB+ Composio dumps) still digest +
 // stay recoverable. Compaction handles long sessions.
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 12000;
-
-function digestEnabled(): boolean {
-  // getRuntimeEnv reads the .env files (the daemon does not load them into
-  // process.env), matching how every other flag is gated.
-  return (getRuntimeEnv('LARGE_TOOL_OUTPUT_DIGEST', 'on') || 'on').trim().toLowerCase() === 'on';
-}
 
 export interface RecallableToolTextOptions {
   maxChars?: number;
@@ -137,17 +130,5 @@ export function formatRecallableToolText(
   // mid-content cut with a structure-aware digest so the model never sees
   // a JSON array severed mid-record — it gets complete records + the true
   // total + how to pull any slice (tool_output_query / recall_tool_result).
-  if (digestEnabled()) {
-    return withIndex(digestToolOutput(text, { maxChars, toolName, callId }));
-  }
-  const iso = new Date().toISOString();
-  // Report the TRUE item count (not just chars) when the payload is a list, so
-  // the model knows the full set size + that recall returns ALL of it — instead
-  // of seeing a few records + a char count and guessing pagination (the scorpion
-  // 44→4 / 'itr2' bug). recall returns the complete payload — no pagination.
-  const dom = dominantListCount(text);
-  const countNote = dom && dom.count > 0
-    ? `contains ${dom.count} ${dom.key} (only a portion shown) — recall_tool_result("${callId}") returns ALL ${dom.count}, no pagination`
-    : `returned ${text.length} chars — call recall_tool_result("${callId}") for full output`;
-  return withIndex(`${text.slice(0, maxChars)}\n[clipped: ${toolName} ${countNote} · ${iso}]`);
+  return withIndex(digestToolOutput(text, { maxChars, toolName, callId }));
 }

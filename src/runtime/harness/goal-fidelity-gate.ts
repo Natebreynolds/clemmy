@@ -89,14 +89,11 @@ export function isGoalFidelityDraftInformEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_FIDELITY_DRAFT_INFORM', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
-/** Gate-unification Step 3: judge write-time fidelity against the BLESSED goal
- *  contract (the same objective+successCriteria the completion validator uses)
- *  instead of a goal RE-DERIVED from raw events — so a send can't be blocked
- *  against a "goal" the user never approved. Default-on; =off reverts to
- *  re-derivation. Fails open to re-derivation for goal-less sessions either way. */
-function goalFidelityUsesContractEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_GOAL_FIDELITY_USE_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
-}
+// Write-time fidelity is ALWAYS judged against the BLESSED goal contract (the
+// objective+successCriteria the completion validator uses), not a goal re-derived
+// from raw events — so a send can't be blocked against a goal the user never
+// approved. Re-derivation remains the fallback for goal-less sessions.
+// (Graduated from CLEMMY_GOAL_FIDELITY_USE_CONTRACT 2026-06-24.)
 
 // ─────────────────────────────────────────────────────────────────
 // Goal assembly (mirrors loop.ts feeding the completion judge)
@@ -117,7 +114,7 @@ export function gatherGoalText(sessionId: string): string {
     // contradiction where a write was blocked against a "goal" the user never
     // blessed while satisfying the one they did. Re-derivation (below) is the
     // fallback ONLY for goal-less sessions, so behavior is unchanged there.
-    if (goalFidelityUsesContractEnabled()) {
+    {
       const contract = getActiveGoalForSession(sessionId);
       const plan = contract?.approvedPlan ?? contract?.plan;
       if (plan) {

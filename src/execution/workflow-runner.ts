@@ -1830,11 +1830,12 @@ export function renderLoopRetryEvidence(attempt: number, problems: string[]): st
   ].join('\n');
 }
 
-/** STATE pillar kill-switch: emit comparable per-attempt records (default on).
- *  Off → the loopUntil path stays byte-identical (step_loop_retry only, no
- *  metric sampling I/O). */
+/** Per-attempt records are ALWAYS emitted — the loopUntil STATE pillar and the
+ *  self-improvement proposer's input signal. Graduated from CLEMMY_ATTEMPT_RECORDS
+ *  2026-06-24: there was never a reason to turn this telemetry off. (Kept as a
+ *  named predicate so call sites read clearly.) */
 export function attemptRecordsEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_ATTEMPT_RECORDS', 'on') ?? 'on').toLowerCase() !== 'off';
+  return true;
 }
 
 /** Cumulative {tokens,toolCalls} snapshot for a step's session — the loop diffs
@@ -2407,7 +2408,7 @@ export async function executeStep(
           // recorded completion (the crash window) must NOT be re-sent — re-running
           // would DOUBLE-SEND. Skip + reconcile + advise (favor no-duplicate, report
           // back). Only bites on resume: a fresh pass has no prior external_write.
-          if (idempotentForEachEnabled() && stepSideEffectClass(step) === 'send'
+          if (stepSideEffectClass(step) === 'send'
             && itemSendAlreadyFired(ctx.runId, step.id, key)) {
             const skipNote = '[skipped on resume — a prior send for this item already fired; not re-sent to avoid a duplicate. Verify it landed.]';
             appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
@@ -2771,13 +2772,10 @@ export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' |
  *
  * Pure + exported so the predicate is unit-tested.
  */
-/** off ⇒ a crashed forEach SEND re-runs every item on resume (legacy bug #8
- *  behavior). Default on: an item whose send already fired on a prior pass is
- *  skipped on resume (favor no-duplicate; surfaced for verify). DELETE-WHEN-
- *  VALIDATED once an injected-crash forEach-send eval shows 0 double-sends. */
-function idempotentForEachEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_IDEMPOTENT_FOREACH', 'on') || 'on').toLowerCase() !== 'off';
-}
+// forEach idempotency on crash-resume is ALWAYS on (validated: injected-crash
+// forEach-send eval showed 0 double-sends, bug #8). A SEND-class item whose send
+// already fired on a prior pass is skipped on resume to avoid a duplicate.
+// (Graduated from CLEMMY_IDEMPOTENT_FOREACH 2026-06-24.)
 
 /** PURE: did a forEach item's send already CLAIM (an external_write) without
  *  being netted by a failure compensation? More writes than failures ⇒ a send

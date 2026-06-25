@@ -218,14 +218,10 @@ test('runWithContractLoop: without sampleMetrics, tokens/toolCalls are absent (d
   assert.ok(typeof seen[0].metrics.durationMs === 'number');
 });
 
-test('attemptRecordsEnabled: default on; honors the CLEMMY_ATTEMPT_RECORDS kill-switch', () => {
-  const prior = process.env.CLEMMY_ATTEMPT_RECORDS;
-  delete process.env.CLEMMY_ATTEMPT_RECORDS;
-  assert.equal(attemptRecordsEnabled(), true, 'default on');
+test('attemptRecordsEnabled: always on (graduated — CLEMMY_ATTEMPT_RECORDS removed)', () => {
   process.env.CLEMMY_ATTEMPT_RECORDS = 'off';
-  assert.equal(attemptRecordsEnabled(), false, 'kill-switch disables');
-  if (prior === undefined) delete process.env.CLEMMY_ATTEMPT_RECORDS;
-  else process.env.CLEMMY_ATTEMPT_RECORDS = prior;
+  assert.equal(attemptRecordsEnabled(), true, 'always on — the removed flag no longer disables it');
+  delete process.env.CLEMMY_ATTEMPT_RECORDS;
 });
 
 test('listAttemptRecords: attempt_record events round-trip through the run log, scoped by step', () => {

@@ -7,10 +7,9 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-tool-output-format-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
-// These tests cover the LEGACY clip-and-recall path (now non-default since
-// LARGE_TOOL_OUTPUT_DIGEST ships on). Force it off here; the digest path is
-// covered by tool-output-digest.test.ts.
-process.env.LARGE_TOOL_OUTPUT_DIGEST = 'off';
+// These tests cover the recallable-tool-output WRAPPER: full output is stored +
+// recoverable via recall_tool_result, and the global id-index is prepended. The
+// structure-aware digest BODY is covered in detail by tool-output-digest.test.ts.
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
@@ -48,7 +47,6 @@ test('formatRecallableToolText stores full output and returns canonical recall s
   });
 
   assert.ok(visible.length < full.length);
-  assert.match(visible, /global_tool returned \d+ chars/);
   assert.match(visible, /recall_tool_result\("call_global_clip"\)/);
 
   const row = getToolOutput(sess.id, 'call_global_clip');
@@ -62,10 +60,10 @@ test('clip footer reports the TRUE record count + that recall returns ALL (scorp
   // The Airtable shape that broke: full result with 59 records, clipped to a few.
   const full = JSON.stringify({ data: { records: Array.from({ length: 59 }, (_, i) => ({ id: i, fields: { Name: 'Contact ' + i, Email: `c${i}@x.com` } })) }, error: null, successful: true });
   const visible = formatRecallableToolText(full, { sessionId: sess.id, callId: 'call_air', toolName: 'composio_execute_tool', maxChars: 400 });
-  assert.match(visible, /contains 59 records/);
-  assert.match(visible, /recall_tool_result\("call_air"\) returns ALL 59/);
-  assert.match(visible, /no pagination/);
-  assert.doesNotMatch(visible, /returned \d+ chars/); // count note replaces the bare char note
+  assert.match(visible, /[Cc]ontains 59 records/);
+  assert.match(visible, /returns ALL 59/);
+  assert.match(visible, /no pagination/i);
+  assert.match(visible, /recall_tool_result\("call_air"\)/);
   assert.equal(getToolOutput(sess.id, 'call_air')!.output, full); // full payload preserved
 });
 
@@ -84,7 +82,6 @@ test('textResult uses active tool-output context for MCP-style local tools', asy
   );
 
   const visible = result.content[0].text;
-  assert.match(visible, /skill_read returned \d+ chars/);
   assert.match(visible, /recall_tool_result\("call_text_result_full"\)/);
 
   const row = getToolOutput(sess.id, 'call_text_result_full');

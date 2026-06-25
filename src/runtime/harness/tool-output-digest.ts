@@ -1,6 +1,7 @@
 /**
- * Structure-aware digest for large tool outputs (flag:
- * LARGE_TOOL_OUTPUT_DIGEST, default off).
+ * Structure-aware digest for large tool outputs — the single, always-on path
+ * for parked tool output (the legacy clip-and-recall fallback + its
+ * LARGE_TOOL_OUTPUT_DIGEST toggle were removed 2026-06-24).
  *
  * The problem: tool outputs are unbounded (query results, API lists, web
  * scrapes), the context window is finite. The old clip was `text.slice(0,
