@@ -75,7 +75,7 @@ import { takeStepResult } from '../tools/step-result-tool.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
-import { verifyStepOutput } from './step-output-verify.js';
+import { verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
@@ -2716,6 +2716,114 @@ export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' |
   return 'read';
 }
 
+/** Does `consumer` read `sourceId`'s output — via dependsOn, a forEach over it,
+ *  or a {{steps.<sourceId>.output…}} reference in its prompt? Pure. */
+export function stepConsumesOutput(consumer: WorkflowStepInput, sourceId: string): boolean {
+  if ((consumer.dependsOn ?? []).includes(sourceId)) return true;
+  if (consumer.forEach === sourceId) return true;
+  const escaped = sourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\{\\{\\s*steps\\.${escaped}[.\\s}]`).test(consumer.prompt ?? '');
+}
+
+export interface EmptyDeliverableRead { stepId: string; consumerId: string; shape: string; }
+
+/**
+ * Wave 2.1 (substance gap): find READ steps that produced NO data yet feed a
+ * downstream step — the silent-nothing MISS (e.g. a `find prospects` read returns
+ * [] because a credential expired, then `forEach prospects → send email` does
+ * nothing, and the run still reports "completed"). The run is flagged
+ * needsAttention so it is surfaced for review instead of passing as clean success.
+ *
+ * Conservative, to avoid false positives:
+ *  - only `read`-class steps (an empty write/send is not a "no data" problem);
+ *  - only steps whose output is actually empty (isEmptyValue — the SAME
+ *    definition the declared-contract path uses);
+ *  - SKIP steps with a declared `non_empty`/`min_items` contract (that path
+ *    already hard-enforces non-emptiness — don't double-flag);
+ *  - only when a DIFFERENT step actually consumes the output (a terminal read
+ *    whose emptiness IS the answer — "no overdue invoices" — is not flagged here).
+ * Pure + exported for tests.
+ */
+export function detectEmptyDeliverableReads(
+  steps: WorkflowStepInput[],
+  rawOutputs: Record<string, unknown>,
+): EmptyDeliverableRead[] {
+  const found: EmptyDeliverableRead[] = [];
+  for (const step of steps) {
+    if (!(step.id in rawOutputs)) continue; // step didn't run (partial/skip)
+    if (stepSideEffectClass(step) !== 'read') continue;
+    if (step.output?.non_empty?.length || step.output?.min_items) continue; // contract enforces it
+    const value = rawOutputs[step.id];
+    if (!isEmptyValue(value)) continue;
+    const consumer = steps.find((t) => t.id !== step.id && stepConsumesOutput(t, step.id));
+    if (!consumer) continue; // terminal read — emptiness may be the legitimate answer
+    found.push({ stepId: step.id, consumerId: consumer.id, shape: describeOutputShape(value) });
+  }
+  return found;
+}
+
+/** Resolve a dot-path (e.g. "result.url") against a value; "" / "." = the root. */
+function resolveOutputPath(value: unknown, dotted: string): unknown {
+  if (dotted === '' || dotted === '.') return value;
+  let cursor: unknown = value;
+  for (const part of dotted.split('.')) {
+    if (cursor === null || typeof cursor !== 'object') return undefined;
+    cursor = (cursor as Record<string, unknown>)[part];
+  }
+  return cursor;
+}
+
+/** Deep-scan a value for http(s) URLs (bounded breadth + depth). */
+function collectHttpUrls(value: unknown, into: Set<string>, depth: number): void {
+  if (into.size >= 8 || depth > 6) return;
+  if (typeof value === 'string') {
+    for (const m of value.matchAll(/https?:\/\/[^\s"'<>)\]]+/g)) { into.add(m[0]); if (into.size >= 8) return; }
+    return;
+  }
+  if (Array.isArray(value)) { for (const v of value) collectHttpUrls(v, into, depth + 1); return; }
+  if (value && typeof value === 'object') { for (const v of Object.values(value as Record<string, unknown>)) collectHttpUrls(v, into, depth + 1); }
+}
+
+/** The first row-collection in a value: the array itself, or the first
+ *  array-valued top-level key (mirrors the spaces row-count heuristic). */
+function arrayCountFor(value: unknown): { label: string; n: number } | null {
+  if (Array.isArray(value)) return { label: '', n: value.length };
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k === '_meta') continue;
+      if (Array.isArray(v)) return { label: k, n: v.length };
+    }
+  }
+  return null;
+}
+
+export interface RunArtifacts { urls: string[]; files: string[]; counts: string[]; }
+
+/**
+ * Wave 2.2 (structured run summary): scan a run's step outputs for the concrete
+ * artifacts it produced — published URLs, saved files (from each step's declared
+ * verify.path_exists), and row counts (an array's length, or the first
+ * array-valued key). Pure + exported for tests. Caps each list so a huge run
+ * can't bloat the summary.
+ */
+export function summarizeRunArtifacts(steps: WorkflowStepInput[], rawOutputs: Record<string, unknown>): RunArtifacts {
+  const urls = new Set<string>();
+  const files = new Set<string>();
+  const counts: string[] = [];
+  for (const step of steps) {
+    if (!(step.id in rawOutputs)) continue;
+    const out = rawOutputs[step.id];
+    collectHttpUrls(out, urls, 0);
+    for (const p of step.output?.verify?.path_exists ?? []) {
+      const resolved = resolveOutputPath(out, p);
+      if (typeof resolved === 'string' && resolved.trim()) files.add(resolved.trim());
+    }
+    const c = arrayCountFor(out);
+    if (c && c.n > 0) counts.push(`${c.label || step.id}: ${c.n}`);
+  }
+  return { urls: [...urls].slice(0, 6), files: [...files].slice(0, 6), counts: counts.slice(0, 8) };
+}
+
 /**
  * Wave 3 P0-3: should crash-resume HALT instead of blind-re-running the
  * in-flight step? Returns the offending step + its class when YES, else null.
@@ -3832,7 +3940,8 @@ async function processOneRunFile(
       const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId, run.goalFeedback);
       throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);
-      const stepOutputs = stringifyOutputs(Object.fromEntries(resume.completedSteps));
+      const rawStepOutputs = Object.fromEntries(resume.completedSteps);
+      const stepOutputs = stringifyOutputs(rawStepOutputs);
       appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
 
       // Self-heal: a step that returned {blocked:true} ran cleanly but
@@ -3840,6 +3949,31 @@ async function processOneRunFile(
       // dumps raw JSON. Detect it, diagnose the root cause, and offer a
       // fix — instead of silently reporting a misleading success.
       const blockedSteps = detectBlockedSteps(stepOutputs, workflow.data.steps.map((s) => s.id));
+
+      // Wave 2.1 (substance gap): a read step that produced NO data while a
+      // downstream step depends on it — the canonical "forEach over an empty
+      // upstream does nothing" shape. This is INFORM-ONLY: a clean empty result
+      // is usually a routine no-op (incremental "find NEW since last run" returns
+      // [] on a quiet day; a genuine failure like an expired credential ERRORS or
+      // BLOCKS and is already caught), so flipping needsAttention here would fire
+      // false "needs attention" pings on quiet runs and pollute the failure ledger.
+      // Instead we record a VISIBLE run-detail advisory event (no needsAttention,
+      // no ping, no ledger impact) and fold the note into the structured run
+      // summary below — so when a user asks "why did this run do nothing?", the
+      // answer is on the record. Skipped for partial single-step re-runs. Uses the
+      // RAW outputs (stepOutputs above is stringified → "[]"/"{}" read as non-empty).
+      const emptyDeliverableReads = run.targetStepId
+        ? []
+        : (() => { try { return detectEmptyDeliverableReads(workflow.data.steps, rawStepOutputs); } catch { return []; } })();
+      for (const er of emptyDeliverableReads) {
+        try {
+          appendWorkflowEvent(workflow.name, run.id, {
+            kind: 'step_advisory',
+            stepId: er.stepId,
+            meta: { reason: 'empty_deliverable_read', consumer: er.consumerId, shape: er.shape },
+          });
+        } catch { /* journal note is best-effort */ }
+      }
 
       // Workflow-level "did we reach the target?" judge (fail-open,
       // conservative, DETECTION-ONLY, ADVISORY). A background workflow is only
@@ -4189,7 +4323,38 @@ async function processOneRunFile(
         : goalMissed
           ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Re-run the workflow once the gaps are addressed, or adjust the goal.`
           : '';
-      const successBody = `${baseSuccessBody}${failureSummary}${goalSummary}`;
+      // Wave 2.2 (structured run summary): emit "succeeded because X + artifacts
+      // (files/URLs/counts)" at completion. The structured `run_summary` event is
+      // a durable per-run record (persisted in events.jsonl for the run detail +
+      // a future run-view consumer to render; it also carries the inform-only
+      // empty-deliverable-read notes from 2.1). A concise "📦 Produced:" line is
+      // appended to the human body ONLY when concrete artifacts exist — and a run
+      // that produced artifacts is by definition NOT a routine no-op, so this can
+      // never break the quiet-day no-op silencing.
+      const runArtifacts = summarizeRunArtifacts(workflow.data.steps, rawStepOutputs);
+      const succeededBecause = (runGoal && goalDecision?.action === 'satisfied')
+        ? `goal met${typeof goalVerdict?.successRatePercent === 'number' ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)` : ''}`
+        : (targetVerdict?.judged && targetVerdict.reached)
+          ? 'reached the workflow target'
+          : `completed ${workflow.data.steps.length} step${workflow.data.steps.length === 1 ? '' : 's'}`;
+      try {
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'run_summary',
+          meta: {
+            because: succeededBecause,
+            needsAttention,
+            artifacts: runArtifacts,
+            emptyDeliverableReads: emptyDeliverableReads.map((e) => ({ stepId: e.stepId, consumer: e.consumerId })),
+          },
+        });
+      } catch { /* summary event is best-effort */ }
+      const producedItems = [
+        runArtifacts.counts.length ? runArtifacts.counts.join(', ') : '',
+        ...runArtifacts.files,
+        ...runArtifacts.urls,
+      ].filter(Boolean);
+      const producedLine = producedItems.length > 0 ? `\n\n📦 Produced: ${producedItems.join(' · ')}` : '';
+      const successBody = `${baseSuccessBody}${producedLine}${failureSummary}${goalSummary}`;
       // Non-failing quality advisories (skill-execution misses + target-miss):
       // appended to whichever body we send so the deliverable is ALWAYS shown,
       // with a clear "review this" heads-up after it. Never replaces the body.

@@ -58,6 +58,9 @@ const {
   stepSideEffectClass,
   finalizeStepOutput,
   sendAlreadyClaimed,
+  detectEmptyDeliverableReads,
+  stepConsumesOutput,
+  summarizeRunArtifacts,
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
@@ -1124,6 +1127,110 @@ test('explainDeterministicSpawnError: an unrelated error passes through unchange
   const err = new Error('some other failure');
   const out = explainDeterministicSpawnError(err, 'scripts/x.sh');
   assert.equal(out.message, 'some other failure');
+});
+
+// ---- Wave 2.1: substance gap — empty read feeding downstream is a MISS ----
+
+test('stepConsumesOutput: dependsOn, forEach, and {{steps.x.output}} all count as consuming', () => {
+  assert.equal(stepConsumesOutput({ id: 'b', prompt: 'x', dependsOn: ['a'] } as any, 'a'), true);
+  assert.equal(stepConsumesOutput({ id: 'b', prompt: 'x', forEach: 'a' } as any, 'a'), true);
+  assert.equal(stepConsumesOutput({ id: 'b', prompt: 'use {{steps.a.output}} now' } as any, 'a'), true);
+  assert.equal(stepConsumesOutput({ id: 'b', prompt: 'unrelated' } as any, 'a'), false);
+  // a different step id that is a prefix must NOT match (steps.a vs steps.account)
+  assert.equal(stepConsumesOutput({ id: 'b', prompt: 'use {{steps.account.output}}' } as any, 'a'), false);
+});
+
+test('detectEmptyDeliverableReads: an empty read feeding a forEach is flagged', () => {
+  const steps = [
+    { id: 'find_prospects', prompt: 'query CRM for prospects' },
+    { id: 'email_each', prompt: 'email them', forEach: 'find_prospects' },
+  ] as any;
+  const hits = detectEmptyDeliverableReads(steps, { find_prospects: [], email_each: [] });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].stepId, 'find_prospects');
+  assert.equal(hits[0].consumerId, 'email_each');
+});
+
+test('detectEmptyDeliverableReads: a NON-empty read is not flagged', () => {
+  const steps = [
+    { id: 'find', prompt: 'query' },
+    { id: 'use', prompt: 'use {{steps.find.output}}' },
+  ] as any;
+  assert.equal(detectEmptyDeliverableReads(steps, { find: [{ id: 1 }], use: 'ok' }).length, 0);
+});
+
+test('detectEmptyDeliverableReads: a TERMINAL empty read (no consumer) is not flagged (legit "nothing found")', () => {
+  const steps = [{ id: 'find_overdue', prompt: 'find overdue invoices' }] as any;
+  assert.equal(detectEmptyDeliverableReads(steps, { find_overdue: [] }).length, 0);
+});
+
+test('detectEmptyDeliverableReads: an empty WRITE/SEND step is not flagged (only reads)', () => {
+  const steps = [
+    { id: 'send_blast', prompt: 'send the email blast to the list', sideEffect: 'send' },
+    { id: 'log_it', prompt: 'record {{steps.send_blast.output}}' },
+  ] as any;
+  assert.equal(detectEmptyDeliverableReads(steps, { send_blast: {}, log_it: 'x' }).length, 0);
+});
+
+test('detectEmptyDeliverableReads: a declared non_empty contract is NOT double-flagged (contract enforces it)', () => {
+  const steps = [
+    { id: 'pull', prompt: 'pull rows', output: { non_empty: [''] } },
+    { id: 'next', prompt: 'use {{steps.pull.output}}' },
+  ] as any;
+  assert.equal(detectEmptyDeliverableReads(steps, { pull: [], next: 'x' }).length, 0);
+});
+
+test("detectEmptyDeliverableReads: a step that didn't run is skipped (partial resume)", () => {
+  const steps = [
+    { id: 'a', prompt: 'read' },
+    { id: 'b', prompt: 'use {{steps.a.output}}' },
+  ] as any;
+  // 'a' not in outputs (never ran) → nothing to flag
+  assert.equal(detectEmptyDeliverableReads(steps, { b: 'x' }).length, 0);
+});
+
+// ---- Wave 2.2: structured run summary — artifacts (files/URLs/counts) ----
+
+test('summarizeRunArtifacts: collects URLs, declared files, and row counts', () => {
+  const steps = [
+    { id: 'pull', prompt: 'query', output: {} },
+    { id: 'render', prompt: 'render', output: { verify: { path_exists: ['path'] } } },
+    { id: 'publish', prompt: 'deploy' },
+  ] as any;
+  const art = summarizeRunArtifacts(steps, {
+    pull: { contacts: [{ id: 1 }, { id: 2 }, { id: 3 }] },
+    render: { path: '/Users/x/report.html' },
+    publish: { url: 'https://demo.netlify.app' },
+  });
+  assert.deepEqual(art.counts, ['contacts: 3']);
+  assert.deepEqual(art.files, ['/Users/x/report.html']);
+  assert.deepEqual(art.urls, ['https://demo.netlify.app']);
+});
+
+test('summarizeRunArtifacts: a top-level array output is counted by step id', () => {
+  const steps = [{ id: 'rows', prompt: 'pull' }] as any;
+  const art = summarizeRunArtifacts(steps, { rows: [1, 2, 3, 4] });
+  assert.deepEqual(art.counts, ['rows: 4']);
+});
+
+test('summarizeRunArtifacts: an empty run produces NO artifacts (so the no-op stays silent)', () => {
+  const steps = [
+    { id: 'find', prompt: 'find new' },
+    { id: 'act', prompt: 'use {{steps.find.output}}' },
+  ] as any;
+  const art = summarizeRunArtifacts(steps, { find: [], act: {} });
+  assert.equal(art.counts.length, 0);
+  assert.equal(art.files.length, 0);
+  assert.equal(art.urls.length, 0);
+});
+
+test('summarizeRunArtifacts: dedupes URLs and ignores _meta when counting', () => {
+  const steps = [{ id: 's', prompt: 'x' }] as any;
+  const art = summarizeRunArtifacts(steps, {
+    s: { _meta: { ok: true }, rows: ['a', 'b'], link: 'see https://x.com and https://x.com again' },
+  });
+  assert.deepEqual(art.counts, ['rows: 2']);
+  assert.deepEqual(art.urls, ['https://x.com']);
 });
 
 test('reapResolvedParkedRuns does NOT re-admit when a watched approval row is missing (no auto-approve on a lost row)', () => {

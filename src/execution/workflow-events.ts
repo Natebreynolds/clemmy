@@ -41,6 +41,7 @@ export type WorkflowEventKind =
   | 'run_cancelled'       // workflow was abandoned by the user/operator
   | 'run_paused'          // explicit pause (approval gate, user pause)
   | 'run_resumed'         // resumed after pause / daemon restart
+  | 'run_summary'         // structured "succeeded because X + artifacts (files/URLs/counts)" at completion
   | 'step_started'        // single-shot or container step started
   | 'step_completed'      // step finished — output is the final result
   | 'step_failed'         // step errored

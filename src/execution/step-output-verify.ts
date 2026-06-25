@@ -48,8 +48,10 @@ function matchesType(value: unknown, type: WorkflowContractType): boolean {
 
 /** Wave 3 P1-9: a value is "empty" when it carries no data — null/undefined,
  *  a blank/whitespace string, a zero-length array, or an object with no own
- *  keys. Numbers and booleans are never empty (0 / false are real values). */
-function isEmptyValue(value: unknown): boolean {
+ *  keys. Numbers and booleans are never empty (0 / false are real values).
+ *  Exported so the runner's substance-gap detector (Wave 2.1) uses the SAME
+ *  definition of "empty" as the declared-contract path. */
+export function isEmptyValue(value: unknown): boolean {
   if (value === null || value === undefined) return true;
   if (typeof value === 'string') return value.trim().length === 0;
   if (Array.isArray(value)) return value.length === 0;
