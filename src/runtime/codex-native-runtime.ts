@@ -506,6 +506,27 @@ export function functionCallInput(toolCall: CodexFunctionCall): CodexInputMessag
   return item;
 }
 
+/**
+ * Belt-and-suspenders: strip any non-fc id off function_call items across the
+ * ENTIRE input right before it is sent. A non-fc function_call id — from
+ * cross-provider history (a Claude/GLM turn replayed on Codex), a pre-fix
+ * persisted approval inputHistory, or any path that bypassed functionCallInput —
+ * makes Codex /responses 400 the WHOLE request ("Invalid input[n].id … Expected
+ * an ID that begins with 'fc'"; live failure 2026-06-24, deep in a mixed-brain
+ * thread). call_id does the function_call↔output correlation, so dropping the id
+ * is safe. Catches the leak no matter how it got into the input.
+ */
+export function sanitizeCodexInputIds(input: CodexInputMessage[]): CodexInputMessage[] {
+  return input.map((item) => {
+    const it = item as { type?: string; id?: string };
+    if (it.type === 'function_call' && it.id !== undefined && !isCodexFunctionCallItemId(it.id)) {
+      const { id: _drop, ...rest } = item as Record<string, unknown>;
+      return rest as CodexInputMessage;
+    }
+    return item;
+  });
+}
+
 function resolveCodexModel(model?: string): string {
   if (!model) return DEFAULT_CODEX_MODEL;
   if (model.startsWith('gpt-5')) return model;
@@ -628,7 +649,7 @@ async function performCodexRequest(
     instructions: request.instructions || 'You are Clementine, a persistent executive assistant. Be concise, accurate, and action-oriented.',
     store: false,
     stream: true,
-    input,
+    input: sanitizeCodexInputIds(input),
     tools: await createCodexToolDefinitions(request.excludeToolNames),
   };
   if (request.sessionId) {
@@ -1611,7 +1632,7 @@ export class CodexNativeRuntime implements AgentRuntime {
         || 'You are Clementine, a persistent executive assistant. Be concise, accurate, and action-oriented.',
       store: false,
       stream: true,
-      input: graceInput,
+      input: sanitizeCodexInputIds(graceInput),
       tools: [], // critical — no tools available on the grace turn
     };
     if (sessionId) body.prompt_cache_key = sessionId;

@@ -13,7 +13,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EventRow } from '../runtime/harness/eventlog.js';
-import { applyEventToState, parseApprovalIntent, parseHarnessCommand, __test__ } from './discord-harness.js';
+import {
+  applyEventToState,
+  isContinueCompletionReason,
+  parseApprovalIntent,
+  parseHarnessCommand,
+  __test__,
+} from './discord-harness.js';
 import type { PendingApprovalRow } from '../runtime/harness/approval-registry.js';
 
 function freshState() {
@@ -226,6 +232,42 @@ test('conversation_completed with sub-agent stall marks "stalled" status', () =>
   assert.equal(s.done, true);
 });
 
+test('continuation completion reasons include current and legacy limit markers', () => {
+  assert.equal(isContinueCompletionReason('awaiting_continue'), true);
+  assert.equal(isContinueCompletionReason('limit_exceeded'), true);
+  assert.equal(isContinueCompletionReason('claude_agent_sdk_brain'), false);
+  assert.equal(isContinueCompletionReason(undefined), false);
+});
+
+test('conversation_completed awaiting_continue marks stopped and preserves reply', () => {
+  const s = freshState();
+  applyEventToState(
+    event('conversation_completed', {
+      reply: 'Reply `continue` to keep going.',
+      reason: 'awaiting_continue',
+      limitKind: 'max_steps',
+    }),
+    s,
+  );
+  assert.equal(s.summary, 'Reply `continue` to keep going.');
+  assert.equal(s.status, 'stopped: max_steps');
+  assert.equal(s.done, true);
+});
+
+test('conversation_completed legacy limit_exceeded remains continuable', () => {
+  const s = freshState();
+  applyEventToState(
+    event('conversation_completed', {
+      summary: 'Paused at the model turn budget.',
+      reason: 'limit_exceeded',
+    }),
+    s,
+  );
+  assert.equal(s.summary, 'Paused at the model turn budget.');
+  assert.equal(s.status, 'stopped: continue');
+  assert.equal(s.done, true);
+});
+
 test('run_failed shows the error and marks done', () => {
   const s = freshState();
   applyEventToState(event('run_failed', { error: 'composio catalog timeout' }), s);
@@ -234,11 +276,11 @@ test('run_failed shows the error and marks done', () => {
   assert.equal(s.done, true);
 });
 
-test('conversation_limit_exceeded surfaces the reason and marks done', () => {
+test('conversation_limit_exceeded surfaces the reason without closing before the continue reply', () => {
   const s = freshState();
   applyEventToState(event('conversation_limit_exceeded', { reason: 'wall_clock', steps: 12 }), s);
   assert.equal(s.status, 'stopped: wall_clock');
-  assert.equal(s.done, true);
+  assert.equal(s.done, false);
 });
 
 test('unknown event types are no-ops (state untouched)', () => {

@@ -122,6 +122,9 @@ const ARTIFACT_EVIDENCE_RE =
 export function isPromiseShapedReply(reply?: string | null): boolean {
   const text = (reply ?? '').trim();
   if (!text) return false;
+  // Conversational alignment: "going forward I'll treat X as Y" is a durable
+  // correction/acknowledgement, not a promise to perform this turn's work.
+  if (/\b(?:going forward|from now on)\s+i'?ll\b/i.test(text)) return false;
   return PROMISE_PHRASE_RE.test(text) && !ARTIFACT_EVIDENCE_RE.test(text);
 }
 
@@ -134,6 +137,7 @@ export function isPromiseShapedReply(reply?: string | null): boolean {
  *  facts injected into every chat + voice prompt). Every prefix is harness-
  *  unique — a real user message never starts with one. */
 export const HARNESS_INJECTED_INPUT_PREFIXES = [
+  'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
   'Continue with the next step of your plan.',
   'You marked this objective complete,',
   'Your previous response was prose, not an action.',

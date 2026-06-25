@@ -51,6 +51,26 @@ export function isValidSpaceSlug(slug: string): boolean {
   return typeof slug === 'string' && SLUG_RE.test(slug);
 }
 
+/**
+ * Workspace runner declarations are filenames under data/, not paths. Keeping
+ * this strict makes save-time validation and runtime execution agree, and avoids
+ * accidentally executing files from served view/assets or other workspace dirs.
+ */
+export function runnerFilenameError(runner: string): string | null {
+  const name = runner.trim();
+  if (!name) return 'runner filename is empty';
+  if (
+    name === '.'
+    || name === '..'
+    || name.includes('/')
+    || name.includes('\\')
+    || name.includes('\0')
+  ) {
+    return `runner must be a filename under data/ (for example "refresh.mjs"), not a path: ${runner}`;
+  }
+  return null;
+}
+
 export interface SpaceDataSource {
   /** Stable id within the Space (e.g. "daily_pull"). */
   id: string;
@@ -114,6 +134,8 @@ export interface SpaceRecord {
   lastOpenedAt?: string;
   lastRefreshedAt?: string;
   recipe?: string;
+  /** Non-persisted diagnostics from normalizing a hand-written space.json. */
+  manifestErrors?: string[];
 }
 
 function ensureDir(dir: string): void {
@@ -161,21 +183,48 @@ function asStr(v: unknown): string | undefined { return typeof v === 'string' &&
 function asObj(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
 }
-function parseJsonObj(v: unknown): Record<string, unknown> | undefined {
+function parseJsonObjField(
+  v: unknown,
+  label: string,
+  manifestErrors: string[],
+): Record<string, unknown> | undefined {
   if (asObj(v)) return v as Record<string, unknown>;
-  if (typeof v === 'string') { try { const p = JSON.parse(v); return asObj(p); } catch { /* ignore */ } }
+  if (typeof v === 'string' && v.trim()) {
+    try {
+      const p = JSON.parse(v);
+      const obj = asObj(p);
+      if (obj) return obj;
+      manifestErrors.push(`${label} must be a JSON object, not ${Array.isArray(p) ? 'an array' : typeof p}.`);
+    } catch (err) {
+      manifestErrors.push(`${label} is not valid JSON: ${err instanceof Error ? err.message : String(err)}.`);
+    }
+  } else if (v != null) {
+    manifestErrors.push(`${label} must be a JSON object string, not ${Array.isArray(v) ? 'an array' : typeof v}.`);
+  }
   return undefined;
 }
 
 /** Normalize a data source, accepting BOTH the canonical camelCase shape and
  *  the snake_case tool-param names the agent may hand-write (composio_slug,
  *  composio_args_json). */
-function normDataSource(raw: unknown): SpaceDataSource {
+function normDataSource(raw: unknown, manifestErrors: string[], index: number): SpaceDataSource {
   const d = asObj(raw) ?? {};
   const ds: SpaceDataSource = { id: asStr(d.id) ?? '' };
-  const runner = asStr(d.runner); if (runner) ds.runner = runner;
+  const label = `Data source "${ds.id || `#${index + 1}`}"`;
+  const runner = asStr(d.runner);
+  if (runner) {
+    ds.runner = runner;
+    const err = runnerFilenameError(runner);
+    if (err) manifestErrors.push(`${label} ${err}.`);
+  }
   const cs = asStr(d.composioSlug) ?? asStr(d.composio_slug); if (cs) ds.composioSlug = cs;
-  const ca = asObj(d.composioArgs) ?? parseJsonObj(d.composio_args_json); if (ca) ds.composioArgs = ca;
+  if (d.composioArgs != null) {
+    const ca = parseJsonObjField(d.composioArgs, `${label} composioArgs`, manifestErrors);
+    if (ca) ds.composioArgs = ca;
+  } else {
+    const ca = parseJsonObjField(d.composio_args_json, `${label} composio_args_json`, manifestErrors);
+    if (ca) ds.composioArgs = ca;
+  }
   const sched = asStr(d.schedule); if (sched) ds.schedule = sched;
   const tz = asStr(d.timezone); if (tz) ds.timezone = tz;
   return ds;
@@ -183,13 +232,25 @@ function normDataSource(raw: unknown): SpaceDataSource {
 
 /** Normalize an action, accepting canonical + snake_case (composio_slug,
  *  args_template_json) the agent may hand-write. */
-function normAction(raw: unknown): SpaceAction {
+function normAction(raw: unknown, manifestErrors: string[], index: number): SpaceAction {
   const a = asObj(raw) ?? {};
   const act: SpaceAction = { id: asStr(a.id) ?? '' };
   const label = asStr(a.label); if (label) act.label = label;
   const cs = asStr(a.composioSlug) ?? asStr(a.composio_slug); if (cs) act.composioSlug = cs;
-  const runner = asStr(a.runner); if (runner) act.runner = runner;
-  const tpl = asObj(a.argsTemplate) ?? parseJsonObj(a.args_template_json); if (tpl) act.argsTemplate = tpl;
+  const diagnosticLabel = `Action "${act.id || `#${index + 1}`}"`;
+  const runner = asStr(a.runner);
+  if (runner) {
+    act.runner = runner;
+    const err = runnerFilenameError(runner);
+    if (err) manifestErrors.push(`${diagnosticLabel} ${err}.`);
+  }
+  if (a.argsTemplate != null) {
+    const tpl = parseJsonObjField(a.argsTemplate, `${diagnosticLabel} argsTemplate`, manifestErrors);
+    if (tpl) act.argsTemplate = tpl;
+  } else {
+    const tpl = parseJsonObjField(a.args_template_json, `${diagnosticLabel} args_template_json`, manifestErrors);
+    if (tpl) act.argsTemplate = tpl;
+  }
   if (a.confirm === true) act.confirm = true;
   return act;
 }
@@ -205,6 +266,7 @@ function normAction(raw: unknown): SpaceAction {
 function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): SpaceRecord | undefined {
   const m = asObj(raw);
   if (!m || m.id !== slug) return undefined;
+  const manifestErrors: string[] = [];
   let reengage = asObj(m.reengage) as { triggers: string[]; guidance?: string } | undefined;
   if (!reengage && (Array.isArray(m.reengageTriggers) || m.reengageGuidance)) {
     reengage = {
@@ -213,13 +275,13 @@ function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): Sp
     };
   }
   const status = m.status === 'paused' || m.status === 'archived' ? m.status : 'active';
-  return {
+  const rec: SpaceRecord = {
     id: slug,
     title: asStr(m.title) ?? slug,
     status,
     viewEntry: asStr(m.viewEntry) ?? 'view/index.html',
-    dataSources: Array.isArray(m.dataSources) ? m.dataSources.map(normDataSource) : [],
-    actions: Array.isArray(m.actions) ? m.actions.map(normAction) : [],
+    dataSources: Array.isArray(m.dataSources) ? m.dataSources.map((src, index) => normDataSource(src, manifestErrors, index)) : [],
+    actions: Array.isArray(m.actions) ? m.actions.map((act, index) => normAction(act, manifestErrors, index)) : [],
     reengage,
     originSessionId: asStr(m.originSessionId),
     focusId: typeof m.focusId === 'number' ? m.focusId : null,
@@ -231,6 +293,53 @@ function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): Sp
     lastRefreshedAt: asStr(m.lastRefreshedAt),
     recipe: asStr(m.recipe),
   };
+  if (manifestErrors.length > 0) rec.manifestErrors = manifestErrors;
+  return rec;
+}
+
+function missingManifestFixes(
+  errors: string[] | undefined,
+  hasDataSources: boolean,
+  hasActions: boolean,
+): string[] {
+  const missing: string[] = [];
+  if (!errors || errors.length === 0) return missing;
+  if (errors.some((e) => /^Data source /.test(e)) && !hasDataSources) missing.push('dataSources');
+  if (errors.some((e) => /^Action /.test(e)) && !hasActions) missing.push('actions');
+  return missing;
+}
+
+function declaredRunnerErrors(
+  dataSources: SpaceDataSource[] | undefined,
+  actions: SpaceAction[] | undefined,
+): string[] {
+  const errors: string[] = [];
+  for (const [index, src] of (dataSources ?? []).entries()) {
+    if (src.runner === undefined) continue;
+    const err = runnerFilenameError(src.runner);
+    if (err) errors.push(`Data source "${src.id || `#${index + 1}`}" ${err}.`);
+  }
+  for (const [index, action] of (actions ?? []).entries()) {
+    if (action.runner === undefined) continue;
+    const err = runnerFilenameError(action.runner);
+    if (err) errors.push(`Action "${action.id || `#${index + 1}`}" ${err}.`);
+  }
+  return errors;
+}
+
+function assertValidDeclaredRunners(
+  dataSources: SpaceDataSource[] | undefined,
+  actions: SpaceAction[] | undefined,
+): void {
+  const errors = declaredRunnerErrors(dataSources, actions);
+  if (errors.length > 0) {
+    throw new Error(`invalid workspace runner declarations:\n- ${errors.join('\n- ')}`);
+  }
+}
+
+function persistableRecord(record: SpaceRecord): Omit<SpaceRecord, 'manifestErrors'> {
+  const { manifestErrors: _manifestErrors, ...persisted } = record;
+  return persisted;
 }
 
 function readManifest(slug: string): SpaceRecord | undefined {
@@ -296,6 +405,15 @@ export class SpaceStore {
     ensureDir(dir);
     const now = new Date().toISOString();
     const existing = readManifest(input.id);
+    const missingFixes = missingManifestFixes(
+      existing?.manifestErrors,
+      input.dataSources !== undefined,
+      input.actions !== undefined,
+    );
+    if (missingFixes.length > 0) {
+      throw new Error(`existing space manifest has invalid fields; pass corrected ${missingFixes.join(' and ')} before saving`);
+    }
+    assertValidDeclaredRunners(input.dataSources, input.actions);
     const record: SpaceRecord = {
       id: input.id,
       title: input.title.trim().slice(0, 200) || input.id,
@@ -314,7 +432,7 @@ export class SpaceStore {
       lastRefreshedAt: existing?.lastRefreshedAt,
       recipe: input.recipe ?? existing?.recipe,
     };
-    atomicWrite(manifestPath(input.id), JSON.stringify(record, null, 2));
+    atomicWrite(manifestPath(input.id), JSON.stringify(persistableRecord(record), null, 2));
     return record;
   }
 
@@ -322,6 +440,13 @@ export class SpaceStore {
   update(slug: string, patch: Partial<Omit<SpaceRecord, 'id' | 'createdAt'>>): SpaceRecord | undefined {
     const existing = readManifest(slug);
     if (!existing) return undefined;
+    const missingFixes = missingManifestFixes(
+      existing.manifestErrors,
+      'dataSources' in patch,
+      'actions' in patch,
+    );
+    if (missingFixes.length > 0) return existing;
+    assertValidDeclaredRunners(patch.dataSources, patch.actions);
     const record: SpaceRecord = {
       ...existing,
       ...patch,
@@ -329,7 +454,8 @@ export class SpaceStore {
       createdAt: existing.createdAt,
       updatedAt: new Date().toISOString(),
     };
-    atomicWrite(manifestPath(slug), JSON.stringify(record, null, 2));
+    delete record.manifestErrors;
+    atomicWrite(manifestPath(slug), JSON.stringify(persistableRecord(record), null, 2));
     return record;
   }
 
@@ -355,6 +481,21 @@ export class SpaceStore {
       bytes: Buffer.byteLength(content, 'utf-8'),
       file: snapRel,
     };
+    if (existing.manifestErrors && existing.manifestErrors.length > 0) {
+      try {
+        const file = manifestPath(slug);
+        const raw = JSON.parse(readFileSync(file, 'utf-8'));
+        const obj = asObj(raw);
+        if (!obj) return existing;
+        obj.version = existing.version + 1;
+        obj.revisions = [...existing.revisions, revision].slice(-50);
+        obj.updatedAt = new Date().toISOString();
+        atomicWrite(file, JSON.stringify(obj, null, 2));
+        return readManifest(slug) ?? existing;
+      } catch {
+        return existing;
+      }
+    }
     return this.update(slug, {
       version: existing.version + 1,
       revisions: [...existing.revisions, revision].slice(-50),
@@ -363,6 +504,21 @@ export class SpaceStore {
 
   /** Archive (soft) — keeps files for restore. */
   archive(slug: string): SpaceRecord | undefined {
+    const existing = readManifest(slug);
+    if (existing?.manifestErrors && existing.manifestErrors.length > 0) {
+      try {
+        const file = manifestPath(slug);
+        const raw = JSON.parse(readFileSync(file, 'utf-8'));
+        const obj = asObj(raw);
+        if (!obj) return undefined;
+        obj.status = 'archived';
+        obj.updatedAt = new Date().toISOString();
+        atomicWrite(file, JSON.stringify(obj, null, 2));
+        return readManifest(slug);
+      } catch {
+        return undefined;
+      }
+    }
     return this.update(slug, { status: 'archived' });
   }
 

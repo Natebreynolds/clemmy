@@ -22,12 +22,15 @@
  * Set to off/0/false/no to restore instant execution while debugging.
  */
 import { getRuntimeEnv } from '../config.js';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
 import {
   onApprovalResolved, register, type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
 import { getSession, createSession } from '../runtime/harness/eventlog.js';
-import { spaceStore, type SpaceAction, type SpaceRecord } from './store.js';
+import { resolveInSpace, spaceStore, type SpaceAction, type SpaceRecord } from './store.js';
 import { appendNote, appendAudit } from './data-store.js';
 import { runSpaceAction } from './runner.js';
 
@@ -81,6 +84,102 @@ function actionPreview(action: SpaceAction, callerArgs: Record<string, unknown>)
   return bits || action.composioSlug || action.runner || action.id;
 }
 
+interface ActionApprovalSnapshot {
+  id: string;
+  label: string | null;
+  composioSlug: string | null;
+  runner: string | null;
+  argsTemplate: Record<string, unknown> | null;
+  confirm: boolean;
+  runnerSha256: string | null;
+}
+
+function asObj(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null;
+}
+
+function stableClone(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(stableClone);
+  const obj = asObj(v);
+  if (!obj) return v;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(obj).sort()) out[key] = stableClone(obj[key]);
+  return out;
+}
+
+function runnerSha256(slug: string, runner: string | undefined): string | null {
+  const name = runner?.trim();
+  if (!name) return null;
+  try {
+    const file = resolveInSpace(slug, path.join('data', name));
+    if (!existsSync(file)) return null;
+    return createHash('sha256').update(readFileSync(file)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function actionSnapshot(rec: SpaceRecord, action: SpaceAction): ActionApprovalSnapshot {
+  return {
+    id: action.id,
+    label: action.label ?? null,
+    composioSlug: action.composioSlug ?? null,
+    runner: action.runner ?? null,
+    argsTemplate: asObj(action.argsTemplate) ? stableClone(action.argsTemplate) as Record<string, unknown> : null,
+    confirm: action.confirm === true,
+    runnerSha256: runnerSha256(rec.id, action.runner),
+  };
+}
+
+function parseActionSnapshot(v: unknown): ActionApprovalSnapshot | null {
+  const obj = asObj(v);
+  if (!obj || typeof obj.id !== 'string') return null;
+  const argsTemplate = obj.argsTemplate === null || obj.argsTemplate === undefined
+    ? null
+    : asObj(obj.argsTemplate);
+  return {
+    id: obj.id,
+    label: typeof obj.label === 'string' ? obj.label : null,
+    composioSlug: typeof obj.composioSlug === 'string' ? obj.composioSlug : null,
+    runner: typeof obj.runner === 'string' ? obj.runner : null,
+    argsTemplate: argsTemplate ? stableClone(argsTemplate) as Record<string, unknown> : null,
+    confirm: obj.confirm === true,
+    runnerSha256: typeof obj.runnerSha256 === 'string' ? obj.runnerSha256 : null,
+  };
+}
+
+function snapshotsEqual(a: ActionApprovalSnapshot, b: ActionApprovalSnapshot): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function actionFromSnapshot(snapshot: ActionApprovalSnapshot): SpaceAction {
+  const action: SpaceAction = { id: snapshot.id };
+  if (snapshot.label) action.label = snapshot.label;
+  if (snapshot.composioSlug) action.composioSlug = snapshot.composioSlug;
+  if (snapshot.runner) action.runner = snapshot.runner;
+  if (snapshot.argsTemplate) action.argsTemplate = snapshot.argsTemplate;
+  if (snapshot.confirm) action.confirm = true;
+  return action;
+}
+
+function recordApprovedActionNotRun(
+  slug: string,
+  actionLabel: string,
+  actionId: string,
+  approvalId: string,
+  error: string,
+): void {
+  appendAudit(slug, {
+    method: 'ACTION', path: `/action/${actionId}`,
+    outcome: 'error', note: error,
+  });
+  appendNote(slug, {
+    text: `“${actionLabel}” was not run after approval: ${error}`,
+    kind: 'action',
+    meta: { actionId, ok: false, approvalId },
+  });
+}
+
 export interface EnqueueResult { approvalId: string; subject: string; }
 
 /** The dedicated session id for a Workspace (shared with the dock + re-engage
@@ -114,6 +213,7 @@ export function enqueueSpaceActionApproval(
       actionId: action.id,
       callerArgs,
       composioSlug: action.composioSlug ?? null,
+      actionSnapshot: actionSnapshot(rec, action),
       preview: actionPreview(action, callerArgs),
     },
   });
@@ -137,17 +237,51 @@ export async function executeApprovedSpaceAction(row: PendingApprovalRow): Promi
   if (!slug || !actionId) return;
   const rec = spaceStore.get(slug);
   if (!rec) return;
+  const approvedSnapshot = parseActionSnapshot(args.actionSnapshot);
   const action = rec.actions.find((a) => a.id === actionId);
-  if (!action) return;
-  const result = await runSpaceAction(slug, action, callerArgs);
+  const label = approvedSnapshot?.label ?? action?.label ?? actionId;
+  if (!approvedSnapshot) {
+    recordApprovedActionNotRun(
+      slug,
+      label,
+      actionId,
+      row.approvalId,
+      'approval is missing its action snapshot; click the workspace action again so the approval can bind to the exact action.',
+    );
+    return;
+  }
+  if (rec.status !== 'active') {
+    recordApprovedActionNotRun(slug, label, actionId, row.approvalId, `workspace is ${rec.status}.`);
+    return;
+  }
+  if (!action) {
+    recordApprovedActionNotRun(slug, label, actionId, row.approvalId, 'action no longer exists in the workspace.');
+    return;
+  }
+  if (!snapshotsEqual(actionSnapshot(rec, action), approvedSnapshot)) {
+    recordApprovedActionNotRun(
+      slug,
+      label,
+      actionId,
+      row.approvalId,
+      'action changed after approval was requested; click it again to approve the current action.',
+    );
+    return;
+  }
+  if (rec.manifestErrors && rec.manifestErrors.length > 0) {
+    const error = `workspace manifest is invalid; fix with space_save before running actions: ${rec.manifestErrors.join('; ')}`;
+    recordApprovedActionNotRun(slug, label, actionId, row.approvalId, error);
+    return;
+  }
+  const result = await runSpaceAction(slug, actionFromSnapshot(approvedSnapshot), callerArgs);
   appendAudit(slug, {
     method: 'ACTION', path: `/action/${actionId}`,
     outcome: result.ok ? 'ok' : 'error', note: result.ok ? row.approvalId : result.error,
   });
   appendNote(slug, {
     text: result.ok
-      ? `Approved and ran “${action.label ?? actionId}”.`
-      : `“${action.label ?? actionId}” failed after approval: ${result.error}`,
+      ? `Approved and ran “${label}”.`
+      : `“${label}” failed after approval: ${result.error}`,
     kind: 'action',
     meta: { actionId, ok: result.ok, approvalId: row.approvalId },
   });
@@ -168,6 +302,21 @@ function recordUnapproved(row: PendingApprovalRow): void {
   });
 }
 
+function recordApprovalExecutionCrash(row: PendingApprovalRow, err: unknown): void {
+  const args = row.args ?? {};
+  const slug = typeof args.spaceSlug === 'string' ? args.spaceSlug : '';
+  const actionId = typeof args.actionId === 'string' ? args.actionId : '';
+  if (!slug || !actionId) return;
+  const message = err instanceof Error ? err.message : String(err);
+  recordApprovedActionNotRun(
+    slug,
+    actionId,
+    actionId,
+    row.approvalId,
+    `approved action crashed before it could report an outcome: ${message}`,
+  );
+}
+
 let initialized = false;
 /**
  * Wire the resolve listener once (idempotent). Called from registerSpaceRoutes
@@ -179,7 +328,9 @@ export function initSpaceActionApprovals(): void {
   onApprovalResolved((row) => {
     if (row.tool !== SPACE_ACTION_TOOL) return;
     if (row.resolution === 'approved') {
-      void executeApprovedSpaceAction(row).catch(() => { /* outcome already audited inside */ });
+      void executeApprovedSpaceAction(row).catch((err) => {
+        recordApprovalExecutionCrash(row, err);
+      });
     } else {
       recordUnapproved(row);
     }

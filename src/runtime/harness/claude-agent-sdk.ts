@@ -17,6 +17,7 @@ import { mergedSpawnEnv } from '../spawn-env.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import { buildGatedToolPermission } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
+import { recordModelUsage } from '../usage-log.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -488,6 +489,82 @@ function extractInit(message: SDKMessage): SDKSystemMessage | null {
     : null;
 }
 
+function numeric(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+function readUsageField(obj: Record<string, unknown> | undefined, snake: string, camel: string): number {
+  if (!obj) return 0;
+  return numeric(obj[snake]) || numeric(obj[camel]);
+}
+
+function usageTotalsFromResult(result: SDKResultMessage | null): {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+} | null {
+  if (!result) return null;
+  const usage = result.usage as Record<string, unknown> | undefined;
+  let inputTokens =
+    readUsageField(usage, 'input_tokens', 'inputTokens')
+    + readUsageField(usage, 'cache_creation_input_tokens', 'cacheCreationInputTokens')
+    + readUsageField(usage, 'cache_read_input_tokens', 'cacheReadInputTokens');
+  let cachedInputTokens = readUsageField(usage, 'cache_read_input_tokens', 'cacheReadInputTokens');
+  let outputTokens = readUsageField(usage, 'output_tokens', 'outputTokens');
+
+  // Some SDK versions emphasize modelUsage; keep it as a fallback when the
+  // aggregate usage is absent/zero.
+  if (inputTokens === 0 && outputTokens === 0 && result.modelUsage && typeof result.modelUsage === 'object') {
+    for (const raw of Object.values(result.modelUsage as Record<string, unknown>)) {
+      const m = raw as Record<string, unknown>;
+      inputTokens += numeric(m.inputTokens) + numeric(m.cacheCreationInputTokens) + numeric(m.cacheReadInputTokens);
+      cachedInputTokens += numeric(m.cacheReadInputTokens);
+      outputTokens += numeric(m.outputTokens);
+    }
+  }
+  if (inputTokens === 0 && outputTokens === 0) return null;
+  return { inputTokens, cachedInputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+}
+
+function recordClaudeAgentSdkUsage(
+  options: ClaudeAgentSdkRunOptions,
+  result: SDKResultMessage | null,
+  init: SDKSystemMessage | null,
+): void {
+  try {
+    const totals = usageTotalsFromResult(result);
+    if (!totals) return;
+    const responseId = (result as { uuid?: unknown } | null)?.uuid;
+    recordModelUsage({
+      sessionId: options.sessionId?.trim() || result?.session_id || init?.session_id || 'unknown',
+      model: init?.model || options.modelId || 'claude-agent-sdk',
+      inputTokens: totals.inputTokens,
+      cachedInputTokens: totals.cachedInputTokens,
+      outputTokens: totals.outputTokens,
+      totalTokens: totals.totalTokens,
+      durationMs: numeric((result as { duration_ms?: unknown } | null)?.duration_ms),
+      responseId: typeof responseId === 'string' ? responseId : undefined,
+    });
+  } catch { /* observability must never break the SDK lane */ }
+}
+
+function bestLimitHitText(lastAssistantText: string, streamedText: string): string {
+  const assistant = lastAssistantText.trim();
+  const streamed = streamedText.trim();
+  if (streamed && (!assistant || streamed.length >= assistant.length)) return streamed;
+  return assistant || streamed || 'I reached the turn budget before finishing. Say "continue" and I\'ll pick up where I left off.';
+}
+
+function bestSuccessText(resultText: string | undefined, lastAssistantText: string, streamedText: string): string {
+  const result = resultText?.trim();
+  if (result) return resultText as string;
+  const assistant = lastAssistantText.trim();
+  const streamed = streamedText.trim();
+  if (streamed && (!assistant || streamed.length >= assistant.length)) return streamed;
+  return assistant || streamed || '';
+}
+
 export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Promise<ClaudeAgentSdkRunResult> {
   const env = await buildClaudeHeadlessEnv();
   const allowed = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
@@ -558,6 +635,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Keep the latest assistant text so a turn-budget stop can surface the partial
   // answer (error results carry no `result` field).
   let lastAssistantText = '';
+  // The SDK may stream text_delta events and then throw a max-turns error before
+  // a full assistant message arrives. Keep those deltas so the durable
+  // conversation_completed reply can preserve the partial work. `streamedAny`
+  // below still tracks only user-visible chunks (onDelta delivered), because
+  // first-byte overload retry is unsafe only after visible output or tool work.
+  let streamedText = '';
   // Some Claude Code SDK versions surface a turn-budget stop NOT as a clean
   // `result` message (subtype error_max_turns) but as a THROWN stream error
   // ("Claude Code returned an error result: Reached maximum number of turns (N)").
@@ -575,15 +658,22 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     init = null;
     toolUses = [];
     lastAssistantText = '';
+    streamedText = '';
+    streamedAny = false;
     threwTurnLimit = false;
     const toolById = new Map<string, { name: string; input: unknown }>();
-    const stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
+    let stream: Query | undefined;
     try {
+      stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       for await (const message of stream) {
         init = init ?? extractInit(message);
-        if (options.onDelta) {
-          const delta = extractTextDelta(message);
-          if (delta) { streamedAny = true; try { await options.onDelta(delta); } catch { /* a delta-sink error must never break the run */ } }
+        const delta = extractTextDelta(message);
+        if (delta) {
+          streamedText += delta;
+          if (options.onDelta) {
+            streamedAny = true;
+            try { await options.onDelta(delta); } catch { /* a delta-sink error must never break the run */ }
+          }
         }
         const atext = extractAssistantText(message);
         if (atext) lastAssistantText = atext;
@@ -601,13 +691,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && (result?.subtype ?? 'success') !== 'success') {
+      if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && result?.subtype !== 'success') {
         threwTurnLimit = true;
       } else if (isProviderOverloadMessage(msg)) {
         const committed = toolUses.length > 0 || streamedAny;
         // Safe first-byte retry: nothing committed yet and budget remains.
         if (overloadRetryEnabled() && !committed && attempt < maxOverloadRetries()) {
-          try { stream.close?.(); } catch { /* ignore */ }
+          try { stream?.close?.(); } catch { /* ignore */ }
           await sleep(overloadBackoffMs(attempt));
           continue;
         }
@@ -618,14 +708,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         throw err;
       }
     } finally {
-      try { stream.close?.(); } catch { /* ignore */ }
+      try { stream?.close?.(); } catch { /* ignore */ }
     }
     break; // success (or a turn-limit stop) → leave the retry loop
   }
+  const partialLimitText = (): string => bestLimitHitText(lastAssistantText, streamedText);
 
   if (threwTurnLimit) {
+    recordClaudeAgentSdkUsage(options, result, init);
     return {
-      text: (lastAssistantText.trim() || 'I reached the turn budget before finishing. Say "continue" and I\'ll pick up where I left off.'),
+      text: partialLimitText(),
       sessionId: result?.session_id ?? init?.session_id,
       model: init?.model,
       toolUses,
@@ -642,8 +734,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     // (mirrors the harness loop's max-turns-with-grace) instead of throwing a
     // raw "Claude Agent SDK failed" error that the caller reports as run_failed.
     if (result.subtype === 'error_max_turns') {
+      recordClaudeAgentSdkUsage(options, result, init);
       return {
-        text: (lastAssistantText.trim() || 'I reached the turn budget before finishing. Say "continue" and I\'ll pick up where I left off.'),
+        text: partialLimitText(),
         sessionId: result.session_id,
         model: init?.model,
         toolUses,
@@ -652,10 +745,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         limitHit: true,
       };
     }
+    recordClaudeAgentSdkUsage(options, result, init);
     throw new Error(`Claude Agent SDK failed: ${JSON.stringify(result).slice(0, 800)}`);
   }
+  recordClaudeAgentSdkUsage(options, result, init);
   return {
-    text: result.result,
+    text: bestSuccessText(result.result, lastAssistantText, streamedText),
     structuredOutput: result.structured_output,
     sessionId: result.session_id,
     model: init?.model,

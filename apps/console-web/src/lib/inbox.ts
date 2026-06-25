@@ -21,6 +21,11 @@ export interface RunRow {
   title: string;
   input?: string;
   status: string;
+  statusLabel?: string;
+  runState?: string;
+  runStateLabel?: string;
+  needsAttention?: boolean;
+  preview?: string;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string;
@@ -100,7 +105,9 @@ export function statusTone(status?: string): { tone: Tone; label: string } {
   if (['completed', 'complete', 'done', 'delivered', 'sent', 'ok'].includes(s)) return { tone: 'success', label: 'Done' };
   if (['failed', 'error', 'not_delivered'].includes(s)) return { tone: 'danger', label: 'Failed' };
   if (['running', 'active', 'received', 'in_progress'].includes(s)) return { tone: 'live', label: 'Working' };
-  if (['awaiting_approval', 'paused', 'queued', 'pending'].includes(s)) return { tone: 'warning', label: 'Waiting' };
+  if (['awaiting_approval', 'needs_attention', 'paused', 'queued', 'pending'].includes(s)) {
+    return { tone: 'warning', label: s === 'needs_attention' ? 'Needs attention' : 'Waiting' };
+  }
   if (['cancelled', 'canceled'].includes(s)) return { tone: 'neutral', label: 'Cancelled' };
   return { tone: 'neutral', label: status || 'Unknown' };
 }

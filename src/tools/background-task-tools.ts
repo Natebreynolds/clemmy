@@ -15,6 +15,8 @@ const statusSchema = z.enum([
   'running',
   'cancelling',
   'awaiting_approval',
+  'awaiting_input',
+  'awaiting_continue',
   'done',
   'failed',
   'aborted',

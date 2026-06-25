@@ -23,12 +23,12 @@ jobs:
         run: npm ci
 
       # Run the node:test suite via tsx. The pattern matches every
-      # *.test.ts file under src/. Currently 100+ tests across:
+      # *.test.ts file under src/ and apps/. Currently 100+ tests across:
       #   - memory: embeddings, recall, facts
       #   - agents: autonomy-v2, run-tracking, autonomy-guardrails, check-ins
       # If you add a new test file, this picks it up automatically.
       - name: Run tests
-        run: npx tsx --test src/**/*.test.ts
+        run: npm test
 
   gate-benchmark:
     name: Harness gate benchmark (violations prevented)
@@ -55,9 +55,8 @@ jobs:
         run: npm run bench:gates
 
   typecheck:
-    name: TypeScript check (non-blocking on WIP files)
+    name: TypeScript check
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -71,10 +70,45 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Run tsc but allow failure for now — there are work-in-progress
-      # type errors in background-tasks.ts and codex-native-runtime.ts
-      # that pre-date the SDK-native autonomy work. This step surfaces
-      # them in CI output without blocking merges. Flip
-      # continue-on-error to false once those files settle.
       - name: Typecheck
-        run: npx tsc --noEmit
+        run: npm run typecheck
+
+  web-apps:
+    name: Web app builds
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            apps/mobile-web/package-lock.json
+            apps/console-web/package-lock.json
+
+      - name: Install mobile-web dependencies
+        run: npm ci
+        working-directory: apps/mobile-web
+
+      - name: Install console-web dependencies
+        run: npm ci
+        working-directory: apps/console-web
+
+      - name: Typecheck mobile-web
+        run: npm run typecheck
+        working-directory: apps/mobile-web
+
+      - name: Build mobile-web
+        run: npm run build
+        working-directory: apps/mobile-web
+
+      - name: Typecheck console-web
+        run: npm run typecheck
+        working-directory: apps/console-web
+
+      - name: Build console-web
+        run: npm run build
+        working-directory: apps/console-web

@@ -45,16 +45,17 @@ test('surfaces ONE nudge for finished + parked stale tasks, with accurate counts
     rec({ id: 'f1', title: 'old enrichment', status: 'done' }),
     rec({ id: 'f2', title: 'failed pull', status: 'failed' }),
     rec({ id: 'p1', title: 'waiting on you', status: 'awaiting_input' }),
+    rec({ id: 'p2', title: 'waiting to continue', status: 'awaiting_continue' }),
   ];
   const out = runStaleTaskHeartbeat(tasks, NOW);
-  assert.equal(out.stale, 3);
+  assert.equal(out.stale, 4);
   const prompts = stalePrompts();
   assert.equal(prompts.length, 1, 'exactly one batched nudge');
-  assert.match(prompts[0].title, /3 old background tasks — archive them\?/);
-  assert.equal(prompts[0].metadata?.staleCount, 3);
+  assert.match(prompts[0].title, /4 old background tasks — archive them\?/);
+  assert.equal(prompts[0].metadata?.staleCount, 4);
   assert.equal(prompts[0].metadata?.finished, 2);
-  assert.equal(prompts[0].metadata?.parked, 1);
-  assert.deepEqual([...(prompts[0].metadata?.staleTaskIds as string[])].sort(), ['f1', 'f2', 'p1']);
+  assert.equal(prompts[0].metadata?.parked, 2);
+  assert.deepEqual([...(prompts[0].metadata?.staleTaskIds as string[])].sort(), ['f1', 'f2', 'p1', 'p2']);
 });
 
 test('dedup: a second sweep in the same 7-day window does not add another nudge', () => {

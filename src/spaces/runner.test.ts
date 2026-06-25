@@ -46,6 +46,7 @@ process.stdin.on('end', () => {
     pathHasWellKnown: (process.env.PATH || '').split(':').some((d) => d === '/usr/local/bin' || d === '/opt/homebrew/bin'),
     sawSecret: process.env.SPACE_TEST_SECRET ?? null,
     payloadSlug: p.slug ?? null,
+    payloadRunner: p.runner ?? null,
   }));
 });
 `;
@@ -62,12 +63,30 @@ test('node (.mjs) runner: ELECTRON_RUN_AS_NODE set, PATH augmented, secrets scru
     assert.equal(d.electron, '1', 'ELECTRON_RUN_AS_NODE must be 1 for a node runner');
     assert.equal(d.slug, slug);
     assert.equal(d.payloadSlug, slug, 'stdin JSON payload must round-trip');
+    assert.equal(d.payloadRunner, 'echo.mjs', 'stdin JSON payload must include runner identity');
     assert.equal(d.pathHasWellKnown, true, 'PATH must be augmented with the well-known bin dirs');
     assert.ok(d.lang, 'LANG baseline must be set');
     assert.equal(d.sawSecret, null, 'daemon secret env must NOT leak into the runner');
   } finally {
     delete process.env.SPACE_TEST_SECRET;
   }
+});
+
+test('runner stdin identity cannot be overridden by dry-run payload extras', async () => {
+  const slug = 'payload-identity';
+  writeRunner(slug, 'echo.mjs', ENV_ECHO_MJS);
+
+  const res = await runner.runScript(slug, 'echo.mjs', {
+    slug: '../other-space',
+    runner: '../view/evil.mjs',
+    customInput: true,
+  });
+
+  assert.equal(res.ok, true, res.ok ? '' : (res as { error: string }).error);
+  const d = (res as { data: Record<string, unknown> }).data;
+  assert.equal(d.slug, slug);
+  assert.equal(d.payloadSlug, slug);
+  assert.equal(d.payloadRunner, 'echo.mjs');
 });
 
 test('shell (.sh) runner: works and does NOT get ELECTRON_RUN_AS_NODE', async () => {
@@ -98,6 +117,23 @@ test('runner that prints non-JSON → clear error (not a crash)', async () => {
   assert.match((res as { error: string }).error, /not valid JSON/);
 });
 
+test('refreshSpaceData refuses malformed hand-written manifest JSON before running sources', async () => {
+  const slug = 'bad-manifest-refresh';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(path.join(dir, 'data'), { recursive: true });
+  writeFileSync(path.join(dir, 'data', 'r.mjs'), `process.stdout.write(JSON.stringify({rows:[1]}));`, 'utf-8');
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Bad Manifest Refresh',
+    dataSources: [{ id: 'pull', runner: 'r.mjs', composio_args_json: '{not json' }],
+  }), 'utf-8');
+
+  const res = await runner.refreshSpaceData(slug, 'pull');
+  assert.equal(res[0].ok, false);
+  assert.match(res[0].error ?? '', /workspace manifest is invalid/);
+  assert.match(res[0].error ?? '', /composio_args_json is not valid JSON/);
+});
+
 test('runner that prints nothing (exit 0) → "produced no output"', async () => {
   const slug = 'no-output';
   writeRunner(slug, 'r.mjs', `process.exit(0);`);
@@ -121,4 +157,16 @@ test('unsupported extension → actionable error', async () => {
   const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: 'data.txt' });
   assert.equal(res.ok, false);
   assert.match((res as { error: string }).error, /unsupported runner extension/);
+});
+
+test('runner path traversal is refused even if the target file exists inside the workspace', async () => {
+  const slug = 'runner-path-traversal';
+  const viewDir = store.resolveInSpace(slug, 'view');
+  mkdirSync(viewDir, { recursive: true });
+  writeFileSync(path.join(viewDir, 'evil.mjs'), `process.stdout.write(JSON.stringify({ran:true}));`, 'utf-8');
+
+  const res = await runner.runSpaceDataSource(slug, { id: 'contacts', runner: '../view/evil.mjs' });
+
+  assert.equal(res.ok, false);
+  assert.match((res as { error: string }).error, /runner must be a filename under data\//);
 });

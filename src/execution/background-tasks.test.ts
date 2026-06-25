@@ -16,6 +16,7 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-bgtasks-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_HARNESS_BACKGROUND = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
@@ -25,12 +26,17 @@ const {
   getBackgroundTask,
   listBackgroundTasks,
   resumeInterruptedBackgroundTasks,
+  resumeBackgroundTask,
   processBackgroundTasks,
   classifyBackgroundTaskOutcome,
+  _setBackgroundDeliveryJudgeForTests,
   markBackgroundTaskAwaitingInput,
+  markBackgroundTaskAwaitingContinue,
   queueBackgroundTaskInputResolution,
+  queueBackgroundTaskContinue,
   getBackgroundTaskByQuestionId,
   findSoleAwaitingInputTaskForOrigin,
+  findSoleAwaitingContinueTaskForOrigin,
   updateBackgroundTask,
   archiveBackgroundTask,
   restoreBackgroundTask,
@@ -41,6 +47,7 @@ const {
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 const { SessionStore } = await import('../memory/session-store.js');
+const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../runtime/harness/fanout-ledger.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -131,6 +138,120 @@ test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-ap
   assert.equal(scope!.planProposalId, `background-task:${task.id}`);
 });
 
+test('processBackgroundTasks auto-continues a max-turn pause before marking the task done', async () => {
+  const task = createBackgroundTask({ title: 'Long analysis', prompt: 'work through all records' });
+  const messages: string[] = [];
+
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { message: string; sessionId: string }) {
+      messages.push(request.message);
+      if (messages.length === 1) {
+        return {
+          text: 'Partial pass finished; more records remain.',
+          sessionId: request.sessionId,
+          stoppedReason: 'max-turns-with-grace' as const,
+        };
+      }
+      return {
+        text: 'Done — all records were processed and verified.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.equal(messages.length, 2, 'the processor should issue a continuation turn');
+  assert.match(messages[1], /Continue background task/);
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'done');
+  assert.match(updated?.result ?? '', /all records were processed/);
+});
+
+test('processBackgroundTasks clears per-turn fanout coverage before automatic continuation', async () => {
+  const task = createBackgroundTask({ title: 'Recover failed fanout', prompt: 'process every prospect' });
+  clearLedger(task.runSessionId);
+  let calls = 0;
+
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { sessionId: string }) {
+      calls += 1;
+      if (calls === 1) {
+        recordWorkerResult({
+          sessionId: task.runSessionId,
+          callId: 'worker-first-failed',
+          item: 'Acme LLP',
+          ok: false,
+          reason: 'ERROR: first pass ran out of room',
+        });
+        return {
+          text: 'Partial pass hit the turn budget; Acme still needs recovery.',
+          sessionId: request.sessionId,
+          stoppedReason: 'max-turns-with-grace' as const,
+        };
+      }
+      return {
+        text: 'Done — recovered Acme and completed every prospect.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.equal(calls, 2);
+  assert.equal(summarizeLedger(task.runSessionId).total, 0, 'max-turn continuation resets per-turn fanout coverage');
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'done');
+  assert.match(updated?.result ?? '', /recovered Acme/);
+});
+
+test('processBackgroundTasks parks turn-budget exhaustion before terminal fanout coverage', async () => {
+  const task = createBackgroundTask({ title: 'Exhausted fanout run', prompt: 'process a very large list' });
+  clearLedger(task.runSessionId);
+  let calls = 0;
+
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { sessionId: string }) {
+      calls += 1;
+      recordWorkerResult({
+        sessionId: task.runSessionId,
+        callId: `worker-failed-${calls}`,
+        item: `Prospect ${calls}`,
+        ok: false,
+        reason: 'ERROR: pass ended before this item recovered',
+      });
+      return {
+        text: `Pass ${calls} hit the turn budget before finishing.`,
+        sessionId: request.sessionId,
+        stoppedReason: 'max-turns-with-grace' as const,
+      };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.ok(calls > 1, 'the worker should attempt bounded automatic continuations before parking');
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'awaiting_continue');
+  assert.match(updated?.error ?? '', /turn budget/i);
+  assert.equal(summarizeLedger(task.runSessionId).total, 0, 'parked continuation clears stale per-turn fanout coverage');
+});
+
 test('markBackgroundTaskDone feeds the result back into the origin session (async report-back)', () => {
   const sessionId = 'sess-reportback-1';
   const task = createBackgroundTask({
@@ -201,6 +322,16 @@ test('classifyBackgroundTaskOutcome: stoppedReason "error" → blocked (not a ho
   assert.ok(outcome.reason && /wall-clock budget/.test(outcome.reason), 'reason carries the error text');
 });
 
+test('classifyBackgroundTaskOutcome: max-turns-with-grace → blocked until continued', () => {
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-turn-budget' },
+    'I hit the run budget before finishing — say "continue" to keep going.',
+    'max-turns-with-grace',
+  );
+  assert.equal(outcome.outcome, 'blocked', 'a continuation prompt is not a completed background task');
+  assert.match(outcome.reason ?? '', /continue|budget/i);
+});
+
 test('classifyBackgroundTaskOutcome: the wall-clock error text alone (no stoppedReason) → blocked', () => {
   const outcome = classifyBackgroundTaskOutcome(
     { runSessionId: 'sess-p0c-text' },
@@ -222,6 +353,88 @@ test('classifyBackgroundTaskOutcome: a genuinely-complete run still reports done
     'Finished the export and saved it to your vault.',
   );
   assert.equal(doneNoReason.outcome, 'done', 'clean text with no stoppedReason stays done');
+});
+
+test('processBackgroundTasks blocks promise-shaped completion when the delivery judge rejects it', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({ title: 'Prepare contacts', prompt: 'Pull the contacts and write the sheet' });
+  let judgeCalls = 0;
+
+  _setBackgroundDeliveryJudgeForTests(async (objective, response) => {
+    judgeCalls += 1;
+    assert.match(objective, /Pull the contacts/);
+    assert.match(response, /send them next/);
+    return { done: false, reason: 'no verifiable sheet or contact rows' };
+  });
+
+  try {
+    const stubAssistant = {
+      getRuntime() {
+        return {} as never;
+      },
+      async respond(request: { sessionId: string }) {
+        return {
+          text: "I'll pull those contacts and send them next.",
+          sessionId: request.sessionId,
+          stoppedReason: 'success' as const,
+        };
+      },
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const processed = await processBackgroundTasks(stubAssistant as any, 1);
+    assert.equal(processed, 1);
+    assert.equal(judgeCalls, 1, 'promise-shaped unattended completion must be judged');
+    const updated = getBackgroundTask(task.id);
+    assert.equal(updated?.status, 'blocked');
+    assert.match(updated?.error ?? '', /no verifiable sheet/);
+  } finally {
+    _setBackgroundDeliveryJudgeForTests(null);
+  }
+});
+
+test('processBackgroundTasks blocks promise-shaped post-approval completion when the delivery judge rejects it', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({ title: 'Finish approved send', prompt: 'Send the approved follow-up email' });
+  updateBackgroundTask(task.id, {
+    approvalResolution: { approvalId: 'approval-bg-1', approved: true, queuedAt: new Date().toISOString() },
+  });
+  let judgeCalls = 0;
+
+  _setBackgroundDeliveryJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: false, reason: 'approval resumed but no send receipt is present' };
+  });
+
+  try {
+    const stubAssistant = {
+      getRuntime() {
+        return {
+          async resolveApproval(approvalId: string, approved: boolean) {
+            return {
+              approvalId,
+              status: approved ? 'approved' as const : 'rejected' as const,
+              text: "I'll send the approved follow-up next.",
+              sessionId: task.runSessionId,
+            };
+          },
+        };
+      },
+      async respond() {
+        throw new Error('respond should not be called on approval resume');
+      },
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const processed = await processBackgroundTasks(stubAssistant as any, 1);
+    assert.equal(processed, 1);
+    assert.equal(judgeCalls, 1, 'post-approval promise-shaped completion must be judged');
+    const updated = getBackgroundTask(task.id);
+    assert.equal(updated?.status, 'blocked');
+    assert.match(updated?.error ?? '', /no send receipt/);
+  } finally {
+    _setBackgroundDeliveryJudgeForTests(null);
+  }
 });
 
 // ─── needs_input check-in round-trip (the judge-gated pause/resume) ───
@@ -257,6 +470,28 @@ test('getBackgroundTaskByQuestionId + findSoleAwaitingInputTaskForOrigin resolve
   assert.equal(findSoleAwaitingInputTaskForOrigin('console:alpha'), null);
 });
 
+test('awaiting_continue tasks can be found by origin and re-queued in place', () => {
+  const task = createBackgroundTask({ title: 'Long background run', prompt: 'keep working', originSessionId: 'console:continue' });
+  markBackgroundTaskAwaitingContinue(task.id, 'hit turn budget', 'partial notes');
+
+  assert.equal(findSoleAwaitingContinueTaskForOrigin('console:continue')?.id, task.id);
+  const queued = queueBackgroundTaskContinue(task.id);
+  assert.equal(queued?.id, task.id, 'continuation keeps the same durable task');
+  assert.equal(queued?.status, 'pending');
+  assert.ok(queued?.continueResolution, 'queued task carries continuation context');
+  assert.match(queued?.lastCheckInMessage ?? '', /Continue requested/);
+});
+
+test('resumeBackgroundTask re-queues awaiting_continue without spawning a child task', () => {
+  const task = createBackgroundTask({ title: 'Resume paused run', prompt: 'continue it', originSessionId: 'console:resume' });
+  markBackgroundTaskAwaitingContinue(task.id, 'hit turn budget', 'partial notes');
+
+  const resumed = resumeBackgroundTask(task.id);
+  assert.equal(resumed?.id, task.id);
+  assert.equal(resumed?.status, 'pending');
+  assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, undefined);
+});
+
 // ─── dispatch tool: agreed plan flows into the worker prompt verbatim ───
 
 test('enqueueDurableChatTask uses a composedPrompt verbatim + sets originSessionId for report-back', () => {
@@ -287,11 +522,16 @@ test('staleTaskKind: a finished task past the threshold is "finished"; a fresh o
   assert.equal(staleTaskKind(done, Date.parse(done.updatedAt) + 1000), null, 'a day-old finished task is not stale');
 });
 
-test('staleTaskKind: a parked (awaiting_input/approval) task past the threshold is "parked"', () => {
+test('staleTaskKind: a parked (awaiting_input/approval/continue) task past the threshold is "parked"', () => {
   const t = createBackgroundTask({ title: 'forgotten parked task', prompt: 'x' });
   updateBackgroundTask(t.id, { status: 'awaiting_input' });
   const parked = getBackgroundTask(t.id)!;
   assert.equal(staleTaskKind(parked, Date.parse(parked.updatedAt) + STALE_TASK_AGE_MS + DAY), 'parked');
+
+  const c = createBackgroundTask({ title: 'forgotten continue task', prompt: 'x' });
+  updateBackgroundTask(c.id, { status: 'awaiting_continue' });
+  const awaitingContinue = getBackgroundTask(c.id)!;
+  assert.equal(staleTaskKind(awaitingContinue, Date.parse(awaitingContinue.updatedAt) + STALE_TASK_AGE_MS + DAY), 'parked');
 });
 
 test('staleTaskKind: active states (pending/running) are NEVER stale, however old', () => {

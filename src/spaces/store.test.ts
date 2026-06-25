@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -85,6 +85,133 @@ test('list ignores non-slug dirs and dirs without a manifest', () => {
   mkdirSync(stray, { recursive: true });
   const ids = store.spaceStore.list().map((s) => s.id);
   assert.equal(ids.includes('no-manifest'), false);
+});
+
+test('hand-written manifest keeps invalid JSON diagnostics instead of silently dropping args', () => {
+  const slug = 'bad-manifest';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Bad Manifest',
+    dataSources: [{ id: 'pull', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', composio_args_json: '{not json' }],
+    actions: [{ id: 'send', runner: 'act.mjs', args_template_json: '[1,2]' }],
+  }), 'utf-8');
+
+  const rec = store.spaceStore.get(slug);
+  assert.equal(rec?.dataSources[0].composioSlug, 'GOOGLECALENDAR_LIST_EVENTS');
+  assert.equal(rec?.dataSources[0].composioArgs, undefined);
+  assert.equal(rec?.actions[0].argsTemplate, undefined);
+  assert.ok(rec?.manifestErrors?.some((e) => /composio_args_json is not valid JSON/.test(e)));
+  assert.ok(rec?.manifestErrors?.some((e) => /args_template_json must be a JSON object/.test(e)));
+
+  assert.throws(
+    () => store.spaceStore.save({ id: slug, title: 'Still Bad' }),
+    /existing space manifest has invalid fields/,
+  );
+  store.spaceStore.save({
+    id: slug,
+    title: 'Fixed Manifest',
+    dataSources: [{ id: 'pull', composioSlug: 'GOOGLECALENDAR_LIST_EVENTS', composioArgs: { max: 10 } }],
+    actions: [{ id: 'send', runner: 'act.mjs', argsTemplate: { to: 'lead@example.com' } }],
+  });
+  const fixed = store.spaceStore.get(slug);
+  assert.equal(fixed?.manifestErrors, undefined);
+  assert.deepEqual(fixed?.dataSources[0].composioArgs, { max: 10 });
+});
+
+test('hand-written manifest flags runner paths as invalid manifest diagnostics', () => {
+  const slug = 'bad-runner-manifest';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Bad Runner Manifest',
+    dataSources: [{ id: 'pull', runner: '../view/evil.mjs' }],
+    actions: [{ id: 'act', runner: 'nested/act.mjs' }],
+  }), 'utf-8');
+
+  const rec = store.spaceStore.get(slug);
+  assert.equal(rec?.dataSources[0].runner, '../view/evil.mjs');
+  assert.equal(rec?.actions[0].runner, 'nested/act.mjs');
+  assert.ok(rec?.manifestErrors?.some((e) => /Data source "pull".*not a path/.test(e)));
+  assert.ok(rec?.manifestErrors?.some((e) => /Action "act".*not a path/.test(e)));
+  assert.throws(
+    () => store.spaceStore.save({ id: slug, title: 'Still Bad' }),
+    /existing space manifest has invalid fields/,
+  );
+});
+
+test('save rejects new runner paths but allows bare filenames before runner files exist', () => {
+  const ok = store.spaceStore.save({
+    id: 'runner-filename-ok',
+    title: 'Runner Filename OK',
+    dataSources: [{ id: 'pull', runner: 'refresh.mjs' }],
+    actions: [{ id: 'act', runner: 'act.mjs' }],
+  });
+  assert.equal(ok.dataSources[0].runner, 'refresh.mjs');
+  assert.equal(ok.actions[0].runner, 'act.mjs');
+
+  assert.throws(
+    () => store.spaceStore.save({
+      id: 'runner-save-bad-source',
+      title: 'Bad Source Runner',
+      dataSources: [{ id: 'pull', runner: '../view/evil.mjs' }],
+    }),
+    /invalid workspace runner declarations:[\s\S]*Data source "pull"[\s\S]*not a path/,
+  );
+  assert.throws(
+    () => store.spaceStore.save({
+      id: 'runner-save-bad-action',
+      title: 'Bad Action Runner',
+      actions: [{ id: 'act', runner: 'nested/act.mjs' }],
+    }),
+    /invalid workspace runner declarations:[\s\S]*Action "act"[\s\S]*not a path/,
+  );
+});
+
+test('update rejects runner path patches without changing the manifest', () => {
+  const slug = 'runner-update-guard';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Runner Update Guard',
+    actions: [{ id: 'act', runner: 'act.mjs' }],
+  });
+
+  assert.throws(
+    () => store.spaceStore.update(slug, {
+      actions: [{ id: 'act', runner: '../view/evil.mjs' }],
+    }),
+    /invalid workspace runner declarations:[\s\S]*Action "act"[\s\S]*not a path/,
+  );
+
+  const after = store.spaceStore.get(slug);
+  assert.equal(after?.actions[0].runner, 'act.mjs');
+});
+
+test('archive preserves malformed manifest fields instead of normalizing them away', () => {
+  const slug = 'bad-archive';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Bad Archive',
+    dataSources: [{ id: 'pull', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', composio_args_json: '{not json' }],
+    actions: [{ id: 'send', runner: 'act.mjs', args_template_json: '[1,2]' }],
+  }), 'utf-8');
+
+  const archived = store.spaceStore.archive(slug);
+  assert.equal(archived?.status, 'archived');
+  assert.ok(archived?.manifestErrors?.length);
+  assert.equal(store.spaceStore.list().some((s) => s.id === slug), false);
+  assert.equal(store.spaceStore.list(true).some((s) => s.id === slug), true);
+
+  const raw = JSON.parse(readFileSync(path.join(dir, 'space.json'), 'utf-8')) as {
+    dataSources: Array<{ composio_args_json?: string }>;
+    actions: Array<{ args_template_json?: string }>;
+  };
+  assert.equal(raw.dataSources[0].composio_args_json, '{not json');
+  assert.equal(raw.actions[0].args_template_json, '[1,2]');
 });
 
 test('data.json round-trips and enforces the size cap', () => {

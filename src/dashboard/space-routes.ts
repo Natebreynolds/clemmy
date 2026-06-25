@@ -183,7 +183,12 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = req.params.id;
     if (!isValidSpaceSlug(slug)) { res.status(400).json({ error: 'invalid id' }); return; }
-    if (!spaceStore.get(slug)) { res.status(404).json({ error: 'not found' }); return; }
+    const rec = spaceStore.get(slug);
+    if (!rec) { res.status(404).json({ error: 'not found' }); return; }
+    if (rec.manifestErrors && rec.manifestErrors.length > 0) {
+      res.status(409).json({ error: `workspace manifest is invalid; fix with space_save before patching metadata: ${rec.manifestErrors.join('; ')}` });
+      return;
+    }
     const patch: Record<string, unknown> = {};
     if (typeof req.body?.title === 'string') patch.title = req.body.title.trim().slice(0, 200);
     if (req.body?.status === 'active' || req.body?.status === 'paused' || req.body?.status === 'archived') {
@@ -304,6 +309,10 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     const rec = spaceStore.get(slug);
     if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
     if (rec.status !== 'active') { res.status(423).json({ error: `workspace is ${rec.status}` }); return; }
+    if (rec.manifestErrors && rec.manifestErrors.length > 0) {
+      res.status(409).json({ error: `workspace manifest is invalid; fix with space_save before running actions: ${rec.manifestErrors.join('; ')}` });
+      return;
+    }
     const actionId = typeof req.body?.actionId === 'string' ? req.body.actionId : '';
     const action = rec.actions.find((a) => a.id === actionId);
     if (!action) { res.status(404).json({ error: `no action "${actionId}"` }); return; }

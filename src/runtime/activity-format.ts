@@ -38,6 +38,7 @@ export interface ActivityRunLike {
   outputPreview?: string;
   error?: string;
   queuedTaskId?: string;
+  needsAttention?: boolean;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string;
@@ -53,6 +54,7 @@ export type UserFacingRunState =
   | 'queued'
   | 'waiting_for_approval'
   | 'waiting_for_input'
+  | 'needs_attention'
   | 'stalled'
   | 'completed'
   | 'failed'
@@ -377,6 +379,7 @@ export function userFacingRunState(run: ActivityRunLike, nowMs = Date.now()): Us
 
   if (status === 'failed' || latestType === 'run_failed' || latestType === 'failed' || run.error) return 'failed';
   if (status === 'cancelled' || latestType === 'cancelled') return 'cancelled';
+  if (run.needsAttention === true) return 'needs_attention';
   if (status === 'completed' || latestType === 'run_completed' || latestType === 'completed' || latestType === 'conversation_completed') return 'completed';
   if (status === 'awaiting_approval' || status === 'parked' || status === 'paused' || latestType === 'approval_requested' || latestType === 'approval_required') return 'waiting_for_approval';
   if (status === 'awaiting_user_input' || latestType === 'awaiting_user_input') return 'waiting_for_input';
@@ -407,6 +410,8 @@ export function userFacingRunStateLabel(state: UserFacingRunState): string {
       return 'Waiting for your approval';
     case 'waiting_for_input':
       return 'Waiting for your input';
+    case 'needs_attention':
+      return 'Needs attention';
     case 'stalled':
       return 'Needs attention';
     case 'completed':
@@ -464,6 +469,7 @@ export function runPreview(run: ActivityRunLike): string {
     const line = liveLine(run);
     if (line) return line;
   }
+  if (state === 'needs_attention' && run.outputPreview) return firstLine(run.outputPreview, 160);
   if (run.error) return firstLine(run.error, 160);
   if (run.outputPreview) return firstLine(run.outputPreview, 160);
   return userFacingRunStateLabel(state);

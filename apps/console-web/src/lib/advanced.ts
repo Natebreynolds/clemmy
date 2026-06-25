@@ -75,11 +75,48 @@ export interface AutoresearchReportResponse {
 }
 export interface AutoresearchRunResponse {
   written?: boolean; reason?: string; report: ObservatoryReport; content?: string;
+  improvementProposals?: { ran: boolean; added: number; total: number } | null;
 }
 
 export const getAutoresearchReport = () => apiGet<AutoresearchReportResponse>('/api/console/autoresearch/report');
 export const runAutoresearch = () => apiPost<AutoresearchRunResponse>('/api/console/autoresearch/run');
 export const runMemoryCleanup = () => apiPost<AutoCleanResult>('/api/console/autoresearch/memory-cleanup');
+
+// ─── Human-gated self-improvement proposals ────────────────────────────────
+export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact' | 'workflow_step';
+export type ImprovementStatus = 'pending' | 'approved' | 'applied' | 'dismissed';
+export type ImprovementApplyMode = 'auto' | 'manual';
+export interface ImprovementProposal {
+  id: string;
+  kind: ImprovementKind;
+  target: string;
+  proposedText: string;
+  rationale: string;
+  evidence: string;
+  applyMode: ImprovementApplyMode;
+  status: ImprovementStatus;
+  proposedAt: string;
+  appliedAt?: string;
+}
+export interface ImprovementProposalResponse {
+  enabled: boolean;
+  proposals: ImprovementProposal[];
+}
+export interface ApplyImprovementResult {
+  ok: boolean;
+  status: ImprovementStatus;
+  applied: number;
+  dryRun: boolean;
+  reason?: 'disabled' | 'not-found' | 'already' | 'manual-acknowledged' | 'apply-failed';
+}
+export interface DismissImprovementResult { ok: boolean; status?: ImprovementStatus; reason?: 'not-found' | 'already' }
+
+export const getImprovementProposals = () =>
+  apiGet<ImprovementProposalResponse>('/api/console/autoresearch/improvements');
+export const approveImprovementProposal = (id: string) =>
+  apiPost<ApplyImprovementResult>('/api/console/autoresearch/improvements/approve', { id });
+export const dismissImprovementProposal = (id: string) =>
+  apiPost<DismissImprovementResult>('/api/console/autoresearch/improvements/dismiss', { id });
 
 // ─── P2 — one-click approvals for knowledge-touching refinements ────────────
 export interface ApproveResult {

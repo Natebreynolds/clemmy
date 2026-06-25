@@ -27,6 +27,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import type { PlanRecord } from '../types.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-store-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -34,7 +35,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 // the state dir exists before any code path tries to write.
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { sweepCrashedExecutions, sweepStaleBlockedExecutions } = await import('./store.js');
+const { ExecutionStore, sweepCrashedExecutions, sweepStaleBlockedExecutions } = await import('./store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
@@ -296,4 +297,40 @@ test('sweepers leave file on disk untouched when there is nothing to sweep', () 
   sweepStaleBlockedExecutions();
   const after = readFileSync(EXECUTIONS_FILE, 'utf-8');
   assert.equal(after, before);
+});
+
+test('syncWithPlan does not auto-complete an execution when all plan rows are done', () => {
+  seedExecutions([]);
+  const store = new ExecutionStore();
+  const execution = store.create({
+    sessionId: 'sess-plan-sync',
+    title: 'Finish report',
+    objective: 'Finish the report and send the receipt',
+    reason: 'test',
+    startedFromMessage: 'finish it',
+    confidence: 0.8,
+    reasons: ['test'],
+    nextStep: 'Draft the report',
+    successCriteria: 'Report exists and receipt id is present',
+  });
+  const iso = new Date().toISOString();
+  const plan: PlanRecord = {
+    id: 'plan-all-done',
+    title: 'Report plan',
+    sessionId: execution.sessionId,
+    source: 'execution',
+    createdAt: iso,
+    updatedAt: iso,
+    steps: [
+      { id: 'draft', text: 'Draft report', status: 'done' },
+      { id: 'send', text: 'Send report', status: 'done' },
+    ],
+  };
+
+  const synced = store.syncWithPlan(execution.id, plan);
+
+  assert.equal(synced?.status, 'active');
+  assert.equal(synced?.blocker, undefined);
+  assert.match(synced?.nextStep ?? '', /Validate completion evidence/);
+  assert.ok(synced?.nextReviewAt, 'finished plans should schedule controller validation');
 });

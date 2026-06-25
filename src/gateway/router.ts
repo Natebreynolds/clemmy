@@ -15,6 +15,7 @@ import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFi
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import type { ToolActivity } from '../types.js';
 
@@ -128,6 +129,40 @@ function parseCommand(message: string): GatewayCommand | null {
   }
 
   return null;
+}
+
+function isBareContinue(message: string): boolean {
+  const t = message.trim().toLowerCase();
+  return t === '/continue' || t === 'continue' || t === 'keep going';
+}
+
+function isContinueCompletionReason(reason: unknown): boolean {
+  return reason === 'awaiting_continue' || reason === 'limit_exceeded';
+}
+
+function buildContinueInput(lastSummary: string | undefined): string {
+  return [
+    'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
+    'Pick up where you left off; do not restart the workflow from scratch.',
+    lastSummary
+      ? `Your last summary on the prior turn was: "${lastSummary.slice(0, 400)}".`
+      : 'Use the conversation history above to figure out where you were.',
+    'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
+  ].join('\n\n');
+}
+
+function rewriteBareContinueForHarness(sessionId: string, message: string): string {
+  if (!isBareContinue(message)) return message;
+  try {
+    const completion = listHarnessEvents(sessionId, { types: ['conversation_completed'], limit: 1, desc: true })[0];
+    if (!completion || !isContinueCompletionReason(completion.data?.reason)) return message;
+    const lastSummary = typeof completion.data?.lastDecisionSummary === 'string'
+      ? completion.data.lastDecisionSummary
+      : undefined;
+    return buildContinueInput(lastSummary);
+  } catch {
+    return message;
+  }
 }
 
 function renderExecutionList(sessionId: string): string {
@@ -425,6 +460,8 @@ export class ClementineGateway {
       return { ...response, runId: run.id };
     }
 
+    const effectiveMessage = rewriteBareContinueForHarness(request.sessionId, request.message);
+
     if (shouldPromoteToDurable(request.message)) {
       addRunEvent(run.id, {
         type: 'queued_background',
@@ -463,7 +500,7 @@ export class ClementineGateway {
       // confirm-first / guardrail / approvals) with the legacy synchronous
       // contract preserved; kill-switch CLEMMY_HARNESS_WEBHOOK=off.
       const response = await respondPreferHarness('webhook', {
-        message: request.message,
+        message: effectiveMessage,
         sessionId: request.sessionId,
         userId: request.userId,
         channel: request.channel,

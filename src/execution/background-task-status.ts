@@ -62,7 +62,7 @@ export function resolveBackgroundTask(input?: string): BackgroundTaskRecord | nu
   }
 
   return listBackgroundTasks()
-    .find((task) => task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'pending')
+    .find((task) => task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'awaiting_continue' || task.status === 'pending')
     ?? listBackgroundTasks()[0]
     ?? null;
 }
@@ -205,7 +205,12 @@ export function listBackgroundTaskStatusSummaries(input: {
     .filter((task) => {
       if (!input.status || input.status === 'all') return true;
       if (input.status === 'active') {
-        return task.status === 'pending' || task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'cancelling';
+        return task.status === 'pending'
+          || task.status === 'running'
+          || task.status === 'awaiting_approval'
+          || task.status === 'awaiting_input'
+          || task.status === 'awaiting_continue'
+          || task.status === 'cancelling';
       }
       return task.status === input.status;
     })

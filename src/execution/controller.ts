@@ -26,8 +26,15 @@ import {
 import type { ExecutionRecord, PlanRecord, PlanStep, RunRequest } from '../types.js';
 import { ExecutionStore } from './store.js';
 import { isUserFacingExecution } from './scope.js';
+import { validateGoal, type GoalValidationResult } from './goal-validate.js';
+import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 
 const logger = pino({ name: 'clementine-next.execution-controller' });
+
+let executionCompletionJudgeForTests: ObjectiveJudgeFn | null = null;
+export function _setExecutionCompletionJudgeForTests(fn: ObjectiveJudgeFn | null): void {
+  executionCompletionJudgeForTests = fn;
+}
 
 interface WorkflowSummary {
   name: string;
@@ -99,6 +106,96 @@ function buildExecutionNotificationMetadata(execution: ExecutionRecord): Record<
     sessionId: execution.sessionId,
     discordUserId: execution.channel?.startsWith('discord:') ? execution.userId : undefined,
   };
+}
+
+function executionCompletionObjective(execution: ExecutionRecord, plan?: PlanRecord): string {
+  return [
+    `Execution title: ${execution.title}`,
+    `Objective: ${execution.objective}`,
+    execution.successCriteria ? `Declared success criteria: ${execution.successCriteria}` : '',
+    plan && plan.steps.length > 0
+      ? [
+          'Plan:',
+          ...plan.steps.map((step, index) => `${index + 1}. [${step.status}] ${step.text}${step.verify ? ` — verify: ${step.verify}` : ''}`),
+        ].join('\n')
+      : '',
+  ].filter(Boolean).join('\n');
+}
+
+function executionCompletionEvidence(execution: ExecutionRecord, summary: string): string {
+  const taskBindings = (execution.taskBindings ?? [])
+    .map((binding) => `- task ${binding.taskId}: ${binding.status}${binding.description ? ` — ${binding.description}` : ''}`)
+    .join('\n') || 'none';
+  const workflowBindings = (execution.workflowBindings ?? [])
+    .map((binding) => `- workflow ${binding.workflow} (${binding.runId}): ${binding.status}`)
+    .join('\n') || 'none';
+  const delegationBindings = (execution.delegationBindings ?? [])
+    .map((binding) => `- delegation ${binding.delegationId} to ${binding.toAgent}: ${binding.status}${binding.result ? ` — ${binding.result}` : ''}`)
+    .join('\n') || 'none';
+  const recentActivity = [...(execution.activity ?? [])]
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .slice(-10)
+    .map((item) => `- ${item.type}: ${item.message}`)
+    .join('\n') || 'none';
+
+  return [
+    `Controller completion summary: ${summary}`,
+    execution.lastAssistantSummary ? `Previous summary: ${execution.lastAssistantSummary}` : '',
+    execution.nextStep ? `Previous next step: ${execution.nextStep}` : '',
+    `Task bindings:\n${taskBindings}`,
+    `Workflow bindings:\n${workflowBindings}`,
+    `Delegation bindings:\n${delegationBindings}`,
+    `Recent execution activity:\n${recentActivity}`,
+  ].filter(Boolean).join('\n');
+}
+
+async function validateExecutionCompletion(
+  execution: ExecutionRecord,
+  plan: PlanRecord | undefined,
+  summary: string,
+): Promise<GoalValidationResult> {
+  return validateGoal({
+    objective: executionCompletionObjective(execution, plan),
+    successCriteria: execution.successCriteria ? [execution.successCriteria] : [],
+    evidenceText: executionCompletionEvidence(execution, summary),
+  }, {
+    ...(executionCompletionJudgeForTests ? { judge: executionCompletionJudgeForTests } : {}),
+  });
+}
+
+function rejectExecutionCompletion(
+  store: ExecutionStore,
+  execution: ExecutionRecord,
+  summary: string,
+  validation: GoalValidationResult,
+  source: 'controller' | 'synthesis',
+): ExecutionRecord {
+  const advice = clean(validation.advice ?? 'completion evidence did not satisfy the execution objective', 360);
+  const message = validation.judgeFailedOpen
+    ? `Completion not accepted: the completion judge was unavailable, so this execution remains active. ${advice}`
+    : `Completion not accepted: ${advice}`;
+  let updatedExecution = store.update(execution.id, {
+    status: 'active',
+    blocker: undefined,
+    lastAssistantSummary: clean(`${summary} | ${message}`, 400),
+    nextStep: clean(`Address completion gap: ${advice}`, 220),
+    nextReviewAt: plusMinutes(validation.judgeFailedOpen ? 30 : 10),
+    lastControllerRunAt: new Date().toISOString(),
+  }) ?? execution;
+  updatedExecution = appendExecutionActivity(store, updatedExecution, {
+    key: `completion-gate:${source}:${Date.now()}:${randomBytes(3).toString('hex')}`,
+    type: 'status',
+    message: clean(message, 500),
+    metadata: {
+      source,
+      judgeFailedOpen: validation.judgeFailedOpen ?? false,
+      successRatePercent: validation.successRatePercent,
+      criteriaMet: validation.criteriaMet,
+      criteriaTotal: validation.criteriaTotal,
+      failedDirectives: validation.failedDirectives,
+    },
+  });
+  return updatedExecution;
 }
 
 function delegationFilePath(toAgent: string, id: string): string {
@@ -822,13 +919,21 @@ async function runSynthesisDecision(
   });
 }
 
-function applySynthesisDecision(
+async function applySynthesisDecision(
   store: ExecutionStore,
   execution: ExecutionRecord,
+  plan: PlanRecord | undefined,
   decision: SynthesisDecision,
   observedThrough: string,
-): ExecutionRecord {
+): Promise<ExecutionRecord> {
   const nextStatus = decision.status ?? execution.status;
+  if (nextStatus === 'completed' && execution.status !== 'completed') {
+    const validation = await validateExecutionCompletion(execution, plan, decision.summary);
+    if (!validation.pass) {
+      return rejectExecutionCompletion(store, execution, decision.summary, validation, 'synthesis');
+    }
+  }
+
   const patch: Partial<Omit<ExecutionRecord, 'id' | 'createdAt' | 'sessionId'>> = {
     status: nextStatus,
     nextStep: nextStatus === 'completed'
@@ -919,7 +1024,7 @@ async function maybeSynthesizeExecution(
   }
 
   return {
-    execution: applySynthesisDecision(store, execution, decision, activity[activity.length - 1]?.createdAt ?? new Date().toISOString()),
+    execution: await applySynthesisDecision(store, execution, plan, decision, activity[activity.length - 1]?.createdAt ?? new Date().toISOString()),
     nextReviewMinutes: decision.nextReviewMinutes,
   };
 }
@@ -1140,13 +1245,21 @@ async function advanceExecution(assistant: ClementineAssistant, execution: Execu
         });
         break;
       case 'mark_completed':
-        currentExecution = store.update(currentExecution.id, {
-          status: 'completed',
-          blocker: undefined,
-          lastAssistantSummary: action.summary ? clean(action.summary, 400) : decision.summary,
-          nextReviewAt: undefined,
-        }) ?? currentExecution;
-        maybeNotifyExecutionCompleted(currentExecution);
+        {
+          const summary = action.summary ? clean(action.summary, 400) : decision.summary;
+          const validation = await validateExecutionCompletion(currentExecution, plan, summary);
+          if (!validation.pass) {
+            currentExecution = rejectExecutionCompletion(store, currentExecution, summary, validation, 'controller');
+            break;
+          }
+          currentExecution = store.update(currentExecution.id, {
+            status: 'completed',
+            blocker: undefined,
+            lastAssistantSummary: summary,
+            nextReviewAt: undefined,
+          }) ?? currentExecution;
+          maybeNotifyExecutionCompleted(currentExecution);
+        }
         break;
       case 'noop':
       default:

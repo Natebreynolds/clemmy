@@ -186,9 +186,15 @@ export class ExecutionStore {
     return this.update(executionId, {
       planId: plan.id,
       nextStep: activeStep?.text ?? execution.nextStep,
-      status: allDone ? 'completed' : execution.status,
-      blocker: allDone ? undefined : execution.blocker,
+      status: execution.status,
+      blocker: execution.blocker,
       lastAssistantSummary: execution.lastAssistantSummary,
+      ...(allDone && execution.status !== 'completed'
+        ? {
+            nextStep: 'Validate completion evidence for the finished plan.',
+            nextReviewAt: new Date().toISOString(),
+          }
+        : {}),
     });
   }
 }

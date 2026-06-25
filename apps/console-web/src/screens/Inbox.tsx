@@ -127,7 +127,7 @@ export function Inbox() {
             : runRows.map((r) => (
               <ListRow key={r.id} selected={selected === r.id} onSelect={() => setSelected(r.id)}
                 title={r.title || r.input || 'Untitled'} meta={[r.kind, relativeTime(r.updatedAt || r.createdAt)].filter(Boolean).join(' · ')}
-                tone={statusTone(r.status)} />
+                tone={statusTone(r.runState || r.status)} />
             )))}
 
           {!loading && tab === 'notifications' && (notifRows.length === 0
@@ -221,7 +221,7 @@ function ApprovalDetail({ row, onApprove, onReject }: { row: ApprovalRow; onAppr
 }
 
 function RunDetail({ row }: { row: RunRow }) {
-  const tone = statusTone(row.status);
+  const tone = statusTone(row.runState || row.status);
   return (
     <div>
       <div className="mb-3 flex items-center gap-2">

@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -23,10 +23,13 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
   createBackgroundTask, markBackgroundTaskRunning, markBackgroundTaskDone,
-  markBackgroundTaskAwaitingApproval, markBackgroundTaskBlocked, markBackgroundTaskFailed,
+  markBackgroundTaskAwaitingApproval, markBackgroundTaskAwaitingContinue, markBackgroundTaskBlocked, markBackgroundTaskFailed,
   getBackgroundTask,
 } = await import('../execution/background-tasks.js');
+const { startRun, finishRun } = await import('../runtime/run-events.js');
 const { registerConsoleRoutes } = await import('./console-routes.js');
+const { writeWorkflow } = await import('../memory/workflow-store.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -61,6 +64,10 @@ test('GET /api/console/board normalizes every background-task status into the ri
   markBackgroundTaskRunning(blocked.id);
   markBackgroundTaskBlocked(blocked.id, 'missing data', 'could not finish');
 
+  const awaitingContinue = createBackgroundTask({ title: 'continue task', prompt: 'p' });
+  markBackgroundTaskRunning(awaitingContinue.id);
+  markBackgroundTaskAwaitingContinue(awaitingContinue.id, 'turn budget', 'partial result');
+
   const done = createBackgroundTask({ title: 'done task', prompt: 'p' });
   markBackgroundTaskRunning(done.id);
   markBackgroundTaskDone(done.id, 'finished');
@@ -87,6 +94,7 @@ test('GET /api/console/board normalizes every background-task status into the ri
     expect(running.id, 'running', ['cancel']);
     expect(awaiting.id, 'needs_you', ['cancel']);
     expect(blocked.id, 'needs_you', ['cancel']);
+    expect(awaitingContinue.id, 'needs_you', ['resume', 'cancel']);
     // Terminal tasks now also offer `archive` (declutter the Done column).
     expect(done.id, 'done', ['archive']);
     expect(interrupted.id, 'done', ['resume', 'archive']);
@@ -143,6 +151,25 @@ test('board archive is rejected for an ACTIVE task (its worker is still live)', 
   }
 });
 
+test('board action route: resume re-queues an awaiting_continue background task', async () => {
+  const task = createBackgroundTask({ title: 'needs continue', prompt: 'p' });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial');
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board/background/${task.id}/resume`, { method: 'POST' });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { ok: boolean; task?: { id: string; status: string } };
+    assert.equal(body.ok, true);
+    assert.equal(body.task?.id, task.id);
+    assert.equal(body.task?.status, 'pending');
+    assert.equal(getBackgroundTask(task.id)?.status, 'pending');
+    assert.ok(getBackgroundTask(task.id)?.continueResolution, 'continuation context is queued');
+  } finally {
+    await h.close();
+  }
+});
+
 test('board action route: cancel is accepted and transitions the task; auth is gated', async () => {
   const task = createBackgroundTask({ title: 'to cancel', prompt: 'p' });
   markBackgroundTaskRunning(task.id);
@@ -166,6 +193,73 @@ test('board action route: cancel is accepted and transitions the task; auth is g
     // 404 for an unknown id.
     const missing = await fetch(`${h.url}/api/console/board/background/does-not-exist/cancel`, { method: 'POST' });
     assert.equal(missing.status, 404);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/board keeps completed workflow runs that need attention in Needs you', async () => {
+  const run = startRun({
+    id: 'wf-attention-run',
+    sessionId: 'workflow:wf-attention-run',
+    channel: 'workflow',
+    source: 'workflow',
+    title: 'Workflow: review me',
+    message: 'Running workflow "review me"',
+  });
+  finishRun(run.id, {
+    status: 'completed',
+    message: 'Needs attention — target not confirmed',
+    outputPreview: 'The output was delivered, but the target was not confirmed.',
+    needsAttention: true,
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: Array<BoardCard & { raw?: Record<string, unknown>; progressHint?: string }> };
+    const card = body.cards.find((c) => c.id === run.id);
+    assert.ok(card, 'workflow run card is present');
+    assert.equal(card!.sourceKind, 'run');
+    assert.equal(card!.column, 'needs_you');
+    assert.equal(card!.status, 'needs_attention');
+    assert.deepEqual(card!.actions, []);
+    assert.equal(card!.raw?.needsAttention, true);
+    assert.match(card!.progressHint ?? '', /target was not confirmed/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/workflows exposes needs-attention last-run status', async () => {
+  const workflowName = 'Workflow Attention List';
+  writeWorkflow('workflow-attention-list', {
+    name: workflowName,
+    description: 'surfaces attention status',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'review', prompt: 'Review output.' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'wf-list-attn.json'), JSON.stringify({
+    id: 'wf-list-attn',
+    workflow: workflowName,
+    status: 'completed',
+    needsAttention: true,
+    createdAt: '2026-06-24T12:00:00.000Z',
+    finishedAt: '2026-06-24T12:01:00.000Z',
+  }, null, 2), 'utf-8');
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/workflows`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { workflows: Array<{ name: string; lastRunStatus?: string | null; lastRunNeedsAttention?: boolean }> };
+    const row = body.workflows.find((item) => item.name === workflowName);
+    assert.ok(row, 'workflow row is present');
+    assert.equal(row!.lastRunStatus, 'needs_attention');
+    assert.equal(row!.lastRunNeedsAttention, true);
   } finally {
     await h.close();
   }

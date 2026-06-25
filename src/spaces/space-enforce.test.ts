@@ -69,6 +69,19 @@ test('auto-repair drops a redundant runner when both backends are declared', () 
   assert.equal(prep.actions[0].composioSlug, 'SOME_TOOL');
 });
 
+test('auto-repair drops a redundant data-source runner when both backends are declared', () => {
+  writeRunner('both-source', 'r.mjs');
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'both-source',
+    dataSources: [{ id: 'pull', composioSlug: 'SOME_READ_TOOL', runner: 'r.mjs' }],
+    actions: [],
+  });
+  assert.equal(prep.ok, true);
+  assert.equal(prep.dataSources[0].runner, undefined);
+  assert.equal(prep.dataSources[0].composioSlug, 'SOME_READ_TOOL');
+  assert.match(prep.repairs.join(' '), /Data source "pull".*dropped the runner/);
+});
+
 test('ERROR: source with no backend blocks the save', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'nob', dataSources: [{ id: 'pull' }], actions: [],
@@ -83,6 +96,22 @@ test('ERROR: runner file that is not on disk blocks the save', () => {
   });
   assert.equal(prep.ok, false);
   assert.match(prep.errors.join(' '), /doesn.t exist/);
+});
+
+test('ERROR: runner declarations must be filenames under data/, not paths', () => {
+  const viewDir = store.resolveInSpace('runner-paths', 'view');
+  mkdirSync(viewDir, { recursive: true });
+  writeFileSync(path.join(viewDir, 'evil.mjs'), 'process.stdout.write("{}")', 'utf-8');
+
+  const prep = enforce.prepareSpaceForWrite({
+    slug: 'runner-paths',
+    dataSources: [{ id: 'pull', runner: '../view/evil.mjs' }],
+    actions: [{ id: 'act', runner: '../view/evil.mjs' }],
+  });
+
+  assert.equal(prep.ok, false);
+  assert.match(prep.errors.join(' '), /Data source "pull".*not a path/);
+  assert.match(prep.errors.join(' '), /Action "act".*not a path/);
 });
 
 test('ERROR: invalid cron on a scheduled source blocks the save', () => {

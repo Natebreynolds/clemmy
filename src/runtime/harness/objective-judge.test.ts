@@ -76,6 +76,8 @@ test('isPromiseShapedReply: a real artifact/result suppresses the promise signal
     "Here's the summary of all 44 records.",
     "I've drafted the report and saved it to /tmp/out.html",
     'Found 5 accounts matching your filter.',
+    "You're right — going forward I'll treat SEO data as raw metrics first.",
+    "From now on I'll use the source column for those rows.",
     '', // empty
   ]) {
     assert.equal(isPromiseShapedReply(r), false, `not a bare promise: ${r}`);
@@ -174,10 +176,12 @@ test('composeJudgedObjective: bare follow-up gets prior REAL user messages as co
   const composed = composeJudgedObjective('just mine please', [
     'I need to pull 25 market leader accounts new from Salesforce that have not had contact in 15 days, de-dupe against Airtable, then SEO enrichment.',
     'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
+    'You hit a step / time budget on the previous turn and the user has now replied `continue`.\n\nPick up where you left off; do not restart the workflow from scratch.',
   ]);
   assert.match(composed, /25 market leader accounts/);
   assert.match(composed, /Current user message .*: just mine please/);
   assert.doesNotMatch(composed, /Continue with the next step/, 'harness drip injections must be filtered');
+  assert.doesNotMatch(composed, /step \/ time budget/, 'synthetic continue inputs must be filtered');
 });
 
 test('composeJudgedObjective: long objective passes through unchanged', async () => {

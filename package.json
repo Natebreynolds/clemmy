@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "0.12.3",
+  "version": "0.12.4",
   "description": "Lightweight background agent system — proactive, customizable, runs out of the box",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
@@ -25,6 +25,8 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.test.js",
+    "!dist/spaces/runner-path.js",
     "apps/mobile-web/dist",
     "apps/console-web/dist",
     "vendor/uv",
@@ -32,11 +34,13 @@
     ".env.example"
   ],
   "scripts": {
+    "clean:dist": "node scripts/clean-dist.mjs",
+    "prebuild": "npm run clean:dist",
     "build": "tsc --outDir dist",
     "build:mobile-web": "npm --prefix apps/mobile-web run build",
     "build:console-web": "npm --prefix apps/console-web run build",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test 'src/**/*.test.ts'",
+    "test": "tsx --test 'src/**/*.test.ts' 'apps/**/*.test.ts'",
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
     "eval:passk": "tsx scripts/eval-passk.ts",
     "eval:spans": "tsx scripts/eval-spans.ts",

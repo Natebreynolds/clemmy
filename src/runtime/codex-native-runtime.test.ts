@@ -25,12 +25,28 @@ process.env.MCP_ATTACH_CONNECTED_ONLY = 'off';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createCodexToolDefinitions, expandParallelHallucination, isWallClockAbort, trimNativeInputForRetry, parseCodexUsage, type CodexFunctionCall } from './codex-native-runtime.js';
+import { createCodexToolDefinitions, expandParallelHallucination, isWallClockAbort, trimNativeInputForRetry, parseCodexUsage, sanitizeCodexInputIds, type CodexFunctionCall } from './codex-native-runtime.js';
 import { invalidateConfiguredMcpServers } from './mcp-servers.js';
 import { AgentRuntimeCancelledError } from './provider.js';
 
 test.after(async () => {
   await invalidateConfiguredMcpServers();
+});
+
+test('sanitizeCodexInputIds strips non-fc ids off function_call items (the 2026-06-24 cross-provider 400)', () => {
+  const input = [
+    { role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+    // a non-fc function_call id (cross-provider history) — must be dropped
+    { type: 'function_call', call_id: 'call_x', name: 'read_file', arguments: '{}', id: '20260624072838009e610297f64eac' },
+    // a genuine Codex fc id — must be kept
+    { type: 'function_call', call_id: 'call_y', name: 'write_file', arguments: '{}', id: 'fc_abc123' },
+    { type: 'function_call_output', call_id: 'call_x', output: 'ok' },
+  ] as unknown as Parameters<typeof sanitizeCodexInputIds>[0];
+  const out = sanitizeCodexInputIds(input) as Array<Record<string, unknown>>;
+  assert.equal(out[1].id, undefined, 'non-fc id dropped');
+  assert.equal(out[1].call_id, 'call_x', 'call_id preserved for correlation');
+  assert.equal(out[2].id, 'fc_abc123', 'a real fc id is kept');
+  assert.equal(out[3].type, 'function_call_output', 'non-function_call items untouched');
 });
 
 // ─── P0-A wall-clock recovery helpers ────────────────────────────────────────

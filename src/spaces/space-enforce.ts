@@ -19,7 +19,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { validateCronExpression } from '../shared/cron.js';
-import { resolveInSpace, type SpaceDataSource, type SpaceAction, type SpaceStatus } from './store.js';
+import { resolveInSpace, runnerFilenameError, type SpaceDataSource, type SpaceAction, type SpaceStatus } from './store.js';
 
 /** A Composio action whose name/label implies an irreversible outbound send —
  *  it should always confirm before firing. */
@@ -58,6 +58,13 @@ export function autoRepairSpaceManifest(
 
   const repairedSources = (dataSources ?? []).map((src) => {
     const s: SpaceDataSource = { ...src };
+    // A source that declares BOTH a runner and a Composio slug is ambiguous.
+    // Prefer the Composio op: it is the credentials-aware backend, and the
+    // runner path is intentionally scrubbed of daemon secrets.
+    if (s.runner && s.composioSlug) {
+      repairs.push(`Data source "${s.id}" declared both a runner and a composio_slug — kept the composio op, dropped the runner.`);
+      delete s.runner;
+    }
     // A bad IANA timezone would silently misfire the daily refresh — drop it
     // (the scheduler falls back to host/profile tz) rather than fail the save.
     if (s.timezone && !isValidTimezone(s.timezone)) {
@@ -111,6 +118,11 @@ export function checkSpaceForWrite(
       continue;
     }
     if (s.runner && s.runner.trim()) {
+      const runnerError = runnerFilenameError(s.runner);
+      if (runnerError) {
+        errors.push(`Data source "${s.id}" ${runnerError}.`);
+        continue;
+      }
       let target = '';
       try { target = resolveInSpace(slug, path.join('data', s.runner.trim())); } catch { /* invalid path */ }
       if (!target || !existsSync(target)) {
@@ -128,6 +140,11 @@ export function checkSpaceForWrite(
       continue;
     }
     if (a.runner && a.runner.trim()) {
+      const runnerError = runnerFilenameError(a.runner);
+      if (runnerError) {
+        errors.push(`Action "${a.id}" ${runnerError}.`);
+        continue;
+      }
       let target = '';
       try { target = resolveInSpace(slug, path.join('data', a.runner.trim())); } catch { /* invalid */ }
       if (!target || !existsSync(target)) {

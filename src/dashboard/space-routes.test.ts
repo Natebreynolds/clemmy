@@ -176,6 +176,33 @@ test('action route runs a READ-class action immediately, merges args, records a 
   assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list/.test(n.text)));
 });
 
+test('action route refuses a workspace with malformed hand-written action JSON', async () => {
+  const slug = 'action-bad-manifest';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(path.join(dir, 'data'), { recursive: true });
+  writeFileSync(path.join(dir, 'data', 'act.mjs'), 'process.stdout.write(JSON.stringify({ok:true}))', 'utf-8');
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Bad Action Manifest',
+    actions: [{ id: 'refresh-list', label: 'Refresh list', runner: 'act.mjs', args_template_json: '[1,2]' }],
+  }), 'utf-8');
+
+  const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ actionId: 'refresh-list', args: { limit: 10 } }),
+  }));
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /workspace manifest is invalid/);
+  assert.match(res.body.error, /args_template_json must be a JSON object/);
+
+  const patch = await j(await fetch(`${base}/api/console/spaces/${slug}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'Should Not Sanitize' }),
+  }));
+  assert.equal(patch.status, 409);
+  assert.match(patch.body.error, /fix with space_save before patching metadata/);
+});
+
 test('E1: a SEND-class action is gated behind one approval (default on) — 202 pending, not yet run', async () => {
   const slug = 'action-gate';
   store.spaceStore.save({

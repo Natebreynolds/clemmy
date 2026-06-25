@@ -163,3 +163,32 @@ test('runClaudeAgentSdkWorkflowStep converts blocked SDK output into a workflow 
   assert.deepEqual(result.output, { blocked: true, reason: 'needs a mutating file write' });
   assert.equal(result.structured, true);
 });
+
+test('runClaudeAgentSdkWorkflowStep converts SDK turn limits into a blocked workflow result', async () => {
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => ({
+    text: 'I reached the turn budget. Say "continue" to keep going.',
+    limitHit: true,
+    sessionId: 'sdk-workflow-session',
+    model: 'claude-sonnet-4-6',
+    toolUses: ['mcp__clementine-local__skill_read'],
+    usage: { input_tokens: 12, output_tokens: 4 },
+    modelUsage: { provider: 'claude', model: 'claude-sonnet-4-6' },
+  }));
+
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step,
+    workflowName: 'Report Workflow',
+    prompt: 'Do the workflow step.',
+    modelId: 'claude-sonnet-4-6',
+  });
+
+  assert.deepEqual(result.output, {
+    blocked: true,
+    reason: 'Claude reached the workflow-step turn budget before finishing this step.',
+  });
+  assert.equal(result.structured, true);
+  assert.equal(result.sdkSessionId, 'sdk-workflow-session');
+  assert.deepEqual(result.toolUses, ['mcp__clementine-local__skill_read']);
+  assert.deepEqual(result.usage, { input_tokens: 12, output_tokens: 4 });
+  assert.deepEqual(result.modelUsage, { provider: 'claude', model: 'claude-sonnet-4-6' });
+});

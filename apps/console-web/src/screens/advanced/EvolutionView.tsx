@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck } from 'lucide-react';
+import { ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck, GitPullRequest, Check, X } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -10,8 +10,10 @@ import { usePoll } from '@/lib/poll';
 import {
   getAutoresearchReport, runAutoresearch, runMemoryCleanup,
   approveDuplicates, liftRecallGaps, retireInternalNoise,
+  getImprovementProposals, approveImprovementProposal, dismissImprovementProposal,
   fmtNum, fmtPct, fmtWhen,
   type ObservatoryReport, type ToolHealth, type MemoryRefinements, type AutoCleanResult, type ApproveResult,
+  type ImprovementProposal, type ImprovementProposalResponse, type ApplyImprovementResult,
 } from '@/lib/advanced';
 
 const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
@@ -390,8 +392,145 @@ function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; o
   );
 }
 
+const IMPROVEMENT_KIND_LABEL: Record<ImprovementProposal['kind'], string> = {
+  tool_desc: 'Tool description',
+  skill_pitfall: 'Skill pitfall',
+  retire_fact: 'Memory cleanup',
+  workflow_step: 'Workflow step',
+};
+
+function improvementTone(p: ImprovementProposal): Parameters<typeof StatusPill>[0]['tone'] {
+  if (p.applyMode === 'manual') return 'info';
+  if (p.kind === 'retire_fact') return 'neutral';
+  if (p.kind === 'workflow_step') return 'warning';
+  return 'success';
+}
+
+function applyMessage(result: ApplyImprovementResult, p: ImprovementProposal): string {
+  if (result.reason === 'manual-acknowledged') return `${p.target} acknowledged for manual source edit`;
+  if (result.status === 'applied') return `${p.target} applied`;
+  if (result.reason === 'already') return `${p.target} was already applied`;
+  return `${p.target} approved`;
+}
+
+function applyError(result: ApplyImprovementResult): string {
+  if (result.reason === 'disabled') return 'Approval is disabled by CLEMMY_MEMORY_APPROVE.';
+  if (result.reason === 'not-found') return 'Proposal was not found.';
+  if (result.reason === 'apply-failed') return 'Proposal could not be applied.';
+  return 'Proposal was not approved.';
+}
+
+function ImprovementProposalsCard({
+  data,
+  onChanged,
+}: {
+  data: ImprovementProposalResponse;
+  onChanged: () => Promise<unknown> | void;
+}) {
+  const items = Array.isArray(data.proposals) ? data.proposals : [];
+  const [busy, setBusy] = useState<{ id: string; action: 'approve' | 'dismiss' } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onApprove = async (p: ImprovementProposal) => {
+    setBusy({ id: p.id, action: 'approve' });
+    setErr(null);
+    setNotice(null);
+    try {
+      const result = await approveImprovementProposal(p.id);
+      if (!result.ok) {
+        setErr(applyError(result));
+        return;
+      }
+      setNotice(applyMessage(result, p));
+      await onChanged();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Approval failed');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const onDismiss = async (p: ImprovementProposal) => {
+    setBusy({ id: p.id, action: 'dismiss' });
+    setErr(null);
+    setNotice(null);
+    try {
+      const result = await dismissImprovementProposal(p.id);
+      if (!result.ok) {
+        setErr(result.reason === 'not-found' ? 'Proposal was not found.' : 'Dismiss failed');
+        return;
+      }
+      setNotice(result.reason === 'already' && result.status
+        ? `${p.target} was already ${result.status}`
+        : `${p.target} dismissed`);
+      await onChanged();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Dismiss failed');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <Card className="p-5">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <GitPullRequest className="h-4 w-4 text-faint" aria-hidden />
+        <h3 className="text-h3 text-fg">Self-improvement proposals</h3>
+        <StatusPill tone={data.enabled ? 'success' : 'neutral'}>{data.enabled ? 'Drafting on' : 'Drafting off'}</StatusPill>
+        <span className="ml-auto text-caption text-faint">{fmtNum(items.length)} pending</span>
+      </div>
+      <p className="mb-3 max-w-2xl text-small text-muted">
+        Clementine drafts changes from recurring tool, memory, and workflow patterns. Auto proposals still wait for your approval; manual proposals are acknowledged for source edits.
+      </p>
+
+      {!data.enabled && (
+        <div className="mb-3 rounded-md border border-border bg-surface p-3 text-small text-muted">
+          Set CLEMMY_IMPROVEMENT_PROPOSER=on to draft new proposals during autoresearch. Existing pending proposals remain reviewable here.
+        </div>
+      )}
+
+      {items.length === 0 ? (
+        <p className="text-small text-muted">No pending proposals.</p>
+      ) : (
+        <ul className="space-y-3">
+          {items.map((p) => {
+            const approving = busy?.id === p.id && busy.action === 'approve';
+            const dismissing = busy?.id === p.id && busy.action === 'dismiss';
+            return (
+              <li key={p.id} className="rounded-md border border-border bg-surface p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <StatusPill tone={improvementTone(p)}>{IMPROVEMENT_KIND_LABEL[p.kind]}</StatusPill>
+                  <StatusPill tone={p.applyMode === 'auto' ? 'success' : 'info'}>{p.applyMode === 'auto' ? 'Auto-applies' : 'Manual edit'}</StatusPill>
+                  <span className="min-w-0 flex-1 truncate font-mono text-caption text-muted" title={p.target}>{p.target}</span>
+                  <span className="text-caption text-faint">{fmtWhen(p.proposedAt)}</span>
+                </div>
+                <p className="mt-2 text-small font-medium text-fg">{p.proposedText}</p>
+                <p className="mt-1 text-small text-muted">{p.rationale}</p>
+                <p className="mt-2 break-words rounded-sm border border-border/70 bg-subtle px-2 py-1 font-mono text-caption text-faint">{p.evidence}</p>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <Button variant="secondary" size="sm" onClick={() => onApprove(p)} disabled={!!busy}>
+                    <Check className="h-4 w-4" aria-hidden /> {approving ? 'Approving…' : p.applyMode === 'manual' ? 'Acknowledge' : 'Approve'}
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => onDismiss(p)} disabled={!!busy} className="text-muted">
+                    <X className="h-4 w-4" aria-hidden /> {dismissing ? 'Dismissing…' : 'Dismiss'}
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {notice && <p className="mt-3 text-caption text-success">{notice}</p>}
+      {err && <p className="mt-3 text-caption text-danger">{err}</p>}
+    </Card>
+  );
+}
+
 export function EvolutionView() {
   const q = usePoll(['autoresearch-report'], getAutoresearchReport, 0);
+  const improvements = usePoll(['autoresearch-improvements'], getImprovementProposals, 0);
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   // Only treat it as a renderable report when it actually has the structured
@@ -401,6 +540,8 @@ export function EvolutionView() {
   const report = raw && Array.isArray(raw.toolHealth) && Array.isArray(raw.suggestions) ? raw : null;
   const mr = q.data?.memoryRefinements;
   const refinements = mr && typeof mr.totalCandidates === 'number' ? mr : null;
+  const improvementData = improvements.data;
+  const showImprovementsCard = !!improvementData && (!improvementData.enabled || improvementData.proposals.length > 0);
 
   const onRun = async () => {
     setRunning(true);
@@ -408,6 +549,7 @@ export function EvolutionView() {
     try {
       await runAutoresearch();
       await q.refetch();
+      await improvements.refetch();
     } catch (err) {
       setRunError(err instanceof Error ? err.message : 'Run failed');
     } finally {
@@ -435,13 +577,16 @@ export function EvolutionView() {
       )}
       {q.isLoading ? (
         <Skeleton className="h-64 w-full" />
-      ) : !report && !refinements ? (
+      ) : !report && !refinements && !showImprovementsCard ? (
         <EmptyState
           title="No self-research yet"
           description="Clementine builds this nightly from how it worked for you. Hit “Run now” to generate the first report."
         />
       ) : (
         <div className="space-y-4">
+          {showImprovementsCard && improvementData && (
+            <ImprovementProposalsCard data={improvementData} onChanged={improvements.refetch} />
+          )}
           {refinements && <MemoryRefinementsCard data={refinements} onCleaned={q.refetch} />}
           {report && <EvolutionReport report={report} />}
         </div>

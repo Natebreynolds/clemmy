@@ -12,7 +12,7 @@
  */
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-improve-proposer';
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -24,11 +24,13 @@ const {
   proposerEnabled,
   proposeFromReport,
   recordProposals,
+  listProposals,
   listPendingProposals,
   approveProposal,
   dismissProposal,
   proposalsFromStepFailures,
   buildWorkflowStepProposals,
+  splitWorkflowStepTarget,
 } = await import('./improvement-proposer.js');
 const { writeDistilledSkill, loadSkill } = await import('../memory/skill-store.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
@@ -40,6 +42,11 @@ import type { WorkflowDefinition } from '../memory/workflow-store.js';
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
   mkdirSync(TEST_HOME, { recursive: true });
+});
+
+test('source stays text-searchable: no NUL delimiters in stable proposal keys', () => {
+  const source = readFileSync(new URL('./improvement-proposer.ts', import.meta.url), 'utf8');
+  assert.equal(source.includes('\0'), false);
 });
 
 function report(toolHealth: ObservatoryReport['toolHealth']): ObservatoryReport {
@@ -113,8 +120,10 @@ test('low-call tools (<5) and healthy tools produce nothing', () => {
 test('proposal ids are stable across runs (dedup substrate)', () => {
   const r = report([{ toolName: 'flaky_tool', calls: 10, successes: 4, errors: 6, emptyResults: 0, wrongPickHints: 0 }]);
   const a = buildImprovementProposals(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE, nowIso: NOW })[0];
-  const b = buildImprovementProposals(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE, nowIso: '2026-07-01T00:00:00Z' })[0];
+  const changedWindow = report([{ toolName: 'flaky_tool', calls: 20, successes: 10, errors: 10, emptyResults: 0, wrongPickHints: 0 }]);
+  const b = buildImprovementProposals(changedWindow, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE, nowIso: '2026-07-01T00:00:00Z' })[0];
   assert.equal(a.id, b.id, 'same issue → same id regardless of when proposed');
+  assert.notEqual(a.proposedText, b.proposedText, 'visible telemetry can still update under the stable id');
 });
 
 // ── gating ─────────────────────────────────────────────────────────────────
@@ -138,6 +147,30 @@ test('proposeFromReport is a no-op when the flag is off, drafts when on', () => 
   delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
 });
 
+test('proposeFromReport uses injected workflow-step failure evidence', () => {
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'on';
+  try {
+    const res = proposeFromReport(report([]), {
+      listSkills: NO_SKILLS,
+      countRetirableNoise: NO_NOISE,
+      collectStepFailures: () => [
+        obs('wf', 'scrape', 'run-1', ['min_items: got 2, needs 10']),
+        obs('wf', 'scrape', 'run-2', ['min_items: got 3, needs 10']),
+      ],
+      nowIso: NOW,
+    });
+
+    assert.equal(res.ran, true);
+    assert.equal(res.added, 1);
+    const [pending] = listPendingProposals();
+    assert.equal(pending.kind, 'workflow_step');
+    assert.equal(pending.target, 'wf::scrape');
+  } finally {
+    delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
+  }
+});
+
 // ── persistence ──────────────────────────────────────────────────────────────
 
 test('recordProposals dedups by id and preserves a resolved status', () => {
@@ -151,6 +184,73 @@ test('recordProposals dedups by id and preserves a resolved status', () => {
   const second = recordProposals(fresh);
   assert.equal(second.added, 0, 're-proposing a known id adds nothing');
   assert.equal(listPendingProposals().length, 0, 'dismissed stays dismissed');
+});
+
+test('approveProposal: dismissed auto proposals are terminal and do not apply later', () => {
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+  writeDistilledSkill({ name: 'dismissed-skill', description: 'd', body: 'Use bad_tool carefully.', origin: { kind: 'manual' } });
+  const [p] = buildImprovementProposals(
+    report([{ toolName: 'bad_tool', calls: 10, successes: 1, errors: 9, emptyResults: 0, wrongPickHints: 0 }]),
+    {
+      listSkills: () => [{ name: 'dismissed-skill', body: 'Use bad_tool carefully.' }],
+      countRetirableNoise: NO_NOISE,
+      nowIso: NOW,
+    },
+  );
+  recordProposals([p]);
+  assert.equal(dismissProposal(p.id).ok, true);
+
+  const res = approveProposal(p.id);
+
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 'dismissed');
+  assert.equal(res.reason, 'already');
+  assert.ok(!loadSkill('dismissed-skill')!.body.includes('Pitfalls (observed)'), 'dismissed proposal did not mutate the skill');
+});
+
+test('dismissProposal: resolved auto proposals are terminal and are not downgraded', () => {
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+  delete process.env.CLEMMY_MEMORY_APPROVE;
+  writeDistilledSkill({ name: 'applied-skill', description: 'd', body: 'Use stale_tool carefully.', origin: { kind: 'manual' } });
+  const [p] = buildImprovementProposals(
+    report([{ toolName: 'stale_tool', calls: 10, successes: 1, errors: 9, emptyResults: 0, wrongPickHints: 0 }]),
+    {
+      listSkills: () => [{ name: 'applied-skill', body: 'Use stale_tool carefully.' }],
+      countRetirableNoise: NO_NOISE,
+      nowIso: NOW,
+    },
+  );
+  recordProposals([p]);
+  const applied = approveProposal(p.id);
+  assert.equal(applied.status, 'applied');
+
+  const dismissed = dismissProposal(p.id);
+
+  assert.equal(dismissed.ok, true);
+  assert.equal(dismissed.status, 'applied');
+  assert.equal(dismissed.reason, 'already');
+  assert.equal(listProposals()[0].status, 'applied');
+});
+
+test('recordProposals refreshes a pending proposal with newer evidence instead of duplicating it', () => {
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+  const first = buildImprovementProposals(
+    report([{ toolName: 'flaky_tool', calls: 10, successes: 4, errors: 6, emptyResults: 0, wrongPickHints: 0 }]),
+    { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE, nowIso: NOW },
+  )[0];
+  const newer = buildImprovementProposals(
+    report([{ toolName: 'flaky_tool', calls: 20, successes: 10, errors: 10, emptyResults: 0, wrongPickHints: 0 }]),
+    { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE, nowIso: '2026-06-24T00:00:00.000Z' },
+  )[0];
+  assert.equal(first.id, newer.id);
+  assert.notEqual(first.evidence, newer.evidence);
+
+  assert.equal(recordProposals([first]).added, 1);
+  assert.equal(recordProposals([newer]).added, 0);
+  const [pending] = listPendingProposals();
+  assert.equal(pending.id, first.id);
+  assert.equal(pending.evidence, newer.evidence);
+  assert.equal(pending.proposedAt, first.proposedAt, 'first-seen timestamp is preserved');
 });
 
 // ── apply (human-gated) ────────────────────────────────────────────────────────
@@ -205,6 +305,13 @@ test('proposalsFromStepFailures: the SAME problem across 2+ runs → a workflow_
   assert.match(out[0].proposedText, /Recurring issue \(seen in 2 runs\)/);
 });
 
+test('splitWorkflowStepTarget: splits on the final separator so workflow ids may contain "::"', () => {
+  assert.deepEqual(splitWorkflowStepTarget('daily::research::scrape'), { workflow: 'daily::research', stepId: 'scrape' });
+  assert.equal(splitWorkflowStepTarget('daily-research'), null);
+  assert.equal(splitWorkflowStepTarget('::scrape'), null);
+  assert.equal(splitWorkflowStepTarget('daily::'), null);
+});
+
 test('proposalsFromStepFailures: id is stable as the run count grows (no nightly duplicates)', () => {
   const two = proposalsFromStepFailures([
     obs('wf', 'scrape', 'r1', ['min_items: got 2, needs 10']),
@@ -232,36 +339,39 @@ test('buildWorkflowStepProposals: uses the injected failure collector', () => {
 });
 
 test('approveProposal: a workflow_step proposal appends a reversible prompt addendum (dryRun never mutates)', () => {
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+  const workflowName = 'hist::wf';
   const def: WorkflowDefinition = {
-    name: 'hist-wf',
+    name: 'history workflow',
     description: 'history workflow',
     enabled: true,
     trigger: { manual: true },
     steps: [{ id: 'scrape', prompt: 'Scrape the directory and return rows.', sideEffect: 'read' }],
   };
-  writeWorkflow('hist-wf', def);
+  writeWorkflow(workflowName, def);
   const [p] = proposalsFromStepFailures([
-    obs('hist-wf', 'scrape', 'r1', ['min_items: got 2, needs 10']),
-    obs('hist-wf', 'scrape', 'r2', ['min_items: got 1, needs 10']),
+    obs(workflowName, 'scrape', 'r1', ['min_items: got 2, needs 10']),
+    obs(workflowName, 'scrape', 'r2', ['min_items: got 1, needs 10']),
   ], NOW);
+  assert.equal(p.target, 'hist::wf::scrape');
   recordProposals([p]);
 
   // dry run: previews, no write
   const dry = approveProposal(p.id, { dryRun: true });
   assert.equal(dry.status, 'pending');
-  assert.equal(readWorkflow('hist-wf')!.data.steps[0].prompt, 'Scrape the directory and return rows.', 'dryRun did not edit the step');
+  assert.equal(readWorkflow(workflowName)!.data.steps[0].prompt, 'Scrape the directory and return rows.', 'dryRun did not edit the step');
 
   // real apply: addendum lands on the step prompt, proposal applied, reversible
   const real = approveProposal(p.id);
   assert.equal(real.ok, true);
   assert.equal(real.status, 'applied');
-  assert.match(readWorkflow('hist-wf')!.data.steps[0].prompt, /Recurring issue \(seen in 2 runs\)/);
+  assert.match(readWorkflow(workflowName)!.data.steps[0].prompt, /Recurring issue \(seen in 2 runs\)/);
 
-  const backups = listStepEditBackups().filter((b) => b.workflow === 'hist-wf');
+  const backups = listStepEditBackups().filter((b) => b.workflow === workflowName);
   assert.ok(backups.length >= 1, 'a reversible backup was snapshotted');
   const rev = revertStepEdit(backups[0].id);
   assert.equal(rev.ok, true);
-  assert.equal(readWorkflow('hist-wf')!.data.steps[0].prompt, 'Scrape the directory and return rows.', 'revert restored the original prompt');
+  assert.equal(readWorkflow(workflowName)!.data.steps[0].prompt, 'Scrape the directory and return rows.', 'revert restored the original prompt');
 });
 
 test('approveProposal: an auto skill_pitfall applies via appendSkillPitfall (dryRun first never mutates)', () => {

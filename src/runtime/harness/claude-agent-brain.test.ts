@@ -21,7 +21,7 @@ const {
   frameTrustedMemory,
   sdkStreamingEnabled,
 } = brain;
-const { getSession, listEvents, resetEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('./eventlog.js');
 
 beforeEach(() => {
   resetEventLog();
@@ -33,6 +33,7 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE;
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
   delete process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY;
+  delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
   process.env.AUTH_MODE = 'api_key';
 });
 
@@ -169,6 +170,183 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   assert.match(res.text, /Sent all 3 emails/);
 });
 
+test('full mode: completion judge receives prior user context and SDK tool evidence', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  createSession({ id: 'brain-judge-evidence', kind: 'chat', title: 'judge evidence' });
+  appendEvent({
+    sessionId: 'brain-judge-evidence',
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Build and publish the Q3 microsite' },
+  });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Published the microsite at https://example.test/q3.',
+    sessionId: 'sdk',
+    model: 'claude-opus-4-8',
+    toolUses: [
+      'mcp__clementine-local__run_shell_command',
+      'mcp__clementine-local__composio_execute_tool',
+      'mcp__clementine-local__composio_execute_tool',
+    ],
+  }));
+  let judgedObjective = '';
+  let toolSummary = '';
+  setClaudeAgentSdkBrainJudgeForTest(async (objective, _response, skillContext) => {
+    judgedObjective = objective;
+    toolSummary = skillContext?.toolCallSummary ?? '';
+    return { done: true, reason: 'published URL present' };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'ship it',
+    sessionId: 'brain-judge-evidence',
+  });
+
+  assert.match(res.text, /https:\/\/example\.test\/q3/);
+  assert.match(judgedObjective, /Build and publish the Q3 microsite/);
+  assert.match(judgedObjective, /Current user message .*ship it/);
+  assert.match(toolSummary, /run_shell_command/);
+  assert.match(toolSummary, /composio_execute_tool x2/);
+});
+
+test('streaming judge continuation appends the corrected final answer when it was not streamed', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'on';
+  const chunks: string[] = [];
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    runs += 1;
+    if (runs === 1) {
+      await options.onDelta?.("I'll send the emails next.");
+      return {
+        text: "I'll send the emails next.",
+        sessionId: 'sdk', model: 'claude-opus-4-8',
+        toolUses: ['mcp__clementine-local__composio_execute_tool'],
+      };
+    }
+    return {
+      text: 'Sent all 3 emails — here are the message links.',
+      sessionId: 'sdk', model: 'claude-opus-4-8',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'],
+    };
+  });
+  let judged = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judged += 1;
+    return judged === 1 ? { done: false, reason: 'no message links shown' } : { done: true, reason: 'links present' };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'send the 3 emails',
+    sessionId: 'brain-stream-judge',
+    onChunk: async (delta) => { chunks.push(delta); },
+  });
+
+  assert.equal(res.text, 'Sent all 3 emails — here are the message links.');
+  assert.deepEqual(chunks, [
+    "I'll send the emails next.",
+    '\n\nSent all 3 emails — here are the message links.',
+  ]);
+});
+
+test('streaming judge continuation suppresses retry deltas after stale streamed text', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'on';
+  const chunks: string[] = [];
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    runs += 1;
+    if (runs === 1) {
+      await options.onDelta?.("I'll send the emails next.");
+      return {
+        text: "I'll send the emails next.",
+        sessionId: 'sdk', model: 'claude-opus-4-8',
+        toolUses: ['mcp__clementine-local__composio_execute_tool'],
+      };
+    }
+    await options.onDelta?.('STREAMED RETRY SHOULD NOT RENDER');
+    return {
+      text: 'Sent all 3 emails — here are the message links.',
+      sessionId: 'sdk', model: 'claude-opus-4-8',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'],
+    };
+  });
+  let judged = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judged += 1;
+    return judged === 1 ? { done: false, reason: 'no message links shown' } : { done: true, reason: 'links present' };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'send the 3 emails',
+    sessionId: 'brain-stream-judge-suppress-retry',
+    onChunk: async (delta) => { chunks.push(delta); },
+  });
+
+  assert.equal(res.text, 'Sent all 3 emails — here are the message links.');
+  assert.deepEqual(chunks, [
+    "I'll send the emails next.",
+    '\n\nSent all 3 emails — here are the message links.',
+  ]);
+});
+
+test('local_authoring mode: completion judge verifies workflow-authoring claims before success', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on'; // default Claude brain mode = local_authoring
+  const prompts: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    prompts.push(options.prompt);
+    return {
+      text: prompts.length === 1 ? 'I created the workflow.' : 'Created workflow wf_daily_digest and scheduled it for 8am.',
+      sessionId: 'sdk', model: 'claude-opus-4-8',
+      toolUses: ['mcp__clementine-local__workflow_create'],
+    };
+  });
+  let judged = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judged += 1;
+    return judged === 1 ? { done: false, reason: 'missing workflow id and schedule evidence' } : { done: true, reason: 'workflow id present' };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'create and schedule a daily digest workflow', sessionId: 'brain-author-judge' });
+
+  assert.equal(prompts.length, 2, 'local-authoring claims are judged and continued once when not done');
+  assert.match(prompts[1], /missing workflow id and schedule evidence/);
+  assert.match(res.text, /wf_daily_digest/);
+});
+
+test('local_authoring mode: zero-tool completion claims are judged before success', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  const prompts: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    prompts.push(options.prompt);
+    return prompts.length === 1
+      ? { text: 'Created workflow daily_digest.', sessionId: 'sdk', model: 'claude-opus-4-8', toolUses: [] }
+      : {
+        text: 'Created workflow wf_daily_digest with workflow_create.',
+        sessionId: 'sdk',
+        model: 'claude-opus-4-8',
+        toolUses: ['mcp__clementine-local__workflow_create'],
+      };
+  });
+  let judged = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judged += 1;
+    return judged === 1 ? { done: false, reason: 'no workflow_create evidence' } : { done: true, reason: 'workflow tool evidence present' };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'create a daily digest workflow', sessionId: 'brain-author-zero-tool-claim' });
+
+  assert.equal(prompts.length, 2, 'zero-tool completion claim must be judged and continued');
+  assert.match(prompts[1], /no workflow_create evidence/);
+  assert.match(res.text, /wf_daily_digest/);
+});
+
 test('full mode: completion-judge kill-switch off ⇒ no judge call, no continuation', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
@@ -189,16 +367,47 @@ test('full mode: completion-judge kill-switch off ⇒ no judge call, no continua
 
 test('turn-budget stop surfaces as max-turns-with-grace and writes user_input + lifecycle events', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
-  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only'; // read_only ⇒ judge skipped (full-only)
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only'; // read_only ⇒ judge skipped
   setClaudeAgentSdkBrainRunForTest(async () => ({ text: 'partial work so far', sessionId: 's', toolUses: [], limitHit: true }));
 
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'a long multi-step task', sessionId: 'brain-limit' });
 
   assert.equal(res.stoppedReason, 'max-turns-with-grace');
+  assert.match(res.text, /Say "continue"/);
   assert.equal(res.raw?.limitHit, true);
-  const types = listEvents('brain-limit').map((e) => (e as { type?: string }).type);
+  const events = listEvents('brain-limit');
+  const types = events.map((e) => (e as { type?: string }).type);
   assert.ok(types.includes('user_input_received'), 'user_input_received written for the SDK brain');
   assert.ok(types.includes('conversation_completed'), 'conversation_completed emitted');
+  assert.ok(types.includes('conversation_limit_exceeded'), 'limit event emitted for paused/stopped classification');
+  assert.ok(
+    types.indexOf('conversation_limit_exceeded') < types.indexOf('conversation_completed'),
+    'limit telemetry lands before the user-facing continue completion',
+  );
+  const completed = events.find((e) => (e as { type?: string }).type === 'conversation_completed') as { data?: Record<string, unknown> } | undefined;
+  assert.equal(completed?.data?.reason, 'awaiting_continue');
+  assert.match(String(completed?.data?.reply ?? ''), /Say "continue"/);
+});
+
+test('streaming max-turn stop appends the missing continue guidance instead of suppressing it', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'on';
+  const chunks: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    await options.onDelta?.('partial work so far');
+    return { text: 'partial work so far', sessionId: 's', toolUses: [], limitHit: true };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'a long multi-step task',
+    sessionId: 'brain-stream-limit',
+    onChunk: async (delta) => { chunks.push(delta); },
+  });
+
+  assert.equal(res.stoppedReason, 'max-turns-with-grace');
+  assert.match(chunks.join(''), /partial work so far\n\nI hit the turn budget/);
+  assert.match(chunks.join(''), /Say "continue"/);
 });
 
 test('looksLikeToolNarration flags described-but-not-called tool protocol, ignores real tool calls', () => {
@@ -268,6 +477,47 @@ test('full mode: a narrated (no-tool-call) turn triggers ONE retry that actually
   assert.match(res.text, /Pulled 5 accounts/);
 });
 
+test('limit-hit tool narration parks for continue instead of retrying inside the same turn', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runs += 1;
+    return {
+      text: 'Tool:run_shell_command\n\nfunction\n{"command":"sf data query"}',
+      sessionId: 's',
+      toolUses: [],
+      limitHit: true,
+    };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 salesforce accounts', sessionId: 'brain-narrate-limit' });
+
+  assert.equal(runs, 1, 'max-turn pause must not spend another SDK turn on narration retry');
+  assert.equal(res.stoppedReason, 'max-turns-with-grace');
+  assert.match(res.text, /Say "continue"/);
+});
+
+test('local_authoring mode: a narrated workflow tool call triggers ONE retry', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on'; // local_authoring
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off'; // isolate narration retry
+  const calls: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls.push(options.prompt);
+    return calls.length === 1
+      ? { text: '**Tool call: workflow_create**\n```json\n{"name":"daily_digest"}\n```', sessionId: 's', toolUses: [] }
+      : { text: 'Created workflow daily_digest.', sessionId: 's', toolUses: ['mcp__clementine-local__workflow_create'] };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'create a daily digest workflow', sessionId: 'brain-author-narrate' });
+
+  assert.equal(calls.length, 2, 'local-authoring narration triggered exactly one retry');
+  assert.match(calls[1], /INVOKE the real tool now/);
+  assert.match(res.text, /Created workflow daily_digest/);
+});
+
 test('full mode: narration retry kill-switch off ⇒ no retry', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
@@ -318,6 +568,23 @@ test('a reasoning-leak (no-tool-call) turn triggers ONE retry that does the task
   assert.equal(calls.length, 2, 'reasoning leak triggered exactly one retry');
   assert.match(calls[1], /TRUSTED context you OWN/);
   assert.match(res.text, /Pulled 5 accounts/);
+});
+
+test('limit-hit reasoning leak parks for continue instead of retrying inside the same turn', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  let runs = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runs += 1;
+    return { text: REASONING_LEAK_TEXT, sessionId: 's', toolUses: [], limitHit: true };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'pull 5 market leaders in SF', sessionId: 'brain-leak-limit' });
+
+  assert.equal(runs, 1, 'max-turn pause must not spend another SDK turn on reasoning-leak retry');
+  assert.equal(res.stoppedReason, 'max-turns-with-grace');
+  assert.match(res.text, /Say "continue"/);
 });
 
 test('reasoning-leak retry shares the narration kill-switch ⇒ off means no retry', async () => {

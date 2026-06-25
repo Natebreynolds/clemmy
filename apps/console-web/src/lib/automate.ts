@@ -8,6 +8,7 @@ export interface WorkflowRow {
   trigger?: { schedule?: string; timezone?: string; manual?: boolean };
   stepCount?: number;
   lastRunStatus?: string | null;
+  lastRunNeedsAttention?: boolean;
 }
 
 export interface WorkflowStep {

@@ -98,6 +98,10 @@ export interface ProposerDeps {
   /** Count of soft-deletable internal-noise memory facts. Injectable; defaults to
    *  a dry-run of retireInternalNoise so the proposer reuses the canonical detector. */
   countRetirableNoise?: () => number;
+  /** Workflow-step contract failures to mine for self-improvement proposals.
+   *  Injectable for deterministic tests; defaults to scanning recent workflow
+   *  runs on disk. */
+  collectStepFailures?: () => StepFailureObservation[];
   /** Timestamp for proposedAt (testability). Defaults to now. */
   nowIso?: string;
 }
@@ -149,7 +153,7 @@ export function buildImprovementProposals(report: ObservatoryReport, deps: Propo
           proposedText: `\`${h.toolName}\` failed ${pct(errorRate)} of ${h.calls} calls — confirm its preconditions are met before invoking it.`,
           rationale: `Skill "${owning.name}" references ${h.toolName}, which is erroring frequently; a pitfall note steers future runs to check preconditions first.`,
           evidence: `error rate ${pct(errorRate)} over ${h.calls} calls${h.sampleError ? ` · sample: "${h.sampleError}"` : ''}`,
-        }, nowIso));
+        }, nowIso, `skill_pitfall:${owning.name}:${h.toolName}:error-rate`));
       } else {
         out.push(mkProposal({
           kind: 'tool_desc',
@@ -158,7 +162,7 @@ export function buildImprovementProposals(report: ObservatoryReport, deps: Propo
           proposedText: `Tighten ${h.toolName}'s description to state the precondition that avoids its ${pct(errorRate)} error rate (e.g. "only call when <X> is connected/non-empty").`,
           rationale: `A ${pct(errorRate)} error rate over ${h.calls} calls suggests the agent reaches for ${h.toolName} when its preconditions aren't met.`,
           evidence: `error rate ${pct(errorRate)} over ${h.calls} calls${h.sampleError ? ` · sample: "${h.sampleError}"` : ''}`,
-        }, nowIso));
+        }, nowIso, `tool_desc:${h.toolName}:error-rate`));
       }
     }
 
@@ -170,7 +174,7 @@ export function buildImprovementProposals(report: ObservatoryReport, deps: Propo
         proposedText: `Clarify when NOT to use ${h.toolName}: ${pct(emptyRate)} of calls returned empty and ${pct(wrongPickRate)} were wrong-pick hints — name the better-fit tool for that intent.`,
         rationale: `${h.toolName} is being picked when a different tool would have data.`,
         evidence: `empty ${pct(emptyRate)} · wrong-pick ${pct(wrongPickRate)} over ${h.calls} calls`,
-      }, nowIso));
+      }, nowIso, `tool_desc:${h.toolName}:empty-wrong-pick`));
     }
   }
 
@@ -183,7 +187,7 @@ export function buildImprovementProposals(report: ObservatoryReport, deps: Propo
       proposedText: `Retire ${noise} self-referential internal-tool memory fact${noise === 1 ? '' : 's'} (soft-delete, reversible) — they dilute recall without representing user knowledge.`,
       rationale: 'Facts derived from Clementine\'s own introspective tools crowd the recall window without adding user value.',
       evidence: `${noise} candidate internal-noise fact${noise === 1 ? '' : 's'}`,
-    }, nowIso));
+    }, nowIso, 'retire_fact:internal-noise'));
   }
 
   // Dedup by id (same issue detected twice in one pass → one proposal).
@@ -222,6 +226,14 @@ function normalizeProblem(p: string): string {
 function trimProblem(p: string, n = 160): string {
   const c = p.replace(/\s+/g, ' ').trim();
   return c.length > n ? c.slice(0, n) + '…' : c;
+}
+
+export function splitWorkflowStepTarget(target: string): { workflow: string; stepId: string } | null {
+  const sep = target.lastIndexOf('::');
+  if (sep <= 0 || sep >= target.length - 2) return null;
+  const workflow = target.slice(0, sep);
+  const stepId = target.slice(sep + 2);
+  return workflow && stepId ? { workflow, stepId } : null;
 }
 
 /** Scan recent runs of every workflow and collect each step's contract problems
@@ -266,7 +278,7 @@ export function proposalsFromStepFailures(observations: StepFailureObservation[]
     for (const p of o.problems) {
       const norm = normalizeProblem(p);
       if (!norm) continue;
-      const key = `${o.workflow} ${o.stepId} ${norm}`;
+      const key = `${o.workflow}\n${o.stepId}\n${norm}`;
       let e = recur.get(key);
       if (!e) { e = { workflow: o.workflow, stepId: o.stepId, problem: p, runs: new Set() }; recur.set(key, e); }
       e.runs.add(o.runId);
@@ -316,18 +328,22 @@ function writeStore(list: ImprovementProposal[]): void {
 }
 
 /**
- * Merge freshly-drafted proposals into the store. A proposal whose id already
- * exists is LEFT AS-IS (its status — applied/dismissed/approved — is preserved, so
- * a resolved item never resurrects as pending). Returns counts for the tick log.
+ * Merge freshly-drafted proposals into the store. Resolved proposals are LEFT
+ * AS-IS (so applied/dismissed/approved items never resurrect as pending), while
+ * still-pending proposals refresh their evidence/text as the nightly window
+ * changes. Returns counts for the tick log.
  */
 export function recordProposals(fresh: ImprovementProposal[]): { added: number; total: number } {
   const existing = readStore();
   const byId = new Map(existing.map((p) => [p.id, p]));
   let added = 0;
   for (const p of fresh) {
-    if (!byId.has(p.id)) {
+    const prev = byId.get(p.id);
+    if (!prev) {
       byId.set(p.id, p);
       added += 1;
+    } else if (prev.status === 'pending') {
+      byId.set(p.id, { ...p, status: prev.status, proposedAt: prev.proposedAt });
     }
   }
   const merged = [...byId.values()];
@@ -353,7 +369,13 @@ export function proposeFromReport(report: ObservatoryReport, deps: ProposerDeps 
   try {
     // Two sources: report-based (tools/skills/memory) + run-history-based
     // (workflow_step — a workflow's own steps improving over time).
-    const fresh = [...buildImprovementProposals(report, deps), ...buildWorkflowStepProposals()];
+    const fresh = [
+      ...buildImprovementProposals(report, deps),
+      ...buildWorkflowStepProposals({
+        collectStepFailures: deps.collectStepFailures,
+        nowIso: deps.nowIso,
+      }),
+    ];
     const { added, total } = recordProposals(fresh);
     return { ran: true, added, total };
   } catch {
@@ -385,7 +407,7 @@ export function approveProposal(id: string, opts: { dryRun?: boolean; nowIso?: s
   const list = readStore();
   const p = list.find((x) => x.id === id);
   if (!p) return { ok: false, status: 'pending', applied: 0, dryRun, reason: 'not-found' };
-  if (p.status === 'applied') return { ok: true, status: 'applied', applied: 0, dryRun, reason: 'already' };
+  if (p.status !== 'pending') return { ok: true, status: p.status, applied: 0, dryRun, reason: 'already' };
 
   const at = opts.nowIso ?? new Date().toISOString();
 
@@ -412,13 +434,11 @@ export function approveProposal(id: string, opts: { dryRun?: boolean; nowIso?: s
     if (dryRun) return { ok: true, status: 'pending', applied, dryRun };
   } else if (p.kind === 'workflow_step') {
     if (dryRun) return { ok: true, status: 'pending', applied: 0, dryRun };
-    // target = "<workflow>::<stepId>"; append the guidance as a reversible
-    // prompt addendum (validated + backed up by workflow-step-edit).
-    const sep = p.target.indexOf('::');
-    const wf = sep > 0 ? p.target.slice(0, sep) : '';
-    const stepId = sep > 0 ? p.target.slice(sep + 2) : '';
-    if (!wf || !stepId) return { ok: false, status: 'pending', applied: 0, dryRun, reason: 'apply-failed' };
-    const r = applyStepPromptAddendum(wf, stepId, p.proposedText, { description: `improvement proposal ${p.id}`, nowIso: at });
+    // target = "<workflow>::<stepId>". Split from the right so workflow names
+    // containing "::" still receive the reversible prompt addendum.
+    const parsed = splitWorkflowStepTarget(p.target);
+    if (!parsed) return { ok: false, status: 'pending', applied: 0, dryRun, reason: 'apply-failed' };
+    const r = applyStepPromptAddendum(parsed.workflow, parsed.stepId, p.proposedText, { description: `improvement proposal ${p.id}`, nowIso: at });
     applied = r.ok ? 1 : 0;
     if (!r.ok) return { ok: false, status: 'pending', applied: 0, dryRun, reason: 'apply-failed' };
   }
@@ -432,11 +452,12 @@ export function approveProposal(id: string, opts: { dryRun?: boolean; nowIso?: s
 
 /** Dismiss a pending proposal (won't resurface — its id stays in the store as
  *  'dismissed'). Reversible by editing the store; never mutates user data. */
-export function dismissProposal(id: string): { ok: boolean; reason?: 'not-found' } {
+export function dismissProposal(id: string): { ok: boolean; status?: ProposalStatus; reason?: 'not-found' | 'already' } {
   const list = readStore();
   const p = list.find((x) => x.id === id);
   if (!p) return { ok: false, reason: 'not-found' };
+  if (p.status !== 'pending') return { ok: true, status: p.status, reason: 'already' };
   p.status = 'dismissed';
   writeStore(list);
-  return { ok: true };
+  return { ok: true, status: 'dismissed' };
 }

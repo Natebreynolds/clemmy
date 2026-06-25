@@ -21,7 +21,7 @@ const {
   _setBridgeImplsForTests,
 } = await import('./respond-bridge.js');
 // eslint-disable-next-line import/first
-const { getSession, resetEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, getSession, resetEventLog } = await import('./eventlog.js');
 // eslint-disable-next-line import/first
 const { AgentRuntimeCancelledError } = await import('../provider.js');
 // eslint-disable-next-line import/first
@@ -203,6 +203,50 @@ test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through C
   assert.equal(runConversationCalled, 0, 'Claude SDK brain is a distinct route from the OpenAI SDK runner');
 });
 
+test('respondPreferHarness: Claude SDK brain relays harness tool/progress events to legacy callbacks', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  const seenTools: Array<{ toolName: string; input: Record<string, unknown> }> = [];
+  const seenReasoning: string[] = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: fakeRun({ status: 'completed' }),
+    claudeAgentBrain: (async (_surface, req) => {
+      if (!getSession(req.sessionId)) {
+        createSession({ id: req.sessionId, kind: 'chat', title: 'claude progress' });
+      }
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'turn_started',
+        data: {},
+      });
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_called',
+        data: { tool: 'run_shell_command', args: { command: 'npm test' } },
+      });
+      return { text: 'claude sdk brain', sessionId: req.sessionId, stoppedReason: 'success' };
+    }) as never,
+  });
+
+  await respondPreferHarness('home', {
+    message: 'run the local check',
+    sessionId: 'claude-brain-progress',
+    onToolActivity: (activity) => { seenTools.push(activity); },
+    onReasoning: (text) => { seenReasoning.push(text); },
+  }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+
+  assert.deepEqual(seenTools, [
+    { toolName: 'run_shell_command', input: { command: 'npm test' } },
+  ]);
+  assert.ok(seenReasoning.some((text) => /planning the next step/i.test(text)));
+});
+
 test('respondPreferHarness: Claude SDK brain opt-in does not route execution surfaces', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
@@ -249,6 +293,51 @@ test('Claude SDK brain overload (uncommitted) falls the turn over to the harness
   const res = await respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-ok' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
   assert.equal(res.text, 'harness-fallover', 'turn ran on the harness brain after Claude overloaded');
   assert.equal(runConversationCalled, 1);
+});
+
+test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  let reuseRecordedUserInput: boolean | undefined;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; reuseRecordedUserInput?: boolean }) => {
+      reuseRecordedUserInput = opts.reuseRecordedUserInput;
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 2,
+        lastDecision: { reply: 'fallback done', summary: 's', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+    claudeAgentBrain: (async (_surface, req) => {
+      if (!getSession(req.sessionId)) {
+        createSession({ id: req.sessionId, kind: 'chat', title: 'fallover test' });
+      }
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'user',
+        type: 'user_input_received',
+        data: { text: req.message },
+      });
+      appendEvent({
+        sessionId: req.sessionId,
+        turn: 1,
+        role: 'system',
+        type: 'turn_started',
+        data: {},
+      });
+      throw new ClaudeSdkProviderOverloadError('API Error: 529 Overloaded', false);
+    }) as never,
+  });
+
+  const res = await respondPreferHarness('home', { message: 'same turn', sessionId: 'fallover-reuse' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+
+  assert.equal(res.text, 'fallback done');
+  assert.equal(reuseRecordedUserInput, true, 'fallback harness turn reuses the Claude-recorded user row');
 });
 
 test('Claude SDK brain overload AFTER committing surfaces the error (no double-act)', async () => {
@@ -317,6 +406,74 @@ test('respondViaHarness: completed maps to AssistantResponse with reply preferre
   const session = getSession('bridge-t5');
   assert.ok(session, 'harness session created');
   assert.equal(session?.kind, 'chat', 'webhook surface creates a chat-kind session');
+});
+
+test('respondViaHarness: relays harness tool/progress events to legacy callbacks', async () => {
+  const seenTools: Array<{ toolName: string; input: Record<string, unknown> }> = [];
+  const seenReasoning: string[] = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string }) => {
+      appendEvent({
+        sessionId: opts.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'turn_started',
+        data: {},
+      });
+      appendEvent({
+        sessionId: opts.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_called',
+        data: { tool: 'memory_search', arguments: JSON.stringify({ query: 'status' }) },
+      });
+      appendEvent({
+        sessionId: opts.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_called',
+        data: { tool: 'run_shell_command', args: { command: 'npm test' } },
+      });
+      appendEvent({
+        sessionId: opts.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_called',
+        data: { toolName: 'browser_open', input: { url: 'http://127.0.0.1:3000' } },
+      });
+      appendEvent({
+        sessionId: opts.sessionId,
+        turn: 1,
+        role: 'agent',
+        type: 'tool_called',
+        data: { tool: 'debug_probe', args: 'not-json' },
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { summary: 's', reply: 'r', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+
+  await respondViaHarness('background', {
+    message: 'work',
+    sessionId: 'bridge-progress',
+    onToolActivity: (activity) => { seenTools.push(activity); },
+    onReasoning: (text) => { seenReasoning.push(text); },
+  });
+
+  assert.deepEqual(seenTools, [
+    { toolName: 'memory_search', input: { query: 'status' } },
+    { toolName: 'run_shell_command', input: { command: 'npm test' } },
+    { toolName: 'browser_open', input: { url: 'http://127.0.0.1:3000' } },
+    { toolName: 'debug_probe', input: { value: 'not-json' } },
+  ]);
+  assert.ok(seenReasoning.some((text) => /planning the next step/i.test(text)));
 });
 
 test('respondViaHarness: cron surface creates an execution-kind session', async () => {

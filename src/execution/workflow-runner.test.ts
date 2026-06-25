@@ -44,6 +44,9 @@ const {
   executeStep,
   findContractViolationStep,
   describeStepNonCompletion,
+  processWorkflowRuns,
+  workflowAdvisoryRequiresAttention,
+  workflowReportLaneForOutcome,
   enqueueWorkflowOutcomeTurn,
   shouldNotifyCancelledRun,
   coerceOutputForContract,
@@ -168,6 +171,40 @@ test('reapResolvedParkedRuns marks the Activity run as resumed when approval cle
   delete process.env.WORKFLOW_APPROVAL_PARKING;
 });
 
+test('pre-start missing-input workflow failure is recorded in Activity runs', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const slug = 'prestart-missing-activity';
+  const workflowName = 'Prestart Missing Activity';
+  const runId = `prestart-missing-${Date.now()}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Requires a URL before it can run.',
+    enabled: true,
+    trigger: { manual: true },
+    inputs: { url: { description: 'Target URL' } },
+    steps: [{ id: 'fetch', prompt: 'Fetch {{input.url}}' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(filePath, JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'queued',
+    inputs: {},
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  await processWorkflowRuns({} as never);
+
+  const runFile = JSON.parse(readFileSync(filePath, 'utf-8')) as { status?: string; error?: string };
+  assert.equal(runFile.status, 'error');
+  assert.match(runFile.error ?? '', /Missing required workflow input: url/);
+  const activityRun = runEvents.getRun(runId);
+  assert.equal(activityRun?.status, 'failed');
+  assert.match(activityRun?.error ?? '', /Missing required workflow input: url/);
+  assert.equal(activityRun?.events.at(-1)?.type, 'failed');
+});
+
 test('reapResolvedParkedRuns re-admits on a rejected approval too (run fails loudly, never stuck)', () => {
   process.env.WORKFLOW_APPROVAL_PARKING = 'on';
   const sid2 = 'workflow-gate:park-test-2:send_step';
@@ -253,6 +290,29 @@ test('describeOutputShape: names the actual produced shape (so a contract failur
   assert.match(describeOutputShape([1, 2, 3]), /array \(3 items\)/);
   assert.match(describeOutputShape('hello world'), /string \(11 chars\)/);
   assert.equal(describeOutputShape(null), 'null');
+});
+
+test('workflowAdvisoryRequiresAttention: confident quality misses are not clean success', () => {
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'target_missed' }), true);
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'foreach_overflow' }), true);
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'skill_not_executed' }), true);
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'idempotent_skip' }), true);
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unavailable' }), false);
+});
+
+test('workflowReportLaneForOutcome: non-review advisories stay on done lane', () => {
+  assert.equal(workflowReportLaneForOutcome({
+    needsAttention: false,
+    advisories: [{ kind: 'goal_validation_unavailable' }],
+  }), 'done');
+  assert.equal(workflowReportLaneForOutcome({
+    needsAttention: false,
+    advisories: [{ kind: 'skill_not_executed' }],
+  }), 'blocked');
+  assert.equal(workflowReportLaneForOutcome({
+    needsAttention: true,
+    advisories: [{ kind: 'goal_validation_unavailable' }],
+  }), 'blocked');
 });
 
 test('applyContractToPrompt: no contract → prompt unchanged', () => {
@@ -775,9 +835,13 @@ test('deterministic step ENFORCES its output contract (regression guard: routes 
   assert.ok(readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
 });
 
-test('forEach caps an oversized fan-out and REPORTS the overflow (anti-choke, no silent drop)', async () => {
+test('forEach batches an oversized fan-out and still attempts every item', async () => {
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
   process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
   try {
     const qualityAdvisories: Array<{ kind: string; note: string }> = [];
     const ctx = {
@@ -793,18 +857,127 @@ test('forEach caps an oversized fan-out and REPORTS the overflow (anti-choke, no
     } as unknown as Parameters<typeof executeStep>[1];
     const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull' } as unknown as Parameters<typeof executeStep>[0];
 
-    await executeStep(step, ctx);
-    // The cap took effect BEFORE fan-out: exactly maxItems items were attempted
-    // and the overflow is reported (no silent drop) — independent of per-item
-    // execution outcome (the stub's per-item result shape is irrelevant here).
+    const output = await executeStep(step, ctx) as Array<{ itemKey: string; output: unknown }>;
+
     const overflow = qualityAdvisories.find((a) => a.kind === 'foreach_overflow');
-    assert.ok(overflow, 'an overflow quality advisory is recorded — never a silent drop');
-    assert.match(overflow!.note, /DEFERRED 3/);
+    assert.equal(overflow, undefined, 'batching is not a terminal overflow advisory when every item is attempted');
+    assert.deepEqual(output.map((item) => item.itemKey), ['a', 'b', 'c', 'd', 'e']);
     const started = readWorkflowEvents('foreach-cap-test', 'fc-1').filter((e) => e.kind === 'item_started');
-    assert.equal(started.length, 2, 'only maxItems items fanned out (no head-of-line blocking)');
+    assert.equal(started.length, 5, 'all pending items are attempted in bounded windows');
+    const batched = readWorkflowEvents('foreach-cap-test', 'fc-1')
+      .find((e) => e.kind === 'step_advisory' && e.meta?.reason === 'foreach_batched');
+    assert.equal(batched?.meta?.batchSize, 2);
+    assert.equal(batched?.meta?.batches, 3);
   } finally {
     if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
     else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
+    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
+    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
+    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
+    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+  }
+});
+
+test('forEach batching resumes after already-completed items and drains remaining pending items', async () => {
+  const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  try {
+    const qualityAdvisories: Array<{ kind: string; note: string }> = [];
+    const completedItems = new Map<string, unknown>([
+      ['a', 'done-a'],
+      ['b', 'done-b'],
+    ]);
+    const ctx = {
+      workflow: { name: 'Choke Resume Test', steps: [] },
+      workflowSlug: 'foreach-cap-resume-test',
+      runId: 'fc-resume-1',
+      inputs: {},
+      stepOutputs: { pull: ['a', 'b', 'c', 'd', 'e'] },
+      assistant: { respond: async () => ({ text: 'done' }) },
+      completedItems,
+      forEachFailures: [],
+      qualityAdvisories,
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
+
+    const output = await executeStep(step, ctx) as Array<{ itemKey: string; output: unknown }>;
+
+    const overflow = qualityAdvisories.find((a) => a.kind === 'foreach_overflow');
+    assert.equal(overflow, undefined, 'resume batching does not turn fully attempted work into an overflow');
+    assert.deepEqual(output.map((item) => item.itemKey), ['a', 'b', 'c', 'd', 'e']);
+    assert.deepEqual(output.slice(0, 2).map((item) => item.output), ['done-a', 'done-b']);
+    const started = readWorkflowEvents('foreach-cap-resume-test', 'fc-resume-1')
+      .filter((e) => e.kind === 'item_started')
+      .map((e) => e.itemKey);
+    assert.deepEqual(started, ['c', 'd', 'e'], 'resume processes only pending items, across all windows');
+    const batched = readWorkflowEvents('foreach-cap-resume-test', 'fc-resume-1')
+      .find((e) => e.kind === 'step_advisory' && e.meta?.reason === 'foreach_batched');
+    assert.equal(batched?.meta?.batchSize, 2);
+    assert.equal(batched?.meta?.batches, 2);
+    const completed = readWorkflowEvents('foreach-cap-resume-test', 'fc-resume-1')
+      .findLast((e) => e.kind === 'step_completed');
+    assert.equal((completed as { meta?: Record<string, unknown> } | undefined)?.meta?.completed, 5, 'step metadata counts resumed + newly processed items');
+    assert.equal((completed as { meta?: Record<string, unknown> } | undefined)?.meta?.resumed, 2);
+    assert.equal((completed as { meta?: Record<string, unknown> } | undefined)?.meta?.processed, 3);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
+    else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
+    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
+    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
+    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
+    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+  }
+});
+
+test('forEach batching attributes item failures to their original keys across windows', async () => {
+  const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  try {
+    const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
+    const ctx = {
+      workflow: { name: 'Choke Failure Attribution Test', steps: [] },
+      workflowSlug: 'foreach-batch-failure-test',
+      runId: 'fc-fail-1',
+      inputs: {},
+      stepOutputs: { pull: ['a', 'b', 'c', 'd', 'e'] },
+      assistant: {
+        respond: async (req: { message?: string }) => {
+          if (/\bItem:\s*d\b/.test(req.message ?? '')) throw new Error('downstream d failed');
+          return { text: 'done' };
+        },
+      },
+      completedItems: new Map(),
+      forEachFailures,
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
+
+    const output = await executeStep(step, ctx) as Array<{ itemKey: string; output: unknown }>;
+
+    assert.deepEqual(output.map((item) => item.itemKey), ['a', 'b', 'c', 'e']);
+    assert.deepEqual(forEachFailures.map((f) => f.itemKey), ['d'], 'run-level failure summary names the failed item');
+    assert.match(forEachFailures[0]?.error ?? '', /downstream d failed/);
+    const itemFailed = readWorkflowEvents('foreach-batch-failure-test', 'fc-fail-1')
+      .find((e) => e.kind === 'item_failed');
+    assert.equal(itemFailed?.itemKey, 'd');
+    const completed = readWorkflowEvents('foreach-batch-failure-test', 'fc-fail-1')
+      .findLast((e) => e.kind === 'step_completed');
+    assert.equal((completed as { meta?: Record<string, unknown> } | undefined)?.meta?.failed, 1);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
+    else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
+    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
+    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
+    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
+    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
   }
 });
 

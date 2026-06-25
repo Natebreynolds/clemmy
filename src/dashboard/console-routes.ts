@@ -68,7 +68,7 @@ import { validateCronExpression } from '../shared/cron.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns, closeCheckIn } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
-import type { PendingApproval } from '../types.js';
+import type { AssistantRequest, PendingApproval } from '../types.js';
 import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
@@ -160,7 +160,21 @@ import {
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
 } from '../agents/plan-scope.js';
 import type { CheckInUrgency } from '../agents/check-ins.js';
-import { cancelBackgroundTask, createBackgroundTask, getBackgroundTask, listBackgroundTasks, processBackgroundTasks, resumeBackgroundTask, findSoleAwaitingInputTaskForOrigin, queueBackgroundTaskInputResolution, archiveBackgroundTask, restoreBackgroundTask, staleTaskKind } from '../execution/background-tasks.js';
+import {
+  archiveBackgroundTask,
+  cancelBackgroundTask,
+  createBackgroundTask,
+  findSoleAwaitingContinueTaskForOrigin,
+  findSoleAwaitingInputTaskForOrigin,
+  getBackgroundTask,
+  listBackgroundTasks,
+  processBackgroundTasks,
+  queueBackgroundTaskContinue,
+  queueBackgroundTaskInputResolution,
+  restoreBackgroundTask,
+  resumeBackgroundTask,
+  staleTaskKind,
+} from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
@@ -537,8 +551,7 @@ function isHarnessTerminalEvent(type: HarnessEventRow['type']): boolean {
     || type === 'run_completed'
     || type === 'run_failed'
     || type === 'approval_requested'
-    || type === 'awaiting_user_input'
-    || type === 'conversation_limit_exceeded';
+    || type === 'awaiting_user_input';
 }
 
 function isHarnessSessionCurrentlyWorking(session: HarnessSessionRow, activeWindowCutoff: number): boolean {
@@ -654,6 +667,7 @@ interface WorkflowRunRecordSummary {
   source: string | null;
   error: string | null;
   targetStepId: string | null;
+  needsAttention: boolean;
 }
 
 function stringField(value: unknown): string | null {
@@ -674,6 +688,7 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
     source: stringField(raw.source),
     error: stringField(raw.error),
     targetStepId: stringField(raw.targetStepId),
+    needsAttention: raw.needsAttention === true,
   };
 }
 
@@ -1142,6 +1157,8 @@ export function registerConsoleRoutes(
    * Autoresearch — force-regenerate the report NOW (the "Run autoresearch
    * now" button on the EVOLUTION panel). Returns the rebuilt content +
    * a written: true|false flag so the UI can say "no-op, content unchanged."
+   * Mirrors the nightly tick's optional improvement-proposer pass: no-op unless
+   * CLEMMY_IMPROVEMENT_PROPOSER=on, and still only drafts human-reviewed items.
    */
   app.post('/api/console/autoresearch/run', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
@@ -1149,10 +1166,16 @@ export function registerConsoleRoutes(
       const { buildReport, writeReport, renderReportMarkdown } = await import('../autoresearch/observatory.js');
       const report = buildReport();
       const result = writeReport(report);
+      let improvementProposals: { ran: boolean; added: number; total: number } | null = null;
+      try {
+        const { proposeFromReport } = await import('../autoresearch/improvement-proposer.js');
+        improvementProposals = proposeFromReport(report);
+      } catch { /* proposal drafting is best-effort and separately gated */ }
       res.json({
         ...result,
         report,
         content: renderReportMarkdown(report),
+        improvementProposals,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -1806,7 +1829,8 @@ export function registerConsoleRoutes(
           synthesis: entry.data.synthesis ?? null,
           allowedTools: entry.data.allowedTools ?? null,
           whenToUse: entry.data.whenToUse ?? null,
-          lastRunStatus: lastRun ? lastRun.status : null,
+          lastRunStatus: lastRun ? (lastRun.needsAttention ? 'needs_attention' : lastRun.status) : null,
+          lastRunNeedsAttention: lastRun?.needsAttention === true || undefined,
           lastRunAt: lastRun ? (lastRun.finishedAt ?? lastRun.startedAt ?? lastRun.createdAt) : null,
           };
         });
@@ -5199,13 +5223,14 @@ export function registerConsoleRoutes(
         const column: BoardColumnId =
           task.status === 'pending' ? 'queued'
             : task.status === 'running' || task.status === 'cancelling' ? 'running'
-              : task.status === 'awaiting_approval' || task.status === 'blocked' ? 'needs_you'
+              : task.status === 'awaiting_approval' || task.status === 'awaiting_continue' || task.status === 'blocked' ? 'needs_you'
                 : 'done';
         const actions: string[] = [];
         if (task.archived) {
           actions.push('restore');
         } else {
           if (task.status === 'pending') actions.push('promote', 'cancel');
+          else if (task.status === 'awaiting_continue') actions.push('resume', 'cancel');
           else if (task.status === 'running' || task.status === 'cancelling'
             || task.status === 'awaiting_approval' || task.status === 'blocked') actions.push('cancel');
           else if (task.status === 'interrupted' || task.status === 'failed' || task.status === 'aborted') {
@@ -5242,9 +5267,11 @@ export function registerConsoleRoutes(
       //    runs (id === `run-<taskId>`) so the same work isn't double-emitted.
       for (const run of listRuns(80)) {
         if (run.id.startsWith('run-bg-')) continue; // background task's own run record
+        const needsAttention = run.needsAttention === true;
         const column: BoardColumnId =
-          run.status === 'queued' || run.status === 'received' ? 'queued'
-            : run.status === 'running' ? 'running'
+          needsAttention ? 'needs_you'
+            : run.status === 'queued' || run.status === 'received' ? 'queued'
+              : run.status === 'running' ? 'running'
               : run.status === 'awaiting_approval' ? 'needs_you'
                 : 'done';
         const live = column === 'queued' || column === 'running' || column === 'needs_you';
@@ -5253,14 +5280,14 @@ export function registerConsoleRoutes(
           sourceKind: 'run',
           title: run.title,
           column,
-          status: run.status,
+          status: needsAttention ? 'needs_attention' : run.status,
           progressHint: run.outputPreview?.slice(0, 600)
             || run.events[run.events.length - 1]?.message || '',
           sessionId: run.sessionId,
           ageMs: ageMs(run.updatedAt),
           updatedAt: run.updatedAt,
-          actions: live ? ['cancel'] : [],
-          raw: { error: run.error, source: run.source, pendingApprovalId: run.pendingApprovalId },
+          actions: live && !needsAttention ? ['cancel'] : [],
+          raw: { error: run.error, source: run.source, pendingApprovalId: run.pendingApprovalId, needsAttention: needsAttention || undefined },
         });
       }
 
@@ -5341,7 +5368,7 @@ export function registerConsoleRoutes(
         return;
       }
       if (action === 'resume') {
-        if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
+        if (task.status !== 'awaiting_continue' && task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
           res.status(409).json({ ok: false, reason: `Cannot resume a ${task.status} task.` });
           return;
         }
@@ -7116,13 +7143,13 @@ export function registerConsoleRoutes(
 
     // /continue — rewrite the bare keyword into a structured
     // continuation directive when the session's last completion was
-    // an awaiting_continue (limit-exceeded). Falls through to the
+    // a limit/continue completion. Falls through to the
     // normal turn path with the rewritten input.
     let turnInput = input;
     if (command === 'continue') {
-      const { readLastConversationCompletion } = await import('../channels/discord-harness.js');
+      const { isContinueCompletionReason, readLastConversationCompletion } = await import('../channels/discord-harness.js');
       const lastCompletion = readLastConversationCompletion(sessionId);
-      if (lastCompletion?.reason === 'awaiting_continue') {
+      if (lastCompletion && isContinueCompletionReason(lastCompletion.reason)) {
         const summaryHint = lastCompletion.lastDecisionSummary
           ? `Your last summary on the prior turn was: "${lastCompletion.lastDecisionSummary.slice(0, 400)}".`
           : 'Use the conversation history above to figure out where you were.';
@@ -7460,7 +7487,7 @@ export function registerConsoleRoutes(
     try {
 
       writeEvent({ type: 'status', text: 'Clementine run started.' });
-      const response = await assistant.respond({
+      const streamReq: AssistantRequest = {
         message,
         sessionId,
         channel: 'cli',
@@ -7475,11 +7502,12 @@ export function registerConsoleRoutes(
             input: activity.input,
           });
         },
-        onReasoning: () => {
-          writeEvent({ type: 'status', text: 'Clementine is planning the next step.' });
+        onReasoning: (text) => {
+          writeEvent({ type: 'status', text: text || 'Clementine is planning the next step.' });
         },
         shouldCancel: () => closed,
-      });
+      };
+      const response = await respondPreferHarness('home', streamReq, (req) => assistant.respond(req));
       writeEvent({
         type: 'done',
         sessionId,
@@ -7738,6 +7766,17 @@ export function registerConsoleRoutes(
         text: `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`,
       });
       return;
+    }
+    if (/^\/?(continue|resume|keep going)$/i.test(message)) {
+      const continueTask = findSoleAwaitingContinueTaskForOrigin(sessionId);
+      if (continueTask) {
+        queueBackgroundTaskContinue(continueTask.id);
+        res.json({
+          sessionId,
+          text: `Continuing background task "${continueTask.title}". It will report back here when it's done.`,
+        });
+        return;
+      }
     }
     try {
       // FORK collapse (staged): interactive console home chat through the gated

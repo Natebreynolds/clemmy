@@ -68,12 +68,13 @@ export function useChat(options?: UseChatOptions) {
       const text = humanHarnessText((d.reply ?? d.summary), '');
       const reason = typeof d.reason === 'string' ? d.reason : '';
       const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : '';
+      const awaitingContinue = reason === 'awaiting_continue' || reason === 'limit_exceeded';
       if (reason === 'plan_first' && planProposalId) {
         patch(assistantId, { text: text || 'I drafted a plan — approve it to go ahead.', status: 'awaiting-plan', planProposalId, progress: undefined });
       } else {
         patch(assistantId, {
           text: text || (reason === 'no_structured_output' ? '(Finished without a written reply.)' : '(Done.)'),
-          status: 'complete',
+          status: awaitingContinue ? 'stopped' : 'complete',
           progress: undefined,
         });
       }

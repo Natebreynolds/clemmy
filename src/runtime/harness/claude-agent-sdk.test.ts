@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import type { Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 const mod = await import('./claude-agent-sdk.js');
+const usageLog = await import('../usage-log.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
   CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
@@ -191,6 +192,58 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
 });
 
+test('runClaudeAgentSdk records usage for the shared usage dashboard and workflow cost joins', async () => {
+  const sessionId = `sdk-usage-recording-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages([
+    {
+      type: 'system',
+      subtype: 'init',
+      model: 'claude-opus-4-8',
+      session_id: 'sdk-session-usage',
+      uuid: 'u1',
+      apiKeySource: 'none',
+      claude_code_version: '2.1.181',
+      cwd: process.cwd(),
+      tools: [],
+      mcp_servers: [],
+      permissionMode: 'dontAsk',
+      slash_commands: [],
+      output_style: 'default',
+      skills: [],
+      plugins: [],
+    } as any,
+    {
+      type: 'result',
+      subtype: 'success',
+      session_id: 'sdk-session-usage',
+      uuid: 'usage-result-1',
+      result: 'ok',
+      duration_ms: 17,
+      duration_api_ms: 12,
+      is_error: false,
+      num_turns: 1,
+      stop_reason: 'end_turn',
+      total_cost_usd: 0,
+      usage: { input_tokens: 10, cache_creation_input_tokens: 3, cache_read_input_tokens: 7, output_tokens: 5 },
+      modelUsage: {},
+      permission_denials: [],
+    } as any,
+  ], {})) as any);
+
+  await runClaudeAgentSdk({ prompt: 'hi', sessionId, modelId: 'claude-opus-4-8' });
+
+  const events = usageLog.readUsageEventsForDate().filter((e) => e.source === sessionId);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, 'other');
+  assert.equal(events[0].model, 'claude-opus-4-8');
+  assert.equal(events[0].inputTokens, 20);
+  assert.equal(events[0].cachedInputTokens, 7);
+  assert.equal(events[0].outputTokens, 5);
+  assert.equal(events[0].totalTokens, 25);
+  assert.equal(events[0].durationMs, 17);
+  assert.equal(events[0].responseId, 'usage-result-1');
+});
+
 test('runClaudeAgentSdk uses the conservative read-only tool set by default', async () => {
   const capture: { call?: any } = {};
   setClaudeAgentSdkQueryForTest(((params: any) => {
@@ -316,6 +369,37 @@ function toolThenThrowQuery(msg: string): Query {
     throw new Error(msg);
   })());
 }
+function streamedDeltasThenTurnLimitQuery(): Query {
+  return stubsFor((async function* () {
+    yield { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 's', uuid: 'i', apiKeySource: 'none', claude_code_version: '2', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any;
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'I finished the first pass' } } } as any;
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' and still need one more check.' } } } as any;
+    throw new Error('Claude Code returned an error result: Reached maximum number of turns (3)');
+  })());
+}
+function assistantThenStreamedDeltaThenTurnLimitQuery(): Query {
+  return stubsFor((async function* () {
+    yield { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 's', uuid: 'i', apiKeySource: 'none', claude_code_version: '2', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any;
+    yield { type: 'assistant', session_id: 's', uuid: 'a1', parent_tool_use_id: null, message: { content: [{ type: 'text', text: 'Earlier checkpoint.' }] } } as any;
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Later streamed checkpoint with more detail.' } } } as any;
+    throw new Error('Claude Code returned an error result: Reached maximum number of turns (3)');
+  })());
+}
+function streamedDeltasThenBlankSuccessQuery(): Query {
+  return stubsFor((async function* () {
+    yield { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 's', uuid: 'i', apiKeySource: 'none', claude_code_version: '2', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any;
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Here is the completed answer' } } } as any;
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' from the SDK stream.' } } } as any;
+    yield { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: '', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] } as any;
+  })());
+}
+function assistantSnapshotThenBlankSuccessQuery(): Query {
+  return stubsFor((async function* () {
+    yield { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 's', uuid: 'i', apiKeySource: 'none', claude_code_version: '2', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any;
+    yield { type: 'assistant', session_id: 's', uuid: 'a1', parent_tool_use_id: null, message: { content: [{ type: 'text', text: 'Assistant snapshot answer.' }] } } as any;
+    yield { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: '', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] } as any;
+  })());
+}
 
 test('overload at first byte is retried and then succeeds (no tools ran yet)', async () => {
   let calls = 0;
@@ -330,6 +414,18 @@ test('overload at first byte is retried and then succeeds (no tools ran yet)', a
   assert.equal(r.text, 'recovered');
 });
 
+test('synchronous overload during query startup is retried before surfacing', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    calls++;
+    if (calls === 1) throw new Error('Claude Code returned an error result: API Error: 529 Overloaded');
+    return successQuery('recovered after startup overload');
+  }) as any);
+  const r = await runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' });
+  assert.equal(calls, 2, 'retried the query startup error');
+  assert.equal(r.text, 'recovered after startup overload');
+});
+
 test('overload AFTER a tool ran is NOT retried (would double-act) — it throws', async () => {
   let calls = 0;
   setClaudeAgentSdkQueryForTest(((_p: any) => { calls++; return toolThenThrowQuery('API Error: 529 Overloaded'); }) as any);
@@ -342,6 +438,80 @@ test('a deterministic (non-overload) error is never retried', async () => {
   setClaudeAgentSdkQueryForTest(((_p: any) => { calls++; return throwingQuery('API Error: 400 Bad Request: invalid schema'); }) as any);
   await assert.rejects(runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' }), /400/);
   assert.equal(calls, 1, 'no retry on a 4xx');
+});
+
+test('thrown max-turns after streamed text returns the visible partial reply, not a generic error', async () => {
+  const chunks: string[] = [];
+  setClaudeAgentSdkQueryForTest(((_p: any) => streamedDeltasThenTurnLimitQuery()) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'long task',
+    sessionId: 'sdk-stream-limit',
+    modelId: 'claude-sonnet-4-6',
+    onDelta: async (delta) => { chunks.push(delta); },
+  });
+
+  assert.equal(r.limitHit, true);
+  assert.equal(r.text, 'I finished the first pass and still need one more check.');
+  assert.deepEqual(chunks, ['I finished the first pass', ' and still need one more check.']);
+});
+
+test('thrown max-turns preserves SDK text deltas even without a caller stream sink', async () => {
+  setClaudeAgentSdkQueryForTest(((_p: any) => streamedDeltasThenTurnLimitQuery()) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'long task',
+    sessionId: 'sdk-stream-limit-no-sink',
+    modelId: 'claude-sonnet-4-6',
+  });
+
+  assert.equal(r.limitHit, true);
+  assert.equal(r.text, 'I finished the first pass and still need one more check.');
+});
+
+test('thrown max-turns prefers later streamed text over an older assistant snapshot', async () => {
+  const chunks: string[] = [];
+  setClaudeAgentSdkQueryForTest(((_p: any) => assistantThenStreamedDeltaThenTurnLimitQuery()) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'long task',
+    sessionId: 'sdk-stream-limit-snapshot',
+    modelId: 'claude-sonnet-4-6',
+    onDelta: async (delta) => { chunks.push(delta); },
+  });
+
+  assert.equal(r.limitHit, true);
+  assert.equal(r.text, 'Later streamed checkpoint with more detail.');
+  assert.deepEqual(chunks, ['Later streamed checkpoint with more detail.']);
+});
+
+test('successful SDK run falls back to streamed deltas when final result text is blank', async () => {
+  const chunks: string[] = [];
+  setClaudeAgentSdkQueryForTest(((_p: any) => streamedDeltasThenBlankSuccessQuery()) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'stream a final answer',
+    sessionId: 'sdk-stream-blank-success',
+    modelId: 'claude-sonnet-4-6',
+    onDelta: async (delta) => { chunks.push(delta); },
+  });
+
+  assert.equal(r.limitHit, undefined);
+  assert.equal(r.text, 'Here is the completed answer from the SDK stream.');
+  assert.deepEqual(chunks, ['Here is the completed answer', ' from the SDK stream.']);
+});
+
+test('successful SDK run falls back to assistant text when final result text is blank', async () => {
+  setClaudeAgentSdkQueryForTest(((_p: any) => assistantSnapshotThenBlankSuccessQuery()) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'return an assistant snapshot',
+    sessionId: 'sdk-assistant-blank-success',
+    modelId: 'claude-sonnet-4-6',
+  });
+
+  assert.equal(r.limitHit, undefined);
+  assert.equal(r.text, 'Assistant snapshot answer.');
 });
 
 test('retries are bounded and then the overload surfaces', async () => {

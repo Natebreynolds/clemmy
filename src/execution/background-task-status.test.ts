@@ -11,10 +11,11 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-bgtask-status-test-'
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { createBackgroundTask, markBackgroundTaskDone } = await import('./background-tasks.js');
+const { createBackgroundTask, markBackgroundTaskAwaitingContinue, markBackgroundTaskDone } = await import('./background-tasks.js');
 const { recordToolEvent } = await import('../agents/tool-observability.js');
 const {
   getBackgroundTaskStatus,
+  listBackgroundTaskStatusSummaries,
   renderBackgroundTaskStatus,
   resolveBackgroundTask,
 } = await import('./background-task-status.js');
@@ -50,4 +51,16 @@ test('background task status resolves ids and includes tool activity/result', ()
   assert.equal(details.toolEvents.length, 1);
   assert.equal(details.toolEvents[0]?.toolName, 'write_file');
   assert.match(renderBackgroundTaskStatus(details), /Report complete/);
+});
+
+test('background task status summaries include awaiting_continue in active work', () => {
+  const task = createBackgroundTask({
+    title: 'Continue long task',
+    prompt: 'keep going',
+    source: 'desktop',
+  });
+  markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial');
+
+  const active = listBackgroundTaskStatusSummaries({ status: 'active', limit: 20 });
+  assert.ok(active.some((item) => item.task.id === task.id && item.task.status === 'awaiting_continue'));
 });

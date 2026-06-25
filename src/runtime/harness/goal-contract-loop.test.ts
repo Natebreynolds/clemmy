@@ -119,7 +119,7 @@ test('goal validation: fail → evidence continuation → pass → goal satisfie
     sessionId: sess.id,
     input: 'get going on the brief',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner("I'll finish compiling the brief next."),
+    runRunner: doneRunner('Done — Q2 brief saved to /tmp/q2-brief.md.'),
     goalValidator: async (input) => {
       validatorCalls.push(input.objective);
       return validatorCalls.length === 1 ? failResult('no artifact produced yet') : PASS_RESULT;
@@ -214,7 +214,7 @@ test('goal validation: attempt budget exhausted → honest unmet note, goal stay
     sessionId: sess.id,
     input: 'go',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner("I'm going to wrap up the migration now."),
+    runRunner: doneRunner('Done — migration report saved to /tmp/migration-report.md.'),
     goalValidator: async () => failResult('no migration evidence'),
   });
 
@@ -239,7 +239,7 @@ test('goal validation: dead judge (judgeFailedOpen) never spins and never satisf
     sessionId: sess.id,
     input: 'go',
     makeRunner: makeRunnerStub,
-    runRunner: doneRunner("I'll publish it shortly."),
+    runRunner: doneRunner('Done — report draft saved to /tmp/report-draft.md.'),
     goalValidator: async () => {
       calls += 1;
       return { pass: false, judgeFailedOpen: true, perCriterion: [], advice: 'judge unavailable' };
@@ -295,7 +295,7 @@ test('kill-switch: CLEMMY_GOAL_CONTRACT=off makes the goal loop inert', async ()
       sessionId: sess.id,
       input: 'go',
       makeRunner: makeRunnerStub,
-      runRunner: doneRunner("I'll ship it next."),
+      runRunner: doneRunner('Done — feature release notes saved to /tmp/release-notes.md.'),
       goalValidator: async () => { calls += 1; return PASS_RESULT; },
     });
     assert.equal(result.status, 'completed');

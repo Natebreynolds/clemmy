@@ -16,13 +16,16 @@ import os from 'node:os';
 import express from 'express';
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mobile-routes-test-'));
+process.env.CLEMENTINE_HOME = TMP_ROOT;
 test.after(() => {
+  resetEventLog();
   try { rmSync(TMP_ROOT, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
 const { createMobileRouter, MOBILE_SESSION_COOKIE } = await import('./mobile-routes.js');
 const { setPin } = await import('../runtime/mobile-pin.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
+const { appendEvent, createSession: createHarnessSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
 interface Harness {
   url: string;
@@ -359,6 +362,50 @@ test('chat/send returns 503 when no assistant is wired', async () => {
     assert.equal(res.status, 503);
     const body = await res.json() as { error: string };
     assert.equal(body.error, 'CHAT_SEND_UNAVAILABLE');
+  } finally { await h.close(); }
+});
+
+test('chat transcript preserves limit-exceeded reason metadata for mobile continue UX', async () => {
+  resetEventLog();
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    const cookie = extractCookie(login.headers.get('set-cookie'))!;
+    const session = createHarnessSession({
+      kind: 'chat',
+      channel: 'mobile',
+      title: 'Long mobile loop',
+      metadata: { source: 'mobile' },
+    });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'keep going' } });
+    appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'system',
+      type: 'conversation_limit_exceeded',
+      data: { reason: 'max_steps', steps: 12, maxSteps: 12, transport: 'claude_agent_sdk_brain' },
+    });
+
+    const res = await fetch(`${h.url}/m/api/chat/sessions/${session.id}`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      events: Array<{ type: string; data: Record<string, unknown> }>;
+    };
+    const limit = body.events.find((event) => event.type === 'conversation_limit_exceeded');
+    assert.ok(limit, 'limit event is present in the mobile transcript');
+    assert.deepEqual(limit!.data, {
+      reason: 'max_steps',
+      steps: 12,
+      maxSteps: 12,
+      maxWallClockMs: null,
+      maxTurns: null,
+      transport: 'claude_agent_sdk_brain',
+    });
   } finally { await h.close(); }
 });
 

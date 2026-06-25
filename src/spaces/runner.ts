@@ -17,7 +17,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import { resolveInSpace, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
+import { resolveInSpace, runnerFilenameError, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
 import { readData, writeData, appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
 import { executeComposioTool } from '../integrations/composio/client.js';
 import { augmentPath } from '../runtime/spawn-env.js';
@@ -87,6 +87,8 @@ function interpreterFor(
  *  (space_try_runner) — exported so the dry-run is byte-identical to a real pull,
  *  minus the write. */
 export async function runScript(slug: string, runner: string, extra?: Record<string, unknown>): Promise<RunSourceResult> {
+  const runnerError = runnerFilenameError(runner);
+  if (runnerError) return { ok: false, error: runnerError };
   let target: string;
   try {
     target = resolveInSpace(slug, path.join('data', runner));
@@ -99,7 +101,7 @@ export async function runScript(slug: string, runner: string, extra?: Record<str
   if (!interp) return { ok: false, error: `unsupported runner extension for data/${runner} (use .mjs/.js/.cjs/.ts/.py/.sh or an executable)` };
 
   const spaceDir = resolveInSpace(slug, 'data');
-  const payload = JSON.stringify({ slug, runner, ...(extra ?? {}) });
+  const payload = JSON.stringify({ ...(extra ?? {}), slug, runner });
   return await new Promise<RunSourceResult>((resolve) => {
     // Safe, complete-enough baseline for AGENT-AUTHORED runner code. We do NOT
     // spread process.env (it carries the daemon's OAuth tokens / API keys); we
@@ -227,6 +229,13 @@ export interface RefreshResult {
 export async function refreshSpaceData(slug: string, sourceId?: string): Promise<RefreshResult[]> {
   const rec = spaceStore.get(slug);
   if (!rec) return [{ ok: false, sourceId: sourceId ?? '(none)', error: `no workspace "${slug}"` }];
+  if (rec.manifestErrors && rec.manifestErrors.length > 0) {
+    return [{
+      ok: false,
+      sourceId: sourceId ?? '(manifest)',
+      error: `workspace manifest is invalid; fix with space_save before refreshing: ${rec.manifestErrors.join('; ')}`,
+    }];
+  }
   if (rec.status === 'paused' || rec.status === 'archived') {
     return [{ ok: false, sourceId: sourceId ?? '(none)', error: `workspace is ${rec.status}` }];
   }

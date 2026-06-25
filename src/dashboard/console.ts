@@ -4631,7 +4631,8 @@ body {
 .inbox-item[data-status="completed"] .ii-dot { background: var(--accent-2); }
 .inbox-item[data-status="failed"] .ii-dot    { background: var(--accent-fail); }
 .inbox-item[data-status="queued"] .ii-dot,
-.inbox-item[data-status="awaiting_approval"] .ii-dot {
+.inbox-item[data-status="awaiting_approval"] .ii-dot,
+.inbox-item[data-status="needs_attention"] .ii-dot {
   background: var(--accent-warn);
   animation: pulse 1.6s ease-in-out infinite;
 }
@@ -4667,6 +4668,7 @@ body {
 .inbox-item[data-status="awaiting_approval"] .ii-preview,
 .inbox-item[data-status="waiting_for_approval"] .ii-preview,
 .inbox-item[data-status="waiting_for_input"] .ii-preview,
+.inbox-item[data-status="needs_attention"] .ii-preview,
 .inbox-item[data-status="stalled"] .ii-preview { color: var(--accent-warn); }
 .inbox-item[data-status="failed"] .ii-preview { color: var(--accent-fail); }
 
@@ -4701,7 +4703,8 @@ body {
 .reading-status[data-status="completed"] { color: var(--accent-2); border-color: var(--accent-2); }
 .reading-status[data-status="failed"] { color: var(--accent-fail); border-color: var(--accent-fail); }
 .reading-status[data-status="queued"],
-.reading-status[data-status="awaiting_approval"] { color: var(--accent-warn); border-color: var(--accent-warn); }
+.reading-status[data-status="awaiting_approval"],
+.reading-status[data-status="needs_attention"] { color: var(--accent-warn); border-color: var(--accent-warn); }
 
 .reading-body {
   flex: 1;
@@ -15980,7 +15983,8 @@ const CONSOLE_JS = `
 
   window.__clementineSelectCron = selectCronByName;
 
-  function workflowStatusClass(status) {
+  function workflowStatusClass(status, needsAttention) {
+    if (needsAttention) return 'err';
     const s = String(status || '').toLowerCase();
     if (s === 'completed') return 'ok';
     if (s === 'error' || s === 'failed') return 'err';
@@ -15991,7 +15995,7 @@ const CONSOLE_JS = `
 
   function workflowRunLabel(run) {
     if (!run) return 'no runs yet';
-    const status = String(run.status || 'unknown');
+    const status = run.needsAttention ? 'needs attention' : String(run.status || 'unknown');
     const when = run.finishedAt || run.startedAt || run.createdAt || '';
     return status + (when ? ' · ' + fmtCronAgo(when) : '');
   }
@@ -16066,8 +16070,8 @@ const CONSOLE_JS = `
       : '<div class="wf-home-empty">— no enabled workflows scheduled in the next 7 days —</div>';
     const recentHtml = recentRuns.length
       ? recentRuns.slice(0, 8).map((run) => [
-        '<div class="wf-recent-run ' + workflowStatusClass(run.status) + '">',
-        '  <span class="wf-recent-status">' + escMem(String(run.status || 'unknown').toUpperCase()) + '</span>',
+        '<div class="wf-recent-run ' + workflowStatusClass(run.status, run.needsAttention) + '">',
+        '  <span class="wf-recent-status">' + escMem(run.needsAttention ? 'NEEDS ATTENTION' : String(run.status || 'unknown').toUpperCase()) + '</span>',
         '  <span class="wf-recent-title">' + escMem(run.workflow || 'workflow') + '</span>',
         '  <span class="wf-recent-meta">' + escMem(workflowRunLabel(run)) + '</span>',
         run.error ? '  <span class="wf-recent-error">' + escMem(String(run.error).slice(0, 120)) + '</span>' : '',
@@ -16493,6 +16497,7 @@ const CONSOLE_JS = `
         const rs = (w.lastRunStatus || '').toLowerCase();
         let dotCls = 'idle', dotLabel = 'no runs yet';
         if (rs === 'running' || rs === 'queued') { dotCls = 'running'; dotLabel = rs; }
+        else if (rs === 'needs_attention') { dotCls = 'failed'; dotLabel = 'last run: needs attention'; }
         else if (rs === 'done' || rs === 'completed' || rs === 'succeeded' || rs === 'ok' || rs === 'success') { dotCls = 'done'; dotLabel = 'last run: done'; }
         else if (rs === 'error' || rs === 'failed' || rs === 'blocked') { dotCls = 'failed'; dotLabel = 'last run: ' + rs; }
         else if (rs) { dotLabel = 'last run: ' + rs; }
@@ -20120,6 +20125,7 @@ const CONSOLE_JS = `
           const summary = humanHarnessText(ev.data && (ev.data.reply || ev.data.summary), '');
           const reason = ev.data && ev.data.reason;
           const planProposalId = ev.data && typeof ev.data.planProposalId === 'string' ? ev.data.planProposalId : '';
+          const awaitingContinue = reason === 'awaiting_continue' || reason === 'limit_exceeded';
           const existing = turn?.querySelector?.('[data-home-chat-turn-text]')?.textContent || '';
           if (reason === 'plan_first' && planProposalId) {
             setChatTurnPlanApproval(turn, summary, planProposalId);
@@ -20140,6 +20146,7 @@ const CONSOLE_JS = `
           }
           setChatTurnStatus(turn, reason === 'plan_first'
             ? 'awaiting plan approval'
+            : awaitingContinue ? 'paused at budget'
             : reason === 'abandoned_by_orchestrator' ? 'abandoned' : 'complete');
           // Speakable final reply for the one-loop voice surface.
           if (summary && options && options.onReplyText) options.onReplyText(summary, { final: true });
@@ -20153,7 +20160,9 @@ const CONSOLE_JS = `
         } else if (ev.type === 'conversation_limit_exceeded') {
           const reason = (ev.data && ev.data.reason) || 'limit';
           setChatTurnStatus(turn, 'stopped: ' + reason);
-          finish();
+          // The loop follows budget telemetry with a conversation_completed
+          // event that carries the user-facing "continue" reply. Keep the
+          // stream open so the final message is not dropped.
         } else if (ev.type === 'awaiting_user_input') {
           const q = (ev.data && ev.data.question) || 'waiting on your reply';
           setChatTurnText(turn, q);

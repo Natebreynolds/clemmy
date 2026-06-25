@@ -14,17 +14,23 @@ import { addNotification } from '../runtime/notifications.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { getGoalPinForDelegation } from '../agents/plan-proposals.js';
 import { ExecutionStore } from './store.js';
-import type { RunStoppedReason } from '../types.js';
+import type { AssistantResponse, RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
-import { BLOCKED_TEXT_PATTERNS } from '../runtime/harness/verify-delivered.js';
+import { BLOCKED_TEXT_PATTERNS, verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
+
+let backgroundDeliveryJudgeForTests: ObjectiveJudgeFn | null = null;
+export function _setBackgroundDeliveryJudgeForTests(fn: ObjectiveJudgeFn | null): void {
+  backgroundDeliveryJudgeForTests = fn;
+}
 
 export type BackgroundTaskStatus =
   | 'pending'
@@ -41,6 +47,11 @@ export type BackgroundTaskStatus =
   // Google Sheet because the Salesforce pull came back empty yet the run
   // still marked itself 'done'.
   | 'blocked'
+  // 'awaiting_continue' = the worker hit an INTERNAL run/turn budget after
+  // bounded automatic continuations. This is not a true external blocker and
+  // not a completed result; the same task can be resumed with a continuation
+  // prompt from the board or originating chat.
+  | 'awaiting_continue'
   // 'awaiting_input' = the run paused to ask the user a CLARIFYING QUESTION
   // (ask_user_question, e.g. a judge/gate decided it needs validation) — it can
   // RESUME from the answer, like 'awaiting_approval' but carrying freeform text
@@ -85,6 +96,11 @@ export interface BackgroundTaskRecord {
     questionId: string;
     answer: string;
     queuedAt: string;
+  };
+  continueResolution?: {
+    queuedAt: string;
+    reason?: string;
+    auto?: boolean;
   };
   resumedFromTaskId?: string;
   resumeCount?: number;
@@ -136,6 +152,11 @@ const PROGRESS_CHECKIN_TOOL_INTERVAL = 5;
 const BACKGROUND_STEP_WALL_CLOCK_MS = (() => {
   const raw = parseInt(process.env.CLEMENTINE_BACKGROUND_STEP_WALL_MS || '', 10);
   return Number.isNaN(raw) ? 10 * 60_000 : Math.max(60_000, raw);
+})();
+const BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP = (() => {
+  const raw = parseInt(process.env.CLEMENTINE_BACKGROUND_TURN_AUTO_CONTINUES || '', 10);
+  if (Number.isNaN(raw)) return 4;
+  return Math.max(0, Math.min(24, raw));
 })();
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
 let backgroundProcessorInFlight = false;
@@ -270,6 +291,18 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
   ].filter(Boolean).join('\n');
 }
 
+function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: string): string {
+  return [
+    `Continue background task ${task.id}.`,
+    'The previous worker turn hit an internal run/turn budget before the objective was complete.',
+    'Pick up from the prior session state and finish the original request. Do not restart from scratch unless the prior state is unusable.',
+    previousText ? `Previous partial result / continuation note:\n${previousText.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
+    '',
+    'Original request:',
+    task.prompt,
+  ].filter(Boolean).join('\n');
+}
+
 export function createBackgroundTask(input: CreateBackgroundTaskInput): BackgroundTaskRecord {
   const createdAt = nowIso();
   const id = makeTaskId(new Date(createdAt));
@@ -334,7 +367,7 @@ export function listBackgroundTasks(filter: { status?: BackgroundTaskStatus; use
 export const STALE_TASK_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 const STALE_FINISHED_STATUSES: readonly BackgroundTaskStatus[] = ['done', 'failed', 'aborted', 'blocked', 'interrupted'];
-const STALE_PARKED_STATUSES: readonly BackgroundTaskStatus[] = ['awaiting_input', 'awaiting_approval'];
+const STALE_PARKED_STATUSES: readonly BackgroundTaskStatus[] = ['awaiting_input', 'awaiting_approval', 'awaiting_continue'];
 
 /** 'finished' = a terminal task lingering on the board; 'parked' = a task that
  *  has waited on the user (input/approval) and gone unanswered. */
@@ -397,6 +430,13 @@ export function getBackgroundTaskByQuestionId(questionId: string): BackgroundTas
 export function findSoleAwaitingInputTaskForOrigin(originSessionId: string): BackgroundTaskRecord | null {
   if (!originSessionId) return null;
   const parked = listBackgroundTasks({ status: 'awaiting_input' })
+    .filter((task) => task.originSessionId === originSessionId);
+  return parked.length === 1 ? parked[0] : null;
+}
+
+export function findSoleAwaitingContinueTaskForOrigin(originSessionId: string): BackgroundTaskRecord | null {
+  if (!originSessionId) return null;
+  const parked = listBackgroundTasks({ status: 'awaiting_continue' })
     .filter((task) => task.originSessionId === originSessionId);
   return parked.length === 1 ? parked[0] : null;
 }
@@ -566,6 +606,42 @@ export function markBackgroundTaskAwaitingApproval(id: string, approvalId: strin
   return updated;
 }
 
+export function markBackgroundTaskAwaitingContinue(id: string, reason: string, resultText: string): BackgroundTaskRecord | null {
+  const reasonText = clean(reason || 'The task reached its internal run budget before finishing.', 1000);
+  const updated = updateBackgroundTask(id, {
+    status: 'awaiting_continue',
+    completedAt: undefined,
+    error: reasonText,
+    result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
+    pendingApprovalId: undefined,
+    approvalResolution: undefined,
+    continueResolution: undefined,
+  });
+  if (updated) {
+    addNotification({
+      id: `${Date.now()}-background-${updated.id}-awaiting-continue`,
+      kind: 'approval',
+      title: `Background task needs continue: ${updated.title}`,
+      body: [
+        `Task ${updated.id} reached its internal run budget before finishing.`,
+        ``,
+        `Reason: ${reasonText}`,
+        ``,
+        `Resume it from the Tasks board, or reply \`continue\` in the originating chat if this is the only parked background task there.`,
+      ].join('\n'),
+      createdAt: nowIso(),
+      read: false,
+      metadata: taskNotificationMetadata(updated, { status: 'awaiting_continue' }),
+    });
+    enqueueBackgroundTaskOutcomeTurn(
+      updated,
+      'needs_input',
+      `Task ${updated.id} reached its internal run budget before finishing. Reply \`continue\` to queue the next background turn, or resume it from the Tasks board.`,
+    );
+  }
+  return updated;
+}
+
 /**
  * Mark a task BLOCKED: it could not complete the objective because a
  * prerequisite was missing (no data, no access, an unmet dependency).
@@ -694,6 +770,13 @@ export function classifyBackgroundTaskOutcome(
       reason: (text || 'The run hit a runtime error before finishing.').slice(0, 400),
     };
   }
+  if (stoppedReason === 'max-turns-with-grace') {
+    const text = (finalText || '').trim();
+    return {
+      outcome: 'blocked',
+      reason: (text || 'The run hit its turn budget before finishing; continue is required.').slice(0, 400),
+    };
+  }
 
   // 3) Text heuristic: the agent's own final words say it's blocked.
   const text = (finalText || '').trim();
@@ -710,6 +793,29 @@ export function classifyBackgroundTaskOutcome(
   //    instead of a hollow "done". Flag-gated (CLEMMY_FANOUT_LEDGER).
   const coverageBlock = fanoutCoverageBlock(task.runSessionId);
   if (coverageBlock) return coverageBlock;
+
+  return { outcome: 'done' };
+}
+
+async function verifyBackgroundTaskDelivery(
+  task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title'>,
+  finalText: string,
+  stoppedReason?: RunStoppedReason,
+): Promise<{ outcome: 'done' | 'blocked'; reason?: string }> {
+  const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason);
+  if (classified.outcome === 'blocked') return classified;
+
+  try {
+    const verdict = await verifyDelivered(task.prompt || task.title, finalText, {
+      stoppedReason,
+      ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
+    });
+    if (!verdict.delivered) {
+      return { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
+    }
+  } catch {
+    return { outcome: 'done' };
+  }
 
   return { outcome: 'done' };
 }
@@ -772,6 +878,9 @@ export function cancelBackgroundTask(id: string, reason = 'Cancelled by user.'):
 export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task) return null;
+  if (task.status === 'awaiting_continue') {
+    return queueBackgroundTaskContinue(id);
+  }
   if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
     return null;
   }
@@ -883,6 +992,37 @@ export function queueBackgroundTaskInputResolution(questionId: string, answer: s
   return updated;
 }
 
+export function queueBackgroundTaskContinue(id: string, opts: { auto?: boolean; reason?: string } = {}): BackgroundTaskRecord | null {
+  const task = getBackgroundTask(id);
+  if (!task || task.status !== 'awaiting_continue') return null;
+  const now = nowIso();
+  const updated = updateBackgroundTask(task.id, {
+    status: 'pending',
+    continueResolution: {
+      queuedAt: now,
+      reason: clean(opts.reason ?? task.error ?? 'Continue requested.', 700),
+      auto: opts.auto,
+    },
+    lastCheckInAt: now,
+    lastCheckInMessage: opts.auto
+      ? 'Internal run budget reached; queued automatic continuation.'
+      : 'Continue requested; queued daemon continuation.',
+  });
+  if (updated) {
+    addNotification({
+      id: `${Date.now()}-background-${updated.id}-continue-queued`,
+      kind: 'execution',
+      title: `Background task continuing: ${updated.title}`,
+      body: `Task ${updated.id} will resume in the daemon from its previous partial progress.`,
+      createdAt: nowIso(),
+      read: false,
+      silent: Boolean(opts.auto),
+      metadata: taskNotificationMetadata(updated, { status: 'pending', continuing: true, auto: opts.auto }),
+    });
+  }
+  return updated;
+}
+
 export function interruptStaleRunningBackgroundTasks(): number {
   let interrupted = 0;
   for (const task of listBackgroundTasks()) {
@@ -902,11 +1042,11 @@ export function interruptStaleRunningBackgroundTasks(): number {
  * coverage/classify checks so a clarifying question is never misread as
  * blocked/done.
  */
-function finishWorkerRun(
+async function finishWorkerRun(
   task: BackgroundTaskRecord,
   run: { id: string },
   response: { text: string; pendingApprovalId?: string; stoppedReason?: RunStoppedReason },
-): void {
+): Promise<void> {
   if (response.pendingApprovalId) {
     markBackgroundTaskAwaitingApproval(task.id, response.pendingApprovalId, response.text);
     finishRun(run.id, {
@@ -932,6 +1072,18 @@ function finishWorkerRun(
     logger.info({ taskId: task.id, questionId }, 'Background task paused for clarifying input');
     return;
   }
+  if (response.stoppedReason === 'max-turns-with-grace') {
+    const reason = (response.text || 'The run hit its turn budget before finishing; continue is required.').trim().slice(0, 400);
+    clearLedger(task.runSessionId);
+    markBackgroundTaskAwaitingContinue(task.id, reason, response.text);
+    finishRun(run.id, {
+      status: 'awaiting_approval',
+      message: `Background task ${task.id} paused at its internal run budget and can be continued.`,
+      outputPreview: response.text,
+    });
+    logger.warn({ taskId: task.id, reason }, 'Background task paused awaiting continue (not done)');
+    return;
+  }
   const coverageBlock = fanoutCoverageBlock(task.runSessionId);
   if (coverageBlock) {
     markBackgroundTaskBlocked(task.id, coverageBlock.reason, response.text);
@@ -940,7 +1092,7 @@ function finishWorkerRun(
     logger.warn({ taskId: task.id, reason: coverageBlock.reason }, 'Background task partial fan-out coverage (blocked, not done)');
     return;
   }
-  const outcome = classifyBackgroundTaskOutcome(task, response.text, response.stoppedReason);
+  const outcome = await verifyBackgroundTaskDelivery(task, response.text, response.stoppedReason);
   if (outcome.outcome === 'blocked') {
     markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text);
     finishRun(run.id, {
@@ -1092,7 +1244,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
           continue;
         }
 
-        const postApprovalOutcome = classifyBackgroundTaskOutcome(task, result.text);
+        const postApprovalOutcome = await verifyBackgroundTaskDelivery(task, result.text);
         if (postApprovalOutcome.outcome === 'blocked') {
           markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text);
           finishRun(run.id, {
@@ -1123,82 +1275,123 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      // unwind via AgentRuntimeCancelledError. The catch handler
 	      // reads cancellationReason and marks the task aborted with a
 	      // user-readable message.
-	      // Resume-with-answer vs fresh run: if this task was re-queued with the
-	      // user's answer to a clarifying question (needs_input round-trip), inject
-	      // the answer instead of the original prompt — the run session holds the
+	      // Resume-with-answer / resume-with-continue vs fresh run: if this task
+	      // was re-queued with a user's answer or a continuation request, inject
+	      // that context instead of the original prompt. The run session holds the
 	      // full history, so it re-enters cleanly. Consume the resolution once.
 	      const resume = task.inputResolution;
-	      const workerMessage = resume
+	      const continuation = task.continueResolution;
+	      let workerMessage = resume
 	        ? `The user answered your question: "${resume.answer}". Continue the task with this answer.`
-	        : buildWorkerPrompt(task);
-	      if (resume) task = updateBackgroundTask(task.id, { inputResolution: undefined }) ?? task;
+	        : continuation
+	          ? buildWorkerContinuePrompt(task, task.result ?? continuation.reason)
+	          : buildWorkerPrompt(task);
+	      if (resume || continuation) {
+	        task = updateBackgroundTask(task.id, {
+	          inputResolution: resume ? undefined : task.inputResolution,
+	          continueResolution: continuation ? undefined : task.continueResolution,
+	        }) ?? task;
+	      }
 	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
-	      // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
-	      // gated harness loop; legacy fallback only pre-run. The shouldCancel
-	      // deadline contract is preserved — the bridge maps it onto the harness
-	      // kill switch and re-throws AgentRuntimeCancelledError on caller-driven
-	      // aborts. Kill-switch CLEMMY_HARNESS_BACKGROUND=off.
-	      const response = await respondPreferHarness('background', {
-	        sessionId: task.runSessionId,
-	        channel: task.channel ?? 'background',
-	        userId: task.userId,
-	        model: task.model ?? MODELS.deep,
-	        // P0-B — give a heavy worker turn real headroom, but never more than
-	        // half the task's soft cap so one overlong call aborts-and-recovers
-	        // (P0-A) well before the whole-task deadline cancels everything.
-	        maxWallClockMs: Math.min(
-	          BACKGROUND_STEP_WALL_CLOCK_MS,
-	          Math.floor((task.maxMinutes * 60_000) / 2),
-	        ),
-	        message: workerMessage,
-	        runId: run.id,
-	        shouldCancel: () => {
-	          if (Date.now() > wallClockDeadlineMs) {
-	            const latest = getBackgroundTask(task.id);
-	            if (latest && latest.status !== 'cancelling' && latest.status !== 'aborted') {
-	              updateBackgroundTask(task.id, {
-	                status: 'cancelling',
-	                cancellationRequestedAt: new Date().toISOString(),
-	                cancellationReason: `Exceeded soft max runtime of ${task.maxMinutes} minutes. Re-queue with a higher cap to continue.`,
-	              });
+	      let autoContinueAttempts = 0;
+	      let response: AssistantResponse;
+	      while (true) {
+	        // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
+	        // gated harness loop; legacy fallback only pre-run. The shouldCancel
+	        // deadline contract is preserved — the bridge maps it onto the harness
+	        // kill switch and re-throws AgentRuntimeCancelledError on caller-driven
+	        // aborts. Kill-switch CLEMMY_HARNESS_BACKGROUND=off.
+	        const remainingWallMs = Math.max(1, wallClockDeadlineMs - Date.now());
+	        response = await respondPreferHarness('background', {
+	          sessionId: task.runSessionId,
+	          channel: task.channel ?? 'background',
+	          userId: task.userId,
+	          model: task.model ?? MODELS.deep,
+	          // P0-B — give a heavy worker turn real headroom, but never more than
+	          // half the task's soft cap so one overlong call aborts-and-recovers
+	          // (P0-A) well before the whole-task deadline cancels everything.
+	          maxWallClockMs: Math.min(
+	            BACKGROUND_STEP_WALL_CLOCK_MS,
+	            Math.floor((task.maxMinutes * 60_000) / 2),
+	            remainingWallMs,
+	          ),
+	          message: workerMessage,
+	          runId: run.id,
+	          shouldCancel: () => {
+	            if (Date.now() > wallClockDeadlineMs) {
+	              const latest = getBackgroundTask(task.id);
+	              if (latest && latest.status !== 'cancelling' && latest.status !== 'aborted') {
+	                updateBackgroundTask(task.id, {
+	                  status: 'cancelling',
+	                  cancellationRequestedAt: new Date().toISOString(),
+	                  cancellationReason: `Exceeded soft max runtime of ${task.maxMinutes} minutes. Re-queue with a higher cap to continue.`,
+	                });
+	              }
+	              return true;
 	            }
-	            return true;
-	          }
-	          const latest = getBackgroundTask(task.id);
-	          return latest?.status === 'cancelling' || latest?.status === 'aborted';
-	        },
-	        onToolActivity: (activity) => {
-	          toolCount += 1;
-	          const now = Date.now();
-	          const shouldCheckIn = toolCount === 1 ||
-	            toolCount % PROGRESS_CHECKIN_TOOL_INTERVAL === 0 ||
-	            now - lastProgressCheckInAt >= progressCheckInMinMs;
-	          if (!shouldCheckIn) return;
-	          lastProgressCheckInAt = now;
-	          const latestTask = getBackgroundTask(task.id) ?? task;
-	          task = emitBackgroundTaskCheckIn(latestTask, {
-	            title: `Background task progress: ${latestTask.title}`,
-	            body: [
-	              `Task ${latestTask.id} is still running.`,
-	              `Run: ${run.id}`,
-	              `Latest tool: ${activity.toolName}`,
-	              `Tool calls observed: ${toolCount}`,
-	            ].join('\n'),
-	            runId: run.id,
-	            metadata: {
-	              status: 'running',
-	              toolName: activity.toolName,
-	              toolCount,
-	            },
-	          });
-	        },
-	      }, (req) => assistant.respond(req));
+	            const latest = getBackgroundTask(task.id);
+	            return latest?.status === 'cancelling' || latest?.status === 'aborted';
+	          },
+	          onToolActivity: (activity) => {
+	            toolCount += 1;
+	            const now = Date.now();
+	            const shouldCheckIn = toolCount === 1 ||
+	              toolCount % PROGRESS_CHECKIN_TOOL_INTERVAL === 0 ||
+	              now - lastProgressCheckInAt >= progressCheckInMinMs;
+	            if (!shouldCheckIn) return;
+	            lastProgressCheckInAt = now;
+	            const latestTask = getBackgroundTask(task.id) ?? task;
+	            task = emitBackgroundTaskCheckIn(latestTask, {
+	              title: `Background task progress: ${latestTask.title}`,
+	              body: [
+	                `Task ${latestTask.id} is still running.`,
+	                `Run: ${run.id}`,
+	                `Latest tool: ${activity.toolName}`,
+	                `Tool calls observed: ${toolCount}`,
+	              ].join('\n'),
+	              runId: run.id,
+	              metadata: {
+	                status: 'running',
+	                toolName: activity.toolName,
+	                toolCount,
+	              },
+	            });
+	          },
+	        }, (req) => assistant.respond(req));
+
+	        if (response.stoppedReason !== 'max-turns-with-grace') break;
+	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) break;
+	        clearLedger(task.runSessionId);
+	        autoContinueAttempts += 1;
+	        addRunEvent(run.id, {
+	          type: 'status',
+	          message: `Background task hit an internal run budget; continuing automatically (${autoContinueAttempts}/${BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP}).`,
+	          data: { stoppedReason: response.stoppedReason, autoContinueAttempts },
+	        });
+	        const latestTask = getBackgroundTask(task.id) ?? task;
+	        lastProgressCheckInAt = Date.now();
+	        task = emitBackgroundTaskCheckIn(latestTask, {
+	          title: `Background task continuing: ${latestTask.title}`,
+	          body: [
+	            `Task ${latestTask.id} hit an internal run budget before finishing.`,
+	            `Run: ${run.id}`,
+	            `Automatic continuation: ${autoContinueAttempts}/${BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP}`,
+	          ].join('\n'),
+	          runId: run.id,
+	          metadata: {
+	            status: 'running',
+	            autoContinue: true,
+	            autoContinueAttempts,
+	          },
+	        });
+	        workerMessage = buildWorkerContinuePrompt(task, response.text);
+	      }
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);
 
 	      // Classify + record the result: pending-approval / awaiting-input (the
 	      // judge-gated check-in) / partial-coverage / blocked / done — all in the
 	      // shared helper so the fresh-run and input-resume paths agree.
-	      finishWorkerRun(task, run, response);
+	      await finishWorkerRun(task, run, response);
 	    } catch (error) {
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);
 	      const message = error instanceof Error ? error.message : String(error);

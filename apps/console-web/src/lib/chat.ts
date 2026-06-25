@@ -9,12 +9,15 @@ import { apiPost } from './api';
 import { getAuthToken } from './bootstrap';
 import type { HarnessEvent, ChatPostResult, AttachResult } from './types';
 
-/** Events that end a streaming turn (the composer re-enables after these). */
+/**
+ * Events that end a streaming turn (the composer re-enables after these).
+ * Budget-limit telemetry is paired with a user-facing conversation_completed
+ * reply, so it must update status without closing the stream first.
+ */
 export function isTerminalEvent(type: string): boolean {
   return (
     type === 'conversation_completed' ||
     type === 'run_failed' ||
-    type === 'conversation_limit_exceeded' ||
     type === 'awaiting_user_input' ||
     type === 'approval_requested'
   );

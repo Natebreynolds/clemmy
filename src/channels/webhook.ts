@@ -252,7 +252,8 @@ function enrichActivityRun<T extends ActivityRunLike>(run: T) {
     rawLive: isLive(run.status),
     liveLine: liveLine(run),
     preview: runPreview(run),
-    needsAttention: runState === 'waiting_for_approval'
+    needsAttention: run.needsAttention === true
+      || runState === 'waiting_for_approval'
       || runState === 'waiting_for_input'
       || runState === 'stalled'
       || runState === 'failed',
@@ -275,6 +276,46 @@ function enrichActivityRunDetail<T extends ActivityRunLike>(run: T) {
     },
   };
 }
+
+function workflowRunRecordAsActivityRun(
+  rec: Record<string, unknown>,
+  fallbackId?: string,
+  options: { detail?: boolean; outputLimit?: number; preferFallbackId?: boolean; statusFallback?: string } = {},
+): ActivityRunLike {
+  const recordId = typeof rec.id === 'string' && rec.id.trim() ? rec.id : '';
+  const fallback = fallbackId && fallbackId.trim() ? fallbackId : '';
+  const id = options.preferFallbackId && fallback ? fallback : (recordId || fallback || 'workflow-run');
+  const wfStatus = (rec.status as string | undefined) ?? options.statusFallback ?? 'queued';
+  const workflowName = typeof rec.workflow === 'string' && rec.workflow.trim() ? rec.workflow.trim() : '';
+  const outputLimit = options.outputLimit ?? 1200;
+  return {
+    id,
+    sessionId: options.detail ? id : `workflow:${id}`,
+    kind: 'workflow',
+    channel: 'workflow',
+    source: 'workflow',
+    title: options.detail
+      ? (workflowName || '(workflow run)')
+      : (workflowName ? `Workflow: ${workflowName}` : 'Workflow run'),
+    input: '',
+    status: wfStatus,
+    createdAt: rec.createdAt as string | undefined,
+    updatedAt: (rec.finishedAt as string | undefined)
+      ?? (rec.startedAt as string | undefined)
+      ?? (options.detail ? undefined : rec.createdAt as string | undefined),
+    completedAt: ['completed', 'failed', 'cancelled'].includes(wfStatus) ? (rec.finishedAt as string | undefined) : undefined,
+    outputPreview: typeof rec.output === 'string' ? rec.output.slice(0, outputLimit) : '',
+    error: typeof rec.error === 'string' ? rec.error : undefined,
+    needsAttention: rec.needsAttention === true,
+    events: [],
+  };
+}
+
+export const __test__ = {
+  enrichActivityRun,
+  enrichActivityRunDetail,
+  workflowRunRecordAsActivityRun,
+};
 
 interface DashboardCronJobRecord {
   name: string;
@@ -352,7 +393,7 @@ function buildRunUpdateBody(run: NonNullable<ReturnType<typeof getRun>>): string
 
 function queueRunRetry(run: NonNullable<ReturnType<typeof getRun>>) {
   const linkedTask = run.queuedTaskId ? getBackgroundTask(run.queuedTaskId) : null;
-  const resumed = linkedTask && ['failed', 'aborted', 'interrupted'].includes(linkedTask.status)
+  const resumed = linkedTask && ['awaiting_continue', 'failed', 'aborted', 'interrupted'].includes(linkedTask.status)
     ? resumeBackgroundTask(linkedTask.id)
     : null;
   const task = resumed ?? createBackgroundTask({
@@ -1649,25 +1690,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const knownIds = new Set([...harnessRuns, ...dedupedLegacy].map((run) => run.id));
     const workflowFileRuns = readWorkflowRuns(Math.max(resolvedLimit, 40))
       .filter((rec) => typeof rec.id === 'string' && !knownIds.has(rec.id as string))
-      .map((rec) => {
-        const wfStatus = (rec.status as string | undefined) ?? 'queued';
-        return {
-          id: rec.id as string,
-          sessionId: `workflow:${rec.id as string}`,
-          kind: 'workflow',
-          channel: 'workflow',
-          source: 'workflow',
-          title: rec.workflow ? `Workflow: ${rec.workflow as string}` : 'Workflow run',
-          input: '',
-          status: wfStatus,
-          createdAt: rec.createdAt as string | undefined,
-          updatedAt: (rec.finishedAt as string | undefined) ?? (rec.startedAt as string | undefined) ?? (rec.createdAt as string | undefined),
-          completedAt: ['completed', 'failed', 'cancelled'].includes(wfStatus) ? (rec.finishedAt as string | undefined) : undefined,
-          outputPreview: typeof rec.output === 'string' ? rec.output.slice(0, 1200) : '',
-          error: typeof rec.error === 'string' ? rec.error : undefined,
-          events: [] as Array<Record<string, unknown>>,
-        };
-      });
+      .map((rec) => workflowRunRecordAsActivityRun(rec, rec.id as string));
     const runs = [...harnessRuns, ...dedupedLegacy, ...workflowFileRuns]
       .sort((left, right) =>
         String(right.updatedAt || right.completedAt || right.createdAt || '')
@@ -1733,21 +1756,12 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       const runPath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
       if (existsSync(runPath)) {
         const wfRun = JSON.parse(readFileSync(runPath, 'utf-8')) as Record<string, unknown>;
-        res.json({ run: enrichActivityRunDetail({
-          id,
-          sessionId: id,
-          kind: 'workflow',
-          channel: 'workflow',
-          source: 'workflow',
-          title: (wfRun.workflow as string | undefined) ?? '(workflow run)',
-          input: '',
-          status: (wfRun.status as string | undefined) ?? 'unknown',
-          createdAt: wfRun.createdAt as string | undefined,
-          updatedAt: (wfRun.finishedAt as string | undefined) ?? (wfRun.startedAt as string | undefined),
-          outputPreview: typeof wfRun.output === 'string' ? wfRun.output.slice(0, 2000) : '',
-          error: typeof wfRun.error === 'string' ? wfRun.error : undefined,
-          events: [],
-        }) });
+        res.json({ run: enrichActivityRunDetail(workflowRunRecordAsActivityRun(wfRun, id, {
+          detail: true,
+          outputLimit: 2000,
+          preferFallbackId: true,
+          statusFallback: 'unknown',
+        })) });
         return;
       }
     } catch (err) {

@@ -137,11 +137,11 @@ export function shouldSilenceCompletionEcho(opts: {
 
 const RUNNER_CONCURRENCY = parseInt(process.env.CLEMENTINE_WORKFLOW_CONCURRENCY ?? '5', 10);
 
-// Anti-choke bound on a single forEach fan-out. The run drain is single-slot by
-// default (runDrainConcurrency = 1), so one forEach over an unbounded upstream
-// array (e.g. 10k scraped rows) serializes thousands of sub-agent runs and
-// head-of-line-blocks the entire workflow queue for hours. Cap the batch and
-// REPORT the overflow (never silently drop) so the run surfaces "N deferred".
+// Anti-choke batch size for a single forEach fan-out. The run drain is
+// single-slot by default (runDrainConcurrency = 1), so one forEach over an
+// unbounded upstream array (e.g. 10k scraped rows) still needs visible,
+// resumable progress. This bounds each window without turning the cap into a
+// hard ceiling: every pending item is attempted before the step completes.
 function forEachMaxItems(): number {
   const raw = parseInt(process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS ?? '200', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 200;
@@ -904,9 +904,10 @@ interface StepExecutionContext {
   // reporting an all-green success when fan-out items quietly errored.
   forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>;
   // Shared accumulator for NON-FAILING quality advisories (skill-execution
-  // judge misses). These NEVER fail a step or run — they ride along with the
-  // delivered output as a "review this" heads-up so a confident-but-wrong
-  // judge can never break a workflow that actually succeeded.
+  // judge misses, resume safety skips, target misses). These NEVER fail a step
+  // or hide the delivered output. Some confident/review-required advisories
+  // still mark the terminal run `needsAttention` so they cannot be counted as
+  // clean success in the ledger.
   qualityAdvisories: WorkflowQualityAdvisory[];
   // Creation-time test mode: read-only steps run for real but a forEach fans
   // out over only the FIRST item (bounded cost — we just need to confirm the
@@ -925,6 +926,31 @@ export interface WorkflowQualityAdvisory {
   itemKey?: string;
   kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip';
   note: string;
+}
+
+export function workflowAdvisoryRequiresAttention(
+  advisory: Pick<WorkflowQualityAdvisory, 'kind'>,
+): boolean {
+  switch (advisory.kind) {
+    case 'target_missed':
+    case 'foreach_overflow':
+    case 'skill_not_executed':
+    case 'idempotent_skip':
+      return true;
+    case 'goal_validation_unavailable':
+      // A dead judge is not proof the deliverable is bad. It is still delivered
+      // loudly as a quality advisory, but it does not count as a workflow
+      // failure or trigger chronic-failure accounting by itself.
+      return false;
+  }
+}
+
+export function workflowReportLaneForOutcome(opts: {
+  needsAttention: boolean;
+  advisories?: Array<Pick<WorkflowQualityAdvisory, 'kind'>>;
+}): 'done' | 'blocked' {
+  if (opts.needsAttention) return 'blocked';
+  return opts.advisories?.some(workflowAdvisoryRequiresAttention) ? 'blocked' : 'done';
 }
 
 /**
@@ -2312,152 +2338,203 @@ export async function executeStep(
       return [];
     }
 
-    // Anti-choke: bound an unbounded fan-out so it can't wedge the single-slot
-    // run drain. Process the first N, DEFER the rest, and report it through the
-    // existing qualityAdvisory→needsAttention path (no silent drop). Creation-test
-    // already sliced to 1 above, so this only bites real runs over a huge upstream.
+    const keyedItems = items.map((item, index) => ({ item, index, key: itemKey(item, index) }));
+    const alreadyCompleted = keyedItems.filter((it) => ctx.completedItems.has(it.key));
+    const pendingItems = keyedItems.filter((it) => !ctx.completedItems.has(it.key));
+
+    // Anti-choke without a hard ceiling: process unbounded fan-out in windows
+    // so progress stays visible and resume still skips completed items, but do
+    // NOT declare the workflow "done" until every pending item was attempted.
+    // Creation-test already sliced to 1 above, so this only shapes real runs
+    // over a huge upstream.
     const maxItems = forEachMaxItems();
-    if (items.length > maxItems) {
-      const deferred = items.length - maxItems;
-      ctx.qualityAdvisories.push({
-        stepId: step.id,
-        kind: 'foreach_overflow',
-        note: `forEach over "${step.forEach}" had ${items.length} items; processed the first ${maxItems} and DEFERRED ${deferred} to keep the workflow queue from wedging. Re-run to continue, or raise CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS.`,
-      });
+    if (pendingItems.length > maxItems) {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_advisory',
         stepId: step.id,
-        meta: { reason: 'foreach_overflow', total: items.length, processed: maxItems, deferred, source: step.forEach },
+        meta: {
+          reason: 'foreach_batched',
+          total: items.length,
+          alreadyCompleted: alreadyCompleted.length,
+          pending: pendingItems.length,
+          batchSize: maxItems,
+          batches: Math.ceil(pendingItems.length / maxItems),
+          source: step.forEach,
+        },
       });
-      items = items.slice(0, maxItems);
     }
 
-    const concurrency = Math.max(1, Math.min(RUNNER_CONCURRENCY, items.length));
+    const activeCount = alreadyCompleted.length + pendingItems.length;
+    const concurrency = Math.max(1, Math.min(RUNNER_CONCURRENCY, Math.min(maxItems, pendingItems.length || 1)));
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_started',
       stepId: step.id,
-      meta: { mode: 'forEach', source: step.forEach, count: items.length, concurrency },
+      meta: {
+        mode: 'forEach',
+        source: step.forEach,
+        count: activeCount,
+        pending: pendingItems.length,
+        alreadyCompleted: alreadyCompleted.length,
+        concurrency,
+        batchSize: maxItems,
+        batches: Math.max(1, Math.ceil(pendingItems.length / maxItems)),
+      },
     });
     // Heartbeat item progress: pre-completed (resumed) items count as done
     // from the start, then each finishing item bumps the live counter.
     setWorkflowRunItemProgress(ctx.runId, step.id, {
-      completed: items.filter((it, idx) => ctx.completedItems.has(itemKey(it, idx))).length,
+      completed: alreadyCompleted.length,
       failed: 0,
-      total: items.length,
+      total: activeCount,
     });
 
-    interface ItemResult { itemKey: string; output: unknown }
-    const itemResults = await runWithConcurrency<unknown, ItemResult>(items, concurrency, async (item, idx) => {
-      const key = itemKey(item, idx);
-      // Resume: skip items we already completed in a prior run pass.
-      if (ctx.completedItems.has(key)) {
-        return { itemKey: key, output: ctx.completedItems.get(key) };
-      }
-      // Bug #8 (Lane B): a SEND-class item whose send already fired on a prior
-      // pass (external_write under the item's deterministic session) but never
-      // recorded completion (the crash window) must NOT be re-sent — re-running
-      // would DOUBLE-SEND. Skip + reconcile + advise (favor no-duplicate, report
-      // back). Only bites on resume: a fresh pass has no prior external_write.
-      if (idempotentForEachEnabled() && stepSideEffectClass(step) === 'send'
-        && itemSendAlreadyFired(ctx.runId, step.id, key)) {
-        const skipNote = '[skipped on resume — a prior send for this item already fired; not re-sent to avoid a duplicate. Verify it landed.]';
-        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-          kind: 'item_completed',
-          stepId: step.id,
-          itemKey: key,
-          output: skipNote,
-        });
-        bumpWorkflowRunItemProgress(ctx.runId, step.id, 'completed');
-        ctx.qualityAdvisories.push({
-          stepId: step.id,
-          itemKey: key,
-          kind: 'idempotent_skip',
-          note: `forEach item "${key}"'s send fired on a prior attempt but the run crashed before recording completion — SKIPPED on resume to avoid a duplicate send. Verify that send landed.`,
-        });
-        return { itemKey: key, output: skipNote };
-      }
-      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-        kind: 'item_started',
-        stepId: step.id,
-        itemKey: key,
+    interface ItemResult { itemKey: string; output: unknown; index: number }
+    type SettledItemResult =
+      | { ok: true; value: ItemResult }
+      | { ok: false; error: string; itemKey: string; index: number };
+    const runPendingWindow = async (windowItems: typeof pendingItems): Promise<SettledItemResult[]> => {
+      const settled = await runWithConcurrency<typeof pendingItems[number], ItemResult>(
+        windowItems,
+        Math.max(1, Math.min(RUNNER_CONCURRENCY, windowItems.length || 1)),
+        async (work) => {
+          const { item, index: idx, key } = work;
+          // Resume: skip items we already completed in a prior run pass.
+          if (ctx.completedItems.has(key)) {
+            return { itemKey: key, output: ctx.completedItems.get(key), index: idx };
+          }
+          // Bug #8 (Lane B): a SEND-class item whose send already fired on a prior
+          // pass (external_write under the item's deterministic session) but never
+          // recorded completion (the crash window) must NOT be re-sent — re-running
+          // would DOUBLE-SEND. Skip + reconcile + advise (favor no-duplicate, report
+          // back). Only bites on resume: a fresh pass has no prior external_write.
+          if (idempotentForEachEnabled() && stepSideEffectClass(step) === 'send'
+            && itemSendAlreadyFired(ctx.runId, step.id, key)) {
+            const skipNote = '[skipped on resume — a prior send for this item already fired; not re-sent to avoid a duplicate. Verify it landed.]';
+            appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+              kind: 'item_completed',
+              stepId: step.id,
+              itemKey: key,
+              output: skipNote,
+            });
+            bumpWorkflowRunItemProgress(ctx.runId, step.id, 'completed');
+            ctx.qualityAdvisories.push({
+              stepId: step.id,
+              itemKey: key,
+              kind: 'idempotent_skip',
+              note: `forEach item "${key}"'s send fired on a prior attempt but the run crashed before recording completion — SKIPPED on resume to avoid a duplicate send. Verify that send landed.`,
+            });
+            return { itemKey: key, output: skipNote, index: idx };
+          }
+          appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+            kind: 'item_started',
+            stepId: step.id,
+            itemKey: key,
+          });
+          try {
+            // Bind this item's declared inputs + fast-fail on missing (no-op
+            // when the step declares no `inputs`). `item` is in scope here.
+            const itemContext = bindStepContext(step, ctx, item);
+            const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
+            const prompt = applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent)));
+            let output: unknown;
+            let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
+            if (workflowHarnessEnabled(step)) {
+              const r = await runStepViaHarness(
+                step,
+                `${ctx.runId}:${step.id}:${key}`,
+                `Item: ${key}\n\n${prompt}`,
+                ctx.workflow.name,
+                workflowAutoApprovalTools(ctx.workflow, step),
+                ctx.runId,
+                itemContext,
+              );
+              output = r.output;
+              itemSessionId = r.sessionId;
+            } else {
+              // FORK collapse (staged): forEach item through the gated harness loop
+              // (default-OFF `workflow` surface → byte-identical to legacy until
+              // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
+              // honorModel preserves the worker-model routing.
+              output = (await respondPreferHarness('workflow', {
+                sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
+                channel: 'workflow',
+                message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
+                // forEach fan-out item = delegated grunt-work labor → BYO worker model when routed.
+                model: step.model || getWorkerModel(),
+                maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+              }, (r) => ctx.assistant.respond(r))).text;
+            }
+            // Per-item skill-execution check (forEach): advisory, DETECTION-ONLY —
+            // a `usesSkill` item that couldn't be confirmed to produce the skill's
+            // deliverables records a non-failing quality advisory. The item still
+            // completes + contributes its output; it never becomes an item failure
+            // on a judge verdict (a confident-but-wrong judge can't drop a good
+            // item). The terminal run may still be marked needsAttention so the
+            // advisory is not counted as clean success. Fail-open; no-op for items
+            // without usesSkill.
+            await noteStepSkillAdvisory(step, itemSessionId, output, itemIntent, ctx, key);
+            appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+              kind: 'item_completed',
+              stepId: step.id,
+              itemKey: key,
+              output,
+            });
+            bumpWorkflowRunItemProgress(ctx.runId, step.id, 'completed');
+            return { itemKey: key, output, index: idx };
+          } catch (err) {
+            const error = err instanceof Error ? err.message : String(err);
+            appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+              kind: 'item_failed',
+              stepId: step.id,
+              itemKey: key,
+              error,
+            });
+            bumpWorkflowRunItemProgress(ctx.runId, step.id, 'failed');
+            throw err;
+          }
+        },
+      );
+      return settled.map((r, localIndex) => {
+        if (r.ok) return r;
+        const item = windowItems[localIndex];
+        return {
+          ok: false,
+          error: r.error,
+          itemKey: item?.key ?? `idx-${localIndex}`,
+          index: item?.index ?? localIndex,
+        };
       });
-      try {
-        // Bind this item's declared inputs + fast-fail on missing (no-op
-        // when the step declares no `inputs`). `item` is in scope here.
-        const itemContext = bindStepContext(step, ctx, item);
-        const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
-        const prompt = applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent)));
-        let output: unknown;
-        let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
-        if (workflowHarnessEnabled(step)) {
-          const r = await runStepViaHarness(
-            step,
-            `${ctx.runId}:${step.id}:${key}`,
-            `Item: ${key}\n\n${prompt}`,
-            ctx.workflow.name,
-            workflowAutoApprovalTools(ctx.workflow, step),
-            ctx.runId,
-            itemContext,
-          );
-          output = r.output;
-          itemSessionId = r.sessionId;
-        } else {
-          // FORK collapse (staged): forEach item through the gated harness loop
-          // (default-OFF `workflow` surface → byte-identical to legacy until
-          // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
-          // honorModel preserves the worker-model routing.
-          output = (await respondPreferHarness('workflow', {
-            sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
-            channel: 'workflow',
-            message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
-            // forEach fan-out item = delegated grunt-work labor → BYO worker model when routed.
-            model: step.model || getWorkerModel(),
-            maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
-          }, (r) => ctx.assistant.respond(r))).text;
-        }
-        // Per-item skill-execution check (forEach): advisory, DETECTION-ONLY —
-        // a `usesSkill` item that couldn't be confirmed to produce the skill's
-        // deliverables records a non-failing quality advisory. The item still
-        // completes + contributes its output; it never becomes an item failure
-        // on a judge verdict (a confident-but-wrong judge can't drop a good
-        // item). Fail-open; no-op for items without usesSkill.
-        await noteStepSkillAdvisory(step, itemSessionId, output, itemIntent, ctx, key);
-        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-          kind: 'item_completed',
-          stepId: step.id,
-          itemKey: key,
-          output,
-        });
-        bumpWorkflowRunItemProgress(ctx.runId, step.id, 'completed');
-        return { itemKey: key, output };
-      } catch (err) {
-        const error = err instanceof Error ? err.message : String(err);
-        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
-          kind: 'item_failed',
-          stepId: step.id,
-          itemKey: key,
-          error,
-        });
-        bumpWorkflowRunItemProgress(ctx.runId, step.id, 'failed');
-        throw err;
-      }
-    });
+    };
+    const itemResults: SettledItemResult[] = [];
+    for (let offset = 0; offset < pendingItems.length; offset += maxItems) {
+      const windowItems = pendingItems.slice(offset, offset + maxItems);
+      if (windowItems.length === 0) continue;
+      itemResults.push(...await runPendingWindow(windowItems));
+    }
 
     const successes = itemResults.filter((r): r is { ok: true; value: ItemResult } => r.ok);
     const failed = itemResults.length - successes.length;
-    const aggregate = successes.map((r) => r.value);
+    const aggregate = [
+      ...alreadyCompleted.map((it) => ({ itemKey: it.key, output: ctx.completedItems.get(it.key), index: it.index })),
+      ...successes.map((r) => r.value),
+    ]
+      .sort((a, b) => a.index - b.index)
+      .map(({ index: _index, ...rest }) => rest);
     // Record failures on the shared accumulator so the outer run
     // notification can flag partial-success runs that previously read
     // as "completed" with no hint that items dropped.
     for (let i = 0; i < itemResults.length; i++) {
       const r = itemResults[i];
       if (r.ok) continue;
-      const key = itemKey(items[i], i);
-      ctx.forEachFailures.push({ stepId: step.id, itemKey: key, error: r.error });
+      ctx.forEachFailures.push({ stepId: step.id, itemKey: r.itemKey, error: r.error });
     }
     clearWorkflowRunItemProgress(ctx.runId, step.id);
     return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, aggregate, {
-      mode: 'forEach', completed: successes.length, failed,
+      mode: 'forEach',
+      completed: aggregate.length,
+      processed: successes.length,
+      resumed: alreadyCompleted.length,
+      failed,
     });
   }
 
@@ -2529,9 +2606,9 @@ export async function executeStep(
 
   // Skill-execution check (advisory, DETECTION-ONLY). Engages ONLY for
   // `usesSkill` steps; fail-open. A confident miss records a non-failing
-  // quality advisory that rides along with the delivered output — it never
-  // fails the step or run, so it can't break a workflow that actually
-  // succeeded.
+  // quality advisory that rides along with the delivered output. It never
+  // fails the step or hides the deliverable; terminal accounting may still mark
+  // the run needsAttention so the miss is not treated as clean success.
   await noteStepSkillAdvisory(step, stepSessionId, output, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs), ctx);
 
   // DETERMINISTIC skill-execution FLOOR (hard). The advisory above is detection-
@@ -2560,10 +2637,12 @@ export async function executeStep(
 /**
  * Run the per-step skill-execution judge and, on a confident miss, record a
  * NON-FAILING quality advisory (the step still completed + delivered its
- * output). DETECTION-ONLY: it never throws / never fails the step or run — a
- * confident-but-wrong judge can therefore never break a workflow that actually
- * succeeded (the owner's #1 bar). No-op for steps without `usesSkill`, and
- * wholly fail-open (any error is swallowed). `itemKey` set for forEach items.
+ * output). DETECTION-ONLY: it never throws / never fails the step or hides the
+ * deliverable — a confident-but-wrong judge can therefore never break a
+ * workflow that actually succeeded. The final run can still be marked
+ * needsAttention so the advisory is reviewed. No-op for steps without
+ * `usesSkill`, and wholly fail-open (any error is swallowed). `itemKey` set for
+ * forEach items.
  */
 async function noteStepSkillAdvisory(
   step: WorkflowStepInput,
@@ -3410,6 +3489,32 @@ export function decideGoalRunOutcome(args: {
   return { action: 'repursue', reason: `goal unmet (attempt ${attemptsUsed}/${args.maxAttempts})` };
 }
 
+function startWorkflowActivityRun(
+  run: QueuedRunRecord,
+  workflowName: string,
+  message?: string,
+): void {
+  try {
+    startRun({
+      id: run.id,
+      sessionId: `workflow:${run.id}`,
+      channel: 'workflow',
+      source: 'workflow',
+      title: `Workflow: ${workflowName}`,
+      message: message ?? `Running workflow "${workflowName}"${run.targetStepId ? ` · step ${run.targetStepId}` : ''}`,
+    });
+  } catch { /* run-events is best-effort; never block the workflow lane */ }
+}
+
+function finishWorkflowActivityRun(
+  runId: string,
+  input: Parameters<typeof finishRun>[1],
+): void {
+  try {
+    finishRun(runId, input);
+  } catch { /* run-events is best-effort; never block the workflow lane */ }
+}
+
 /** Evidence the validator judges: the final deliverable + a truncated
  *  per-step ledger (so a criterion about an intermediate step is checkable). */
 function buildGoalEvidenceText(finalOutput: string, stepOutputs: Record<string, unknown>): string {
@@ -3555,6 +3660,7 @@ async function processOneRunFile(
     const workflow = workflows.find((entry) => entry.data.name === run.workflow);
     if (!workflow) {
       const message = `Workflow not found: "${run.workflow}". It may have been renamed or deleted.`;
+      startWorkflowActivityRun(run, run.workflow, `Starting workflow "${run.workflow}"`);
       writeRunRecord(filePath, {
         ...run,
         status: 'error',
@@ -3572,6 +3678,11 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: run.workflow, runId: run.id },
       });
+      finishWorkflowActivityRun(run.id, {
+        status: 'failed',
+        message: `Workflow failed before start: ${message}`,
+        error: message,
+      });
       markRunNotified(filePath);
       return;
     }
@@ -3580,11 +3691,13 @@ async function processOneRunFile(
     // draft (it's exactly what you dry-run), executes NOTHING, and reports a
     // per-issue "would this run?" verdict, then finalizes the record.
     if (run.status === 'dry_run') {
+      startWorkflowActivityRun(run, workflow.data.name, `Dry-running workflow "${workflow.data.name}"`);
       const inputs = normalizeWorkflowRunInputs({
         ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
         ...(run.inputs ?? {}),
       });
       const preflight = preflightWorkflow(workflow.data, inputs);
+      const report = renderPreflightReport(workflow.data.name, preflight);
       writeRunRecord(filePath, {
         ...run,
         status: 'dry_run',
@@ -3595,10 +3708,16 @@ async function processOneRunFile(
         id: `workflow-${run.id}-dryrun`,
         kind: 'workflow',
         title: preflight.ok ? `Dry-run OK: ${workflow.data.name}` : `Dry-run found issues: ${workflow.data.name}`,
-        body: renderPreflightReport(workflow.data.name, preflight),
+        body: report,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id, dryRun: true, preflightOk: preflight.ok },
+      });
+      finishWorkflowActivityRun(run.id, {
+        status: 'completed',
+        message: preflight.ok ? 'Workflow dry-run passed' : 'Workflow dry-run found issues',
+        outputPreview: report,
+        needsAttention: !preflight.ok,
       });
       markRunNotified(filePath);
       return;
@@ -3608,6 +3727,7 @@ async function processOneRunFile(
     // draft disabled + report what to fix). Works on a disabled draft, so it
     // sits before the enabled gate.
     if (run.status === 'creation_test') {
+      startWorkflowActivityRun(run, workflow.data.name, `Creation-testing workflow "${workflow.data.name}"`);
       const ctInputs = normalizeWorkflowRunInputs({
         ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
         ...(run.inputs ?? {}),
@@ -3643,6 +3763,12 @@ async function processOneRunFile(
         metadata: { workflow: workflow.data.name, runId: run.id, creationTest: true, pass: result.pass },
       });
       enqueueWorkflowOutcomeTurn(run, workflow.data.name, result.pass ? 'done' : 'blocked', body);
+      finishWorkflowActivityRun(run.id, {
+        status: 'completed',
+        message: result.pass ? 'Workflow creation test passed' : 'Workflow creation test found issues',
+        outputPreview: body,
+        needsAttention: !result.pass,
+      });
       markRunNotified(filePath);
       return;
     }
@@ -3651,6 +3777,7 @@ async function processOneRunFile(
     // the workflow to be approved.
     if (!run.targetStepId && !workflow.data.enabled) {
       const message = `Workflow "${workflow.data.name}" is disabled — approve/enable it before it can run.`;
+      startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
       appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
       writeRunRecord(filePath, {
         ...run,
@@ -3667,6 +3794,11 @@ async function processOneRunFile(
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id },
       });
+      finishWorkflowActivityRun(run.id, {
+        status: 'failed',
+        message: `Workflow failed before start: ${message}`,
+        error: message,
+      });
       markRunNotified(filePath);
       return;
     }
@@ -3678,6 +3810,7 @@ async function processOneRunFile(
     const missingInputs = missingWorkflowRunInputs(workflow.data, inputs);
     if (missingInputs.length > 0) {
       const message = `Missing required workflow input${missingInputs.length === 1 ? '' : 's'}: ${missingInputs.join(', ')}`;
+      startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
       appendWorkflowEvent(workflow.name, run.id, { kind: 'run_failed', error: message });
       writeRunRecord(filePath, {
         ...run,
@@ -3694,6 +3827,11 @@ async function processOneRunFile(
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { workflow: workflow.data.name, runId: run.id, status: 'error' },
+      });
+      finishWorkflowActivityRun(run.id, {
+        status: 'failed',
+        message: `Workflow failed before start: ${message}`,
+        error: message,
       });
       markRunNotified(filePath);
       logger.warn({ workflow: workflow.data.name, runId: run.id, missingInputs }, 'Workflow run rejected before start: missing required inputs');
@@ -3714,16 +3852,11 @@ async function processOneRunFile(
     // (run-events / listRuns) so it shows alongside chat + background tasks,
     // not only on the Workflows page. startRun upserts (id = run.id), so any
     // trigger source (chat, scheduler, dashboard, API) lands here.
-    try {
-      startRun({
-        id: run.id,
-        sessionId: `workflow:${run.id}`,
-        channel: 'workflow',
-        source: 'workflow',
-        title: `Workflow: ${workflow.data.name}`,
-        message: `${isResume ? 'Resuming' : 'Running'} workflow "${workflow.data.name}"${run.targetStepId ? ` · step ${run.targetStepId}` : ''}`,
-      });
-    } catch { /* run-events is best-effort; never block the run */ }
+    startWorkflowActivityRun(
+      run,
+      workflow.data.name,
+      `${isResume ? 'Resuming' : 'Running'} workflow "${workflow.data.name}"${run.targetStepId ? ` · step ${run.targetStepId}` : ''}`,
+    );
 
     const stopHeartbeat = startWorkflowHeartbeat(workflow.data.name, run.id, Date.now());
     try {
@@ -3918,26 +4051,27 @@ async function processOneRunFile(
           proposedFix = recordProposedFix(workflow.name, run.id, diagnosis);
         }
       }
-      // A CONFIDENT target-miss is promoted from a silent advisory to a
-      // NON-BLOCKING needs-attention: the run still completed and DELIVERS its
-      // output, but it is flagged for review instead of reported as a clean
-      // success. It has no diagnosable block, so it never routes to the Doctor;
-      // and tryAutoHealAndRequeue requires a proposedFix — so a target-miss can
-      // NEVER trigger a blind re-run that doubles irreversible side effects.
+      // Confident/review-required quality misses are promoted from silent
+      // advisories to NON-BLOCKING needs-attention: the run still completed and
+      // DELIVERS its output, but it is flagged for review instead of reported
+      // as clean success. These have no diagnosable block, so they never route
+      // to the Doctor; and tryAutoHealAndRequeue requires a proposedFix — so a
+      // quality miss can NEVER trigger a blind re-run that doubles irreversible
+      // side effects.
       const targetMissed = Boolean(targetVerdict && targetVerdict.judged && !targetVerdict.reached);
       const hasForEachFailures = forEachFailures.length > 0;
-      const foreachOverflow = qualityAdvisories.find((a) => a.kind === 'foreach_overflow');
-      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || goalMissed || Boolean(foreachOverflow);
+      const reviewRequiredAdvisory = qualityAdvisories.find(workflowAdvisoryRequiresAttention);
+      const needsAttention = blockedSteps.length > 0 || targetMissed || hasForEachFailures || goalMissed || Boolean(reviewRequiredAdvisory);
       const attentionReason =
         blockedSteps[0]?.reason ??
         (hasForEachFailures
           ? `${forEachFailures.length} forEach item${forEachFailures.length === 1 ? '' : 's'} failed`
-          : foreachOverflow
-          ? foreachOverflow.note
           : goalMissed
           ? `pinned goal not met — ${goalDecision?.reason ?? 'criteria unmet'}`
           : targetMissed
           ? `target not confirmed: ${targetVerdict?.gap ?? 'deliverable may not reach the workflow target'}`
+          : reviewRequiredAdvisory
+          ? reviewRequiredAdvisory.note
           : undefined);
 
       // Cross-fire failure ledger (#6): record this run's outcome so a
@@ -4125,7 +4259,7 @@ async function processOneRunFile(
       const interactive = Boolean(run.originSessionId);
       let runIsNoOp = false;
       if (!stepAlreadyNotified) {
-        const lane: 'done' | 'blocked' = (needsAttention || hasAdvisories) ? 'blocked' : 'done';
+        const lane = workflowReportLaneForOutcome({ needsAttention, advisories: qualityAdvisories });
         const voiced = await rewriteInClementineVoice(reportBody, { workflowName: workflow.data.name, lane });
         reportBody = voiced.message;
         runIsNoOp = voiced.nothingHappened
@@ -4141,7 +4275,7 @@ async function processOneRunFile(
             // renderLegibleOutcome titles a no-blocked-step run "completed"; a
             // target-miss or goal-miss is needs-attention with no blocked step,
             // so title it honestly.
-            : (targetMissed || goalMissed) && blockedSteps.length === 0
+            : needsAttention && blockedSteps.length === 0
               ? `⚠️ Workflow needs attention: ${workflow.data.name}`
               : outcome.title,
         // Send the full body. Discord delivery splits long content into
@@ -4175,16 +4309,18 @@ async function processOneRunFile(
                 : `Needs attention — ${attentionReason ?? 'target not confirmed'}`)
             : `Completed${hasFailures ? ` with ${forEachFailures.length} item failure${forEachFailures.length === 1 ? '' : 's'}` : ''}${hasAdvisories ? ` · ${qualityAdvisories.length} quality advisory${qualityAdvisories.length === 1 ? '' : 'ies'}` : ''}`,
           outputPreview: reportBody.slice(0, 800),
+          needsAttention,
         });
       } catch { /* best-effort */ }
       // Gap E: re-enter the origin chat in-context (no-op for scheduled/cron).
-      // needs-attention OR a quality advisory → 'blocked' so Clem knows to
-      // review; a clean run → 'done'. A routine no-op never wakes the chat.
+      // Needs-attention OR a review-required advisory → 'blocked' so Clem knows
+      // to review; informational advisories still ride the body on the done
+      // lane. A routine no-op never wakes the chat.
       if (!runIsNoOp) {
         enqueueWorkflowOutcomeTurn(
           run,
           workflow.data.name,
-          needsAttention || hasAdvisories ? 'blocked' : 'done',
+          workflowReportLaneForOutcome({ needsAttention, advisories: qualityAdvisories }),
           reportBody,
         );
       }

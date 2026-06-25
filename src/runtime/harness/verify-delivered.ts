@@ -102,6 +102,13 @@ export async function verifyDelivered(
   if (stoppedReason === 'pending-approval') {
     return { delivered: false, status: 'blocked', reason: 'Stopped awaiting an approval that was not surfaced.' };
   }
+  if (stoppedReason === 'max-turns-with-grace') {
+    return {
+      delivered: false,
+      status: 'blocked',
+      reason: (text || 'The run hit its turn budget before finishing; continue is required.').slice(0, 400),
+    };
+  }
 
   // 2) The agent's own words say it's blocked / needs input.
   if (matchesBlockedText(text)) {

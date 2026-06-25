@@ -48,6 +48,19 @@ test('a cancelled run is blocked', async () => {
   assert.equal(v.status, 'blocked');
 });
 
+test('max-turns-with-grace is blocked until the user continues', async () => {
+  const judge = judgeStub(true);
+  const v = await verifyDelivered(
+    'finish the whole research run',
+    'I hit the run budget before finishing — say "continue" to keep going.',
+    { stoppedReason: 'max-turns-with-grace', judgeFn: judge.fn },
+  );
+  assert.equal(v.delivered, false);
+  assert.equal(v.status, 'blocked');
+  assert.match(v.reason ?? '', /continue|budget/i);
+  assert.equal(judge.calls(), 0, 'structured stop reason must not spend a judge call');
+});
+
 test('blocked-text in the final reply is blocked (no judge needed)', async () => {
   const judge = judgeStub(true);
   const v = await verifyDelivered('pull salesforce contacts', 'I am blocked — unable to access the CRM.', {

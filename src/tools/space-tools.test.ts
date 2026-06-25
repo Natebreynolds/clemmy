@@ -92,6 +92,87 @@ test('space_save records declared data sources + re-engage contract', async () =
   assert.deepEqual(rec?.reengage?.triggers, ['note', 'ask']);
 });
 
+test('space_save rejects invalid Composio JSON templates before installing a workspace', async () => {
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-bad-json.html');
+  writeFileSync(draft, '<html>bad-json</html>', 'utf-8');
+
+  const sourceRes = text(await tools.space_save({
+    slug: 'bad-json-source',
+    title: 'Bad Source',
+    view_path: draft,
+    data_sources: [{
+      id: 'cal',
+      composio_slug: 'GOOGLECALENDAR_LIST_EVENTS',
+      composio_args_json: '{not json',
+      runner: null,
+      schedule: null,
+      timezone: null,
+    }],
+  }));
+  assert.match(sourceRes, /was NOT saved/);
+  assert.match(sourceRes, /Data source "cal" composio_args_json is not valid JSON/);
+  assert.equal(store.spaceStore.get('bad-json-source'), undefined);
+
+  const actionRes = text(await tools.space_save({
+    slug: 'bad-json-action',
+    title: 'Bad Action',
+    view_path: draft,
+    actions: [{
+      id: 'send',
+      label: 'Send',
+      composio_slug: 'OUTLOOK_SEND_EMAIL',
+      args_template_json: '[1,2]',
+      runner: null,
+      confirm: null,
+    }],
+  }));
+  assert.match(actionRes, /was NOT saved/);
+  assert.match(actionRes, /Action "send" args_template_json must be a JSON object/);
+  assert.equal(store.spaceStore.get('bad-json-action'), undefined);
+});
+
+test('space_get surfaces hand-written manifest JSON errors and space_save requires corrected definitions', async () => {
+  const slug = 'handwrite-fix';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(path.join(dir, 'view'), { recursive: true });
+  mkdirSync(path.join(dir, 'data'), { recursive: true });
+  writeFileSync(path.join(dir, 'view', 'index.html'), '<html>old</html>', 'utf-8');
+  writeFileSync(path.join(dir, 'data', 'r.mjs'), 'process.stdout.write(JSON.stringify({rows:[{ok:true}]}))', 'utf-8');
+  writeFileSync(path.join(dir, 'data', 'act.mjs'), 'process.stdout.write(JSON.stringify({ok:true}))', 'utf-8');
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Handwritten',
+    dataSources: [{ id: 'pull', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', composio_args_json: '{not json' }],
+    actions: [{ id: 'act', runner: 'act.mjs', args_template_json: '[1,2]' }],
+  }), 'utf-8');
+
+  const got = text(await tools.space_get({ slug }));
+  assert.match(got, /Manifest errors: fix with space_save/);
+  assert.match(got, /composio_args_json is not valid JSON/);
+  assert.match(got, /args_template_json must be a JSON object/);
+
+  const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-handwrite-fix.html');
+  writeFileSync(draft, '<html>new</html>', 'utf-8');
+  const viewOnly = text(await tools.space_save({ slug, title: 'Handwritten', view_path: draft }));
+  assert.match(viewOnly, /was NOT saved/);
+  assert.match(viewOnly, /Pass corrected data_sources and actions/);
+
+  const fixed = text(await tools.space_save({
+    slug,
+    title: 'Handwritten',
+    view_path: draft,
+    data_sources: [{ id: 'pull', runner: 'r.mjs', composio_slug: null, composio_args_json: null, schedule: null, timezone: null }],
+    actions: [{ id: 'act', label: 'Act', runner: 'act.mjs', composio_slug: null, args_template_json: '{"scope":"team"}', confirm: null }],
+  }));
+  assert.match(fixed, /Updated workspace/);
+  const rec = store.spaceStore.get(slug);
+  assert.equal(rec?.manifestErrors, undefined);
+  assert.deepEqual(rec?.actions[0].argsTemplate, { scope: 'team' });
+  assert.equal(rec?.version, 2, 'fixing a malformed manifest while replacing the view still snapshots the prior view');
+  assert.equal(rec?.revisions.length, 1);
+  assert.match(readFileSync(store.resolveInSpace(slug, rec!.revisions[0].file), 'utf-8'), /old/);
+});
+
 test('space_list + space_get read back', async () => {
   assert.match(text(await tools.space_list({})), /CRM Board/);
   const got = text(await tools.space_get({ slug: 'crm' }));
@@ -114,6 +195,28 @@ test('space_edit_view applies a targeted change + bumps version + snapshots', as
   assert.match(canonical, /href="tel:\+1"/);
   assert.equal(canonical.includes('<button>Call</button>'), false);
   assert.equal(store.spaceStore.get('editable')!.version, before + 1); // bumped + snapshot taken
+});
+
+test('space_edit_view refuses malformed manifests so revisions are reliable', async () => {
+  const slug = 'bad-edit-manifest';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(path.join(dir, 'view'), { recursive: true });
+  writeFileSync(path.join(dir, 'view', 'index.html'), '<html><body>Old</body></html>', 'utf-8');
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Bad Edit Manifest',
+    actions: [{ id: 'send', runner: 'act.mjs', args_template_json: '[1,2]' }],
+  }), 'utf-8');
+
+  const res = text(await tools.space_edit_view({
+    slug,
+    edits: [{ find: 'Old', replace: 'New' }],
+  }));
+
+  assert.match(res, /was NOT edited/);
+  assert.match(res, /manifest is invalid/);
+  assert.match(res, /args_template_json must be a JSON object/);
+  assert.match(readFileSync(store.resolveInSpace(slug, 'view/index.html'), 'utf-8'), /Old/);
 });
 
 test('space_edit_view reports when no find string matches (no write)', async () => {
@@ -277,6 +380,29 @@ test('space_set_data refuses the reserved "_meta" source id (would clobber prove
   assert.match(res, /reserved key/);
   // the existing dataset + its _meta map are untouched
   assert.equal(JSON.stringify(dataMod.readData('setdata')), before);
+});
+
+test('space_set_data refuses paused or archived workspaces without mutating data', async () => {
+  const dataMod = await import('../spaces/data-store.js');
+  store.spaceStore.update('setdata', { status: 'paused' });
+  const beforePaused = JSON.stringify(dataMod.readData('setdata'));
+  const paused = text(await tools.space_set_data({
+    slug: 'setdata',
+    source_id: 'deals',
+    data_json: JSON.stringify([{ firm: 'Paused Write' }]),
+  }));
+  assert.match(paused, /data writes are disabled/);
+  assert.equal(JSON.stringify(dataMod.readData('setdata')), beforePaused);
+
+  store.spaceStore.update('setdata', { status: 'archived' });
+  const beforeArchived = JSON.stringify(dataMod.readData('setdata'));
+  const archived = text(await tools.space_set_data({
+    slug: 'setdata',
+    source_id: 'deals',
+    data_json: JSON.stringify([{ firm: 'Archived Write' }]),
+  }));
+  assert.match(archived, /data writes are disabled/);
+  assert.equal(JSON.stringify(dataMod.readData('setdata')), beforeArchived);
 });
 
 test('isSpacesEnabled defaults ON (beta) and honors the kill-switch', () => {

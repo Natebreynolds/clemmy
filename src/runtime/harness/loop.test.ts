@@ -1244,6 +1244,42 @@ test('runConversation: stops on first completed decision', async () => {
   assert.equal(events.filter((e) => e.type === 'conversation_completed').length, 1);
 });
 
+test('runConversation: reuseRecordedUserInput skips a duplicate user_input row on provider fallover', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'retry this turn' },
+  });
+  const runner = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'Recovered on fallback',
+        reply: 'Recovered on fallback.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    },
+  ]);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'retry this turn',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+    reuseRecordedUserInput: true,
+  });
+
+  assert.equal(result.status, 'completed');
+  const inputs = listEventsForConv(sess.id, { types: ['user_input_received'] });
+  assert.equal(inputs.length, 1, 'fallback reused the Claude-recorded user input instead of duplicating it');
+  assert.equal((inputs[0].data as { text?: string }).text, 'retry this turn');
+});
+
 test('runConversation: YOLO auto-resolved ask (autonomy_note + stray nextAction:awaiting_user_input) CONTINUES, never stuck', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -1454,6 +1490,31 @@ test('honest-completion: a blocked/error-stub final reply does NOT bank as compl
   assert.ok(completed.at(-1)!.data.blockedReason, 'blockedReason recorded');
 });
 
+test('honest-completion: a promise-shaped final reply is judged before banking completion', async () => {
+  const sess = HarnessSession.create({ kind: 'workflow' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'promised', reply: "I'll prep those contacts and get them over next.", done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const judgeCalls: Array<{ objective: string; response: string }> = [];
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'prep the contacts',
+    judgeFn: async (objective, response) => {
+      judgeCalls.push({ objective, response });
+      return { done: false, reason: 'no artifact produced' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'promise-shaped reply must not false-green');
+  assert.equal(judgeCalls.length, 1, 'promise-shaped completion used the delivery judge');
+  assert.match(judgeCalls[0].objective, /prep the contacts/i);
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.delivered, false);
+  assert.match(String(completed.data.blockedReason), /no artifact produced/i);
+});
+
 test('done-invariant: done:true + nextAction:awaiting_user_input does NOT bank completed', async () => {
   // `done` and `nextAction` are independent schema fields; a contradictory
   // done:true + awaiting_user_input must honor the conservative awaiting state.
@@ -1501,6 +1562,70 @@ test('honest-completion: the live RESUME path (runConversationFromResume) also g
   });
   assert.equal(result.status, 'awaiting_user_input', 'resume blocked reply must not bank completed');
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, false);
+});
+
+test('honest-completion: RESUME path judges promise-shaped final replies before banking completion', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumePromiseTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-promise' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'pull the latest records' },
+  });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  const runRunner: RunRunnerFn = async () => ({
+    history: [], lastResponseId: undefined,
+    finalOutput: { done: true, nextAction: 'completed', reply: "I'll pull those records next.", summary: 'promised', reason: null },
+  });
+  const judgeCalls: Array<{ objective: string; response: string }> = [];
+  const result = await runConversationFromResume({
+    agent, sessionId: sess.id, decision: 'approve', resolver: 'unit-test',
+    judgeFn: async (objective, response) => {
+      judgeCalls.push({ objective, response });
+      return { done: false, reason: 'no records were returned' };
+    },
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'resume promise-shaped reply must not bank completed');
+  assert.equal(judgeCalls.length, 1);
+  assert.match(judgeCalls[0].objective, /pull the latest records/i);
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.delivered, false);
+  assert.match(String(completed.data.blockedReason), /no records were returned/i);
+});
+
+test('resume budget exit emits the PAIRED conversation_completed (bare limit event hangs the chat dock / Discord)', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeBudgetTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-budget' });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  // The resumed turn (and every continuation) keeps working → the loop runs to maxSteps.
+  const recurseForever = scriptedRunner([
+    { finalOutput: { summary: 'still working', done: false, nextAction: 'awaiting_handoff_result', reason: null } },
+  ]);
+  const result = await runConversationFromResume({
+    agent, sessionId: sess.id, decision: 'approve', resolver: 'unit-test',
+    maxSteps: 3,
+    makeRunner: makeRunnerStub, runRunner: recurseForever,
+  });
+  assert.equal(result.status, 'limit_exceeded');
+  // The audit event AND the paired user-facing completion must BOTH be present —
+  // the clients (chat.ts isTerminalEvent, console.ts SSE, Discord) treat a bare
+  // conversation_limit_exceeded as NON-terminal and wait for the pair, so a bare
+  // emit on the resume path hangs the surface until its idle/safety timeout.
+  assert.ok(listEventsForConv(sess.id, { types: ['conversation_limit_exceeded'] }).length >= 1, 'audit limit event present');
+  const paired = listEventsForConv(sess.id, { types: ['conversation_completed'] })
+    .find((e) => (e.data as { reason?: unknown }).reason === 'awaiting_continue');
+  assert.ok(paired, 'resume budget exit MUST emit a paired conversation_completed(reason=awaiting_continue)');
 });
 
 test('resume path: narration-deferral in a continuation turn is force-corrected (was an UNGUARDED path)', async () => {
@@ -1561,7 +1686,7 @@ test('honest-completion: kill-switch off leaves blocked text completing (byte-id
   }
 });
 
-test('objective judge: off by default (no judgeCompletion opt-in)', async () => {
+test('objective judge: off by default for non-promise answer (no judgeCompletion opt-in)', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
     { finalOutput: { summary: 'said what I would do', reply: 'Here is what I would do.', done: true, nextAction: 'completed', reason: null } },
@@ -1576,10 +1701,10 @@ test('objective judge: off by default (no judgeCompletion opt-in)', async () => 
     runRunner: runner,
   });
   assert.equal(result.status, 'completed');
-  assert.equal(judgeInvoked, false, 'judge must not run unless judgeCompletion is opted in');
+  assert.equal(judgeInvoked, false, 'plain delivered reply must not invoke the judge unless judgeCompletion is opted in');
 });
 
-test('objective judge: continuation budget caps at 3, then accepts the model\'s done', async () => {
+test('objective judge: continuation budget caps retries, then delivery verifier blocks a remaining promise', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const premature = { finalOutput: { summary: 'promised again', reply: 'I will do it.', done: true, nextAction: 'completed', reason: null } };
   const runner = scriptedRunner([premature, premature, premature, premature, premature]);
@@ -1593,9 +1718,12 @@ test('objective judge: continuation budget caps at 3, then accepts the model\'s 
     makeRunner: makeRunnerStub,
     runRunner: runner,
   });
-  assert.equal(result.status, 'completed');
-  assert.equal(judgeCalls, 3, 'judge fires up to the continuation budget then stops gating');
-  assert.equal(result.steps, 4, '3 judge-forced continuations + the accepted 4th completion');
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(judgeCalls, 4, '3 judge-forced continuations + 1 final delivery verification');
+  assert.equal(result.steps, 4, '3 judge-forced continuations + the final not-delivered boundary');
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.delivered, false);
+  assert.match(String(completed.data.blockedReason), /still nothing produced/i);
 });
 
 test('runConversation: recurses through done=false steps until done=true', async () => {

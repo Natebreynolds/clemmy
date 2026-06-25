@@ -30,13 +30,14 @@
  * Known, accepted contract differences from the legacy loop (same trade the
  * workflow runner accepted when it converged):
  *   - `request.model` is ignored — the harness uses its configured model.
- *   - `onToolActivity` / `onReasoning` / `runId` run-event streaming are not
- *     bridged; the harness writes its own richer event log instead.
+ *   - `runId` run-event streaming is not bridged; the harness writes its own
+ *     richer event log instead. `onToolActivity` / `onReasoning` are relayed
+ *     best-effort from harness events for legacy progress surfaces.
  */
 import { runConversation } from './loop.js';
 import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
 import { configureHarnessRuntime } from './codex-client.js';
-import { clearKill, createSession, getSession, requestKill } from './eventlog.js';
+import { clearKill, createSession, getSession, listEvents, requestKill, type EventRow } from './eventlog.js';
 import { listPending } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from './claude-agent-brain.js';
 import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
@@ -44,7 +45,8 @@ import { AgentRuntimeCancelledError } from '../provider.js';
 import { getRuntimeEnv } from '../../config.js';
 import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
-import type { AssistantRequest, AssistantResponse } from '../../types.js';
+import { actionBus } from '../action-bus.js';
+import type { AssistantRequest, AssistantResponse, ToolActivity } from '../../types.js';
 
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow';
 
@@ -76,6 +78,37 @@ const HARNESS_FILTERABLE_TOOLS: ReadonlySet<string> = new Set(LOCAL_MCP_TOOL_NAM
 function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
   if (!names || names.length === 0) return true;
   return names.every((n) => HARNESS_FILTERABLE_TOOLS.has(n));
+}
+
+const REUSE_USER_INPUT_TERMINALS = new Set<string>([
+  'conversation_completed',
+  'conversation_limit_exceeded',
+  'run_completed',
+  'run_failed',
+  'run_cancelled',
+  'run_paused',
+  'awaiting_user_input',
+  'approval_requested',
+]);
+
+function hasReusableRecordedUserInput(sessionId: string, text: string): boolean {
+  try {
+    const expected = text.trim();
+    if (!expected) return false;
+    const recent = listEvents(sessionId).slice(-12);
+    let matchSeq = -1;
+    for (const event of recent) {
+      if (event.type !== 'user_input_received') continue;
+      const got = typeof (event.data as { text?: unknown })?.text === 'string'
+        ? ((event.data as { text?: string }).text ?? '').trim()
+        : '';
+      if (got === expected) matchSeq = event.seq;
+    }
+    if (matchSeq < 0) return false;
+    return !recent.some((event) => event.seq > matchSeq && REUSE_USER_INPUT_TERMINALS.has(event.type));
+  } catch {
+    return false;
+  }
 }
 
 /** Interactive chat lanes get the objective-completion judge (parity with
@@ -132,9 +165,78 @@ export function _setBridgeImplsForTests(impls: {
  *  harness kill switch — matches the legacy runtime's own 2s cancel poll. */
 const CANCEL_POLL_MS = 2_000;
 
+function objectRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function toolActivityInput(value: unknown): Record<string, unknown> {
+  if (value == null) return {};
+  if (typeof value === 'string') {
+    if (!value.trim()) return {};
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : { value };
+    } catch {
+      return { value };
+    }
+  }
+  return objectRecord(value);
+}
+
+function toolActivityFromHarnessEvent(event: EventRow): ToolActivity | null {
+  if (event.type !== 'tool_called') return null;
+  const data = objectRecord(event.data);
+  const rawName = data.tool ?? data.toolName;
+  const toolName = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : 'unknown_tool';
+  const rawArgs = data.arguments ?? data.args ?? data.input;
+  return { toolName, input: toolActivityInput(rawArgs) };
+}
+
+function reasoningProgressFromHarnessEvent(event: EventRow): string | null {
+  switch (event.type) {
+    case 'turn_started':
+      return 'Clementine is planning the next step.';
+    case 'conversation_step':
+      return 'Clementine is continuing the task.';
+    case 'stall_retry_attempted':
+      return 'Clementine is recovering from a stalled step.';
+    case 'budget_elevated':
+      return 'Clementine raised the run budget for a longer task.';
+    default:
+      return null;
+  }
+}
+
+function attachLegacyProgressRelay(request: AssistantRequest): () => void {
+  if (!request.onToolActivity && !request.onReasoning) return () => {};
+  return actionBus.subscribe((event) => {
+    if (event.kind !== 'harness.event') return;
+    if (event.sessionId !== request.sessionId) return;
+    if (request.onToolActivity) {
+      const activity = toolActivityFromHarnessEvent(event.event);
+      if (activity) {
+        void Promise.resolve(request.onToolActivity(activity)).catch(() => {
+          // Legacy progress callbacks are observability only; never break a run.
+        });
+      }
+    }
+    if (request.onReasoning) {
+      const progress = reasoningProgressFromHarnessEvent(event.event);
+      if (progress) {
+        void Promise.resolve(request.onReasoning(progress)).catch(() => {
+          // Legacy progress callbacks are observability only; never break a run.
+        });
+      }
+    }
+  });
+}
+
 export async function respondViaHarness(
   surface: HarnessSurface,
   request: AssistantRequest,
+  opts: { reuseRecordedUserInput?: boolean } = {},
 ): Promise<AssistantResponse> {
   const config = SURFACE_CONFIG[surface];
   const sessionId = request.sessionId;
@@ -172,6 +274,7 @@ export async function respondViaHarness(
     }, CANCEL_POLL_MS);
   }
 
+  const detachProgressRelay = attachLegacyProgressRelay(request);
   try {
     const agent = await buildAgentImpl({
       userInput: request.message,
@@ -193,6 +296,7 @@ export async function respondViaHarness(
       maxWallClockMs: request.maxWallClockMs,
       judgeCompletion: config.judgeCompletion,
       onChunk: request.onChunk,
+      reuseRecordedUserInput: opts.reuseRecordedUserInput,
     });
 
     const replyText =
@@ -257,6 +361,7 @@ export async function respondViaHarness(
         throw new Error(result.error || `harness run ${result.status}`);
     }
   } finally {
+    detachProgressRelay();
     if (cancelPoll) clearInterval(cancelPoll);
   }
 }
@@ -286,6 +391,13 @@ export async function respondPreferHarness(
   }
   if (!auth.ok) return legacyRespond(request);
   if (claudeAgentSdkBrainEnabled(surface)) {
+    const detachProgressRelay = attachLegacyProgressRelay(request);
+    let detached = false;
+    const detach = (): void => {
+      if (detached) return;
+      detached = true;
+      detachProgressRelay();
+    };
     try {
       return await claudeAgentBrainImpl(surface, request);
     } catch (err) {
@@ -298,9 +410,14 @@ export async function respondPreferHarness(
       // fall over. Kill-switch: CLEMMY_BRAIN_FALLOVER=off.
       if (chatBrainFalloverEnabled() && err instanceof ClaudeSdkProviderOverloadError && !err.committed) {
         bridgeLogger.warn({ surface }, 'Claude brain overloaded at turn start — falling the turn over to the harness brain (Codex→GLM)');
-        return respondViaHarness(surface, request);
+        detach();
+        return respondViaHarness(surface, request, {
+          reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
+        });
       }
       throw err;
+    } finally {
+      detach();
     }
   }
   return respondViaHarness(surface, request);

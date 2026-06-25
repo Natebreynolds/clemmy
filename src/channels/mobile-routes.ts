@@ -148,6 +148,16 @@ function serializeEventForMobile(event: HarnessEventRow): {
         };
       }
       break;
+    case 'conversation_limit_exceeded':
+      trimmed = {
+        reason: typeof data.reason === 'string' ? data.reason : 'limit_exceeded',
+        steps: typeof data.steps === 'number' ? data.steps : null,
+        maxSteps: typeof data.maxSteps === 'number' ? data.maxSteps : null,
+        maxWallClockMs: typeof data.maxWallClockMs === 'number' ? data.maxWallClockMs : null,
+        maxTurns: typeof data.maxTurns === 'number' ? data.maxTurns : null,
+        transport: typeof data.transport === 'string' ? data.transport : null,
+      };
+      break;
     case 'tool_called':
       trimmed = {
         tool: typeof data.tool === 'string' ? data.tool : String(data.name ?? 'unknown'),

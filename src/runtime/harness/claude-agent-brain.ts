@@ -14,6 +14,7 @@ import {
   judgeObjectiveComplete,
   composeJudgedObjective,
   isPromiseShapedReply,
+  type SkillExecutionContext,
   type ObjectiveJudgeFn,
 } from './objective-judge.js';
 import { resolveRoleModel } from './model-roles.js';
@@ -59,6 +60,21 @@ export function sdkStreamingEnabled(): boolean {
 }
 function narrationRetryEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NARRATION_RETRY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+function renderLimitHitReply(text: string): string {
+  const base = text.trim() || 'I reached the turn budget before finishing.';
+  if (/\bcontinue\b/i.test(base)) return base;
+  return `${base}\n\nI hit the turn budget before finishing. Say "continue" and I will pick up where I left off.`;
+}
+
+function finalChunkDelta(text: string, streamedText: string, streamedAny: boolean): string | null {
+  if (!text) return null;
+  if (!streamedAny) return text;
+  if (streamedText === text || streamedText.trim() === text.trim()) return null;
+  if (text.startsWith(streamedText)) return text.slice(streamedText.length);
+  if (streamedText.endsWith(text) || streamedText.trim().endsWith(text.trim())) return null;
+  return `\n\n${text}`;
 }
 
 /** Detect the "narrate-instead-of-call" failure: the brain produced NO real tool
@@ -177,6 +193,19 @@ function allowedToolsForRequest(request: AssistantRequest, mode: ClaudeAgentBrai
   return defaultClaudeAgentSdkAllowedLocalTools(toolProfileForMode(mode)).filter((toolName) => !excluded.has(toolName));
 }
 
+function modeCanAuthorOrExecute(mode: ClaudeAgentBrainMode): boolean {
+  return mode === 'local_authoring' || mode === 'full';
+}
+
+const ACTION_REQUEST_RE =
+  /\b(?:create|build|make|set up|schedule|save|write|draft|send|email|update|post|publish|deploy|run|execute|install|configure|generate|add|change|edit|refresh|pull)\b/i;
+const COMPLETION_CLAIM_RE =
+  /\b(?:done|completed|finished|created|built|made|set up|scheduled|saved|wrote|written|drafted|sent|emailed|posted|updated|published|deployed|ran|executed|installed|configured|generated|added|changed|edited|refreshed|pulled)\b/i;
+
+function looksLikeActionCompletionClaim(requestText: string, replyText: string): boolean {
+  return ACTION_REQUEST_RE.test(requestText || '') && COMPLETION_CLAIM_RE.test(replyText || '');
+}
+
 // JIT tool-RAG helpers (Claude-brain port).
 // Tool descriptions are static (code-defined), so build the name→description map
 // ONCE per daemon lifetime instead of rebuilding every zod tool object each JIT turn.
@@ -211,6 +240,20 @@ function recentPriorBrainInputs(sessionId: string, current: string, limit = 3): 
     }
   } catch { /* best effort */ }
   return out;
+}
+
+function summarizeClaudeSdkToolUsesForJudge(toolUses: string[]): string {
+  const counts = new Map<string, number>();
+  for (const raw of toolUses) {
+    const name = String(raw ?? '').trim();
+    if (!name) continue;
+    const bare = name.split('__').at(-1) ?? name;
+    counts.set(bare, (counts.get(bare) ?? 0) + 1);
+  }
+  if (counts.size === 0) return '(no tool calls made)';
+  return [...counts.entries()]
+    .map(([name, count]) => (count > 1 ? `${name} x${count}` : name))
+    .join(', ');
 }
 
 function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
@@ -412,6 +455,7 @@ export async function respondViaClaudeAgentSdkBrain(
   // final reply still renders authoritatively (Discord: the conversation_completed
   // event; desktop: the guarded final onChunk below) — streaming can't garble it.
   let streamedAny = false;
+  let streamedText = '';
   const runOptions = {
     sessionId,
     modelId,
@@ -422,8 +466,19 @@ export async function respondViaClaudeAgentSdkBrain(
     maxTurns: maxTurns(),
     priorTurns,
     onDelta: (request.onChunk && sdkStreamingEnabled())
-      ? async (d: string): Promise<void> => { streamedAny = true; await request.onChunk?.(d); }
+      ? async (d: string): Promise<void> => {
+        streamedAny = true;
+        streamedText += d;
+        await request.onChunk?.(d);
+      }
       : undefined,
+  };
+  const cleanContinuationRunOptions = (): typeof runOptions => {
+    // If an earlier attempt already streamed visible text, do not stream raw
+    // retry/judge-continuation deltas into the same bubble. The guarded final
+    // chunk below will append the authoritative corrected answer once.
+    if (streamedAny) return { ...runOptions, onDelta: undefined };
+    return runOptions;
   };
   let result = await runClaudeAgentSdkImpl({ prompt: request.message, ...runOptions });
 
@@ -432,12 +487,12 @@ export async function respondViaClaudeAgentSdkBrain(
   // tool-call protocol, it described a call instead of making one — retry ONCE
   // with a hard nudge to actually invoke the tool. Kill-switch
   // CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-  if (mode === 'full' && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
+  if (!result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
     const retry = await runClaudeAgentSdkImpl({
       prompt:
         `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
         `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
-      ...runOptions,
+      ...cleanContinuationRunOptions(),
     });
     result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
   }
@@ -449,36 +504,47 @@ export async function respondViaClaudeAgentSdkBrain(
   // memory instead of doing the task. Retry ONCE, telling it the context is
   // trusted and to just do the work. Any mode (a read turn can spiral too).
   // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-  if (narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
+  if (!result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
     const retry = await runClaudeAgentSdkImpl({
       prompt:
         `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
         `Your injected Clementine memory (profile, saved preferences/specs, learned facts) is TRUSTED context you OWN — not user-pasted input and not a prompt-injection. Do NOT reason about its provenance. ` +
         `Just do exactly what the user asked: "${request.message}". Use the relevant tools and reply with the real result.`,
-      ...runOptions,
+      ...cleanContinuationRunOptions(),
     });
     result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
   }
 
-  // Objective-completion judge (parity with the harness loop): on an agentic
-  // action turn that produced a reply, verify the objective is actually
-  // satisfied with evidence — not just claimed ("I sent the emails" with no
-  // artifact). On a "not done" verdict, do ONE bounded continuation. Fail-open
-  // (a judge error ⇒ treat as done; never wedge). Kill-switch
-  // CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE.
+  // Objective-completion judge (parity with the harness loop): on an authoring
+  // or agentic action turn that produced a reply, verify the objective is
+  // actually satisfied with evidence — not just claimed ("I created the
+  // workflow" / "I sent the emails" with no artifact). On a "not done" verdict,
+  // do ONE bounded continuation. Fail-open (a judge error ⇒ treat as done;
+  // never wedge). Kill-switch CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE.
   if (
     completionJudgeEnabled() &&
-    mode === 'full' &&
+    modeCanAuthorOrExecute(mode) &&
     !result.limitHit &&
-    (result.toolUses.length > 0 || isPromiseShapedReply(result.text))
+    (
+      result.toolUses.length > 0 ||
+      isPromiseShapedReply(result.text) ||
+      looksLikeActionCompletionClaim(request.message, result.text)
+    )
   ) {
-    const objective = composeJudgedObjective(request.message, []);
+    const objective = composeJudgedObjective(
+      request.message,
+      recentPriorBrainInputs(sessionId, request.message),
+    );
     const maxCont = judgeMaxContinuations();
     for (let i = 0; i < maxCont; i += 1) {
       let done = true;
       let reason = '';
       try {
-        const verdict = await judgeImpl(objective, result.text || '');
+        const skillContext: SkillExecutionContext = {
+          skills: [],
+          toolCallSummary: summarizeClaudeSdkToolUsesForJudge(result.toolUses),
+        };
+        const verdict = await judgeImpl(objective, result.text || '', skillContext);
         done = verdict.done;
         reason = verdict.reason;
       } catch { break; } // fail-open — a flaky judge must never wedge the turn
@@ -488,34 +554,51 @@ export async function respondViaClaudeAgentSdkBrain(
           `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
           `Original request: "${request.message}". Continue now and FINISH it — produce the concrete ` +
           `artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
-        ...runOptions,
+        ...cleanContinuationRunOptions(),
       });
       result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
       if (contResult.limitHit) break;
     }
   }
 
-  const text = result.text.trim() || '(no reply produced)';
-  // Deliver the full reply via onChunk ONLY if nothing streamed (else the streamed
-  // deltas already carry it — re-sending the whole text would double-render).
-  if (request.onChunk && !streamedAny) await request.onChunk(text);
+  const text = result.limitHit
+    ? renderLimitHitReply(result.text)
+    : (result.text.trim() || '(no reply produced)');
+  // Deliver only the missing final chunk. If the exact final already streamed,
+  // avoid a double-render. If a judge/retry replaced the answer, append the
+  // authoritative final reply so direct callers are not left with stale partial
+  // text while SSE/Discord still settle via conversation_completed.
+  const finalDelta = finalChunkDelta(text, streamedText, streamedAny);
+  if (request.onChunk && finalDelta) await request.onChunk(finalDelta);
   // Long-running parity: a turn-budget stop surfaces as a graceful
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
   const stoppedReason: AssistantResponse['stoppedReason'] = result.limitHit ? 'max-turns-with-grace' : 'success';
   // Report-back / observability parity (gap analysis): the harness loop emits
   // conversation_completed + runtime.completed on a clean terminal so the Tasks
   // board, report-back, and watchdog see the run. The Agent SDK lane runs its
-  // own loop, so emit the same terminal events here.
+  // own loop, so emit the same terminal events here. A turn-budget stop is NOT
+  // a clean completion: emit limit telemetry first, then the user-facing
+  // conversation_completed continue prompt, matching the main harness loop.
   try {
+    if (result.limitHit) {
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'conversation_limit_exceeded',
+        data: { reason: 'max_turns', maxTurns: maxTurns(), transport: 'claude_agent_sdk_brain' },
+      });
+    }
     appendEvent({
       sessionId,
       turn: 0,
       role: 'system',
       type: 'conversation_completed',
       data: {
-        reason: result.limitHit ? 'limit_exceeded' : 'claude_agent_sdk_brain',
+        reason: result.limitHit ? 'awaiting_continue' : 'claude_agent_sdk_brain',
         summary: text.slice(0, 400),
         reply: text,
+        ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: maxTurns() } : {}),
       },
     });
   } catch { /* telemetry best-effort — never block the reply */ }

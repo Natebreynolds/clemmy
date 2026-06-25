@@ -74,25 +74,38 @@ const actionShape = z.object({
   confirm: z.boolean().nullable().describe('Hint that the view should confirm before firing (advisory).'),
 });
 
-function toAction(raw: z.infer<typeof actionShape>): SpaceAction {
+function parseJsonObjectField(raw: string | null | undefined, label: string, errors: string[]): Record<string, unknown> | undefined {
+  const text = raw?.trim();
+  if (!text) return undefined;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    errors.push(`${label} must be a JSON object (for example {"max":10}), not ${Array.isArray(parsed) ? 'an array' : typeof parsed}.`);
+  } catch (err) {
+    errors.push(`${label} is not valid JSON: ${err instanceof Error ? err.message : String(err)}.`);
+  }
+  return undefined;
+}
+
+function toAction(raw: z.infer<typeof actionShape>, errors: string[] = []): SpaceAction {
   const a: SpaceAction = { id: raw.id.trim() };
   if (raw.label && raw.label.trim()) a.label = raw.label.trim();
   if (raw.composio_slug && raw.composio_slug.trim()) a.composioSlug = raw.composio_slug.trim();
   if (raw.runner && raw.runner.trim()) a.runner = raw.runner.trim();
-  if (raw.args_template_json && raw.args_template_json.trim()) {
-    try { a.argsTemplate = JSON.parse(raw.args_template_json) as Record<string, unknown>; } catch { /* ignore bad json */ }
-  }
+  const argsTemplate = parseJsonObjectField(raw.args_template_json, `Action "${a.id}" args_template_json`, errors);
+  if (argsTemplate) a.argsTemplate = argsTemplate;
   if (raw.confirm) a.confirm = true;
   return a;
 }
 
-function toDataSource(raw: z.infer<typeof dataSourceShape>): SpaceDataSource {
+function toDataSource(raw: z.infer<typeof dataSourceShape>, errors: string[] = []): SpaceDataSource {
   const ds: SpaceDataSource = { id: raw.id.trim() };
   if (raw.runner && raw.runner.trim()) ds.runner = raw.runner.trim();
   if (raw.composio_slug && raw.composio_slug.trim()) ds.composioSlug = raw.composio_slug.trim();
-  if (raw.composio_args_json && raw.composio_args_json.trim()) {
-    try { ds.composioArgs = JSON.parse(raw.composio_args_json) as Record<string, unknown>; } catch { /* ignore bad json */ }
-  }
+  const composioArgs = parseJsonObjectField(raw.composio_args_json, `Data source "${ds.id}" composio_args_json`, errors);
+  if (composioArgs) ds.composioArgs = composioArgs;
   if (raw.schedule && raw.schedule.trim()) ds.schedule = raw.schedule.trim();
   if (raw.timezone && raw.timezone.trim()) ds.timezone = raw.timezone.trim();
   return ds;
@@ -260,12 +273,29 @@ export function registerSpaceTools(server: McpServer): void {
       if (!existing && (!view_path || !view_path.trim())) {
         return textResult('Error: view_path is required when creating a new workspace. Write the HTML with write_file first, then pass its path.');
       }
+      if (existing?.manifestErrors && existing.manifestErrors.length > 0) {
+        const needsSources = existing.manifestErrors.some((e) => /^Data source /.test(e));
+        const needsActions = existing.manifestErrors.some((e) => /^Action /.test(e));
+        const missing: string[] = [];
+        if (needsSources && data_sources == null) missing.push('data_sources');
+        if (needsActions && actions == null) missing.push('actions');
+        if (missing.length > 0) {
+          return textResult(
+            `Workspace "${slug}" was NOT saved — its existing manifest has invalid fields. `
+            + `Pass corrected ${missing.join(' and ')} to space_save so I do not silently drop the broken values:\n- ${existing.manifestErrors.join('\n- ')}`,
+          );
+        }
+      }
 
       // Authoring-reliability gate (mirror of prepareWorkflowForWrite): auto-repair
       // + validate the declared data sources/actions BEFORE installing the view or
       // persisting. Refuse a Workspace set up to fail; repairs surface as advisories.
-      const dsList = data_sources ? data_sources.map(toDataSource) : (existing?.dataSources ?? []);
-      const actList = actions ? actions.map(toAction) : (existing?.actions ?? []);
+      const parseErrors: string[] = [];
+      const dsList = data_sources ? data_sources.map((src) => toDataSource(src, parseErrors)) : (existing?.dataSources ?? []);
+      const actList = actions ? actions.map((act) => toAction(act, parseErrors)) : (existing?.actions ?? []);
+      if (parseErrors.length > 0) {
+        return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${parseErrors.join('\n- ')}`);
+      }
       const prep = prepareSpaceForWrite({ slug, dataSources: dsList, actions: actList, status: existing?.status });
       if (!prep.ok) {
         return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${prep.errors.join('\n- ')}`);
@@ -393,6 +423,12 @@ export function registerSpaceTools(server: McpServer): void {
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       const rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}". Create it with space_save first.`);
+      if (rec.manifestErrors && rec.manifestErrors.length > 0) {
+        return textResult(
+          `Workspace "${slug}" was NOT edited — its manifest is invalid, so I cannot create a reliable view revision. `
+          + `Fix it with space_save first:\n- ${rec.manifestErrors.join('\n- ')}`,
+        );
+      }
       const viewFile = resolveInSpace(slug, rec.viewEntry);
       if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with a view_path.`);
       let html = readFileSync(viewFile, 'utf-8');
@@ -487,6 +523,9 @@ export function registerSpaceTools(server: McpServer): void {
       } catch { dataPreview = '(unreadable)'; }
       const parts = [
         `Workspace "${rec.title}" (${slug}) — ${rec.status}, v${rec.version}.`,
+        rec.manifestErrors && rec.manifestErrors.length > 0
+          ? `Manifest errors: fix with space_save before refresh/actions run.\n  - ${rec.manifestErrors.join('\n  - ')}`
+          : '',
         rec.reengage ? `Re-engage on: ${rec.reengage.triggers.join(', ')}${rec.reengage.guidance ? ` — ${rec.reengage.guidance}` : ''}` : 'Re-engage: not configured.',
         rec.dataSources.length > 0 ? `Data sources: ${rec.dataSources.map((d) => d.id).join(', ')}` : 'Data sources: none.',
         rec.actions.length > 0 ? `Actions: ${rec.actions.map((a) => a.label ?? a.id).join(', ')}` : 'Actions: none.',
@@ -589,6 +628,7 @@ export function registerSpaceTools(server: McpServer): void {
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       const rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}".`);
+      if (rec.status !== 'active') return textResult(`Workspace "${slug}" is ${rec.status}; data writes are disabled until it is active.`);
       const sid = source_id.trim();
       if (sid === '_meta') return textResult('Error: "_meta" is a reserved key (it tracks per-source provenance). Use the data source id your view reads, e.g. data["deals"].');
       let parsed: unknown;

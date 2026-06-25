@@ -160,6 +160,7 @@ test('userFacingRunState distinguishes planning, execution, waiting, and stale w
   }, now), 'stalled');
 
   assert.equal(userFacingRunStateLabel('stalled'), 'Needs attention');
+  assert.equal(userFacingRunStateLabel('needs_attention'), 'Needs attention');
   assert.equal(userFacingRunStateIsLive('executing'), true);
   assert.equal(userFacingRunStateIsLive('stalled'), false);
   assert.equal(runPreview({
@@ -167,6 +168,19 @@ test('userFacingRunState distinguishes planning, execution, waiting, and stale w
     updatedAt: '2020-01-01T10:00:00Z',
     events: [{ type: 'tool_called', data: { tool: 'Outlook' }, createdAt: '2020-01-01T10:00:00Z' }],
   }), 'No recent progress — needs attention');
+});
+
+test('completed runs flagged needsAttention render as attention, not done', () => {
+  const run: ActivityRunLike = {
+    status: 'completed',
+    needsAttention: true,
+    outputPreview: 'Delivered the report, but the target was not confirmed.',
+    events: [{ type: 'completed' }],
+  };
+  assert.equal(userFacingRunState(run), 'needs_attention');
+  assert.equal(userFacingRunStateLabel(userFacingRunState(run)), 'Needs attention');
+  assert.equal(userFacingRunStateIsLive(userFacingRunState(run)), false);
+  assert.equal(runPreview(run), 'Delivered the report, but the target was not confirmed.');
 });
 
 test('liveLine + timeline are order-agnostic (harness events arrive newest-first)', () => {

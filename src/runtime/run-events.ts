@@ -42,6 +42,8 @@ export interface RunRecord {
   pendingApprovalId?: string;
   error?: string;
   outputPreview?: string;
+  /** Terminal run completed mechanically but still needs human review/action. */
+  needsAttention?: boolean;
   events: RunEvent[];
 }
 
@@ -116,6 +118,7 @@ export function startRun(input: {
   if (existing) {
     existing.status = 'running';
     existing.updatedAt = now;
+    delete existing.needsAttention;
     existing.events.push({
       id: randomUUID(),
       type: 'received',
@@ -191,6 +194,7 @@ export function finishRun(
     queuedTaskId?: string;
     pendingApprovalId?: string;
     error?: string;
+    needsAttention?: boolean;
   },
 ): RunRecord | undefined {
   if (!runId) return undefined;
@@ -208,6 +212,8 @@ export function finishRun(
   run.queuedTaskId = input.queuedTaskId ?? run.queuedTaskId;
   run.pendingApprovalId = input.pendingApprovalId ?? run.pendingApprovalId;
   run.error = input.error ?? run.error;
+  if (input.needsAttention === true) run.needsAttention = true;
+  else delete run.needsAttention;
   run.events.push({
     id: randomUUID(),
     type: input.status === 'failed'

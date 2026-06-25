@@ -1,8 +1,10 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { ExecutionStore } from '../execution/store.js';
+import { validateGoal, type GoalValidationResult } from '../execution/goal-validate.js';
 import { textResult } from './shared.js';
 import type { ExecutionRecord } from '../types.js';
+import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 
 /**
  * Pure focus-matcher: given a `query` (an execution id OR a
@@ -64,6 +66,57 @@ export function pickFocusTarget(query: string, active: ExecutionRecord[]): Focus
  */
 
 const store = new ExecutionStore();
+
+let executionToolCompletionJudgeForTests: ObjectiveJudgeFn | null = null;
+export function _setExecutionToolCompletionJudgeForTests(fn: ObjectiveJudgeFn | null): void {
+  executionToolCompletionJudgeForTests = fn;
+}
+
+function clean(value: string, maxChars = 360): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+function executionToolCompletionObjective(execution: ExecutionRecord): string {
+  return [
+    `Execution title: ${execution.title}`,
+    `Objective: ${execution.objective}`,
+    execution.successCriteria ? `Declared success criteria: ${execution.successCriteria}` : '',
+    execution.nextStep ? `Previous next step: ${execution.nextStep}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function executionToolCompletionEvidence(execution: ExecutionRecord, summary: string): string {
+  const recentActivity = [...(execution.activity ?? [])]
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .slice(-10)
+    .map((item) => `- ${item.type}: ${item.message}`)
+    .join('\n') || 'none';
+  return [
+    `Tool completion summary: ${summary}`,
+    execution.lastAssistantSummary ? `Previous summary: ${execution.lastAssistantSummary}` : '',
+    `Recent execution activity:\n${recentActivity}`,
+  ].filter(Boolean).join('\n');
+}
+
+async function validateExecutionToolCompletion(
+  execution: ExecutionRecord,
+  summary: string,
+): Promise<GoalValidationResult> {
+  return validateGoal({
+    objective: executionToolCompletionObjective(execution),
+    successCriteria: execution.successCriteria ? [execution.successCriteria] : [],
+    evidenceText: executionToolCompletionEvidence(execution, summary),
+  }, {
+    ...(executionToolCompletionJudgeForTests ? { judge: executionToolCompletionJudgeForTests } : {}),
+  });
+}
+
+function completionRejectionText(validation: GoalValidationResult): string {
+  const advice = clean(validation.advice ?? 'completion evidence did not satisfy the execution objective', 360);
+  return validation.judgeFailedOpen
+    ? `Completion not accepted: the completion judge was unavailable, so this execution remains active. ${advice}`
+    : `Completion not accepted: ${advice}`;
+}
 
 export function registerExecutionTools(server: McpServer): void {
   server.tool(
@@ -327,6 +380,32 @@ export function registerExecutionTools(server: McpServer): void {
       const e = store.get(id);
       if (!e) return textResult(`No execution found with id ${id}.`);
       if (e.status === 'completed') return textResult(`Execution ${id} was already completed.`);
+      const validation = await validateExecutionToolCompletion(e, summary);
+      if (!validation.pass) {
+        const message = completionRejectionText(validation);
+        const updated = store.update(id, {
+          status: 'active',
+          lastAssistantSummary: clean(`${summary} | ${message}`, 400),
+          nextStep: clean(`Address completion gap: ${validation.advice ?? 'produce verifiable completion evidence'}`, 220),
+          lastActivityAt: new Date().toISOString(),
+          blocker: undefined,
+        });
+        store.addActivity({
+          executionId: id,
+          key: `execution-complete-rejected:${Date.now()}`,
+          type: 'status',
+          message,
+          metadata: {
+            source: 'execution_complete',
+            judgeFailedOpen: validation.judgeFailedOpen ?? false,
+            successRatePercent: validation.successRatePercent,
+            criteriaMet: validation.criteriaMet,
+            criteriaTotal: validation.criteriaTotal,
+            failedDirectives: validation.failedDirectives,
+          },
+        });
+        return textResult(`${message}\nExecution ${updated?.id ?? id} remains active.`);
+      }
       const updated = store.update(id, {
         status: 'completed',
         lastAssistantSummary: summary,

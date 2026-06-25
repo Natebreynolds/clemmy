@@ -877,7 +877,7 @@ export function parseHarnessCommand(prompt: string): HarnessCommand | null {
 /**
  * Find the most recent `conversation_completed` event for a session.
  * Used by the /continue path to inspect whether the session ended on
- * an awaiting_continue limit and to extract the last orchestrator
+ * a continue/limit completion and to extract the last orchestrator
  * summary as continuation context.
  */
 export function readLastConversationCompletion(sessionId: string): {
@@ -900,6 +900,10 @@ export function readLastConversationCompletion(sessionId: string): {
   } catch {
     return null;
   }
+}
+
+export function isContinueCompletionReason(reason: unknown): boolean {
+  return reason === 'awaiting_continue' || reason === 'limit_exceeded';
 }
 
 /**
@@ -1594,17 +1598,15 @@ export async function runDiscordHarnessConversation(opts: {
   }
   if (command === 'continue') {
     // /continue is only meaningful when the session's last
-    // conversation_completed was an "awaiting_continue" — the
-    // synthetic prompt we emit from the loop's max-step / wall-clock
-    // branch. When that's the case, rewrite the bare "continue" into
-    // a structured continuation directive the orchestrator can act
-    // on (with the prior turn's summary inlined for context), and
-    // fall through to the normal turn path. Otherwise leave `continue`
-    // as-is and let the agent handle it as a regular message.
+    // conversation_completed was a continue/limit completion. The
+    // current loop emits awaiting_continue, while older stored sessions
+    // may still carry limit_exceeded. Rewrite only those cases into a
+    // structured continuation directive; otherwise leave `continue` as
+    // a regular user message.
     const entry = getOrHydrateChannelSession(channelId);
     if (entry) {
       const lastCompletion = readLastConversationCompletion(entry.sessionId);
-      if (lastCompletion?.reason === 'awaiting_continue') {
+      if (lastCompletion && isContinueCompletionReason(lastCompletion.reason)) {
         prompt = buildContinueInput(lastCompletion.lastDecisionSummary);
       }
     }
@@ -2594,12 +2596,18 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
       const summary = humanHarnessText(reply || data.summary, state.summary);
       if (summary) state.summary = summary;
       const reason = data.reason ? String(data.reason) : '';
-      state.status =
-        reason === 'abandoned_by_orchestrator'
-          ? 'abandoned'
-          : reason === 'sub_agent_stalled'
-            ? 'stalled'
-            : 'complete';
+      const limitKind = typeof data.limitKind === 'string' && data.limitKind.trim()
+        ? data.limitKind.trim()
+        : '';
+      if (isContinueCompletionReason(reason)) {
+        state.status = `stopped: ${limitKind || 'continue'}`;
+      } else if (reason === 'abandoned_by_orchestrator') {
+        state.status = 'abandoned';
+      } else if (reason === 'sub_agent_stalled') {
+        state.status = 'stalled';
+      } else {
+        state.status = 'complete';
+      }
       state.done = true;
       return;
     }
@@ -2618,7 +2626,10 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     case 'conversation_limit_exceeded': {
       const reason = String(data.reason ?? 'limit');
       state.status = `stopped: ${reason}`;
-      state.done = true;
+      // Budget-limit telemetry is followed by a user-facing
+      // conversation_completed continue prompt. Keep the live subscription open
+      // so Discord does not finalize the message before that reply arrives.
+      state.done = false;
       return;
     }
   }

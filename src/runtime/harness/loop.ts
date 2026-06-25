@@ -39,7 +39,7 @@ import {
 } from './budget.js';
 import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, composeJudgedObjective, type ObjectiveJudgeFn } from './objective-judge.js';
-import { verifyDeliveredEnabled, matchesBlockedText } from './verify-delivered.js';
+import { verifyDelivered, verifyDeliveredEnabled } from './verify-delivered.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -628,6 +628,8 @@ export interface RunTurnOptions {
    *  harness's own synthetic re-prompts (judge/stall/grounding/YOLO). Only the
    *  first turn carries a real user message. (2026-06-23 fact-pollution fix.) */
   suppressMemoryCapture?: boolean;
+  /** See RunConversationOptions.reuseRecordedUserInput. */
+  reuseRecordedUserInput?: boolean;
 }
 
 export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
@@ -724,6 +726,12 @@ export interface RunConversationOptions {
   runRunner?: RunRunnerFn;
   /** Opt-in: callback fired for each token delta (output_text_delta) emitted by the model. Forwarded to each runTurn. */
   onChunk?: (delta: string) => void | Promise<void>;
+  /**
+   * Internal bridge path: an earlier first-byte provider attempt already wrote
+   * the user_input_received row for this exact message, and no model/tool work
+   * committed. Reuse that row instead of duplicating it on the fallback lane.
+   */
+  reuseRecordedUserInput?: boolean;
 }
 
 export interface RunConversationResult {
@@ -773,6 +781,17 @@ export function dispatchedBackgroundWorkflowRun(sessionId: string, turn: number)
     }
   } catch { /* fail toward running the judge */ }
   return false;
+}
+
+function composeResumeDeliveryObjective(sessionId: string): string {
+  try {
+    const inputs = listEvents(sessionId, { types: ['user_input_received'] })
+      .map((ev) => String((ev.data as { text?: string } | undefined)?.text ?? ''))
+      .filter((t) => t.trim().length > 0);
+    return composeJudgedObjective('', inputs);
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -1367,6 +1386,7 @@ async function runConversationCore(
       // Only the first step carries the real user message; every later step is a
       // harness continuation (judge/stall/grounding re-prompt) → don't learn it.
       suppressMemoryCapture: stepIndex > 1,
+      reuseRecordedUserInput: stepIndex === 1 ? options.reuseRecordedUserInput : false,
       maxTurns,
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
@@ -1757,6 +1777,15 @@ async function runConversationCore(
       // by the goal's persistent attempt budget; a dead judge resolves
       // not-satisfied + escalates (it can never auto-satisfy a goal).
       let goalUnmetNote = '';
+      // True when THIS turn's goal CONTRACT validated 'satisfied'. The honest-
+      // completion verifyDelivered gate below must NOT override a contract-verified
+      // completion just because the final reply is promise-shaped — the goal
+      // contract (validator + strict judge over the PARKED criteria) is the
+      // authoritative artifact verification; the promise-shaped heuristic is weaker.
+      // Without this, a satisfied goal whose reply reads "I'll publish it shortly"
+      // was flipped to awaiting_user_input (broke 4 goal-contract-loop tests; the
+      // gate is default-on).
+      let goalSatisfiedThisTurn = false;
       const activeGoal = safeActiveGoal(options.sessionId);
       const goalGate = Boolean(activeGoal)
         && (totalToolCalls >= 1 || isPromiseShapedReply(decision.reply || decision.summary));
@@ -1846,6 +1875,7 @@ async function runConversationCore(
           continue;
         } else if (validation.pass) {
           satisfyGoal(activeGoal.id, 'external validation passed');
+          goalSatisfiedThisTurn = true;
           // Capability compounding (C2): a satisfied goal that did real
           // discovery distills into a reusable draft skill. Fire-and-forget —
           // it gates on novelty internally and never blocks completion.
@@ -2043,19 +2073,19 @@ async function runConversationCore(
       const completionNotes = [goalUnmetNote, outputGroundingNote].filter((n) => n && n.trim());
       const userVisibleSummary = completionNotes.length ? `${baseSummary}\n\n${completionNotes.join('\n\n')}` : baseSummary;
 
-      // Honest-completion backstop (Done? node). The objective judge above only
-      // runs for opted-in ACTION objectives, so a turn that ends with an
-      // explicit blocked / "I can't proceed" / runtime-error stub — on a
-      // workflow step, a casual session, or any non-opted-in lane — currently
-      // banks as a clean "completed". That false green is the #1 trust-killer
-      // on long runs. This guard is deterministic (no model call — the judge
-      // already spent any call above), fail-open + monotonic (it can only
-      // convert a FALSE completed into an honest awaiting_user_input, never
-      // wedge a real completion), and kill-switched (CLEMMY_VERIFY_DELIVERED).
-      // awaiting_user_input is the honest terminal: a blocked reply IS waiting
-      // on the user/approval/credentials, and every downstream consumer already
-      // treats it as a non-completion that needs attention.
-      if (verifyDeliveredEnabled() && matchesBlockedText(userVisibleSummary)) {
+      // Honest-completion backstop (Done? node). The objective judge above
+      // handles opted-in ACTION objectives with bounded continuations. This
+      // final pass is monotonic report-back honesty for every lane: explicit
+      // blocked/error language and promise-shaped completions become an honest
+      // awaiting_user_input instead of a false-green completion. It reuses the
+      // shared verifyDelivered chokepoint used by gateway/daemon report-back.
+      // A goal contract validated 'satisfied' this turn is the AUTHORITATIVE artifact
+      // verification — skip the gate so its weaker promise-shaped heuristic can't
+      // override a contract-verified completion into awaiting_user_input.
+      const delivery = verifyDeliveredEnabled() && !goalSatisfiedThisTurn && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn)
+        ? await verifyDelivered(objective, userVisibleSummary, { judgeFn: objectiveJudge })
+        : { delivered: true as const, status: 'completed' as const };
+      if (!delivery.delivered) {
         safeAppend({
           sessionId: options.sessionId,
           turn: turnResult.turn,
@@ -2067,12 +2097,12 @@ async function runConversationCore(
             internalSummary: decision.summary,
             reply: decision.reply ?? null,
             delivered: false,
-            blockedReason: userVisibleSummary.slice(0, 400),
+            blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
           },
         });
         const goalForBlocked = safeActiveGoal(options.sessionId);
         if (goalForBlocked) {
-          safeAppendGoalLedger(goalForBlocked.id, 'blocked', userVisibleSummary);
+          safeAppendGoalLedger(goalForBlocked.id, 'blocked', delivery.reason ?? userVisibleSummary);
         }
         return {
           sessionId: options.sessionId,
@@ -2689,7 +2719,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     type: 'turn_started',
     data: { input: clip(options.input, 200) },
   });
-  session.recordUserInput(options.input, turn);
+  if (!options.reuseRecordedUserInput) {
+    session.recordUserInput(options.input, turn);
+  }
 
   // Memory writeback. The harness path was previously missing this —
   // every user message went into the conversation log but no durable
@@ -3770,6 +3802,8 @@ export async function runConversationFromResume(opts: {
   toolCallsPerTurn?: number;
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
+  /** Test injection for promise-shaped completion verification (defaults to judgeObjectiveComplete). */
+  judgeFn?: ObjectiveJudgeFn;
   /** Opt-in: callback fired for each token delta emitted by the model. */
   onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
@@ -3790,6 +3824,7 @@ async function runConversationFromResumeCore(opts: {
   toolCallsPerTurn?: number;
   makeRunner?: () => Runner;
   runRunner?: RunRunnerFn;
+  judgeFn?: ObjectiveJudgeFn;
   onChunk?: (delta: string) => void | Promise<void>;
 }): Promise<RunConversationResult> {
   const budget = getHarnessBudgetSettings();
@@ -3911,10 +3946,14 @@ async function runConversationFromResumeCore(opts: {
           ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision?.summary ?? '(none)'})`
           : decision?.summary;
 
-      // Honest-completion backstop (resume variant): a blocked/error-stub final
-      // reply converts to the honest awaiting_user_input. Ungated, deterministic,
-      // fail-open + monotonic, kill-switched (CLEMMY_VERIFY_DELIVERED).
-      if (verifyDeliveredEnabled() && matchesBlockedText(userVisibleSummary)) {
+      // Honest-completion backstop (resume variant): a blocked/error-stub or
+      // promise-shaped final reply converts to the honest awaiting_user_input.
+      const deliveryObjective = composeResumeDeliveryObjective(opts.sessionId);
+      const objectiveJudge = opts.judgeFn ?? judgeObjectiveComplete;
+      const delivery = verifyDeliveredEnabled()
+        ? await verifyDelivered(deliveryObjective, userVisibleSummary ?? '', { judgeFn: objectiveJudge })
+        : { delivered: true as const, status: 'completed' as const };
+      if (!delivery.delivered) {
         safeAppend({
           sessionId: opts.sessionId,
           turn: lastTurn,
@@ -3926,11 +3965,11 @@ async function runConversationFromResumeCore(opts: {
             internalSummary: decision?.summary,
             reply: decision?.reply ?? null,
             delivered: false,
-            blockedReason: (userVisibleSummary ?? '').slice(0, 400),
+            blockedReason: (delivery.reason ?? userVisibleSummary ?? '').slice(0, 400),
           },
         });
         const goalForBlocked = safeActiveGoal(opts.sessionId);
-        if (goalForBlocked) safeAppendGoalLedger(goalForBlocked.id, 'blocked', userVisibleSummary ?? '');
+        if (goalForBlocked) safeAppendGoalLedger(goalForBlocked.id, 'blocked', delivery.reason ?? userVisibleSummary ?? '');
         return {
           sessionId: opts.sessionId,
           status: 'awaiting_user_input',
@@ -4059,12 +4098,19 @@ async function runConversationFromResumeCore(opts: {
     }
 
     if (maxWallMs > 0 && Date.now() - startedAt > maxWallMs) {
-      safeAppend({
+      // Resume path must be SYMMETRIC with the primary loop (2312): emit BOTH the
+      // audit event AND the paired conversation_completed(reason='awaiting_continue').
+      // The chat dock / console SSE / Discord all treat a bare
+      // conversation_limit_exceeded as NON-terminal (they wait for the pair), so a
+      // bare emit on a resumed budget-limited turn hangs the surface until its idle/
+      // safety timeout. emitLimitExceededWithContinuePrompt restores the pairing.
+      emitLimitExceededWithContinuePrompt({
         sessionId: opts.sessionId,
         turn: lastTurn,
-        role: 'system',
-        type: 'conversation_limit_exceeded',
-        data: { steps: stepIndex, reason: 'wall_clock', maxWallClockMs: maxWallMs },
+        steps: stepIndex,
+        reason: 'wall_clock',
+        limitDetail: { maxWallClockMs: maxWallMs },
+        lastDecision: decision,
       });
       return {
         sessionId: opts.sessionId,
@@ -4153,12 +4199,16 @@ async function runConversationFromResumeCore(opts: {
     }
   }
 
-  safeAppend({
+  // Resume path max-steps exit: same symmetry fix as the wall_clock exit above and
+  // the primary loop (2353) — emit the paired conversation_completed so the chat
+  // dock / console SSE / Discord settle instead of hanging on a bare limit event.
+  emitLimitExceededWithContinuePrompt({
     sessionId: opts.sessionId,
     turn: lastTurn,
-    role: 'system',
-    type: 'conversation_limit_exceeded',
-    data: { steps: stepIndex, reason: 'max_steps', maxSteps },
+    steps: stepIndex,
+    reason: 'max_steps',
+    limitDetail: { maxSteps },
+    lastDecision,
   });
   return {
     sessionId: opts.sessionId,
