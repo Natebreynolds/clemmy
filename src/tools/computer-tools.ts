@@ -365,6 +365,203 @@ export function shellMutatesMemoryStore(rawCommand: unknown): boolean {
   return FACTS_TABLE_REF.test(cmd) || /memory\.db/i.test(cmd);
 }
 
+const SKILL_ARTIFACT_DIRS = new Set(['output', 'outputs', 'runs', 'artifacts', 'reports', 'tmp', '.tmp']);
+
+function installedSkillsRoot(): string {
+  return path.join(BASE_DIR, 'skills');
+}
+
+function installedSkillPathParts(filePath: string): string[] | null {
+  const resolved = path.resolve(expandHome(filePath));
+  const root = path.resolve(installedSkillsRoot());
+  if (!isInside(root, resolved)) return null;
+  const rel = path.relative(root, resolved);
+  if (!rel) return [];
+  return rel.split(path.sep).filter(Boolean);
+}
+
+function isInstalledSkillArtifactPath(filePath: string): boolean {
+  const parts = installedSkillPathParts(filePath);
+  if (!parts || parts.length < 2) return false;
+  return SKILL_ARTIFACT_DIRS.has(parts[1]);
+}
+
+export function isProtectedInstalledSkillSourcePath(filePath: string): boolean {
+  const parts = installedSkillPathParts(filePath);
+  if (!parts) return false;
+  return !isInstalledSkillArtifactPath(filePath);
+}
+
+function tokenizeShell(command: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  const flush = () => {
+    if (current) tokens.push(current);
+    current = '';
+  };
+
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch) || /[;&|<>]/.test(ch)) {
+      flush();
+      continue;
+    }
+    current += ch;
+  }
+  flush();
+  return tokens;
+}
+
+function outputRedirectionTargets(command: string): string[] {
+  const targets: string[] = [];
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch !== '>') continue;
+
+    i += 1;
+    if (command[i] === '>') i += 1;
+    while (i < command.length && /\s/.test(command[i])) i += 1;
+    if (i >= command.length) break;
+
+    const targetQuote = command[i] === '"' || command[i] === "'" ? command[i] : null;
+    if (targetQuote) i += 1;
+    let target = '';
+    for (; i < command.length; i += 1) {
+      const targetCh = command[i];
+      if (targetQuote) {
+        if (targetCh === targetQuote) break;
+        target += targetCh;
+      } else if (/\s/.test(targetCh) || /[;&|<>]/.test(targetCh)) {
+        i -= 1;
+        break;
+      } else {
+        target += targetCh;
+      }
+    }
+    if (target) targets.push(target);
+  }
+
+  return targets;
+}
+
+function resolveShellPathToken(token: string, cwd: string): string | null {
+  const cleaned = token.trim();
+  if (!cleaned || cleaned.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(cleaned)) return null;
+  const expanded = cleaned
+    .replace(/^\$\{HOME\}(?=\/|$)/, os.homedir())
+    .replace(/^\$HOME(?=\/|$)/, os.homedir());
+  if (expanded.includes('*') || expanded.includes('?') || expanded.includes('$(') || expanded.includes('`')) return null;
+  const homeExpanded = expandHome(expanded);
+  return path.isAbsolute(homeExpanded) ? path.resolve(homeExpanded) : path.resolve(cwd, homeExpanded);
+}
+
+function tokenResolvesToProtectedSkillSource(token: string, cwd: string): boolean {
+  const resolved = resolveShellPathToken(token, cwd);
+  return Boolean(resolved && isProtectedInstalledSkillSourcePath(resolved));
+}
+
+function tokenResolvesToSkillArtifact(token: string, cwd: string): boolean {
+  const resolved = resolveShellPathToken(token, cwd);
+  return Boolean(resolved && isInstalledSkillArtifactPath(resolved));
+}
+
+function shellWriteApiTargets(command: string, cwd: string): boolean {
+  const apiWrite = /\b(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync)\s*\(/.test(command);
+  if (!apiWrite) return false;
+  const quotedPath = command.matchAll(/(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync)\s*\(\s*['"]([^'"]+)['"]/g);
+  let sawPath = false;
+  for (const match of quotedPath) {
+    sawPath = true;
+    if (tokenResolvesToProtectedSkillSource(match[1], cwd)) return true;
+  }
+  return !sawPath && isProtectedInstalledSkillSourcePath(cwd);
+}
+
+function shellCommandTargetsProtectedSkillSource(command: string, cwd: string): boolean {
+  const tokens = tokenizeShell(command);
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    const binary = path.basename(token);
+    if (binary === 'tee') {
+      const targets = tokens.slice(i + 1).filter((entry) => !entry.startsWith('-'));
+      if (targets.some((entry) => tokenResolvesToProtectedSkillSource(entry, cwd))) return true;
+    }
+    const args = tokens.slice(i + 1).filter((entry) => !entry.startsWith('-'));
+    if (binary === 'cp' || binary === 'install') {
+      const target = args.at(-1);
+      if (target && tokenResolvesToProtectedSkillSource(target, cwd)) return true;
+      continue;
+    }
+    if (binary === 'mv') {
+      if (args.some((entry) => tokenResolvesToProtectedSkillSource(entry, cwd))) return true;
+      continue;
+    }
+    if (binary === 'touch' || binary === 'mkdir') {
+      if (args.some((entry) => tokenResolvesToProtectedSkillSource(entry, cwd))) return true;
+    }
+  }
+
+  return false;
+}
+
+export function shellWritesInstalledSkillSource(rawCommand: unknown, cwdInput?: string): boolean {
+  if (typeof rawCommand !== 'string') return false;
+  const cwd = path.resolve(expandHome(cwdInput || BASE_DIR));
+  const command = rawCommand.trim();
+  if (!command) return false;
+
+  const redirectionTargets = outputRedirectionTargets(command);
+  if (redirectionTargets.some((target) => tokenResolvesToProtectedSkillSource(target, cwd))) return true;
+
+  if (isProtectedInstalledSkillSourcePath(cwd)) {
+    if (redirectionTargets.length > 0 && redirectionTargets.some((target) => !tokenResolvesToSkillArtifact(target, cwd))) return true;
+    if (/\b(?:sed|perl)\s+-[A-Za-z0-9]*i[A-Za-z0-9]*\b/.test(command)) return true;
+  }
+
+  return shellCommandTargetsProtectedSkillSource(command, cwd) || shellWriteApiTargets(command, cwd);
+}
+
 function developerToolStubBlockMessage(command: string): string | null {
   const matches = command.matchAll(/(?:^|[;&|]\s*)([A-Za-z0-9_.+-]+)\b/g);
   for (const match of matches) {
@@ -693,6 +890,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       'mode=create or null creates a new file and refuses to replace an existing one.',
       'mode=append appends content to the existing file, adding a newline boundary when needed.',
       'mode=overwrite replaces the entire file; use only when the user asks to replace it or after reading the current file and preparing the full replacement.',
+      'Installed skill source files under ~/.clementine-next/skills/<skill>/ are read-only; generated artifacts belong under output/, outputs/, runs/, artifacts/, reports/, or tmp/.',
       'Auto-approved for allowed local paths; destructive/system paths remain blocked by the path boundary.',
     ].join('\n'),
     parameters: z.object({
@@ -703,6 +901,12 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     needsApproval: needsApprovalForWriteFile(),
     execute: async (input) => {
       const filePath = resolveAllowedPath(input.path);
+      if (isProtectedInstalledSkillSourcePath(filePath)) {
+        return [
+          `Refused to write ${filePath}: installed skill source files are read-only during skill runs.`,
+          'Write generated artifacts under the skill output/, outputs/, runs/, artifacts/, reports/, or tmp/ directory, or update the skill package through the skill install/update path.',
+        ].join(' ');
+      }
       const mode = input.mode ?? 'create';
       mkdirSync(path.dirname(filePath), { recursive: true });
       const exists = existsSync(filePath);
@@ -752,6 +956,16 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         );
       }
       const cwd = resolveAllowedCwd(input.cwd ?? undefined);
+      if (shellWritesInstalledSkillSource(input.command, cwd)) {
+        return formatToolOutput(
+          'run_shell_command',
+          runContext,
+          details,
+          'Refused: this shell command appears to write into an installed skill source tree under ~/.clementine-next/skills. '
+            + 'Installed skills are treated as read-only package source during runs; write generated artifacts under output/, outputs/, runs/, artifacts/, reports/, or tmp/, '
+            + 'or update the skill through the skill install/update path.',
+        );
+      }
       return formatToolOutput(
         'run_shell_command',
         runContext,

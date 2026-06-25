@@ -17,10 +17,19 @@ mkdirSync(process.env.CLEMENTINE_HOME, { recursive: true });
 let getComputerTools: typeof import('./computer-tools.js').getComputerTools;
 let annotateShellStderr: typeof import('./computer-tools.js').annotateShellStderr;
 let annotateSpawnError: typeof import('./computer-tools.js').annotateSpawnError;
+let isProtectedInstalledSkillSourcePath: typeof import('./computer-tools.js').isProtectedInstalledSkillSourcePath;
 let resolveAllowedCwd: typeof import('./computer-tools.js').resolveAllowedCwd;
+let shellWritesInstalledSkillSource: typeof import('./computer-tools.js').shellWritesInstalledSkillSource;
 
 before(async () => {
-  ({ getComputerTools, annotateShellStderr, annotateSpawnError, resolveAllowedCwd } = await import('./computer-tools.js'));
+  ({
+    getComputerTools,
+    annotateShellStderr,
+    annotateSpawnError,
+    isProtectedInstalledSkillSourcePath,
+    resolveAllowedCwd,
+    shellWritesInstalledSkillSource,
+  } = await import('./computer-tools.js'));
 });
 
 // ─── Recoverable-failure self-recovery hints (2026-06-15) ───
@@ -150,6 +159,39 @@ test('write_file append creates a missing file', async () => {
   assert.equal(existsSync(file), false);
   assert.equal(await invokeWrite({ path: file, content: 'created by append', mode: 'append' }), `Appended ${file} (17 chars).`);
   assert.equal(readFileSync(file, 'utf-8'), 'created by append\n');
+});
+
+test('installed skill source paths are protected while artifact paths stay writable', () => {
+  const skillRoot = path.join(process.env.CLEMENTINE_HOME!, 'skills', 'lunar');
+  assert.equal(isProtectedInstalledSkillSourcePath(path.join(skillRoot, 'build.cjs')), true);
+  assert.equal(isProtectedInstalledSkillSourcePath(path.join(skillRoot, 'src', 'validate-html.js')), true);
+  assert.equal(isProtectedInstalledSkillSourcePath(path.join(skillRoot, 'references', 'pipeline.md')), true);
+  assert.equal(isProtectedInstalledSkillSourcePath(path.join(skillRoot, 'output', 'index.html')), false);
+  assert.equal(isProtectedInstalledSkillSourcePath(path.join(skillRoot, 'runs', '2026-06-25', 'notes.md')), false);
+  assert.equal(isProtectedInstalledSkillSourcePath(path.join(tmpHome, 'not-a-skill', 'build.cjs')), false);
+});
+
+test('shellWritesInstalledSkillSource blocks obvious source writes but permits report outputs and normal execution', () => {
+  const skillRoot = path.join(process.env.CLEMENTINE_HOME!, 'skills', 'lunar');
+  assert.equal(shellWritesInstalledSkillSource('cat > build.cjs', skillRoot), true);
+  assert.equal(shellWritesInstalledSkillSource("node -e \"require('fs').writeFileSync('src/validate-html.js', 'x')\"", skillRoot), true);
+  assert.equal(shellWritesInstalledSkillSource('tee references/pipeline.md', skillRoot), true);
+  assert.equal(shellWritesInstalledSkillSource('cp templates/report.html output/index.html', skillRoot), false);
+  assert.equal(shellWritesInstalledSkillSource('cat > output/index.html', skillRoot), false);
+  assert.equal(shellWritesInstalledSkillSource('node gather.cjs', skillRoot), false);
+});
+
+test('write_file refuses installed skill source writes but permits output artifacts', async () => {
+  const skillRoot = path.join(process.env.CLEMENTINE_HOME!, 'skills', 'lunar');
+  const sourceFile = path.join(skillRoot, 'build.cjs');
+  const artifactFile = path.join(skillRoot, 'output', 'index.html');
+
+  const refused = await invokeWrite({ path: sourceFile, content: 'mutated source', mode: null });
+  assert.match(refused, /installed skill source files are read-only/i);
+  assert.equal(existsSync(sourceFile), false);
+
+  assert.equal(await invokeWrite({ path: artifactFile, content: '<html></html>', mode: null }), `Wrote ${artifactFile} (13 chars).`);
+  assert.equal(readFileSync(artifactFile, 'utf-8'), '<html></html>\n');
 });
 
 test('shellMutatesMemoryStore: blocks SQL mutation of the facts store, allows read-only + unrelated', async () => {

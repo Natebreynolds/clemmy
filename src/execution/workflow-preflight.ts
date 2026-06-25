@@ -20,6 +20,11 @@ import {
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
 } from './workflow-inputs.js';
+import { findSafeCliCommand } from '../runtime/cli-discovery.js';
+import {
+  defaultClaudeAgentSdkAllowedLocalTools,
+} from '../runtime/harness/claude-agent-sdk.js';
+import { requiredLocalMcpToolsForWorkflowStep } from '../runtime/harness/claude-agent-workflow-step.js';
 
 export interface PreflightResult {
   /** Structurally runnable (missing run inputs do NOT flip this false). */
@@ -39,6 +44,7 @@ export function preflightWorkflow(
   runInputs: Record<string, string> = {},
 ): PreflightResult {
   const check = checkWorkflowForWrite(def);
+  const capabilityErrors = workflowCapabilityErrors(def);
   const inputs = normalizeWorkflowRunInputs({
     ...Object.fromEntries(
       Object.entries(def.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? '']),
@@ -46,15 +52,33 @@ export function preflightWorkflow(
     ...runInputs,
   });
   const missingInputs = missingWorkflowRunInputs(def, inputs);
-  const ok = check.ok;
+  const errors = [...check.errors, ...capabilityErrors];
+  const ok = check.ok && capabilityErrors.length === 0;
   const stepCount = def.steps?.length ?? 0;
   const summary = ok
     ? `Preflight passed — ${stepCount} step${stepCount === 1 ? '' : 's'} look runnable`
       + (missingInputs.length > 0
         ? `, but you'll need to supply ${missingInputs.map((k) => `"${k}"`).join(', ')} at run time.`
         : '.')
-    : `Preflight found ${check.errors.length} blocking issue${check.errors.length === 1 ? '' : 's'} — fix before running.`;
-  return { ok, errors: check.errors, warnings: check.warnings, missingInputs, summary };
+    : `Preflight found ${errors.length} blocking issue${errors.length === 1 ? '' : 's'} — fix before running.`;
+  return { ok, errors, warnings: check.warnings, missingInputs, summary };
+}
+
+function workflowCapabilityErrors(def: WorkflowDefinition): string[] {
+  const errors: string[] = [];
+  const workerTools = new Set(defaultClaudeAgentSdkAllowedLocalTools('worker'));
+  for (const step of def.steps ?? []) {
+    const requiredTools = requiredLocalMcpToolsForWorkflowStep(step, true);
+    const missingTools = requiredTools.filter((tool) => !workerTools.has(tool));
+    if (missingTools.length > 0) {
+      errors.push(`Step "${step.id}" requires local MCP tool${missingTools.length === 1 ? '' : 's'} ${missingTools.join(', ')} but the Claude workflow-step worker profile does not allow them.`);
+    }
+    const text = `${step.prompt ?? ''}\n${step.intent ?? ''}`.toLowerCase();
+    if ((text.includes('sf data query') || text.includes('salesforce cli')) && !findSafeCliCommand('sf')) {
+      errors.push(`Step "${step.id}" requires the Salesforce CLI ("sf"), but it was not found on PATH.`);
+    }
+  }
+  return errors;
 }
 
 /** Render a preflight result as a legible report body (notification / chat). */

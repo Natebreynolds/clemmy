@@ -32,6 +32,7 @@ const {
   listFixBackups,
   detectSelfReportedFailure,
   deepSelfReportedFailure,
+  diagnoseWorkflowBlock,
 } = mod;
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 
@@ -183,6 +184,32 @@ test('renderLegibleOutcome: blocked + auto-applicable diagnosis offers the fix c
   assert.match(out.title, /needs attention/i);
   assert.match(out.body, /couldn't finish/);
   assert.match(out.body, /apply fix fix-abc123/);
+});
+
+test('diagnoseWorkflowBlock classifies missing local MCP tools as runtime/manual, not reconnect_service', async () => {
+  const diagnosis = await diagnoseWorkflowBlock({
+    workflow: {
+      name: 'daily-overdue-salesforce-meetings',
+      description: 'Notify Nate about overdue Salesforce meetings.',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{
+        id: 'main',
+        prompt: 'Use the Salesforce CLI via run_shell_command, then notify Nate.',
+        sideEffect: 'send',
+      }],
+    } as never,
+    blockedSteps: [{
+      stepId: 'main',
+      kind: 'blocked',
+      reason: 'Clementine workflow runtime did not expose required local MCP tools: run_shell_command, notify_user. This is a runtime/tool-surface issue, not a service credential issue.',
+    }],
+  });
+
+  assert.equal(diagnosis?.fix.kind, 'manual');
+  assert.equal(diagnosis?.fix.service, null);
+  assert.equal(diagnosis?.fix.autoApplicable, false);
+  assert.match(diagnosis?.rootCause ?? '', /runtime\/tool-surface/);
 });
 
 test('recordProposedFix → load → list → dismiss round-trips', () => {

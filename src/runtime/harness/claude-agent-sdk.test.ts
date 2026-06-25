@@ -14,6 +14,7 @@ const usageLog = await import('../usage-log.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
   CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
+  ClaudeAgentSdkToolSurfaceError,
   buildAllowOnlyToolsPermission,
   buildClaudeAgentSdkLocalMcpServers,
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -190,6 +191,51 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.equal(result.text, 'ok');
   assert.deepEqual(result.structuredOutput, { ok: true });
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
+});
+
+test('runClaudeAgentSdk fails before model work when required local MCP tools are absent from SDK init', async () => {
+  setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages([
+    {
+      type: 'system',
+      subtype: 'init',
+      model: 'claude-sonnet-4-6',
+      session_id: 'sdk-session',
+      uuid: 'u1',
+      apiKeySource: 'none',
+      claude_code_version: '2.1.181',
+      cwd: process.cwd(),
+      tools: ['mcp__clementine-local__ping'],
+      mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+      permissionMode: 'default',
+      slash_commands: [],
+      output_style: 'default',
+      skills: [],
+      plugins: [],
+    } as any,
+    {
+      type: 'assistant',
+      session_id: 'sdk-session',
+      uuid: 'u2',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'text', text: 'I should never get to work.' }] },
+    } as any,
+  ], {})) as any);
+
+  await assert.rejects(
+    () => runClaudeAgentSdk({
+      prompt: 'Run sf data query.',
+      sessionId: 'workflow:run:main',
+      modelId: 'claude-sonnet-4-6',
+      agentic: true,
+      requiredLocalMcpTools: ['run_shell_command'],
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof ClaudeAgentSdkToolSurfaceError);
+      assert.deepEqual(err.missingTools, ['run_shell_command']);
+      assert.match(err.message, /missing required tool/);
+      return true;
+    },
+  );
 });
 
 test('runClaudeAgentSdk records usage for the shared usage dashboard and workflow cost joins', async () => {

@@ -20,6 +20,23 @@ function wf(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   } as WorkflowDefinition;
 }
 
+function withEnv(overrides: Record<string, string | undefined>, fn: () => void): void {
+  const previous: Record<string, string | undefined> = {};
+  for (const key of Object.keys(overrides)) {
+    previous[key] = process.env[key];
+    if (overrides[key] === undefined) delete process.env[key];
+    else process.env[key] = overrides[key];
+  }
+  try {
+    fn();
+  } finally {
+    for (const key of Object.keys(overrides)) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  }
+}
+
 test('preflight: a clean workflow passes', () => {
   const r = preflightWorkflow(wf());
   assert.equal(r.ok, true);
@@ -52,6 +69,20 @@ test('preflight: supplying the input clears the heads-up', () => {
   });
   const r = preflightWorkflow(def, { segment: 'law firms' });
   assert.deepEqual(r.missingInputs, []);
+});
+
+test('preflight: flags workflow steps whose required local MCP tool is excluded from the worker profile', () => {
+  withEnv({ CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS: 'ping,notify_user' }, () => {
+    const r = preflightWorkflow(wf({
+      steps: [{
+        id: 'main',
+        prompt: 'Use the authenticated Salesforce CLI via run_shell_command: sf data query --query "SELECT Id FROM Event" --json, then notify Nate.',
+        sideEffect: 'send',
+      }],
+    }));
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => /requires local MCP tool run_shell_command/.test(e)), r.errors.join('\n'));
+  });
 });
 
 test('renderPreflightReport: legible, and states nothing was executed', () => {

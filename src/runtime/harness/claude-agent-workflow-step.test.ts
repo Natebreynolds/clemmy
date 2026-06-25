@@ -21,13 +21,16 @@ writeFileSync(
 );
 
 const mod = await import('./claude-agent-workflow-step.js');
+const sdkMod = await import('./claude-agent-sdk.js');
 const {
   claudeAgentSdkWorkflowStepEnabled,
   claudeWorkflowStepOutputSchema,
   renderClaudeAgentWorkflowStepSystemAppend,
+  requiredLocalMcpToolsForWorkflowStep,
   runClaudeAgentSdkWorkflowStep,
   setClaudeAgentSdkWorkflowStepRunForTest,
 } = mod;
+const { ClaudeAgentSdkToolSurfaceError } = sdkMod;
 
 beforeEach(() => {
   setClaudeAgentSdkWorkflowStepRunForTest(null);
@@ -111,6 +114,18 @@ test('renderClaudeAgentWorkflowStepSystemAppend full lane permits gated executio
   assert.match(prompt, /call `skill_read`/);
 });
 
+test('requiredLocalMcpToolsForWorkflowStep detects Salesforce CLI and notification requirements', () => {
+  const salesforceStep = {
+    id: 'main',
+    sideEffect: 'send' as const,
+    prompt: 'Use the authenticated Salesforce CLI via run_shell_command: sf data query --query "SELECT Id FROM Event" --json. Notify Nate with the results.',
+  };
+  const tools = requiredLocalMcpToolsForWorkflowStep(salesforceStep, true);
+  assert.ok(tools.includes('run_shell_command'));
+  assert.ok(tools.includes('notify_user'));
+  assert.deepEqual(requiredLocalMcpToolsForWorkflowStep(salesforceStep, false), []);
+});
+
 test('runClaudeAgentSdkWorkflowStep full lane runs the tool-capable gated profile on the workflow session', async () => {
   let captured: any;
   setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
@@ -141,8 +156,40 @@ test('runClaudeAgentSdkWorkflowStep full lane runs the tool-capable gated profil
   assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'), 'shell exposed (gated)');
   assert.ok(captured.allowedLocalMcpTools.includes('write_file'), 'file write exposed (gated)');
   assert.ok(captured.allowedLocalMcpTools.includes('notify_user'), 'notify_user exposed so notify/report steps can deliver');
+  assert.deepEqual(captured.requiredLocalMcpTools, [], 'generic full-lane steps do not over-require every possible tool');
   // Workflow authoring stays out of a step lane even in full mode.
   assert.equal(captured.allowedLocalMcpTools.includes('execution_create'), false);
+});
+
+test('runClaudeAgentSdkWorkflowStep passes concrete required tools for Salesforce send steps', async () => {
+  let captured: any;
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    captured = options;
+    return {
+      text: '{"status":"completed","output":{"notified":true}}',
+      structuredOutput: { status: 'completed', output: { notified: true } },
+      sessionId: 'sdk-workflow-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: ['mcp__clementine-local__run_shell_command', 'mcp__clementine-local__notify_user'],
+    };
+  });
+
+  const salesforceStep = {
+    id: 'main',
+    sideEffect: 'send' as const,
+    prompt: 'Use run_shell_command to execute sf data query --query "SELECT Id FROM Event" --json, then notify Nate.',
+  };
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step: salesforceStep,
+    workflowName: 'daily-overdue-salesforce-meetings',
+    prompt: salesforceStep.prompt,
+    modelId: 'claude-opus-4-8',
+    sessionId: 'workflow:run-salesforce:main',
+    fullLane: true,
+  });
+
+  assert.deepEqual(result.output, { notified: true });
+  assert.deepEqual(captured.requiredLocalMcpTools.sort(), ['notify_user', 'run_shell_command']);
 });
 
 test('runClaudeAgentSdkWorkflowStep converts blocked SDK output into a workflow blocked result', async () => {
@@ -161,6 +208,31 @@ test('runClaudeAgentSdkWorkflowStep converts blocked SDK output into a workflow 
     modelId: 'claude-sonnet-4-6',
   });
   assert.deepEqual(result.output, { blocked: true, reason: 'needs a mutating file write' });
+  assert.equal(result.structured, true);
+});
+
+test('runClaudeAgentSdkWorkflowStep converts missing tool surface into a blocked workflow result', async () => {
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+    throw new ClaudeAgentSdkToolSurfaceError(['run_shell_command'], ['mcp__clementine-local__ping']);
+  });
+
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step: {
+      id: 'main',
+      prompt: 'Use run_shell_command to execute sf data query --json, then notify Nate.',
+      sideEffect: 'send' as const,
+    },
+    workflowName: 'daily-overdue-salesforce-meetings',
+    prompt: 'Use run_shell_command to execute sf data query --json, then notify Nate.',
+    modelId: 'claude-opus-4-8',
+    sessionId: 'workflow:run-salesforce:main',
+    fullLane: true,
+  });
+
+  assert.deepEqual(result.output, {
+    blocked: true,
+    reason: 'Clementine workflow runtime did not expose required local MCP tool: run_shell_command. This is a runtime/tool-surface issue, not a service credential issue.',
+  });
   assert.equal(result.structured, true);
 });
 

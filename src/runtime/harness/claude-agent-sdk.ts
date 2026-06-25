@@ -62,6 +62,21 @@ export class ClaudeSdkProviderOverloadError extends Error {
   }
 }
 
+export class ClaudeAgentSdkToolSurfaceError extends Error {
+  readonly missingTools: string[];
+  readonly availableTools: string[];
+
+  constructor(missingTools: string[], availableTools: string[]) {
+    super(
+      `Claude Agent SDK local MCP surface is missing required tool${missingTools.length === 1 ? '' : 's'}: `
+      + `${missingTools.join(', ')}. Available tools: ${availableTools.length ? availableTools.join(', ') : '(none)'}`,
+    );
+    this.name = 'ClaudeAgentSdkToolSurfaceError';
+    this.missingTools = missingTools;
+    this.availableTools = availableTools;
+  }
+}
+
 /** Anthropic/Codex SDK overloads embed the status in the message text. */
 export function isProviderOverloadMessage(msg: string): boolean {
   if (!msg) return false;
@@ -302,6 +317,10 @@ export function buildAllowOnlyToolsPermission(allowedTools: string[]): CanUseToo
   };
 }
 
+function mcpToolTail(toolName: string): string {
+  return toolName.split('__').at(-1) ?? toolName;
+}
+
 function sdkToolNamesForLocalMcp(tools: string[]): string[] {
   const out = new Set<string>();
   for (const tool of tools) {
@@ -312,6 +331,22 @@ function sdkToolNamesForLocalMcp(tools: string[]): string[] {
     out.add(`mcp__clementine_local__${t}`);
   }
   return [...out];
+}
+
+function missingRequiredLocalMcpTools(requiredTools: string[] | undefined, advertisedTools: string[]): string[] {
+  const required = [...new Set((requiredTools ?? []).map((t) => t.trim()).filter(Boolean))];
+  if (required.length === 0) return [];
+  const advertised = new Set<string>();
+  for (const tool of advertisedTools) {
+    advertised.add(normalizeToolName(tool));
+    advertised.add(normalizeToolName(mcpToolTail(tool)));
+  }
+  return required.filter((tool) => !advertised.has(normalizeToolName(tool)));
+}
+
+function assertRequiredLocalMcpTools(requiredTools: string[] | undefined, advertisedTools: string[]): void {
+  const missing = missingRequiredLocalMcpTools(requiredTools, advertisedTools);
+  if (missing.length > 0) throw new ClaudeAgentSdkToolSurfaceError(missing, advertisedTools);
 }
 
 export interface ClaudeAgentSdkRunOptions {
@@ -338,6 +373,12 @@ export interface ClaudeAgentSdkRunOptions {
    * of whatever the model is permitted to call (allowedLocalMcpTools).
    */
   mcpToolAllowlist?: string[];
+  /**
+   * Concrete tools this run is about to depend on. The SDK init message is the
+   * authoritative advertised MCP surface; if any required tool is missing there,
+   * fail before the model starts trying to work around a tool that does not exist.
+   */
+  requiredLocalMcpTools?: string[];
   /**
    * CHAT-only multi-turn history. When set, the prior user/assistant turns of
    * this session are prepended to the prompt as an authoritative transcript block
@@ -670,7 +711,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     try {
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       for await (const message of stream) {
-        init = init ?? extractInit(message);
+        const nextInit = extractInit(message);
+        if (nextInit && !init) {
+          init = nextInit;
+          assertRequiredLocalMcpTools(options.requiredLocalMcpTools, init.tools ?? []);
+        }
         const delta = extractTextDelta(message);
         if (delta) {
           streamedText += delta;
@@ -717,6 +762,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     break; // success (or a turn-limit stop) → leave the retry loop
   }
   const partialLimitText = (): string => bestLimitHitText(lastAssistantText, streamedText);
+
+  if (!init && (options.requiredLocalMcpTools?.length ?? 0) > 0) {
+    throw new ClaudeAgentSdkToolSurfaceError(options.requiredLocalMcpTools ?? [], []);
+  }
 
   if (threwTurnLimit) {
     recordClaudeAgentSdkUsage(options, result, init);

@@ -314,6 +314,7 @@ const DOCTOR_INSTRUCTIONS = [
   'Be concrete and plain-spoken — the summary and fix.description are shown directly to a non-engineer. No JSON, no tool-call jargon in those fields.',
   'Common root causes and the right fix kind:',
   '- The step named a tool/query that failed or does not exist, OR was too vague about HOW to reach a service (e.g. "use the available Salesforce tooling"): kind=edit_step. Provide newStepPrompt = the full step rewritten to name the concrete path. For Salesforce, the local `sf` CLI is available via run_shell_command; for other services, discover via composio_status / composio_search_tools then call composio_execute_tool with the correct tool slug + args.',
+  '- If the failure says a Clementine/local MCP tool itself was not exposed or did not exist (for example run_shell_command, notify_user, write_file, local_cli_list/probe), this is a runtime/tool-lane issue, NOT a provider credential problem. kind=manual, autoApplicable=false. Do not propose reconnecting Salesforce/Outlook/Composio unless the observed error is an auth/401/403/expired-connection error from that provider.',
   '- A connection/auth error (ComposioToolExecutionError about auth, expired/invalid connection, 401/403): kind=reconnect_service, service=<the service>. Do NOT pretend an edit fixes an auth problem. autoApplicable=false.',
   '- A required run input was missing/empty: kind=adjust_input. autoApplicable=false.',
   '- The step RAN but its output FAILED its declared output contract — wrong type, a missing required key, or a verify.url_present/path_exists handle that was empty or fake (e.g. it claimed "produced a brief" but returned no real URL/file): kind=edit_step. Rewrite the step prompt to EXPLICITLY produce the declared shape — name the required keys it must return, and instruct it to return the REAL artifact (the actual created URL / saved file path), not a summary or a bare claim. The newStepPrompt MUST keep the same declared output contract. autoApplicable=true.',
@@ -328,9 +329,43 @@ export interface DiagnoseInput {
   toolErrors?: string[];
 }
 
+function diagnoseRuntimeToolSurfaceBlock(input: DiagnoseInput): WorkflowDiagnosis | null {
+  const primary = input.blockedSteps[0];
+  if (!primary) return null;
+  const evidence = [
+    primary.reason,
+    ...(input.toolErrors ?? []),
+  ].join('\n');
+  if (
+    !/local MCP surface|tool-surface|No such tool available|required local MCP tool|did not expose required local MCP tool/i.test(evidence)
+    || !/\brun_shell_command\b|\bwrite_file\b|\bnotify_user\b|\bcomposio_execute_tool\b|\blocal_cli_/i.test(evidence)
+  ) {
+    return null;
+  }
+  const missing = [...new Set(
+    evidence.match(/\b(?:run_shell_command|write_file|notify_user|composio_execute_tool|composio_search_tools|composio_list_tools|local_cli_list|local_cli_probe)\b/g) ?? [],
+  )];
+  const toolList = missing.length ? missing.join(', ') : 'the required local MCP tools';
+  return {
+    summary: `The workflow runner did not expose ${toolList} to the model lane, so the step could not execute its required local action.`,
+    rootCause: `This is a Clementine runtime/tool-surface problem: the workflow step requires ${toolList}, but the active SDK workflow-step environment did not advertise the tool before execution.`,
+    fix: {
+      kind: 'manual',
+      stepId: primary.stepId,
+      description: `Fix the workflow runtime so the full gated workflow-step lane advertises ${toolList}; do not reconnect or switch services unless the workflow intentionally changes its data source.`,
+      newStepPrompt: null,
+      service: null,
+      autoApplicable: false,
+    },
+    confidence: 'high',
+  };
+}
+
 export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<WorkflowDiagnosis | null> {
   const primary = input.blockedSteps[0];
   if (!primary) return null;
+  const runtimeDiagnosis = diagnoseRuntimeToolSurfaceBlock(input);
+  if (runtimeDiagnosis) return runtimeDiagnosis;
   const step = input.workflow.steps.find((s) => s.id === primary.stepId);
   const agent = new Agent({
     name: 'WorkflowDoctor',
