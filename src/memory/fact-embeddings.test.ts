@@ -61,7 +61,15 @@ beforeEach(() => {
   globalThis.fetch = (async (_url: string, init?: { body?: string }) => {
     fetchCalls++;
     const body = JSON.parse(init?.body ?? '{}') as { input: string[] };
-    const data = body.input.map((text, index) => ({ embedding: topicVector(text), index }));
+    // Pad the 4-dim topic vector to the OpenAI provider's declared dim (1536)
+    // so the stored dim matches provider.dim — otherwise the re-embed-on-
+    // provider-change guard (WS3) treats every row as stale. Trailing zeros
+    // don't change cosine, so the semantic-similarity assertions are unaffected.
+    const data = body.input.map((text, index) => {
+      const v = topicVector(text);
+      while (v.length < 1536) v.push(0);
+      return { embedding: v, index };
+    });
     return {
       ok: true,
       status: 200,

@@ -1,7 +1,15 @@
 import path from 'node:path';
 import { openMemoryDb } from '../memory/db.js';
-import { listActiveFacts } from '../memory/facts.js';
+import { listActiveFacts, countActiveFacts } from '../memory/facts.js';
 import { bufferToVector, isEmbeddingsEnabled, loadFactEmbeddings } from '../memory/embeddings.js';
+import { getRuntimeEnv } from '../config.js';
+import { listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
+import { listSkills } from '../memory/skill-store.js';
+import { listWorkflows } from '../memory/workflow-store.js';
+import { listGoalRecords } from '../memory/goals-list.js';
+import { listFocuses } from '../memory/focus.js';
+import { compileWordMatcher } from '../memory/word-match.js';
+import { loadFactEntityEdges, loadEntityEdges } from '../memory/relations.js';
 
 /**
  * Pure builder for the Memory tab's knowledge graph.
@@ -32,8 +40,18 @@ export interface GraphEdge {
   source: string;
   target: string;
   type: string;
-  /** cosine similarity for `type:'similar'` edges; absent otherwise. */
+  /** cosine similarity for `type:'similar'` edges; recurrence for `type:'related'`. */
   weight?: number;
+  /** predicate for stored entity↔entity (`type:'related'`) edges; absent otherwise. */
+  label?: string;
+  /**
+   * True for `mentions`/`entity` edges that were INFERRED at render time by
+   * matching the fact text against a file basename / entity name (no stored
+   * relationship). The UI renders these dashed to distinguish "we guessed this
+   * connection" from a stored edge. Absent (= false) on stored/semantic edges.
+   * WS2 replaces the bulk of these with stored `fact_entities` edges.
+   */
+  inferred?: boolean;
 }
 
 export interface MemoryGraphResult {
@@ -299,6 +317,151 @@ function semanticEdgesCached(
   return result;
 }
 
+// ── Non-fact stores (tool-recall · skills · workflows · goals · focus) ────
+// The graph historically rendered ONLY fact|kind|file|entity, so the entire
+// procedural-memory store (tool-recall), the capability layer (skills /
+// workflows), and the intent layer (goals / focus) were invisible — the user's
+// "I don't see the entire picture" complaint. This collector adds them as
+// first-class node types with the ownership/usage edges that already exist as
+// data (workflow→skill, goal→focus). Each store read is independently guarded
+// so one bad store never blanks the graph. Gated by isGraphFullEnabled() so the
+// legacy response stays byte-identical when off.
+
+/** Default-ON; `CLEMMY_GRAPH_FULL=off` restores the legacy fact-only graph. */
+export function isGraphFullEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_GRAPH_FULL', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+interface NonFactStoreResult {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  counts: { toolRecall: number; skills: number; workflows: number; goals: number; focus: number };
+}
+
+export function collectNonFactStoreNodes(opts: {
+  toolRecallLimit?: number; skillsLimit?: number; workflowsLimit?: number; goalsLimit?: number; focusLimit?: number;
+} = {}): NonFactStoreResult {
+  const toolRecallLimit = clamp(opts.toolRecallLimit ?? 120, 0, 400);
+  const skillsLimit = clamp(opts.skillsLimit ?? 120, 0, 400);
+  const workflowsLimit = clamp(opts.workflowsLimit ?? 120, 0, 400);
+  const goalsLimit = clamp(opts.goalsLimit ?? 80, 0, 300);
+  const focusLimit = clamp(opts.focusLimit ?? 40, 0, 200);
+
+  const nodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+  const counts = { toolRecall: 0, skills: 0, workflows: 0, goals: 0, focus: 0 };
+
+  // Tool-recall (procedural) memory — proven tool per intent, with outcome score.
+  try {
+    const choices = listToolChoices().slice(0, toolRecallLimit);
+    for (const c of choices) {
+      const id = `toolrecall:${c.intent}`;
+      nodes.push({
+        id,
+        label: c.intent.length > 60 ? `${c.intent.slice(0, 57)}…` : c.intent,
+        type: 'tool-recall',
+        data: {
+          chosenTool: c.choice?.identifier ?? null,
+          kind: c.choice?.kind ?? null,
+          score: c.choice ? computeChoiceScore(c.choice) : 0,
+          successCount: c.choice?.successCount ?? 0,
+          failureCount: c.choice?.failureCount ?? 0,
+          fallbacks: c.fallbacks.length,
+          invalidated: c.choice === null,
+        },
+      });
+    }
+    counts.toolRecall = choices.length;
+  } catch { /* tool-choice store unreadable — skip */ }
+
+  // Skills (capability layer). Skip quarantined drafts (hidden from the index).
+  const skillNames = new Set<string>();
+  try {
+    const skills = listSkills().filter((s) => s.frontmatter?.quarantined !== true).slice(0, skillsLimit);
+    for (const s of skills) {
+      skillNames.add(s.name);
+      nodes.push({
+        id: `skill:${s.name}`,
+        label: s.name,
+        type: 'skill',
+        data: {
+          description: s.frontmatter?.description?.slice(0, 200) ?? null,
+          tier: s.frontmatter?.tier ?? 'approved',
+          useCount: s.frontmatter?.useCount ?? 0,
+          failureCount: s.frontmatter?.failureCount ?? 0,
+        },
+      });
+    }
+    counts.skills = skills.length;
+  } catch { /* skills dir unreadable — skip */ }
+
+  // Workflows (capability layer) + workflow→skill ownership edges.
+  try {
+    const workflows = listWorkflows().slice(0, workflowsLimit);
+    for (const w of workflows) {
+      const id = `workflow:${w.name}`;
+      nodes.push({
+        id,
+        label: w.name,
+        type: 'workflow',
+        data: {
+          description: w.data?.description?.slice(0, 200) ?? null,
+          enabled: w.data?.enabled !== false,
+          steps: Array.isArray(w.data?.steps) ? w.data.steps.length : 0,
+        },
+      });
+      // Skill usage: any per-step `uses_skill` (steps compose installed skills).
+      const skillRefs = new Set<string>();
+      for (const step of w.data?.steps ?? []) {
+        const ref = step.usesSkill;
+        if (typeof ref === 'string' && ref.trim()) skillRefs.add(ref.trim());
+      }
+      for (const ref of skillRefs) {
+        if (skillNames.has(ref)) {
+          edges.push({ id: `${id}->skill:${ref}`, source: id, target: `skill:${ref}`, type: 'uses' });
+        }
+      }
+    }
+    counts.workflows = workflows.length;
+  } catch { /* workflows dir unreadable — skip */ }
+
+  // Goals (intent layer). Active/paused/blocked only — completed goals retire.
+  const goalIds = new Set<string>();
+  try {
+    const goals = listGoalRecords().filter((g) => g.status !== 'completed').slice(0, goalsLimit);
+    for (const g of goals) {
+      goalIds.add(g.id);
+      nodes.push({
+        id: `goal:${g.id}`,
+        label: (g.title || g.id).slice(0, 60),
+        type: 'goal',
+        data: { status: g.status, priority: g.priority, nextActions: g.nextActions?.length ?? 0 },
+      });
+    }
+    counts.goals = goals.length;
+  } catch { /* goals store unreadable — skip */ }
+
+  // Focus (intent layer) + goal→focus "pursues" edges.
+  try {
+    const focuses = listFocuses({ limit: focusLimit });
+    for (const f of focuses) {
+      const id = `focus:${f.id}`;
+      nodes.push({
+        id,
+        label: (f.title || f.resource_ref || `focus ${f.id}`).slice(0, 60),
+        type: 'focus',
+        data: { status: f.status, resourceKind: f.resource_kind ?? null },
+      });
+      if (f.related_goal_id && goalIds.has(f.related_goal_id)) {
+        edges.push({ id: `goal:${f.related_goal_id}->${id}`, source: `goal:${f.related_goal_id}`, target: id, type: 'pursues' });
+      }
+    }
+    counts.focus = focuses.length;
+  } catch { /* focus store unreadable — skip */ }
+
+  return { nodes, edges, counts };
+}
+
 // ── The builder ─────────────────────────────────────────────────────────
 
 export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}): MemoryGraphResult {
@@ -338,7 +501,8 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
   // Fact nodes + fact→kind + fact→file edges.
   const fileBasenames = files.map((f) => {
     const base = path.basename(f.path, path.extname(f.path));
-    return { path: f.path, base, baseLower: base.toLowerCase() };
+    const baseLower = base.toLowerCase();
+    return { path: f.path, base, baseLower, re: compileWordMatcher(baseLower) };
   });
 
   for (const fact of facts) {
@@ -365,13 +529,14 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
     if (fact.kind) {
       edges.push({ id: `${id}->kind:${fact.kind}`, source: id, target: `kind:${fact.kind}`, type: 'kind' });
     }
-    // Fact → file edges when the fact text mentions a file basename.
+    // Fact → file edges when the fact text mentions a file basename. INFERRED
+    // (word-boundary match, no stored link) — rendered dashed by the UI.
     const lower = (fact.content || '').toLowerCase();
     if (lower.length > 0) {
       for (const f of fileBasenames) {
-        if (f.baseLower.length < 4) continue; // skip tiny names
-        if (lower.includes(f.baseLower)) {
-          edges.push({ id: `${id}->file:${f.path}`, source: id, target: `file:${f.path}`, type: 'mentions' });
+        if (!f.re) continue; // tiny/empty names skipped
+        if (f.re.test(lower)) {
+          edges.push({ id: `${id}->file:${f.path}`, source: id, target: `file:${f.path}`, type: 'mentions', inferred: true });
         }
       }
     }
@@ -392,8 +557,11 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
     });
   }
 
-  // Entity nodes + fact→entity edges (derived by substring match of canonical
-  // name / aliases, ≥4 chars — same technique as files; no stored link).
+  // Entity nodes + fact→entity edges. STORED edges (fact_entities, WS2) are
+  // emitted SOLID (inferred:false); for any rendered fact with NO stored link
+  // we fall back to the word-boundary substring match (inferred:true, dashed) so
+  // the graph degrades gracefully before/without a link sync. Plus entity↔entity
+  // edges from the stored entity_edges relation.
   if (entitiesLimit > 0) {
     const entityRows = db.prepare(`
       SELECT id, entity_type, canonical_name, canonical_name_lc, aliases_json, mention_count
@@ -401,31 +569,52 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
       ORDER BY mention_count DESC, last_seen_at DESC
       LIMIT ?
     `).all(entitiesLimit) as Array<{ id: number; entity_type: string; canonical_name: string; canonical_name_lc: string; aliases_json: string | null; mention_count: number }>;
-
-    const entityMatchers = entityRows.map((e) => {
-      const names = new Set<string>();
-      if (e.canonical_name_lc && e.canonical_name_lc.length >= 4) names.add(e.canonical_name_lc);
-      try {
-        const aliases = e.aliases_json ? JSON.parse(e.aliases_json) : [];
-        if (Array.isArray(aliases)) {
-          for (const a of aliases) {
-            const al = String(a || '').trim().toLowerCase();
-            if (al.length >= 4) names.add(al);
-          }
-        }
-      } catch { /* malformed aliases — skip */ }
-      return { row: e, names: Array.from(names) };
-    });
+    const entityById = new Map(entityRows.map((e) => [e.id, e]));
 
     const referencedEntityIds = new Set<number>();
+    const factIds = facts.map((f) => f.id);
+
+    // 1. STORED fact→entity edges (only to entities we'll render).
+    const factsWithStoredLink = new Set<number>();
+    for (const link of loadFactEntityEdges(factIds)) {
+      if (!entityById.has(link.entityId)) continue;
+      referencedEntityIds.add(link.entityId);
+      factsWithStoredLink.add(link.factId);
+      edges.push({ id: `fact:${link.factId}->entity:${link.entityId}`, source: `fact:${link.factId}`, target: `entity:${link.entityId}`, type: 'entity' });
+    }
+
+    // 2. INFERRED fallback — only for facts the stored layer hasn't covered yet.
+    const entityMatchers = entityRows.map((e) => {
+      const names = new Set<string>();
+      if (e.canonical_name_lc) names.add(e.canonical_name_lc);
+      try {
+        const aliases = e.aliases_json ? JSON.parse(e.aliases_json) : [];
+        if (Array.isArray(aliases)) for (const a of aliases) {
+          const al = String(a || '').trim().toLowerCase();
+          if (al) names.add(al);
+        }
+      } catch { /* malformed aliases — skip */ }
+      const res = Array.from(names).map((n) => compileWordMatcher(n)).filter((r): r is RegExp => r !== null);
+      return { row: e, res };
+    });
     for (const fact of facts) {
+      if (factsWithStoredLink.has(fact.id)) continue;
       const lower = (fact.content || '').toLowerCase();
       if (!lower) continue;
       for (const m of entityMatchers) {
-        if (m.names.some((nm) => lower.includes(nm))) {
+        if (m.res.some((re) => re.test(lower))) {
           referencedEntityIds.add(m.row.id);
-          edges.push({ id: `fact:${fact.id}->entity:${m.row.id}`, source: `fact:${fact.id}`, target: `entity:${m.row.id}`, type: 'entity' });
+          edges.push({ id: `fact:${fact.id}->entity:${m.row.id}`, source: `fact:${fact.id}`, target: `entity:${m.row.id}`, type: 'entity', inferred: true });
         }
+      }
+    }
+
+    // 3. STORED entity↔entity edges (predicate-labeled), endpoints must render.
+    const edgeRows = loadEntityEdges(200);
+    for (const ee of edgeRows) {
+      if (entityById.has(ee.subjectId) && entityById.has(ee.objectId)) {
+        referencedEntityIds.add(ee.subjectId);
+        referencedEntityIds.add(ee.objectId);
       }
     }
 
@@ -439,6 +628,24 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
         data: { entity_type: e.entity_type, mention_count: e.mention_count },
       });
     }
+
+    // Emit entity↔entity edges only between entities that ended up as nodes.
+    const entityNodeIds = new Set(nodes.filter((n) => n.type === 'entity').map((n) => n.id));
+    for (const ee of edgeRows) {
+      const s = `entity:${ee.subjectId}`, t = `entity:${ee.objectId}`;
+      if (entityNodeIds.has(s) && entityNodeIds.has(t)) {
+        edges.push({ id: `related:${ee.subjectId}-${ee.predicate}-${ee.objectId}`, source: s, target: t, type: 'related', label: ee.predicate, weight: ee.recurrenceCount });
+      }
+    }
+  }
+
+  // Non-fact stores (tool-recall · skills · workflows · goals · focus). Additive;
+  // gated so the legacy fact-only response is byte-identical when disabled.
+  let nonFact: NonFactStoreResult = { nodes: [], edges: [], counts: { toolRecall: 0, skills: 0, workflows: 0, goals: 0, focus: 0 } };
+  if (isGraphFullEnabled()) {
+    nonFact = collectNonFactStoreNodes();
+    for (const n of nonFact.nodes) nodes.push(n);
+    for (const e of nonFact.edges) edges.push(e);
   }
 
   // Semantic fact↔fact edges (opt-in via simEdges).
@@ -485,11 +692,17 @@ export function buildMemoryGraph(db: MemoryDb, opts: BuildMemoryGraphOpts = {}):
     meta: {
       // original meta keys/values — unchanged
       factCount: facts.length,
+      // True total of active facts so the UI can show "showing N of M" instead
+      // of implying the rendered slice (capped at factsLimit) is everything.
+      totalFacts: countActiveFacts(),
       fileCount: nodes.filter((n) => n.type === 'file').length,
       kindCount: kinds.length,
       entityCount: nodes.filter((n) => n.type === 'entity').length,
       edgeCount: edges.length,
       semantic: semanticLayout,
+      // additive meta — non-fact store presence (WS1 graph completeness).
+      graphFull: isGraphFullEnabled(),
+      stores: nonFact.counts,
       // additive meta
       semanticEdges: {
         enabled: isEmbeddingsEnabled(),

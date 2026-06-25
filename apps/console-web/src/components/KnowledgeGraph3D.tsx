@@ -30,8 +30,16 @@ function hasWebGL(): boolean {
 }
 
 const KIND_COLOR: Record<string, string> = { project: '#FF8A3D', user: '#8FA2FF', feedback: '#FF73B9', reference: '#4FD8C4' };
-const COLOR = { kind: '#FF7A1A', entity: '#FFC24B', file: '#6FE0FF', similar: '#B58CFF' };
+const COLOR = {
+  kind: '#FF7A1A', entity: '#FFC24B', file: '#6FE0FF', similar: '#B58CFF',
+  // WS1 non-fact stores
+  'tool-recall': '#7CF5A6', skill: '#FFD166', workflow: '#67B7FF', goal: '#FF6FA8', focus: '#C792EA',
+};
 const KIND_LABEL: Record<string, string> = { project: 'Projects', user: 'About you', feedback: 'Feedback', reference: 'Reference' };
+const NODE_TYPE_LABEL: Record<string, string> = {
+  'tool-recall': 'Tool recall', skill: 'Skill', workflow: 'Workflow', goal: 'Goal', focus: 'Focus',
+  entity: 'Person / thing', file: 'File', kind: 'Topic', fact: 'Fact',
+};
 
 const dim = (hex: string, a: number) => {
   const h = hex.replace('#', '');
@@ -46,12 +54,20 @@ const EDGE_BASE: Record<string, (w?: number) => string> = {
   entity: () => dim(COLOR.entity, 0.1),
   mentions: () => dim(COLOR.file, 0.12),
   kind: () => 'rgba(255,150,80,0.07)',
+  uses: () => dim(COLOR.skill, 0.28),
+  pursues: () => dim(COLOR.goal, 0.28),
+  related: () => dim(COLOR.entity, 0.4), // stored entity↔entity relations
 };
 
 function nodeVal(n: GNode): number {
   if (n.type === 'kind') return 42;
   if (n.type === 'entity') return 6 + Math.min(18, (n.data?.mention_count as number) || 0) * 0.5;
   if (n.type === 'file') return 5;
+  if (n.type === 'goal') return 14;
+  if (n.type === 'workflow') return 9;
+  if (n.type === 'skill') return 7 + Math.min(12, (n.data?.useCount as number) || 0) * 0.4;
+  if (n.type === 'tool-recall') return 5 + Math.min(10, (n.data?.successCount as number) || 0) * 0.4;
+  if (n.type === 'focus') return 8;
   const imp = n.data?.importance as number | undefined;
   const deg = (n.data?.degree as number) || 0;
   return imp ? 2 + imp * 0.7 : 3 + Math.min(deg, 16) * 0.35;
@@ -62,11 +78,19 @@ type GNode = GraphNode & { x?: number; y?: number; z?: number };
 // once the graph is built, so override (don't intersect) those fields.
 type GLink = Omit<GraphEdge, 'source' | 'target'> & { source: string | GNode; target: string | GNode };
 
-const TYPES = [
+// All possible legend chips, in display order. The component renders only the
+// ones actually present in the loaded graph so the legend stays honest (e.g.
+// no "Workflows" chip when there are none, or when CLEMMY_GRAPH_FULL is off).
+const ALL_TYPES = [
   { type: 'kind', label: 'Topics', color: COLOR.kind },
+  { type: 'fact', label: 'Facts', color: '#FFB98A' },
   { type: 'entity', label: 'People & things', color: COLOR.entity },
   { type: 'file', label: 'Files', color: COLOR.file },
-  { type: 'fact', label: 'Facts', color: '#FFB98A' },
+  { type: 'tool-recall', label: 'Tool recall', color: COLOR['tool-recall'] },
+  { type: 'skill', label: 'Skills', color: COLOR.skill },
+  { type: 'workflow', label: 'Workflows', color: COLOR.workflow },
+  { type: 'goal', label: 'Goals', color: COLOR.goal },
+  { type: 'focus', label: 'Focus', color: COLOR.focus },
 ];
 
 interface Sel { label: string; type: string; content?: string; data?: Record<string, unknown>; connected: number }
@@ -80,7 +104,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
 
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error' | 'nowebgl'>('loading');
   const [data, setData] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
-  const [counts, setCounts] = useState({ facts: 0, links: 0 });
+  const [counts, setCounts] = useState({ facts: 0, links: 0, totalFacts: 0 });
   const [dims, setDims] = useState({ w: 0, h: height });
 
   // view state
@@ -124,7 +148,11 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
         });
         const links = (res.edges ?? []).filter((e) => e.source && e.target).map((e) => ({ ...e })) as GLink[];
         setData({ nodes, links });
-        setCounts({ facts: nodes.filter((n) => n.type === 'fact').length, links: links.filter((l) => l.type === 'similar').length });
+        setCounts({
+          facts: nodes.filter((n) => n.type === 'fact').length,
+          links: links.filter((l) => l.type === 'similar').length,
+          totalFacts: res.meta?.totalFacts ?? 0,
+        });
         setStatus('ready');
       } catch {
         if (!cancelled) setStatus('error');
@@ -137,6 +165,13 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
     const m = new Map<string, GNode>();
     if (data) for (const n of data.nodes) m.set(n.id, n);
     return m;
+  }, [data]);
+
+  // Only show legend chips for node types actually present (honest legend).
+  const presentTypes = useMemo(() => {
+    const s = new Set<string>();
+    if (data) for (const n of data.nodes) s.add(n.type);
+    return ALL_TYPES.filter((t) => s.has(t.type));
   }, [data]);
 
   // ── visibility / styling predicates (read live state) ──────────────
@@ -285,6 +320,8 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           linkColor={(l) => {
             if (hi.current.links.has(l)) return l.type === 'similar' ? dim(COLOR.similar, 0.95) : 'rgba(255,255,255,0.7)';
             if (focusing) return l.type === 'similar' ? dim(COLOR.similar, 0.06) : 'rgba(255,255,255,0.02)';
+            // Stored fact→entity edges read brighter than inferred (substring) ones.
+            if (l.type === 'entity') return dim(COLOR.entity, l.inferred ? 0.07 : 0.22);
             return (EDGE_BASE[l.type] || EDGE_BASE.kind)(l.weight);
           }}
           linkWidth={(l) => (hi.current.links.has(l) ? 1.4 : l.type === 'similar' ? 0.5 : 0.25)}
@@ -306,7 +343,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
         <>
           {/* filters + search (top-left) */}
           <div className="absolute left-3 top-3 flex max-w-[calc(100%-9rem)] flex-wrap items-center gap-1.5">
-            {TYPES.map((t) => {
+            {presentTypes.map((t) => {
               const off = hideType.has(t.type);
               return (
                 <button key={t.type} type="button" onClick={() => toggleType(t.type)}
@@ -330,7 +367,10 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
 
           {/* controls (top-right) */}
           <div className="absolute right-3 top-3 flex items-center gap-2">
-            <span className="rounded-md bg-black/50 px-2 py-1 text-caption text-white/60 backdrop-blur">{counts.facts} facts · {counts.links} links</span>
+            <span className="rounded-md bg-black/50 px-2 py-1 text-caption text-white/60 backdrop-blur"
+              title={counts.totalFacts > counts.facts ? `Showing the ${counts.facts} most relevant of ${counts.totalFacts} facts` : undefined}>
+              {counts.totalFacts > counts.facts ? `${counts.facts} of ${counts.totalFacts}` : counts.facts} facts · {counts.links} links
+            </span>
             <button type="button" onClick={() => setBloomOn((v) => !v)} aria-label="Toggle glow" title="Toggle glow"
               className={cn('rounded-md border p-1.5 backdrop-blur cursor-pointer', bloomOn ? 'border-amber-300/50 bg-amber-400/20 text-amber-200' : 'border-white/15 bg-black/50 text-white/70 hover:text-white')}>
               <Sparkles className="h-4 w-4" aria-hidden />
@@ -358,7 +398,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
         <div className="absolute bottom-3 right-3 w-72 rounded-lg border border-white/15 bg-black/70 p-3 text-white shadow-lg backdrop-blur">
           <div className="mb-1 flex items-start justify-between gap-2">
             <span className="text-caption font-semibold uppercase tracking-wide" style={{ color: sel.type === 'fact' ? KIND_COLOR[(sel.data?.kind as string)] || '#FBE9D6' : (COLOR as Record<string, string>)[sel.type] }}>
-              {sel.type === 'fact' ? (KIND_LABEL[(sel.data?.kind as string)] || 'Fact') : sel.type === 'entity' ? 'Person / thing' : sel.type === 'file' ? 'File' : 'Topic'}
+              {sel.type === 'fact' ? (KIND_LABEL[(sel.data?.kind as string)] || 'Fact') : (NODE_TYPE_LABEL[sel.type] ?? 'Topic')}
             </span>
             <button type="button" onClick={clearFocus} aria-label="Close" className="cursor-pointer text-white/50 hover:text-white"><X className="h-4 w-4" aria-hidden /></button>
           </div>
@@ -367,6 +407,11 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           <div className="mt-2 flex flex-wrap gap-1.5">
             {sel.data?.pinned === true && <span className="rounded-full bg-amber-400/90 px-2 py-0.5 text-[10px] font-semibold text-amber-950">pinned</span>}
             {typeof sel.data?.importance === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">importance {sel.data.importance as number}/10</span>}
+            {sel.type === 'tool-recall' && typeof sel.data?.chosenTool === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">→ {sel.data.chosenTool as string}</span>}
+            {sel.type === 'tool-recall' && typeof sel.data?.score === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{Math.round((sel.data.score as number) * 100)}% success</span>}
+            {sel.type === 'skill' && typeof sel.data?.tier === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.tier as string}</span>}
+            {(sel.type === 'goal' || sel.type === 'focus') && typeof sel.data?.status === 'string' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.status as string}</span>}
+            {sel.type === 'workflow' && typeof sel.data?.steps === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.steps as number} steps</span>}
             {sel.connected > 0 && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.connected} connected</span>}
           </div>
         </div>
@@ -378,7 +423,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
 function labelHtml(n: GNode): string {
   const kind = n.type === 'fact' ? (KIND_LABEL[(n.data?.kind as string)] || 'Fact')
     : n.type === 'entity' ? ((n.data?.entity_type as string) || 'entity')
-    : n.type === 'file' ? 'file' : 'topic';
+    : n.type === 'file' ? 'file' : (NODE_TYPE_LABEL[n.type] ?? 'topic');
   const txt = n.type === 'fact' ? ((n.data?.content as string) || n.label) : n.label;
   const esc = String(txt).slice(0, 180).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m] as string));
   return `<div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:12px;color:#F6EEE6;background:rgba(16,11,18,0.92);border:1px solid rgba(255,180,120,0.16);padding:7px 10px;border-radius:9px;max-width:280px;box-shadow:0 8px 24px rgba(0,0,0,0.5)"><div style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.07em;opacity:0.7;margin-bottom:2px">${kind}</div>${esc}</div>`;

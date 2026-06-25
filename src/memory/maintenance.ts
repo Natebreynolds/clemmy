@@ -4,12 +4,13 @@ import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
-import { STATE_DIR, backupMemoryDb, reapStaleEpisodicPointers } from './db.js';
+import { STATE_DIR, backupMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFacts } from './db.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
 import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { mergeParaphrases } from './memory-merge.js';
+import { syncFactEntityLinks, syncFactResourceLinks } from './relations.js';
 import { reapStaleToolOutputs, reapStaleSessions } from '../runtime/harness/eventlog.js';
 import {
   reapStuckRecallRecordings,
@@ -471,6 +472,27 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'paraphrase merge nightly job failed');
+      }
+      // WS2 — refresh stored fact↔entity / fact↔resource links AFTER the merge
+      // (merge rewrites/retires facts, so links re-derive against the settled
+      // set). Deterministic + idempotent; the graph reads these stored edges.
+      try {
+        const ent = syncFactEntityLinks();
+        const rsc = syncFactResourceLinks();
+        if (ent.linksWritten > 0 || rsc.linksWritten > 0) {
+          logger.info({ entityLinks: ent.linksWritten, resourceLinks: rsc.linksWritten }, 'relationship link sync completed');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'relationship link sync failed');
+      }
+      // WS6 — hard-purge facts soft-deleted well beyond the recovery window so
+      // consolidated_facts + fact_embeddings stop growing forever (FK CASCADE
+      // drops their embeddings + links). Default 180d; floored at 30d.
+      try {
+        const purged = purgeSoftDeletedFacts();
+        if (purged > 0) logger.info({ purged }, 'soft-deleted fact hard-purge completed');
+      } catch (err) {
+        logger.warn({ err }, 'soft-deleted fact hard-purge failed');
       }
     }
   }

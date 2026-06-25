@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
-  FileSearch, Users, MapPin,
+  FileSearch, Users, MapPin, Wrench, CheckCircle2, XCircle,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
@@ -17,11 +17,11 @@ import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
   listFacts, forgetFact, pinFact, getContext, addFact, addGoal, searchMemory, getMemoryFiles,
-  getBrainHealth, listEntities, getSourceMap, fileBasename, FACT_KINDS,
-  type Fact, type ContextFile, type Entity,
+  getBrainHealth, getMemoryHealth, getToolRecall, listEntities, getSourceMap, fileBasename, FACT_KINDS,
+  type Fact, type ContextFile, type Entity, type ToolRecallRecord,
 } from '@/lib/memory';
 
-type Tab = 'overview' | 'facts' | 'entities' | 'sources' | 'you';
+type Tab = 'overview' | 'facts' | 'entities' | 'procedures' | 'sources' | 'you';
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference' };
 
 export function Memory() {
@@ -37,6 +37,7 @@ export function Memory() {
     { key: 'overview', label: 'Overview', icon: Network },
     { key: 'facts', label: 'Facts', icon: BookOpen },
     { key: 'entities', label: 'People & things', icon: Users },
+    { key: 'procedures', label: 'Tool recall', icon: Wrench },
     { key: 'sources', label: 'Sources', icon: FileText },
     { key: 'you', label: 'You & goals', icon: User },
   ];
@@ -69,6 +70,7 @@ export function Memory() {
           {tab === 'overview' && <OverviewTab />}
           {tab === 'facts' && <FactsTab qc={qc} />}
           {tab === 'entities' && <EntitiesTab />}
+          {tab === 'procedures' && <ProceduresTab />}
           {tab === 'sources' && <SourcesTab />}
           {tab === 'you' && <YouTab qc={qc} />}
         </>
@@ -80,6 +82,7 @@ export function Memory() {
 // ─────────── Overview: the knowledge graph as the focal point + stats ───────────
 function OverviewTab() {
   const health = usePoll(['brain-health'], getBrainHealth, 30000);
+  const memHealth = usePoll(['memory-health'], getMemoryHealth, 30000);
   const files = usePoll(['memory-files'], getMemoryFiles, 60000);
   const sources = usePoll(['source-map'], getSourceMap, 60000);
   const h = health.data ?? {};
@@ -101,11 +104,47 @@ function OverviewTab() {
           </Card>
         ))}
       </div>
+      <RecallHealthStrip health={memHealth.data} />
       <div>
         <p className="mb-2 text-small text-muted">How everything connects — tap a topic to fold it, drag to explore, tap a node for detail.</p>
         <MemoryGraphContainer height={540} />
       </div>
     </div>
+  );
+}
+
+// ─────────── Recall / embedding health ───────────
+// Surfaces the signal that was illegible before: when embeddings are off (no
+// key) or circuit-broken, semantic recall silently degrades to lexical match.
+function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryHealth }) {
+  const emb = health?.embeddings;
+  const recall = health?.recall;
+  if (!emb) return null;
+  const pct = (v?: number) => `${Math.round((v ?? 0) * 100)}%`;
+  const semanticOn = emb.enabled && !emb.breakerOpen;
+  const tone: 'good' | 'warn' | 'neutral' = !emb.enabled ? 'warn' : emb.breakerOpen ? 'warn' : 'good';
+  const dot = tone === 'good' ? 'bg-success' : tone === 'warn' ? 'bg-warning' : 'bg-faint';
+  const label = !emb.enabled
+    ? 'Semantic recall OFF — no embedding key; using lexical match only'
+    : emb.breakerOpen
+      ? `Semantic recall paused (${emb.lastErrorClass ?? 'error'}) — temporarily lexical-only`
+      : 'Semantic recall on';
+  return (
+    <Card className="flex flex-wrap items-center gap-x-5 gap-y-2 p-3.5 text-small">
+      <span className="flex items-center gap-2 font-medium text-fg">
+        <span className={cn('inline-block h-2 w-2 rounded-full', dot)} aria-hidden />
+        {label}
+      </span>
+      {semanticOn && (
+        <span className="text-muted">
+          Embedded: <span className="font-medium text-fg">{pct(emb.factCoverage)}</span> facts · <span className="font-medium text-fg">{pct(emb.vaultCoverage)}</span> notes
+          {emb.model ? <span className="text-faint"> · {emb.model}{emb.dim ? ` (${emb.dim}d)` : ''}</span> : null}
+        </span>
+      )}
+      {recall && (recall.calls ?? 0) > 0 && (
+        <span className="text-muted">Recall hit-rate: <span className="font-medium text-fg">{pct(recall.hitRate)}</span> <span className="text-faint">({recall.hits}/{recall.calls})</span></span>
+      )}
+    </Card>
   );
 }
 
@@ -225,6 +264,56 @@ function EntityCard({ entity }: { entity: Entity }) {
 }
 
 // ─────────── Sources (what Clementine reads + where data lives) ───────────
+// ─────────── Tool recall (procedural memory) ───────────
+// Surfaces the per-machine learned-procedure store that was previously
+// inspectable only by hand-reading .md files — the strongest ever-learning
+// signal, now auditable: which tool proved out for an intent, its success
+// rate, and what fell back.
+function ProceduresTab() {
+  const recall = usePoll(['tool-recall'], getToolRecall, 30000);
+  const rows = recall.data?.records ?? [];
+  return (
+    <>
+      <p className="mb-3 text-small text-muted">Tools Clementine learned to reach for, per intent — she skips rediscovery and goes straight to a proven path. Sorted by what's working.</p>
+      {recall.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
+        : rows.length === 0 ? <Card><EmptyState title="No learned procedures yet" description="As Clementine proves out which tool handles a kind of task, it lands here so she doesn't rediscover it next time." /></Card>
+          : <div className="space-y-2">{rows.map((r) => <ProcedureCard key={r.intent} rec={r} />)}</div>}
+    </>
+  );
+}
+
+function ProcedureCard({ rec }: { rec: ToolRecallRecord }) {
+  const c = rec.choice;
+  const score = typeof c?.score === 'number' ? Math.round(c.score * 100) : null;
+  const success = c?.successCount ?? 0;
+  const failure = c?.failureCount ?? 0;
+  return (
+    <Card className="p-3.5">
+      <div className="flex items-start gap-3">
+        <Wrench className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{rec.intent}</span>
+            {c ? <StatusPill tone="neutral">{c.kind}</StatusPill> : <StatusPill tone="warning">needs rediscovery</StatusPill>}
+            {score != null && <span className="shrink-0 text-caption text-faint">{score}%</span>}
+          </div>
+          {c && <p className="mt-0.5 font-mono text-small text-muted">→ {c.identifier}</p>}
+          {rec.description && <p className="mt-0.5 text-small text-muted">{rec.description}</p>}
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
+            {(success > 0 || failure > 0) && (
+              <span className="inline-flex items-center gap-2">
+                <span className="inline-flex items-center gap-1"><CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden />{success}</span>
+                <span className="inline-flex items-center gap-1"><XCircle className="h-3.5 w-3.5 text-warning" aria-hidden />{failure}</span>
+              </span>
+            )}
+            {rec.fallbacks.length > 0 && <span>{rec.fallbacks.length} fallback{rec.fallbacks.length === 1 ? '' : 's'} tried</span>}
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function SourcesTab() {
   const ctx = usePoll(['context'], getContext, 30000);
   const files = usePoll(['memory-files'], getMemoryFiles, 30000);

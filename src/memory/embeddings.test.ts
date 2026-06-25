@@ -70,11 +70,13 @@ test('cosine returns 0 when one vector is zero (avoids NaN)', () => {
   assert.equal(cosine(z, z), 0);
 });
 
-test('cosine handles mismatched lengths by clipping to shorter', () => {
+test('cosine returns 0 on mismatched lengths (different provider spaces)', () => {
   const a = new Float32Array([1, 0, 0, 100]);
   const b = new Float32Array([1, 0, 0]); // length 3
-  // Should clip a to first 3 dims, both become [1,0,0] → cosine = 1.
-  assert.ok(Math.abs(cosine(a, b) - 1) < 1e-6);
+  // WS3: a 1536-dim OpenAI vector and a 384-dim local vector live in different
+  // spaces — comparing them is meaningless, so cosine returns 0 rather than a
+  // garbage truncated score that would corrupt ranking/dedup.
+  assert.equal(cosine(a, b), 0);
 });
 
 test('isEmbeddingsEnabled honors EMBEDDINGS_DISABLED (key-decoupled opt-out)', () => {

@@ -848,17 +848,37 @@ export const TOOL_CHOICE_SCORE_FLOOR = 0.34;
 /** Auto-invalidate (→ rediscovery) after this many failures with no later win. */
 const AUTO_INVALIDATE_FAILURE_STREAK = 3;
 
+/** WS5 — confidence half-life (days). An unrevalidated choice's score decays
+ *  toward the neutral prior over time, so a path that worked 8 months ago and
+ *  was never re-exercised stops being injected as authoritatively "previously
+ *  worked" and prompts a cheap re-probe. Default OFF until dev-smoke validates
+ *  (per the no-rollout-flags discipline); flip CLEMMY_TOOL_CHOICE_DECAY=on. */
+const TOOL_CHOICE_HALF_LIFE_DAYS = 90;
+function toolChoiceDecayEnabled(): boolean {
+  return (process.env.CLEMMY_TOOL_CHOICE_DECAY ?? 'off').trim().toLowerCase() === 'on';
+}
+
 /**
  * Laplace-smoothed success rate in (0,1). positives = success + approval;
  * negatives = failure + rejection. Prior 0.5 (one phantom win + one loss) so a
  * single observation can't peg the score to 0 or 1 — a freshly-learned choice
- * sits at the neutral prior until evidence accrues.
+ * sits at the neutral prior until evidence accrues. When the (gated) age decay
+ * is on, the score is additionally pulled toward 0.5 by time since last
+ * validation, so stale confidence fades instead of persisting forever.
  */
 export function computeChoiceScore(choice: ToolChoiceRecordChoice | null | undefined): number {
   if (!choice) return 0.5;
   const pos = (choice.successCount ?? 0) + (choice.approvalCount ?? 0);
   const neg = (choice.failureCount ?? 0) + (choice.rejectionCount ?? 0);
-  return (pos + 1) / (pos + neg + 2);
+  const raw = (pos + 1) / (pos + neg + 2);
+  if (!toolChoiceDecayEnabled()) return raw;
+  const anchor = choice.lastSuccessAt || choice.testedAt;
+  const anchorMs = anchor ? Date.parse(anchor) : NaN;
+  if (!Number.isFinite(anchorMs)) return raw;
+  const ageDays = (Date.now() - anchorMs) / 86_400_000;
+  if (ageDays <= 0) return raw;
+  const keep = Math.pow(0.5, ageDays / TOOL_CHOICE_HALF_LIFE_DAYS); // 1 → 0 with age
+  return 0.5 + (raw - 0.5) * keep; // decays toward the neutral prior
 }
 
 function applyOutcome(choice: ToolChoiceRecordChoice, outcome: ProceduralOutcome, nowIso: string): ToolChoiceRecordChoice {

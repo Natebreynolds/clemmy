@@ -23,8 +23,18 @@ import { openMemoryDb } from './db.js';
 
 const logger = pino({ name: 'clementine-next.memory.embeddings' });
 
+// OpenAI defaults (the provider used when an OPENAI_API_KEY is present). Kept as
+// exported constants for back-compat; the ACTIVE provider's model/dim are read
+// via activeEmbeddingModel()/activeEmbeddingDim() so a different provider's
+// vectors are stored + compared correctly.
 export const EMBEDDING_MODEL = 'text-embedding-3-small';
 export const EMBEDDING_DIM = 1536;
+
+// Bundled local fallback (zero external key). Transformers.js / ONNX model.
+// 384-dim — DIFFERENT from OpenAI's 1536, so the re-embed-on-provider-change
+// path + cosine dim-guard below are load-bearing, not theoretical.
+export const LOCAL_EMBEDDING_MODEL = 'Xenova/bge-small-en-v1.5';
+export const LOCAL_EMBEDDING_DIM = 384;
 
 // OpenAI accepts up to 2048 inputs per request; we stay conservative
 // so a single bad chunk can't poison too many at once.
@@ -162,13 +172,152 @@ export function _resetEmbeddingHealthForTest(): void {
 export function _driveEmbedFailureForTest(err: unknown): void { recordFailure(err); }
 export function _driveEmbedSuccessForTest(): void { recordSuccess(); }
 
+// ── Embedding provider abstraction (WS3) ────────────────────────────────
+// Ends the OpenAI hard-lock: a non-OpenAI-key user (codex_oauth / claude-brain)
+// no longer silently loses ALL semantic recall. Providers are selected by
+// available credentials — OpenAI when a key is present, else a bundled local
+// ONNX model (zero key). Each provider declares its model + dim so vectors are
+// stored + compared in the right space (the cosine dim-guard + re-embed paths
+// rely on this). The default path with a key present is byte-identical to before.
+
+export interface EmbeddingProvider {
+  /** Stable provider id stored alongside vectors ('openai' | 'local'). */
+  readonly name: string;
+  /** Model identifier (also stored, so a model change triggers re-embed). */
+  readonly model: string;
+  /** Output dimensionality. */
+  readonly dim: number;
+  /** Embed a batch; returns vectors in input order. Throws on hard failure. */
+  embed(texts: string[]): Promise<Float32Array[]>;
+}
+
+const OPENAI_PROVIDER: EmbeddingProvider = {
+  name: 'openai',
+  model: EMBEDDING_MODEL,
+  dim: EMBEDDING_DIM,
+  embed: (texts) => openaiEmbedBatch(texts),
+};
+
+// Local provider is loaded lazily (the Transformers.js / onnxruntime dependency
+// is heavy + optional). `undefined` = not yet probed; `null` = probed and
+// unavailable (degrade to lexical, exactly today's no-key behavior).
+let localProvider: EmbeddingProvider | null | undefined = undefined;
+let localProbeInFlight: Promise<EmbeddingProvider | null> | null = null;
+// Test seam — inject a deterministic provider without any network/model load.
+let injectedProvider: EmbeddingProvider | null | undefined = undefined;
+
+/** Attempt local provider on no-key installs unless explicitly disabled. */
+function localEmbeddingsAllowed(): boolean {
+  return (getRuntimeEnv('CLEMMY_LOCAL_EMBEDDINGS', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+async function loadLocalProvider(): Promise<EmbeddingProvider | null> {
+  if (localProvider !== undefined) return localProvider;
+  if (localProbeInFlight) return localProbeInFlight;
+  localProbeInFlight = (async () => {
+    try {
+      // Lazy + optional: the package is an optionalDependency. If it isn't
+      // installed (or the model can't load offline), we degrade to lexical —
+      // never a crash, never a startup cost when unused.
+      const mod = await import(/* @vite-ignore */ '@huggingface/transformers' as string).catch(() => null) as
+        | { pipeline?: (task: string, model: string) => Promise<(input: string[], opts?: unknown) => Promise<{ data: ArrayLike<number> }>> }
+        | null;
+      if (!mod?.pipeline) { localProvider = null; return null; }
+      const extractor = await mod.pipeline('feature-extraction', LOCAL_EMBEDDING_MODEL);
+      const provider: EmbeddingProvider = {
+        name: 'local',
+        model: LOCAL_EMBEDDING_MODEL,
+        dim: LOCAL_EMBEDDING_DIM,
+        async embed(texts) {
+          const out: Float32Array[] = [];
+          for (const t of texts) {
+            const res = await extractor([t], { pooling: 'mean', normalize: true });
+            out.push(Float32Array.from(res.data as ArrayLike<number>));
+          }
+          return out;
+        },
+      };
+      localProvider = provider;
+      logger.info({ model: LOCAL_EMBEDDING_MODEL, dim: LOCAL_EMBEDDING_DIM }, 'local embedding provider loaded');
+      return provider;
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'local embedding provider unavailable — semantic recall on lexical fallback');
+      localProvider = null;
+      return null;
+    } finally {
+      localProbeInFlight = null;
+    }
+  })();
+  return localProbeInFlight;
+}
+
+/** Hard opt-out (honored for every provider). */
+function embeddingsDisabledByEnv(): boolean {
+  return (getRuntimeEnv('EMBEDDINGS_DISABLED', '') || '').trim().toLowerCase() === 'true';
+}
+
+/** Forced provider override: 'openai' | 'local' | 'off' (else auto by creds). */
+function providerOverride(): string {
+  return (getRuntimeEnv('CLEMMY_EMBED_PROVIDER', '') || '').trim().toLowerCase();
+}
+
+/**
+ * The active provider, async (may lazily load the local model). Selection:
+ *   override 'off' / EMBEDDINGS_DISABLED → none
+ *   override 'openai' OR (no override AND key present) → OpenAI
+ *   override 'local' OR (no key) → local (if loadable)
+ */
+export async function getEmbeddingProvider(): Promise<EmbeddingProvider | null> {
+  if (injectedProvider !== undefined) return injectedProvider;
+  if (embeddingsDisabledByEnv()) return null;
+  const override = providerOverride();
+  if (override === 'off') return null;
+  if (override !== 'local' && getOpenAiApiKey()) return OPENAI_PROVIDER;
+  if (override === 'openai') return null; // forced openai but no key
+  if (!localEmbeddingsAllowed()) return null;
+  return loadLocalProvider();
+}
+
+/** Sync best-effort view of the active provider (no model load). Used by the
+ *  many sync gates (recall fast-path, graph). Returns the local provider only
+ *  if it has ALREADY loaded; warmup below makes that the common case. */
+function activeProviderSync(): EmbeddingProvider | null {
+  if (injectedProvider !== undefined) return injectedProvider;
+  if (embeddingsDisabledByEnv()) return null;
+  const override = providerOverride();
+  if (override === 'off') return null;
+  if (override !== 'local' && getOpenAiApiKey()) return OPENAI_PROVIDER;
+  if (override === 'openai') return null;
+  if (!localEmbeddingsAllowed()) return null;
+  return localProvider ?? null; // null until warmup completes
+}
+
+export function activeEmbeddingModel(): string | null { return activeProviderSync()?.model ?? null; }
+export function activeEmbeddingDim(): number | null { return activeProviderSync()?.dim ?? null; }
+
 export function isEmbeddingsEnabled(): boolean {
-  // Explicit, key-decoupled opt-out. Previously EMBEDDINGS_DISABLED was read
-  // nowhere (a dead flag); honoring it makes the user's off-switch real. Default
-  // (unset) is byte-identical to the old key-presence behavior. When disabled,
-  // every consumer degrades gracefully to the FTS/LIKE fallback.
-  if ((getRuntimeEnv('EMBEDDINGS_DISABLED', '') || '').trim().toLowerCase() === 'true') return false;
-  return Boolean(getOpenAiApiKey());
+  // Enabled when a provider resolves. OpenAI is sync (key presence); the local
+  // provider becomes "enabled" once warmup loads it (kicked off below on
+  // no-key installs), degrading to lexical until then — same as the old
+  // no-key behavior. EMBEDDINGS_DISABLED=true forces off for every provider.
+  return activeProviderSync() !== null;
+}
+
+/** Test-only: inject (or clear with `null`) a deterministic provider. */
+export function _setEmbeddingProviderForTest(p: EmbeddingProvider | null | undefined): void {
+  injectedProvider = p;
+}
+/** Test-only: reset the lazily-probed local provider. */
+export function _resetLocalProviderForTest(): void {
+  localProvider = undefined;
+  localProbeInFlight = null;
+}
+
+// Eager local warmup on no-key installs so isEmbeddingsEnabled() flips true
+// before the first recall, instead of reporting "off" for the first turn.
+// Fire-and-forget; failures already degrade to lexical inside loadLocalProvider.
+if (!getOpenAiApiKey() && localEmbeddingsAllowed() && providerOverride() !== 'off' && providerOverride() !== 'openai' && !embeddingsDisabledByEnv()) {
+  void loadLocalProvider();
 }
 
 /**
@@ -187,7 +336,12 @@ export function bufferToVector(buffer: Buffer): Float32Array {
 }
 
 export function cosine(a: Float32Array, b: Float32Array): number {
-  const len = Math.min(a.length, b.length);
+  // Dim mismatch ⇒ 0, never a garbage truncated score. Before the provider
+  // abstraction this used Math.min(a,b) and would silently compare a 1536-dim
+  // OpenAI vector against a 384-dim local one as if the overlap were meaningful,
+  // corrupting ranking/dedup. Different dims = different spaces = not comparable.
+  if (a.length !== b.length) return 0;
+  const len = a.length;
   let dot = 0;
   let na = 0;
   let nb = 0;
@@ -209,10 +363,10 @@ interface EmbeddingsApiResponse {
 }
 
 /**
- * Embed a batch of texts. Returns vectors in the same order as input.
- * Throws on hard failure — callers decide whether to retry or skip.
+ * Embed a batch of texts via the OpenAI API. The OpenAI provider's `embed`.
+ * Returns vectors in input order. Throws on hard failure — callers decide.
  */
-async function embedBatch(texts: string[]): Promise<Float32Array[]> {
+async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
   const apiKey = getOpenAiApiKey();
   if (!apiKey) {
     throw new Error('OPENAI_API_KEY is not set');
@@ -258,10 +412,11 @@ async function embedBatch(texts: string[]): Promise<Float32Array[]> {
  * — recall falls back to FTS-only ordering.
  */
 export async function embedQuery(query: string): Promise<Float32Array | null> {
-  if (!isEmbeddingsEnabled()) return null;
+  const provider = await getEmbeddingProvider();
+  if (!provider) return null;
   if (inCooldown()) return null;
   try {
-    const [vector] = await embedBatch([query]);
+    const [vector] = await provider.embed([query]);
     recordSuccess();
     return vector ?? null;
   } catch (err) {
@@ -279,10 +434,11 @@ export async function embedQuery(query: string): Promise<Float32Array | null> {
  */
 export async function embedTexts(texts: string[]): Promise<Float32Array[] | null> {
   if (texts.length === 0) return [];
-  if (!isEmbeddingsEnabled()) return null;
+  const provider = await getEmbeddingProvider();
+  if (!provider) return null;
   if (inCooldown()) return null;
   try {
-    const vectors = await embedBatch(texts);
+    const vectors = await provider.embed(texts);
     recordSuccess();
     return vectors;
   } catch (err) {
@@ -313,8 +469,9 @@ export interface EmbedBackfillStats {
  */
 export async function embedMissingChunks(options: { maxChunks?: number } = {}): Promise<EmbedBackfillStats> {
   const start = Date.now();
+  const provider = await getEmbeddingProvider();
   const stats: EmbedBackfillStats = {
-    enabled: isEmbeddingsEnabled(),
+    enabled: provider !== null,
     candidateChunks: 0,
     batched: 0,
     embedded: 0,
@@ -322,8 +479,8 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
     durationMs: 0,
   };
 
-  if (!stats.enabled) {
-    stats.reason = 'OPENAI_API_KEY not set';
+  if (!provider) {
+    stats.reason = 'no embedding provider (no OpenAI key + local unavailable)';
     stats.durationMs = Date.now() - start;
     return stats;
   }
@@ -336,14 +493,17 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
   const db = openMemoryDb();
   const limit = Math.max(1, options.maxChunks ?? 200);
 
+  // Re-embed when missing OR when the stored vectors came from a DIFFERENT
+  // provider model/dim (e.g. switched OpenAI↔local) — mixed dims would corrupt
+  // cosine (now guarded to 0), so a provider change rebuilds the affected rows.
   const rows = db.prepare(`
     SELECT vc.id AS id, vc.content AS content
     FROM vault_chunks vc
     LEFT JOIN embeddings e ON e.chunk_id = vc.id
-    WHERE e.chunk_id IS NULL
+    WHERE e.chunk_id IS NULL OR e.model != ? OR e.dim != ?
     ORDER BY vc.id ASC
     LIMIT ?
-  `).all(limit) as { id: number; content: string }[];
+  `).all(provider.model, provider.dim, limit) as { id: number; content: string }[];
 
   stats.candidateChunks = rows.length;
   if (rows.length === 0) {
@@ -362,7 +522,7 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
     stats.batched++;
     let vectors: Float32Array[] = [];
     try {
-      vectors = await embedBatch(batch.map((r) => r.content));
+      vectors = await provider.embed(batch.map((r) => r.content));
       recordSuccess();
     } catch (err) {
       recordFailure(err);
@@ -382,7 +542,7 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
       for (let j = 0; j < batch.length; j++) {
         const vector = vectors[j];
         if (!vector) continue;
-        insert.run(batch[j].id, EMBEDDING_MODEL, vector.length, vectorToBuffer(vector), now);
+        insert.run(batch[j].id, provider.model, vector.length, vectorToBuffer(vector), now);
         stats.embedded++;
       }
     });
@@ -426,8 +586,9 @@ export function loadEmbeddingsForChunks(chunkIds: number[]): Map<number, Float32
  */
 export async function embedMissingFacts(options: { maxChunks?: number; newestFirst?: boolean } = {}): Promise<EmbedBackfillStats> {
   const start = Date.now();
+  const provider = await getEmbeddingProvider();
   const stats: EmbedBackfillStats = {
-    enabled: isEmbeddingsEnabled(),
+    enabled: provider !== null,
     candidateChunks: 0,
     batched: 0,
     embedded: 0,
@@ -435,8 +596,8 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
     durationMs: 0,
   };
 
-  if (!stats.enabled) {
-    stats.reason = 'OPENAI_API_KEY not set';
+  if (!provider) {
+    stats.reason = 'no embedding provider (no OpenAI key + local unavailable)';
     stats.durationMs = Date.now() - start;
     return stats;
   }
@@ -453,15 +614,16 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
   // oldest-first order the nightly backfill uses for eventual full coverage.
   const order = options.newestFirst ? 'DESC' : 'ASC';
 
+  // Re-embed on missing, stale content, OR a provider model/dim change.
   const rows = db.prepare(`
     SELECT cf.id AS id, cf.content AS content, cf.content_hash AS hash
     FROM consolidated_facts cf
     LEFT JOIN fact_embeddings fe ON fe.fact_id = cf.id
     WHERE cf.active = 1
-      AND (fe.fact_id IS NULL OR fe.content_hash != cf.content_hash)
+      AND (fe.fact_id IS NULL OR fe.content_hash != cf.content_hash OR fe.model != ? OR fe.dim != ?)
     ORDER BY cf.id ${order}
     LIMIT ?
-  `).all(limit) as { id: number; content: string; hash: string }[];
+  `).all(provider.model, provider.dim, limit) as { id: number; content: string; hash: string }[];
 
   stats.candidateChunks = rows.length;
   if (rows.length === 0) {
@@ -480,7 +642,7 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
     stats.batched++;
     let vectors: Float32Array[] = [];
     try {
-      vectors = await embedBatch(batch.map((r) => r.content));
+      vectors = await provider.embed(batch.map((r) => r.content));
       recordSuccess();
     } catch (err) {
       recordFailure(err);
@@ -497,7 +659,7 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
       for (let j = 0; j < batch.length; j++) {
         const vector = vectors[j];
         if (!vector) continue;
-        insert.run(batch[j].id, EMBEDDING_MODEL, vector.length, vectorToBuffer(vector), batch[j].hash, now);
+        insert.run(batch[j].id, provider.model, vector.length, vectorToBuffer(vector), batch[j].hash, now);
         stats.embedded++;
       }
     });

@@ -92,6 +92,38 @@ export interface BrainHealth {
 }
 export const getBrainHealth = () => apiGet<BrainHealth>('/api/console/brain/health');
 
+/** Rich memory health — embedding coverage + recall hit-rate. Distinct from
+ *  BrainHealth: this is the signal that makes silent semantic degradation
+ *  (no embedding key / circuit-broken) legible in the Memory screen. */
+export interface MemoryHealth {
+  facts?: { active?: number; inactive?: number; total?: number; pinned?: number };
+  entities?: number;
+  episodicPointers?: number;
+  focusActive?: number;
+  embeddings?: {
+    enabled?: boolean;
+    breakerOpen?: boolean;
+    lastErrorClass?: string | null;
+    model?: string | null;
+    dim?: number | null;
+    factCoverage?: number;
+    vaultCoverage?: number;
+    factEmbeds?: number;
+    chunkEmbeds?: number;
+  };
+  recall?: { calls?: number; hits?: number; empties?: number; hitRate?: number };
+}
+export const getMemoryHealth = () => apiGet<MemoryHealth>('/api/console/memory/health');
+
+/** A learned tool-recall (procedural) memo — which tool proved out for an intent. */
+export interface ToolRecallRecord {
+  intent: string;
+  description?: string | null;
+  choice: { kind: string; identifier: string; testedAt?: string; successCount?: number; failureCount?: number; lastSuccessAt?: string | null; lastFailureAt?: string | null; score?: number } | null;
+  fallbacks: { kind: string; identifier: string; reason?: string; failedAt?: string }[];
+}
+export const getToolRecall = () => apiGet<{ count: number; records: ToolRecallRecord[] }>('/api/console/memory/tool-recall');
+
 export interface Entity { id: number | string; entityType: string; canonicalName: string; aliases?: string[]; mentionCount?: number }
 export const listEntities = (limit = 400) => apiGet<{ entities: Entity[]; total: number }>(`/api/console/brain/entities?limit=${limit}`);
 
@@ -99,10 +131,12 @@ export interface SourcePointer { id: number | string; app: string; kind?: string
 export const getSourceMap = () => apiGet<{ enabled?: boolean; count?: number; pointers?: SourcePointer[] }>('/api/console/memory/source-map');
 
 export interface GraphNode { id: string; label: string; type: string; data?: Record<string, unknown> }
-export interface GraphEdge { id: string; source: string; target: string; type: string; weight?: number }
+export interface GraphEdge { id: string; source: string; target: string; type: string; weight?: number; inferred?: boolean; label?: string }
 export interface GraphMeta {
-  factCount?: number; fileCount?: number; kindCount?: number; entityCount?: number; edgeCount?: number;
+  factCount?: number; totalFacts?: number; fileCount?: number; kindCount?: number; entityCount?: number; edgeCount?: number;
   semantic?: boolean;
+  graphFull?: boolean;
+  stores?: { toolRecall?: number; skills?: number; workflows?: number; goals?: number; focus?: number };
   semanticEdges?: { enabled: boolean; requested: number; threshold: number; cap: number; count: number; embeddedFacts: number; skippedNoEmbedding: number };
   clustering?: { mode: string; clusters: number };
 }

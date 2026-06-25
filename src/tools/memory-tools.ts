@@ -7,6 +7,7 @@ import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../
 import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned, touchFactAccess } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
+import { recallEverything, formatUnifiedRecall } from '../memory/unified-recall.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { addNotification } from '../runtime/notifications.js';
@@ -295,6 +296,23 @@ export function registerMemoryTools(server: McpServer): void {
       if (facts.length === 0) return textResult('No relevant facts found.');
       const lines = facts.map((fact) => `- #${fact.id} ${fact.kind}: ${fact.content}`);
       return textResult(lines.join('\n'));
+    },
+  );
+
+  server.tool(
+    'memory_recall_all',
+    'Recall EVERYTHING relevant to an objective in one call — durable facts, vault notes, known people/things (entities), where data lives (resources), and proven tools (tool-recall) — ranked together across all memory stores. Use this as the FIRST lookup for "what do I already know / have / use for X?" instead of firing memory_search, memory_search_facts, etc. separately. Returns a single ranked list tagged by kind (FACT/NOTE/WHO·WHAT/WHERE/HOW).',
+    {
+      objective: z.string().min(1),
+      limit: z.number().int().min(1).max(50).optional(),
+    },
+    async ({ objective, limit }) => {
+      const result = await recallEverything(objective, { limit: limit ?? 12 });
+      if (result.hits.length === 0) return textResult('No relevant memory found across facts, notes, entities, resources, or tool-recall.');
+      const block = formatUnifiedRecall(result, 4000);
+      // Reinforce surfaced facts (an agent-facing recall is an access).
+      for (const h of result.hits) if (h.type === 'fact') { const id = Number(h.ref); if (Number.isFinite(id)) touchFactAccess(id); }
+      return textResult(block);
     },
   );
 

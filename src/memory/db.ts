@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { existsSync, mkdirSync, unlinkSync, readdirSync, statSync, statfsSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, readdirSync, statSync, statfsSync, copyFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
@@ -572,6 +572,49 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
       }
     },
   },
+  {
+    // v13 — STORED relationship layer (WS2). Until now EVERY cross-type edge
+    // (fact↔entity, fact↔resource, entity↔entity) was either absent or
+    // re-derived at render time by substring matching in the graph UI — so the
+    // "connected knowledge graph" was an illusion produced only at the
+    // visualization layer, invisible to recall (you couldn't traverse "what do
+    // I know about entity X"). These three join tables persist the relationships
+    // so the graph shows stored truth and recall can traverse. All FK-cascaded
+    // so a hard fact/entity delete drops its links for free. Additive — the
+    // legacy fact-only paths are untouched when the tables are empty.
+    version: 13,
+    sql: `
+      CREATE TABLE IF NOT EXISTS fact_entities (
+        fact_id    INTEGER NOT NULL REFERENCES consolidated_facts(id) ON DELETE CASCADE,
+        entity_id  INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (fact_id, entity_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fact_entities_entity ON fact_entities(entity_id);
+
+      CREATE TABLE IF NOT EXISTS fact_resources (
+        fact_id     INTEGER NOT NULL REFERENCES consolidated_facts(id) ON DELETE CASCADE,
+        resource_id INTEGER NOT NULL REFERENCES resource_pointers(id) ON DELETE CASCADE,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (fact_id, resource_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fact_resources_resource ON fact_resources(resource_id);
+
+      -- Subject-predicate-object edges between entities ("Dana" -is CFO at- "Acme").
+      -- Reinforced by recurrence, aged by last_seen so a stale relation can decay.
+      CREATE TABLE IF NOT EXISTS entity_edges (
+        subject_id       INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+        predicate        TEXT NOT NULL,
+        object_id        INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+        recurrence_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_at    TEXT NOT NULL,
+        last_seen_at     TEXT NOT NULL,
+        PRIMARY KEY (subject_id, predicate, object_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_entity_edges_subject ON entity_edges(subject_id);
+      CREATE INDEX IF NOT EXISTS idx_entity_edges_object ON entity_edges(object_id);
+    `,
+  },
 ];
 
 function runMigrations(db: Database.Database): void {
@@ -638,7 +681,16 @@ export function closeMemoryDb(): void {
 
 /**
  * Drop and re-open the memory DB. Used by tests and the `clementine doctor
- * --rebuild-index` path. Safe because the vault is the source of truth.
+ * --rebuild-index` path.
+ *
+ * CAUTION: this is NOT lossless. Only `vault_chunks`/`vault_chunks_fts`/
+ * `embeddings` are rebuildable from the markdown vault (the indexer
+ * repopulates them). `consolidated_facts`, `fact_embeddings`, `entities`,
+ * `resource_pointers`, `episodic_pointers`, and `current_focus` are NOT
+ * derivable from anything on disk — dropping the DB permanently loses them
+ * unless a `backupMemoryDb` snapshot is restored first (see
+ * {@link restoreMemoryDb}). Callers that only want the rebuildable index
+ * should reindex the vault, not reset the whole DB.
  */
 export function resetMemoryDb(): void {
   closeMemoryDb();
@@ -705,6 +757,80 @@ export function backupMemoryDb(opts: { retain?: number } = {}): BackupResult | n
     return { backupPath, bytes };
   } catch {
     return null;
+  }
+}
+
+export interface RestoreResult {
+  restoredFrom: string;
+  bytes: number;
+}
+
+/**
+ * WS6 — restore the memory DB from a {@link backupMemoryDb} snapshot. The
+ * nightly backup wrote snapshots but NOTHING read them — recovery was a manual,
+ * undocumented file copy. This closes that DR gap.
+ *
+ * Safety:
+ *   - Validates the snapshot is a real Clementine memory DB (has
+ *     consolidated_facts) + passes integrity_check BEFORE clobbering the live DB.
+ *   - Snapshots the CURRENT DB first, so a mistaken restore is itself reversible.
+ *   - Drops the WAL/SHM sidecars so the restored main file isn't shadowed.
+ *   - Reopens (runs migrations) so an older snapshot is brought to current schema.
+ *
+ * The CALLER must ensure no concurrent writers (stop the daemon / run from
+ * `doctor`). Throws on a missing/corrupt/foreign snapshot — never leaves the
+ * live DB in a half-restored state (validation happens before any mutation).
+ */
+export function restoreMemoryDb(backupPath: string): RestoreResult {
+  if (!existsSync(backupPath)) throw new Error(`restoreMemoryDb: backup not found: ${backupPath}`);
+  // Validate BEFORE touching the live DB.
+  const probe = new Database(backupPath, { readonly: true });
+  try {
+    const hasFacts = probe.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='consolidated_facts'",
+    ).get();
+    if (!hasFacts) throw new Error('restoreMemoryDb: snapshot has no consolidated_facts table — not a Clementine memory snapshot');
+    const integrity = probe.pragma('integrity_check') as Array<{ integrity_check: string }>;
+    const ok = Array.isArray(integrity) && integrity.length === 1 && integrity[0].integrity_check === 'ok';
+    if (!ok) throw new Error('restoreMemoryDb: snapshot failed integrity_check');
+  } finally {
+    probe.close();
+  }
+  // Reversible: snapshot the current DB before overwriting it.
+  try { backupMemoryDb({ retain: 14 }); } catch { /* best effort — don't block restore */ }
+  closeMemoryDb();
+  for (const suffix of ['-wal', '-shm']) {
+    const f = MEMORY_DB_PATH + suffix;
+    if (existsSync(f)) unlinkSync(f);
+  }
+  copyFileSync(backupPath, MEMORY_DB_PATH);
+  openMemoryDb(); // reopen + migrate the restored snapshot forward
+  let bytes = 0;
+  try { bytes = statSync(MEMORY_DB_PATH).size; } catch { /* ignore */ }
+  return { restoredFrom: backupPath, bytes };
+}
+
+/**
+ * WS6 — long-TTL hard-purge of soft-deleted facts. Every retirement
+ * (deleteFact, decay/evict, merge) only sets active=0, and the ONLY hard delete
+ * was an explicit user tool call — so consolidated_facts + fact_embeddings (the
+ * two largest tables) grew monotonically forever, every backup copying the dead
+ * weight. This drops facts that have been inactive well beyond the recovery
+ * window; FK CASCADE removes their embeddings + relationship links for free.
+ * Pinned facts are never purged. minAgeDays is floored at 30 (the soft-delete
+ * recovery window) and defaults to 180.
+ */
+export function purgeSoftDeletedFacts(opts: { minAgeDays?: number } = {}): number {
+  const minAgeDays = Math.max(30, opts.minAgeDays ?? 180);
+  try {
+    const db = openMemoryDb();
+    const cutoff = new Date(Date.now() - minAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const info = db.prepare(
+      'DELETE FROM consolidated_facts WHERE active = 0 AND pinned = 0 AND updated_at < ?',
+    ).run(cutoff);
+    return Number(info.changes ?? 0);
+  } catch {
+    return 0;
   }
 }
 

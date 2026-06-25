@@ -12,12 +12,22 @@ function cssVar(name: string): string {
 
 const KIND_LABELS: Record<string, string> = { USER: 'About you', PROJECT: 'Projects', FEEDBACK: 'Feedback', REFERENCE: 'Reference' };
 
-const TYPES = [
+const TYPES: { type: string; label: string; varName?: string; hex?: string }[] = [
   { type: 'kind', label: 'Topics', varName: '--primary' },
   { type: 'entity', label: 'People & things', varName: '--success' },
   { type: 'file', label: 'Files', varName: '--info' },
   { type: 'fact', label: 'Facts', varName: '--text-subtle' },
+  // WS1 non-fact stores (fixed hex — no theme var). Shown only when present.
+  { type: 'tool-recall', label: 'Tool recall', hex: '#7CF5A6' },
+  { type: 'skill', label: 'Skills', hex: '#FFD166' },
+  { type: 'workflow', label: 'Workflows', hex: '#67B7FF' },
+  { type: 'goal', label: 'Goals', hex: '#FF6FA8' },
+  { type: 'focus', label: 'Focus', hex: '#C792EA' },
 ];
+// Fixed colors for the non-fact node types (parity with the 3D constellation).
+const STORE_COLOR: Record<string, string> = {
+  'tool-recall': '#7CF5A6', skill: '#FFD166', workflow: '#67B7FF', goal: '#FF6FA8', focus: '#C792EA',
+};
 
 // Which topic rooms the user has folded — persisted so returning users keep
 // their tidied layout. A brand-new user (no key) gets an empty set → all rooms
@@ -80,7 +90,7 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
         const kept = new Set(nodes.map((n) => n.id));
         const keptEdges = edges.filter((e) => e.type !== 'kind' && kept.has(e.source) && kept.has(e.target));
 
-        const color: Record<string, string> = { kind: cssVar('--primary'), fact: cssVar('--text-subtle'), file: cssVar('--info'), entity: cssVar('--success') };
+        const color: Record<string, string> = { kind: cssVar('--primary'), fact: cssVar('--text-subtle'), file: cssVar('--info'), entity: cssVar('--success'), ...STORE_COLOR };
         const surface = cssVar('--bg-surface');
         const text = cssVar('--text');
         const edgeColor = cssVar('--border-strong');
@@ -281,7 +291,7 @@ export function MemoryGraph({ height = 480 }: { height?: number }) {
                 <button key={t.type} type="button" onClick={() => toggleType(t.type)}
                   className={cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption backdrop-blur transition-colors cursor-pointer',
                     off ? 'border-border bg-surface/70 text-faint line-through' : 'border-border bg-surface/90 text-muted')}>
-                  <span className="h-2.5 w-2.5 rounded-full" style={{ background: off ? 'var(--text-subtle)' : cssVar(t.varName) }} aria-hidden />{t.label}
+                  <span className="h-2.5 w-2.5 rounded-full" style={{ background: off ? 'var(--text-subtle)' : (t.hex ?? cssVar(t.varName ?? '')) }} aria-hidden />{t.label}
                 </button>
               );
             })}

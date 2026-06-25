@@ -368,6 +368,25 @@ test('computeChoiceScore is a smoothed success rate (prior 0.5)', () => {
   assert.ok(Math.abs(computeChoiceScore({ kind: 'mcp', identifier: 'x', testedAt: 'now', failureCount: 1 }) - 1 / 3) < 1e-9);
 });
 
+test('WS5: gated age decay pulls a STALE win toward the prior (flag off = byte-identical)', () => {
+  const stale = { kind: 'mcp' as const, identifier: 'x', testedAt: new Date(Date.now() - 180 * 86_400_000).toISOString(), successCount: 5 };
+  // Flag OFF → no decay, raw Laplace score (back-compat).
+  delete process.env.CLEMMY_TOOL_CHOICE_DECAY;
+  assert.ok(Math.abs(computeChoiceScore(stale) - 6 / 7) < 1e-9, 'flag off: undecayed');
+  // Flag ON → 180 days ≈ 2 half-lives (90d) → keep 0.25 → pulled toward 0.5.
+  process.env.CLEMMY_TOOL_CHOICE_DECAY = 'on';
+  try {
+    const decayed = computeChoiceScore(stale);
+    assert.ok(decayed < 6 / 7 && decayed > 0.5, 'decayed below raw, still above prior');
+    assert.ok(Math.abs(decayed - (0.5 + (6 / 7 - 0.5) * 0.25)) < 1e-6, 'matches 2-half-life decay');
+    // A fresh win of the same strength is barely touched.
+    const fresh = computeChoiceScore({ kind: 'mcp', identifier: 'x', testedAt: new Date().toISOString(), successCount: 5 });
+    assert.ok(fresh > decayed, 'fresh outranks stale under decay');
+  } finally {
+    delete process.env.CLEMMY_TOOL_CHOICE_DECAY;
+  }
+});
+
 test('procedural outcomes is DEFAULT-ON (unset env) — records + shifts score', () => {
   delete process.env.CLEMMY_PROCEDURAL_OUTCOMES; // unset → default on
   try {

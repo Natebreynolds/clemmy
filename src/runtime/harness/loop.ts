@@ -64,7 +64,8 @@ import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
-import { primeTurnRecallVector, searchFactsByText } from '../../memory/facts.js';
+import { primeTurnRecallVector, searchFactsByText, touchFactAccess } from '../../memory/facts.js';
+import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import { scrubInternalNarration } from './scrub-internal-narration.js';
@@ -940,6 +941,27 @@ const STALL_RETRY_BACKOFF_MS = [250, 1000];
 const TURN_MEMORY_PRIMER_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_TOP_K', 6);
 const TURN_MEMORY_PRIMER_MAX_CHARS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_MAX_CHARS', 2600);
 const TURN_MEMORY_PRIMER_FACT_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_FACT_TOP_K', 5);
+const TURN_MEMORY_PRIMER_EPISODIC_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_EPISODIC_TOP_K', 6);
+
+/** Recent episodic breadcrumbs for THIS session — "I already pulled X". These
+ *  pointers were written on every qualifying tool return but, until now, NEVER
+ *  read back into any prompt (the table was write-only). Surfacing them lets a
+ *  long-running turn recall_tool_result instead of re-fetching. Session-scoped
+ *  and bounded; the block only appears when pointers exist. */
+function episodicBlockForPrimer(sessionId: string): string {
+  if (!sessionId) return '';
+  try {
+    const pointers = listRecentEpisodicPointers(sessionId, TURN_MEMORY_PRIMER_EPISODIC_TOP_K);
+    if (pointers.length === 0) return '';
+    const lines = pointers.map((p) => `- ${p.label}${p.tool ? ` (via ${p.tool})` : ''}`);
+    return [
+      '[RECENTLY OBSERVED THIS SESSION — you already pulled these; recall_tool_result to re-read instead of re-fetching]',
+      ...lines,
+    ].join('\n');
+  } catch {
+    return '';
+  }
+}
 
 /** Query-relevant durable facts for the per-turn primer (lexical → finds even
  *  a fact remembered seconds ago, before its embedding indexes). The primer's
@@ -949,6 +971,11 @@ function factsBlockForPrimer(query: string): string {
   try {
     const facts = searchFactsByText(query, TURN_MEMORY_PRIMER_FACT_TOP_K);
     if (facts.length === 0) return '';
+    // Surfacing a fact into the per-turn primer IS an access in Stanford's
+    // framework (same as renderFactsForInstructions). Reinforce so a fact that
+    // is only ever recalled via this lexical primer stops looking "idle" to
+    // decayAndEvictFacts. Best-effort — never break the primer.
+    try { for (const f of facts) touchFactAccess(f.id); } catch { /* recency anchor stays slightly stale */ }
     const lines = facts.map((f) => `- ${f.content}`);
     return ['[REMEMBERED FACTS — durable, user-stated or curated; treat as known]', ...lines].join('\n');
   } catch {
@@ -1013,12 +1040,14 @@ interface TurnMemoryPrimer {
   skippedReason?: string;
 }
 
-function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source']): TurnMemoryPrimer {
+function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = ''): TurnMemoryPrimer {
   const formatted = formatSearchHits(hits, TURN_MEMORY_PRIMER_MAX_CHARS);
   // Durable facts relevant to THIS message — the primer's vault search alone
   // never surfaced consolidated_facts, so a just-remembered fact was invisible.
   const factsBlock = factsBlockForPrimer(query);
-  if (!formatted && !factsBlock) {
+  // Recently-observed breadcrumbs for this session (was a write-only table).
+  const episodicBlock = episodicBlockForPrimer(sessionId);
+  if (!formatted && !factsBlock && !episodicBlock) {
     return { enabled: true, query, hitCount: hits.length, injectedBytes: 0, source, skippedReason: 'no_hits' };
   }
   const sourceLabel = source === 'hybrid'
@@ -1029,6 +1058,7 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     `A ${sourceLabel} memory search ran for the latest user message before this model call.`,
     'Use these hits to steer the first response and tool choice. Treat snippets as candidate memory, not proof; before mutating external resources or creating source-backed artifacts, load the source with memory_read/read_file/recall_tool_result or call memory_recall for more context.',
     ...(factsBlock ? ['', factsBlock] : []),
+    ...(episodicBlock ? ['', episodicBlock] : []),
     ...(formatted ? ['', formatted] : []),
   ].join('\n');
   return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text };
@@ -1044,7 +1074,7 @@ async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<ty
   ]);
 }
 
-async function buildTurnMemoryPrimer(input: string): Promise<TurnMemoryPrimer> {
+async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<TurnMemoryPrimer> {
   const enabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER', 'on') ?? 'on').toLowerCase() !== 'off';
   const hybridEnabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID', 'on') ?? 'on').toLowerCase() !== 'off';
   const query = input.replace(/\s+/g, ' ').trim();
@@ -1056,27 +1086,27 @@ async function buildTurnMemoryPrimer(input: string): Promise<TurnMemoryPrimer> {
 
   try {
     const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
-    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5');
+    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId);
 
     try {
       const hybridHits = await searchVaultAsyncWithTimeout(query);
       if (hybridHits && hybridHits.length > 0) {
-        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid');
+        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId);
       }
       if (hybridHits === null) {
         return {
-          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout'),
+          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId),
           skippedReason: ftsHits.length > 0 ? 'hybrid_timeout' : 'hybrid_timeout_no_fts_hits',
         };
       }
     } catch {
       return {
-        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error'),
+        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId),
         skippedReason: ftsHits.length > 0 ? 'hybrid_error' : 'hybrid_error_no_fts_hits',
       };
     }
 
-    return formatTurnMemoryPrimer(query, ftsHits, 'fts5');
+    return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId);
   } catch (err) {
     return {
       enabled: true,
@@ -3067,7 +3097,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // background; it never blocks the turn again.
   const assemblySettled = await Promise.race([
     Promise.all([
-      buildTurnMemoryPrimer(options.input),
+      buildTurnMemoryPrimer(options.input, options.sessionId),
       primeTurnRecallVector(options.input),
     ]).then((r) => r as [TurnMemoryPrimer, void]),
     new Promise<null>((resolve) => {

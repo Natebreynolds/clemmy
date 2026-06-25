@@ -17,6 +17,7 @@ import {
 } from './facts.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
+import { recordEntityEdge } from './relations.js';
 import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
@@ -89,6 +90,13 @@ const ExtractedResourceSchema = z.object({
   whats_here: z.string().max(200).optional(),
   when_to_use: z.string().max(160).optional(),
 });
+// Entity↔entity relationship ("Dana" -is CFO at- "Acme") → entity_edges (WS2).
+// Subject/object are entity NAMES the extractor also lists in `entities`.
+const ExtractedRelationshipSchema = z.object({
+  subject: z.string().min(1).max(120),
+  predicate: z.string().min(1).max(80),
+  object: z.string().min(1).max(120),
+});
 const ExtractionSchema = z.object({
   facts: z.array(ExtractedFactSchema).max(8),
   entities: z.array(ExtractedEntitySchema).max(12),
@@ -104,6 +112,7 @@ const ExtractionSchemaWithResources = z.object({
 });
 export type Extraction = z.infer<typeof ExtractionSchema> & {
   resources?: z.infer<typeof ExtractedResourceSchema>[];
+  relationships?: z.infer<typeof ExtractedRelationshipSchema>[];
 };
 
 export interface ReflectionInput {
@@ -127,16 +136,29 @@ export interface ReflectionResult {
 const PROMPT_PREAMBLE = buildExtractorPreamble(false);
 const PROMPT_PREAMBLE_WITH_RESOURCES = buildExtractorPreamble(true);
 
-function buildExtractorPreamble(includeResources: boolean): string {
+/** WS2 entity↔entity edges from the extractor. Default OFF (validation-gated
+ *  flip per the no-rollout-flags directive) so the extractor prompt + schema
+ *  stay byte-identical until proven. The entity_edges table + graph rendering
+ *  ship regardless; this only controls POPULATION from the extractor. */
+function entityEdgesEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_ENTITY_EDGES', 'off') || 'off').trim().toLowerCase() === 'on';
+}
+
+function buildExtractorPreamble(includeResources: boolean, includeRelationships = false): string {
+  // The pointers line is the LAST entry only when nothing follows it.
+  const pointersTrailing = !includeResources && !includeRelationships;
   const shape = [
     '  "facts": [{ "kind": "user|project|feedback|reference", "text": "<short fact>", "importance": <1-10> }],',
     '  "entities": [{ "type": "person|company|project|place|thing", "name": "<canonical>", "aliases": ["<alt>", ...] }],',
-    includeResources
-      ? '  "pointers": [{ "label": "<short human label>", "source_uri": "<optional uri like outlook:thread:abc>" }],'
-      : '  "pointers": [{ "label": "<short human label>", "source_uri": "<optional uri like outlook:thread:abc>" }]',
+    pointersTrailing
+      ? '  "pointers": [{ "label": "<short human label>", "source_uri": "<optional uri like outlook:thread:abc>" }]'
+      : '  "pointers": [{ "label": "<short human label>", "source_uri": "<optional uri like outlook:thread:abc>" }],',
   ];
   if (includeResources) {
-    shape.push('  "resources": [{ "kind": "folder|file|doc|sheet|base|table|object|channel|label", "name": "<resource name>", "ref": "<optional stable id/uri>", "whats_here": "<one phrase: what this holds>", "when_to_use": "<optional: when to come back here>" }]');
+    shape.push(`  "resources": [{ "kind": "folder|file|doc|sheet|base|table|object|channel|label", "name": "<resource name>", "ref": "<optional stable id/uri>", "whats_here": "<one phrase: what this holds>", "when_to_use": "<optional: when to come back here>" }]${includeRelationships ? ',' : ''}`);
+  }
+  if (includeRelationships) {
+    shape.push('  "relationships": [{ "subject": "<entity name>", "predicate": "<short relation, e.g. works at / reports to / owns>", "object": "<entity name>" }]');
   }
   const lines = [
     'You are the reflection layer of a long-running personal assistant.',
@@ -162,9 +184,14 @@ function buildExtractorPreamble(includeResources: boolean): string {
   if (includeResources) {
     lines.push('- "resources" are NAMED LOCATIONS this output reveals — a Drive folder, an Airtable base/table, a CRM object, a mail label, a channel. Capture WHERE data lives + what it holds (NOT the content). Only include real, re-visitable containers; skip one-off records and the data values themselves.');
   }
+  if (includeRelationships) {
+    lines.push('- "relationships" connect two entities you already listed in "entities" with a short predicate ("works at", "reports to", "owns"). Only include relations the output actually states; subject and object MUST be names present in "entities".');
+  }
+  const arrayCount = 3 + (includeResources ? 1 : 0) + (includeRelationships ? 1 : 0);
+  const countWord = ['zero', 'one', 'two', 'three', 'four', 'five'][arrayCount] ?? String(arrayCount);
   lines.push(
     '- DO NOT extract ephemeral state (current weather, request-ids, timestamps).',
-    `- DO NOT invent facts. If the output is noise/empty/error, return all ${includeResources ? 'four' : 'three'} arrays empty.`,
+    `- DO NOT invent facts. If the output is noise/empty/error, return all ${countWord} arrays empty.`,
     '- Output ONLY the JSON object. No markdown fences. No commentary.',
   );
   return lines.join('\n');
@@ -295,8 +322,23 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
   // Source-map: when on, ask the extractor for `resources` too (named
   // locations). Flag-off keeps the schema + prompt byte-identical to today.
   const withResources = isSourceMapEnabled();
-  const schema = withResources ? ExtractionSchemaWithResources : ExtractionSchema;
-  const instructions = withResources ? PROMPT_PREAMBLE_WITH_RESOURCES : PROMPT_PREAMBLE;
+  const withRelationships = entityEdgesEnabled();
+  // Common case (no relationships): use the precomputed static schemas/prompts
+  // so flag-off is byte-identical to today. Only compose dynamically when the
+  // (default-off) entity-edges flag is on.
+  let schema: z.ZodTypeAny = withResources ? ExtractionSchemaWithResources : ExtractionSchema;
+  let instructions = withResources ? PROMPT_PREAMBLE_WITH_RESOURCES : PROMPT_PREAMBLE;
+  if (withRelationships) {
+    const shape: Record<string, z.ZodTypeAny> = {
+      facts: z.array(ExtractedFactSchema).max(8),
+      entities: z.array(ExtractedEntitySchema).max(12),
+      pointers: z.array(ExtractedPointerSchema).max(4),
+      relationships: z.array(ExtractedRelationshipSchema).max(8),
+    };
+    if (withResources) shape.resources = z.array(ExtractedResourceSchema).max(6);
+    schema = z.object(shape);
+    instructions = buildExtractorPreamble(withResources, true);
+  }
   try {
     // v0.5.22.1 — outputType binds ExtractionSchema to the SDK's structured-
     // output path, so OpenAI's grammar-constrained sampling guarantees a
@@ -929,12 +971,31 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     }
   }
 
+  // Upsert entities, keeping a name→id map so relationships can resolve.
+  const entityIdByName = new Map<string, number>();
   for (const entity of extraction.entities) {
     try {
-      upsertEntity({ type: entity.type, name: entity.name, aliases: entity.aliases });
+      const id = upsertEntity({ type: entity.type, name: entity.name, aliases: entity.aliases });
+      entityIdByName.set(entity.name.trim().toLowerCase(), id);
+      for (const a of entity.aliases ?? []) entityIdByName.set(String(a).trim().toLowerCase(), id);
       entitiesUpserted += 1;
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : String(err), entity }, 'reflection: upsertEntity failed');
+    }
+  }
+
+  // WS2 (gated): persist entity↔entity relations the extractor surfaced. Both
+  // endpoints must be entities we just upserted (subject/object are names from
+  // the same `entities` list) so we never invent an edge to an unknown node.
+  if (Array.isArray(extraction.relationships)) {
+    for (const rel of extraction.relationships) {
+      try {
+        const subjectId = entityIdByName.get(rel.subject.trim().toLowerCase());
+        const objectId = entityIdByName.get(rel.object.trim().toLowerCase());
+        if (subjectId && objectId) recordEntityEdge({ subjectId, predicate: rel.predicate, objectId });
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err), rel }, 'reflection: recordEntityEdge failed');
+      }
     }
   }
 

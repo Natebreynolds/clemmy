@@ -28,7 +28,7 @@ import {
 import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
-import { readEmbeddingStats } from '../memory/embeddings.js';
+import { readEmbeddingStats, getEmbeddingHealth } from '../memory/embeddings.js';
 import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
@@ -215,7 +215,7 @@ import {
   type ByoProvider,
 } from '../runtime/harness/byo-providers.js';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
-import { slugifyIntent } from '../memory/tool-choice-store.js';
+import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain } from '../runtime/harness/model-role-options.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
@@ -1432,12 +1432,19 @@ export function registerConsoleRoutes(
       const entities = one('SELECT COUNT(*) AS c FROM entities');
       const focusActive = one("SELECT COUNT(*) AS c FROM current_focus WHERE status = 'active'");
       const embStats = readEmbeddingStats();
+      const embHealth = getEmbeddingHealth();
       res.json({
         facts: { active: facts, inactive: factsInactive, total: factsTotal, pinned },
         entities,
         episodicPointers: episodic,
         focusActive,
         embeddings: {
+          // `enabled`/`breakerOpen` make the silent no-key / circuit-broken
+          // degradation legible to the Memory screen — when false the whole
+          // semantic layer (fact recall, dedup, 'similar' edges) is FTS/LIKE-only.
+          enabled: embHealth.enabled,
+          breakerOpen: embHealth.breakerOpen,
+          lastErrorClass: embHealth.lastErrorClass,
           model: embStats.model,
           dim: embStats.dim,
           factCoverage: factsTotal > 0 ? factEmbeds / factsTotal : 0,
@@ -1447,6 +1454,42 @@ export function registerConsoleRoutes(
         },
         recall: getRecallStats(),
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Tool-recall (procedural) memory — the per-machine store of which tool
+   * proved out for a given intent. Until now this learned-procedure store was
+   * inspectable only by hand-reading the `.md` files; the Memory screen renders
+   * the list from here so the strongest ever-learning signal is auditable and
+   * (eventually) correctable. Read-only: returns each record with its
+   * Laplace-smoothed outcome score so the UI can sort by what's working.
+   */
+  app.get('/api/console/memory/tool-recall', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const records = listToolChoices().map((r) => ({
+        intent: r.intent,
+        description: r.description ?? null,
+        choice: r.choice
+          ? {
+              kind: r.choice.kind,
+              identifier: r.choice.identifier,
+              testedAt: r.choice.testedAt,
+              successCount: r.choice.successCount ?? 0,
+              failureCount: r.choice.failureCount ?? 0,
+              lastSuccessAt: r.choice.lastSuccessAt ?? null,
+              lastFailureAt: r.choice.lastFailureAt ?? null,
+              score: computeChoiceScore(r.choice),
+            }
+          : null,
+        fallbacks: r.fallbacks.map((f) => ({ kind: f.kind, identifier: f.identifier, reason: f.reason, failedAt: f.failedAt })),
+      }));
+      // Strongest, most-recently-validated first; invalidated (no active choice) sink.
+      records.sort((a, b) => (b.choice?.score ?? -1) - (a.choice?.score ?? -1));
+      res.json({ count: records.length, records });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
