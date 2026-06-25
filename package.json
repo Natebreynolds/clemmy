@@ -106,7 +106,7 @@
   },
   "overrides": {
     "fast-uri": "^3.1.2",
-    "hono": "^4.12.23",
+    "hono": "^4.12.27",
     "ip-address": "^10.2.0",
     "qs": "^6.15.2",
     "ws": "^8.21.0"
@@ -122,5 +122,8 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.2.0"
   }
 }
