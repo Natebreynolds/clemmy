@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildWorkflowObjective,
+  deriveLegacyWorkflowRunGoal,
   renderDeliverableForJudge,
   judgeWorkflowTarget,
 } from './workflow-objective-judge.js';
@@ -50,6 +51,46 @@ test('buildWorkflowObjective: empty when nothing declared and no inputs', () => 
   assert.equal(obj, '');
 });
 
+test('deriveLegacyWorkflowRunGoal: derives provisional goal from intent, inputs, and output contracts', () => {
+  const goal = deriveLegacyWorkflowRunGoal(
+    wf({
+      description_body: 'Cover rankings and citation gaps.',
+      synthesis: { prompt: 'Assemble a branded audit page.' },
+      steps: [
+        {
+          id: 'deploy',
+          output: {
+            type: 'object',
+            required_keys: ['url', 'path', 'items'],
+            verify: { url_present: ['url'], path_exists: ['path'] },
+            non_empty: ['items'],
+            min_items: { items: 1 },
+          },
+        },
+      ],
+    }),
+    { url: 'https://acme-law.com' },
+  );
+  assert.ok(goal);
+  assert.equal(goal!.source, 'legacy');
+  assert.equal(goal!.maxAttempts, 1);
+  assert.match(goal!.objective, /competitive SEO brief/i);
+  assert.match(goal!.objective, /url=https:\/\/acme-law\.com/);
+  assert.ok(goal!.successCriteria.some((c) => /synthesis intent/i.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /required keys: url, path, items/.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /http\(s\) URL at "url"/.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /existing local file path at "path"/.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /at least 1 item/.test(c)));
+});
+
+test('deriveLegacyWorkflowRunGoal: null when a legacy workflow has no objective source', () => {
+  const goal = deriveLegacyWorkflowRunGoal(
+    { name: 'x', description: '', steps: [] } as Parameters<typeof deriveLegacyWorkflowRunGoal>[0],
+    {},
+  );
+  assert.equal(goal, null);
+});
+
 // ── renderDeliverableForJudge ────────────────────────────────────────────
 
 test('renderDeliverableForJudge: passes a string deliverable through', () => {
@@ -88,6 +129,28 @@ test('judgeWorkflowTarget: reached when the judge says done', async () => {
   assert.equal(v.reached, true);
   assert.equal(v.judged, true);
   assert.equal(j.calls(), 1);
+});
+
+test('judgeWorkflowTarget: includes provisional legacy success criteria in the judged objective', async () => {
+  let seenObjective = '';
+  const goal = {
+    objective: 'Produce a live audit page.',
+    successCriteria: ['A real URL is present.', 'The local HTML file exists.'],
+  };
+  const v = await judgeWorkflowTarget({
+    workflow: wf(),
+    inputs: {},
+    finalOutput: 'Audit at https://example.com',
+    goal,
+    judgeFn: async (objective) => {
+      seenObjective = objective;
+      return { done: true, reason: 'ok' };
+    },
+  });
+  assert.equal(v.reached, true);
+  assert.match(seenObjective, /Produce a live audit page/);
+  assert.match(seenObjective, /Success criteria inferred from the workflow contract/);
+  assert.match(seenObjective, /A real URL is present/);
 });
 
 test('judgeWorkflowTarget: NOT reached when the judge names a specific miss', async () => {

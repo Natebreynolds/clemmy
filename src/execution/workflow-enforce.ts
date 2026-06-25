@@ -29,6 +29,8 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
     enabled: def.enabled,
     trigger: def.trigger,
     inputs: def.inputs as WorkflowFrontmatter['inputs'],
+    synthesis: def.synthesis,
+    goal: def.goal,
     steps: def.steps.map((s) => ({
       id: s.id,
       prompt: s.prompt,
@@ -457,23 +459,28 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
     }
   }
 
-  // 3. {{input.X}} referenced in a step prompt but undeclared (and not a
-  //    common injectable key) → declare it so the engine binds it. Mirrors
-  //    the validator's checkInputTokenBinding error surface exactly.
+  // 3. {{input.X}} referenced in a step/synthesis prompt but undeclared →
+  //    declare it so the engine binds it and callers know to supply it. This
+  //    now includes common keys like url/domain: they are still recognized by
+  //    the runner, but should not stay invisible in workflow metadata.
   const declared: Record<string, WorkflowInputDef> = { ...(def.inputs ?? {}) };
   let declaredChanged = false;
-  for (const step of steps) {
-    if (!step.prompt) continue;
+  const declareReferencedInputs = (prompt: string | undefined, source: string): void => {
+    if (!prompt) return;
     const inputRe = /\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g;
     let m: RegExpExecArray | null;
-    while ((m = inputRe.exec(step.prompt)) !== null) {
+    while ((m = inputRe.exec(prompt)) !== null) {
       const key = m[1];
-      if (key in declared || COMMON_WORKFLOW_INPUT_KEYS.has(key)) continue;
+      if (key in declared) continue;
       declared[key] = { type: 'string' };
       declaredChanged = true;
-      repairs.push(`Declared workflow input "${key}" (referenced by {{input.${key}}} but never declared).`);
+      repairs.push(`Declared workflow input "${key}" (${source} referenced {{input.${key}}} but never declared it).`);
     }
+  };
+  for (const step of steps) {
+    declareReferencedInputs(step.prompt, `step "${step.id}"`);
   }
+  declareReferencedInputs(def.synthesis?.prompt, 'synthesis prompt');
 
   if (repairs.length === 0 && !sideEffectChanged) return { def, repairs };
   const repaired: WorkflowDefinition = {

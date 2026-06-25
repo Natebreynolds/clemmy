@@ -176,6 +176,17 @@ test('autoRepair: undeclared {{input.X}} gets declared so the engine binds it', 
   assert.equal(checkWorkflowForWrite(repaired).ok, true);
 });
 
+test('autoRepair: undeclared synthesis {{input.X}} gets declared too', () => {
+  const def = wf({
+    synthesis: { prompt: 'Summarize the workflow result for {{input.sheetId}}.' },
+  });
+  assert.equal(checkWorkflowForWrite(def).ok, false);
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.ok(repaired.inputs?.sheetId);
+  assert.match(repairs.join(' '), /synthesis prompt.*sheetId/);
+  assert.equal(checkWorkflowForWrite(repaired).ok, true);
+});
+
 test('autoRepair P0-3: derives sideEffect from the prompt when the author omitted it', () => {
   const def = wf({
     steps: [
@@ -198,11 +209,20 @@ test('autoRepair P0-3: never overrides an author-declared sideEffect', () => {
   assert.equal(repaired.steps[0].sideEffect, 'read'); // declared value preserved
 });
 
-test('autoRepair: never declares a COMMON input key (url is injectable)', () => {
+test('autoRepair: declares COMMON input keys so callers/UI can supply them', () => {
   const def = wf({ steps: [{ id: 'a', prompt: 'audit {{input.url}}' }] });
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
-  assert.equal(repairs.length, 0);
-  assert.equal(repaired.inputs?.url, undefined);
+  assert.ok(repaired.inputs?.url);
+  assert.match(repairs.join(' '), /url/);
+  assert.equal(checkWorkflowForWrite(repaired).ok, true);
+});
+
+test('checkWorkflowForWrite: synthesis participates in validation', () => {
+  const result = checkWorkflowForWrite(wf({
+    synthesis: { prompt: 'Write the final summary for {{input.sheetId}}.' },
+  }));
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join(' '), /Synthesis prompt.*sheetId/);
 });
 
 test('autoRepair: refuses to introduce a cycle (leaves the error for the validator)', () => {

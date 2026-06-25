@@ -51,6 +51,12 @@ function workflowUpdate(): ToolHandler {
   return handler;
 }
 
+function workflowContractProposals(): ToolHandler {
+  const handler = handlers.get('workflow_contract_proposals');
+  assert.ok(handler, 'workflow_contract_proposals registered');
+  return handler;
+}
+
 function resultText(result: ToolResult): string {
   return result.content.map((item) => item.text).join('\n');
 }
@@ -169,6 +175,33 @@ test('workflow_create persists a step OUTPUT contract (declarable verification u
   });
   assert.match(resultText(result), /Created workflow "contract-wf"/);
   assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, contract);
+});
+
+test('workflow_contract_proposals reports upgrades without mutating workflow files', async () => {
+  writeWorkflow('legacy-contract-wf', {
+    name: 'legacy-contract-wf',
+    description: 'Audit {{input.url}} and publish a report.',
+    enabled: false,
+    trigger: { manual: true },
+    synthesis: { prompt: 'Return the live report URL.' },
+    steps: [
+      { id: 'deploy', prompt: 'Deploy the audit page and return the URL for {{input.url}}.' },
+    ],
+  });
+
+  const before = readWorkflow('legacy-contract-wf')!.data;
+  const result = await workflowContractProposals()({ name: 'legacy contract' });
+  const text = resultText(result);
+
+  assert.match(text, /Workflow Contract Proposals/);
+  assert.match(text, /Suggested inputs/);
+  assert.match(text, /Suggested pinned goal/);
+  assert.match(text, /url_present: \["url"\]/);
+
+  const after = readWorkflow('legacy-contract-wf')!.data;
+  assert.deepEqual(after.goal, before.goal);
+  assert.deepEqual(after.inputs, before.inputs);
+  assert.deepEqual(after.steps[0].output, before.steps[0].output);
 });
 
 test('workflow_create persists step intent for intent-routed worker models', async () => {

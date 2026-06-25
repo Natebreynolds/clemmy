@@ -33,10 +33,17 @@ export interface PreflightResult {
   errors: string[];
   /** Non-blocking authoring advisories. */
   warnings: string[];
+  /** Semantic edits worth making before the next production run. */
+  editAdvisories: string[];
   /** Inputs the workflow needs at run time that weren't supplied here. */
   missingInputs: string[];
   /** One-line human verdict. */
   summary: string;
+}
+
+export function workflowEditAdvisories(warnings: string[]): string[] {
+  return warnings.filter((w) =>
+    /no pinned `goal`|output contract|common input \{\{input\.|Synthesis prompt references common input/i.test(w));
 }
 
 export function preflightWorkflow(
@@ -54,6 +61,7 @@ export function preflightWorkflow(
   const missingInputs = missingWorkflowRunInputs(def, inputs);
   const errors = [...check.errors, ...capabilityErrors];
   const ok = check.ok && capabilityErrors.length === 0;
+  const editAdvisories = workflowEditAdvisories(check.warnings);
   const stepCount = def.steps?.length ?? 0;
   const summary = ok
     ? `Preflight passed — ${stepCount} step${stepCount === 1 ? '' : 's'} look runnable`
@@ -61,7 +69,7 @@ export function preflightWorkflow(
         ? `, but you'll need to supply ${missingInputs.map((k) => `"${k}"`).join(', ')} at run time.`
         : '.')
     : `Preflight found ${errors.length} blocking issue${errors.length === 1 ? '' : 's'} — fix before running.`;
-  return { ok, errors, warnings: check.warnings, missingInputs, summary };
+  return { ok, errors, warnings: check.warnings, editAdvisories, missingInputs, summary };
 }
 
 function workflowCapabilityErrors(def: WorkflowDefinition): string[] {
@@ -95,6 +103,13 @@ export function renderPreflightReport(workflowName: string, result: PreflightRes
   }
   if (result.warnings.length > 0) {
     lines.push('', 'Advisories:', ...result.warnings.slice(0, 5).map((w) => `- ${w}`));
+  }
+  if (result.editAdvisories.length > 0) {
+    lines.push(
+      '',
+      'Recommended edits before relying on this workflow unattended:',
+      ...result.editAdvisories.slice(0, 5).map((w) => `- ${w}`),
+    );
   }
   lines.push('', 'Note: a preflight checks runnability without executing — no tools ran, nothing was sent.');
   return lines.join('\n');

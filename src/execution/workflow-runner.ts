@@ -68,7 +68,7 @@ import {
   type BlockedStep,
 } from './workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
-import { stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
+import { prepareWorkflowForWrite, stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
 import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
 import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold, clearWorkflowFailures } from './workflow-failure-ledger.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
@@ -76,7 +76,7 @@ import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { verifyStepOutput, isEmptyValue } from './step-output-verify.js';
-import { judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
+import { deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
 import { deliverOutcome } from '../runtime/outcome.js';
@@ -2593,8 +2593,8 @@ export async function executeStep(
   if ((process.env.HARNESS_SKILL_EXEC_GATE ?? 'on').toLowerCase() !== 'off' && step.usesSkill?.trim()) {
     let skillGap: { skill: string; prescribed: string[] } | null = null;
     try {
-      const body = loadSkill(step.usesSkill.trim())?.body ?? '';
-      skillGap = body ? skillBodyExecutionShortfall(step.usesSkill.trim(), body, stepSessionId) : null;
+      const skill = loadSkill(step.usesSkill.trim());
+      skillGap = skill?.body ? skillBodyExecutionShortfall(step.usesSkill.trim(), skill.body, stepSessionId, skill.dir) : null;
     } catch { skillGap = null; }
     if (skillGap) {
       throw new Error(
@@ -3880,6 +3880,74 @@ async function processOneRunFile(
       return;
     }
 
+    if (!run.targetStepId) {
+      const prep = prepareWorkflowForWrite(workflow.data);
+      if (prep.ok && prep.repairs.length > 0) {
+        workflow.data = prep.def;
+        try { writeWorkflow(workflow.name, prep.def); } catch { /* best-effort: run with repaired in-memory definition */ }
+        try {
+          appendWorkflowEvent(workflow.name, run.id, {
+            kind: 'step_advisory',
+            stepId: '(preflight)',
+            meta: { reason: 'pre_run_auto_repair', repairs: prep.repairs.slice(0, 8) },
+          });
+        } catch { /* best-effort */ }
+        logger.info({ workflow: workflow.data.name, runId: run.id, repairs: prep.repairs }, 'workflow pre-run auto-repair applied');
+      }
+      const preflight = preflightWorkflow(workflow.data, run.inputs ?? {});
+      if (!preflight.ok) {
+        const message = `Workflow "${workflow.data.name}" needs edits before it can run. ${preflight.summary}`;
+        startWorkflowActivityRun(run, workflow.data.name, `Starting workflow "${workflow.data.name}"`);
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'run_failed',
+          error: message,
+          meta: { preflightErrors: preflight.errors.slice(0, 8), editAdvisories: preflight.editAdvisories.slice(0, 8) },
+        });
+        writeRunRecord(filePath, {
+          ...run,
+          status: 'error',
+          error: message,
+          finishedAt: new Date().toISOString(),
+        });
+        addNotification({
+          id: `workflow-${run.id}-preflight`,
+          kind: 'workflow',
+          title: `Workflow needs edits: ${workflow.data.name}`,
+          body: renderPreflightReport(workflow.data.name, preflight),
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: { workflow: workflow.data.name, runId: run.id, status: 'error', preflight: true },
+        });
+        finishWorkflowActivityRun(run.id, {
+          status: 'failed',
+          message,
+          error: preflight.errors.join('\n'),
+        });
+        markRunNotified(filePath);
+        logger.warn(
+          { workflow: workflow.data.name, runId: run.id, errors: preflight.errors },
+          'Workflow run rejected before start: preflight failed',
+        );
+        return;
+      }
+      if (preflight.editAdvisories.length > 0) {
+        try {
+          appendWorkflowEvent(workflow.name, run.id, {
+            kind: 'step_advisory',
+            stepId: '(preflight)',
+            meta: {
+              reason: 'workflow_edit_recommended',
+              editAdvisories: preflight.editAdvisories.slice(0, 8),
+            },
+          });
+        } catch { /* best-effort */ }
+        logger.info(
+          { workflow: workflow.data.name, runId: run.id, editAdvisories: preflight.editAdvisories },
+          'workflow preflight recommends edits before unattended reliance',
+        );
+      }
+    }
+
     const inputs: Record<string, string> = normalizeWorkflowRunInputs({
       ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([key, meta]) => [key, meta.default ?? ''])),
       ...(run.inputs ?? {}),
@@ -3997,6 +4065,7 @@ async function processOneRunFile(
       // the parked criteria are stricter and produce per-criterion evidence,
       // so double-judging would only burn a second model call.
       const declaredRunGoal = workflowRunGoal(workflow.data);
+      const legacyRunGoal = declaredRunGoal ? null : deriveLegacyWorkflowRunGoal(workflow.data, inputs);
       let targetVerdict: WorkflowTargetVerdict | null = null;
       if (!declaredRunGoal) {
         try {
@@ -4004,6 +4073,7 @@ async function processOneRunFile(
             workflow: workflow.data,
             inputs,
             finalOutput,
+            goal: legacyRunGoal ?? undefined,
             fallbackBody: baseSuccessBody,
             isPartialRun: Boolean(run.targetStepId),
           });
@@ -4012,11 +4082,18 @@ async function processOneRunFile(
           qualityAdvisories.push({
             stepId: '(workflow target)',
             kind: 'target_missed',
-            note: `couldn't confirm this run reached the workflow's target: ${targetVerdict.gap}`,
+            note: `couldn't confirm this run reached the workflow's inferred legacy goal: ${targetVerdict.gap}`,
           });
           logger.info(
-            { workflow: workflow.data.name, runId: run.id, gap: targetVerdict.gap },
-            'Workflow target check flagged a possible miss — surfacing as a non-failing advisory',
+            {
+              workflow: workflow.data.name,
+              runId: run.id,
+              gap: targetVerdict.gap,
+              legacyGoal: legacyRunGoal
+                ? { objective: legacyRunGoal.objective.slice(0, 240), criteria: legacyRunGoal.successCriteria.length }
+                : null,
+            },
+            'Legacy workflow target check flagged a possible miss — surfacing as a non-failing advisory',
           );
         }
       }

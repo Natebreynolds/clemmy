@@ -58,6 +58,13 @@ export interface WorkflowFrontmatter {
   steps?: WorkflowStepShape[];
   inputs?: Record<string, { type?: string; default?: string; description?: string }>;
   synthesis?: { prompt?: string };
+  goal?: {
+    objective?: string;
+    successCriteria?: string[];
+    success_criteria?: string[];
+    maxAttempts?: number;
+    max_attempts?: number;
+  };
 }
 
 export interface WorkflowValidation {
@@ -236,8 +243,9 @@ function checkStepOutputReferences(
 // validation into create/enable so a broken workflow can't be enabled.)
 
 const KNOWN_TOKEN = /^(?:date|input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?)$/;
+const INPUT_TOKEN_RE = /\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g;
 
-function checkMalformedTokens(stepId: string, prompt: string): string[] {
+function checkMalformedTokens(subject: string, prompt: string): string[] {
   const errors: string[] = [];
   const tokenPattern = /\{\{\s*([^{}]+?)\s*\}\}/g;
   let match;
@@ -251,7 +259,7 @@ function checkMalformedTokens(stepId: string, prompt: string): string[] {
     if (looksLikeToken && !KNOWN_TOKEN.test(token)) {
       const hint = /^[a-zA-Z0-9_-]+$/.test(token) ? ` Did you mean {{input.${token}}}?` : '';
       errors.push(
-        `Step "${stepId}" uses an unrecognized template token {{${token}}} — it renders as literal text and silently drops the value.${hint}`,
+        `${subject} uses an unrecognized template token {{${token}}} — it renders as literal text and silently drops the value.${hint}`,
       );
     }
   }
@@ -259,23 +267,44 @@ function checkMalformedTokens(stepId: string, prompt: string): string[] {
 }
 
 function checkInputTokenBinding(
-  stepId: string,
+  subject: string,
   prompt: string,
   declaredInputKeys: Set<string>,
 ): string[] {
   const errors: string[] = [];
-  const inputPattern = /\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g;
   let match;
-  while ((match = inputPattern.exec(prompt)) !== null) {
+  INPUT_TOKEN_RE.lastIndex = 0;
+  while ((match = INPUT_TOKEN_RE.exec(prompt)) !== null) {
     const key = match[1];
     if (!declaredInputKeys.has(key) && !COMMON_WORKFLOW_INPUT_KEYS.has(key)) {
       errors.push(
-        `Step "${stepId}" references {{input.${key}}} but no workflow/step input declares "${key}". `
+        `${subject} references {{input.${key}}} but no workflow/step input declares "${key}". `
         + 'Declare it under the workflow `inputs:` (or the step `inputs:`) so the engine binds it — otherwise it renders empty.',
       );
     }
   }
   return errors;
+}
+
+function checkImplicitCommonInputDeclarations(
+  subject: string,
+  prompt: string,
+  declaredInputKeys: Set<string>,
+): string[] {
+  const warnings: string[] = [];
+  const seen = new Set<string>();
+  INPUT_TOKEN_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = INPUT_TOKEN_RE.exec(prompt)) !== null) {
+    const key = match[1];
+    if (seen.has(key) || declaredInputKeys.has(key) || !COMMON_WORKFLOW_INPUT_KEYS.has(key)) continue;
+    seen.add(key);
+    warnings.push(
+      `${subject} references common input {{input.${key}}} without declaring "${key}" under workflow inputs. `
+      + 'Declare it so workflow_run, the dashboard, and the agent can ask for or supply the value before the run starts.',
+    );
+  }
+  return warnings;
 }
 
 // ─── Tool slug catalog check ─────────────────────────────────────────
@@ -398,16 +427,61 @@ function checkDeterministicRunner(step: WorkflowStepShape): string | null {
 // deliverable passes silently. Advisory only (regex can't be certain), and
 // skipped when the step already declares output / is a forEach fan-out wrapper
 // (its items carry the shape) / is purely deterministic config.
-const DELIVERABLE_RE = /\b(report|brief|audit|file|document|url|link|html|sheet|spreadsheet|pdf|csv|deck|slides?|deploy(?:ed|ment)?|publish(?:ed)?|draft(?:ed)?|record|page|website|saved to|written to|upload(?:ed)?)\b/i;
+const DELIVERABLE_RE = /\b(report|brief|audit|file|document|url|link|html|sheet|spreadsheet|pdf|csv|deck|slides?|deploy(?:ed|ment)?|publish(?:ed)?|draft(?:ed)?|records?|rows?|list|items?|leads?|prospects?|meetings?|accounts?|contacts?|results?|page|website|saved to|written to|upload(?:ed)?)\b/i;
 const PRODUCE_RE = /\b(produce|generate|create|build|write|draft|deploy|publish|save|export|render|compile|assemble|deliver|output)\b/i;
+const URL_DELIVERABLE_RE = /\b(url|link|deploy(?:ed|ment)?|publish(?:ed)?|website|page|live\s+site|netlify|vercel)\b/i;
+const FILE_DELIVERABLE_RE = /\b(file|html|pdf|csv|deck|slides?|document|screenshot|preview|saved to|written to|export|render)\b/i;
+const LIST_DELIVERABLE_RE = /\b(list|rows?|records?|items?|leads?|prospects?|meetings?|accounts?|contacts?|results?)\b/i;
+
+function stepLooksDeliverable(step: WorkflowStepShape): boolean {
+  const prompt = step.prompt ?? '';
+  return DELIVERABLE_RE.test(prompt) && PRODUCE_RE.test(prompt);
+}
+
+function workflowHasGoal(data: WorkflowFrontmatter): boolean {
+  const objective = data.goal?.objective;
+  return typeof objective === 'string' && objective.trim().length >= 4;
+}
+
+function outputContractSuggestion(prompt: string): string {
+  const checks: string[] = [];
+  const required = new Set<string>();
+  if (URL_DELIVERABLE_RE.test(prompt)) {
+    required.add('url');
+    checks.push('verify: { url_present: ["url"] }');
+  }
+  if (FILE_DELIVERABLE_RE.test(prompt)) {
+    required.add('path');
+    checks.push('verify: { path_exists: ["path"] }');
+  }
+  if (LIST_DELIVERABLE_RE.test(prompt)) {
+    required.add('items');
+    checks.push('non_empty: ["items"]');
+    checks.push('min_items: { items: 1 }');
+  }
+  if (required.size === 0) {
+    required.add('result');
+    checks.push('non_empty: ["result"]');
+  }
+  return `Suggested shape: output: { type: "object", required_keys: [${[...required].map((k) => `"${k}"`).join(', ')}], ${checks.join(', ')} }.`;
+}
 
 function checkOutputContractHint(step: WorkflowStepShape): string | null {
   if (step.output && Object.keys(step.output).length > 0) return null;
   if (step.forEach) return null; // the fan-out wrapper aggregates; per-item shape is what matters
   if (step.deterministic) return null; // deterministic steps are handled by checkDeterministicRunner
   const prompt = step.prompt ?? '';
-  if (!DELIVERABLE_RE.test(prompt) || !PRODUCE_RE.test(prompt)) return null;
-  return `Step "${step.id}" looks like it produces a deliverable but declares no output contract. Add an "output" block (e.g. required_keys, or verify.url_present / verify.path_exists for a real URL or file) so the engine can confirm the deliverable actually exists and the end-of-run target check can verify it — otherwise a step that claims success without producing the artifact passes silently.`;
+  if (!stepLooksDeliverable(step)) return null;
+  return `Step "${step.id}" looks like it produces a deliverable but declares no output contract. Add an "output" block so the engine can confirm the deliverable actually exists and the end-of-run target check can verify it — otherwise a step that claims success without producing the artifact passes silently. ${outputContractSuggestion(prompt)}`;
+}
+
+function checkWorkflowGoalHint(data: WorkflowFrontmatter, steps: WorkflowStepShape[]): string | null {
+  if (workflowHasGoal(data)) return null;
+  const hasDeliverableStep = steps.some((step) => !step.forEach && !step.deterministic && stepLooksDeliverable(step));
+  const synthesisPrompt = data.synthesis?.prompt ?? '';
+  const hasDeliverableSynthesis = synthesisPrompt.length > 0 && DELIVERABLE_RE.test(synthesisPrompt);
+  if (!hasDeliverableStep && !hasDeliverableSynthesis) return null;
+  return 'Workflow appears to produce a deliverable but has no pinned `goal`. Add a goal objective and success criteria so completion is judged against external evidence, not just the model saying it is done.';
 }
 
 // A step that should run a PROVEN cli/mcp tool-choice but leaves its prompt
@@ -533,6 +607,20 @@ export function validateWorkflowDefinition(
   // Workflow-level declared input keys (typed-workflow-contract).
   const workflowInputKeys = new Set(Object.keys(data.inputs ?? {}));
 
+  const goalIssue = checkWorkflowGoalHint(data, steps);
+  if (goalIssue) warnings.push(goalIssue);
+
+  if (data.synthesis?.prompt) {
+    const subject = 'Synthesis prompt';
+    for (const issue of checkMalformedTokens(subject, data.synthesis.prompt)) errors.push(issue);
+    for (const issue of checkInputTokenBinding(subject, data.synthesis.prompt, workflowInputKeys)) {
+      errors.push(issue);
+    }
+    for (const issue of checkImplicitCommonInputDeclarations(subject, data.synthesis.prompt, workflowInputKeys)) {
+      warnings.push(issue);
+    }
+  }
+
   // ── Per-step semantic checks (the new 2026-05-21 additions) ──
   for (const step of steps) {
     if (!step.id || !step.prompt) continue;
@@ -566,13 +654,17 @@ export function validateWorkflowDefinition(
     // unrecognized tokens ({{url}} vs {{input.url}}, typos) and
     // {{input.X}} that no declared/common input binds → errors. Declared
     // keys = workflow-level inputs ∪ this step's declared inputs.
-    for (const issue of checkMalformedTokens(step.id, step.prompt)) errors.push(issue);
+    const subject = `Step "${step.id}"`;
+    for (const issue of checkMalformedTokens(subject, step.prompt)) errors.push(issue);
     const declaredInputKeys = new Set([
       ...workflowInputKeys,
       ...Object.keys(step.inputs ?? {}),
     ]);
-    for (const issue of checkInputTokenBinding(step.id, step.prompt, declaredInputKeys)) {
+    for (const issue of checkInputTokenBinding(subject, step.prompt, declaredInputKeys)) {
       errors.push(issue);
+    }
+    for (const issue of checkImplicitCommonInputDeclarations(subject, step.prompt, declaredInputKeys)) {
+      warnings.push(issue);
     }
 
     // Hand-off language → errors (these break workflows in production)

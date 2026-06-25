@@ -6,7 +6,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
+import { preflightWorkflow, renderPreflightReport, workflowEditAdvisories } from './workflow-preflight.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
 function wf(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
@@ -71,6 +71,26 @@ test('preflight: supplying the input clears the heads-up', () => {
   assert.deepEqual(r.missingInputs, []);
 });
 
+test('preflight: separates semantic edit recommendations from generic warnings', () => {
+  const r = preflightWorkflow(wf({
+    enabled: true,
+    description: 'Workflow that builds a client audit',
+    steps: [{ id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' }],
+  }));
+  assert.equal(r.ok, true);
+  assert.ok(r.warnings.some((w) => /output contract/.test(w)));
+  assert.ok(r.editAdvisories.some((w) => /output contract/.test(w)));
+  assert.ok(r.editAdvisories.some((w) => /no pinned `goal`/.test(w)));
+});
+
+test('workflowEditAdvisories: ignores routine non-edit warnings', () => {
+  const out = workflowEditAdvisories([
+    'Workflow is currently disabled — scheduled triggers will not fire.',
+    'Step "build" looks like it produces a deliverable but declares no output contract.',
+  ]);
+  assert.deepEqual(out, ['Step "build" looks like it produces a deliverable but declares no output contract.']);
+});
+
 test('preflight: flags workflow steps whose required local MCP tool is excluded from the worker profile', () => {
   withEnv({ CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS: 'ping,notify_user' }, () => {
     const r = preflightWorkflow(wf({
@@ -89,4 +109,14 @@ test('renderPreflightReport: legible, and states nothing was executed', () => {
   const body = renderPreflightReport('demo', preflightWorkflow(wf()));
   assert.match(body, /✅ Dry-run preflight: demo/);
   assert.match(body, /no tools ran, nothing was sent/);
+});
+
+test('renderPreflightReport: shows recommended workflow edits separately', () => {
+  const body = renderPreflightReport('demo', preflightWorkflow(wf({
+    enabled: true,
+    description: 'Workflow that builds a client audit',
+    steps: [{ id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' }],
+  })));
+  assert.match(body, /Recommended edits before relying on this workflow unattended/);
+  assert.match(body, /output contract/);
 });

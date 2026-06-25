@@ -1,5 +1,5 @@
 import { judgeObjectiveComplete, JUDGE_RESPONSE_MAX_CHARS, type ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
-import type { WorkflowDefinition } from '../memory/workflow-store.js';
+import type { WorkflowDefinition, WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 /**
  * Workflow-level "did we reach the target?" judge.
@@ -68,6 +68,19 @@ type WorkflowTargetFields = Pick<
   'name' | 'description' | 'description_body' | 'whenToUse' | 'synthesis'
 >;
 
+type LegacyGoalStep = {
+  id?: string;
+  output?: WorkflowStepOutputContract;
+};
+
+export interface LegacyWorkflowRunGoal {
+  source: 'legacy';
+  objective: string;
+  successCriteria: string[];
+  /** Legacy inferred goals never auto-re-pursue. */
+  maxAttempts: 1;
+}
+
 function truncateScalar(v: unknown): string {
   const s = typeof v === 'string' ? v : safeJson(v);
   return (s ?? '').slice(0, MAX_INPUT_SCALAR_CHARS);
@@ -101,6 +114,48 @@ export function buildWorkflowObjective(
   return parts.join('\n').slice(0, MAX_OBJECTIVE_CHARS).trim();
 }
 
+function appendContractCriteria(out: string[], step: LegacyGoalStep): void {
+  const id = step.id || 'unnamed';
+  const c = step.output;
+  if (!c || Object.keys(c).length === 0) return;
+  if (c.required_keys?.length) {
+    out.push(`Step "${id}" output includes required keys: ${c.required_keys.join(', ')}.`);
+  }
+  for (const p of c.non_empty ?? []) {
+    out.push(`Step "${id}" output has non-empty value at "${p || '(root)'}".`);
+  }
+  for (const [p, min] of Object.entries(c.min_items ?? {})) {
+    out.push(`Step "${id}" output has at least ${min} item(s) at "${p || '(root)'}".`);
+  }
+  for (const p of c.verify?.url_present ?? []) {
+    out.push(`Step "${id}" output has a real non-empty http(s) URL at "${p}".`);
+  }
+  for (const p of c.verify?.path_exists ?? []) {
+    out.push(`Step "${id}" output has an existing local file path at "${p}".`);
+  }
+}
+
+export function deriveLegacyWorkflowRunGoal(
+  workflow: WorkflowTargetFields & { steps?: LegacyGoalStep[] },
+  inputs: Record<string, unknown>,
+): LegacyWorkflowRunGoal | null {
+  const objective = buildWorkflowObjective(workflow, inputs);
+  if (!objective) return null;
+  const successCriteria: string[] = [];
+  if (workflow.synthesis?.prompt?.trim()) {
+    successCriteria.push(`Final deliverable satisfies synthesis intent: ${workflow.synthesis.prompt.trim()}`);
+  }
+  for (const step of workflow.steps ?? []) {
+    appendContractCriteria(successCriteria, step);
+  }
+  return {
+    source: 'legacy',
+    objective,
+    successCriteria: [...new Set(successCriteria)],
+    maxAttempts: 1,
+  };
+}
+
 /** Render the run's final deliverable as the text the judge audits. */
 export function renderDeliverableForJudge(finalOutput: unknown, fallbackBody?: string): string {
   const fromOutput =
@@ -120,6 +175,8 @@ export interface JudgeWorkflowTargetInput {
   workflow: WorkflowTargetFields & { steps?: unknown };
   inputs: Record<string, unknown>;
   finalOutput: unknown;
+  /** Optional explicit/provisional goal. Legacy workflows pass a derived one. */
+  goal?: Pick<LegacyWorkflowRunGoal, 'objective' | 'successCriteria'>;
   /** Humanized success body — fallback deliverable text when finalOutput is thin. */
   fallbackBody?: string;
   /** True for a `targetStepId` single-step re-run → not judged against the full target. */
@@ -142,7 +199,7 @@ export async function judgeWorkflowTarget(
       gap: 'single-step re-run — not judged against the full workflow target',
     };
   }
-  const objective = buildWorkflowObjective(opts.workflow, opts.inputs);
+  const objective = opts.goal?.objective ?? buildWorkflowObjective(opts.workflow, opts.inputs);
   const deliverable = renderDeliverableForJudge(opts.finalOutput, opts.fallbackBody);
   if (!objective || !deliverable) {
     return {
@@ -159,6 +216,13 @@ export async function judgeWorkflowTarget(
   const objectivePrompt = [
     "This is a BACKGROUND WORKFLOW's target — the complete deliverable the user needs while they are away:",
     objective,
+    ...((opts.goal?.successCriteria?.length ?? 0) > 0
+      ? [
+          '',
+          'Success criteria inferred from the workflow contract:',
+          ...opts.goal!.successCriteria.map((c, i) => `${i + 1}. ${c}`),
+        ]
+      : []),
     '',
     'The run is successful ONLY if the deliverable below fully reaches that target. Be CONSERVATIVE: report NOT done only when a SPECIFIC required part of the target is clearly missing or unfulfilled in the deliverable. If the deliverable plausibly satisfies the target, accept it (done=true).',
     ...(wasWindowedForJudge

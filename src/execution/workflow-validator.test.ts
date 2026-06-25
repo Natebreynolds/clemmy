@@ -277,6 +277,10 @@ test('deliverable-producing step without an output contract → advisory warning
     result.warnings.some((w) => /output contract/i.test(w)),
     `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`,
   );
+  assert.ok(
+    result.warnings.some((w) => /path_exists/.test(w)),
+    `expected file/path contract suggestion, got: ${JSON.stringify(result.warnings)}`,
+  );
 });
 
 test('deliverable step WITH an output contract → no advisory', () => {
@@ -329,6 +333,63 @@ test('forEach + deterministic steps are exempt from the output-contract advisory
     ],
   });
   assert.ok(!det.warnings.some((w) => /output contract/i.test(w)), 'deterministic step exempt');
+});
+
+test('deploy deliverable without output contract suggests URL and file verification', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that deploys an audit page',
+    steps: [
+      { id: 'deploy', prompt: 'Build the audit HTML file, deploy it to Netlify, and return the live URL and saved preview path.' },
+    ],
+  });
+  const warning = result.warnings.find((w) => /output contract/i.test(w));
+  assert.ok(warning, `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`);
+  assert.match(warning!, /url_present/);
+  assert.match(warning!, /path_exists/);
+});
+
+test('list-producing deliverable without output contract suggests non-empty data contract', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that gathers meetings',
+    steps: [
+      { id: 'pull', prompt: 'Generate the list of overdue Salesforce meetings and output the rows.' },
+    ],
+  });
+  const warning = result.warnings.find((w) => /output contract/i.test(w));
+  assert.ok(warning, `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`);
+  assert.match(warning!, /non_empty/);
+  assert.match(warning!, /min_items/);
+});
+
+test('deliverable workflow without a pinned goal gets a goal-loop advisory', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that builds a report',
+    steps: [
+      { id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' },
+    ],
+  });
+  assert.ok(
+    result.warnings.some((w) => /no pinned `goal`/.test(w)),
+    `expected pinned goal advisory, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('deliverable workflow with a pinned goal suppresses goal-loop advisory', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that builds a report',
+    goal: { objective: 'Publish a verified client audit report.' },
+    steps: [
+      { id: 'build', prompt: 'Generate the client audit report and save it to an HTML file.' },
+    ],
+  });
+  assert.ok(
+    !result.warnings.some((w) => /no pinned `goal`/.test(w)),
+    `expected no pinned goal advisory, got: ${JSON.stringify(result.warnings)}`,
+  );
 });
 
 test('deterministic config without runner → warning', () => {
@@ -459,6 +520,19 @@ test('a known token {{input.url}} with a common key validates clean', () => {
   assert.ok(!result.errors.some((e) => /template token|input\./.test(e)), JSON.stringify(result.errors));
 });
 
+test('common input {{input.url}} without workflow input declaration gets metadata advisory', () => {
+  const result = validateWorkflowDefinition({
+    name: 'implicit-url',
+    description: 'Workflow that audits a site',
+    steps: [{ id: 'audit', prompt: 'Run the site audit for {{input.url}}.' }],
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.errors));
+  assert.ok(
+    result.warnings.some((w) => /common input \{\{input\.url\}\}/.test(w) && /dashboard/.test(w)),
+    `expected declaration advisory, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
 test('{{input.X}} with no declared/common binding is flagged', () => {
   const result = validateWorkflowDefinition({
     name: 'unbound',
@@ -482,6 +556,33 @@ test('{{input.X}} declared on the STEP validates clean', () => {
     steps: [{ id: 's', prompt: 'Use {{input.sheet}}.', inputs: { sheet: { type: 'string' } } }],
   });
   assert.ok(!result.errors.some((e) => /sheet/.test(e)), JSON.stringify(result.errors));
+});
+
+test('synthesis {{input.X}} with no declared/common binding is flagged', () => {
+  const result = validateWorkflowDefinition({
+    name: 'synth-unbound',
+    description: 'Workflow with synthesis',
+    steps: [{ id: 's', prompt: 'Produce source data.' }],
+    synthesis: { prompt: 'Summarize the run for {{input.spreadsheetId}}.' },
+  });
+  assert.ok(
+    result.errors.some((e) => /Synthesis prompt/.test(e) && /spreadsheetId/.test(e)),
+    JSON.stringify(result.errors),
+  );
+});
+
+test('synthesis common input {{input.url}} gets declaration advisory', () => {
+  const result = validateWorkflowDefinition({
+    name: 'synth-url',
+    description: 'Workflow with synthesis',
+    steps: [{ id: 's', prompt: 'Produce source data.' }],
+    synthesis: { prompt: 'Summarize the audit for {{input.url}}.' },
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.errors));
+  assert.ok(
+    result.warnings.some((w) => /Synthesis prompt/.test(w) && /input\.url/.test(w)),
+    `expected synthesis input advisory, got: ${JSON.stringify(result.warnings)}`,
+  );
 });
 
 test('{{steps.X.output}} and {{item}} tokens are not flagged as malformed', () => {

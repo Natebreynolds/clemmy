@@ -23,6 +23,7 @@ import { validateCronExpression } from '../shared/cron.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
+import { proposeWorkflowContractUpgrades, renderWorkflowContractProposalReport } from '../execution/workflow-contract-proposals.js';
 import { listCachedToolkits } from '../integrations/composio/client.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
@@ -725,6 +726,45 @@ export function registerOrchestrationTools(server: McpServer): void {
           })
           .join('\n\n'),
       );
+    },
+  );
+
+  server.tool(
+    'workflow_contract_proposals',
+    'Scan one workflow or all installed workflows and propose pinned goal, input, and step output-contract upgrades. Read-only: it never edits workflow files. Use before enabling old workflows or tagging a release.',
+    {
+      name: z.string().optional().describe('Optional workflow name. Omit to scan every installed workflow. Fuzzy names are resolved the same way workflow_get resolves them.'),
+      include_clean: z.boolean().optional().describe('When true, include workflows with no proposed changes. Default false.'),
+    },
+    async ({ name, include_clean }) => {
+      const all = listWorkflowFiles();
+      if (all.length === 0) return textResult('No workflows found.');
+      let targets = all;
+      if (name) {
+        let entry = all.find((w) => w.data.name === name);
+        if (!entry) {
+          const resolution = resolveWorkflowName(
+            name,
+            all.map((e) => ({ name: e.data.name, slug: path.basename(e.dir) })),
+          );
+          if (resolution.kind === 'exact' || resolution.kind === 'fuzzy') {
+            entry = all.find((w) => workflowNamesEqual(w.data.name, resolution.name));
+          } else if (resolution.kind === 'ambiguous') {
+            return textResult(
+              `"${name}" could mean: ${resolution.candidates.map((c) => `"${c}"`).join(', ')}. Ask the user which one, then call workflow_contract_proposals with that exact name.`,
+            );
+          }
+        }
+        if (!entry) {
+          const names = all.map((w) => `"${w.data.name}"`).join(', ');
+          return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
+        }
+        targets = [entry];
+      }
+      const proposals = targets
+        .map((entry) => proposeWorkflowContractUpgrades(entry.data))
+        .filter((proposal) => include_clean === true || proposal.needsUpgrade);
+      return textResult(renderWorkflowContractProposalReport(proposals), { maxChars: 40_000 });
     },
   );
 

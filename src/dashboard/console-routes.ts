@@ -282,6 +282,13 @@ interface WorkflowFrontmatter {
   steps?: WorkflowStepShape[];
   inputs?: Record<string, { type?: string; default?: string; description?: string }>;
   synthesis?: { prompt?: string };
+  goal?: {
+    objective?: string;
+    successCriteria?: string[];
+    success_criteria?: string[];
+    maxAttempts?: number;
+    max_attempts?: number;
+  };
 }
 
 interface ContextFileDefinition {
@@ -2212,6 +2219,7 @@ export function registerConsoleRoutes(
       steps: entry.data.steps,
       inputs: entry.data.inputs,
       synthesis: entry.data.synthesis,
+      goal: entry.data.goal,
     };
     res.json(validateWorkflowDefinition(data));
   });

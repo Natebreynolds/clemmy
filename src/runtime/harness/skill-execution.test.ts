@@ -5,7 +5,7 @@
  * session loaded (un-clipped, envelope stripped), the cheap read-gate, and the
  * tool-call evidence summary. All helpers FAIL-OPEN. Temp CLEMENTINE_HOME.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -17,7 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { resetEventLog, createSession, appendEvent, writeToolOutput } = await import('./eventlog.js');
-const { gatherSessionSkills, sessionReadAnySkill, summarizeToolCallsForJudge, extractInvokedScripts, skillExecutionShortfall } = await import('./skill-execution.js');
+const { gatherSessionSkills, sessionReadAnySkill, summarizeToolCallsForJudge, extractInvokedScripts, skillExecutionShortfall, skillBodyExecutionShortfall } = await import('./skill-execution.js');
 
 function skillRead(sessionId: string, callId: string, name: string): void {
   appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'skill_read', callId, arguments: JSON.stringify({ name }) } });
@@ -25,11 +25,15 @@ function skillRead(sessionId: string, callId: string, name: string): void {
 function shellRun(sessionId: string, command: string): void {
   appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: `c-${Math.abs(command.length)}-${command.slice(0, 4)}`, arguments: JSON.stringify({ command }) } });
 }
+function shellRunArgs(sessionId: string, command: string, cwd?: string): void {
+  appendEvent({ sessionId, turn: 0, role: 'agent', type: 'tool_called', data: { tool: 'run_shell_command', callId: `a-${Math.abs(command.length)}-${command.slice(0, 4)}`, args: { command, ...(cwd ? { cwd } : {}) } } });
+}
 /** Seed a loaded skill whose body prescribes the given src/ scripts. */
-function loadScriptSkill(sessionId: string, callId: string, name: string, scripts: string[]): void {
+function loadScriptSkill(sessionId: string, callId: string, name: string, scripts: string[], dir?: string): void {
   skillRead(sessionId, callId, name);
   const body = `Act 2 — build:\n${scripts.map((s, i) => `${i + 1}. Run \`src/${s}\` to produce the artifact.`).join('\n')}\nValidation is **Mandatory**.`;
-  writeToolOutput({ sessionId, callId, tool: 'skill_read', output: `# ${name}\n\nmanifest\n\ncrib\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\n${body}` });
+  const loc = dir ? `Skill location on disk: ${dir}\n\n` : '';
+  writeToolOutput({ sessionId, callId, tool: 'skill_read', output: `# ${name}\n\n${loc}manifest\n\ncrib\n\n=== HOW TO RUN THIS SKILL ===\nx\n\n---\n${body}` });
 }
 
 test('skillExecutionShortfall: a script-backed skill with ZERO prescribed scripts run → shortfall (hand-rolled deliverable)', () => {
@@ -80,6 +84,38 @@ test('skillExecutionShortfall: require(path.join(base,"src/generate-html.js")) c
   // The real lunar-audit form: build the path with path.join, not a string literal.
   shellRun(sess.id, "node - <<'NODE'\nconst path=require('path'); const base='/x/skills/lunar';\nconst generateHtml=require(path.join(base,'src/generate-html.js'));\nrequire('fs').writeFileSync('o.html', generateHtml(d).html);\nNODE");
   assert.equal(skillExecutionShortfall(sess.id), null, 'path.join-constructed require of the renderer must NOT false-bounce');
+});
+
+test('skillExecutionShortfall: live data.args shell events are parsed', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js']);
+  shellRunArgs(sess.id, 'node src/generate-html.js > out.html');
+  assert.equal(skillExecutionShortfall(sess.id), null, 'live data.args command shape must count renderer execution');
+});
+
+test('skillExecutionShortfall: skill-owned build wrapper that imports renderer clears the gate', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const skillDir = path.join(TMP_HOME, 'skills', 'lunar-audit');
+  mkdirSync(path.join(skillDir, 'src'), { recursive: true });
+  writeFileSync(path.join(skillDir, 'build.cjs'), "const generateHtml = require('./src/generate-html');\nmodule.exports = generateHtml;\n", 'utf-8');
+  writeFileSync(path.join(skillDir, 'src', 'generate-html.js'), 'module.exports = () => ({ html: "<html></html>" });\n', 'utf-8');
+  loadScriptSkill(sess.id, 'c1', 'lunar-audit', ['aggregate.js', 'generate-html.js', 'validate-html.js'], skillDir);
+  shellRunArgs(sess.id, `cd ${skillDir} && node build.cjs`);
+  assert.equal(skillExecutionShortfall(sess.id), null, 'a skill-local wrapper importing the renderer is valid execution');
+});
+
+test('skillBodyExecutionShortfall: workflow usesSkill path accepts skill-owned renderer wrapper', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'workflow' });
+  const skillDir = path.join(TMP_HOME, 'skills', 'workflow-lunar-audit');
+  mkdirSync(path.join(skillDir, 'src'), { recursive: true });
+  writeFileSync(path.join(skillDir, 'build.cjs'), "const generateHtml = require('./src/generate-html');\nmodule.exports = generateHtml;\n", 'utf-8');
+  writeFileSync(path.join(skillDir, 'src', 'generate-html.js'), 'module.exports = () => ({ html: "<html></html>" });\n', 'utf-8');
+  const body = 'Act 2 — build:\nRun `src/generate-html.js` to produce the artifact.\nValidation is mandatory.';
+  shellRunArgs(sess.id, 'node build.cjs', skillDir);
+  assert.equal(skillBodyExecutionShortfall('workflow-lunar-audit', body, sess.id, skillDir), null, 'workflow guard sees the same valid wrapper evidence');
 });
 
 test('skillExecutionShortfall: a pure-reference skill (no bundled scripts) is never gated', () => {
