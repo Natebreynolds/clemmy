@@ -58,6 +58,91 @@ function recordBackup(workflow: string, stepId: string, priorDefinition: Workflo
   }
 }
 
+/** On a missed `find`, pinpoint WHERE it diverged: the longest prefix of `find`
+ *  that IS in the prompt, and what the prompt has at that point. Whitespace is
+ *  made visible via JSON-quoting (tabs vs spaces). Local copy of space-tools'
+ *  editMismatchHint so this stays a light module (no agent-runtime imports). */
+function findMismatchHint(haystack: string, find: string): { matchedChars: number; findHad: string; promptHad: string } | null {
+  if (!find) return null;
+  let lo = 0;
+  let hi = find.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (haystack.includes(find.slice(0, mid))) lo = mid; else hi = mid - 1;
+  }
+  const k = lo;
+  if (k >= find.length) return null; // fully present (shouldn't happen on a miss)
+  const pos = haystack.indexOf(find.slice(0, k));
+  const quote = (s: string): string => JSON.stringify(s.slice(0, 24));
+  return {
+    matchedChars: k,
+    findHad: quote(find.slice(k)),
+    promptHad: pos >= 0 ? quote(haystack.slice(pos + k, pos + k + 24)) : '(prefix not located)',
+  };
+}
+
+/**
+ * Make a TARGETED, reversible find/replace edit to ONE step's prompt. The
+ * `find` must appear VERBATIM in the current step prompt — that verbatim
+ * requirement IS the grounding: an agent that didn't read the real definition
+ * (via workflow_get) can't produce a matching find, so a blind edit fails with
+ * a precise near-miss hint instead of silently clobbering the wrong thing.
+ * Mirrors space_edit_view. Validated through checkWorkflowForWrite and
+ * snapshotted (revertStepEdit) before writing. Returns ok:false (no mutation)
+ * on a missing workflow/step, a non-matching find, or a validation failure.
+ */
+export function applyStepPromptEdit(
+  workflow: string,
+  stepId: string,
+  find: string,
+  replace: string,
+  opts: { description?: string; nowIso?: string } = {},
+): StepEditResult {
+  const entry = readWorkflow(workflow);
+  if (!entry) return { ok: false, message: `Workflow "${workflow}" not found.` };
+  const def = entry.data;
+  const idx = def.steps.findIndex((s) => s.id === stepId);
+  if (idx < 0) return { ok: false, message: `Step "${stepId}" not found in "${workflow}".` };
+  if (!find) return { ok: false, message: 'Empty find string — nothing to match.' };
+
+  const prompt = def.steps[idx].prompt ?? '';
+  const occurrences = prompt.split(find).length - 1;
+  if (occurrences === 0) {
+    const hint = findMismatchHint(prompt, find);
+    return {
+      ok: false,
+      message: hint && hint.matchedChars > 0
+        ? `That find string isn't in step "${stepId}" — it matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the step has ${hint.promptHad}. Re-read with workflow_get("${workflow}", step:"${stepId}") and copy the exact characters (watch tabs vs spaces), then retry.`
+        : `That find string isn't in step "${stepId}". Re-read with workflow_get("${workflow}", step:"${stepId}") and copy an exact snippet.`,
+    };
+  }
+
+  const nextPrompt = prompt.split(find).join(replace);
+  if (nextPrompt === prompt) return { ok: false, message: 'find and replace are identical — nothing to change.' };
+  if (!nextPrompt.trim()) return { ok: false, message: 'That edit would empty the step prompt; a step must keep a prompt.' };
+
+  const updated: WorkflowDefinition = {
+    ...def,
+    steps: def.steps.map((s, i) => (i === idx ? { ...s, prompt: nextPrompt } : s)),
+  };
+  const check = checkWorkflowForWrite(updated);
+  if (!check.ok) {
+    return { ok: false, message: 'The edited workflow would fail validation; not applied.', errors: check.errors };
+  }
+
+  const at = opts.nowIso ?? new Date().toISOString();
+  const id = recordBackup(workflow, stepId, def, opts.description ?? `find/replace edit to ${stepId}`, at);
+  writeWorkflow(workflow, updated);
+  const occNote = occurrences > 1 ? ` (replaced all ${occurrences} occurrences)` : '';
+  return {
+    ok: true,
+    backupId: id ?? undefined,
+    message: id
+      ? `Updated "${workflow}" step "${stepId}"${occNote}. Revert with revertStepEdit("${id}") if it doesn't help.`
+      : `Updated "${workflow}" step "${stepId}"${occNote} (backup unavailable — not reversible).`,
+  };
+}
+
 /**
  * Append a guidance line to a workflow step's prompt, reversibly. Validates the
  * edited workflow through checkWorkflowForWrite BEFORE writing — a proposed edit

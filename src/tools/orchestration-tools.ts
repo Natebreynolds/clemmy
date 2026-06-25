@@ -17,7 +17,8 @@ import {
   type WorkflowStepInput,
 } from '../memory/workflow-store.js';
 import { workflowExecutionSurfaceChanged, prepareWorkflowForWrite, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
-import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron } from '../execution/workflow-describe.js';
+import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron, deriveStepDataSources, renderWorkflowDataSources } from '../execution/workflow-describe.js';
+import { applyStepPromptEdit, revertStepEdit } from '../execution/workflow-step-edit.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
@@ -136,6 +137,14 @@ export function draftToDefinition(name: string, draft: WorkflowDraft): WorkflowD
 export function renderAuthoringAdvisories(warnings: string[] | undefined): string {
   if (!warnings || warnings.length === 0) return '';
   return `\n\nHeads up (advisory — the workflow was saved):\n- ${warnings.join('\n- ')}`;
+}
+
+/** Author-time data-source review block (trailing-padded for the response body),
+ *  or '' when no step has a derivable source. Surfaced on create/update so a
+ *  wrong connector binding is caught the moment it's authored. */
+function appendDataSources(def: WorkflowDefinition): string {
+  const block = renderWorkflowDataSources(def);
+  return block ? `${block}\n\n` : '';
 }
 
 export interface StepBindResult {
@@ -891,6 +900,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(
           `${analysisReport}`
           + `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+          + `${appendDataSources(created.savedDef)}`
           + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
           + `${queued.message}${advisoryTail}`,
         );
@@ -898,6 +908,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       return textResult(
         `${analysisReport}`
         + `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+        + `${appendDataSources(created.savedDef)}`
         + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
         + `${advisoryTail}`,
       );
@@ -944,6 +955,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       return textResult(
         `Built a draft workflow "${name}" from this chat — saved DISABLED so you can review before it runs.\n\n`
           + describeWorkflowPlainEnglish(built.savedDef)
+          + `\n\n${appendDataSources(built.savedDef)}`.trimEnd()
           + promoteBindReport
           + `\n\n${preflight.ok ? '✅' : '⚠️'} ${preflight.summary}`
           + `\n\nReconstructed from ${n} action${n === 1 ? '' : 's'} you took. Before enabling:\n- ${draft.notes.join('\n- ')}`
@@ -1100,11 +1112,13 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_get',
-    'Fetch the full definition of a single workflow by name. Includes description, trigger, every step with its prompt + dependencies, declared inputs, and synthesis prompt.',
+    'Fetch the full definition of a single workflow by name. Includes description, trigger, every step with its FULL prompt (line-numbered) + its derived DATA SOURCES (which tools/connectors/scripts it actually uses — e.g. Salesforce vs Composio), dependencies, declared inputs, and synthesis prompt. '
+      + 'Read this BEFORE editing: copy a VERBATIM snippet of a step prompt into workflow_edit_step. Pass step="<id>" to read just one step in full when a workflow is large.',
     {
       name: z.string().min(1),
+      step: z.string().optional().describe('Optional step id — return just this step\'s full text + data sources (use when a workflow is too large to read whole).'),
     },
-    async ({ name }) => {
+    async ({ name, step }) => {
       const allGet = listWorkflowFiles();
       let entry = allGet.find((w) => w.data.name === name);
       if (!entry) {
@@ -1127,13 +1141,49 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
       }
       const w = entry.data;
-      const stepsBlock = w.steps.map((step) => {
-        const deps = step.dependsOn && step.dependsOn.length > 0 ? ` (depends on: ${step.dependsOn.join(', ')})` : '';
-        const model = step.model ? ` model=${step.model}` : '';
-        const forEach = step.forEach ? ` forEach=${step.forEach}` : '';
-        const det = step.deterministic ? ` deterministic=${step.deterministic.runner}` : '';
-        return `  ${step.id}${deps}${model}${forEach}${det}\n    ${step.prompt.slice(0, 600).replace(/\n+/g, ' ')}`;
-      }).join('\n');
+      // Render one step with its FULL prompt line-numbered (cat -n style, so the
+      // agent can copy a VERBATIM snippet into workflow_edit_step) and its
+      // derived data sources (the real connectors/scripts it uses — kills the
+      // "is this Salesforce or Composio?" blind spot). Mirrors space_get_view's
+      // renderViewForRead. The "<n>\t" prefix is NOT part of the prompt text.
+      const renderStepForRead = (stp: typeof w.steps[number]): string => {
+        const deps = stp.dependsOn && stp.dependsOn.length > 0 ? ` (depends on: ${stp.dependsOn.join(', ')})` : '';
+        const model = stp.model ? ` model=${stp.model}` : '';
+        const forEach = stp.forEach ? ` forEach=${stp.forEach}` : '';
+        const det = stp.deterministic ? ` deterministic=${stp.deterministic.runner}` : '';
+        const sources = deriveStepDataSources(stp);
+        const sourcesLine = sources.length > 0 ? `    data: ${sources.join(' · ')}` : '';
+        const promptLines = (stp.prompt ?? '').split('\n');
+        const pwidth = String(promptLines.length).length;
+        const numbered = promptLines.map((l, i) => `      ${String(i + 1).padStart(pwidth)}\t${l}`).join('\n');
+        return [`  ${stp.id}${deps}${model}${forEach}${det}`, sourcesLine, '    prompt:', numbered].filter(Boolean).join('\n');
+      };
+      // step=<id> targeting: when a workflow is large, read just one step in full.
+      if (step) {
+        const one = w.steps.find((s) => s.id === step);
+        if (!one) {
+          return textResult(`Workflow "${w.name}" has no step "${step}". Steps: ${w.steps.map((s) => `"${s.id}"`).join(', ') || '(none)'}.`);
+        }
+        return textResult(
+          `Step "${step}" of "${w.name}" (the "<n>\\t" prefix is the line number, NOT part of the prompt — copy a VERBATIM snippet into workflow_edit_step):\n${renderStepForRead(one)}`,
+        );
+      }
+      // Whole-workflow read, capped — if the full step text overflows, tell the
+      // agent to target a single step rather than silently clipping logic.
+      const WORKFLOW_GET_CHAR_CAP = 24_000;
+      const renderedSteps: string[] = [];
+      let stepsBudget = WORKFLOW_GET_CHAR_CAP;
+      let stepsTruncated = false;
+      for (const stp of w.steps) {
+        const rendered = renderStepForRead(stp);
+        stepsBudget -= rendered.length + 1;
+        if (stepsBudget < 0) { stepsTruncated = true; break; }
+        renderedSteps.push(rendered);
+      }
+      if (stepsTruncated) {
+        renderedSteps.push(`  … workflow is large — read remaining steps in full with workflow_get("${w.name}", step:"<id>").`);
+      }
+      const stepsBlock = renderedSteps.join('\n');
       const inputsBlock = w.inputs && Object.keys(w.inputs).length > 0
         ? Object.entries(w.inputs).map(([k, meta]) => `  - ${k}: ${meta.type ?? 'string'}${meta.default !== undefined ? ` (default: ${meta.default})` : ''}${meta.description ? ` — ${meta.description}` : ''}`).join('\n')
         : '  (none)';
@@ -1152,7 +1202,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         w.whenToUse ? `When to use: ${w.whenToUse}` : '',
         `Trigger: ${trigger}`,
         `Allowed tools: ${allowed}`,
-        `Steps (${w.steps.length}):`,
+        `Steps (${w.steps.length}) — each shows its DATA sources + FULL prompt; the "<n>\\t" prefix is the line number, NOT part of the prompt (copy a VERBATIM snippet into workflow_edit_step):`,
         stepsBlock,
         `Inputs:`,
         inputsBlock,
@@ -1399,9 +1449,92 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updateGaps = renderWorkflowGapQuestions(analyzeWorkflowGaps(savedNext));
       return textResult(
         `Workflow "${name}" updated. Here's what it does now:\n\n${describeWorkflowPlainEnglish(savedNext)}\n\n`
+          + `${appendDataSources(savedNext)}`
           + `${reSmoke ? `${reSmoke.message}\n\n` : ''}`
           + `${updateBindReport}${updateAdvisories}${updateGaps}`.trim(),
       );
+    },
+  );
+
+  server.tool(
+    'workflow_edit_step',
+    [
+      "Make a TARGETED, reversible edit to ONE step's prompt in an existing workflow — the FAST, grounded way to change a step's logic (fix a data source, add a missing instruction, change a tool).",
+      'Provide step_id + {find, replace}: `find` must appear VERBATIM in that step\'s current prompt — call workflow_get("<name>", step:"<step_id>") FIRST to read the exact current text (it is line-numbered; the "<n>\\t" prefix is NOT part of the prompt). It snapshots the prior definition (revert with workflow_revert_step) and re-validates before saving.',
+      "Prefer this over workflow_update for a single-step change: it cannot clobber sibling steps or trip whole-array validation, and a blind edit (you did not read the real step) fails with a precise hint instead of silently mis-editing.",
+    ].join('\n'),
+    {
+      name: z.string().min(1).describe('Workflow name.'),
+      step_id: z.string().min(1).describe('The step to edit.'),
+      find: z.string().min(1).max(8000).describe('Exact substring currently in the step prompt to replace (copy VERBATIM from workflow_get).'),
+      replace: z.string().max(8000).describe('Replacement text (may be empty to delete the found text).'),
+    },
+    async ({ name, step_id, find, replace }) => {
+      const all = listWorkflowFiles();
+      let entry = all.find((w) => w.data.name === name);
+      if (!entry) {
+        const resolution = resolveWorkflowName(name, all.map((e) => ({ name: e.data.name, slug: path.basename(e.dir) })));
+        if (resolution.kind === 'exact' || resolution.kind === 'fuzzy') {
+          entry = all.find((w) => workflowNamesEqual(w.data.name, resolution.name));
+        } else if (resolution.kind === 'ambiguous') {
+          return textResult(`"${name}" could mean: ${resolution.candidates.map((c) => `"${c}"`).join(', ')}. Call workflow_edit_step with the exact name.`);
+        }
+      }
+      if (!entry) {
+        const names = all.map((w) => `"${w.data.name}"`).join(', ');
+        return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
+      }
+      const before = entry.data;
+      const result = applyStepPromptEdit(before.name, step_id, find, replace, { description: `workflow_edit_step ${step_id}` });
+      if (!result.ok) {
+        // Structured, NON-silent failure (change #4): the user AND the model see
+        // the edit did not land and exactly what to do next — never a quiet no-op.
+        return textResult(
+          `Edit NOT applied to "${before.name}" step "${step_id}".\n${result.message}`
+            + (result.errors?.length ? `\n- ${result.errors.join('\n- ')}` : ''),
+        );
+      }
+      // Re-smoke parity with workflow_update: if the workflow is ENABLED and this
+      // edit changed what it executes, re-verify by running (saved disabled,
+      // auto-enables on pass) instead of trusting the edited config. Schedule/copy
+      // edits that don't change execution skip the test.
+      const updated = listWorkflowFiles().find((w) => w.data.name === before.name)?.data;
+      let reSmokeMsg = '';
+      if (updated && before.enabled && workflowExecutionSurfaceChanged(before, updated)) {
+        const testInputs = normalizeWorkflowRunInputs(
+          Object.fromEntries(Object.entries(updated.inputs ?? {}).map(([k, m]) => [k, m.default ?? ''])),
+        );
+        let runTest = workflowNeedsCreationTest(updated);
+        if (runTest && missingWorkflowRunInputs(updated, testInputs).length > 0) runTest = false;
+        if (runTest) {
+          writeWorkflow(before.name, { ...updated, enabled: false });
+          const queued = queueWorkflowCreationTest(before.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
+          reSmokeMsg = `\n\n${queued.message}`;
+        }
+      }
+      addNotification({
+        id: `workflow-edit-step-${before.name}-${step_id}-${Date.now()}`,
+        kind: 'workflow',
+        title: `Workflow step edited: ${before.name}`,
+        body: `Edited step "${step_id}".`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        silent: true,
+        metadata: { source: 'workflow_edit_step', workflowName: before.name, stepId: step_id },
+      });
+      return textResult(`${result.message}${reSmokeMsg}`);
+    },
+  );
+
+  server.tool(
+    'workflow_revert_step',
+    'Undo the most recent workflow_edit_step / step edit, restoring the workflow to its pre-edit definition. Pass the backup id returned by workflow_edit_step.',
+    {
+      backup_id: z.string().min(1).describe('The revert id from a prior workflow_edit_step result (e.g. "wfedit-1a2b3c4d").'),
+    },
+    async ({ backup_id }) => {
+      const result = revertStepEdit(backup_id);
+      return textResult(result.message);
     },
   );
 

@@ -106,6 +106,23 @@ export function looksLikeToolNarration(text: string, toolUses: string[]): boolea
   );
 }
 
+/** Streaming-time guard: detect the UNAMBIGUOUS tool-call-protocol / native XML
+ *  markers in the live text accumulated SO FAR, so the dock stops streaming the
+ *  moment a delta starts reproducing tool-call XML (the noise that made raw
+ *  streaming default-off). Unlike looksLikeToolNarration this takes no toolUses
+ *  arg — mid-stream we don't yet know the final tool-call count — so it checks
+ *  only the high-precision markers that are never legitimate prose, never the
+ *  ambiguous bare-JSON shape. The authoritative final reply still delivers once. */
+export function looksLikeStreamingNarration(text: string): boolean {
+  const t = text || '';
+  if (!t) return false;
+  return (
+    /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t) ||
+    /(^|\n)\s*\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
+    /(^|\n)\s*[<[]\s*tool[\s_-]*call\b/i.test(t)
+  );
+}
+
 /** Detect the "reasoning-leak" failure: the brain verbalized its instruction-
  *  hierarchy / prompt-injection deliberation about its OWN injected context
  *  (memory, preferences/specs, tool descriptions, system reminders) and did NO
@@ -456,6 +473,12 @@ export async function respondViaClaudeAgentSdkBrain(
   // event; desktop: the guarded final onChunk below) — streaming can't garble it.
   let streamedAny = false;
   let streamedText = '';
+  // Once the live text starts reproducing tool-call XML/protocol (the
+  // narrate-instead-of-call failure), stop forwarding deltas for the rest of the
+  // turn so the dock never shows that noise. streamedAny/streamedText track only
+  // what was ACTUALLY shown, so a turn that ONLY narrated still streams its clean
+  // narration-retry answer and the final reply delivers authoritatively.
+  let narrationStream = false;
   const runOptions = {
     sessionId,
     modelId,
@@ -467,8 +490,11 @@ export async function respondViaClaudeAgentSdkBrain(
     priorTurns,
     onDelta: (request.onChunk && sdkStreamingEnabled())
       ? async (d: string): Promise<void> => {
+        if (narrationStream) return;
+        const candidate = streamedText + d;
+        if (looksLikeStreamingNarration(candidate)) { narrationStream = true; return; }
+        streamedText = candidate;
         streamedAny = true;
-        streamedText += d;
         await request.onChunk?.(d);
       }
       : undefined,

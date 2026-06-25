@@ -10,7 +10,7 @@
  * surface) and mcp-server.ts (the standalone MCP server), gated by the
  * CLEMENTINE_SPACES flag — mirrors registerWorkflowScheduleTools.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -19,7 +19,7 @@ import { BASE_DIR } from '../config.js';
 import { textResult } from './shared.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
-  spaceStore, resolveInSpace, isValidSpaceSlug, type SpaceDataSource, type SpaceAction,
+  spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, type SpaceDataSource, type SpaceAction,
 } from '../spaces/store.js';
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
@@ -182,12 +182,20 @@ const VIEW_READ_RESULT_MAX_CHARS = 50_000;
  * it, the whole view capped at VIEW_READ_CHAR_CAP. A no-match grep falls through to
  * the full view (never a dead end). The "<n>\t" prefix is NOT part of the file.
  */
-function renderViewForRead(html: string, opts: { slug: string; grep?: string; around?: number }): string {
+function renderViewForRead(
+  html: string,
+  opts: { slug: string; grep?: string; around?: number; noun?: string; editTool?: string },
+): string {
   const lines = html.split('\n');
   const total = lines.length;
   const width = String(total).length;
   const fmt = (i: number): string => `${String(i + 1).padStart(width)}\t${lines[i]}`;
   const around = Number.isFinite(opts.around as number) ? Math.max(0, Math.min(40, opts.around as number)) : 6;
+  // noun/editTool default to view wording so the space_get_view caller is
+  // byte-identical; space_get_runner passes 'runner' / 'space_edit_runner'.
+  const noun = opts.noun ?? 'view';
+  const Noun = noun.charAt(0).toUpperCase() + noun.slice(1);
+  const editTool = opts.editTool ?? 'space_edit_view';
 
   if (opts.grep) {
     const needle = opts.grep.toLowerCase();
@@ -204,7 +212,7 @@ function renderViewForRead(html: string, opts: { slug: string; grep?: string; ar
         else ranges.push([lo, hi]);
       }
       const out: string[] = [
-        `View of "${opts.slug}" — ${hits.length} line${hits.length === 1 ? '' : 's'} matching "${opts.grep}" (±${around} context), of ${total} total. The "<n>\\t" prefix is the line number, NOT part of the view — copy a VERBATIM snippet (whitespace included) into space_edit_view.`,
+        `${Noun} of "${opts.slug}" — ${hits.length} line${hits.length === 1 ? '' : 's'} matching "${opts.grep}" (±${around} context), of ${total} total. The "<n>\\t" prefix is the line number, NOT part of the ${noun} — copy a VERBATIM snippet (whitespace included) into ${editTool}.`,
       ];
       let budget = VIEW_READ_CHAR_CAP;
       for (let r = 0; r < ranges.length; r++) {
@@ -221,23 +229,69 @@ function renderViewForRead(html: string, opts: { slug: string; grep?: string; ar
     }
   }
 
-  // No grep, or grep matched nothing → the full view (capped).
+  // No grep, or grep matched nothing → the full source (capped).
   const out: string[] = [
     opts.grep
-      ? `No view line matched "${opts.grep}". Full view of "${opts.slug}" (${total} lines) follows — the "<n>\\t" prefix is the line number, NOT part of the view; copy a VERBATIM snippet into space_edit_view.`
-      : `View of "${opts.slug}" (${total} lines). The "<n>\\t" prefix is the line number, NOT part of the view — copy a VERBATIM snippet (whitespace included) into space_edit_view.`,
+      ? `No ${noun} line matched "${opts.grep}". Full ${noun} of "${opts.slug}" (${total} lines) follows — the "<n>\\t" prefix is the line number, NOT part of the ${noun}; copy a VERBATIM snippet into ${editTool}.`
+      : `${Noun} of "${opts.slug}" (${total} lines). The "<n>\\t" prefix is the line number, NOT part of the ${noun} — copy a VERBATIM snippet (whitespace included) into ${editTool}.`,
   ];
   let budget = VIEW_READ_CHAR_CAP;
   for (let i = 0; i < total; i++) {
     const row = fmt(i);
     budget -= row.length + 1;
     if (budget < 0) {
-      out.push(`  … view is large (${total} lines) — pass grep:'<nearby text>' to target the region you want to edit.`);
+      out.push(`  … ${noun} is large (${total} lines) — pass grep:'<nearby text>' to target the region you want to edit.`);
       break;
     }
     out.push(row);
   }
   return out.join('\n');
+}
+
+/** Engine/SOQL/JS tokens that look like connector slugs but aren't — excluded
+ *  from runner provenance so STEP_CONTEXT / MAX_BUFFER don't read as data
+ *  sources. NOT a vendor list. */
+const RUNNER_NON_CONNECTOR = new Set([
+  'STEP_CONTEXT', 'JSON', 'HTTP', 'HTTPS', 'URL', 'API', 'UTF', 'NULL', 'TRUE', 'FALSE',
+  'MAX_BUFFER', 'NODE_ENV', 'TODO', 'NOTE', 'AND', 'OR', 'NOT', 'CSV', 'PDF', 'HTML', 'ID',
+]);
+
+/**
+ * Vendor-agnostic provenance for a RUNNER's source text — what external system
+ * it actually reaches (the runner twin of deriveStepDataSources). Surfaces the
+ * CLI it shells (e.g. `sf` → Salesforce), SOQL objects, composio/MCP/connector
+ * refs, and HTTP hosts — so a reader sees "this runner queries Salesforce"
+ * instead of guessing. No curated vendor list.
+ */
+export function deriveRunnerProvenance(src: string): string[] {
+  const s = src || '';
+  const out: string[] = [];
+  // CLI shell-outs — the binary reveals the system (sf=Salesforce CLI, gh, curl…).
+  const clis = new Set<string>();
+  for (const m of s.matchAll(/(?:execFileSync|execSync|spawnSync|spawn|exec)\s*\(\s*['"`]([a-zA-Z0-9_.\/-]+)['"`]/g)) {
+    clis.add((m[1].split('/').pop() || m[1]));
+  }
+  if (clis.size > 0) {
+    const note = clis.has('sf') ? ' (sf = Salesforce CLI)' : '';
+    out.push(`shells: ${[...clis].join(', ')}${note}`);
+  }
+  // SOQL objects (Salesforce): FROM <Object>.
+  const objs = new Set<string>();
+  for (const m of s.matchAll(/\bFROM\s+([A-Z][A-Za-z0-9_]+)/g)) objs.add(m[1]);
+  if (objs.size > 0) out.push(`SOQL FROM: ${[...objs].slice(0, 8).join(', ')} (Salesforce)`);
+  // Connector references: composio, MCP tool names, ALL_CAPS connector slugs.
+  const refs = new Set<string>();
+  if (/\bcomposio_execute_tool\b/.test(s)) refs.add('composio_execute_tool');
+  for (const m of s.matchAll(/\bmcp__[a-zA-Z0-9_]+__[a-zA-Z0-9_]+\b/g)) refs.add(m[0]);
+  for (const m of s.matchAll(/\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g)) {
+    if (!RUNNER_NON_CONNECTOR.has(m[0])) refs.add(m[0]);
+  }
+  if (refs.size > 0) out.push(`refs: ${[...refs].slice(0, 12).join(', ')}`);
+  // HTTP endpoints.
+  const hosts = new Set<string>();
+  for (const m of s.matchAll(/https?:\/\/([a-zA-Z0-9.-]+)/g)) hosts.add(m[1]);
+  if (hosts.size > 0) out.push(`http: ${[...hosts].slice(0, 6).join(', ')}`);
+  return out;
 }
 
 export function registerSpaceTools(server: McpServer): void {
@@ -527,8 +581,15 @@ export function registerSpaceTools(server: McpServer): void {
           ? `Manifest errors: fix with space_save before refresh/actions run.\n  - ${rec.manifestErrors.join('\n  - ')}`
           : '',
         rec.reengage ? `Re-engage on: ${rec.reengage.triggers.join(', ')}${rec.reengage.guidance ? ` — ${rec.reengage.guidance}` : ''}` : 'Re-engage: not configured.',
-        rec.dataSources.length > 0 ? `Data sources: ${rec.dataSources.map((d) => d.id).join(', ')}` : 'Data sources: none.',
-        rec.actions.length > 0 ? `Actions: ${rec.actions.map((a) => a.label ?? a.id).join(', ')}` : 'Actions: none.',
+        rec.dataSources.length > 0
+          ? `Data sources: ${rec.dataSources.map((d) => `${d.id}${d.runner ? ` → ${d.runner}` : ''}`).join(', ')}`
+          : 'Data sources: none.',
+        rec.actions.length > 0
+          ? `Actions: ${rec.actions.map((a) => `${a.label ?? a.id}${a.runner ? ` → ${a.runner}` : ''}`).join(', ')}`
+          : 'Actions: none.',
+        (rec.dataSources.some((d) => d.runner) || rec.actions.some((a) => a.runner))
+          ? 'To see HOW a runner pulls its data (which connector/query) — and to edit it — use space_get_runner / space_edit_runner.'
+          : '',
         `Dataset (truncated): ${dataPreview}`,
         notes.length > 0 ? `Recent notes:\n${notes.map((n) => `  - [${n.kind ?? 'note'}] ${n.text}`).join('\n')}` : 'No notes yet.',
         audit.length > 0 ? `Recent activity: ${audit.length} data-plane call(s).` : '',
@@ -562,6 +623,182 @@ export function registerSpaceTools(server: McpServer): void {
         renderViewForRead(html, { slug, grep: grep?.trim() || undefined, around: around ?? undefined }),
         { maxChars: VIEW_READ_RESULT_MAX_CHARS },
       );
+    },
+  );
+
+  server.tool(
+    'space_get_runner',
+    [
+      "Read the SOURCE of a Workspace data/action RUNNER (the .mjs/.py/.sh script under data/ that pulls or computes the data), line-numbered — the EXACT text to craft a space_edit_runner find string. Use this BEFORE editing a runner, and to SEE where it actually pulls data from.",
+      'space_get shows the manifest + dataset (NOT runner source); space_try_runner EXECUTES a runner but does not show its code. This is the sanctioned way to READ a runner — never read_file/grep/ls it from the shell.',
+      'Omit runner_path to LIST every runner the workspace declares, each with its data source / action and a one-line data-source provenance. Pass grep to target a region of a large runner.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      runner_path: z.string().max(120).nullable().describe('Runner filename under data/, e.g. "deepwhy.mjs". Omit to LIST all runners + their provenance.'),
+      grep: z.string().max(200).nullable().describe('Optional case-insensitive substring to locate a region. Omit to read the whole runner.'),
+      around: z.number().int().min(0).max(40).nullable().describe('Context lines around each grep match (default 6).'),
+    },
+    async ({ slug, runner_path, grep, around }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const declaredBy = (runner: string): string[] => {
+        const where: string[] = [];
+        for (const d of rec.dataSources) if (d.runner === runner) where.push(`data source "${d.id}"${d.schedule ? ` (schedule ${d.schedule})` : ''}`);
+        for (const a of rec.actions) if (a.runner === runner) where.push(`action "${a.label ?? a.id}"`);
+        return where;
+      };
+      const allRunners = Array.from(new Set([
+        ...rec.dataSources.map((d) => d.runner),
+        ...rec.actions.map((a) => a.runner),
+      ].filter((r): r is string => Boolean(r))));
+
+      if (!runner_path || !runner_path.trim()) {
+        if (allRunners.length === 0) return textResult(`Workspace "${slug}" declares no runners (no data source / action has a runner script).`);
+        const lines = allRunners.map((r) => {
+          const f = resolveInSpace(slug, path.join('data', r));
+          let prov: string[] = [];
+          try { prov = existsSync(f) ? deriveRunnerProvenance(readFileSync(f, 'utf-8')) : ['(file missing)']; } catch { prov = ['(unreadable)']; }
+          return `- ${r} ← ${declaredBy(r).join(', ') || '(declared but unreferenced)'}\n    data: ${prov.join(' · ') || '(no external calls detected)'}`;
+        });
+        return textResult(`Runners in "${slug}" — read one in full with space_get_runner("${slug}", "<file>"):\n${lines.join('\n')}`);
+      }
+
+      const runner = runner_path.trim();
+      const ferr = runnerFilenameError(runner);
+      if (ferr) return textResult(`Error: ${ferr}`);
+      const file = resolveInSpace(slug, path.join('data', runner));
+      if (!existsSync(file)) {
+        return textResult(`Workspace "${slug}" has no runner "data/${runner}". Declared runners: ${allRunners.map((r) => `"${r}"`).join(', ') || '(none)'}.`);
+      }
+      let src: string;
+      try { src = readFileSync(file, 'utf-8'); }
+      catch (err) { return textResult(`Error reading runner "data/${runner}": ${(err as Error).message}`); }
+      const where = declaredBy(runner);
+      const prov = deriveRunnerProvenance(src);
+      const header = [
+        `Runner data/${runner} of "${slug}"${where.length ? ` — used by ${where.join(', ')}` : ' (not referenced by any data source/action)'}.`,
+        `data: ${prov.join(' · ') || '(no external calls detected)'}`,
+      ].join('\n');
+      return textResult(
+        `${header}\n${renderViewForRead(src, { slug, grep: grep?.trim() || undefined, around: around ?? undefined, noun: 'runner', editTool: 'space_edit_runner' })}`,
+        { maxChars: VIEW_READ_RESULT_MAX_CHARS },
+      );
+    },
+  );
+
+  server.tool(
+    'space_edit_runner',
+    [
+      "Make a TARGETED, reversible edit to a Workspace runner's SOURCE — FAST, for changing what/how a runner pulls (a query, a field, a filter, a data source). Use this instead of rewriting the whole file.",
+      'Provide runner_path + one or more {find, replace}; each `find` must appear VERBATIM in the current runner — call space_get_runner first to read the exact text. It snapshots the prior source (revert with space_revert_runner) before writing.',
+      'If the runner backs a DATA SOURCE, the data is re-pulled + the new row count reported; if it backs an ACTION, nothing is auto-run (no side effect) — dry-run it with space_try_runner. Reserve write_file + space_save for a full rewrite.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      runner_path: z.string().min(1).max(120).describe('Runner filename under data/, e.g. "deepwhy.mjs".'),
+      edits: z.array(z.object({
+        find: z.string().min(1).max(8000).describe('Exact substring currently in the runner to replace.'),
+        replace: z.string().max(8000).describe('Replacement text (may be empty to delete).'),
+      })).min(1).max(20).describe('Targeted find/replace edits, applied in order.'),
+    },
+    async ({ slug, runner_path, edits }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const runner = runner_path.trim();
+      const ferr = runnerFilenameError(runner);
+      if (ferr) return textResult(`Error: ${ferr}`);
+      const file = resolveInSpace(slug, path.join('data', runner));
+      if (!existsSync(file)) return textResult(`Workspace "${slug}" has no runner "data/${runner}". Read one with space_get_runner("${slug}").`);
+      let src: string;
+      try { src = readFileSync(file, 'utf-8'); }
+      catch (err) { return textResult(`Error reading runner "data/${runner}": ${(err as Error).message}`); }
+
+      let next = src;
+      const detailLines: string[] = [];
+      let applied = 0;
+      edits.forEach((e, i) => {
+        const occurrences = e.find ? next.split(e.find).length - 1 : 0;
+        if (occurrences === 0) {
+          const hint = editMismatchHint(next, e.find);
+          detailLines.push(
+            hint && hint.matchedChars > 0
+              ? `edit ${i + 1}: NOT applied — matched the first ${hint.matchedChars} char(s), then your find had ${hint.findHad} but the runner has ${hint.viewHad}. Re-read with space_get_runner and copy the exact characters (watch tabs vs spaces), then retry just this edit.`
+              : `edit ${i + 1}: NOT applied — that find string isn't in the runner; re-read with space_get_runner and copy an exact snippet.`,
+          );
+          return;
+        }
+        next = next.split(e.find).join(e.replace);
+        applied += 1;
+        if (occurrences > 1) detailLines.push(`edit ${i + 1}: applied to ALL ${occurrences} occurrences.`);
+      });
+      const detail = detailLines.length ? `\n${detailLines.join('\n')}` : '';
+      if (applied === 0) {
+        return textResult(`No edits applied to "data/${runner}" — none of the find strings were in the runner. Call space_get_runner('${slug}', '${runner}') to read the exact source, then match a find EXACTLY (whitespace included).${detail}`);
+      }
+      if (!next.trim()) return textResult(`That edit would empty the runner; a runner must keep its source. Nothing changed.${detail}`);
+
+      // Snapshot prior source (reversible) BEFORE writing — traversal-guarded by resolveInSpace.
+      let backedUp = false;
+      try {
+        mkdirSync(resolveInSpace(slug, path.join('data', '.runner-history')), { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        writeFileSync(resolveInSpace(slug, path.join('data', '.runner-history', `${runner}.${stamp}.bak`)), src, 'utf-8');
+        backedUp = true;
+      } catch { backedUp = false; }
+      writeFileSync(file, next, 'utf-8');
+
+      const backedSources = rec.dataSources.filter((d) => d.runner === runner);
+      const backedActions = rec.actions.filter((a) => a.runner === runner);
+      let refreshNote = '';
+      if (backedSources.length > 0) {
+        try {
+          const results = await refreshSpaceData(slug, backedSources[0].id);
+          const r = results.find((x) => x.sourceId === backedSources[0].id) ?? results[0];
+          refreshNote = r && r.ok
+            ? `\nRe-pulled data source "${backedSources[0].id}" — the open Workspace auto-refreshes.`
+            : `\n⚠️ Re-pull of "${backedSources[0].id}" FAILED: ${r?.error ?? 'unknown'} (the edit saved; fix it and call space_refresh, or space_revert_runner).`;
+        } catch (err) { refreshNote = `\n⚠️ Re-pull failed: ${(err as Error).message} (edit saved).`; }
+      } else if (backedActions.length > 0) {
+        refreshNote = `\nThis runner backs action "${backedActions[0].label ?? backedActions[0].id}" — not auto-run (no side effect). Dry-run with space_try_runner('${slug}', '${runner}').`;
+      }
+      const revertNote = backedUp ? ` Revert with space_revert_runner('${slug}', '${runner}').` : ' (backup unavailable — not reversible.)';
+      return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to "data/${runner}".${revertNote}${refreshNote}${detail}`);
+    },
+  );
+
+  server.tool(
+    'space_revert_runner',
+    'Undo the most recent space_edit_runner on a runner, restoring its prior source from the snapshot taken before the edit. Re-pulls the data if the runner backs a data source.',
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug.'),
+      runner_path: z.string().min(1).max(120).describe('Runner filename under data/, e.g. "deepwhy.mjs".'),
+    },
+    async ({ slug, runner_path }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const rec = spaceStore.get(slug);
+      if (!rec) return textResult(`No workspace named "${slug}".`);
+      const runner = runner_path.trim();
+      const ferr = runnerFilenameError(runner);
+      if (ferr) return textResult(`Error: ${ferr}`);
+      const histDir = resolveInSpace(slug, path.join('data', '.runner-history'));
+      let backups: string[] = [];
+      try { backups = existsSync(histDir) ? readdirSync(histDir).filter((f) => f.startsWith(`${runner}.`) && f.endsWith('.bak')).sort() : []; } catch { backups = []; }
+      if (backups.length === 0) return textResult(`No reversible edit found for "data/${runner}".`);
+      const latest = backups[backups.length - 1];
+      const file = resolveInSpace(slug, path.join('data', runner));
+      try {
+        writeFileSync(file, readFileSync(path.join(histDir, latest), 'utf-8'), 'utf-8');
+        try { unlinkSync(path.join(histDir, latest)); } catch { /* best effort */ }
+      } catch (err) { return textResult(`Couldn't revert "data/${runner}": ${(err as Error).message}`); }
+      const backedSources = rec.dataSources.filter((d) => d.runner === runner);
+      let refreshNote = '';
+      if (backedSources.length > 0) {
+        try { await refreshSpaceData(slug, backedSources[0].id); refreshNote = ` Re-pulled "${backedSources[0].id}".`; } catch { /* ignore */ }
+      }
+      return textResult(`Reverted "data/${runner}" to its pre-edit source.${refreshNote}`);
     },
   );
 

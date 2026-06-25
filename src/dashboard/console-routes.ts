@@ -636,6 +636,7 @@ function sanitizeWorkflowName(name: string): string {
 const ARCHITECT_HIDDEN_TOOLS = [
   'workflow_create',
   'workflow_update',
+  'workflow_edit_step',
   'workflow_set_enabled',
   'workflow_delete',
   'workflow_run',

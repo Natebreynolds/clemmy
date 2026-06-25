@@ -13,6 +13,7 @@ import {
   describeProduces,
   describeWorkflowPlainEnglish,
   describeWorkflowOneLine,
+  deriveStepDataSources,
 } from './workflow-describe.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
@@ -144,6 +145,49 @@ test('describeWorkflowPlainEnglish: a realistic workflow renders clearly with no
 test('describeWorkflowPlainEnglish: empty-steps workflow does not throw', () => {
   const out = describeWorkflowPlainEnglish(wf({ steps: [] }));
   assert.match(out, /none yet/);
+});
+
+// ─── deriveStepDataSources (the Salesforce-vs-Composio grounding signal) ───
+
+test('deriveStepDataSources: surfaces the real connector slug from the prompt (Salesforce, not guessed)', () => {
+  const out = deriveStepDataSources({
+    id: 'pull',
+    prompt: 'Call composio_execute_tool with SALESFORCE_QUERY to pull emails for {{input.account_id}}.',
+    sideEffect: 'read',
+  });
+  const joined = out.join(' · ');
+  assert.match(joined, /SALESFORCE_QUERY/, 'the real connector slug is surfaced');
+  assert.match(joined, /composio_execute_tool/, 'the tool it calls is surfaced');
+  assert.match(joined, /input\.account_id/, 'data-flow binding surfaced');
+  assert.match(joined, /side-effect: read/);
+});
+
+test('deriveStepDataSources: a deterministic step shows its script + allowed tools', () => {
+  const out = deriveStepDataSources({
+    id: 'export',
+    prompt: 'run it',
+    deterministic: { runner: 'scripts/salesforce-pull.py' },
+    allowedTools: ['run_shell_command'],
+  }).join(' · ');
+  assert.match(out, /script: scripts\/salesforce-pull\.py/);
+  assert.match(out, /allowed tools: run_shell_command/);
+});
+
+test('deriveStepDataSources: engine grammar tokens (STEP_CONTEXT) are NOT mistaken for connectors', () => {
+  const out = deriveStepDataSources({ id: 'x', prompt: 'Read STEP_CONTEXT.upstream and write a JSON summary.' }).join(' · ');
+  assert.doesNotMatch(out, /STEP_CONTEXT/, 'engine token excluded');
+  assert.doesNotMatch(out, /\bJSON\b/, 'generic token excluded');
+});
+
+test('deriveStepDataSources: forEach + mcp tool names are surfaced', () => {
+  const out = deriveStepDataSources({
+    id: 'each',
+    prompt: 'For {{item}}, call mcp__claude_ai_Gmail__authenticate.',
+    forEach: 'leads',
+  }).join(' · ');
+  assert.match(out, /mcp__claude_ai_Gmail__authenticate/);
+  assert.match(out, /forEach leads/);
+  assert.match(out, /item/);
 });
 
 test('describeWorkflowOneLine: compact list summary', () => {

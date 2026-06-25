@@ -13,7 +13,7 @@ import path from 'node:path';
 
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-tools-test-'));
 
-const { registerSpaceTools } = await import('./space-tools.js');
+const { registerSpaceTools, deriveRunnerProvenance } = await import('./space-tools.js');
 const store = await import('../spaces/store.js');
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
@@ -403,6 +403,125 @@ test('space_set_data refuses paused or archived workspaces without mutating data
   }));
   assert.match(archived, /data writes are disabled/);
   assert.equal(JSON.stringify(dataMod.readData('setdata')), beforeArchived);
+});
+
+// --- space_get_runner / space_edit_runner: grounded runner read+edit (the Space twin of the workflow fix) ---
+
+function makeRunnerSpace(): string {
+  const slug = 'deal-risk';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(path.join(dir, 'view'), { recursive: true });
+  mkdirSync(path.join(dir, 'data'), { recursive: true });
+  writeFileSync(path.join(dir, 'view', 'index.html'), '<html>deal risk</html>', 'utf-8');
+  // Simple data-source runner (no external call).
+  writeFileSync(path.join(dir, 'data', 'refresh.mjs'), 'process.stdout.write(JSON.stringify([{ deal: "A", risk: 9 }]))', 'utf-8');
+  // Action runner that pulls email bodies from SALESFORCE (sf CLI + SOQL) — the
+  // exact shape from darrin-sennott-deal-risk that Clem wrongly believed was Composio.
+  writeFileSync(path.join(dir, 'data', 'deepwhy.mjs'), [
+    "import { execFileSync } from 'node:child_process';",
+    "const q = `SELECT Subject, TextBody, FromAddress FROM EmailMessage WHERE RelatedToId IN ('006xx')`;",
+    "const out = execFileSync('sf', ['data', 'query', '--query', q, '--json'], { encoding: 'utf8' });",
+    "process.stdout.write(out);",
+  ].join('\n'), 'utf-8');
+  writeFileSync(path.join(dir, 'space.json'), JSON.stringify({
+    id: slug,
+    title: 'Deal Risk',
+    dataSources: [{ id: 'risk', runner: 'refresh.mjs', schedule: '0 7 * * *' }],
+    actions: [{ id: 'deepwhy', label: 'Refresh Why — pull real emails', runner: 'deepwhy.mjs' }],
+  }), 'utf-8');
+  return slug;
+}
+
+test('deriveRunnerProvenance surfaces the REAL connector from runner source (Salesforce, not guessed)', () => {
+  const src = "import {execFileSync} from 'node:child_process';\nexecFileSync('sf',['data','query','--query',`SELECT Subject FROM EmailMessage WHERE RelatedToId IN ('x')`,'--json']);";
+  const out = deriveRunnerProvenance(src).join(' · ');
+  assert.match(out, /shells: sf.*Salesforce CLI/);
+  assert.match(out, /SOQL FROM: EmailMessage \(Salesforce\)/);
+});
+
+test('deriveRunnerProvenance flags composio/connector refs but ignores engine tokens', () => {
+  const out = deriveRunnerProvenance("composio_execute_tool({ slug: 'OUTLOOK_FETCH_MESSAGES' }); const ctx = STEP_CONTEXT; fetch('https://api.z.ai/v1');").join(' · ');
+  assert.match(out, /composio_execute_tool/);
+  assert.match(out, /OUTLOOK_FETCH_MESSAGES/);
+  assert.match(out, /http: api\.z\.ai/);
+  assert.doesNotMatch(out, /STEP_CONTEXT/);
+});
+
+test('registerSpaceTools exposes the runner read/edit/revert tools', () => {
+  assert.ok(tools.space_get_runner);
+  assert.ok(tools.space_edit_runner);
+  assert.ok(tools.space_revert_runner);
+});
+
+test('space_get_runner reads a runner line-numbered + surfaces its Salesforce provenance (kills the is-it-Composio blind spot)', async () => {
+  const slug = makeRunnerSpace();
+  const out = text(await tools.space_get_runner({ slug, runner_path: 'deepwhy.mjs', grep: null, around: null }));
+  // provenance line — the real data source is VISIBLE
+  assert.match(out, /shells: sf.*Salesforce CLI/);
+  assert.match(out, /SOQL FROM: EmailMessage \(Salesforce\)/);
+  // self-locating: which action uses it
+  assert.match(out, /used by action "Refresh Why — pull real emails"/);
+  // line-numbered source (cat -n), pointing at space_edit_runner
+  assert.match(out, /1\timport \{ execFileSync \}/);
+  assert.match(out, /space_edit_runner/);
+});
+
+test('space_get_runner with no runner_path LISTS every runner + provenance', async () => {
+  const slug = makeRunnerSpace();
+  const out = text(await tools.space_get_runner({ slug, runner_path: null, grep: null, around: null }));
+  assert.match(out, /refresh\.mjs ← data source "risk"/);
+  assert.match(out, /deepwhy\.mjs ← action "Refresh Why/);
+  assert.match(out, /Salesforce/); // deepwhy's provenance shows in the list
+});
+
+test('space_get still hides runner SOURCE but now shows the runner filename + the space_get_runner pointer', async () => {
+  const slug = makeRunnerSpace();
+  const out = text(await tools.space_get({ slug }));
+  assert.match(out, /risk → refresh\.mjs/);
+  assert.match(out, /Refresh Why.*→ deepwhy\.mjs/);
+  assert.match(out, /space_get_runner/);
+  // the runner SOURCE must not leak into space_get (it stays manifest-level)
+  assert.doesNotMatch(out, /execFileSync/);
+  assert.doesNotMatch(out, /EmailMessage/);
+});
+
+test('space_edit_runner applies a verbatim find/replace on a runner and is reversible', async () => {
+  const slug = makeRunnerSpace();
+  const res = text(await tools.space_edit_runner({
+    slug, runner_path: 'deepwhy.mjs',
+    edits: [{ find: "RelatedToId IN ('006xx')", replace: "AccountId IN ('001xx')" }],
+  }));
+  assert.match(res, /Applied 1 edit/);
+  assert.match(res, /space_revert_runner/);
+  // action runner → NOT auto-run (no side effect)
+  assert.match(res, /action "Refresh Why.*not auto-run/);
+  const after = readFileSync(store.resolveInSpace(slug, 'data/deepwhy.mjs'), 'utf-8');
+  assert.match(after, /AccountId IN \('001xx'\)/);
+  assert.equal(after.includes("RelatedToId IN ('006xx')"), false);
+
+  const rev = text(await tools.space_revert_runner({ slug, runner_path: 'deepwhy.mjs' }));
+  assert.match(rev, /Reverted/);
+  assert.match(readFileSync(store.resolveInSpace(slug, 'data/deepwhy.mjs'), 'utf-8'), /RelatedToId IN \('006xx'\)/);
+});
+
+test('space_edit_runner on a non-matching find returns a precise hint and does NOT write (the grounding catch-22)', async () => {
+  const slug = makeRunnerSpace();
+  const res = text(await tools.space_edit_runner({
+    slug, runner_path: 'deepwhy.mjs',
+    edits: [{ find: 'RelatedToXd IN', replace: 'x' }],
+  }));
+  assert.match(res, /No edits applied/);
+  assert.match(res, /matched the first \d+ char/);
+  assert.match(res, /space_get_runner/);
+  // unchanged
+  assert.match(readFileSync(store.resolveInSpace(slug, 'data/deepwhy.mjs'), 'utf-8'), /RelatedToId IN \('006xx'\)/);
+});
+
+test('space_get_runner errors cleanly for a missing runner + lists what IS declared', async () => {
+  const slug = makeRunnerSpace();
+  const out = text(await tools.space_get_runner({ slug, runner_path: 'ghost.mjs', grep: null, around: null }));
+  assert.match(out, /has no runner "data\/ghost\.mjs"/);
+  assert.match(out, /deepwhy\.mjs/);
 });
 
 test('isSpacesEnabled defaults ON (beta) and honors the kill-switch', () => {

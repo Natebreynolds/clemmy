@@ -106,6 +106,7 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   // shelling out to read_file/grep the view.
   'space_get',
   'space_get_view',
+  'space_get_runner',
   'space_list',
   'list_files',
   'read_file',
@@ -154,6 +155,7 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   'workflow_create',
   'workflow_from_session',
   'workflow_update',
+  'workflow_edit_step',
   'workflow_set_enabled',
   'workflow_run',
   'workflow_run_status',
@@ -164,6 +166,8 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   // view; space_refresh re-pulls its data. Without these in the surface, a Claude
   // dock turn can't persist a workspace edit and wrongly writes a scratch file.
   'space_edit_view',
+  'space_edit_runner',
+  'space_revert_runner',
   'space_save',
   'space_refresh',
   // space_try_runner dry-runs a candidate data runner (no persist) so the model

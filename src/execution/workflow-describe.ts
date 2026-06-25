@@ -154,6 +154,80 @@ export function describeStep(step: WorkflowStepInput, index: number): string {
   return `${index + 1}. ${label}${suffix}`;
 }
 
+// ─── data-source provenance ──────────────────────────────────────────
+
+/** Engine/template tokens that look like connector slugs but aren't — excluded
+ *  from the "refs in prompt" derivation so STEP_CONTEXT etc. don't read as data
+ *  sources. NOT a vendor list (that would violate global/no-curated-lists) —
+ *  it's the harness's own grammar tokens. */
+const NON_CONNECTOR_TOKENS = new Set([
+  'STEP_CONTEXT', 'STEP', 'CONTEXT', 'JSON', 'HTTP', 'HTTPS', 'URL', 'URI', 'API',
+  'ID', 'IDS', 'CSV', 'HTML', 'PDF', 'UTC', 'TODO', 'NOTE', 'AND', 'OR', 'NOT',
+]);
+
+/**
+ * Vendor-agnostic derivation of WHERE a step's data comes from and what it can
+ * touch — surfaced at READ time so an editor sees a step's REAL bindings
+ * (e.g. that it queries Salesforce, not Composio) instead of guessing from a
+ * clipped prompt. Pure: reads the step's declared capability surface +
+ * data-flow bindings, plus a light regex over the prompt for concrete tool /
+ * connector references. No curated vendor list — it surfaces whatever the step
+ * literally names.
+ */
+export function deriveStepDataSources(step: WorkflowStepInput): string[] {
+  const out: string[] = [];
+  const prompt = step.prompt ?? '';
+
+  // 1) Explicit, declared capability surface (the most reliable signals).
+  if (step.deterministic?.runner) out.push(`script: ${step.deterministic.runner} (no AI)`);
+  if (step.allowedTools && step.allowedTools.length > 0) {
+    out.push(`allowed tools: ${step.allowedTools.join(', ')}`);
+  }
+
+  // 2) Concrete tool/connector references INSIDE the prompt (general patterns,
+  //    no vendor list): MCP tool names, Composio-style ALL_CAPS slugs
+  //    (SALESFORCE_QUERY, OUTLOOK_FETCH_MESSAGES), and named harness tools.
+  const refs = new Set<string>();
+  for (const m of prompt.matchAll(/\bmcp__[a-zA-Z0-9_]+__[a-zA-Z0-9_]+\b/g)) refs.add(m[0]);
+  for (const m of prompt.matchAll(/\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g)) {
+    if (!NON_CONNECTOR_TOKENS.has(m[0])) refs.add(m[0]);
+  }
+  for (const m of prompt.matchAll(/\b(?:composio_execute_tool|run_tool_program|write_file|run_shell_command|web_fetch|web_search)\b/g)) {
+    refs.add(m[0]);
+  }
+  if (refs.size > 0) out.push(`refs in prompt: ${[...refs].slice(0, 12).join(', ')}`);
+
+  // 3) Data flow — what it reads in / iterates over.
+  const flow = new Set<string>();
+  for (const m of prompt.matchAll(/\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output[^}]*\}\}/g)) flow.add(`steps.${m[1]}`);
+  for (const m of prompt.matchAll(/\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g)) flow.add(`input.${m[1]}`);
+  if (step.forEach) flow.add(`forEach ${step.forEach}`);
+  if (/\{\{\s*item[.\s}]/.test(prompt)) flow.add('item');
+  if (flow.size > 0) out.push(`data flow: ${[...flow].join(', ')}`);
+
+  // 4) Side-effect class (read / write / send) — visible so an editor knows
+  //    whether a step touches external state.
+  if (step.sideEffect) out.push(`side-effect: ${step.sideEffect}`);
+
+  return out;
+}
+
+/**
+ * A compact per-step "data sources" review block for author-time confirmation —
+ * so a WRONG binding (e.g. a step built on Composio when it should read
+ * Salesforce) is VISIBLE the moment a workflow is created or edited, not
+ * discovered at run time. Returns '' when no step has a derivable source.
+ */
+export function renderWorkflowDataSources(def: WorkflowDefinition): string {
+  const lines: string[] = [];
+  for (const step of def.steps ?? []) {
+    const sources = deriveStepDataSources(step);
+    if (sources.length > 0) lines.push(`- ${step.id}: ${sources.join(' · ')}`);
+  }
+  if (lines.length === 0) return '';
+  return `**Data sources per step** (confirm these are right — e.g. the correct connector):\n${lines.join('\n')}`;
+}
+
 // ─── produces ────────────────────────────────────────────────────────
 
 /** One-line "what you get at the end" phrase, best-effort + honest. */

@@ -923,9 +923,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // NOT), so the model reads a view via the sanctioned tool instead of
       // defecting to read_file/grep in the shell. byName no-ops when spaces off.
       'space_get_view',
+      'space_get_runner',
       'space_list',
       'space_save',
       'space_edit_view',
+      'space_edit_runner',
+      'space_revert_runner',
       'space_refresh',
       // space_try_runner dry-runs a candidate runner (no persist) so the model
       // stops emulating it with `node data/x.mjs` in the shell; space_set_data
@@ -958,6 +961,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'workflow_run',
       'workflow_run_status',
       'workflow_update',
+      'workflow_edit_step',
       'workflow_delete',
       'workflow_set_enabled',
       'workflow_schedule',

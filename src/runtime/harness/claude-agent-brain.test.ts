@@ -17,6 +17,7 @@ const {
   setClaudeAgentSdkBrainRunForTest,
   setClaudeAgentSdkBrainJudgeForTest,
   looksLikeToolNarration,
+  looksLikeStreamingNarration,
   looksLikeReasoningLeak,
   frameTrustedMemory,
   sdkStreamingEnabled,
@@ -444,6 +445,21 @@ test('sdkStreamingEnabled defaults OFF (clean dock — opt back in with =on)', (
   process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'on';
   assert.equal(sdkStreamingEnabled(), true);
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
+});
+
+test('looksLikeStreamingNarration suppresses live streaming the moment tool-call XML/protocol appears, never on clean prose', () => {
+  // The high-precision markers that must cut the live stream (the dock noise).
+  assert.equal(looksLikeStreamingNarration('Let me check…\n<invoke name="run_shell_command">'), true);
+  assert.equal(looksLikeStreamingNarration('<parameter name="command">ls</parameter>'), true);
+  assert.equal(looksLikeStreamingNarration('**Tool call: skill_read**'), true);
+  assert.equal(looksLikeStreamingNarration('Tool call: workflow_get'), true);
+  assert.equal(looksLikeStreamingNarration('<tool_call>'), true);
+  assert.equal(looksLikeStreamingNarration('[tool_call] skill_read'), true);
+  // Clean prose must keep streaming — no false cut mid-answer.
+  assert.equal(looksLikeStreamingNarration('Pulled your 5 deals — here is the summary.'), false);
+  assert.equal(looksLikeStreamingNarration('Here is what each tool call does in the pipeline.'), false);
+  assert.equal(looksLikeStreamingNarration('I will invoke the report generator next.'), false);
+  assert.equal(looksLikeStreamingNarration(''), false);
 });
 
 test('renderClaudeAgentBrainSystemAppend injects the workspace primer for a "space-" session', async () => {
