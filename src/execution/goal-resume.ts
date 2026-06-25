@@ -30,13 +30,107 @@ import {
   type PlanProposal,
 } from '../agents/plan-proposals.js';
 import { shouldProactivelyReport } from '../runtime/outcome.js';
-import { addNotification } from '../runtime/notifications.js';
+import { addNotification, listNotifications, type NotificationRecord } from '../runtime/notifications.js';
 
 const logger = pino({ name: 'clementine-next.goal-resume' });
 
 function selfDriveEnabled(): boolean {
   if ((getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() === 'off') return false;
   return (getRuntimeEnv('CLEMMY_GOAL_SELF_DRIVE', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * OODA re-Orient gate (default OFF). When on, a self-driving goal resume folds
+ * fresh monitor observations (inbox/calendar needs-you items that landed since
+ * the last cycle and overlap the goal) into the resume directive — closing the
+ * "Act → prepare to reassess" feedback edge. OFF ⇒ zero added work: no
+ * notification read, no telemetry, and the directive is byte-identical to today.
+ * Rides the master CLEMMY_GOAL_CONTRACT kill-switch like self-drive.
+ */
+function reorientObsEnabled(): boolean {
+  if ((getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() === 'off') return false;
+  return (getRuntimeEnv('CLEMMY_GOAL_REORIENT_OBS', 'off') ?? 'off').toLowerCase() === 'on';
+}
+
+// ── re-Orient: fresh monitor observations relevant to the goal ────────────────
+/** Monitor sources whose notifications are already anti-firehose'd needs-you
+ *  items by construction (the monitor only cards an item it scored as needing
+ *  the user) — so the re-Orient injector reuses that verdict instead of
+ *  re-scoring, and only adds a relevance-to-this-goal filter on top. */
+const REORIENT_MONITOR_SOURCES: ReadonlySet<string> = new Set(['inbox-monitor', 'calendar-monitor']);
+/** Cap injected lines — a re-orient nudge, never a digest dump. */
+const REORIENT_OBS_CAP = 3;
+/** Never reach back further than a day for "what changed since last cycle",
+ *  even if a goal's resume cadence is longer. */
+const MAX_OBS_WINDOW_MS = 24 * 60 * 60 * 1000;
+const REORIENT_STOPWORDS: ReadonlySet<string> = new Set([
+  'the', 'and', 'for', 'with', 'your', 'you', 'this', 'that', 'from', 'have', 'will',
+  'their', 'about', 'into', 'over', 'when', 'what', 'which', 'goal', 'task', 'please',
+  'need', 'needs', 'them', 'they', 'then', 'than', 'were', 'been', 'also', 'each',
+]);
+
+/** Meaningful (length ≥4, non-stopword) lowercase tokens — the overlap unit. */
+function overlapTokens(text: string): Set<string> {
+  const set = new Set<string>();
+  for (const raw of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
+    if (raw.length >= 4 && !REORIENT_STOPWORDS.has(raw)) set.add(raw);
+  }
+  return set;
+}
+
+/**
+ * Pure + exported for tests: from the monitor notifications, pick the ≤N most
+ * recent needs-you items that landed inside (sinceMs, nowMs] AND share a
+ * meaningful token with the goal objective. Newest first; deduped by line.
+ * Empty objective ⇒ no matches (never inject everything).
+ */
+export function selectReorientObservations(
+  notifications: NotificationRecord[],
+  objective: string,
+  sinceMs: number,
+  nowMs: number,
+): string[] {
+  const objectiveTokens = overlapTokens(objective);
+  if (objectiveTokens.size === 0) return [];
+  const matches: Array<{ at: number; line: string }> = [];
+  const seen = new Set<string>();
+  for (const n of notifications) {
+    const source = typeof n.metadata?.source === 'string' ? n.metadata.source : '';
+    if (!REORIENT_MONITOR_SOURCES.has(source)) continue;
+    const at = Date.parse(n.createdAt);
+    if (!Number.isFinite(at) || at <= sinceMs || at > nowMs) continue;
+    const account = typeof n.metadata?.account === 'string' ? n.metadata.account : '';
+    const haystack = `${n.title}\n${n.body}\n${account}`;
+    const hayTokens = overlapTokens(haystack);
+    let overlaps = false;
+    for (const t of objectiveTokens) { if (hayTokens.has(t)) { overlaps = true; break; } }
+    if (!overlaps) continue;
+    const reasons = Array.isArray(n.metadata?.reasons)
+      ? (n.metadata.reasons as unknown[]).filter((r): r is string => typeof r === 'string')
+      : [];
+    const title = (n.title ?? '').trim();
+    if (!title) continue;
+    const line = reasons.length > 0 ? `${title} (${reasons.join(', ')})` : title;
+    if (seen.has(line)) continue;
+    seen.add(line);
+    matches.push({ at, line });
+  }
+  matches.sort((a, b) => b.at - a.at);
+  return matches.slice(0, REORIENT_OBS_CAP).map((m) => m.line);
+}
+
+/** Live reader (REAL_DEPS): the monitor notifications from the goal's last cycle
+ *  window that overlap its objective. Best-effort — never throws into the tick. */
+function liveRecentObservations(goal: PlanProposal): string[] {
+  try {
+    const objective = (goal.approvedPlan ?? goal.plan)?.objective ?? '';
+    if (!objective) return [];
+    const nowMs = Date.now();
+    const window = Math.min(goal.resumeEveryMs ?? GOAL_DEFAULT_RESUME_EVERY_MS, MAX_OBS_WINDOW_MS);
+    return selectReorientObservations(listNotifications(200), objective, nowMs - window, nowMs);
+  } catch {
+    return [];
+  }
 }
 
 /** Injectable seams so the tick logic is unit-testable without a real daemon. */
@@ -50,6 +144,13 @@ export interface GoalResumeDeps {
   fireResume: (goal: PlanProposal, directive: string) => void;
   /** Escalate a freshly-parked goal to the human (one notification). */
   escalate: (goal: PlanProposal, reason: string, body: string) => void;
+  /** Fresh monitor observations (inbox/calendar needs-you items) that landed
+   *  since the goal's last cycle and overlap its objective — the OODA re-Orient
+   *  input. Optional + best-effort (omitted in tests; never throws). Only read
+   *  when CLEMMY_GOAL_REORIENT_OBS is on. */
+  recentObservations?: (goal: PlanProposal) => string[];
+  /** Emit the ooda_cycle re-Orient telemetry marker (pure observability). */
+  emitReorient?: (goal: PlanProposal, payload: { observationsInjected: number }) => void;
 }
 
 function snapshotsEqual(
@@ -59,14 +160,21 @@ function snapshotsEqual(
   return !!a && a.ledger === b.ledger && a.evidence === b.evidence && a.stagesDone === b.stagesDone;
 }
 
-function buildResumeDirective(goal: PlanProposal): string {
+function buildResumeDirective(goal: PlanProposal, observations: string[] = []): string {
   const plan = goal.approvedPlan ?? goal.plan;
   const stage = goal.stages?.find((s) => s.status === 'pending');
   const ledgerTail = (goal.progressLedger ?? []).slice(-5);
+  // OODA re-Orient block: only present when fresh, goal-relevant observations were
+  // injected (flag on). With observations=[] the line drops out via filter(Boolean)
+  // → the directive is byte-identical to the pre-feature output.
+  const obsBlock = observations.length > 0
+    ? `What changed since your last cycle (re-orient before continuing — an item below may already address the goal or change what to do next):\n${observations.map((o) => `- ${o}`).join('\n')}`
+    : '';
   return [
     `You are autonomously resuming a pinned goal you have been working on. Objective: ${plan.objective}`,
     stage ? `Current stage: ${stage.title}.` : '',
     ledgerTail.length > 0 ? `Progress so far:\n${ledgerTail.map((l) => `- ${l}`).join('\n')}` : '',
+    obsBlock,
     'Continue the work toward the next concrete milestone. Do NOT redo work already recorded above.',
     'If you finish a milestone, give ONE concise progress line and keep going. If you are BLOCKED — a tool keeps failing, a required input is missing, or an external service is unavailable — STOP and state the specific blocker (set nextAction=awaiting_user_input); do not spin.',
   ].filter(Boolean).join('\n');
@@ -146,8 +254,21 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
       snapshot: snap,
       noProgressStreak: streak,
     });
+    // Re-Orient (OODA feedback edge): before resuming, fold in fresh monitor
+    // observations that landed since the last cycle so the turn re-reads the world
+    // instead of continuing blind. Flag-gated (default off) ⇒ no read, no event, and
+    // a byte-identical directive when off. Best-effort — a reader/telemetry hiccup
+    // never affects the resume itself.
+    let injectedObs: string[] = [];
+    if (reorientObsEnabled()) {
+      try { injectedObs = deps.recentObservations?.(goal) ?? []; } catch { injectedObs = []; }
+      if (injectedObs.length > 0) {
+        try { deps.emitReorient?.(goal, { observationsInjected: injectedObs.length }); }
+        catch { /* telemetry is best-effort */ }
+      }
+    }
     try {
-      deps.fireResume(goal, buildResumeDirective(goal));
+      deps.fireResume(goal, buildResumeDirective(goal, injectedObs));
       fired = goal.id;
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : err, goalId: goal.id }, 'goal resume fire failed');
@@ -166,7 +287,7 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
 export async function processGoalResumptions(): Promise<void> {
   if (!selfDriveEnabled()) return;
   try {
-    const [{ listEvents }, approvalRegistry] = await Promise.all([
+    const [{ listEvents, appendEvent }, approvalRegistry] = await Promise.all([
       import('../runtime/harness/eventlog.js'),
       import('../runtime/harness/approval-registry.js'),
     ]);
@@ -208,6 +329,25 @@ export async function processGoalResumptions(): Promise<void> {
             metadata: { sessionId: goal.sessionId, goalId: goal.id, parkedReason: reason, needsYou: true },
           });
         } catch { /* escalation is best-effort */ }
+      },
+      recentObservations: liveRecentObservations,
+      emitReorient: (goal, payload) => {
+        if (!goal.sessionId) return;
+        try {
+          appendEvent({
+            sessionId: goal.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'ooda_cycle',
+            data: {
+              phase: 'reorient',
+              scope: 'goal',
+              goalId: goal.id,
+              objective: ((goal.approvedPlan ?? goal.plan)?.objective ?? '').slice(0, 200),
+              observationsInjected: payload.observationsInjected,
+            },
+          });
+        } catch { /* telemetry is best-effort */ }
       },
     };
     const result = evaluateGoalResumptions(deps);

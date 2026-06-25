@@ -27,8 +27,9 @@ const {
   surfacePlan, approvePlanProposal, getPlanProposal, getActiveGoalForSession,
   enableGoalSelfDrive, touchGoalActivity,
 } = await import('../agents/plan-proposals.js');
-const { evaluateGoalResumptions } = await import('./goal-resume.js');
+const { evaluateGoalResumptions, selectReorientObservations } = await import('./goal-resume.js');
 import type { GoalResumeDeps } from './goal-resume.js';
+import type { NotificationRecord } from '../runtime/notifications.js';
 
 beforeEach(() => {
   rmSync(TMP_HOME + '/state/plan-proposals', { recursive: true, force: true });
@@ -54,22 +55,47 @@ function makeSelfDrivingGoal(opts: { resumeEveryMs?: number; maxResumes?: number
   return { goal, sessionId };
 }
 
-/** Eligible-by-default deps: idle session, no pending approval, capturing fires. */
+/** Eligible-by-default deps: idle session, no pending approval, capturing fires.
+ *  `captured` holds the resume directives passed to fireResume (for re-orient
+ *  parity asserts); `reorients` holds the per-fire observationsInjected count. */
 function makeDeps(over: Partial<GoalResumeDeps> & { nowMs?: number } = {}): GoalResumeDeps & {
-  fires: string[]; escalations: { id: string; reason: string }[];
+  fires: string[]; escalations: { id: string; reason: string }[]; captured: string[]; reorients: number[];
 } {
   const fires: string[] = [];
   const escalations: { id: string; reason: string }[] = [];
-  const deps: GoalResumeDeps & { fires: string[]; escalations: { id: string; reason: string }[] } = {
+  const captured: string[] = [];
+  const reorients: number[] = [];
+  const deps: GoalResumeDeps & {
+    fires: string[]; escalations: { id: string; reason: string }[]; captured: string[]; reorients: number[];
+  } = {
     now: () => over.nowMs ?? Date.now() + 60 * 60 * 1000, // default: an hour ahead so the goal is due
     sessionIdleMs: over.sessionIdleMs ?? (() => 5 * 60 * 1000), // idle 5 min
     hasPendingApproval: over.hasPendingApproval ?? (() => false),
-    fireResume: over.fireResume ?? ((goal) => { fires.push(goal.id); }),
+    fireResume: over.fireResume ?? ((goal, directive) => { fires.push(goal.id); captured.push(directive); }),
     escalate: over.escalate ?? ((goal, reason) => { escalations.push({ id: goal.id, reason }); }),
+    recentObservations: over.recentObservations,
+    emitReorient: over.emitReorient ?? ((_goal, payload) => { reorients.push(payload.observationsInjected); }),
     fires,
     escalations,
+    captured,
+    reorients,
   };
   return deps;
+}
+
+/** Minimal monitor notification for selectReorientObservations tests. */
+function obsNotif(opts: {
+  title: string; body?: string; source?: string; account?: string; reasons?: string[]; atMs: number;
+}): NotificationRecord {
+  return {
+    id: `n-${opts.title}-${opts.atMs}`,
+    kind: 'execution',
+    title: opts.title,
+    body: opts.body ?? '',
+    createdAt: new Date(opts.atMs).toISOString(),
+    read: false,
+    metadata: { source: opts.source ?? 'inbox-monitor', account: opts.account, reasons: opts.reasons, needsAttention: true },
+  };
 }
 
 test('a due, eligible self-driving goal fires one resume and schedules the next first', () => {
@@ -193,5 +219,108 @@ test('kill-switch CLEMMY_GOAL_SELF_DRIVE=off makes the pass inert', () => {
     assert.equal(r.parked.length, 0);
   } finally {
     delete process.env.CLEMMY_GOAL_SELF_DRIVE;
+  }
+});
+
+// ── OODA re-Orient: fresh-observation injection (CLEMMY_GOAL_REORIENT_OBS) ─────
+
+test('selectReorientObservations: source-filters, time-windows, overlaps objective, caps + orders newest-first', () => {
+  const now = 10_000_000;
+  const objective = 'Enrich the Salesforce prospect accounts and email them';
+  const items: NotificationRecord[] = [
+    obsNotif({ title: '📥 Jane: Re: Salesforce prospect list', reasons: ['asks you something'], atMs: now - 1000 }), // match, newest
+    obsNotif({ title: '📥 Bob: prospect data ready', reasons: ['a reply in your thread'], atMs: now - 5000 }),       // match, oldest
+    obsNotif({ title: '📥 Promo: 50% off shoes', atMs: now - 500 }),                                                  // no overlap → excluded
+    obsNotif({ title: '📥 Old: Salesforce note', atMs: now - 9_000_000 }),                                           // pre-window → excluded
+    obsNotif({ title: 'workflow ran for Salesforce', source: 'workflow-runner', atMs: now - 100 }),                  // wrong source → excluded
+    obsNotif({ title: '📥 Amy: another prospect ping', reasons: ['time-sensitive'], atMs: now - 3000 }),             // match, middle
+  ];
+  const lines = selectReorientObservations(items, objective, now - 60_000, now);
+  assert.equal(lines.length, 3, 'newest 3 matches, capped');
+  assert.ok(lines[0].includes('Jane'), 'newest match first');
+  assert.ok(lines.some((l) => l.includes('Amy')));
+  assert.ok(!lines.some((l) => l.includes('Promo')), 'tangential item excluded by objective overlap');
+  assert.ok(!lines.some((l) => l.includes('workflow')), 'non-monitor source excluded');
+  assert.ok(!lines.some((l) => l.includes('Old:')), 'pre-window item excluded');
+  assert.ok(lines[0].includes('(asks you something)'), 'reasons appended to the line');
+});
+
+test('selectReorientObservations: empty/whitespace objective never injects (no match-everything)', () => {
+  const now = 1000;
+  const items = [obsNotif({ title: '📥 Salesforce prospect', atMs: now - 100 })];
+  assert.deepEqual(selectReorientObservations(items, '', now - 1000, now), []);
+  assert.deepEqual(selectReorientObservations(items, '   ', now - 1000, now), []);
+});
+
+test('selectReorientObservations: dedupes identical lines', () => {
+  const now = 1000;
+  const items = [
+    obsNotif({ title: '📥 Jane: prospect ping', reasons: ['asks you something'], atMs: now - 100 }),
+    obsNotif({ title: '📥 Jane: prospect ping', reasons: ['asks you something'], atMs: now - 200 }),
+  ];
+  assert.equal(selectReorientObservations(items, 'prospect outreach', now - 1000, now).length, 1);
+});
+
+test('re-orient: flag OFF → reader never called, directive byte-identical (no "What changed" block)', () => {
+  const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
+  let called = 0;
+  const deps = makeDeps({
+    nowMs: Date.now() + 60 * 60 * 1000,
+    recentObservations: () => { called++; return ['📥 Jane: should NOT appear (asks you something)']; },
+  });
+  const r = evaluateGoalResumptions(deps);
+  assert.equal(r.fired, goal.id);
+  assert.equal(called, 0, 'recentObservations is never read when the flag is off');
+  assert.equal(deps.captured.length, 1);
+  assert.ok(!deps.captured[0].includes('What changed since your last cycle'), 'no re-orient block');
+  assert.ok(!deps.captured[0].includes('should NOT appear'));
+  assert.deepEqual(deps.reorients, [], 'no telemetry emitted when off');
+});
+
+test('re-orient: flag ON + fresh observations → injected into directive + ooda_cycle telemetry', () => {
+  const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
+  process.env.CLEMMY_GOAL_REORIENT_OBS = 'on';
+  try {
+    const deps = makeDeps({
+      nowMs: Date.now() + 60 * 60 * 1000,
+      recentObservations: () => ['📥 Jane: Re: contract (asks you something)'],
+    });
+    const r = evaluateGoalResumptions(deps);
+    assert.equal(r.fired, goal.id);
+    assert.ok(deps.captured[0].includes('What changed since your last cycle'), 're-orient block present');
+    assert.ok(deps.captured[0].includes('Jane: Re: contract'), 'observation injected');
+    assert.deepEqual(deps.reorients, [1], 'telemetry records the injected count');
+  } finally {
+    delete process.env.CLEMMY_GOAL_REORIENT_OBS;
+  }
+});
+
+test('re-orient: flag ON but no relevant observations → no block, no telemetry', () => {
+  const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
+  process.env.CLEMMY_GOAL_REORIENT_OBS = 'on';
+  try {
+    const deps = makeDeps({ nowMs: Date.now() + 60 * 60 * 1000, recentObservations: () => [] });
+    const r = evaluateGoalResumptions(deps);
+    assert.equal(r.fired, goal.id);
+    assert.ok(!deps.captured[0].includes('What changed since your last cycle'));
+    assert.deepEqual(deps.reorients, [], 'no telemetry when nothing was injected');
+  } finally {
+    delete process.env.CLEMMY_GOAL_REORIENT_OBS;
+  }
+});
+
+test('re-orient: a throwing observation reader never blocks the resume (best-effort)', () => {
+  const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
+  process.env.CLEMMY_GOAL_REORIENT_OBS = 'on';
+  try {
+    const deps = makeDeps({
+      nowMs: Date.now() + 60 * 60 * 1000,
+      recentObservations: () => { throw new Error('boom'); },
+    });
+    const r = evaluateGoalResumptions(deps);
+    assert.equal(r.fired, goal.id, 'resume still fires despite a reader error');
+    assert.ok(!deps.captured[0].includes('What changed'));
+  } finally {
+    delete process.env.CLEMMY_GOAL_REORIENT_OBS;
   }
 });
