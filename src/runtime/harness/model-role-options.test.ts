@@ -82,6 +82,7 @@ test('connected model catalog includes authenticated Codex/Claude and configured
     OPENAI_MODEL_WORKER: 'qwen-worker',
   }, () => {
     const ids = new Set(connectedModelGroups().flatMap((g) => g.models.map((m) => m.id)));
+    assert.equal(ids.has('gpt-5.4-nano'), true);
     assert.equal(ids.has('gpt-5.4'), true);
     assert.equal(ids.has('claude-opus-4-8'), true);
     assert.equal(ids.has('deepseek-chat'), true);

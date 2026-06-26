@@ -44,6 +44,12 @@ test('model settings snapshot reports process env overrides', () => {
     assert.equal(snapshot.models.primary, 'gpt-5.4-mini');
     assert.equal(snapshot.processEnvOverrides.primary, true);
     assert.equal(snapshot.processEnvOverrides.fast, false);
+    assert.deepEqual(snapshot.presets.map((p) => p.id), [
+      'gpt-5.4-nano',
+      'gpt-5.4-mini',
+      'gpt-5.4',
+      'gpt-5.5',
+    ]);
   } finally {
     if (original === undefined) delete process.env.OPENAI_MODEL_PRIMARY;
     else process.env.OPENAI_MODEL_PRIMARY = original;
