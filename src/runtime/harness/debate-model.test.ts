@@ -175,6 +175,26 @@ test('getResponse: debate turn → both brains draft, judge sees both drafts and
   });
 });
 
+test('getResponse: slow debate judge hits deadline and falls back to the stronger draft', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    let aborted = false;
+    const b = brains({
+      draftA: model({ getResponse: async () => msg('short') }),
+      draftB: model({ getResponse: async () => msg('LONGER-CODEX-DRAFT') }),
+      judge: model({ getResponse: async (r: any) => {
+        const sig = r.signal as AbortSignal | undefined;
+        sig?.addEventListener('abort', () => { aborted = true; }, { once: true });
+        return new Promise<ModelResponse>(() => {});
+      } }),
+    });
+    const t0 = Date.now();
+    const res = await dm(b, { checkerDeadlineMs: 10 }).getResponse(req());
+    assert.equal((res.output[0] as any).content, 'LONGER-CODEX-DRAFT');
+    assert.ok(Date.now() - t0 < 2000, 'deadline fallback returned promptly');
+    assert.equal(aborted, true, 'deadline aborts the late judge request');
+  });
+});
+
 test('getResponse: one draft fails → fail open to the survivor (no judge)', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
     let judged = 0;
@@ -269,6 +289,26 @@ test('getStreamedResponse: debate streams the JUDGE; exactly one response_starte
     assert.ok(startIdx >= 0 && startIdx < firstContentIdx, 'response_started precedes any content');
     assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'RECONCILED'));
     assert.equal(evs.filter((e) => e.type === 'response_done').length, 1);
+  });
+});
+
+test('getStreamedResponse: debate judge can start then hang; deadline aborts and streams fallback draft', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all' }, async () => {
+    let aborted = false;
+    const b = brains({
+      draftA: model({ getResponse: async () => msg('short') }),
+      draftB: model({ getResponse: async () => msg('LONGER-STREAM-DRAFT') }),
+      judge: model({ getStreamedResponse: async function* (r: any) {
+        const sig = r.signal as AbortSignal | undefined;
+        sig?.addEventListener('abort', () => { aborted = true; }, { once: true });
+        yield { type: 'response_started' } as any;
+        await new Promise<void>((resolve) => sig?.addEventListener('abort', () => resolve(), { once: true }));
+      } }),
+    });
+    const evs = await collect(dm(b, { heartbeatMs: 0, checkerDeadlineMs: 10 }).getStreamedResponse(req()));
+    assert.ok(evs.some((e) => e.type === 'output_text_delta' && e.delta === 'LONGER-STREAM-DRAFT'), 'streamed the fallback draft');
+    assert.equal(evs.filter((e) => e.type === 'response_done').length, 1);
+    assert.equal(aborted, true, 'deadline aborts the late debate judge');
   });
 });
 
@@ -570,21 +610,23 @@ test('verify: forwarded checker response_done is normalized before the SDK parse
 
 test('verify: a HUNG checker (Anthropic capacity hang) ships the executor draft past the deadline — no failure, no hang', async () => {
   await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let aborted = false;
     const b = brains({
       passthrough: model({ getResponse: async () => msg('DRAFT-PROSE') }),
-      // The checker takes far longer than the deadline to produce its first event
-      // — exactly the Anthropic transport-timeout hang. Without the deadline it
-      // would block the turn (then fail); with it, the executor's draft (the
-      // safety net) ships at the deadline. (Finite delay so the test loop drains.)
-      judge: model({ getStreamedResponse: async function* () {
-        await new Promise((r) => setTimeout(r, 200));
-        yield { type: 'response_done', response: { output: [{ type: 'message', content: 'LATE-CHECKER' }] } } as any;
+      // The checker starts the stream but never produces committed content —
+      // exactly the subtle "response_started then transport hang" shape.
+      judge: model({ getStreamedResponse: async function* (r: any) {
+        const sig = r.signal as AbortSignal | undefined;
+        sig?.addEventListener('abort', () => { aborted = true; }, { once: true });
+        yield { type: 'response_started' } as any;
+        await new Promise<void>((resolve) => sig?.addEventListener('abort', () => resolve(), { once: true }));
       } }),
     });
     const evs = await collect(dm(b, { heartbeatMs: 0, checkerDeadlineMs: 10 }).getStreamedResponse(req()));
     const dones: any[] = evs.filter((e) => e.type === 'response_done');
     assert.equal(dones.length, 1, 'exactly one response_done — the shipped draft (no crash, no duplicate)');
     assert.match(JSON.stringify(evs), /DRAFT-PROSE/, 'shipped the executor draft instead of failing on the hung checker');
+    assert.equal(aborted, true, 'deadline aborts the late checker');
   });
 });
 
@@ -617,6 +659,25 @@ test('verify strategy: executor drafts, checker verifies → returns the checker
     assert.equal(executorCalls, 1, 'executor drafted exactly once (2 calls total, not 3)');
     assert.match(checkerSawDraft, /CODEX-DRAFT/, 'checker received the executor draft');
     assert.match(checkerSawDraft, /VERIFY & REFINE/);
+  });
+});
+
+test('verify strategy: non-streamed hung checker hits deadline, aborts, and ships executor draft', async () => {
+  await withEnv({ CLEMMY_DEBATE_MODE: 'all', CLEMMY_FUSION_STRATEGY: 'verify' }, async () => {
+    let aborted = false;
+    const b = brains({
+      passthrough: model({ getResponse: async () => msg('EXECUTOR-DRAFT') }),
+      judge: model({ getResponse: async (r: any) => {
+        const sig = r.signal as AbortSignal | undefined;
+        sig?.addEventListener('abort', () => { aborted = true; }, { once: true });
+        return new Promise<ModelResponse>(() => {});
+      } }),
+    });
+    const t0 = Date.now();
+    const res = await dm(b, { checkerDeadlineMs: 10 }).getResponse(req());
+    assert.equal((res.output[0] as any).content, 'EXECUTOR-DRAFT');
+    assert.ok(Date.now() - t0 < 2000, 'deadline fallback returned promptly');
+    assert.equal(aborted, true, 'deadline aborts the late checker request');
   });
 });
 

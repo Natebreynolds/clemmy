@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelRequest } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { CodexResponsesModel } from './codex-model.js';
+import { buildCodexRequestBody, CodexResponsesModel } from './codex-model.js';
 import { BoundaryError } from '../boundary-error.js';
 import { buildTransportTimeoutError, detectCodexTransportFailure } from '../codex-dispatcher.js';
 
@@ -40,6 +40,54 @@ function modelRequest(input: ModelRequest['input'] = []): ModelRequest {
     tracing: false,
   } as unknown as ModelRequest;
 }
+
+test('buildCodexRequestBody drops non-Codex function_call ids from mixed-provider history', () => {
+  const body = buildCodexRequestBody('gpt-5.5', modelRequest([
+    { role: 'user', content: 'edit this workspace' },
+    {
+      type: 'function_call',
+      id: '20260624072838009e610297f64eac',
+      callId: 'call_cross_provider',
+      name: 'workspace_update',
+      arguments: '{}',
+      status: 'completed',
+    },
+    {
+      type: 'function_call',
+      id: 'fc_real123',
+      callId: 'call_codex',
+      name: 'workspace_read',
+      arguments: '{}',
+      status: 'completed',
+    },
+    {
+      type: 'function_call',
+      id: 'fc_base_p0',
+      call_id: 'call_parallel',
+      name: 'workspace_list',
+      arguments: '{}',
+      status: 'completed',
+    },
+    {
+      type: 'function_call_result',
+      id: 'fcr_cross_provider',
+      callId: 'call_cross_provider',
+      output: { type: 'text', text: 'ok' },
+      status: 'completed',
+    },
+  ] as unknown as ModelRequest['input']));
+
+  const input = body.input as Array<Record<string, unknown>>;
+  assert.equal(input[1].type, 'function_call');
+  assert.equal(input[1].id, undefined, 'timestamp-style provider id must not be sent to Codex');
+  assert.equal(input[1].call_id, 'call_cross_provider', 'call_id correlation is preserved');
+  assert.equal(input[2].id, 'fc_real123', 'genuine Codex item id is preserved');
+  assert.equal(input[3].id, undefined, 'synthetic parallel-expansion id must not be sent to Codex');
+  assert.equal(input[3].call_id, 'call_parallel', 'snake_case call_id is accepted');
+  assert.equal(input[4].type, 'function_call_output');
+  assert.equal(input[4].id, undefined, 'function_call_output does not need a provider-specific item id');
+  assert.equal(input[4].call_id, 'call_cross_provider');
+});
 
 class ScriptedCodexModel extends CodexResponsesModel {
   attempts = 0;

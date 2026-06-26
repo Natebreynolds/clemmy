@@ -1,5 +1,6 @@
 import { judgeObjectiveComplete, type ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { summarizeToolCallsForJudge } from '../runtime/harness/skill-execution.js';
+import { withJudgeTimeout } from '../runtime/harness/judge-family.js';
 import { loadSkill } from '../memory/skill-store.js';
 import type { WorkflowStepInput } from '../memory/workflow-store.js';
 
@@ -64,25 +65,6 @@ function safeJson(v: unknown): string {
     return JSON.stringify(v, null, 2);
   } catch {
     return String(v);
-  }
-}
-
-const JUDGE_TIMEOUT_MS = 25_000;
-
-/** Race a judge call against a wall-clock timeout so a model HANG can never
- *  stall the completion hot path. Resolves to null on timeout → caller accepts
- *  completion (fail-open). */
-async function withJudgeTimeout<T>(p: Promise<T>): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      p,
-      new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), JUDGE_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 }
 

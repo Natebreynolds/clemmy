@@ -193,31 +193,61 @@ export function _setGroundingJudgeForTests(fn: GroundingJudgeFn | null): void { 
  *  (caller converts to fail-open). Dynamic imports keep brackets.ts free of
  *  an SDK dependency at module load. */
 async function runGroundingJudge(payload: string, sources: GroundingSource[]): Promise<GroundingVerdict> {
-  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }] = await Promise.all([
+  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('zod'),
     import('../../config.js'),
     import('../schema-normalizer.js'),
     import('./debate-model.js'),
+    import('./judge-family.js'),
   ]);
   const VerdictSchema = z.object({
     grounded: z.boolean().describe('False ONLY on a concrete contradiction between the payload and the target\'s source artifacts (or between the sources themselves) on a load-bearing fact.'),
     reason: z.string().describe('One short sentence: the specific contradiction, or why the payload is consistent.'),
   });
+  const routing = resolveBoundaryJudge();
   const agent = new Agent({
     name: 'GroundingJudge',
     instructions: 'Verify outgoing external-write payloads against the session\'s own source artifacts. Output only the structured verdict.',
     // Cross-family boundary judge (a Codex/GLM brain is not graded by its own
     // family); falls open to MODELS.fast when no different family is available.
-    model: resolveBoundaryJudge().model ?? MODELS.fast,
+    model: routing.model ?? MODELS.fast,
+    modelSettings: { reasoning: { effort: 'low' } },
     outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],
   });
   const runner = new Runner({ workflowName: 'clementine-grounding-judge' });
-  const result = await runner.run(agent, buildGroundingPrompt(payload, sources), { maxTurns: 1 });
-  const parsed = VerdictSchema.safeParse(result.finalOutput);
-  if (!parsed.success) throw new Error('grounding judge output did not parse');
-  return parsed.data;
+  const startedAt = Date.now();
+  let recorded = false;
+  const record = (outcome: 'passed' | 'blocked' | 'timeout' | 'invalid' | 'error') => {
+    recorded = true;
+    recordJudgeMetric({
+      lane: 'grounding',
+      outcome,
+      durationMs: Date.now() - startedAt,
+      modelId: routing.modelId,
+      judgeFamily: routing.judgeFamily,
+      brainFamily: routing.brainFamily,
+      selfJudge: routing.selfJudge,
+    });
+  };
+  try {
+    const result = await withJudgeTimeout(runner.run(agent, buildGroundingPrompt(payload, sources), { maxTurns: 1 }));
+    if (!result) {
+      record('timeout');
+      throw new Error('grounding judge timed out');
+    }
+    const parsed = VerdictSchema.safeParse(result.finalOutput);
+    if (!parsed.success) {
+      record('invalid');
+      throw new Error('grounding judge output did not parse');
+    }
+    record(parsed.data.grounded ? 'passed' : 'blocked');
+    return parsed.data;
+  } catch (err) {
+    if (!recorded) record('error');
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────

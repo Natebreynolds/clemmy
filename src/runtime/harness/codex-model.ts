@@ -1066,13 +1066,19 @@ function buildResponseFormat(
 // Input + tool serialization
 // ----------------------------------------------------------------------
 
+/** A genuine Codex-issued function_call item id begins with 'fc'. History
+ * replayed from another provider (GLM/Claude) or harness-synthesized ids are not
+ * valid Codex item ids, and `/responses` rejects the whole request if they are
+ * forwarded. The id is optional on input; call_id is the correlation key. */
+export function isCodexFunctionCallItemId(id: unknown): id is string {
+  return typeof id === 'string' && id.startsWith('fc') && !/_p\d+$/.test(id);
+}
+
 /**
  * Convert the SDK's AgentInputItem[] into the codex Responses API wire
- * format. Codex needs `function_call` items to carry both `id` and
- * `call_id`, and the matching `function_call_output` must share the
- * `call_id` value. Cross-turn omission of the `function_call` is what
- * caused the "No tool call found for function call output" 400s — we
- * preserve everything verbatim.
+ * format. Codex pairs `function_call` and `function_call_output` by `call_id`.
+ * A genuine Codex function_call item id may be replayed, but cross-provider ids
+ * must be dropped because Codex validates their prefix.
  */
 function serializeInput(input: ModelRequest['input']): unknown[] {
   if (typeof input === 'string') {
@@ -1104,22 +1110,32 @@ function serializeInputItem(item: AgentInputItem): unknown {
   }
   // Tool call → emitted by a previous assistant turn.
   if (anyItem.type === 'function_call') {
-    return {
+    const callId = typeof anyItem.callId === 'string'
+      ? anyItem.callId
+      : typeof anyItem.call_id === 'string'
+        ? anyItem.call_id
+        : undefined;
+    const out: Record<string, unknown> = {
       type: 'function_call',
-      id: anyItem.id,
-      call_id: anyItem.callId,
+      call_id: callId,
       name: anyItem.name,
       arguments: anyItem.arguments,
       status: anyItem.status,
     };
+    if (isCodexFunctionCallItemId(anyItem.id)) out.id = anyItem.id;
+    return out;
   }
   // Tool result paired with a prior function_call.
   if (anyItem.type === 'function_call_result') {
     const output = anyItem.output as { type?: string; text?: string } | undefined;
+    const callId = typeof anyItem.callId === 'string'
+      ? anyItem.callId
+      : typeof anyItem.call_id === 'string'
+        ? anyItem.call_id
+        : undefined;
     return {
       type: 'function_call_output',
-      id: anyItem.id,
-      call_id: anyItem.callId,
+      call_id: callId,
       output: output?.type === 'text' ? output.text ?? '' : JSON.stringify(output ?? null),
       status: anyItem.status,
     };

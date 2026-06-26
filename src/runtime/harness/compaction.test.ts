@@ -26,12 +26,28 @@ import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
 const { resetEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
-const { clipOldToolResults, collapseOldCompletedToolPairs, compactSessionIfNeeded, validateCallIdReferences, checkpointGoalStage } = await import('./compaction.js');
+const {
+  clipOldToolResults,
+  collapseOldCompletedToolPairs,
+  compactSessionIfNeeded,
+  summarizeOlderMessages,
+  validateCallIdReferences,
+  checkpointGoalStage,
+  _setCompactionSummarizerForTests,
+} = await import('./compaction.js');
 const { estimateInputTokens } = await import('./token-estimator.js');
 const { HarnessSession } = await import('./session.js');
 
 function userMessage(text: string): AgentInputItem {
   return { role: 'user', content: text } as unknown as AgentInputItem;
+}
+
+function assistantMessage(text: string): AgentInputItem {
+  return { role: 'assistant', content: text } as unknown as AgentInputItem;
+}
+
+function systemMessage(text: string): AgentInputItem {
+  return { role: 'system', content: text } as unknown as AgentInputItem;
 }
 
 function toolCall(callId: string, name: string, args = '{}'): AgentInputItem {
@@ -250,6 +266,60 @@ test('validateCallIdReferences — sanitizes hallucinated ids', () => {
   assert.match(sanitized, /\[call_abc\]/);
   assert.match(sanitized, /\[invalid call_id\]/);
   assert.doesNotMatch(sanitized, /call_xyz/);
+});
+
+test('summarizeOlderMessages — preserves compaction summaries instead of re-summarizing recall maps', async () => {
+  resetEventLog();
+  const session = HarnessSession.create({ kind: 'chat', title: 'l2 preserve compaction summaries' });
+  let serializedOlder = '';
+  _setCompactionSummarizerForTests(async (serialized) => {
+    serializedOlder = serialized;
+    return { summary: '- Assistant noted the draft still needed final review.', modelUsed: 'test-summarizer' };
+  });
+
+  try {
+    const collapsedToolSummary = systemMessage([
+      '[summary of older completed tool activity]',
+      '1 older completed tool call/result pair was collapsed before this turn.',
+      '- scrape.site [call_old] args: {"url":"https://example.test"}; result: ok [clipped: scrape.site collapsed before this turn - call recall_tool_result("call_old") for full output]',
+    ].join('\n'));
+    const priorLayer2Summary = systemMessage([
+      '[summary of earlier conversation]',
+      '- User approved the implementation direction.',
+    ].join('\n'));
+    const items = [
+      userMessage('original request'),
+      collapsedToolSummary,
+      assistantMessage('The draft still needs final review.'),
+      priorLayer2Summary,
+      userMessage('also check latency before shipping'),
+      assistantMessage('recent answer kept in tail'),
+      userMessage('tail request kept verbatim'),
+    ];
+
+    const result = await summarizeOlderMessages(items, session.id, 2);
+    assert.equal(result.applied, true);
+    assert.equal(result.modelUsed, 'test-summarizer');
+    assert.match(serializedOlder, /draft still needs final review/);
+    assert.doesNotMatch(serializedOlder, /summary of older completed tool activity/);
+    assert.doesNotMatch(serializedOlder, /recall_tool_result\("call_old"\)/);
+    assert.doesNotMatch(serializedOlder, /summary of earlier conversation/);
+
+    const contents = (result.mutatedItems ?? [])
+      .map((item) => (item as Record<string, unknown>).content)
+      .filter((content): content is string => typeof content === 'string');
+    assert.ok(contents.includes((collapsedToolSummary as { content: string }).content));
+    assert.ok(contents.includes((priorLayer2Summary as { content: string }).content));
+    assert.deepEqual(contents.slice(0, 5), [
+      'original request',
+      (collapsedToolSummary as { content: string }).content,
+      '[summary of earlier conversation]\n- Assistant noted the draft still needed final review.',
+      (priorLayer2Summary as { content: string }).content,
+      'also check latency before shipping',
+    ]);
+  } finally {
+    _setCompactionSummarizerForTests(null);
+  }
 });
 
 test('estimateInputTokens — grows with content', () => {

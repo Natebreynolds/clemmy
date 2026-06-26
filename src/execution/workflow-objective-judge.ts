@@ -1,4 +1,5 @@
 import { judgeObjectiveComplete, JUDGE_RESPONSE_MAX_CHARS, type ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
+import { withJudgeTimeout } from '../runtime/harness/judge-family.js';
 import type { WorkflowDefinition, WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 /**
@@ -45,23 +46,6 @@ const MAX_DELIVERABLE_CHARS = 12000;
 // genuine miss names a missing TARGET element. Suppressed when we windowed.
 const TRUNCATION_SHAPED_GAP = /truncat|cut ?off|incomplete (response|text|json|output|deliverable|data)|no complete verifiable|not fully (visible|shown|present)|appears? (to be )?(cut|incomplete)|omitted/i;
 const MAX_INPUT_SCALAR_CHARS = 200;
-const JUDGE_TIMEOUT_MS = 25_000;
-
-/** Race the judge against a wall-clock timeout so a model HANG can never stall
- *  the completion hot path. Resolves to null on timeout → caller accepts (fail-open). */
-async function withJudgeTimeout<T>(p: Promise<T>): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      p,
-      new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), JUDGE_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
 
 type WorkflowTargetFields = Pick<
   WorkflowDefinition,

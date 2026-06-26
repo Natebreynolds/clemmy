@@ -7,9 +7,9 @@ import { ConnectedModelsStrip } from './ConnectedModelsStrip';
 /**
  * The ONE model section, in two plain halves:
  *
- *   1. ASSIGN — the dropdowns ARE the controls. The Brain/Workers/Judge pickers
- *      (ModelRolesCard) are the single way to choose which connected model fills
- *      each lane. No separate "run on Claude" toggle anywhere.
+ *   1. ASSIGN — the Brain/Workers controls pick who does work. The Judge lane is
+ *      automatic so completion checks, write gates, and second-opinion checks all
+ *      resolve through one visible route.
  *   2. CONNECT — how a model becomes available to those dropdowns. Two ways,
  *      surfaced side by side: Codex + Claude sign in with your subscription
  *      (OAuth); everything else (GLM, DeepSeek, …) connects with an API key.
@@ -22,9 +22,9 @@ export function ModelsRoutingSection() {
     <Card className="p-5">
       <h3 className="mb-1 text-h3 text-fg">Models &amp; routing</h3>
       <p className="mb-4 text-small text-muted">
-        Pick which connected model is the brain and which serve workers and the judge/checker — the
-        dropdowns below are the only control. You can also just tell Clementine in chat (“use DeepSeek
-        for the workers”, “make the judge Opus”). Applies on the next message; no restart.
+        Pick which connected model is the brain and which models serve workers. The judge/checker is
+        automatic and uses one visible route for completion checks, write gates, and Second opinion.
+        You can also just tell Clementine in chat (“use DeepSeek for the workers”). Applies on the next message; no restart.
       </p>
 
       <ModelRolesCard embedded />

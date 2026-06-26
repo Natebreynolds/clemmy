@@ -300,12 +300,13 @@ export function buildOutputGroundingPrompt(claims: NumericClaim[], sources: Grou
 }
 
 async function runOutputGroundingJudge(claims: NumericClaim[], sources: GroundingSource[]): Promise<OutputGroundingVerdict> {
-  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }] = await Promise.all([
+  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('zod'),
     import('../../config.js'),
     import('../schema-normalizer.js'),
     import('./debate-model.js'),
+    import('./judge-family.js'),
   ]);
   const VerdictSchema = z.object({
     verdict: z.enum(['grounded', 'contradicted', 'unverifiable']).describe("'contradicted' if any figure conflicts with a source; 'unverifiable' if a load-bearing figure has no plausible source; else 'grounded'."),
@@ -316,18 +317,47 @@ async function runOutputGroundingJudge(claims: NumericClaim[], sources: Groundin
     })).describe('Only the figures that failed; empty when grounded.'),
     reason: z.string().describe('One short sentence: the contradiction found, or why the figures are consistent.'),
   });
+  const routing = resolveBoundaryJudge();
   const agent = new Agent({
     name: 'OutputGroundingJudge',
     instructions: "Verify a deliverable's numeric claims against the session's own captured tool results. Accept derived/rounded/aggregated figures. Output only the structured verdict.",
-    model: resolveBoundaryJudge().model ?? MODELS.fast,
+    model: routing.model ?? MODELS.fast,
+    modelSettings: { reasoning: { effort: 'low' } },
     outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],
   });
   const runner = new Runner({ workflowName: 'clementine-output-grounding-judge' });
-  const result = await runner.run(agent, buildOutputGroundingPrompt(claims, sources), { maxTurns: 1 });
-  const parsed = VerdictSchema.safeParse(result.finalOutput);
-  if (!parsed.success) throw new Error('output-grounding judge output did not parse');
-  return parsed.data;
+  const startedAt = Date.now();
+  let recorded = false;
+  const record = (outcome: 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error') => {
+    recorded = true;
+    recordJudgeMetric({
+      lane: 'output_grounding',
+      outcome,
+      durationMs: Date.now() - startedAt,
+      modelId: routing.modelId,
+      judgeFamily: routing.judgeFamily,
+      brainFamily: routing.brainFamily,
+      selfJudge: routing.selfJudge,
+    });
+  };
+  try {
+    const result = await withJudgeTimeout(runner.run(agent, buildOutputGroundingPrompt(claims, sources), { maxTurns: 1 }));
+    if (!result) {
+      record('timeout');
+      throw new Error('output-grounding judge timed out');
+    }
+    const parsed = VerdictSchema.safeParse(result.finalOutput);
+    if (!parsed.success) {
+      record('invalid');
+      throw new Error('output-grounding judge output did not parse');
+    }
+    record(parsed.data.verdict === 'grounded' ? 'passed' : (parsed.data.verdict === 'unverifiable' ? 'advisory' : 'blocked'));
+    return parsed.data;
+  } catch (err) {
+    if (!recorded) record('error');
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────

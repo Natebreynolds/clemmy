@@ -329,24 +329,26 @@ export function buildGoalFidelityPrompt(input: GoalFidelityJudgeInput): string {
  *  (caller converts to fail-open). Dynamic imports keep brackets.ts free of an
  *  SDK dependency at module load — same pattern as the grounding judge. */
 async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<GoalFidelityVerdict> {
-  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }] = await Promise.all([
+  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('zod'),
     import('../../config.js'),
     import('../schema-normalizer.js'),
     import('./debate-model.js'),
+    import('./judge-family.js'),
   ]);
   const VerdictSchema = z.object({
     fulfills: z.boolean().describe('False ONLY on a concrete, nameable gap between this action and the goal\'s intent or the skill\'s defining requirement. Vague/style/uncertain → true (fail open).'),
     gap: z.string().describe('One short sentence: the single specific gap and the concrete recovery, or why the action is faithful.'),
     blockKind: z.enum(['present_for_approval', 'other']).describe('When fulfills=false: "present_for_approval" if the ONLY gap is that the loaded skill is draft-only — it says "does not send" / "present for approval" / "never claim the email was sent" (that is the skill\'s SCOPE, NOT a ban on the user sending the approved draft). Use "other" for a genuine violation (wrong/byte-identical target, off-goal, un-rendered artifact, per-item research skipped). When fulfills=true, use "other".'),
   });
+  const routing = resolveBoundaryJudge();
   const agent = new Agent({
     name: 'GoalFidelityJudge',
     instructions: 'Verify an about-to-fire irreversible external action against the run\'s goal and the loaded skill\'s defining requirement. Output only the structured verdict.',
     // Cross-family boundary judge (avoids same-family self-grading); falls open to
     // MODELS.fast when no different family is logged in.
-    model: resolveBoundaryJudge().model ?? MODELS.fast,
+    model: routing.model ?? MODELS.fast,
     // Binary verdict against an explicit rubric — low reasoning effort trims the
     // largest chunk of per-call latency on this hot path (same as the
     // completion judge).
@@ -355,10 +357,37 @@ async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<Goal
     tools: [],
   });
   const runner = new Runner({ workflowName: 'clementine-goal-fidelity-judge' });
-  const result = await runner.run(agent, buildGoalFidelityPrompt(input), { maxTurns: 1 });
-  const parsed = VerdictSchema.safeParse(result.finalOutput);
-  if (!parsed.success) throw new Error('goal-fidelity judge output did not parse');
-  return parsed.data;
+  const startedAt = Date.now();
+  let recorded = false;
+  const record = (outcome: 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error') => {
+    recorded = true;
+    recordJudgeMetric({
+      lane: 'goal_fidelity',
+      outcome,
+      durationMs: Date.now() - startedAt,
+      modelId: routing.modelId,
+      judgeFamily: routing.judgeFamily,
+      brainFamily: routing.brainFamily,
+      selfJudge: routing.selfJudge,
+    });
+  };
+  try {
+    const result = await withJudgeTimeout(runner.run(agent, buildGoalFidelityPrompt(input), { maxTurns: 1 }));
+    if (!result) {
+      record('timeout');
+      throw new Error('goal-fidelity judge timed out');
+    }
+    const parsed = VerdictSchema.safeParse(result.finalOutput);
+    if (!parsed.success) {
+      record('invalid');
+      throw new Error('goal-fidelity judge output did not parse');
+    }
+    record(parsed.data.fulfills ? 'passed' : (input.skills.length === 0 ? 'advisory' : 'blocked'));
+    return parsed.data;
+  } catch (err) {
+    if (!recorded) record('error');
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────

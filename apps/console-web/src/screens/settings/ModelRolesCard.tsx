@@ -4,6 +4,8 @@ import { AlertTriangle, Check, BrainCircuit, Users, Scale, Sparkles, X } from 'l
 import { Card } from '@/components/ui/Card';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { Switch } from '@/components/ui/Switch';
+import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
 import {
   getSettings,
@@ -11,6 +13,7 @@ import {
   patchModelRole,
   patchFusion,
   type ActiveBrain,
+  type JudgeMetricsSnapshot,
   type ResolvedRole,
 } from '@/lib/settings';
 
@@ -55,6 +58,100 @@ function RoleRow({
   );
 }
 
+function RoleStatus({
+  icon: Icon,
+  label,
+  hint,
+  resolved,
+  action,
+}: {
+  icon: typeof Users;
+  label: string;
+  hint: string;
+  resolved: ResolvedRole;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="grid items-center gap-2 sm:grid-cols-[1fr_1.2fr] sm:gap-4">
+      <div className="mb-4">
+        <div className="mb-1.5 block text-label text-fg">{label}</div>
+        <div className="flex min-h-11 items-center gap-2 rounded-md border border-border bg-canvas px-3 text-body text-fg">
+          <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+          <span>Automatic</span>
+          {action}
+        </div>
+        <p className="mt-1 text-caption text-muted">{hint}</p>
+      </div>
+      <div className="min-w-0 pb-1">
+        <div className="flex min-w-0 items-center gap-2 text-small text-muted">
+          <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+          <span className="truncate text-fg" title={resolved.modelId}>{resolved.modelId}</span>
+          <span className="shrink-0 rounded bg-canvas px-1.5 py-0.5 text-caption text-muted">{resolved.provider}</span>
+          <span className="shrink-0 text-caption text-muted">· {SOURCE_LABEL[resolved.source]}</span>
+        </div>
+        {resolved.inactiveBinding && (
+          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-caption text-warning" title={resolved.inactiveBinding.reason}>
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+            <span className="truncate">Saved {resolved.inactiveBinding.modelId} is unavailable; using default.</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const JUDGE_LANE_LABEL: Record<string, string> = {
+  completion: 'Completion',
+  grounding: 'Write grounding',
+  goal_fidelity: 'Goal fidelity',
+  output_grounding: 'Numeric grounding',
+};
+
+function formatJudgeDuration(ms: number | undefined): string {
+  const n = Math.max(0, Math.round(ms ?? 0));
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}s`;
+  return `${n}ms`;
+}
+
+function JudgeMetrics({ metrics }: { metrics?: JudgeMetricsSnapshot }) {
+  const total = metrics?.total;
+  const lanes = (metrics?.lanes ?? []).filter((lane) => lane.calls > 0);
+  return (
+    <div className="grid gap-2 sm:grid-cols-[1fr_1.2fr] sm:gap-4">
+      <div className="hidden sm:block" aria-hidden />
+      <div className="min-w-0 text-caption text-muted">
+        {!total?.calls ? (
+          <p>No judge calls recorded since daemon start.</p>
+        ) : (
+          <>
+            <p>
+              Since daemon start: <span className="text-fg">{total.calls}</span> calls,
+              avg <span className="text-fg">{formatJudgeDuration(total.avgMs)}</span>,
+              max <span className="text-fg">{formatJudgeDuration(total.maxMs)}</span>,
+              cap <span className="text-fg">{formatJudgeDuration(metrics?.timeoutMs)}</span>.
+              {(total.timeouts > 0 || total.errors > 0 || total.invalid > 0) && (
+                <> {total.timeouts} timeout, {total.errors} error, {total.invalid} invalid.</>
+              )}
+              {(total.blocked > 0 || total.advisory > 0) && (
+                <> {total.blocked} blocked, {total.advisory} advisory.</>
+              )}
+            </p>
+            {lanes.length > 0 && (
+              <p className="mt-0.5 truncate" title={lanes.map((lane) => `${JUDGE_LANE_LABEL[lane.lane] ?? lane.lane}: ${lane.calls} calls, avg ${formatJudgeDuration(lane.avgMs)}`).join(' · ')}>
+                {lanes
+                  .sort((a, b) => b.calls - a.calls)
+                  .slice(0, 3)
+                  .map((lane) => `${JUDGE_LANE_LABEL[lane.lane] ?? lane.lane}: ${lane.calls} @ ${formatJudgeDuration(lane.avgMs)}`)
+                  .join(' · ')}
+              </p>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
@@ -72,28 +169,19 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['settings'] }); };
   const workerOptions = mr.roleOptions?.worker ?? mr.available;
-  const judgeOptions = mr.roleOptions?.judge ?? mr.available;
   const workerFlat = workerOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
-  const judgeFlat = judgeOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
   const connected = (prov: string) => mr.available.some((p) => p.provider === prov);
 
-  // ── Second opinion (fusion) — folded onto the Judge row. The Judge dropdown
-  // picks WHO checks; this picks WHETHER + HOW (verify = brain drafts, judge
-  // refines; debate = two flagships draft, judge reconciles).
+  // ── Second opinion (fusion) — one user-facing judge path. The resolved Judge
+  // row says WHO checks; this switch says WHETHER it verifies the brain's draft.
   const fusion = settings.data?.fusion;
-  const bothFlagships = Boolean(fusion?.brainsAvailable.claude && fusion?.brainsAvailable.codex);
-  const secondOpinion: 'off' | 'verify' | 'debate' =
-    !fusion || fusion.mode === 'off' ? 'off' : fusion.strategy === 'debate' ? 'debate' : 'verify';
+  const judgeMetrics = settings.data?.judgeMetrics;
+  const secondOpinionOn = Boolean(fusion && fusion.mode !== 'off');
   const fusionWhen: 'high' | 'all' = fusion?.mode === 'all' ? 'all' : 'high';
-  // The legacy claude/codex reconcile field — derive from the judge role's
-  // provider so it tracks the picker (a BYO judge keeps its role binding, which
-  // the fusion route never drops).
-  const deriveJudgeKind = (): 'claude' | 'codex' =>
-    mr.roles.judge.provider === 'codex' ? 'codex' : mr.roles.judge.provider === 'claude' ? 'claude' : (fusion?.judge ?? 'claude');
-  const onSecondOpinion = (v: 'off' | 'verify' | 'debate') =>
-    run('fusion', () => patchFusion({ mode: v === 'off' ? 'off' : fusionWhen, judge: deriveJudgeKind(), strategy: v === 'debate' ? 'debate' : 'verify' }));
+  const onSecondOpinion = (on: boolean) =>
+    run('fusion', () => patchFusion({ mode: on ? fusionWhen : 'off', strategy: 'verify' }));
   const onFusionWhen = (when: 'high' | 'all') =>
-    run('fusion', () => patchFusion({ mode: when, judge: deriveJudgeKind(), strategy: secondOpinion === 'debate' ? 'debate' : 'verify' }));
+    run('fusion', () => patchFusion({ mode: when, strategy: 'verify' }));
   // Verify with the judge == the brain is a self-check (no real second opinion).
   const judgeSameAsBrain = mr.roles.judge.provider === mr.roles.brain.provider && mr.roles.judge.modelId === mr.roles.brain.modelId;
 
@@ -109,8 +197,9 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   };
 
   const onBrain = (v: ActiveBrain) => run('brain', () => setActiveBrain(v));
-  const onRole = (role: 'worker' | 'judge', v: string) =>
+  const onRole = (role: 'worker', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
+  const onClearJudge = () => run('judge', () => patchModelRole({ role: 'judge', clear: true }));
 
   // Task-specific (intent-scoped) worker routing — e.g. "design" → Claude. Reads
   // the same bindings the chat tool writes; routes only workers tagged with that
@@ -135,9 +224,9 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
         <>
           <h3 className="mb-1 text-h3 text-fg">Models — who does what</h3>
           <p className="mb-4 text-small text-muted">
-            Pick the active brain provider and which connected models serve workers and judge/checker.
-            You can also just tell Clementine in chat — “use DeepSeek for the workers”,
-            “make the judge Opus”. Applies on the next message; no restart.
+            Pick the active brain provider and which connected models serve workers.
+            The judge/checker is automatic and uses one visible route for completion checks,
+            write gates, and Second opinion. Applies on the next message; no restart.
           </p>
         </>
       )}
@@ -168,51 +257,46 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
           )}
         </RoleRow>
 
-        <RoleRow icon={Scale} label="Judge / checker" hint="The model that checks the work (when Second opinion is on)." resolved={mr.roles.judge}>
-          {(id) => (
-            <Select id={id} disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
-              onChange={(e) => onRole('judge', e.target.value)}>
-              <option value="__default__">Default</option>
-              {judgeFlat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
-            </Select>
-          )}
-        </RoleRow>
+        <RoleStatus
+          icon={Scale}
+          label="Judge / checker"
+          hint="One automatic checker for completion, write-boundary gates, and Second opinion. Auto prefers a fast different model family when available."
+          resolved={mr.roles.judge}
+          action={mr.roles.judge.source !== 'default' ? (
+            <Button className="ml-auto h-7 px-2 text-caption" size="sm" variant="secondary" disabled={busy === 'judge'} onClick={onClearJudge}>
+              <X className="h-3.5 w-3.5" aria-hidden /> Reset
+            </Button>
+          ) : undefined}
+        />
+        <JudgeMetrics metrics={judgeMetrics} />
 
-        {/* Second opinion — whether/how the judge above checks the work. Replaces
-            the old standalone Fusion card; one place to read "who + whether". */}
+        {/* Second opinion — whether the one judge above checks the brain's draft. */}
         <div className="rounded-lg border border-border bg-canvas p-3">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-label text-fg">Second opinion</span>
-            <Select className="h-8 w-auto" disabled={busy === 'fusion'} value={secondOpinion}
-              onChange={(e) => onSecondOpinion(e.target.value as 'off' | 'verify' | 'debate')}>
-              <option value="off">Off — brain answers alone</option>
-              <option value="verify">Verify — the judge double-checks (2 calls)</option>
-              <option value="debate" disabled={!bothFlagships}>
-                Debate — two brains draft, judge picks {bothFlagships ? '(3 calls)' : '(needs Claude + Codex)'}
-              </option>
-            </Select>
-            {secondOpinion !== 'off' && (
+            <div className="flex items-center gap-2 text-label text-fg">
+              <Switch checked={secondOpinionOn} disabled={busy === 'fusion'} onChange={onSecondOpinion} label="Second opinion" />
+              <span>Second opinion</span>
+            </div>
+            {secondOpinionOn && (
               <Select className="h-8 w-auto" disabled={busy === 'fusion'} value={fusionWhen}
                 onChange={(e) => onFusionWhen(e.target.value as 'high' | 'all')}>
-                <option value="high">on high-stakes turns</option>
-                <option value="all">on every turn (2–3× cost)</option>
+                <option value="high">High-stakes turns</option>
+                <option value="all">Every turn (extra call)</option>
               </Select>
             )}
           </div>
           <p className="mt-1.5 text-caption text-muted">
-            {secondOpinion === 'off'
-              ? 'Your brain answers every turn alone — cheapest.'
-              : secondOpinion === 'debate'
-                ? 'Claude and Codex each draft independently, then the judge above reconciles them into one answer.'
-                : 'Your brain drafts the answer, then the judge above verifies and refines it.'}
+            {secondOpinionOn
+              ? 'The brain drafts once, then the judge above verifies and refines the answer before delivery.'
+              : 'The brain answers directly. Write-boundary and completion judges still run when the harness needs them.'}
             {' '}{fusion?.active
               ? <span className="text-success">Active now.</span>
-              : (secondOpinion !== 'off' && <span className="text-warning">Configured but inactive — the judge/flagship isn’t available yet.</span>)}
+              : (secondOpinionOn && <span className="text-warning">Configured but inactive — the judge is not available yet.</span>)}
           </p>
-          {secondOpinion === 'verify' && judgeSameAsBrain && (
+          {secondOpinionOn && judgeSameAsBrain && (
             <p className="mt-1 flex items-center gap-1.5 text-caption text-warning">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
-              The judge is the same model as the brain — it would check its own work. Pick a different judge above.
+              The judge is the same model as the brain, so this adds little value. Connect another model family or reset a custom judge.
             </p>
           )}
         </div>

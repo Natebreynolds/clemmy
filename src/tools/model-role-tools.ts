@@ -52,9 +52,14 @@ function applyRoleBinding(role: ModelRole, modelId: string, clear: boolean, when
   // The claude↔codex judge BRANCH sync applies ONLY to a ROLE-WIDE judge rule —
   // an intent-scoped judge rule must not flip the global default.
   if (role === 'judge' && !intentSlug) {
-    const branch = clear ? 'claude' : resolveProvider(modelId) === 'codex' ? 'codex' : 'claude';
-    updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);
-    process.env.CLEMMY_DEBATE_JUDGE = branch;
+    if (clear) {
+      updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
+      delete process.env.CLEMMY_DEBATE_JUDGE;
+    } else {
+      const branch = resolveProvider(modelId) === 'codex' ? 'codex' : 'claude';
+      updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);
+      process.env.CLEMMY_DEBATE_JUDGE = branch;
+    }
   }
   bustModelCaches();
 }

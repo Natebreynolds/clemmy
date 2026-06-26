@@ -219,6 +219,7 @@ import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/to
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain } from '../runtime/harness/model-role-options.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
+import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
 import {
   appendRecallTranscriptSegment,
@@ -3648,7 +3649,7 @@ export function registerConsoleRoutes(
         brainsAvailable: fusionBrains,
         active: debateMode() !== 'off' && ((fusionBrains.claude && fusionBrains.codex) || verifyJudgeAvailable()),
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: getByoProviderSnapshots(), claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(), developerMode: isDevModeEnabled() });
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: getByoProviderSnapshots(), claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(), judgeMetrics: getJudgeMetricsSnapshot(), developerMode: isDevModeEnabled() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6974,10 +6975,15 @@ export function registerConsoleRoutes(
       // The fusion judge BRANCH is GLOBAL (which provider reconciles), so only a
       // role-WIDE judge binding flips it — an intent-scoped judge rule must not.
       if (role === 'judge' && !slug) {
-        const prov = clear ? 'claude' : resolveProvider(modelId);
-        const branch = prov === 'codex' ? 'codex' : 'claude';
-        updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);
-        process.env.CLEMMY_DEBATE_JUDGE = branch;
+        if (clear) {
+          updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
+          delete process.env.CLEMMY_DEBATE_JUDGE;
+        } else {
+          const prov = resolveProvider(modelId);
+          const branch = prov === 'codex' ? 'codex' : 'claude';
+          updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);
+          process.env.CLEMMY_DEBATE_JUDGE = branch;
+        }
       }
 
       // Re-resolve next turn (no restart).
@@ -6994,11 +7000,13 @@ export function registerConsoleRoutes(
 
   /**
    * Fusion (multi-model) settings — a LIVE toggle (no daemon restart).
-   * CLEMMY_DEBATE_MODE picks how often the two flagships debate a turn
-   * (off | high-stakes | all); CLEMMY_DEBATE_JUDGE picks who reconciles.
+   * CLEMMY_DEBATE_MODE picks how often Second opinion runs
+   * (off | high-stakes | all). The main Settings UI leaves the judge provider
+   * on the automatic role resolver; legacy callers can still pass `judge` to pin
+   * CLEMMY_DEBATE_JUDGE explicitly.
    * updateEnvKey persists it, process.env makes it live this session, and
    * resetHarnessRuntimeConfig forces the next turn's configureHarnessRuntime to
-   * re-register so maybeWrapDebate re-evaluates debate on/off.
+   * re-register so maybeWrapDebate re-evaluates fusion on/off.
    */
   app.patch('/api/console/settings/fusion', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
@@ -7006,13 +7014,18 @@ export function registerConsoleRoutes(
       const body = (req.body ?? {}) as { mode?: unknown; judge?: unknown; strategy?: unknown };
       const rawMode = typeof body.mode === 'string' ? body.mode.trim().toLowerCase() : '';
       const mode = rawMode === 'all' ? 'all' : rawMode === 'high' ? 'high' : 'off';
-      const judge = typeof body.judge === 'string' && body.judge.trim().toLowerCase() === 'codex' ? 'codex' : 'claude';
-      const strategy = typeof body.strategy === 'string' && body.strategy.trim().toLowerCase() === 'verify' ? 'verify' : 'debate';
+      const rawJudge = typeof body.judge === 'string' ? body.judge.trim().toLowerCase() : '';
+      const hasJudge = rawJudge.length > 0;
+      const judge = hasJudge && rawJudge === 'codex' ? 'codex' : 'claude';
+      const rawStrategy = typeof body.strategy === 'string' ? body.strategy.trim().toLowerCase() : '';
+      const strategy = rawStrategy === 'debate' ? 'debate' : 'verify';
 
       updateEnvKey('CLEMMY_DEBATE_MODE', mode);
       process.env.CLEMMY_DEBATE_MODE = mode;
-      updateEnvKey('CLEMMY_DEBATE_JUDGE', judge);
-      process.env.CLEMMY_DEBATE_JUDGE = judge;
+      if (hasJudge) {
+        updateEnvKey('CLEMMY_DEBATE_JUDGE', judge);
+        process.env.CLEMMY_DEBATE_JUDGE = judge;
+      }
       updateEnvKey('CLEMMY_FUSION_STRATEGY', strategy);
       process.env.CLEMMY_FUSION_STRATEGY = strategy;
 
@@ -7023,15 +7036,17 @@ export function registerConsoleRoutes(
       // representable by this 2-valued control, and resolveDebateBrains
       // dispatches it by its own provider regardless of CLEMMY_DEBATE_JUDGE.
       // (Before this guard, every FusionForm Save silently destroyed it.)
-      const bindings = readDurableBindings();
-      const nextBindings = bindings.filter((b) => {
-        if (!(b.role === 'judge' && !b.whenIntent)) return true;
-        const prov = resolveProvider(b.modelId);
-        if (prov === 'byo') return true;
-        return prov === judge;
-      });
-      if (nextBindings.length !== bindings.length) {
-        updateEnvKey('CLEMMY_MODEL_ROLES', JSON.stringify(nextBindings));
+      if (hasJudge) {
+        const bindings = readDurableBindings();
+        const nextBindings = bindings.filter((b) => {
+          if (!(b.role === 'judge' && !b.whenIntent)) return true;
+          const prov = resolveProvider(b.modelId);
+          if (prov === 'byo') return true;
+          return prov === judge;
+        });
+        if (nextBindings.length !== bindings.length) {
+          updateEnvKey('CLEMMY_MODEL_ROLES', JSON.stringify(nextBindings));
+        }
       }
 
       // Re-register the provider next turn so debate wrapping flips on/off live.

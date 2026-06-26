@@ -80,6 +80,7 @@ export interface SettingsSnapshot {
   activeBrain?: ActiveBrain;
   fusion?: FusionSettings;
   modelRoles?: ModelRolesSnapshot;
+  judgeMetrics?: JudgeMetricsSnapshot;
   /** Whether the desktop Developer panel is revealed (CLEMMY_DEV_MODE=on). */
   developerMode?: boolean;
 }
@@ -206,9 +207,37 @@ export type ActiveBrain = 'codex_oauth' | 'claude_oauth' | 'api_key';
 export const setActiveBrain = (brain: ActiveBrain) =>
   patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', { brain });
 
-// Fusion (multi-model) — both flagships draft a turn, a judge reconciles. A live
-// toggle: mode/judge apply on the next message, no restart. Needs BOTH a Claude
-// and a Codex login; otherwise Clementine runs single-brain on the primary.
+export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding';
+export type JudgeMetricOutcome = 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error';
+export interface JudgeMetricLaneSnapshot {
+  lane: JudgeMetricLane;
+  calls: number;
+  passed: number;
+  blocked: number;
+  advisory: number;
+  timeouts: number;
+  invalid: number;
+  errors: number;
+  avgMs: number;
+  maxMs: number;
+  lastOutcome?: JudgeMetricOutcome;
+  lastDurationMs?: number;
+  lastModelId?: string;
+  lastJudgeFamily?: 'codex' | 'claude' | 'byo';
+  lastBrainFamily?: 'codex' | 'claude' | 'byo';
+  lastSelfJudge?: boolean;
+  updatedAt?: string;
+}
+export interface JudgeMetricsSnapshot {
+  timeoutMs: number;
+  total: Omit<JudgeMetricLaneSnapshot, 'lane'>;
+  lanes: JudgeMetricLaneSnapshot[];
+  updatedAt?: string;
+}
+
+// Fusion (multi-model) — optional Second opinion: the brain drafts once, then
+// the automatic judge/checker verifies/refines when enabled. A live toggle:
+// mode/strategy apply on the next message, no restart.
 export type FusionMode = 'off' | 'high' | 'all';
 export type FusionStrategy = 'debate' | 'verify';
 export interface FusionSettings {
@@ -219,5 +248,5 @@ export interface FusionSettings {
   brainsAvailable: { claude: boolean; codex: boolean };
   active: boolean;
 }
-export const patchFusion = (p: { mode: FusionMode; judge: 'claude' | 'codex'; strategy?: FusionStrategy }) =>
+export const patchFusion = (p: { mode: FusionMode; judge?: 'claude' | 'codex'; strategy?: FusionStrategy }) =>
   patch<{ fusion: FusionSettings }>('/api/console/settings/fusion', p);

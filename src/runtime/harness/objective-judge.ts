@@ -4,6 +4,7 @@ import { MODELS } from '../../config.js';
 import type { RuntimeContextValue } from '../../types.js';
 import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
+import { recordJudgeMetric, withJudgeTimeout, type JudgeMetricOutcome } from './judge-family.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -222,6 +223,22 @@ function buildJudgeAgent(routing?: BoundaryJudgeRouting): Agent<RuntimeContextVa
   });
 }
 
+function recordCompletionJudgeMetric(
+  outcome: JudgeMetricOutcome,
+  startedAt: number,
+  routing?: BoundaryJudgeRouting,
+): void {
+  recordJudgeMetric({
+    lane: 'completion',
+    outcome,
+    durationMs: Date.now() - startedAt,
+    modelId: routing?.modelId,
+    judgeFamily: routing?.judgeFamily,
+    brainFamily: routing?.brainFamily,
+    selfJudge: routing?.selfJudge,
+  });
+}
+
 /** Binding cap on the response text shown to the completion judge. Above this
  *  we window the head AND tail (artifact evidence — a sheet URL, a file path, a
  *  send confirmation — clusters at the TAIL of a long multi-deliverable reply)
@@ -298,14 +315,37 @@ export async function judgeObjectiveCompleteStrict(
   if (!objective.trim() || !assistantResponse.trim()) {
     throw new Error('insufficient text to judge');
   }
-  const { resolveBoundaryJudge } = await import('./debate-model.js');
-  const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-  const result = await runner.run(buildJudgeAgent(resolveBoundaryJudge()), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
-    maxTurns: 1,
-  });
-  const parsed = VerdictSchema.safeParse(result.finalOutput);
-  if (!parsed.success) throw new Error('judge output did not parse');
-  return { done: parsed.data.done, reason: parsed.data.reason };
+  const startedAt = Date.now();
+  let routing: BoundaryJudgeRouting | undefined;
+  let recorded = false;
+  const record = (outcome: JudgeMetricOutcome) => {
+    recorded = true;
+    recordCompletionJudgeMetric(outcome, startedAt, routing);
+  };
+  try {
+    const { resolveBoundaryJudge } = await import('./debate-model.js');
+    routing = resolveBoundaryJudge();
+    const runner = new Runner({ workflowName: 'clementine-objective-judge' });
+    const result = await withJudgeTimeout(
+      runner.run(buildJudgeAgent(routing), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
+        maxTurns: 1,
+      }),
+    );
+    if (!result) {
+      record('timeout');
+      throw new Error('judge timed out');
+    }
+    const parsed = VerdictSchema.safeParse(result.finalOutput);
+    if (!parsed.success) {
+      record('invalid');
+      throw new Error('judge output did not parse');
+    }
+    record(parsed.data.done ? 'passed' : 'blocked');
+    return { done: parsed.data.done, reason: parsed.data.reason };
+  } catch (err) {
+    if (!recorded) record('error');
+    throw err;
+  }
 }
 
 /**
@@ -321,16 +361,35 @@ export async function judgeObjectiveComplete(
   if (!objective.trim() || !assistantResponse.trim()) {
     return { done: true, reason: 'insufficient text to judge — accepting completion' };
   }
+  const startedAt = Date.now();
+  let routing: BoundaryJudgeRouting | undefined;
+  let recorded = false;
+  const record = (outcome: JudgeMetricOutcome) => {
+    recorded = true;
+    recordCompletionJudgeMetric(outcome, startedAt, routing);
+  };
   try {
     const { resolveBoundaryJudge } = await import('./debate-model.js');
+    routing = resolveBoundaryJudge();
     const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-    const result = await runner.run(buildJudgeAgent(resolveBoundaryJudge()), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
-      maxTurns: 1,
-    });
+    const result = await withJudgeTimeout(
+      runner.run(buildJudgeAgent(routing), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
+        maxTurns: 1,
+      }),
+    );
+    if (!result) {
+      record('timeout');
+      return { done: true, reason: 'judge timed out — accepting completion' };
+    }
     const parsed = VerdictSchema.safeParse(result.finalOutput);
-    if (!parsed.success) return { done: true, reason: 'judge output did not parse — accepting completion' };
+    if (!parsed.success) {
+      record('invalid');
+      return { done: true, reason: 'judge output did not parse — accepting completion' };
+    }
+    record(parsed.data.done ? 'passed' : 'blocked');
     return { done: parsed.data.done, reason: parsed.data.reason };
   } catch {
+    if (!recorded) record('error');
     return { done: true, reason: 'judge unavailable — accepting completion' };
   }
 }

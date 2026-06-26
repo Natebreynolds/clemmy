@@ -49,8 +49,6 @@ import {
   codexAvailable,
   debateBrainsAvailable,
   judgeCrossFamilyEnabled,
-  boundaryClaudeJudgeModel,
-  boundaryCodexJudgeModel,
   chooseBoundaryJudgeFamily,
 } from './judge-family.js';
 // Re-exported from the judge-family leaf (moved out of this file) so existing
@@ -306,6 +304,37 @@ function resolveSync(m: Model | Promise<Model>): Model {
   return m as Model;
 }
 
+const DEADLINE = Symbol('deadline');
+
+function raceDeadline<T>(work: Promise<T>, deadlineMs: number): Promise<T | typeof DEADLINE> {
+  // If the deadline wins, keep the loser observed so a late rejection cannot
+  // surface as an unhandled promise after we've already shipped the safe draft.
+  work.catch(() => {});
+  return new Promise<T | typeof DEADLINE>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(DEADLINE), deadlineMs);
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
+function linkedAbortRequest(request: ModelRequest): { request: ModelRequest; abort: () => void; cleanup: () => void } {
+  const parent = (request as { signal?: AbortSignal }).signal;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const onParentAbort = () => controller.abort();
+  if (parent) {
+    if (parent.aborted) controller.abort();
+    else parent.addEventListener('abort', onParentAbort, { once: true });
+  }
+  return {
+    request: { ...request, signal: controller.signal } as ModelRequest,
+    abort,
+    cleanup: () => { if (parent) parent.removeEventListener('abort', onParentAbort); },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------
@@ -407,8 +436,15 @@ export class DebateModel implements Model {
     const da = summarizeOutput(a.output);
     const db = summarizeOutput(b.output);
     const div = divergence(da, db);
+    const judgeReq = linkedAbortRequest(buildJudgeRequest(request, a, b));
     try {
-      const final = await this.brains.judge.getResponse(buildJudgeRequest(request, a, b));
+      const final = await raceDeadline(this.brains.judge.getResponse(judgeReq.request), this.checkerDeadline);
+      if (final === DEADLINE) {
+        judgeReq.abort();
+        logger.warn({ deadlineMs: this.checkerDeadline }, 'debate judge exceeded deadline — falling back to the longer surviving draft');
+        recordDebateTrace({ path: 'getResponse', outcome: 'judge-timeout-draft-fallback', divergence: div });
+        return pickLongerDraft(a, b);
+      }
       const judge = judgeTraceLabel();
       logger.info({ path: 'getResponse', divergence: div, draftAlen: da.length, draftBlen: db.length, judge }, 'debate turn reconciled');
       recordDebateTrace({ path: 'getResponse', n: this.debatesThisTurn, divergence: div, judge, draftA: capText(da), draftB: capText(db), final: capText(extractAssistantText(final.output)) });
@@ -419,6 +455,8 @@ export class DebateModel implements Model {
       logger.warn({ err: errText(err) }, 'debate judge failed — falling back to the longer surviving draft');
       recordDebateTrace({ path: 'getResponse', outcome: 'judge-failed-draft-fallback', divergence: div });
       return pickLongerDraft(a, b);
+    } finally {
+      judgeReq.cleanup();
     }
   }
 
@@ -474,15 +512,32 @@ export class DebateModel implements Model {
     let judgeFinalOutput: unknown;
     let judgeYieldedContent = false;
     let sawDone = false;
+    const judgeReq = linkedAbortRequest(buildJudgeRequest(request, a, b));
+    const judgeIt = this.brains.judge.getStreamedResponse(judgeReq.request)[Symbol.asyncIterator]();
     try {
-      for await (const ev of this.brains.judge.getStreamedResponse(buildJudgeRequest(request, a, b))) {
+      while (true) {
+        const next = judgeYieldedContent || sawDone
+          ? await judgeIt.next()
+          : await raceDeadline(judgeIt.next(), this.checkerDeadline);
+        if (next === DEADLINE) {
+          judgeReq.abort();
+          void judgeIt.return?.().catch(() => {});
+          logger.warn({ deadlineMs: this.checkerDeadline }, 'debate judge exceeded deadline before committed content — replaying the longer surviving draft');
+          recordDebateTrace({ path: 'stream', outcome: 'judge-timeout-draft-fallback', divergence: div });
+          yield* streamResponseAsEvents(pickLongerDraft(a, b));
+          return;
+        }
+        if (next.done) break;
+        const res = next;
+        const ev = res.value;
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
-        if (e.type === 'response_started') continue;
-        if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; judgeYieldedContent = true; }
-        const outEv = e.type === 'response_done' ? normalizeResponseDoneEvent(ev, 'debate-judge') : ev;
-        const out = outEv as { type?: string; response?: { output?: unknown } };
-        if (out.type === 'response_done') { sawDone = true; if (out.response) judgeFinalOutput = out.response.output; }
-        yield outEv;
+        if (e.type !== 'response_started') {
+          if (e.type === 'output_text_delta' && typeof e.delta === 'string') { finalText += e.delta; judgeYieldedContent = true; }
+          const outEv = e.type === 'response_done' ? normalizeResponseDoneEvent(ev, 'debate-judge') : ev;
+          const out = outEv as { type?: string; response?: { output?: unknown } };
+          if (out.type === 'response_done') { sawDone = true; if (out.response) judgeFinalOutput = out.response.output; }
+          yield outEv;
+        }
       }
     } catch (err) {
       // Recover ONLY if nothing was committed — neither a text delta NOR a
@@ -493,6 +548,8 @@ export class DebateModel implements Model {
       recordDebateTrace({ path: 'stream', outcome: 'judge-failed-draft-fallback', divergence: div });
       yield* streamResponseAsEvents(pickLongerDraft(a, b));
       return;
+    } finally {
+      judgeReq.cleanup();
     }
     // Guarantee a terminal response_done — a judge that streamed text but no done
     // would otherwise crash the turn ("did not produce a final response").
@@ -588,8 +645,15 @@ export class DebateModel implements Model {
     if (!hasUserFacingAnswer(draft.output) || !this.spendFusionSlot()) {
       return draft;
     }
+    const checkerReq = linkedAbortRequest(buildVerifyRequest(request, draft));
     try {
-      const final = await this.brains.judge.getResponse(buildVerifyRequest(request, draft));
+      const final = await raceDeadline(this.brains.judge.getResponse(checkerReq.request), this.checkerDeadline);
+      if (final === DEADLINE) {
+        checkerReq.abort();
+        logger.warn({ deadlineMs: this.checkerDeadline }, 'fusion verify: checker exceeded deadline — shipping the executor draft');
+        recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-timeout-ship-draft' });
+        return draft;
+      }
       recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, judge: judgeTraceLabel(), executor: capText(summarizeOutput(draft.output)), final: capText(extractAssistantText(final.output)) });
       return final;
     } catch (err) {
@@ -597,6 +661,8 @@ export class DebateModel implements Model {
       logger.warn({ err: errText(err) }, 'fusion verify: checker failed — shipping the executor draft');
       recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
       return draft;
+    } finally {
+      checkerReq.cleanup();
     }
   }
 
@@ -630,7 +696,8 @@ export class DebateModel implements Model {
     let checkerOutput: unknown;
     let checkerYieldedContent = false;
     let sawDone = false;
-    const it = this.brains.judge.getStreamedResponse(buildVerifyRequest(request, draft))[Symbol.asyncIterator]();
+    const checkerReq = linkedAbortRequest(buildVerifyRequest(request, draft));
+    const it = this.brains.judge.getStreamedResponse(checkerReq.request)[Symbol.asyncIterator]();
     try {
       // DEADLINE on the checker's FIRST event: the executor's Codex draft is
       // already the answer, so a hung/slow checker (Anthropic at capacity HANGS
@@ -638,36 +705,23 @@ export class DebateModel implements Model {
       // retry budget. If the checker doesn't deliver within the deadline, ship the
       // draft. (Falling the checker over to Codex would be pointless here — the
       // executor IS Codex; shipping the draft we already have is the right move.)
-      const firstP = it.next();
-      let firstErr: unknown;
-      let firstRejected = false;
-      firstP.catch((e) => { firstErr = e; firstRejected = true; }); // observe (and swallow) a rejection without consuming firstP
       const deadline = this.checkerDeadline;
-      const first = await new Promise<IteratorResult<StreamEvent> | 'deadline'>((resolve) => {
-        const timer = setTimeout(() => resolve('deadline'), deadline);
-        if (typeof (timer as { unref?: () => void }).unref === 'function') (timer as { unref: () => void }).unref();
-        firstP.then(
-          (r) => { clearTimeout(timer); resolve(r); },
-          () => { clearTimeout(timer); resolve('deadline'); }, // a pre-first-event throw → nothing committed → ship the draft (below)
-        );
-      });
-      if (first === 'deadline') {
-        // Nothing committed (no event). Either the checker THREW before any event,
-        // or it HUNG past the deadline — both → ship the draft. firstRejected
-        // distinguishes them for the trace; the run never blocks either way.
-        void it.return?.().catch(() => {});
-        if (firstRejected) {
-          logger.warn({ err: errText(firstErr) }, 'fusion verify: checker failed pre-content — shipping the executor draft');
-          recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
-        } else {
-          logger.warn({ deadlineMs: deadline }, 'fusion verify: checker exceeded deadline — shipping the executor draft');
+      while (true) {
+        const next = checkerYieldedContent || sawDone
+          ? await it.next()
+          : await raceDeadline(it.next(), deadline);
+        if (next === DEADLINE) {
+          // Nothing committed and the checker hung past the deadline: abort it
+          // and ship the draft. A pre-first-event throw is handled below.
+          checkerReq.abort();
+          void it.return?.().catch(() => {});
+          logger.warn({ deadlineMs: deadline }, 'fusion verify: checker exceeded deadline before committed content — shipping the executor draft');
           recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-timeout-ship-draft' });
+          yield* streamResponseAsEvents(draft);
+          return;
         }
-        yield* streamResponseAsEvents(draft);
-        return;
-      }
-      let res = first;
-      while (!res.done) {
+        if (next.done) break;
+        const res = next;
         const ev = res.value;
         const e = ev as { type?: string; delta?: string; response?: { output?: unknown } };
         if (e.type !== 'response_started') {
@@ -695,7 +749,6 @@ export class DebateModel implements Model {
             yield ev;
           }
         }
-        res = await it.next();
       }
     } catch (err) {
       // Recover (ship the executor draft) ONLY if nothing committed — no text AND
@@ -705,6 +758,8 @@ export class DebateModel implements Model {
       recordDebateTrace({ path: 'verify', n: this.debatesThisTurn, outcome: 'checker-failed-ship-draft' });
       yield* streamResponseAsEvents(draft);
       return;
+    } finally {
+      checkerReq.cleanup();
     }
     // Backstop a checker that streamed text but no terminal done.
     if (!sawDone) yield* synthesizeTerminalDone(checkerOutput, finalText);
@@ -852,28 +907,33 @@ export interface BoundaryJudgeRouting {
 
 // chooseBoundaryJudgeFamily moved to the judge-family leaf (imported + re-exported above).
 
-/** Resolve a cheap boundary judge whose family differs from the active brain.
- *  Returns model:null (and selfJudge:true) when no different family is available
- *  or the kill-switch is off — the caller then dispatches MODELS.fast unchanged. */
+/** Resolve the one configured judge lane for boundary/completion checks.
+ *
+ * The judge role default is already cheap + cross-family when another family is
+ * logged in. Honor that same resolved lane here so the Settings panel, fusion
+ * verify, completion judge, grounding judge, and goal-fidelity judge all agree.
+ * If that lane is unavailable, fail open to the historical MODELS.fast path.
+ */
 export function resolveBoundaryJudge(): BoundaryJudgeRouting {
-  const brainFamily = resolveRoleModel('brain').provider;
+  const brain = resolveRoleModel('brain');
+  const brainFamily = brain.provider;
   if (!judgeCrossFamilyEnabled()) {
     return { model: null, modelId: MODELS.fast, judgeFamily: brainFamily, brainFamily, selfJudge: true };
   }
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
-  const target = chooseBoundaryJudgeFamily(brainFamily, haveClaude, haveCodex);
-  if (target) {
-    const model = buildJudgeForRole(
-      { modelId: target.modelId, provider: target.provider, source: 'default' },
-      haveClaude,
-      haveCodex,
-    );
-    if (model) {
-      return { model, modelId: target.modelId, judgeFamily: target.provider, brainFamily, selfJudge: false };
-    }
+  const checker = resolveRoleModel('judge');
+  const model = buildJudgeForRole(checker, haveClaude, haveCodex);
+  if (model) {
+    return {
+      model,
+      modelId: checker.modelId,
+      judgeFamily: checker.provider,
+      brainFamily,
+      selfJudge: checker.provider === brain.provider,
+    };
   }
-  // Fail-open: no guaranteed different family → keep MODELS.fast (current behavior), tagged.
+  // Fail-open: no usable resolved judge → keep MODELS.fast (current behavior), tagged.
   return { model: null, modelId: MODELS.fast, judgeFamily: brainFamily, brainFamily, selfJudge: true };
 }
 

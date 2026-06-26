@@ -62,6 +62,20 @@ const DEFAULT_LAYER3_TOKEN_FRACTION = 0.9;
 const DEFAULT_LAYER1_ITEM_TRIGGER_MIN_FRACTION = 0.5;
 const DEFAULT_INPUT_BUDGET_TOKENS = 200_000;
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
+const COMPACTION_SYSTEM_SUMMARY_PREFIXES = [
+  '[summary of older completed tool activity]',
+  '[summary of earlier conversation]',
+] as const;
+
+type SummarizerTurnResult = { summary: string; modelUsed: string } | { error: string };
+
+let summarizerTurnForTests: ((serializedOlder: string) => Promise<SummarizerTurnResult>) | null = null;
+
+export function _setCompactionSummarizerForTests(
+  fn: ((serializedOlder: string) => Promise<SummarizerTurnResult>) | null,
+): void {
+  summarizerTurnForTests = fn;
+}
 
 const CLIP_PLACEHOLDER = (
   toolName: string | null,
@@ -245,6 +259,22 @@ function outputTextOf(item: Record<string, unknown>): string {
   if (typeof output === 'string') return output;
   if (output && typeof output === 'object' && typeof output.text === 'string') return output.text;
   return '';
+}
+
+function isCompactionSystemSummary(item: AgentInputItem): boolean {
+  const any = item as Record<string, unknown> & { role?: unknown; content?: unknown };
+  const content = any.content;
+  return any.role === 'system'
+    && typeof content === 'string'
+    && COMPACTION_SYSTEM_SUMMARY_PREFIXES.some((prefix) => content.startsWith(prefix));
+}
+
+function isLayer2PreservedItem(item: AgentInputItem): boolean {
+  const any = item as Record<string, unknown> & { type?: string; role?: string };
+  return any.role === 'user'
+    || any.type === 'function_call'
+    || any.type === 'function_call_result'
+    || isCompactionSystemSummary(item);
 }
 
 function recallableToolOutputExists(sessionId: string | undefined, callId: string): boolean {
@@ -474,7 +504,9 @@ function serializeForSummarizer(items: AgentInputItem[]): string {
  * for the outer compaction loop — Layer 2 is best-effort, and Layer 3
  * can still take over if needed.
  */
-async function runSummarizerTurn(serializedOlder: string): Promise<{ summary: string; modelUsed: string } | { error: string }> {
+async function runSummarizerTurn(serializedOlder: string): Promise<SummarizerTurnResult> {
+  if (summarizerTurnForTests) return summarizerTurnForTests(serializedOlder);
+
   const model = getSummarizerModel();
   try {
     const agent = new Agent({
@@ -545,6 +577,7 @@ function listValidCallIdsForSession(sessionId: string): Set<string> {
  *      `retainMessages` items.
  *   2. Split older items into PRESERVE (verbatim) vs SUMMARIZE (replaceable):
  *        - user messages → preserve
+ *        - compaction system summaries        → preserve (recall map + summary drift)
  *        - function_call (tool calls)         → preserve (Codex pairing)
  *        - function_call_result (tool returns) → preserve (Codex pairing)
  *        - assistant/system messages          → summarize
@@ -583,17 +616,12 @@ export async function summarizeOlderMessages(
   const older = items.slice(0, olderEnd);
   const tail = items.slice(olderEnd);
 
-  // Partition: preserve set + summarizable subset.
-  const preserved: AgentInputItem[] = [];
+  // Partition: keep exact state out of the summarizer, summarize only natural
+  // language assistant/system context, and drop replay-only reasoning.
   const summarizable: AgentInputItem[] = [];
   for (const item of older) {
     const any = item as Record<string, unknown> & { type?: string; role?: string };
-    if (any.role === 'user') {
-      preserved.push(item);
-      continue;
-    }
-    if (any.type === 'function_call' || any.type === 'function_call_result') {
-      preserved.push(item);
+    if (isLayer2PreservedItem(item)) {
       continue;
     }
     if (any.type === 'reasoning') {
@@ -632,8 +660,26 @@ export async function summarizeOlderMessages(
     content: `[summary of earlier conversation]\n${sanitized}`,
   } as unknown as AgentInputItem;
 
-  // Reassemble: preserved (in original order) + summary + tail.
-  const mutated: AgentInputItem[] = [...preserved, summaryMessage, ...tail];
+  // Reassemble in original order, replacing the first summarizable run with
+  // the new summary and preserving exact tool/recall state where it already was.
+  const mutatedOlder: AgentInputItem[] = [];
+  let insertedSummary = false;
+  for (const item of older) {
+    const any = item as Record<string, unknown> & { type?: string };
+    if (isLayer2PreservedItem(item)) {
+      mutatedOlder.push(item);
+      continue;
+    }
+    if (any.type === 'reasoning') {
+      continue;
+    }
+    if (!insertedSummary) {
+      mutatedOlder.push(summaryMessage);
+      insertedSummary = true;
+    }
+  }
+
+  const mutated: AgentInputItem[] = [...mutatedOlder, ...tail];
 
   return {
     applied: true,
