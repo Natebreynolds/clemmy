@@ -58,6 +58,7 @@ const {
   stepSideEffectClass,
   finalizeStepOutput,
   sendAlreadyClaimed,
+  seedFailedItemRetryRun,
   detectEmptyDeliverableReads,
   stepConsumesOutput,
   summarizeRunArtifacts,
@@ -1011,6 +1012,47 @@ test('forEach batching attributes item failures to their original keys across wi
     if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
     else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
   }
+});
+
+test('failed-item retry seeding inherits upstream + completed items but not stale downstream outputs', () => {
+  const workflow = {
+    name: 'Retry Seed Test',
+    steps: [
+      { id: 'pull', prompt: 'Pull records.' },
+      { id: 'blast', prompt: 'Process one record.', forEach: 'pull', dependsOn: ['pull'] },
+      { id: 'summarize', prompt: 'Summarize all processed records.', dependsOn: ['blast'] },
+    ],
+  } as never;
+  appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'step_completed', stepId: 'pull', output: ['a', 'b', 'c'] });
+  appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'item_completed', stepId: 'blast', itemKey: 'a', output: 'done-a' });
+  appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'item_failed', stepId: 'blast', itemKey: 'b', error: 'temporary b failure' });
+  appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'item_completed', stepId: 'blast', itemKey: 'c', output: 'done-c' });
+  appendWorkflowEvent('retry-seed-test', 'source-run', {
+    kind: 'step_completed',
+    stepId: 'blast',
+    output: [
+      { itemKey: 'a', output: 'done-a' },
+      { itemKey: 'c', output: 'done-c' },
+    ],
+  });
+  appendWorkflowEvent('retry-seed-test', 'source-run', { kind: 'step_completed', stepId: 'summarize', output: 'old summary missing b' });
+
+  const seeded = seedFailedItemRetryRun(workflow, 'retry-seed-test', 'retry-run', {
+    fromRunId: 'source-run',
+    stepId: 'blast',
+    itemKeys: ['b'],
+  });
+
+  assert.deepEqual(seeded, { inheritedSteps: 1, inheritedItems: 2, sentSkips: 0 });
+  const state = computeResumeState('retry-seed-test', 'retry-run');
+  assert.equal(state.completedSteps.get('pull')?.toString(), 'a,b,c');
+  assert.equal(state.completedSteps.has('blast'), false, 'retry step reruns with failed item pending');
+  assert.equal(state.completedSteps.has('summarize'), false, 'downstream summary must recompute after retry');
+  assert.deepEqual(Array.from(state.completedItems.get('blast')?.keys() ?? []), ['a', 'c']);
+  const seededEvent = readWorkflowEvents('retry-seed-test', 'retry-run')
+    .find((ev) => ev.kind === 'step_advisory' && ev.meta?.reason === 'failed_item_retry_seeded');
+  assert.equal(seededEvent?.meta?.inheritedSteps, 1);
+  assert.equal(seededEvent?.meta?.inheritedItems, 2);
 });
 
 test('workflow conversion: a plain step routes through the GATED harness loop when CLEMMY_HARNESS_WORKFLOW=on (not the legacy core)', async () => {

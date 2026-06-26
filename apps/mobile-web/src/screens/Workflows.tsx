@@ -206,8 +206,8 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
         {events.map((ev, idx) => (
           <div key={idx} class={`workflow-event ${ev.error ? 'event-error' : ''}`}>
             <div class="workflow-event-head">
-              <span class="workflow-event-kind">{ev.kind}</span>
-              {ev.stepId ? <span class="workflow-event-step">{ev.stepId}</span> : null}
+              <span class="workflow-event-kind">{workflowEventLabel(ev)}</span>
+              {workflowEventDetail(ev) ? <span class="workflow-event-step">{workflowEventDetail(ev)}</span> : null}
               <span class="workflow-event-time">{shortTime(ev.t)}</span>
             </div>
             {ev.error ? <div class="workflow-event-error">{ev.error}</div> : null}
@@ -217,6 +217,50 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
       </div>
     </div>
   );
+}
+
+function workflowEventLabel(ev: WorkflowEventSummary): string {
+  switch (ev.kind) {
+    case 'run_started': return 'Run started';
+    case 'run_resumed': return 'Run resumed';
+    case 'run_summary': return 'Run summary';
+    case 'run_completed': return 'Completed';
+    case 'run_failed': return 'Failed';
+    case 'step_started': return 'Step started';
+    case 'step_completed': return 'Step done';
+    case 'step_failed': return 'Step failed';
+    case 'step_advisory': return 'Note';
+    case 'item_started': return 'Item started';
+    case 'item_completed': return 'Item done';
+    case 'item_failed': return 'Item failed';
+    case 'approval_requested': return 'Needs approval';
+    default: return ev.kind.replace(/_/g, ' ');
+  }
+}
+
+function workflowEventDetail(ev: WorkflowEventSummary): string {
+  if (ev.kind === 'run_summary') {
+    return [
+      typeof ev.meta?.because === 'string' ? ev.meta.because : '',
+      workflowArtifactsText(ev.meta?.artifacts),
+    ].filter(Boolean).join(' · ');
+  }
+  if (ev.kind === 'step_advisory') {
+    return [ev.stepId, typeof ev.meta?.reason === 'string' ? ev.meta.reason : ''].filter(Boolean).join(' · ');
+  }
+  if (ev.itemKey) return [ev.stepId, ev.itemKey].filter(Boolean).join(' · ');
+  return ev.stepId ?? '';
+}
+
+function workflowArtifactsText(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const artifacts = value as { counts?: unknown; files?: unknown; urls?: unknown };
+  const parts = [
+    ...(Array.isArray(artifacts.counts) ? artifacts.counts.map(String) : []),
+    ...(Array.isArray(artifacts.files) ? artifacts.files.map(String) : []),
+    ...(Array.isArray(artifacts.urls) ? artifacts.urls.map(String) : []),
+  ];
+  return parts.slice(0, 3).join(' · ');
 }
 
 function relativeTime(iso: string | null): string {

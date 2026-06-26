@@ -960,6 +960,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'workflow_get',
       'workflow_run',
       'workflow_run_status',
+      'workflow_rerun_failed_items',
       'workflow_update',
       'workflow_edit_step',
       'workflow_delete',

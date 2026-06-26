@@ -1082,7 +1082,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         t: ev.t,
         kind: ev.kind,
         stepId: ev.stepId ?? null,
+        itemKey: ev.itemKey ?? null,
         error: ev.error ?? null,
+        meta: ev.meta ?? null,
         // output can be huge — only ship a short preview to mobile.
         outputPreview: ev.output !== undefined
           ? truncateOutput(ev.output)

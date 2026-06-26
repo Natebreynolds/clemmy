@@ -44,7 +44,8 @@ import {
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
 } from '../execution/workflow-inputs.js';
-import { queueWorkflowRun, queueWorkflowCreationTest } from './workflow-run-queue.js';
+import { listFinalFailedItems } from '../execution/workflow-events.js';
+import { queueWorkflowRun, queueWorkflowCreationTest, requeueWorkflowFailedItemsFromRun } from './workflow-run-queue.js';
 import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { listEvents, getSession } from '../runtime/harness/eventlog.js';
@@ -1702,12 +1703,18 @@ export function registerOrchestrationTools(server: McpServer): void {
             ? (record.blockedSteps as Array<{ stepId?: unknown; reason?: unknown }>)
             : [];
           const blockedIds = new Set(blockedSteps.map((b) => String(b.stepId ?? '')));
+          const workflowName = typeof record.workflow === 'string' ? record.workflow : '';
+          const workflowEntry = workflowName
+            ? listWorkflows().find((entry) => entry.data.name === workflowName || entry.name === workflowName)
+            : undefined;
+          const failedItems = workflowEntry ? listFinalFailedItems(workflowEntry.name, run_id) : [];
           const stepLines = stepOutputs.map(([id, out]) => {
             const text = typeof out === 'string' ? out : JSON.stringify(out);
             const clipped = text && text.length > 300 ? `${text.slice(0, 300)}…` : (text || '(empty)');
             return `  - ${id}${blockedIds.has(id) ? ' [BLOCKED]' : ''}: ${clipped}`;
           });
           const blockedLines = blockedSteps.map((b) => `  - ${String(b.stepId ?? '?')}: ${String(b.reason ?? '(no reason recorded)')}`);
+          const failedItemLines = failedItems.map((f) => `  - ${f.stepId} · ${f.itemKey}: ${f.error.slice(0, 240)}`);
           const output = typeof record.output === 'string' ? record.output : '';
           const lines = [
             `Run ${run_id}`,
@@ -1719,6 +1726,9 @@ export function registerOrchestrationTools(server: McpServer): void {
             record.goalOutcome ? `Pinned goal: ${record.goalOutcome}${record.goalReason ? ` — ${record.goalReason}` : ''}` : '',
             record.error ? `Error: ${record.error}` : '',
             blockedLines.length > 0 ? `Blocked steps:\n${blockedLines.join('\n')}` : '',
+            failedItemLines.length > 0
+              ? `Failed fan-out items:\n${failedItemLines.join('\n')}\nRetry: call workflow_rerun_failed_items with run_id="${run_id}"${new Set(failedItems.map((f) => f.stepId)).size > 1 ? ' and step_id set to one failed step' : ''}.`
+              : '',
             stepLines.length > 0 ? `Step results:\n${stepLines.join('\n')}` : '',
             output ? `Final output (truncated):\n${output.length > 1500 ? `${output.slice(0, 1500)}…` : output}` : '',
           ].filter(Boolean);
@@ -1729,6 +1739,30 @@ export function registerOrchestrationTools(server: McpServer): void {
       }
       // No id → list active + recent runs so Clem can answer "what's running?".
       return textResult(renderWorkflowRunsOverview());
+    },
+  );
+
+  server.tool(
+    'workflow_rerun_failed_items',
+    'Re-run only the failed forEach items from a prior workflow run. Use this after workflow_run_status shows failed fan-out items and the user asks to retry/fix/re-run just the failures. It reuses completed upstream work and skips items that already succeeded.',
+    {
+      run_id: z.string().min(1).describe('The source workflow run id that contains item_failed events.'),
+      step_id: z.string().optional().describe('Required only when the source run has failed items in more than one forEach step.'),
+    },
+    async ({ run_id, step_id }) => {
+      const queued = requeueWorkflowFailedItemsFromRun(run_id, {
+        stepId: step_id,
+        originSessionId: getToolOutputContext()?.sessionId,
+      });
+      if (queued.status === 'queued') {
+        return textResult(
+          `${queued.message}\n\nTell the user the failed items are being retried in the background and Clementine will report back when the retry run finishes. Do not poll or redo the work yourself.`,
+        );
+      }
+      if (queued.status === 'ambiguous') {
+        return textResult(`${queued.message}\n\nFailed items:\n${(queued.failedItems ?? []).map((f) => `- ${f.stepId} · ${f.itemKey}: ${f.error}`).join('\n')}`);
+      }
+      return textResult(queued.message);
     },
   );
 

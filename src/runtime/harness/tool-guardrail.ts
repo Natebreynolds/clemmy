@@ -134,6 +134,7 @@ const MUTATING_TOOLS = new Set<string>([
   'goal_create', 'goal_update',
   'note_create', 'note_take',
   'workflow_run',
+  'workflow_rerun_failed_items',
   'execution_update_step', 'execution_complete', 'execution_mark_blocked',
   'focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear',
   'tool_choice_remember', 'tool_choice_invalidate',

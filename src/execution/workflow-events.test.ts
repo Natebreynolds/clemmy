@@ -28,7 +28,7 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-events-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listPendingRuns, reapRunEventDir } =
+const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listFinalFailedItems, listPendingRuns, reapRunEventDir } =
   await import('./workflow-events.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
@@ -92,6 +92,22 @@ test('computeResumeState surfaces completed steps + items', () => {
   assert.equal(state.completedItems.get('two')?.get('b'), 'B');
   assert.equal(state.inFlightStepId, 'two', 'step two started but not completed');
   assert.equal(state.terminal, false);
+});
+
+test('listFinalFailedItems returns only items whose latest terminal item state failed', () => {
+  appendWorkflowEvent('failed-items', 'r1', { kind: 'item_failed', stepId: 'fanout', itemKey: 'a', error: 'first failure' });
+  appendWorkflowEvent('failed-items', 'r1', { kind: 'item_failed', stepId: 'fanout', itemKey: 'b', error: 'still broken' });
+  appendWorkflowEvent('failed-items', 'r1', { kind: 'item_completed', stepId: 'fanout', itemKey: 'a', output: 'recovered' });
+  appendWorkflowEvent('failed-items', 'r1', { kind: 'item_failed', stepId: 'other', itemKey: 'x', error: 'other failed' });
+
+  const failed = listFinalFailedItems('failed-items', 'r1');
+  assert.deepEqual(
+    failed.map((item) => ({ stepId: item.stepId, itemKey: item.itemKey, error: item.error })),
+    [
+      { stepId: 'fanout', itemKey: 'b', error: 'still broken' },
+      { stepId: 'other', itemKey: 'x', error: 'other failed' },
+    ],
+  );
 });
 
 test('computeResumeState tracks failedSteps (the runtime-approval park signature)', () => {

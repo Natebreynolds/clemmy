@@ -372,6 +372,14 @@ interface QueuedRunRecord {
   goalOutcome?: string;
   goalReason?: string;
   /**
+   * Failed-item retry lineage. A retry run inherits completed upstream step
+   * outputs and completed forEach items from the source run, then leaves only
+   * these item keys pending for the named forEach step.
+   */
+  retryFailedItemsFromRunId?: string;
+  retryFailedItemsStepId?: string;
+  retryFailedItemKeys?: string[];
+  /**
    * P0 event-driven approval parking (flag WORKFLOW_APPROVAL_PARKING).
    * When a step pauses on a human approval, the runner records the
    * resume coordinates here, sets status='parked', and RETURNS — freeing
@@ -2879,6 +2887,124 @@ function itemSendAlreadyFired(runId: string, stepId: string, itemKey: string): b
   }
 }
 
+function downstreamOfStep(steps: WorkflowStepInput[], rootStepId: string): Set<string> {
+  const affected = new Set<string>([rootStepId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const step of steps) {
+      if (affected.has(step.id)) continue;
+      for (const id of affected) {
+        if (stepConsumesOutput(step, id)) {
+          affected.add(step.id);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  return affected;
+}
+
+function failedItemRetrySeeded(workflowSlug: string, runId: string): boolean {
+  return readWorkflowEvents(workflowSlug, runId).some((ev) =>
+    ev.kind === 'step_advisory' && ev.meta?.reason === 'failed_item_retry_seeded');
+}
+
+export function seedFailedItemRetryRun(
+  workflow: WorkflowDefinition,
+  workflowSlug: string,
+  runId: string,
+  retry: { fromRunId: string; stepId: string; itemKeys: string[] },
+): { inheritedSteps: number; inheritedItems: number; sentSkips: number } {
+  if (failedItemRetrySeeded(workflowSlug, runId)) {
+    return { inheritedSteps: 0, inheritedItems: 0, sentSkips: 0 };
+  }
+  const fromRunId = retry.fromRunId.trim();
+  const stepId = retry.stepId.trim();
+  const failedKeys = Array.from(new Set(retry.itemKeys.map((key) => key.trim()).filter(Boolean)));
+  if (!fromRunId || !stepId || failedKeys.length === 0) {
+    throw new Error('Failed-item retry is missing its source run, step, or item keys.');
+  }
+  const retryStep = workflow.steps.find((step) => step.id === stepId);
+  if (!retryStep) throw new Error(`Failed-item retry step "${stepId}" does not exist in workflow "${workflow.name}".`);
+  if (!retryStep.forEach) throw new Error(`Failed-item retry step "${stepId}" is not a forEach step.`);
+
+  const source = computeResumeState(workflowSlug, fromRunId);
+  if (!source.completedSteps.has(retryStep.forEach)) {
+    throw new Error(
+      `Cannot retry failed items for "${stepId}" because source run "${fromRunId}" did not complete upstream step "${retryStep.forEach}".`,
+    );
+  }
+
+  const affectedSteps = downstreamOfStep(workflow.steps, stepId);
+  let inheritedSteps = 0;
+  for (const [completedStepId, output] of source.completedSteps) {
+    if (affectedSteps.has(completedStepId)) continue;
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'step_completed',
+      stepId: completedStepId,
+      output,
+      meta: { inheritedFromRunId: fromRunId, retryFailedItemsOnly: true },
+    });
+    inheritedSteps += 1;
+  }
+
+  const failedSet = new Set(failedKeys);
+  let inheritedItems = 0;
+  for (const [itemKey, output] of source.completedItems.get(stepId) ?? new Map<string, unknown>()) {
+    if (failedSet.has(itemKey)) continue;
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'item_completed',
+      stepId,
+      itemKey,
+      output,
+      meta: { inheritedFromRunId: fromRunId, retryFailedItemsOnly: true },
+    });
+    inheritedItems += 1;
+  }
+
+  let sentSkips = 0;
+  if (stepSideEffectClass(retryStep) === 'send') {
+    for (const itemKey of failedSet) {
+      if (!itemSendAlreadyFired(fromRunId, stepId, itemKey)) continue;
+      const skipNote = '[skipped on failed-item retry — a prior send for this item already fired; not re-sent to avoid a duplicate. Verify it landed.]';
+      appendWorkflowEvent(workflowSlug, runId, {
+        kind: 'item_completed',
+        stepId,
+        itemKey,
+        output: skipNote,
+        meta: { inheritedFromRunId: fromRunId, retryFailedItemsOnly: true, reason: 'prior_send_already_fired' },
+      });
+      appendWorkflowEvent(workflowSlug, runId, {
+        kind: 'step_advisory',
+        stepId,
+        meta: {
+          reason: 'idempotent_failed_item_retry_skip',
+          fromRunId,
+          itemKey,
+          note: `Item "${itemKey}" was not re-sent because the source run already recorded an external write for it.`,
+        },
+      });
+      sentSkips += 1;
+    }
+  }
+
+  appendWorkflowEvent(workflowSlug, runId, {
+    kind: 'step_advisory',
+    stepId,
+    meta: {
+      reason: 'failed_item_retry_seeded',
+      fromRunId,
+      failedItemKeys: failedKeys,
+      inheritedSteps,
+      inheritedItems,
+      sentSkips,
+    },
+  });
+  return { inheritedSteps, inheritedItems, sentSkips };
+}
+
 export function shouldHaltResumeForSideEffect(
   workflow: WorkflowDefinition,
   resume: { inFlightStepId?: string; completedSteps: Map<string, unknown>; failedSteps?: Set<string> },
@@ -4005,6 +4131,13 @@ async function processOneRunFile(
 
     const stopHeartbeat = startWorkflowHeartbeat(workflow.data.name, run.id, Date.now());
     try {
+      if (run.retryFailedItemsFromRunId && run.retryFailedItemsStepId && Array.isArray(run.retryFailedItemKeys)) {
+        seedFailedItemRetryRun(workflow.data, workflow.name, run.id, {
+          fromRunId: run.retryFailedItemsFromRunId,
+          stepId: run.retryFailedItemsStepId,
+          itemKeys: run.retryFailedItemKeys,
+        });
+      }
       const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId, run.goalFeedback);
       throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);

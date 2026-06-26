@@ -4,6 +4,7 @@ import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from './shared.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
+import { listFinalFailedItems } from '../execution/workflow-events.js';
 
 /**
  * Shared workflow-run queueing — the single place that writes a run request
@@ -91,6 +92,14 @@ export interface QueueWorkflowRunOptions {
    *  (the source is still status:'running' on disk during a mid-completion
    *  re-pursuit queue, and must not count as "already queued"). */
   excludeRunId?: string;
+  /** Failed-item retry lineage: queue a targeted workflow run that inherits
+   *  completed upstream work from `fromRunId`, then reprocesses only these
+   *  failed forEach item keys for `stepId`. */
+  retryFailedItems?: {
+    fromRunId: string;
+    stepId: string;
+    itemKeys: string[];
+  };
 }
 
 export function queueWorkflowRun(
@@ -116,6 +125,16 @@ export function queueWorkflowRun(
     ? opts.goalAttempt
     : undefined;
   const goalFeedback = opts?.goalFeedback?.trim() || undefined;
+  const retryFailedItems = opts?.retryFailedItems
+    && opts.retryFailedItems.fromRunId.trim()
+    && opts.retryFailedItems.stepId.trim()
+    && opts.retryFailedItems.itemKeys.length > 0
+    ? {
+        retryFailedItemsFromRunId: opts.retryFailedItems.fromRunId.trim(),
+        retryFailedItemsStepId: opts.retryFailedItems.stepId.trim(),
+        retryFailedItemKeys: Array.from(new Set(opts.retryFailedItems.itemKeys.map((k) => k.trim()).filter(Boolean))),
+      }
+    : undefined;
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
     JSON.stringify({
@@ -130,6 +149,7 @@ export function queueWorkflowRun(
       ...(selfHealAttempt ? { selfHealAttempt } : {}),
       ...(goalAttempt ? { goalAttempt } : {}),
       ...(goalFeedback ? { goalFeedback } : {}),
+      ...(retryFailedItems ? retryFailedItems : {}),
     }, null, 2),
     'utf-8',
   );
@@ -216,8 +236,9 @@ export function resumeWorkflowRun(
 }
 
 export interface RequeueResult {
-  status: 'queued' | 'duplicate' | 'not_found';
+  status: 'queued' | 'duplicate' | 'not_found' | 'no_failed_items' | 'ambiguous';
   id?: string;
+  failedItems?: Array<{ stepId: string; itemKey: string; error: string }>;
   message: string;
 }
 
@@ -262,4 +283,76 @@ export function requeueWorkflowFromRun(
     excludeRunId: originalRunId,
   });
   return { status: queued.status, id: queued.id, message: queued.message };
+}
+
+export function requeueWorkflowFailedItemsFromRun(
+  originalRunId: string,
+  opts: QueueWorkflowRunOptions & { stepId?: string } = {},
+): RequeueResult {
+  const safe = originalRunId.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
+  if (!existsSync(file)) {
+    return { status: 'not_found', message: `Original run "${originalRunId}" not found; no failed items to re-queue.` };
+  }
+  let rec: { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
+  try {
+    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
+  } catch {
+    return { status: 'not_found', message: 'Original run record unreadable; no failed items to re-queue.' };
+  }
+  const workflow = typeof rec.workflow === 'string' ? rec.workflow : undefined;
+  if (!workflow) return { status: 'not_found', message: 'Original run record has no workflow name.' };
+
+  const workflowEntry = listWorkflows().find((entry) => entry.data.name === workflow || entry.name === workflow);
+  const workflowSlug = workflowEntry?.name ?? workflow;
+  const allFailures = listFinalFailedItems(workflowSlug, originalRunId);
+  const requestedStep = opts.stepId?.trim();
+  const failures = requestedStep ? allFailures.filter((f) => f.stepId === requestedStep) : allFailures;
+  if (failures.length === 0) {
+    return {
+      status: 'no_failed_items',
+      message: requestedStep
+        ? `Run "${originalRunId}" has no failed forEach items for step "${requestedStep}".`
+        : `Run "${originalRunId}" has no failed forEach items to re-run.`,
+    };
+  }
+  const stepIds = Array.from(new Set(failures.map((f) => f.stepId)));
+  if (stepIds.length !== 1) {
+    return {
+      status: 'ambiguous',
+      failedItems: failures.map(({ stepId, itemKey, error }) => ({ stepId, itemKey, error })),
+      message:
+        `Run "${originalRunId}" has failed items in more than one step: ${stepIds.join(', ')}. `
+        + `Call again with stepId set to one of those steps so Clementine can re-run that fan-out safely.`,
+    };
+  }
+  const stepId = stepIds[0];
+  const inputs = normalizeWorkflowRunInputs(
+    rec.inputs && typeof rec.inputs === 'object' && !Array.isArray(rec.inputs)
+      ? (rec.inputs as Record<string, string>)
+      : {},
+  );
+  const originSessionId = opts.originSessionId
+    ?? (typeof rec.originSessionId === 'string' ? rec.originSessionId : undefined);
+  const queued = queueWorkflowRun(workflow, inputs, {
+    originSessionId,
+    selfHealAttempt: opts.selfHealAttempt,
+    goalAttempt: opts.goalAttempt,
+    goalFeedback: opts.goalFeedback,
+    excludeRunId: originalRunId,
+    retryFailedItems: {
+      fromRunId: originalRunId,
+      stepId,
+      itemKeys: failures.map((f) => f.itemKey),
+    },
+  });
+  const failedItems = failures.map(({ stepId: failedStepId, itemKey, error }) => ({ stepId: failedStepId, itemKey, error }));
+  return {
+    status: queued.status,
+    id: queued.id,
+    failedItems,
+    message: queued.status === 'queued'
+      ? `Queued failed-item retry for "${workflow}" step "${stepId}" (${failedItems.length} item${failedItems.length === 1 ? '' : 's'}) as run ${queued.id}. It will reuse completed upstream work and reprocess only the failed items.`
+      : queued.message,
+  };
 }

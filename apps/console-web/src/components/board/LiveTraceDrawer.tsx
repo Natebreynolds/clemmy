@@ -47,8 +47,13 @@ const WORKFLOW_MILESTONES: Record<string, { label: string; icon: typeof Radio; t
   step_completed: { label: 'Step done', icon: CheckCircle2, tone: 'success' },
   step_failed: { label: 'Step failed', icon: AlertCircle, tone: 'danger' },
   step_retry: { label: 'Retry', icon: Wrench, tone: 'warning' },
+  step_advisory: { label: 'Note', icon: AlertCircle, tone: 'warning' },
+  item_started: { label: 'Item started', icon: Dot, tone: 'live' },
+  item_completed: { label: 'Item done', icon: CheckCircle2, tone: 'success' },
+  item_failed: { label: 'Item failed', icon: AlertCircle, tone: 'danger' },
   tool_called: { label: 'Tool call', icon: Wrench, tone: 'live' },
   approval_requested: { label: 'Needs approval', icon: Hand, tone: 'warning' },
+  run_summary: { label: 'Summary', icon: CheckCircle2, tone: 'success' },
   run_completed: { label: 'Completed', icon: CheckCircle2, tone: 'success' },
   run_failed: { label: 'Failed', icon: AlertCircle, tone: 'danger' },
   run_cancelled: { label: 'Cancelled', icon: X, tone: 'muted' },
@@ -66,6 +71,37 @@ function toolName(data?: Record<string, unknown>): string {
   if (!data) return '';
   const n = (data.tool ?? data.name ?? data.toolName) as unknown;
   return typeof n === 'string' ? n : '';
+}
+
+function workflowDetail(ev: Record<string, unknown>): string {
+  const kind = String(ev.kind ?? '');
+  const stepId = typeof ev.stepId === 'string' ? ev.stepId : '';
+  const itemKey = typeof ev.itemKey === 'string' ? ev.itemKey : '';
+  const error = typeof ev.error === 'string' ? ev.error : '';
+  const meta = ev.meta && typeof ev.meta === 'object' && !Array.isArray(ev.meta)
+    ? ev.meta as Record<string, unknown>
+    : {};
+  if (kind === 'run_summary') {
+    return [typeof meta.because === 'string' ? meta.because : '', workflowArtifactsText(meta.artifacts)]
+      .filter(Boolean)
+      .join(' · ');
+  }
+  if (kind === 'step_advisory') {
+    return [stepId, typeof meta.reason === 'string' ? meta.reason : ''].filter(Boolean).join(' · ');
+  }
+  if (itemKey) return [stepId, itemKey, error].filter(Boolean).join(' — ');
+  return [stepId, error].filter(Boolean).join(' — ');
+}
+
+function workflowArtifactsText(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const artifacts = value as { counts?: unknown; files?: unknown; urls?: unknown };
+  const parts = [
+    ...(Array.isArray(artifacts.counts) ? artifacts.counts.map(String) : []),
+    ...(Array.isArray(artifacts.files) ? artifacts.files.map(String) : []),
+    ...(Array.isArray(artifacts.urls) ? artifacts.urls.map(String) : []),
+  ];
+  return parts.slice(0, 3).join(' · ');
 }
 
 export function LiveTraceDrawer({ card, onClose }: { card: BoardCard; onClose: () => void }) {
@@ -104,6 +140,11 @@ export function LiveTraceDrawer({ card, onClose }: { card: BoardCard; onClose: (
         if (fresh.length) {
           since = String(fresh[fresh.length - 1].t ?? since);
           setRawWorkflow((prev) => [...prev, ...fresh].slice(-400));
+          const latest = fresh[fresh.length - 1];
+          const latestKind = String(latest.kind ?? '');
+          const label = WORKFLOW_MILESTONES[latestKind]?.label ?? latestKind.replace(/_/g, ' ');
+          const detail = workflowDetail(latest);
+          setCurrent([label, detail].filter(Boolean).join(': '));
         }
       } catch { /* best effort */ }
     };
@@ -117,7 +158,7 @@ export function LiveTraceDrawer({ card, onClose }: { card: BoardCard; onClose: (
         const kind = String(ev.kind ?? '');
         const m = WORKFLOW_MILESTONES[kind];
         if (!m) return [];
-        const detail = [ev.stepId, ev.error].filter(Boolean).map(String).join(' — ');
+        const detail = workflowDetail(ev);
         return [{ key: `wf-${i}`, icon: m.icon, label: m.label, detail, time: ev.t as string, tone: m.tone }];
       })
     : rawHarness.flatMap((ev) => {

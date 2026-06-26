@@ -236,6 +236,7 @@ const ALWAYS_READ = new Set<string>([
   // approving the queue action itself created duplicate approval noise
   // without adding safety.
   'workflow_run',
+  'workflow_rerun_failed_items',
 ]);
 
 /**

@@ -67,6 +67,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'workflow_edit_step',
   'workflow_delete',
   'workflow_run_status',
+  'workflow_rerun_failed_items',
   'workflow_import_framework',
   'workflow_import_status',
   'cron_progress_read',

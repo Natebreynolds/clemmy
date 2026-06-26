@@ -174,6 +174,7 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   'workflow_set_enabled',
   'workflow_run',
   'workflow_run_status',
+  'workflow_rerun_failed_items',
   'workflow_schedule',
   'workflow_unschedule',
   // Editing a Workspace is LOCAL Clementine state (the view + its data runners),

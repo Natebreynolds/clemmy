@@ -14,8 +14,9 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-wf-queue-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
-const { queueWorkflowRun, resumeWorkflowRun, requeueWorkflowFromRun, queueWorkflowCreationTest } = await import('./workflow-run-queue.js');
+const { queueWorkflowRun, resumeWorkflowRun, requeueWorkflowFromRun, requeueWorkflowFailedItemsFromRun, queueWorkflowCreationTest } = await import('./workflow-run-queue.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
+const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 
@@ -154,6 +155,60 @@ test('requeueWorkflowFromRun carries originSessionId from the prior run (re-run 
     .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { originSessionId?: string });
   assert.equal(fresh.length, 1);
   assert.equal(fresh[0].originSessionId, 'sess-abc');
+});
+
+test('requeueWorkflowFailedItemsFromRun queues lineage for only final failed forEach items', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-partial-failure';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed_with_errors', originSessionId: 'sess-failed-items' }),
+    'utf-8',
+  );
+  appendWorkflowEvent('audit-brief', origId, { kind: 'step_completed', stepId: 'normalize', output: ['a', 'b', 'c'] });
+  appendWorkflowEvent('audit-brief', origId, { kind: 'item_completed', stepId: 'blast', itemKey: 'a', output: 'done-a' });
+  appendWorkflowEvent('audit-brief', origId, { kind: 'item_failed', stepId: 'blast', itemKey: 'b', error: 'temporary b failure' });
+  appendWorkflowEvent('audit-brief', origId, { kind: 'item_failed', stepId: 'blast', itemKey: 'c', error: 'temporary c failure' });
+  appendWorkflowEvent('audit-brief', origId, { kind: 'item_completed', stepId: 'blast', itemKey: 'c', output: 'recovered-c' });
+
+  const rq = requeueWorkflowFailedItemsFromRun(origId);
+  assert.equal(rq.status, 'queued');
+  assert.deepEqual(rq.failedItems?.map((item) => item.itemKey), ['b']);
+  const fresh = readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as {
+      retryFailedItemsFromRunId?: string;
+      retryFailedItemsStepId?: string;
+      retryFailedItemKeys?: string[];
+      originSessionId?: string;
+    });
+  assert.equal(fresh.length, 1);
+  assert.equal(fresh[0].retryFailedItemsFromRunId, origId);
+  assert.equal(fresh[0].retryFailedItemsStepId, 'blast');
+  assert.deepEqual(fresh[0].retryFailedItemKeys, ['b']);
+  assert.equal(fresh[0].originSessionId, 'sess-failed-items');
+});
+
+test('requeueWorkflowFailedItemsFromRun asks for a step when multiple fan-outs failed', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-multi-failure';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed_with_errors' }),
+    'utf-8',
+  );
+  appendWorkflowEvent('audit-brief', origId, { kind: 'item_failed', stepId: 'blast_one', itemKey: 'a', error: 'a failed' });
+  appendWorkflowEvent('audit-brief', origId, { kind: 'item_failed', stepId: 'blast_two', itemKey: 'b', error: 'b failed' });
+
+  const ambiguous = requeueWorkflowFailedItemsFromRun(origId);
+  assert.equal(ambiguous.status, 'ambiguous');
+  assert.match(ambiguous.message, /more than one step/);
+
+  const scoped = requeueWorkflowFailedItemsFromRun(origId, { stepId: 'blast_two' });
+  assert.equal(scoped.status, 'queued');
+  assert.deepEqual(scoped.failedItems?.map((item) => item.itemKey), ['b']);
 });
 
 test('self-heal lineage: requeue bumps + persists selfHealAttempt (bound counter survives run→run)', () => {

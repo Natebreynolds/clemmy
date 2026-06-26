@@ -219,6 +219,35 @@ export function listAttemptRecords(
   return out;
 }
 
+/** Return the final failed forEach items for a run.
+ *
+ * An item can fail and then later complete during a retry/resume pass, so this
+ * tracks the last terminal item state per step+key rather than returning every
+ * historical `item_failed` event. This is the durable source of truth for
+ * "rerun failed items only".
+ */
+export function listFinalFailedItems(
+  workflowName: string,
+  runId: string,
+): Array<{ stepId: string; itemKey: string; error: string; at: string }> {
+  const state = new Map<string, { stepId: string; itemKey: string; error: string; at: string } | null>();
+  for (const ev of readWorkflowEvents(workflowName, runId)) {
+    if (!ev.stepId || !ev.itemKey) continue;
+    const key = `${ev.stepId}\u0000${ev.itemKey}`;
+    if (ev.kind === 'item_failed') {
+      state.set(key, {
+        stepId: ev.stepId,
+        itemKey: ev.itemKey,
+        error: ev.error ?? 'item failed',
+        at: ev.t,
+      });
+    } else if (ev.kind === 'item_completed') {
+      state.set(key, null);
+    }
+  }
+  return Array.from(state.values()).filter((item): item is NonNullable<typeof item> => item !== null);
+}
+
 /**
  * What's the durability layer's view of where we left off? Replays
  * the events log and returns a summary the runner uses to decide

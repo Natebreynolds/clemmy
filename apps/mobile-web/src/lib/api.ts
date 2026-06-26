@@ -375,7 +375,9 @@ export interface WorkflowEventSummary {
   t: string;
   kind: string;
   stepId: string | null;
+  itemKey: string | null;
   error: string | null;
+  meta: Record<string, unknown> | null;
   outputPreview: string | null;
 }
 
