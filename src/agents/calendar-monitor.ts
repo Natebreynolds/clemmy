@@ -5,7 +5,9 @@
  * that genuinely need them — double-bookings, unanswered invites, and imminent
  * meetings with other people — as needs-you cards. Like the inbox monitor:
  *  - GENERAL (binding: feedback_global_not_user_specific): calendar connections
- *    are discovered at runtime; all are watched; each item is labeled by account.
+ *    are discovered at runtime; readable ones are watched; each item is labeled
+ *    by account. Stale connections that return hard Composio auth errors are
+ *    backed off by connection id.
  *  - SURFACE-ONLY BY CONSTRUCTION: only ever calls a READ action
  *    (OUTLOOK_GET_CALENDAR_VIEW / GOOGLECALENDAR_EVENTS_LIST) + addNotification —
  *    it can never create/cancel/respond to an event.
@@ -22,6 +24,13 @@ import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { executeComposioTool, listConnectedToolkits } from '../integrations/composio/client.js';
 import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
+import {
+  clearConnectionSuppression,
+  isConnectionSuppressed,
+  pruneConnectionSuppressions,
+  suppressConnectionAfterHardAuthFailure,
+  type ComposioConnectionSuppression,
+} from './composio-connection-suppression.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
 import { decideSurface, shouldSurface, surfaceDecisionV2Enabled, type SurfaceDecision } from './surface-decision.js';
 
@@ -53,6 +62,7 @@ interface CalProvider {
 interface CalendarMonitorState {
   lastScanAt?: string;
   surfacedIds: string[];
+  suppressedConnections?: Record<string, ComposioConnectionSuppression>;
 }
 
 export interface CalendarMonitorConfig {
@@ -252,9 +262,11 @@ function accountLabel(conn: { accountEmail?: string; accountName?: string; slug:
 }
 
 /**
- * One ambient scan: for each connected calendar, read the upcoming window, score,
- * and surface the top needs-you events (capped, deduped, dashboard-only). Returns
- * the count surfaced. Best-effort: never throws.
+ * One ambient scan: for each readable connected calendar, read the upcoming
+ * window, score, and surface the top needs-you events (capped, deduped,
+ * dashboard-only). Connections with hard Composio auth failures are backed off
+ * by connection id so stale accounts do not spam the logs. Returns the count
+ * surfaced. Best-effort: never throws.
  */
 export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DEPS): Promise<number> {
   const cfg = deps.config();
@@ -272,7 +284,9 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
     logger.warn({ err }, 'calendar-monitor: could not list connections');
     return 0;
   }
-  const calendars = connections.filter((c) => PROVIDERS[c.slug]); // status-agnostic (Composio status is unreliable)
+  // Status-agnostic because Composio status can lag; hard auth failures are
+  // suppressed after the attempted read.
+  const calendars = connections.filter((c) => PROVIDERS[c.slug]);
   if (calendars.length === 0) return 0;
 
   const startIso = new Date(nowMs).toISOString();
@@ -282,14 +296,30 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
   const candidates: Array<{ ev: CalEvent; score: EventScore; label: string; connectionId: string; slug: string }> = [];
 
   for (const cal of calendars) {
+    if (isConnectionSuppressed(state, cal.connectionId, nowMs)) {
+      logger.debug({ slug: cal.slug, connectionId: cal.connectionId }, 'calendar-monitor: skipping suppressed calendar');
+      continue;
+    }
     const provider = PROVIDERS[cal.slug];
     let resp: unknown;
     try {
       resp = await deps.executeTool(provider.slug, provider.args(startIso, endIso, cfg.fetchTop), cal.connectionId || undefined);
     } catch (err) {
-      logger.warn({ err, slug: cal.slug }, 'calendar-monitor: read failed for a calendar');
+      const suppression = suppressConnectionAfterHardAuthFailure(state, cal.connectionId, err, nowMs);
+      if (suppression) {
+        logger.warn({
+          err,
+          slug: cal.slug,
+          connectionId: cal.connectionId,
+          reason: suppression.reason,
+          suppressUntil: suppression.suppressUntil,
+        }, 'calendar-monitor: suppressing calendar after hard auth failure');
+      } else {
+        logger.warn({ err, slug: cal.slug }, 'calendar-monitor: read failed for a calendar');
+      }
       continue;
     }
+    clearConnectionSuppression(state, cal.connectionId);
     const events = provider.parse(resp);
     for (const ev of events) {
       const key = `${cal.connectionId}:${ev.id}`;
@@ -310,7 +340,11 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
   }
 
   const persisted = [...surfaced].filter((k) => seenKeys.has(k)).slice(-SURFACED_IDS_CAP);
-  deps.saveState({ lastScanAt: new Date(nowMs).toISOString(), surfacedIds: persisted });
+  deps.saveState({
+    lastScanAt: new Date(nowMs).toISOString(),
+    surfacedIds: persisted,
+    suppressedConnections: pruneConnectionSuppressions(state, nowMs),
+  });
 
   if (toSurface.length > 0) logger.info({ surfaced: toSurface.length, scanned: calendars.length }, 'calendar-monitor surfaced needs-you events');
   return toSurface.length;

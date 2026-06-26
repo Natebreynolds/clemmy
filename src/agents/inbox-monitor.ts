@@ -11,9 +11,11 @@
  * Design (binding: general, never user-specific — see feedback_global_not_user_specific):
  *  - Works for ANY user with ANY connected mail provider. Mail connections are
  *    DISCOVERED at runtime (listConnectedToolkits) — no hardcoded inbox/pin.
- *  - Multiple accounts → all ACTIVE mail connections are watched, and every
+ *  - Multiple accounts → readable mail connections are watched, and every
  *    surfaced item is LABELED with its source account (the connection id rides
  *    in metadata for routing) so it's visible, never buried in a guessed default.
+ *    Stale connections that return hard Composio auth errors are backed off by
+ *    connection id.
  *  - SURFACE-ONLY BY CONSTRUCTION: the monitor only ever calls a READ action and
  *    addNotification(). It never sends/replies/mutates — so it cannot act on the
  *    user's mail no matter what.
@@ -31,6 +33,13 @@ import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { executeComposioTool, listConnectedToolkits } from '../integrations/composio/client.js';
 import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
+import {
+  clearConnectionSuppression,
+  isConnectionSuppressed,
+  pruneConnectionSuppressions,
+  suppressConnectionAfterHardAuthFailure,
+  type ComposioConnectionSuppression,
+} from './composio-connection-suppression.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
 import { decideSurface, shouldSurface, surfaceDecisionV2Enabled, type SurfaceDecision } from './surface-decision.js';
 
@@ -61,6 +70,7 @@ interface MailProvider {
 interface InboxMonitorState {
   lastScanAt?: string;
   surfacedIds: string[];
+  suppressedConnections?: Record<string, ComposioConnectionSuppression>;
 }
 
 export interface InboxMonitorDeps {
@@ -250,9 +260,11 @@ function accountLabel(conn: { accountEmail?: string; accountName?: string; slug:
 }
 
 /**
- * One ambient scan: for each ACTIVE connected mailbox, read unread, score, and
- * surface the top needs-you items (capped, deduped, dashboard-only). Returns the
- * number of items surfaced. Best-effort: never throws.
+ * One ambient scan: for each readable connected mailbox, read unread, score,
+ * and surface the top needs-you items (capped, deduped, dashboard-only).
+ * Connections with hard Composio auth failures are backed off by connection id
+ * so stale accounts do not spam the logs. Returns the number of items surfaced.
+ * Best-effort: never throws.
  */
 export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): Promise<number> {
   const cfg = deps.config();
@@ -275,7 +287,8 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
   // report EXPIRED if not hit recently; filtering it would silently stop
   // watching a usable inbox). A genuinely-dead connection surfaces as a read
   // error in the per-mailbox try/catch below. No hardcoded inbox; multiple
-  // accounts are all watched + labeled.
+  // accounts are all watched + labeled. Hard Composio auth failures are
+  // suppressed after the attempted read, so false EXPIRED labels can still work.
   const mailboxes = connections.filter((c) => PROVIDERS[c.slug]);
   if (mailboxes.length === 0) return 0;
 
@@ -284,14 +297,30 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
   const candidates: Array<{ msg: UnreadMessage; score: MessageScore; label: string; connectionId: string; slug: string }> = [];
 
   for (const box of mailboxes) {
+    if (isConnectionSuppressed(state, box.connectionId, nowMs)) {
+      logger.debug({ slug: box.slug, connectionId: box.connectionId }, 'inbox-monitor: skipping suppressed mailbox');
+      continue;
+    }
     const provider = PROVIDERS[box.slug];
     let resp: unknown;
     try {
       resp = await deps.executeTool(provider.slug, provider.args(cfg.fetchTop), box.connectionId || undefined);
     } catch (err) {
-      logger.warn({ err, slug: box.slug }, 'inbox-monitor: read failed for a mailbox');
+      const suppression = suppressConnectionAfterHardAuthFailure(state, box.connectionId, err, nowMs);
+      if (suppression) {
+        logger.warn({
+          err,
+          slug: box.slug,
+          connectionId: box.connectionId,
+          reason: suppression.reason,
+          suppressUntil: suppression.suppressUntil,
+        }, 'inbox-monitor: suppressing mailbox after hard auth failure');
+      } else {
+        logger.warn({ err, slug: box.slug }, 'inbox-monitor: read failed for a mailbox');
+      }
       continue;
     }
+    clearConnectionSuppression(state, box.connectionId);
     for (const msg of provider.parse(resp)) {
       const key = `${box.connectionId}:${msg.id}`;
       seenKeys.add(key);
@@ -316,7 +345,11 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
   // of a fixed-size window and re-surfacing as a duplicate. Read/deleted ones
   // drop out naturally (they won't reappear in the unread list). Cap is a backstop.
   const persisted = [...surfaced].filter((k) => seenKeys.has(k)).slice(-SURFACED_IDS_CAP);
-  deps.saveState({ lastScanAt: new Date(nowMs).toISOString(), surfacedIds: persisted });
+  deps.saveState({
+    lastScanAt: new Date(nowMs).toISOString(),
+    surfacedIds: persisted,
+    suppressedConnections: pruneConnectionSuppressions(state, nowMs),
+  });
 
   if (toSurface.length > 0) {
     logger.info({ surfaced: toSurface.length, scanned: mailboxes.length }, 'inbox-monitor surfaced needs-you items');

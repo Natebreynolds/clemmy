@@ -35,7 +35,7 @@ const outlookResp = (msgs: Array<Partial<UnreadMessage> & { id: string }>): unkn
 function makeDeps(over: Partial<InboxMonitorDeps> & {
   connections?: Array<{ slug: string; connectionId: string; status: string; accountEmail?: string }>;
   resp?: unknown;
-  state?: { lastScanAt?: string; surfacedIds: string[] };
+  state?: { lastScanAt?: string; surfacedIds: string[]; suppressedConnections?: Record<string, unknown> };
   // config conveniences
   enabled?: boolean;
   intervalMs?: number;
@@ -180,6 +180,35 @@ test('processInboxMonitor: watches ALL mailboxes status-agnostically, labels eac
   const n = await processInboxMonitor(deps);
   assert.equal(n, 3, 'every mailbox watched regardless of status label');
   assert.deepEqual(notified.map((x) => x.metadata.account).sort(), ['me@a.com', 'me@b.com', 'me@x.com']);
+});
+
+test('processInboxMonitor: suppresses hard Composio auth failures by connection id', async () => {
+  let now = Date.parse('2026-06-16T12:00:00Z');
+  const calls: string[] = [];
+  const { deps, saved } = makeDeps({
+    now: () => now,
+    intervalMs: 15 * 60_000,
+    connections: [
+      { slug: 'outlook', connectionId: 'ca_good', status: 'ACTIVE', accountEmail: 'good@example.com' },
+      { slug: 'outlook', connectionId: 'ca_bad', status: 'EXPIRED', accountEmail: 'bad@example.com' },
+    ],
+    executeTool: async (_slug: string, _args: any, conn?: string) => {
+      calls.push(conn ?? '');
+      if (conn === 'ca_bad') {
+        throw new Error("ConnectedAccountExpired: Connected account ca_bad for toolkit 'outlook' is in EXPIRED state. code: 1820");
+      }
+      return outlookResp([]);
+    },
+  });
+
+  assert.equal(await processInboxMonitor(deps), 0);
+  assert.deepEqual(calls, ['ca_good', 'ca_bad']);
+  assert.equal(saved.at(-1)?.suppressedConnections?.ca_bad?.reason, 'expired');
+
+  calls.length = 0;
+  now += 16 * 60_000;
+  assert.equal(await processInboxMonitor(deps), 0);
+  assert.deepEqual(calls, ['ca_good'], 'the hard-failed stale connection is skipped on the next scan');
 });
 
 test('processInboxMonitor: excludes promo/survey content even from a real-looking sender', async () => {

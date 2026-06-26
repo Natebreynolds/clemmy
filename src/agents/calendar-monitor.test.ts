@@ -43,11 +43,12 @@ const toCalEvent = (o: Parameters<typeof gEv>[0]): CalEvent => ({
 
 function makeDeps(over: Partial<CalendarMonitorDeps> & {
   connections?: Array<{ slug: string; connectionId: string; status: string; accountEmail?: string }>;
-  resp?: unknown; enabled?: boolean; intervalMs?: number; maxPerScan?: number;
-} = {}): { deps: CalendarMonitorDeps; notified: any[]; toolCalls: any[] } {
+  resp?: unknown; enabled?: boolean; intervalMs?: number; maxPerScan?: number; state?: any;
+} = {}): { deps: CalendarMonitorDeps; notified: any[]; toolCalls: any[]; saved: any[] } {
   const notified: any[] = [];
   const toolCalls: any[] = [];
-  let state = { surfacedIds: [] as string[] } as any;
+  const saved: any[] = [];
+  let state = over.state ?? ({ surfacedIds: [] as string[] } as any);
   const deps: CalendarMonitorDeps = {
     listConnections: over.listConnections ?? (async () => (over.connections ?? [
       { slug: 'outlook', connectionId: 'ca_1', status: 'ACTIVE', accountEmail: 'nate@corp.com' },
@@ -61,9 +62,9 @@ function makeDeps(over: Partial<CalendarMonitorDeps> & {
     proactiveWorkAllowed: over.proactiveWorkAllowed ?? (() => true),
     now: over.now ?? (() => NOW),
     loadState: over.loadState ?? (() => state),
-    saveState: over.saveState ?? ((s: any) => { state = s; }),
+    saveState: over.saveState ?? ((s: any) => { state = s; saved.push(s); }),
   };
-  return { deps, notified, toolCalls };
+  return { deps, notified, toolCalls, saved };
 }
 
 // ── scoring ─────────────────────────────────────────────────────────────────
@@ -162,4 +163,33 @@ test('processCalendarMonitor: watches ALL calendars status-agnostically, labels 
   const n = await processCalendarMonitor(deps);
   assert.equal(n, 2, 'each calendar surfaced regardless of status label');
   assert.deepEqual(notified.map((x) => x.metadata.account).sort(), ['me@a.com', 'me@b.com']);
+});
+
+test('processCalendarMonitor: suppresses hard Composio auth failures by connection id', async () => {
+  let now = NOW;
+  const calls: string[] = [];
+  const { deps, saved } = makeDeps({
+    now: () => now,
+    intervalMs: 30 * 60_000,
+    connections: [
+      { slug: 'outlook', connectionId: 'ca_good', status: 'ACTIVE', accountEmail: 'good@example.com' },
+      { slug: 'outlook', connectionId: 'ca_bad', status: 'EXPIRED', accountEmail: 'bad@example.com' },
+    ],
+    executeTool: async (_slug: string, _args: any, conn?: string) => {
+      calls.push(conn ?? '');
+      if (conn === 'ca_bad') {
+        throw new Error('ConnectedAccountEntityIdMismatch: Connected account user ID does not match the provided user ID. code: 1812');
+      }
+      return calResp([]);
+    },
+  });
+
+  assert.equal(await processCalendarMonitor(deps), 0);
+  assert.deepEqual(calls, ['ca_good', 'ca_bad']);
+  assert.equal(saved.at(-1)?.suppressedConnections?.ca_bad?.reason, 'entity-mismatch');
+
+  calls.length = 0;
+  now += 31 * 60_000;
+  assert.equal(await processCalendarMonitor(deps), 0);
+  assert.deepEqual(calls, ['ca_good'], 'the hard-failed stale connection is skipped on the next scan');
 });
