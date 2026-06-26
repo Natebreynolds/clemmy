@@ -33,6 +33,7 @@ const {
   withTimeout,
   ToolTimeout,
   timeoutForTool,
+  isTimeoutSelfCorrectTool,
   DEFAULT_TIMEOUTS_MS,
   DEFAULT_MAX_TURNS,
   DEFAULT_TOOL_CALLS_PER_TURN,
@@ -456,6 +457,128 @@ test('wrapToolForHarness: applies per-tool timeout via withTimeout', async () =>
     );
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prev;
+  }
+});
+
+// ─── Tool-timeout self-correction (long external jobs) ──────────────────────
+//
+// A withTimeout kill of an external-API / long-job tool (Composio, MCP) returns a
+// self-correcting corrective as the tool RESULT (run continues) instead of
+// propagating ToolTimeout to the loop's ask-user "retry/switch/stop" pause. Reads
+// → async START+POLL; writes → verify-before-retry. Internal/shell/draft_plan and
+// run_worker are excluded from the GENERAL path (run_worker has its own block).
+
+const tscSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Run a tool whose work (200ms) exceeds a 50ms budget; return {result}|{error}.
+ *  Manages the bracket + gate env so the call reaches withTimeout (the exec/confirm
+ *  gates default ON and would otherwise intercept a composio write first). */
+async function runTscTimeout(opts: {
+  name: string;
+  path?: 'execute' | 'invoke';
+  input?: unknown;            // execute: raw input; invoke: args object (JSON-stringified)
+  selfCorrect?: 'on' | 'off'; // override CLEMMY_TOOL_TIMEOUT_SELF_CORRECT (default: unset → on)
+}): Promise<{ result?: unknown; error?: unknown }> {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_TOOL_TIMEOUT_SELF_CORRECT: process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  if (opts.selfCorrect) process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT = opts.selfCorrect;
+  else delete process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT;
+  try {
+    const counter = new ToolCallsCounter(10);
+    const slow = async () => { await tscSleep(200); return 'ran'; };
+    if (opts.path === 'invoke') {
+      const wrapped = wrapToolForHarness({ name: opts.name, invoke: slow }, { timeoutMs: 50 });
+      const argStr = JSON.stringify(opts.input ?? {});
+      return await withHarnessRunContext({ sessionId: `tsc-inv-${opts.name}`, counter }, async () => {
+        try {
+          const result = await (wrapped as unknown as {
+            invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown>;
+          }).invoke(null, argStr, { toolCall: { callId: `c-${opts.name}` } });
+          return { result };
+        } catch (error) { return { error }; }
+      });
+    }
+    const wrapped = wrapToolForHarness({ name: opts.name, execute: slow }, { timeoutMs: 50 });
+    return await withHarnessRunContext({ sessionId: `tsc-${opts.name}`, counter }, async () => {
+      try { return { result: await wrapped.execute!(opts.input ?? {}) }; }
+      catch (error) { return { error }; }
+    });
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test('timeout self-correct: composio READ timeout → async start+poll corrective, no throw', async () => {
+  const { result, error } = await runTscTimeout({
+    name: 'composio_execute_tool',
+    input: { tool_slug: 'APIFY_GET_DATASET_ITEMS' },
+  });
+  assert.equal(error, undefined, 'run continues — no ToolTimeout thrown');
+  assert.equal(typeof result, 'string');
+  assert.match(result as string, /TIMED OUT/);
+  assert.match(result as string, /ASYNC pattern|START the job|POLL/i);
+  assert.doesNotMatch(result as string, /WRITE TIMED OUT/);
+});
+
+test('timeout self-correct: composio WRITE timeout → verify-before-retry corrective', async () => {
+  const { result, error } = await runTscTimeout({
+    name: 'composio_execute_tool',
+    input: { tool_slug: 'AIRTABLE_CREATE_RECORD' },
+  });
+  assert.equal(error, undefined);
+  assert.match(result as string, /WRITE TIMED OUT/);
+  assert.match(result as string, /READ THE TARGET BACK|duplicate|verify/i);
+  assert.doesNotMatch(result as string, /Use the ASYNC pattern/);
+});
+
+test('timeout self-correct: kill-switch off restores ToolTimeout propagation', async () => {
+  const { error } = await runTscTimeout({
+    name: 'composio_execute_tool',
+    input: { tool_slug: 'APIFY_GET_DATASET_ITEMS' },
+    selfCorrect: 'off',
+  });
+  assert.ok(error instanceof ToolTimeout, 'kill-switch off → propagate to ask-user card');
+});
+
+test('timeout self-correct: internal + draft_plan timeouts still propagate (ask-user card preserved)', async () => {
+  for (const name of ['memory_search', 'draft_plan', 'read_file']) {
+    const { error } = await runTscTimeout({ name });
+    assert.ok(error instanceof ToolTimeout, `${name} must keep propagating`);
+  }
+});
+
+test('timeout self-correct: MCP (__) and dynamic cx_ tools self-correct on the invoke path', async () => {
+  for (const name of ['dataforseo__serp_organic_live', 'cx_apify_run_actor']) {
+    const { result, error } = await runTscTimeout({ name, path: 'invoke' });
+    assert.equal(error, undefined, `${name} should not throw`);
+    assert.match(result as string, /TIMED OUT/, `${name} returns the corrective`);
+  }
+});
+
+test('timeout self-correct: run_worker keeps its OWN message on the invoke path (precedence)', async () => {
+  const { result, error } = await runTscTimeout({ name: 'run_worker', path: 'invoke' });
+  assert.equal(error, undefined);
+  assert.match(result as string, /run_worker timed out/);
+  assert.match(result as string, /needs-attention/);
+  assert.doesNotMatch(result as string, /Use the ASYNC pattern/);
+});
+
+test('isTimeoutSelfCorrectTool: external-API/MCP class only', () => {
+  for (const t of ['composio_execute_tool', 'cx_apify_run_actor', 'external_api_foo', 'dataforseo__serp']) {
+    assert.equal(isTimeoutSelfCorrectTool(t), true, `${t} should self-correct`);
+  }
+  for (const t of ['run_worker', 'draft_plan', 'memory_search', 'write_file', 'run_shell_command', 'read_file']) {
+    assert.equal(isTimeoutSelfCorrectTool(t), false, `${t} should NOT self-correct`);
   }
 });
 

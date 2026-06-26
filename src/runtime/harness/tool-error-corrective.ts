@@ -15,6 +15,7 @@
  * retry-once-if-transient / fix the field" for free.
  */
 import { isTransientStepError } from '../../execution/transient-error.js';
+import { getRuntimeEnv } from '../../config.js';
 
 export type ToolFailureKind =
   | 'permission_denied'
@@ -60,6 +61,23 @@ export function asyncJobTimeoutCorrective(label: string, summary: string, where 
     `⚠️ ${label} TIMED OUT${where}: ${summary}`,
     `A timeout means the call exceeded its time budget. If this is a LONG-RUNNING JOB — an actor/agent run, a large scrape or export, or a blocking "sync get dataset items" call — do NOT retry the SAME blocking call; it will time out again. Use the ASYNC pattern: START the job with an action that returns a run/job id (e.g. a *_RUN / *_ACT_RUNS / *_CREATE / *_START action), then POLL its status/results (e.g. *_GET / *_RUNS_GET / dataset-items) until it finishes.`,
     `Only if this was a brief network blip (NOT a long job) should you retry the identical call ONCE.`,
+  ].join('\n\n');
+}
+
+/**
+ * Corrective for a TIMEOUT on a WRITE/mutating call. A write that timed out is
+ * DANGEROUS to re-issue: the harness abandons the call but does NOT cancel the
+ * underlying request, so the write MAY HAVE LANDED server-side. Blindly retrying
+ * (or "switching to async start+poll" as for a read) risks a DUPLICATE record.
+ * Steer to verify-before-retry instead. Banner is "WRITE TIMED OUT" — NOT a
+ * "FAILED" banner — on purpose: a FAILED banner would trip compensateFailedExternalWrite
+ * into decrementing the external-write ledger for a write that may have succeeded.
+ * General — pattern names, no per-vendor slug list. */
+export function writeJobTimeoutCorrective(label: string, summary: string, where = ''): string {
+  return [
+    `⚠️ ${label} WRITE TIMED OUT${where}: ${summary}`,
+    `This was a WRITE that exceeded its time budget. The call was ABANDONED but NOT cancelled — it may still have completed server-side. Do NOT blindly re-issue it; you could create a DUPLICATE.`,
+    `FIRST verify whether the write landed: READ THE TARGET BACK with a *_GET / *_LIST / *_SEARCH action for this same record/object. Only write again if it is confirmed ABSENT. If the toolkit supports an idempotency key or an UPSERT action, prefer that over a plain create.`,
   ].join('\n\n');
 }
 
@@ -153,4 +171,15 @@ export function detectStructuredToolFailure(text: string): { failed: boolean; su
 /** Kill-switch. Validated-default-ON (set CLEMMY_MCP_ERROR_CORRECTIVE=off to disable). */
 export function mcpErrorCorrectiveEnabled(): boolean {
   return (process.env.CLEMMY_MCP_ERROR_CORRECTIVE ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Kill-switch. Validated-default-ON (set CLEMMY_TOOL_TIMEOUT_SELF_CORRECT=off to disable).
+ *  When ON, a withTimeout kill of a long-job EXTERNAL tool (Composio / external_api / MCP)
+ *  returns the async start+poll corrective (reads) or the verify-before-retry corrective
+ *  (writes) as the tool RESULT — so the model self-corrects within the same run instead of
+ *  the run parking on the loop's ask-user "retry/switch/stop" card. Read via getRuntimeEnv
+ *  (not raw process.env) so the value applies under launchd, matching the brackets.ts
+ *  kill-switch convention. */
+export function toolTimeoutSelfCorrectEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_TOOL_TIMEOUT_SELF_CORRECT', 'on') ?? 'on').toLowerCase() !== 'off';
 }

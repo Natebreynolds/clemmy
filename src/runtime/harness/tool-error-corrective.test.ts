@@ -10,8 +10,10 @@ import {
   classifyToolError,
   toolFailureCorrective,
   asyncJobTimeoutCorrective,
+  writeJobTimeoutCorrective,
   detectStructuredToolFailure,
   mcpErrorCorrectiveEnabled,
+  toolTimeoutSelfCorrectEnabled,
 } from './tool-error-corrective.js';
 
 test('classifyToolError: maps the common failure shapes vendor-agnostically', () => {
@@ -101,4 +103,35 @@ test('mcpErrorCorrectiveEnabled: default-on, kill-switch off', () => {
     if (prev === undefined) delete process.env.CLEMMY_MCP_ERROR_CORRECTIVE;
     else process.env.CLEMMY_MCP_ERROR_CORRECTIVE = prev;
   }
+});
+
+test('toolTimeoutSelfCorrectEnabled: default-on, kill-switch off', () => {
+  const prev = process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT;
+  try {
+    delete process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT;
+    assert.equal(toolTimeoutSelfCorrectEnabled(), true, 'default on');
+    process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT = 'off';
+    assert.equal(toolTimeoutSelfCorrectEnabled(), false, 'kill-switch off');
+    process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT = 'on';
+    assert.equal(toolTimeoutSelfCorrectEnabled(), true);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT;
+    else process.env.CLEMMY_TOOL_TIMEOUT_SELF_CORRECT = prev;
+  }
+});
+
+test('writeJobTimeoutCorrective: WRITE banner + verify-before-retry (no FAILED banner, no async-retry copy)', () => {
+  const out = writeJobTimeoutCorrective(
+    'composio_execute_tool',
+    'exceeded its 300s time budget',
+    ' (composio_execute_tool)',
+  );
+  assert.match(out, /WRITE TIMED OUT/);
+  assert.match(out, /READ THE TARGET BACK/);
+  assert.match(out, /duplicate/i);
+  // A FAILED banner would trip compensateFailedExternalWrite into decrementing the
+  // external-write ledger for a write that may have landed — must NOT use it.
+  assert.doesNotMatch(out, /FAILED/);
+  // That's the READ corrective's advice; a write must verify first, not blindly poll.
+  assert.doesNotMatch(out, /Use the ASYNC pattern/);
 });

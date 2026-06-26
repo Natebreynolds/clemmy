@@ -51,6 +51,11 @@ import {
 } from './destination-gate.js';
 import { establishedTargetsFor, recordPublishedDestination } from './published-destinations.js';
 import { creditMatchingRecall, isTransientFailure } from '../../memory/procedural-recall-link.js';
+import {
+  asyncJobTimeoutCorrective,
+  writeJobTimeoutCorrective,
+  toolTimeoutSelfCorrectEnabled,
+} from './tool-error-corrective.js';
 
 /**
  * Reliability brackets — the safety primitives the harness loop weaves
@@ -390,6 +395,41 @@ export function timeoutForTool(toolName: string): number {
     return DEFAULT_TIMEOUTS_MS.mcp;
   }
   return DEFAULT_TIMEOUTS_MS.default;
+}
+
+/** Tools whose ToolTimeout should SELF-CORRECT (return the async/verify corrective
+ *  as the tool result) instead of propagating to the loop's ask-user "retry/switch/
+ *  stop" pause. The class is the long-running EXTERNAL-job surface: Composio (static
+ *  composio_execute_tool + dynamic cx_*), external_api_*, and MCP "__" tools —
+ *  exactly the tools timeoutForTool puts in the generous externalApi/mcp buckets, and
+ *  whose timeout means "long upstream job, switch to async/verify", not "internal bug".
+ *  Internal default-60s tools (memory_/workspace_/file/plan) and shell are DELIBERATELY
+ *  excluded: a timeout there is a genuine hang with no async recovery move, so the
+ *  ask-user card is still correct. run_worker is handled by its own dedicated block
+ *  (worker-specific message) — returned false here so it never reaches the general path.
+ *  draft_plan stays excluded (a planner/Codex flake → ask-user is the right call). */
+export function isTimeoutSelfCorrectTool(toolName: string): boolean {
+  if (toolName === 'run_worker' || /^run_worker/.test(toolName)) return false; // own block
+  if (toolName === 'composio_execute_tool') return true;
+  if (toolName.startsWith('cx_')) return true;            // dynamic first-class Composio tools
+  if (/^(composio|external_api)_/.test(toolName)) return true;
+  if (toolName.includes('__')) return true;               // MCP namespace shim separator
+  return false;
+}
+
+/** Pick the self-correcting corrective for a timed-out long-job tool. Reads vs
+ *  writes get OPPOSITE advice: a read switches to async START+POLL; a write must
+ *  verify-before-retry (it may have landed server-side — re-issuing risks a
+ *  duplicate). Reuses classifyExternalWrite so the two gates agree on "is this a
+ *  write". We only know the tool name + budget here (withTimeout synthesizes the
+ *  ToolTimeout), so the summary is the elapsed budget and `where` is the tool tag. */
+function timeoutCorrectiveFor(toolName: string, parsedInput: unknown, timeoutMs: number): string {
+  const summary = `exceeded its ${Math.round(timeoutMs / 1000)}s time budget`;
+  const where = ` (${toolName})`;
+  const { mutating } = classifyExternalWrite(toolName, parsedInput);
+  return mutating
+    ? writeJobTimeoutCorrective(toolName, summary, where)
+    : asyncJobTimeoutCorrective(toolName, summary, where);
 }
 
 /** Per-role max-turn caps. The loop passes these into `Runner({maxTurns})`. */
@@ -1711,6 +1751,45 @@ export function wrapToolForHarness<T extends WrappableTool>(
           throw err;
         }
       }
+      // GENERAL long-job timeout self-correction. A withTimeout kill of an
+      // external-API / long-running-job tool (Composio static + cx_*, external_api_*,
+      // MCP __) means "the upstream job exceeded even its generous budget" — the live
+      // 2026-06-24 Apify case. Return the async start+poll corrective (reads) or the
+      // verify-before-retry corrective (writes) as the tool RESULT instead of letting
+      // ToolTimeout propagate to handleRunError's ask-user "retry/switch/stop" pause —
+      // so the model self-corrects within the SAME run, generalizing the run_worker
+      // precedent above to the broader class. Behind CLEMMY_TOOL_TIMEOUT_SELF_CORRECT
+      // (default on). Internal default-60s tools, shell, and draft_plan are NOT in the
+      // class: their timeout is a real hang/flake the loop's ask-user card should still
+      // surface, so they keep propagating. NOTE on the orphaned call: withTimeout
+      // rejects with ToolTimeout and the outer promise STAYS rejected, so when the
+      // underlying call finishes later its resolve() is a no-op (promises settle
+      // once). The bookkeeping .then() on invokePromise therefore does NOT run on a
+      // timeout and the late result is discarded. Consequence for a WRITE: a
+      // timed-out write that lands late is recorded NOWHERE (no recordPublish), so
+      // the verify-before-retry corrective's read-back is the ONLY dup protection —
+      // there is no ledger backstop. (A true fix is AbortController cancellation.)
+      //
+      // Ordering matters: gate on the CHEAP pure predicate, and read the
+      // kill-switch (a filesystem .env read via getRuntimeEnv) ONLY inside the
+      // catch on an actual ToolTimeout — never on the per-call success path. A
+      // class tool's normal return must not pay an fs read every invoke.
+      if (isTimeoutSelfCorrectTool(tool.name)) {
+        try {
+          const result = await invokePromise;
+          // Preserve the fan-out nudge append on the success path so this block is
+          // fully equivalent to the generic path below for non-timeout outcomes.
+          if (fanoutNudge) {
+            return typeof result === 'string' ? `${result}\n\n${fanoutNudge}` : result;
+          }
+          return result;
+        } catch (err) {
+          if (err instanceof ToolTimeout && toolTimeoutSelfCorrectEnabled()) {
+            return timeoutCorrectiveFor(tool.name, parsedInput, timeoutMs);
+          }
+          throw err;
+        }
+      }
       // Deliver the fan-out nudge INTO the model's view: append it to a
       // string result. (Non-string results skip the nudge rather than risk
       // corrupting a structured payload — the next serial call will re-fire.)
@@ -1738,12 +1817,28 @@ export function wrapToolForHarness<T extends WrappableTool>(
       if (soft !== null) return soft;
       throw err;
     }
-    const result = await withTimeout(
-      (async () => originalExecute(input, runContext))(),
-      timeoutMs,
-      tool.name,
-      { isPaused: isPausedFactory(ctx?.sessionId) },
-    );
+    let result: unknown;
+    try {
+      result = await withTimeout(
+        (async () => originalExecute(input, runContext))(),
+        timeoutMs,
+        tool.name,
+        { isPaused: isPausedFactory(ctx?.sessionId) },
+      );
+    } catch (err) {
+      // Same general self-correction as the invoke path: a long-job timeout on an
+      // external-API / MCP tool returns the async/verify corrective as the result
+      // (run continues) instead of propagating ToolTimeout to the ask-user pause.
+      // Non-class tools (internal-60s, shell, draft_plan) keep propagating.
+      if (
+        err instanceof ToolTimeout &&
+        isTimeoutSelfCorrectTool(tool.name) &&
+        toolTimeoutSelfCorrectEnabled()
+      ) {
+        return timeoutCorrectiveFor(tool.name, input, timeoutMs);
+      }
+      throw err;
+    }
     compensateFailedExternalWrite(ctx?.sessionId, tool.name, input, result);
     recordPublishIfSucceeded(tool.name, input, result);
     creditRecallFromToolResult(ctx?.sessionId, tool.name, input, result);
