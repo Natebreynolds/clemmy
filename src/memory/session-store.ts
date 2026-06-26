@@ -1,8 +1,20 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeSync,
+} from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import type { ConversationTurn, SessionRecord } from '../types.js';
 import { ASSISTANT_PAUSED_PLACEHOLDER } from '../runtime/provider.js';
+import { withFileLockSync } from '../runtime/atomic-json.js';
 import { deriveTitle } from './derive-title.js';
 
 const SESSION_DIR = path.join(BASE_DIR, 'state');
@@ -68,13 +80,48 @@ function loadSessions(): Record<string, SessionRecord> {
   try {
     return JSON.parse(readFileSync(SESSION_FILE, 'utf-8')) as Record<string, SessionRecord>;
   } catch {
+    // Corrupt file (a torn write from an older build, disk damage). Quarantine
+    // it aside BEFORE returning empty, so the next write lands on a fresh path
+    // and can never clobber recoverable bytes — and warn, so the failure is
+    // loud rather than a silent wipe of the user's chat history.
+    try {
+      const quarantine = `${SESSION_FILE}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      renameSync(SESSION_FILE, quarantine);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[session-store] sessions.json was unreadable; preserved a copy at ${path.basename(quarantine)} and started fresh`,
+      );
+    } catch {
+      // Best effort — if the rename fails, the next atomic write still
+      // replaces the corrupt file safely via temp+rename below.
+    }
     return {};
   }
 }
 
 function saveSessions(data: Record<string, SessionRecord>): void {
   ensureSessionDir();
-  writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
+  // Atomic write: a crash between truncate and a full write must never leave
+  // a torn sessions.json (the next load would JSON.parse-fail, fall back to
+  // {}, and the first appendTurn would overwrite it — silent total history
+  // loss). Write to a temp file, fsync, then rename (atomic on the same
+  // filesystem) so a partial write is never visible under the live path.
+  const tmp = `${SESSION_FILE}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
+  const fd = openSync(tmp, 'w');
+  try {
+    writeSync(fd, JSON.stringify(data, null, 2));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, SESSION_FILE);
+}
+
+/** A fresh, unpersisted session record. Shared by `get()` (read-only
+ *  synthesize-if-missing) and `appendTurn` (get-or-create under the lock). */
+function synthesizeSession(sessionId: string): SessionRecord {
+  const now = new Date().toISOString();
+  return { id: sessionId, createdAt: now, updatedAt: now, turns: [] };
 }
 
 export class SessionStore {
@@ -101,56 +148,61 @@ export class SessionStore {
 
   get(sessionId: string): SessionRecord {
     const sessions = loadSessions();
-    const existing = sessions[sessionId];
-    if (existing) return existing;
-
-    const now = new Date().toISOString();
-    return {
-      id: sessionId,
-      createdAt: now,
-      updatedAt: now,
-      turns: [],
-    };
+    return sessions[sessionId] ?? synthesizeSession(sessionId);
   }
 
   upsert(session: SessionRecord): void {
-    const sessions = loadSessions();
-    sessions[session.id] = session;
-    saveSessions(sessions);
+    // Lock the whole read-modify-write so a concurrent process (e.g. the
+    // CLI while the daemon is up) re-reads the latest committed map instead
+    // of stomping it. Within one process the event loop already serializes
+    // these synchronous mutators, so the lock is purely cross-process.
+    withFileLockSync(SESSION_FILE, () => {
+      const sessions = loadSessions();
+      sessions[session.id] = session;
+      saveSessions(sessions);
+    });
   }
 
   appendTurn(sessionId: string, turn: ConversationTurn, userId?: string, channel?: string): SessionRecord {
-    const session = this.get(sessionId);
-    session.userId = userId ?? session.userId;
-    session.channel = channel ?? session.channel;
-    if (!isPersistableTurn(turn)) {
-      // Don't store error placeholders. The channel already rendered
-      // the text to the user; nothing is lost in their view, and we
-      // keep the turn window dense with real content.
+    // One locked load-mutate-save — does NOT call this.get()/this.upsert()
+    // (that would re-enter the lock and stall). Re-reads the latest map so a
+    // cross-process writer can't lose this turn.
+    return withFileLockSync(SESSION_FILE, () => {
+      const sessions = loadSessions();
+      const session = sessions[sessionId] ?? synthesizeSession(sessionId);
+      session.userId = userId ?? session.userId;
+      session.channel = channel ?? session.channel;
+      if (!isPersistableTurn(turn)) {
+        // Don't store error placeholders. The channel already rendered
+        // the text to the user; nothing is lost in their view, and we
+        // keep the turn window dense with real content.
+        session.updatedAt = new Date().toISOString();
+        sessions[session.id] = session;
+        saveSessions(sessions);
+        return session;
+      }
+      session.turns.push(turn);
+      // Auto-title from the first user message so the Conversations list
+      // shows something meaningful instead of a raw id. Only set once; a
+      // user-supplied title (via setMeta) is never overwritten.
+      if (!session.title && turn.role === 'user' && turn.text.trim()) {
+        session.title = deriveTitle(turn.text, 'New chat');
+      }
+      if (session.turns.length > MAX_TURNS_PER_SESSION) {
+        // Archive the rotated turns to the vault before dropping so the
+        // conversation remains FTS-recallable. Previously these were
+        // silently lost — see commit history for the "I had a chat
+        // earlier and the agent can't find it" failure mode.
+        const overflow = session.turns.length - MAX_TURNS_PER_SESSION;
+        const dropped = session.turns.slice(0, overflow);
+        archiveDroppedTurnsToVault(session.id, dropped);
+        session.turns = session.turns.slice(-MAX_TURNS_PER_SESSION);
+      }
       session.updatedAt = new Date().toISOString();
-      this.upsert(session);
+      sessions[session.id] = session;
+      saveSessions(sessions);
       return session;
-    }
-    session.turns.push(turn);
-    // Auto-title from the first user message so the Conversations list
-    // shows something meaningful instead of a raw id. Only set once; a
-    // user-supplied title (via setMeta) is never overwritten.
-    if (!session.title && turn.role === 'user' && turn.text.trim()) {
-      session.title = deriveTitle(turn.text, 'New chat');
-    }
-    if (session.turns.length > MAX_TURNS_PER_SESSION) {
-      // Archive the rotated turns to the vault before dropping so the
-      // conversation remains FTS-recallable. Previously these were
-      // silently lost — see commit history for the "I had a chat
-      // earlier and the agent can't find it" failure mode.
-      const overflow = session.turns.length - MAX_TURNS_PER_SESSION;
-      const dropped = session.turns.slice(0, overflow);
-      archiveDroppedTurnsToVault(session.id, dropped);
-      session.turns = session.turns.slice(-MAX_TURNS_PER_SESSION);
-    }
-    session.updatedAt = new Date().toISOString();
-    this.upsert(session);
-    return session;
+    });
   }
 
   recentTranscript(sessionId: string, maxTurns = 12): string {
@@ -190,41 +242,45 @@ export class SessionStore {
     sessionId: string,
     patch: { title?: string; pinned?: boolean; tags?: string[]; archived?: boolean },
   ): SessionRecord | null {
-    const sessions = loadSessions();
-    const session = sessions[sessionId];
-    if (!session) return null;
-    let changed = false;
-    if (patch.title !== undefined) {
-      const next = patch.title.trim().slice(0, 120);
-      if (next !== session.title) { session.title = next; changed = true; }
-    }
-    if (patch.pinned !== undefined && patch.pinned !== Boolean(session.pinned)) {
-      session.pinned = patch.pinned; changed = true;
-    }
-    if (patch.archived !== undefined && patch.archived !== Boolean(session.archived)) {
-      session.archived = patch.archived; changed = true;
-    }
-    if (patch.tags !== undefined) {
-      const next = normalizeTags(patch.tags);
-      if (JSON.stringify(next) !== JSON.stringify(session.tags ?? [])) {
-        session.tags = next; changed = true;
+    return withFileLockSync(SESSION_FILE, () => {
+      const sessions = loadSessions();
+      const session = sessions[sessionId];
+      if (!session) return null;
+      let changed = false;
+      if (patch.title !== undefined) {
+        const next = patch.title.trim().slice(0, 120);
+        if (next !== session.title) { session.title = next; changed = true; }
       }
-    }
-    if (changed) {
-      session.updatedAt = new Date().toISOString();
-      sessions[sessionId] = session;
-      saveSessions(sessions);
-    }
-    return session;
+      if (patch.pinned !== undefined && patch.pinned !== Boolean(session.pinned)) {
+        session.pinned = patch.pinned; changed = true;
+      }
+      if (patch.archived !== undefined && patch.archived !== Boolean(session.archived)) {
+        session.archived = patch.archived; changed = true;
+      }
+      if (patch.tags !== undefined) {
+        const next = normalizeTags(patch.tags);
+        if (JSON.stringify(next) !== JSON.stringify(session.tags ?? [])) {
+          session.tags = next; changed = true;
+        }
+      }
+      if (changed) {
+        session.updatedAt = new Date().toISOString();
+        sessions[sessionId] = session;
+        saveSessions(sessions);
+      }
+      return session;
+    });
   }
 
   /** Permanently remove a session. Returns true if one was deleted. */
   delete(sessionId: string): boolean {
-    const sessions = loadSessions();
-    if (!sessions[sessionId]) return false;
-    delete sessions[sessionId];
-    saveSessions(sessions);
-    return true;
+    return withFileLockSync(SESSION_FILE, () => {
+      const sessions = loadSessions();
+      if (!sessions[sessionId]) return false;
+      delete sessions[sessionId];
+      saveSessions(sessions);
+      return true;
+    });
   }
 }
 

@@ -12,7 +12,7 @@
  * Isolated via per-test CLEMENTINE_HOME so the user's real
  * ~/.clementine-next/state/sessions.json is never touched.
  */
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -90,6 +90,33 @@ test('listAll returns every session newest-first', () => {
   assert.ok(ids.includes('sess-b'));
   // b is newer, so it sorts first.
   assert.equal(ids.indexOf('sess-b') < ids.indexOf('sess-a'), true);
+});
+
+// Self-contained: writes its own corrupt file and asserts recovery, so it
+// neither depends on nor (durably) disturbs the other tests' state.
+test('a corrupt sessions.json is quarantined, not clobbered, and the store recovers', () => {
+  const stateDir = path.join(TMP_HOME, 'state');
+  const file = path.join(stateDir, 'sessions.json');
+  // Simulate a torn write — half a JSON object that JSON.parse can't read.
+  writeFileSync(file, '{ "sess-x": { "id": "sess-x", "turns": [');
+
+  const store = new SessionStore();
+  // Load must not throw and must start fresh rather than crashing the turn.
+  assert.deepEqual(store.listAll(), []);
+
+  // The unreadable bytes were preserved aside (recoverable), not overwritten.
+  const quarantined = readdirSync(stateDir).filter((f) => f.startsWith('sessions.json.corrupt-'));
+  assert.equal(quarantined.length >= 1, true);
+
+  // A subsequent write succeeds, leaves valid JSON, and litters no temp file.
+  store.upsert({
+    id: 'sess-y',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    turns: [],
+  });
+  assert.equal(store.exists('sess-y'), true);
+  assert.equal(readdirSync(stateDir).some((f) => f.includes('sessions.json.tmp.')), false);
 });
 
 test('records without the new optional fields still load', () => {

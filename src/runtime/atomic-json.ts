@@ -174,6 +174,43 @@ async function withFileLock<T>(filePath: string, work: () => Promise<T> | T): Pr
   }
 }
 
+/** Park the thread synchronously without burning CPU. Used only by the
+ *  sync lock path, where the critical section is a sub-millisecond JSON
+ *  read-modify-write, so total park time under contention is tiny. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+const SYNC_LOCK_MAX_WAIT_MS = 2_000;
+
+/**
+ * Synchronous sibling of {@link withFileLock} for callers whose critical
+ * section is itself synchronous and on a hot path that must keep a sync
+ * public API (e.g. `SessionStore`'s load-mutate-save on every chat turn).
+ *
+ * The JS event loop already serializes synchronous work in-process, so —
+ * unlike the async variant — this needs no in-process mutex; only the
+ * cross-process advisory `.lock` matters. It is **best-effort by
+ * contract**: if the lock can't be acquired within `SYNC_LOCK_MAX_WAIT_MS`
+ * (a peer crashed mid-write, etc.) the work runs anyway. Any caller pairs
+ * this with an atomic temp+rename write, which already guarantees no torn
+ * file; the lock only narrows the cross-process lost-update window. We
+ * never block a hot turn on a stuck lock.
+ */
+export function withFileLockSync<T>(filePath: string, work: () => T): T {
+  const startedAt = Date.now();
+  let locked = tryAcquireFileLock(filePath);
+  while (!locked && Date.now() - startedAt < SYNC_LOCK_MAX_WAIT_MS) {
+    sleepSync(LOCK_RETRY_MS);
+    locked = tryAcquireFileLock(filePath);
+  }
+  try {
+    return work();
+  } finally {
+    if (locked) releaseFileLock(filePath);
+  }
+}
+
 // -------------------------------------------------------- atomicJsonMutate
 
 /**
