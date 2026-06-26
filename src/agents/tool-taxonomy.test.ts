@@ -94,6 +94,13 @@ test('classifyTool: local-side-effect tools never gate on approval', () => {
   assert.equal(classifyTool('workflow_run'), 'read');
 });
 
+test('decideToolApproval: task_hygiene is local bookkeeping and does not ask', () => {
+  const decision = decideToolApproval({ toolName: 'task_hygiene' });
+  assert.equal(decision.kind, 'write');
+  assert.equal(decision.needsApproval, false);
+  assert.equal(decision.reason, 'read-always-auto');
+});
+
 test('classifyTool: memory_review_instructions is a READ (the confirm-first gate forces this call — it must not self-park for approval)', () => {
   // Regression for the 2026-06-17 double-approval on an outbound email batch:
   // the confirm-first gate requires the model to call memory_review_instructions

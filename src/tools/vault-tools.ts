@@ -12,8 +12,88 @@ import {
   replaceFile,
   safeTitle,
   textResult,
+  type ParsedTask,
 } from './shared.js';
 import { VAULT_DIR } from '../memory/vault.js';
+import { ExecutionStore } from '../execution/store.js';
+import {
+  formatTaskLedgerHygieneResult,
+  runTaskLedgerHygiene,
+} from '../tasks/task-ledger-hygiene.js';
+
+interface TaskTimeline {
+  createdAt?: string;
+  completedAt?: string;
+  ownerCompletedAt?: string;
+}
+
+function parseSinceCutoff(value: string): { cutoffMs: number } | { error: string } {
+  const trimmed = value.trim();
+  const lower = trimmed.toLowerCase();
+  const date = new Date();
+
+  if (lower === 'today') {
+    date.setHours(0, 0, 0, 0);
+    return { cutoffMs: date.getTime() };
+  }
+  if (lower === 'yesterday') {
+    date.setDate(date.getDate() - 1);
+    date.setHours(0, 0, 0, 0);
+    return { cutoffMs: date.getTime() };
+  }
+
+  const parsed = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+    ? Date.parse(`${trimmed}T00:00:00`)
+    : Date.parse(trimmed);
+  if (!Number.isFinite(parsed)) {
+    return { error: `Invalid since filter "${value}". Use today, yesterday, YYYY-MM-DD, or an ISO datetime.` };
+  }
+  return { cutoffMs: parsed };
+}
+
+function earlierIso(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return Date.parse(right) < Date.parse(left) ? right : left;
+}
+
+function laterIso(...values: Array<string | undefined>): string | undefined {
+  return values
+    .filter((value): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value)))
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0];
+}
+
+function taskTimestampForSince(task: ParsedTask, timeline?: TaskTimeline): string | undefined {
+  if (task.status === 'completed') {
+    return laterIso(timeline?.completedAt, timeline?.ownerCompletedAt);
+  }
+  return timeline?.createdAt;
+}
+
+function loadTaskTimelines(): Map<string, TaskTimeline> {
+  const timelines = new Map<string, TaskTimeline>();
+  for (const execution of new ExecutionStore().list(5000)) {
+    for (const binding of execution.taskBindings ?? []) {
+      const current = timelines.get(binding.taskId) ?? {};
+      current.createdAt = earlierIso(current.createdAt, binding.createdAt);
+      current.completedAt = laterIso(current.completedAt, binding.completedAt);
+      if (execution.status === 'completed') {
+        current.ownerCompletedAt = laterIso(current.ownerCompletedAt, binding.completedAt, execution.updatedAt);
+      }
+      timelines.set(binding.taskId, current);
+    }
+  }
+  return timelines;
+}
+
+function formatTask(task: ParsedTask): string {
+  const meta = [
+    task.priority ? `priority=${task.priority}` : '',
+    task.dueDate ? `due=${task.dueDate}` : '',
+    task.project ? `project=${task.project}` : '',
+  ].filter(Boolean).join(', ');
+  return `- [${task.status}] {${task.id}} ${task.description}${meta ? ` (${meta})` : ''}`;
+}
 
 export function registerVaultTools(server: McpServer): void {
   server.tool(
@@ -55,18 +135,62 @@ export function registerVaultTools(server: McpServer): void {
     {
       status: z.enum(['all', 'pending', 'completed']).optional(),
       project: z.string().optional(),
+      priority: z.enum(['high', 'medium', 'low']).optional(),
+      since: z.string().optional(),
+      limit: z.number().int().min(1).max(500).optional(),
     },
-    async ({ status, project }) => {
+    async ({ status, project, priority, since, limit }) => {
       ensureTasksFile();
-      const tasks = parseTasks(readFileSync(TASKS_FILE, 'utf-8'))
+      let tasks = parseTasks(readFileSync(TASKS_FILE, 'utf-8'))
         .filter((task) => !status || status === 'all' || task.status === status)
-        .filter((task) => !project || task.project.toLowerCase() === project.toLowerCase());
+        .filter((task) => !project || task.project.toLowerCase() === project.toLowerCase())
+        .filter((task) => !priority || task.priority === priority);
 
-      if (tasks.length === 0) {
-        return textResult('No tasks found matching the criteria.');
+      const notes: string[] = [];
+      if (since) {
+        const cutoff = parseSinceCutoff(since);
+        if ('error' in cutoff) {
+          return textResult(cutoff.error);
+        }
+        const timelines = loadTaskTimelines();
+        tasks = tasks.filter((task) => {
+          const timestamp = taskTimestampForSince(task, timelines.get(task.id));
+          return Boolean(timestamp && Date.parse(timestamp) >= cutoff.cutoffMs);
+        });
+        notes.push('Note: since filtering uses execution task-binding timestamps; manual TASKS.md rows without timestamps are excluded.');
       }
 
-      return textResult(tasks.map((task) => `- [${task.status}] {${task.id}} ${task.description}`).join('\n'));
+      const total = tasks.length;
+      if (limit && tasks.length > limit) {
+        tasks = tasks.slice(0, limit);
+        notes.push(`Showing ${tasks.length} of ${total} matching tasks.`);
+      }
+
+      if (tasks.length === 0) {
+        return textResult([...notes, 'No tasks found matching the criteria.'].join('\n'));
+      }
+
+      return textResult([...notes, ...tasks.map(formatTask)].join('\n'));
+    },
+  );
+
+  server.tool(
+    'task_hygiene',
+    'Repair and compact the task ledger so completed execution-owned tasks do not remain in the active queue. Dry-run by default; set apply=true to mutate TASKS.md and execution bindings.',
+    {
+      apply: z.boolean().optional(),
+      close_stale_unowned_before: z.string().optional(),
+    },
+    async ({ apply, close_stale_unowned_before }) => {
+      try {
+        const result = runTaskLedgerHygiene({
+          apply: apply === true,
+          closeUnownedBefore: close_stale_unowned_before,
+        });
+        return textResult(formatTaskLedgerHygieneResult(result));
+      } catch (error) {
+        return textResult(`Task ledger hygiene failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     },
   );
 

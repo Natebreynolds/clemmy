@@ -104,6 +104,7 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // Task + goal bookkeeping — local JSON, no external surface.
   'task_add',
   'task_update',
+  'task_hygiene',
   'goal_create',
   'goal_update',
   // Current focus — local SQLite attention pointer. Pure local writes,

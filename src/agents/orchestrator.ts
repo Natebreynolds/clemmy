@@ -946,6 +946,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // Tasks (writes)
       'task_add',
       'task_update',
+      'task_hygiene',
       // Workflows — full surface added 2026-05-21. Catalog had these
       // registered but the orchestrator's discoveryTools array never
       // included them, so the agent couldn't actually create the

@@ -20,6 +20,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'note_create',
   'note_take',
   'task_list',
+  'task_hygiene',
   'task_add',
   'task_update',
   'create_plan',

@@ -26,6 +26,7 @@ import { checkAllSkillUpdates } from '../runtime/skill-installer.js';
 import { addNotification, reapStaleNotifications } from '../runtime/notifications.js';
 import { reapExpiredGoals } from '../agents/plan-proposals.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
+import { previousLocalDayKey, runTaskLedgerHygiene } from '../tasks/task-ledger-hygiene.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -113,6 +114,7 @@ interface MemoryMaintenanceState {
   lastBackupDay?: string;
   lastMergeDay?: string;
   lastGoalReapDay?: string;
+  lastTaskLedgerHygieneDay?: string;
   lastNotificationReapDay?: string;
 }
 const MAINTENANCE_STATE_FILE = path.join(STATE_DIR, 'memory-maintenance-state.json');
@@ -168,6 +170,13 @@ const MEMORY_MERGE_NIGHTLY_MINUTE = 45; // offset from backup's 4:30
 // offset from the merge's 4:45.
 const GOAL_REAP_NIGHTLY_HOUR = 5;
 const GOAL_REAP_NIGHTLY_MINUTE = 0;
+
+// Task ledger hygiene — closes execution-owned task rows whose executions are
+// already terminal, compacts checked rows out of Pending, and closes only
+// unowned rows that were due before today. Runs just before the 5 PM EOD
+// workflow so the wrap-up sees a groomed active queue.
+const TASK_LEDGER_HYGIENE_DAILY_HOUR = 16;
+const TASK_LEDGER_HYGIENE_DAILY_MINUTE = 55;
 
 // Notification hygiene — stale unread approval/execution cards flip to read,
 // >30d records purge. Also runs at daemon boot (daemon/runner.ts). 5:15,
@@ -510,6 +519,29 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'goal reaper nightly job failed');
+      }
+    }
+  }
+
+  // Task-ledger hygiene before end-of-day. The cutoff is "yesterday" so a
+  // legitimate manual task due today is still visible in the EOD urgent list;
+  // only already-stale unowned rows are closed automatically.
+  if (isAtOrAfterDailyTime(now, TASK_LEDGER_HYGIENE_DAILY_HOUR, TASK_LEDGER_HYGIENE_DAILY_MINUTE)) {
+    const taskHygieneEnabled = (getRuntimeEnv('CLEMMY_TASK_LEDGER_HYGIENE', 'on') || 'on').toLowerCase() !== 'off';
+    if (taskHygieneEnabled && maintenanceState.lastTaskLedgerHygieneDay !== today) {
+      maintenanceState.lastTaskLedgerHygieneDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const stats = runTaskLedgerHygiene({
+          apply: true,
+          closeUnownedBefore: previousLocalDayKey(now),
+          now,
+        });
+        if (stats.repairableTasks > 0 || stats.compactedTaskRows > 0 || stats.updatedBindings > 0) {
+          logger.info({ stats }, 'task ledger hygiene daily job completed');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'task ledger hygiene daily job failed');
       }
     }
   }

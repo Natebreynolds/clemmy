@@ -37,6 +37,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { ExecutionStore, sweepCrashedExecutions, sweepStaleBlockedExecutions } = await import('./store.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const { TASKS_FILE, ensureTasksFile, parseTasks } = await import('../tools/shared.js');
 
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
@@ -74,6 +75,59 @@ function baseExecution(overrides: Record<string, unknown>): Record<string, unkno
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+test('ExecutionStore.update closes linked vault task rows when an execution completes', () => {
+  seedExecutions([
+    baseExecution({
+      id: 'exec-with-task',
+      status: 'active',
+      taskBindings: [
+        {
+          taskId: 'T-001',
+          description: 'Do the tracked work',
+          status: 'pending',
+          createdAt: nowMinusMinutes(15),
+        },
+      ],
+      activity: [],
+    }),
+  ]);
+  ensureTasksFile();
+  writeFileSync(
+    TASKS_FILE,
+    [
+      '---',
+      'type: tasks',
+      '---',
+      '',
+      '# Tasks',
+      '',
+      '## Pending',
+      '',
+      '- [ ] {T-001} Do the tracked work !!high',
+      '',
+      '## Completed',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const updated = new ExecutionStore().update('exec-with-task', {
+    status: 'completed',
+    lastAssistantSummary: 'Work finished.',
+  });
+
+  const tasks = parseTasks(readFileSync(TASKS_FILE, 'utf-8'));
+  const taskBody = readFileSync(TASKS_FILE, 'utf-8');
+  const pendingSection = taskBody.slice(taskBody.indexOf('## Pending'), taskBody.indexOf('## Completed'));
+  const completedSection = taskBody.slice(taskBody.indexOf('## Completed'));
+  assert.equal(tasks.find((task) => task.id === 'T-001')?.status, 'completed');
+  assert.doesNotMatch(pendingSection, /T-001/);
+  assert.match(completedSection, /T-001/);
+  assert.equal(updated?.taskBindings?.[0]?.status, 'completed');
+  assert.ok(updated?.taskBindings?.[0]?.completedAt, 'binding gets completion timestamp');
+  assert.ok(updated?.activity?.some((item) => item.type === 'status' && /Closed 1 linked task row/.test(item.message)));
 });
 
 test('sweepCrashedExecutions: active with stale heartbeat is auto-failed', () => {

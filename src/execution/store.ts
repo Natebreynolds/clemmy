@@ -6,6 +6,8 @@ import type { ExecutionRecord, PlanRecord } from '../types.js';
 import { isUserFacingExecution } from './scope.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { addNotification } from '../runtime/notifications.js';
+import { TASKS_FILE, ensureTasksFile } from '../tools/shared.js';
+import { closeAndCompactTaskLedgerBody } from '../tasks/task-ledger-hygiene.js';
 // v0.5.19 Bug F — pause-aware sweep needs these. Static ESM imports
 // (no circular dep: neither module imports from execution/store).
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
@@ -38,6 +40,46 @@ function saveExecutions(executions: ExecutionRecord[]): void {
 
 function clean(value: string, maxChars = 220): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+function closeLinkedVaultTasks(execution: ExecutionRecord, now: string): number {
+  const pendingBindings = (execution.taskBindings ?? []).filter((binding) => binding.status === 'pending');
+  if (pendingBindings.length === 0) return 0;
+
+  const taskIds = new Set(pendingBindings.map((binding) => binding.taskId));
+  let closedRows = 0;
+  try {
+    ensureTasksFile();
+    const compacted = closeAndCompactTaskLedgerBody(readFileSync(TASKS_FILE, 'utf-8'), taskIds);
+    closedRows = compacted.checkedTaskRows;
+    if (closedRows > 0 || compacted.compactedTaskRows > 0) {
+      writeFileSync(TASKS_FILE, compacted.body, 'utf-8');
+    }
+  } catch {
+    // Execution persistence is the source of truth. If the vault ledger is
+    // unavailable, still close the bindings so summaries stop treating the
+    // terminal execution as live work.
+  }
+
+  execution.taskBindings = (execution.taskBindings ?? []).map((binding) =>
+    taskIds.has(binding.taskId)
+      ? { ...binding, status: 'completed', completedAt: binding.completedAt ?? now }
+      : binding,
+  );
+  execution.activity = Array.isArray(execution.activity) ? execution.activity : [];
+  execution.activity.push({
+    id: randomUUID(),
+    key: `task-bindings:closed:${now}`,
+    type: 'status',
+    message: clean(`Closed ${pendingBindings.length} linked task row${pendingBindings.length === 1 ? '' : 's'} because the execution completed.`, 500),
+    createdAt: now,
+    metadata: {
+      taskIds: pendingBindings.map((binding) => binding.taskId),
+      closedVaultRows: closedRows,
+    },
+  });
+  execution.activity = execution.activity.slice(-60);
+  return pendingBindings.length;
 }
 
 export interface CreateExecutionInput {
@@ -156,10 +198,14 @@ export class ExecutionStore {
     const execution = executions.find((entry) => entry.id === id);
     if (!execution) return undefined;
 
+    const now = new Date().toISOString();
     Object.assign(execution, patch, {
-      updatedAt: new Date().toISOString(),
-      lastActivityAt: patch.lastActivityAt ?? new Date().toISOString(),
+      updatedAt: now,
+      lastActivityAt: patch.lastActivityAt ?? now,
     });
+    if (patch.status === 'completed') {
+      closeLinkedVaultTasks(execution, now);
+    }
     saveExecutions(executions);
     return execution;
   }
