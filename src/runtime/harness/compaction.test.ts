@@ -25,7 +25,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
-const { resetEventLog, createSession, writeToolOutput, getToolOutput } = await import('./eventlog.js');
+const { resetEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
 const { clipOldToolResults, collapseOldCompletedToolPairs, compactSessionIfNeeded, validateCallIdReferences, checkpointGoalStage } = await import('./compaction.js');
 const { estimateInputTokens } = await import('./token-estimator.js');
 const { HarnessSession } = await import('./session.js');
@@ -276,16 +276,24 @@ test('tool_outputs table — round-trips 200KB losslessly', () => {
   assert.equal(row.truncatedAtWrite, false);
 });
 
-test('tool_outputs — tail-truncates outputs over 200KB and marks the row', () => {
+test('tool_outputs — stores large sub-cap results in full, tail-truncates + marks only beyond the cap', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  const oversized = 'y'.repeat(300_000);
+  // 300KB exceeded the OLD 200KB ceiling (tail-dropped); under the 2MB cap it is now kept whole.
+  const big = 'y'.repeat(300_000);
+  writeToolOutput({ sessionId: sess.id, callId: 'call_big300', tool: 'composio.big', output: big });
+  const bigRow = getToolOutput(sess.id, 'call_big300');
+  assert.ok(bigRow);
+  assert.equal(bigRow.output.length, 300_000, 'sub-cap result stored in full — no tail loss');
+  assert.equal(bigRow.truncatedAtWrite, false);
+  // Beyond the cap: tail-truncate + mark (backstop).
+  const oversized = 'y'.repeat(TOOL_OUTPUT_MAX_BYTES + 100_000);
   writeToolOutput({ sessionId: sess.id, callId: 'call_huge', tool: 'composio.huge', output: oversized });
   const row = getToolOutput(sess.id, 'call_huge');
   assert.ok(row);
-  assert.equal(row.contentBytes, 300_000, 'original byte count preserved on the row');
+  assert.equal(row.contentBytes, TOOL_OUTPUT_MAX_BYTES + 100_000, 'original byte count preserved on the row');
   assert.equal(row.truncatedAtWrite, true);
-  assert.ok(row.output.length <= 200_000, 'stored payload is bounded');
+  assert.ok(row.output.length <= TOOL_OUTPUT_MAX_BYTES, 'stored payload is bounded by the cap');
 });
 
 test('tool_outputs — call_id is scoped per session (no cross-session leakage)', () => {

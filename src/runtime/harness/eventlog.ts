@@ -788,7 +788,18 @@ export function clearKill(sessionId: string): void {
   db.prepare('DELETE FROM kill_switches WHERE session_id = ?').run(sessionId);
 }
 
-export const TOOL_OUTPUT_MAX_BYTES = 200_000;
+// Lossless side-store cap for a single tool result. This bounds ONLY what's
+// parked for recall_tool_result / tool_output_query — it NEVER enters the model
+// context (that's gated separately by the ~8KB event-log clip + ~12KB digest +
+// the per-turn recall budget), so a generous value costs disk, not tokens.
+// Raised 200KB → 2MB (2026-06-25): a 200KB ceiling tail-dropped the back of
+// large-but-legitimate results (Apify dataset items, DataForSEO reports), and
+// since tool_output_query pages from THIS store, dropped rows became
+// unqueryable — not just unshown. 2MB covers realistic single-call results
+// (~thousands of records); the 14-day retention sweep below bounds aggregate
+// disk. The tail-truncate + truncated_at_write marker stays as a backstop for
+// the pathological >2MB case.
+export const TOOL_OUTPUT_MAX_BYTES = 2_000_000;
 
 export interface ToolOutputRecord {
   output: string;
@@ -808,8 +819,9 @@ export interface WriteToolOutputInput {
 /**
  * Persist the full tool output keyed by (session_id, call_id) so the
  * recall_tool_result tool can retrieve it after the event-log copy is
- * clipped. Hard 200KB cap with explicit truncated_at_write marker —
- * distinct from the per-turn `[clipped: ...]` stub Layer 1 emits.
+ * clipped. Capped at TOOL_OUTPUT_MAX_BYTES with an explicit
+ * truncated_at_write marker — distinct from the per-turn `[clipped: ...]`
+ * stub Layer 1 emits.
  *
  * Idempotent on conflict: `(session_id, call_id)` is the primary key
  * and we INSERT OR REPLACE so a duplicate tool_returned event (e.g.

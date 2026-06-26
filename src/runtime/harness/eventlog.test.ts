@@ -34,6 +34,7 @@ const {
   listEvents,
   writeToolOutput,
   getToolOutput,
+  TOOL_OUTPUT_MAX_BYTES,
   getLatestEventSeq,
   requestKill,
   isKillRequested,
@@ -401,4 +402,29 @@ test('writeToolOutput preserves an existing larger payload for the same call id'
   assert.ok(row);
   assert.equal(row.output, full);
   assert.equal(row.contentBytes, Buffer.byteLength(full, 'utf8'));
+});
+
+test('writeToolOutput stores a 300KB result in FULL (was tail-dropped under the old 200KB cap)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const big = 'D'.repeat(300_000); // 300KB — exceeds the OLD 200KB ceiling, under the new 2MB one
+  writeToolOutput({ sessionId: sess.id, callId: 'call_300k', tool: 'composio_execute_tool', output: big });
+  const row = getToolOutput(sess.id, 'call_300k');
+  assert.ok(row);
+  assert.equal(row.output.length, 300_000, 'full payload stored, no tail loss');
+  assert.equal(row.truncatedAtWrite, false);
+  assert.equal(row.contentBytes, 300_000);
+});
+
+test('writeToolOutput still tail-truncates + marks beyond the cap (backstop)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const overBy = 100_000;
+  const huge = 'H'.repeat(TOOL_OUTPUT_MAX_BYTES + overBy); // ASCII → bytes == chars
+  writeToolOutput({ sessionId: sess.id, callId: 'call_huge', tool: 'composio_execute_tool', output: huge });
+  const row = getToolOutput(sess.id, 'call_huge');
+  assert.ok(row);
+  assert.equal(row.truncatedAtWrite, true, 'overflow is marked');
+  assert.equal(row.contentBytes, TOOL_OUTPUT_MAX_BYTES + overBy, 'original byte count preserved for the header');
+  assert.equal(row.output.length, TOOL_OUTPUT_MAX_BYTES, 'stored body clamped to the cap');
 });

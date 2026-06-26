@@ -71,7 +71,84 @@ test('recall_tool_result returns the requested large slice without default 4KB t
   );
 
   const text = result.content[0].text;
-  assert.match(text, /Recalled 9000 chars/);
+  assert.match(text, /Recalled chars 0.9000 of 10000/);
   assert.ok(text.includes('R'.repeat(8_000)), 'large recalled slice should survive the result wrapper');
   assert.doesNotMatch(text, /chars omitted; re-call with a narrower scope/);
+});
+
+function captureToolOutputQueryHandler(): RecallHandler {
+  let handler: RecallHandler | null = null;
+  registerRecallTools({
+    tool: (name: string, _description: string, _schema: unknown, cb: RecallHandler) => {
+      if (name === 'tool_output_query') handler = cb;
+    },
+  } as any);
+  assert.ok(handler);
+  return handler;
+}
+
+test('recall_tool_result pages with offset and signals when more remains', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const head = 'A'.repeat(30_000);
+  const tail = 'B'.repeat(20_000); // 50KB total — bigger than one 30KB slice
+  writeToolOutput({ sessionId: sess.id, callId: 'call_page', tool: 'composio_execute_tool', output: head + tail });
+
+  const handler = captureRecallHandler();
+  const page1 = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => handler({ call_id: 'call_page' }),
+  );
+  const t1 = page1.content[0].text;
+  assert.match(t1, /Recalled chars 0.30000 of 50000/);
+  assert.match(t1, /more remains.*offset: 30000/);
+
+  const page2 = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => handler({ call_id: 'call_page', offset: 30_000 }),
+  );
+  const t2 = page2.content[0].text;
+  assert.match(t2, /Recalled chars 30000.50000 of 50000/);
+  assert.ok(t2.includes('B'.repeat(20_000)), 'offset reaches the tail of the payload');
+  assert.doesNotMatch(t2, /more remains/);
+});
+
+test('tool_output_query reaches list rows that were UNQUERYABLE under the old 200KB cap', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  // 4000 records → serialized JSON well over the old 200KB cap, under the new 2MB one.
+  const records = Array.from({ length: 4000 }, (_, i) => ({ id: i, email: `partner${i}@firm.example`, note: 'x'.repeat(40) }));
+  const json = JSON.stringify(records);
+  assert.ok(json.length > 200_000, 'fixture must exceed the old cap to prove the fix');
+  writeToolOutput({ sessionId: sess.id, callId: 'call_list', tool: 'composio_execute_tool', output: json });
+
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_list', offset: 3990, limit: 10, fields: ['id', 'email'] }),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /of 4000 matching \(4000 total\)/);
+  assert.ok(text.includes('partner3999@firm.example'), 'the tail record is now stored and queryable');
+});
+
+test('tool_output_query bounds an unfiltered large-object response (no full-payload context dump)', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  // ~300KB top-level object — the object branch returns the projected object, which
+  // WITHOUT fields would be the whole thing now that the store holds up to 2MB.
+  const obj: Record<string, string> = {};
+  for (let i = 0; i < 3000; i++) obj[`k${i}`] = 'v'.repeat(100);
+  const json = JSON.stringify(obj);
+  assert.ok(json.length > 200_000, 'fixture must be large');
+  writeToolOutput({ sessionId: sess.id, callId: 'call_obj', tool: 'composio_execute_tool', output: json });
+
+  const query = captureToolOutputQueryHandler();
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_obj' }),
+  );
+  const text = res.content[0].text;
+  assert.ok(text.length <= 51_000, `response must be bounded, got ${text.length}`);
+  assert.match(text, /clipped to 50000 chars/);
 });

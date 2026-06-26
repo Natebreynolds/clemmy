@@ -318,7 +318,7 @@ export function attachEventLogHooks(
                 return String(result);
               }
             })();
-    // Lossless write FIRST (up to 200KB, see eventlog.ts). The event
+    // Lossless write FIRST (up to TOOL_OUTPUT_MAX_BYTES, see eventlog.ts). The event
     // log copy below is intentionally clipped for readability; the
     // recall_tool_result tool reads from tool_outputs to retrieve the
     // verbatim original.

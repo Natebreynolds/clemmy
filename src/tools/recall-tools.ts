@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { getToolOutput } from '../runtime/harness/eventlog.js';
+import { getToolOutput, TOOL_OUTPUT_MAX_BYTES } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { textResult } from './shared.js';
 
@@ -9,8 +9,9 @@ import { textResult } from './shared.js';
  * call when auto-compact (Layer 1) has clipped it from the conversation.
  *
  * Lossless fetch from the `tool_outputs` table (populated at write-time
- * in hooks.ts with up to 200KB of original output, before the
- * event-log copy is clipped to 8KB).
+ * in hooks.ts with up to TOOL_OUTPUT_MAX_BYTES (2MB) of original output,
+ * before the event-log copy is clipped to 8KB). Pass `offset` to page
+ * through a payload larger than a single 30KB slice.
  *
  * Scoping: reads the session id from the harness AsyncLocalStorage
  * (brackets.ts:harnessRunContextStorage). Cross-session call_id lookups
@@ -24,6 +25,18 @@ import { textResult } from './shared.js';
 
 const DEFAULT_RECALL_MAX_CHARS = 30_000;
 
+// Cap a single tool_output_query response. The store now holds up to 2MB, and
+// tool_output_query intentionally bypasses the digest clip (it returns exactly
+// the page/projection asked for) — so without this bound an UNFILTERED query on
+// a large parked object (or a big array page) could dump the whole payload into
+// context. A page/projection is an explicit ask, so this sits a bit above
+// recall's per-call 30KB; the marker tells the model how to narrow further.
+const QUERY_MAX_CHARS = 50_000;
+const clipQueryBody = (text: string): string =>
+  text.length <= QUERY_MAX_CHARS
+    ? text
+    : `${text.slice(0, QUERY_MAX_CHARS)}\n…[clipped to ${QUERY_MAX_CHARS} chars — narrow with fields:[...], a filter, or a smaller limit]`;
+
 export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
@@ -31,13 +44,19 @@ export function registerRecallTools(server: McpServer): void {
       'Retrieve the full verbatim output of a prior tool call by its call_id.',
       'Use this whenever the conversation shows a `[clipped: …]` stub OR a `[digest: …]` footer carrying a call_id and you need a detail the shortened view dropped (URLs, IDs, exact figures, ranking positions, full records, etc.).',
       'This reader is ALWAYS available to you inside a turn — the full payload is stored losslessly. Never tell the user the data is unavailable, that the reader "isn\'t exposed", or that a completed call is still pending: call this instead.',
-      'Returns up to 30KB of original output. Counts against a per-turn budget of 3 calls / 60KB total — use sparingly.',
+      'Returns up to 30KB of original output per call, starting at `offset` (default 0). When the result is bigger, the header says how much remains and the exact `offset` to pass next to continue paging. Counts against a per-turn budget of 3 calls / 60KB total — use sparingly; for a JSON list prefer tool_output_query (it pages records, not raw chars).',
     ].join(' '),
     {
       call_id: z
         .string()
         .min(1)
         .describe('The call_id from the [clipped: ...] stub. Looks like "call_abc123".'),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Start character to read from (default 0). Use the "more remains — offset: N" hint from a prior call to page through a large payload.'),
       max_chars: z
         .number()
         .int()
@@ -51,6 +70,9 @@ export function registerRecallTools(server: McpServer): void {
       const maxChars = Number.isFinite(input.max_chars as number)
         ? Math.min(DEFAULT_RECALL_MAX_CHARS, Math.max(100, Math.trunc(input.max_chars as number)))
         : DEFAULT_RECALL_MAX_CHARS;
+      const offset = Number.isFinite(input.offset as number)
+        ? Math.max(0, Math.trunc(input.offset as number))
+        : 0;
 
       const ctx = harnessRunContextStorage.getStore();
       if (!ctx?.sessionId) {
@@ -66,8 +88,11 @@ export function registerRecallTools(server: McpServer): void {
         );
       }
 
-      // Slice the result to maxChars and account for actual returned bytes.
-      const slice = row.output.length > maxChars ? row.output.slice(0, maxChars) : row.output;
+      // Slice [offset, offset+maxChars) so a payload bigger than one slice can be
+      // paged across calls, and account for actual returned bytes.
+      const total = row.output.length;
+      const start = Math.min(offset, total);
+      const slice = row.output.slice(start, start + maxChars);
       const sliceBytes = Buffer.byteLength(slice, 'utf8');
 
       // Budget check — only when a HarnessRunContext provided one.
@@ -76,13 +101,16 @@ export function registerRecallTools(server: McpServer): void {
         if (err) return textResult(err);
       }
 
+      const end = start + slice.length;
       const header = [
-        `Recalled ${slice.length} chars (of ${row.contentBytes} total bytes)`,
+        `Recalled chars ${start}–${end} of ${total} (${row.contentBytes} total bytes)`,
         row.tool ? `tool=${row.tool}` : null,
         `recorded at ${row.createdAt}`,
-        row.truncatedAtWrite ? '⚠ original was tail-truncated at write-time (200KB cap)' : null,
-        slice.length < row.output.length
-          ? `(showing first ${maxChars} chars; pass max_chars to widen up to 30000)`
+        row.truncatedAtWrite
+          ? `⚠ original was tail-truncated at write-time (${Math.round(TOOL_OUTPUT_MAX_BYTES / 1_000_000)}MB cap)`
+          : null,
+        end < total
+          ? `(more remains — call again with offset: ${end} to continue)`
           : null,
       ]
         .filter(Boolean)
@@ -156,13 +184,13 @@ export function registerRecallTools(server: McpServer): void {
         const limit = Number.isFinite(input.limit as number) ? Math.min(200, Math.max(1, Math.trunc(input.limit as number))) : 50;
         const page = rows.slice(offset, offset + limit).map(project);
         const header = `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total)`;
-        const bodyText = `${header}\n\n${JSON.stringify(page, null, 1)}`;
+        const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`);
         return textResult(bodyText, { maxChars: bodyText.length });
       }
 
       if (parsed && typeof parsed === 'object') {
         const projected = project(parsed);
-        const bodyText = `Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`;
+        const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`);
         return textResult(bodyText, { maxChars: bodyText.length });
       }
 
