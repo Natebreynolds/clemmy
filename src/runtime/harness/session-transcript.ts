@@ -33,10 +33,9 @@ export function pullRecentTurnsForSession(
       if (row.type === 'user_input_received' && typeof data.text === 'string') {
         turns.push({ who: 'user', text: data.text, at: row.created_at });
       } else if (row.type === 'conversation_completed') {
-        // Prefer the user-facing summary (already trimmed); fall back to reply.
-        const text = typeof data.summary === 'string' && data.summary
-          ? data.summary
-          : (typeof data.reply === 'string' ? data.reply : '');
+        const reply = typeof data.reply === 'string' && data.reply.trim() ? data.reply.trim() : '';
+        const summary = typeof data.summary === 'string' && data.summary.trim() ? data.summary.trim() : '';
+        const text = reply || summary;
         if (text) turns.push({ who: 'assistant', text, at: row.created_at });
       }
     } catch { /* skip malformed rows */ }

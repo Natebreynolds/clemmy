@@ -938,6 +938,9 @@ export function buildPreflightBlockMessage(input: {
  */
 const MAX_STALL_RETRIES = positiveIntEnv('HARNESS_MAX_STALL_RETRIES', 2);
 const STALL_RETRY_BACKOFF_MS = [250, 1000];
+const MAX_MISSING_REPLY_RETRIES = 1;
+const MISSING_REPLY_USER_FALLBACK =
+  "I didn't produce a visible reply there. Please send that again and I'll retry.";
 const TURN_MEMORY_PRIMER_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_TOP_K', 6);
 const TURN_MEMORY_PRIMER_MAX_CHARS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_MAX_CHARS', 2600);
 const TURN_MEMORY_PRIMER_FACT_TOP_K = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_FACT_TOP_K', 5);
@@ -987,6 +990,38 @@ const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_
 function isSyntheticStallRetryInput(text: string): boolean {
   return text.startsWith('Your previous response was prose, not an action.')
     || text.startsWith('Your previous response did not make progress on the directive.');
+}
+
+function hasUserFacingReply(decision: OrchestratorDecisionShape | null | undefined): boolean {
+  return Boolean(decision?.reply?.trim());
+}
+
+function isCompletedWithoutUserFacingReply(decision: OrchestratorDecisionShape | null | undefined): boolean {
+  return Boolean(decision && decision.nextAction === 'completed' && !hasUserFacingReply(decision));
+}
+
+function userVisibleStepDecision(
+  decision: OrchestratorDecisionShape | null,
+): OrchestratorDecisionShape | null {
+  if (!decision || !isCompletedWithoutUserFacingReply(decision)) return decision;
+  return {
+    ...decision,
+    summary: MISSING_REPLY_USER_FALLBACK,
+    reply: null,
+  };
+}
+
+function buildMissingReplyRetryMessage(decision: OrchestratorDecisionShape, path: 'conversation' | 'resume'): string {
+  const internal = JSON.stringify((decision.summary ?? '').slice(0, 700));
+  return [
+    'Your previous structured decision marked nextAction=completed, but `reply` was empty.',
+    'That leaves the user with no visible answer. Do NOT expose this diagnostic text to the user.',
+    `Internal summary for context (${path} path): ${internal}.`,
+    'Return the exact structured decision object again with a concise, non-empty, user-facing `reply`.',
+    'If the latest user message was only a greeting or small talk, reply naturally and ask what they would like to work on.',
+    'If real work was completed, put the actual result/evidence in `reply`.',
+    'Use `summary` only for internal notes.',
+  ].join(' ');
 }
 
 function latestHumanInputForStallRetry(sessionId: string): string | undefined {
@@ -1354,6 +1389,7 @@ async function runConversationCore(
   // remaining. Reset implicitly because it's a local — a fresh
   // runConversation() call starts from zero.
   let stallRetriesUsed = 0;
+  let missingReplyRetriesUsed = 0;
 
   // Independent objective-completion judge (Hermes-style). Only for interactive
   // chat callers (opt-in). The judge catches the model declaring "done" before
@@ -1464,6 +1500,30 @@ async function runConversationCore(
     const decision = toOrchestratorDecision(turnResult.finalOutput);
     lastDecision = decision ?? lastDecision;
 
+    const missingReplyDecision = isCompletedWithoutUserFacingReply(decision) ? decision : null;
+    if (
+      missingReplyDecision
+      && missingReplyRetriesUsed < MAX_MISSING_REPLY_RETRIES
+      && stepIndex < maxSteps
+    ) {
+      missingReplyRetriesUsed += 1;
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'completed_without_reply',
+          attempt: missingReplyRetriesUsed,
+          maxRetries: MAX_MISSING_REPLY_RETRIES,
+          internalSummary: missingReplyDecision.summary,
+          path: 'conversation',
+        },
+      });
+      nextInput = buildMissingReplyRetryMessage(missingReplyDecision, 'conversation');
+      continue;
+    }
+
     safeAppend({
       sessionId: options.sessionId,
       turn: turnResult.turn,
@@ -1471,7 +1531,7 @@ async function runConversationCore(
       type: 'conversation_step',
       data: {
         step: stepIndex,
-        decision: decision ?? null,
+        decision: userVisibleStepDecision(decision),
       },
     });
 
@@ -2081,21 +2141,15 @@ async function runConversationCore(
       // Render priority on the chat surface: prefer `reply` (the
       // natural-language message intended for the user) over `summary`
       // (an internal log entry).
-      //
-      // When the model marks the turn complete (done:true,
-      // nextAction:completed) but provides NO reply, the previous
-      // fallback leaked the META summary into the bubble — which the
-      // user reads as if it were the bot's answer, e.g. "Drafted a
-      // workflow and surfaced two decisions" instead of THE workflow
-      // and THE decisions. Make this failure VISIBLE: emit an obvious
-      // "model produced no user-facing reply" message so the bug is
-      // diagnosable instead of masked by plausible-looking META text.
+      // Empty completed replies are retried once above. If the retry budget is
+      // exhausted, keep the diagnostic in telemetry and show a plain recovery
+      // prompt instead of leaking the internal summary into the chat bubble.
       const hasReply = decision.reply && decision.reply.trim();
       const isCompletedAction = decision.nextAction === 'completed';
       const baseSummary = hasReply
         ? decision.reply!
         : isCompletedAction
-          ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision.summary})`
+          ? MISSING_REPLY_USER_FALLBACK
           : decision.summary;
       // Goal contract: criteria still unmet after the attempt budget — the
       // user must SEE that, never a silent clean-looking completion. The
@@ -2126,6 +2180,7 @@ async function runConversationCore(
             summary: userVisibleSummary,
             internalSummary: decision.summary,
             reply: decision.reply ?? null,
+            missingReply: isCompletedAction && !hasReply ? true : undefined,
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
           },
@@ -3879,6 +3934,7 @@ async function runConversationFromResumeCore(opts: {
   // force-corrected (audit 2026-06-16). `resumeContinuationInput` is normally the
   // bland nudge but gets overridden with the stall-forcing message on a hit.
   let stallRetriesUsed = 0;
+  let missingReplyRetriesUsed = 0;
   let resumeContinuationInput = CONTINUATION_INPUT;
 
   // Step 1: resume the paused approval.
@@ -3944,7 +4000,7 @@ async function runConversationFromResumeCore(opts: {
     // a contradictory awaiting_* nextAction must honor the conservative awaiting
     // state, not bank completed. A null decision (unparseable output) still
     // gracefully resolves done.
-    const doneStands = !decision || (decision.done
+    let doneStands = !decision || (decision.done
       && decision.nextAction !== 'awaiting_user_input'
       && decision.nextAction !== 'awaiting_approval'
       && decision.nextAction !== 'awaiting_handoff_result');
@@ -3962,6 +4018,32 @@ async function runConversationFromResumeCore(opts: {
       });
     }
     if (doneStands) {
+      const missingReplyDecision = isCompletedWithoutUserFacingReply(decision) ? decision : null;
+      if (
+        missingReplyDecision
+        && missingReplyRetriesUsed < MAX_MISSING_REPLY_RETRIES
+        && stepIndex < maxSteps
+      ) {
+        missingReplyRetriesUsed += 1;
+        safeAppend({
+          sessionId: opts.sessionId,
+          turn: lastTurn,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: {
+            kind: 'completed_without_reply',
+            attempt: missingReplyRetriesUsed,
+            maxRetries: MAX_MISSING_REPLY_RETRIES,
+            internalSummary: missingReplyDecision.summary,
+            path: 'resume',
+          },
+        });
+        resumeContinuationInput = buildMissingReplyRetryMessage(missingReplyDecision, 'resume');
+        decision = { ...missingReplyDecision, done: false, nextAction: 'awaiting_handoff_result' };
+        doneStands = false;
+      }
+    }
+    if (doneStands) {
       // Render priority on the chat surface: prefer `reply` (user-facing)
       // over `summary` (internal META log). Mirrors the equivalent path
       // in runConversation at line ~286 — without this the resume path
@@ -3973,7 +4055,7 @@ async function runConversationFromResumeCore(opts: {
       const userVisibleSummary = hasReply
         ? decision!.reply!
         : isCompletedAction
-          ? `(The model marked the turn complete without producing a user-facing reply. This is a bug. Internal log: ${decision?.summary ?? '(none)'})`
+          ? MISSING_REPLY_USER_FALLBACK
           : decision?.summary;
 
       // Honest-completion backstop (resume variant): a blocked/error-stub or
@@ -3994,6 +4076,7 @@ async function runConversationFromResumeCore(opts: {
             summary: userVisibleSummary,
             internalSummary: decision?.summary,
             reply: decision?.reply ?? null,
+            missingReply: isCompletedAction && !hasReply ? true : undefined,
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary ?? '').slice(0, 400),
           },
@@ -4177,12 +4260,37 @@ async function runConversationFromResumeCore(opts: {
     }
     decision = toOrchestratorDecision(turnResult.finalOutput);
     lastDecision = decision ?? lastDecision;
+
+    const missingReplyDecision = isCompletedWithoutUserFacingReply(decision) ? decision : null;
+    if (
+      missingReplyDecision
+      && missingReplyRetriesUsed < MAX_MISSING_REPLY_RETRIES
+      && stepIndex < maxSteps
+    ) {
+      missingReplyRetriesUsed += 1;
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'completed_without_reply',
+          attempt: missingReplyRetriesUsed,
+          maxRetries: MAX_MISSING_REPLY_RETRIES,
+          internalSummary: missingReplyDecision.summary,
+          path: 'resume',
+        },
+      });
+      resumeContinuationInput = buildMissingReplyRetryMessage(missingReplyDecision, 'resume');
+      continue;
+    }
+
     safeAppend({
       sessionId: opts.sessionId,
       turn: turnResult.turn,
       role: 'Clem',
       type: 'conversation_step',
-      data: { step: stepIndex, decision: decision ?? null },
+      data: { step: stepIndex, decision: userVisibleStepDecision(decision) },
     });
     // Stall detection for the resume continuation (parity with the main loop at
     // ~1379). A narration-deferral / zero-tool false-completion turn must be
@@ -5046,7 +5154,7 @@ function evaluateProgress(opts: {
             userVisibleMessage:
               reply && reply.trim()
                 ? reply
-                : `_(The model produced a structured decision but no user-facing reply. Internal summary: "${(parsed.summary as string).slice(0, 160)}". Re-ask if you wanted a specific result.)_`,
+                : MISSING_REPLY_USER_FALLBACK,
             detail: {
               summary: parsed.summary,
               done: parsed.done,

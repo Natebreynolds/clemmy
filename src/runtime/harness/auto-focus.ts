@@ -41,14 +41,14 @@ function summaryFromOutput(value: unknown): string {
   if (!value) return '';
   if (typeof value === 'object') {
     const v = value as Record<string, unknown>;
-    return cleanLine(v.summary ?? v.reply, 500);
+    return cleanLine(v.reply ?? v.summary, 500);
   }
   if (typeof value !== 'string') return '';
   const raw = value.trim();
   if (!raw) return '';
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return cleanLine(parsed.summary ?? parsed.reply, 500);
+    return cleanLine(parsed.reply ?? parsed.summary, 500);
   } catch {
     return cleanLine(raw, 500);
   }

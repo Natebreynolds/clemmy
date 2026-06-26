@@ -49,6 +49,13 @@ test('friendlyEventMessage produces plain language', () => {
     friendlyEventMessage({ type: 'conversation_completed', data: { summary: 'Sent the report.' } }),
     'Sent the report.',
   );
+  assert.equal(
+    friendlyEventMessage({
+      type: 'conversation_completed',
+      data: { summary: 'Internal log: sent report.', reply: 'Sent the report to Maya.' },
+    }),
+    'Sent the report to Maya.',
+  );
   // Unknown type falls back to a humanized label, never the raw machine name.
   assert.equal(friendlyEventMessage({ type: 'turn_started' }), 'Turn started');
 });

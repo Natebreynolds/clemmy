@@ -213,7 +213,7 @@ export function friendlyEventMessage(event: ActivityEventLike): string {
     case 'plan_approved':
       return 'Plan approved';
     case 'conversation_completed':
-      return firstLine(data.summary || data.reply, 200) || 'Replied';
+      return firstLine(data.reply || data.summary, 200) || 'Replied';
     case 'run_completed':
     case 'completed':
       return 'Completed';

@@ -139,6 +139,16 @@ function harnessEventMessage(event: HarnessEventRow): string {
   return friendlyEventMessage({ type: event.type, data: event.data });
 }
 
+function completionOutputPreview(
+  completion: Pick<HarnessEventRow, 'data'> | null | undefined,
+  limit = 1200,
+): string {
+  const data = completion?.data as { reply?: unknown; summary?: unknown } | undefined;
+  const reply = typeof data?.reply === 'string' ? data.reply.trim() : '';
+  const summary = typeof data?.summary === 'string' ? data.summary.trim() : '';
+  return (reply || summary).slice(0, limit);
+}
+
 function normalizeHostHeader(value: unknown): string {
   if (typeof value !== 'string') return '';
   const first = value.split(',')[0]?.trim().toLowerCase() ?? '';
@@ -205,9 +215,7 @@ function harnessSessionAsActivityRun(session: HarnessSessionRow) {
   const completion = events.find((event) =>
     event.type === 'conversation_completed' || event.type === 'run_completed',
   );
-  const outputPreview = completion
-    ? String(completion.data.summary || completion.data.reply || '').slice(0, 1200)
-    : '';
+  const outputPreview = completionOutputPreview(completion);
   return {
     id: session.id,
     sessionId: session.id,
@@ -312,6 +320,7 @@ function workflowRunRecordAsActivityRun(
 }
 
 export const __test__ = {
+  completionOutputPreview,
   enrichActivityRun,
   enrichActivityRunDetail,
   workflowRunRecordAsActivityRun,
@@ -1721,9 +1730,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
           const completion = events.find((event) =>
             event.type === 'conversation_completed' || event.type === 'run_completed',
           );
-          const outputPreview = completion
-            ? String(completion.data?.summary || completion.data?.reply || '').slice(0, 1200)
-            : '';
+          const outputPreview = completionOutputPreview(completion);
           res.json({ run: enrichActivityRunDetail({
             id,
             sessionId: id,

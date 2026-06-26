@@ -162,6 +162,40 @@ test('maybeAutoFocusSession pins a thread focus for one-turn high-tool work', ()
   assert.equal(getActiveFocus()?.resource_ref, `session:${sess.id}`);
 });
 
+test('maybeAutoFocusSession prefers reply over internal summary for focus text', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'greeting thread' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'user_input_received',
+    data: { text: 'hey hey' },
+  });
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'tool_called',
+      data: { tool: 'run_shell_command', arguments: JSON.stringify({ command: `step-${i}` }) },
+    });
+  }
+
+  const result = maybeAutoFocusSession({
+    sessionId: sess.id,
+    summaryHint: {
+      summary: 'Greeted user; awaiting their request.',
+      reply: 'Hey - what would you like to work on?',
+    },
+  });
+
+  assert.ok(result);
+  const active = getActiveFocus();
+  assert.equal(active?.summary, 'Hey - what would you like to work on?');
+  assert.doesNotMatch(active?.title ?? '', /Greeted user/);
+});
+
 test('maybeAutoFocusSession leaves an existing active focus alone', () => {
   resetAll();
   const existing = createFocus({

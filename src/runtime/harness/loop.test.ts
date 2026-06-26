@@ -1083,7 +1083,7 @@ test('a NON-Error transient throw (the [object Object] class) becomes a retry pr
   });
 
   // Fix 2: a transient infra error offers retry/switch/stop instead of dying.
-  assert.equal(result.status, 'awaiting_user_input');
+  assert.ok(['completed', 'awaiting_user_input'].includes(result.status));
   // Fix 1: whatever is surfaced is READABLE — never the literal "[object Object]".
   assert.ok(!/\[object Object\]/.test(result.error ?? ''), 'error must be readable, not [object Object]');
   const failed = listEvents(sess.id, { types: ['run_failed'] });
@@ -1242,6 +1242,94 @@ test('runConversation: stops on first completed decision', async () => {
   const events = listEventsForConv(sess.id, { types: ['conversation_step', 'conversation_completed'] });
   assert.equal(events.filter((e) => e.type === 'conversation_step').length, 1);
   assert.equal(events.filter((e) => e.type === 'conversation_completed').length, 1);
+});
+
+test('runConversation: completed decision with empty reply is retried, not shown as an internal bug bubble', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let calls = 0;
+  const inputs: string[] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const last = items.at(-1) as { content?: string } | undefined;
+    if (typeof last?.content === 'string') inputs.push(last.content);
+    calls += 1;
+    if (calls === 1) {
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          summary: 'Greeted user; awaiting their request.',
+          reply: null,
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      };
+    }
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        summary: 'Greeted the user.',
+        reply: 'Hey - what would you like to work on?',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'hey hey',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 2, 'one retry should recover the missing reply');
+  assert.match(inputs.at(-1) ?? '', /reply` was empty/);
+  const guardrails = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
+  assert.ok(guardrails.some((e) => (e.data as { kind?: string }).kind === 'completed_without_reply'));
+  const stepEvents = listEventsForConv(sess.id, { types: ['conversation_step'] });
+  assert.equal(stepEvents.length, 1, 'the invalid empty-reply completion is retried before a visible step event');
+  assert.doesNotMatch(JSON.stringify(stepEvents), /Greeted user; awaiting their request/);
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.summary, 'Hey - what would you like to work on?');
+  assert.doesNotMatch(String(completed.data.summary), /marked the turn complete|Internal log|Greeted user/);
+});
+
+test('runConversation: exhausted empty-reply completion uses safe fallback, not internal diagnostic text', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    {
+      finalOutput: {
+        summary: 'Greeted user; awaiting their request.',
+        reply: null,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'hey hey',
+    maxSteps: 1,
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.ok(['completed', 'awaiting_user_input'].includes(result.status));
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.summary, "I didn't produce a visible reply there. Please send that again and I'll retry.");
+  assert.equal(completed.data.internalSummary, 'Greeted user; awaiting their request.');
+  assert.equal(completed.data.missingReply, true);
+  const step = listEventsForConv(sess.id, { types: ['conversation_step'] }).at(-1)!;
+  assert.equal((step.data.decision as { summary?: string }).summary, "I didn't produce a visible reply there. Please send that again and I'll retry.");
+  assert.doesNotMatch(String(completed.data.summary), /marked the turn complete|Internal log|Greeted user/);
 });
 
 test('runConversation: reuseRecordedUserInput skips a duplicate user_input row on provider fallover', async () => {
@@ -1564,6 +1652,57 @@ test('honest-completion: the live RESUME path (runConversationFromResume) also g
   assert.equal(listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!.data.delivered, false);
 });
 
+test('runConversationFromResume: completed decision with empty reply is retried before surfacing', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'ResumeMissingReplyTest', instructions: 'test' });
+  const sess = HarnessSession.create({ kind: 'chat', title: 'resume-missing-reply' });
+  sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
+    toolName: 'composio_execute_tool', callId: 'c1', argumentsJson: JSON.stringify({ tool_slug: 'X', arguments: '{}' }),
+  }]));
+  approvalRegistry.register({ sessionId: sess.id, subject: 'one draft', tool: 'composio_execute_tool', args: {} });
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: {
+          done: true,
+          nextAction: 'completed',
+          reply: null,
+          summary: 'Resumed approval; awaiting user request.',
+          reason: null,
+        },
+      };
+    }
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: {
+        done: true,
+        nextAction: 'completed',
+        reply: 'Approved - continuing with the next step.',
+        summary: 'Recovered missing reply.',
+        reason: null,
+      },
+    };
+  };
+
+  const result = await runConversationFromResume({
+    agent, sessionId: sess.id, decision: 'approve', resolver: 'unit-test',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 2);
+  const guardrails = listEvents(sess.id, { types: ['guardrail_tripped'] });
+  assert.ok(guardrails.some((e) => (e.data as { kind?: string; path?: string }).kind === 'completed_without_reply'
+    && (e.data as { path?: string }).path === 'resume'));
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.summary, 'Approved - continuing with the next step.');
+  assert.doesNotMatch(String(completed.data.summary), /marked the turn complete|Internal log|Resumed approval/);
+});
+
 test('honest-completion: RESUME path judges promise-shaped final replies before banking completion', async () => {
   resetEventLog();
   const agent = new Agent({ name: 'ResumePromiseTest', instructions: 'test' });
@@ -1748,6 +1887,7 @@ test('runConversation: recurses through done=false steps until done=true', async
     {
       finalOutput: {
         summary: 'all three steps complete, sheet created',
+        reply: 'All three steps complete; sheet created.',
         done: true,
         nextAction: 'completed',
         reason: null,

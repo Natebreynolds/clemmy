@@ -5,7 +5,7 @@
  * (2026-06-22). The brain writes user_input_received + conversation_completed to
  * the event log; this reads them back as chronological prior turns and renders the
  * USER:/YOU: block injected into the brain prompt. Validates: ordering, the
- * summary→reply fallback, the per-turn trim, and that an empty session yields an
+ * reply→summary fallback, the per-turn trim, and that an empty session yields an
  * empty block (so the brain's no-history path is byte-identical).
  */
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
@@ -41,14 +41,14 @@ test('pulls prior turns chronologically (user → assistant → user)', () => {
   assert.equal(turns[2].text, 'I meant Clementine app releases');
 });
 
-test('assistant text prefers summary, falls back to reply', () => {
+test('assistant text prefers reply, falls back to summary', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;
-  asstMsg(sid, { reply: 'reply-only field' });
-  asstMsg(sid, { summary: 'summary wins', reply: 'ignored' });
+  asstMsg(sid, { summary: 'summary-only field' });
+  asstMsg(sid, { summary: 'internal summary ignored', reply: 'reply wins' });
   const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
-  assert.equal(turns[0].text, 'reply-only field');
-  assert.equal(turns[1].text, 'summary wins');
+  assert.equal(turns[0].text, 'summary-only field');
+  assert.equal(turns[1].text, 'reply wins');
 });
 
 test('renderTranscriptTurns formats USER:/YOU: lines and trims long turns to 800', () => {

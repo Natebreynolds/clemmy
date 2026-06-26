@@ -79,7 +79,7 @@ export const OrchestratorDecisionSchema = z.object({
   reply: z
     .string()
     .nullish()
-    .describe('The natural-language message to show the user IN THIS TURN. Write this FIRST. REQUIRED on every turn where you produce the user-visible text (greetings, questions, confirmations, results). Pass null ONLY when nextAction is awaiting_approval or awaiting_user_input — that approval/question text is already in front of the user. There is no separate executor, so "I am handing off" is NEVER a reason to pass null. Without a reply here, the chat surface renders nothing and the user sees an empty bubble.'),
+    .describe('The natural-language message to show the user IN THIS TURN. Write this FIRST. REQUIRED when nextAction=completed, including greetings, small talk, confirmations, and final results. Pass null ONLY when nextAction is awaiting_approval or awaiting_user_input because that approval/question text is already in front of the user. There is no separate executor, so "I am handing off" is NEVER a reason to pass null. Without a reply here, the harness treats the decision as invalid and retries.'),
   summary: z
     .string()
     .min(8)

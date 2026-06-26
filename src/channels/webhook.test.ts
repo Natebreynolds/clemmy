@@ -23,3 +23,19 @@ test('workflow run file fallback preserves needsAttention in activity enrichment
   assert.equal(enriched.live, false);
   assert.equal(enriched.preview, 'Delivered the report, but the pinned goal was not confirmed.');
 });
+
+test('completionOutputPreview prefers reply over internal summary', () => {
+  assert.equal(
+    __test__.completionOutputPreview({
+      data: { summary: 'Internal log: greeted user; awaiting request.', reply: 'Hey - what can I help with?' },
+    }),
+    'Hey - what can I help with?',
+  );
+});
+
+test('completionOutputPreview falls back to summary for legacy completions', () => {
+  assert.equal(
+    __test__.completionOutputPreview({ data: { summary: 'Legacy public completion.' } }),
+    'Legacy public completion.',
+  );
+});
