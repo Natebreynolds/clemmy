@@ -14,11 +14,12 @@
  * module is that decision, shared so desktop, Discord, and the gateway (mobile)
  * promote identically — honoring the desktop↔Discord parity directive.
  *
- * The trigger is EXPLICIT user intent only (see `hasDurableExecutionIntent`),
- * which is itself the user's "approve once, run to completion" opt-in. Plain
- * asks still run foreground unchanged. Because the blast radius is bounded to
- * explicit intent, this ships without a rollout flag (validated behavior is the
- * default).
+ * The trigger is either EXPLICIT user intent (see `hasDurableExecutionIntent`)
+ * or a high-confidence unattended workload shape: a broad, multi-system,
+ * multi-step data pipeline with batch enrichment and an external destination.
+ * Plain asks still run foreground unchanged. The auto path is intentionally
+ * narrower than "complex" so ordinary builds, questions, and one-off lookups
+ * do not disappear into the background.
  */
 import { MODELS } from '../config.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
@@ -26,24 +27,85 @@ import { deriveTitle } from '../memory/derive-title.js';
 import { createBackgroundTask, type BackgroundTaskRecord } from './background-tasks.js';
 
 /**
- * Explicit, user-expressed intent to run this work as a durable background job.
+ * Explicit or high-confidence intent to run this work as a durable background job.
  * Keyword/regex matcher (NOT a model call): a `/background` prefix, an explicit
  * "run … in the background / overnight / as a job", a "keep working / don't
- * stop / take your time", or a finish-it-all phrase paired with a build verb.
+ * stop / take your time", a finish-it-all phrase paired with a build verb, or
+ * an obvious unattended data/enrichment pipeline across multiple systems.
  *
- * Conservative by design — a plain "build me a site" returns false and keeps
- * running foreground. (Moved verbatim from gateway/router.ts so the gateway,
- * desktop dock, and Discord share one decision.)
+ * Conservative by design — a plain "build me a site" or "pull 5 Salesforce
+ * accounts" returns false and keeps running foreground. (Moved from
+ * gateway/router.ts so the gateway, desktop dock, and Discord share one
+ * decision.)
  */
 export function hasDurableExecutionIntent(message: string): boolean {
-  const lower = message.toLowerCase();
+  const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
   if (/^\/?(background|bg)\b/.test(lower)) return true;
   if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(lower)) return true;
   if (/\b(keep working|don't stop|do not stop|long-running|longer running|overnight|take your time)\b/.test(lower)) return true;
   if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(lower)) {
     return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(lower);
   }
+  return hasAutomaticDataPipelineShape(lower);
+}
+
+function hasAutomaticDataPipelineShape(lower: string): boolean {
+  // Skip obvious pure questions/explanations. These can mention several services
+  // without asking Clementine to move data through them.
+  if (/^(what|why|how|when|who|where|explain|summarize|tell me about)\b/.test(lower)) return false;
+
+  const serviceHits = countHits(lower, [
+    /\bsalesforce\b/,
+    /\b(?:sf|sfdx)\s+(?:cli|data|org|query)\b/,
+    /\bcli\b/,
+    /\bapify\b/,
+    /\bmcp\b/,
+    /\bairtable\b/,
+    /\bcrm\b/,
+    /\bgoogle\s+(?:reviews?|business|maps?|search)\b/,
+    /\bdataforseo\b/,
+    /\bseo\b/,
+    /\bhubspot\b/,
+    /\blinkedin\b/,
+    /\bsheets?\b|\bgoogle\s+sheets?\b/,
+  ]);
+
+  const actionHits = countHits(lower, [
+    /\bpull\b|\bfetch\b|\bquery\b|\bexport\b|\bimport\b|\bcollect\b|\bgather\b/,
+    /\bscrape\b|\bscrap\b|\bcrawl\b/,
+    /\benrich\b|\banaly[sz]e\b|\bscore\b|\bclassify\b|\bclean\b|\bdedupe\b/,
+    /\brun\b|\buse\b|\bvia\b/,
+    /\badd\b|\bwrite\b|\bupdate\b|\bcreate\b|\binsert\b|\bappend\b|\bsync\b|\bpush\b|\bload\b/,
+  ]);
+
+  const batchHits = countHits(lower, [
+    /\bfull\s+data\b|\ball\s+(?:of\s+)?(?:the\s+)?data\b/,
+    /\ball\s+(?:of\s+)?(?:the\s+)?(?:[\w-]+\s+){0,3}(?:records?|accounts?|leads?|prospects?|companies?)\b/,
+    /\bevery\s+(?:[\w-]+\s+){0,3}(?:records?|accounts?|leads?|prospects?|companies?)\b/,
+    /\bbulk\b|\bbatch\b|\bat\s+scale\b/,
+    /\b\d+\+?\s+(?:different\s+)?(?:actors?|sources?|records?|accounts?|leads?|prospects?|companies?)\b/,
+    /\bmultiple\s+(?:actors?|sources?|systems?|records?|accounts?|leads?)\b/,
+  ]);
+
+  const pipelineHits = countHits(lower, [
+    /\bthen\b|\band\s+then\b|\bafter\b|\bfinally\b|\bonce\b/,
+    /\bfrom\b.{0,80}\b(?:to|into)\b/,
+    /\b(?:add|write|update|create|insert|append|sync|push|load)\b.{0,50}\b(?:to|into|in)\b/,
+    /\bsub-?agents?\b|\bworkers?\b|\bfan\s*out\b|\bactors?\b/,
+  ]);
+
+  const destinationHit = /\b(?:add|write|update|create|insert|append|sync|push|load)\b.{0,80}\b(?:airtable|crm|sheet|database|table|records?)\b/.test(lower)
+    || /\b(?:to|into)\s+(?:my\s+)?(?:airtable|crm|sheet|database)\b/.test(lower);
+
+  if (destinationHit && serviceHits >= 2 && batchHits >= 1 && pipelineHits >= 1 && actionHits >= 2) return true;
+  if (serviceHits >= 3 && actionHits >= 2 && batchHits >= 1 && pipelineHits >= 1) return true;
+  if (lower.length >= 180 && serviceHits >= 2 && actionHits >= 3 && batchHits >= 1) return true;
+
   return false;
+}
+
+function countHits(text: string, patterns: RegExp[]): number {
+  return patterns.reduce((count, pattern) => count + (pattern.test(text) ? 1 : 0), 0);
 }
 
 /** Strip a leading `/background` / `bg:` command prefix from the user's message. */
@@ -55,8 +117,8 @@ export function stripBackgroundPrefix(message: string): string {
 
 /**
  * The promotion gate the interactive surfaces should call. Promote only when
- * there's explicit durable intent AND a non-empty instruction once the command
- * prefix is stripped — so a bare "/background" (no actual task) does NOT queue a
+ * there is durable intent AND a non-empty instruction once the command prefix is
+ * stripped — so a bare "/background" (no actual task) does NOT queue a
  * content-free worker; it falls through to a normal turn instead.
  */
 export function shouldPromoteToDurable(message: string): boolean {

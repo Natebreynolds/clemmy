@@ -106,6 +106,7 @@ test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-ap
 
   let approvedDuringRun: boolean | undefined;
   let runSessionSeen: string | undefined;
+  let workerPromptSeen = '';
 
   // Minimal ClementineAssistant stub. respond() stands in for the worker
   // run; we probe the scope from inside it (the exact window where internal
@@ -114,8 +115,9 @@ test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-ap
     getRuntime() {
       return {} as never;
     },
-    async respond(request: { sessionId: string }) {
+    async respond(request: { message: string; sessionId: string }) {
       runSessionSeen = request.sessionId;
+      workerPromptSeen = request.message;
       // A representative mutating tool (write_file) must be auto-approved by
       // the scope the processor opened for this run session.
       approvedDuringRun = isAutoApprovedByScope(request.sessionId, 'write_file', { path: '/tmp/out.csv' });
@@ -129,6 +131,7 @@ test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-ap
 
   assert.ok(runSessionSeen, 'respond should have been called with the run session id');
   assert.equal(runSessionSeen, task.runSessionId);
+  assert.match(workerPromptSeen, /run_worker fan-out/i, 'background worker prompt should steer batch work to subagent fan-out');
   assert.equal(approvedDuringRun, true, 'mutating tool must be pre-approved by the sticky scope mid-run');
 
   // The scope persists and covers all non-read tools for this run session.

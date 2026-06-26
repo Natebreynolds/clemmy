@@ -7371,15 +7371,14 @@ export function registerConsoleRoutes(
           });
           if (continuity.handled) return;
         }
-        // Durable background promotion (gap C1): when the user EXPLICITLY asks
-        // to run this to completion ("…overnight", "keep working", "/background
-        // …"), hand it to the daemon's durable lane instead of an ephemeral
-        // in-process run. The task then survives a window close / daemon
-        // restart, surfaces on the Tasks board, and reports back into THIS
-        // session on completion (originSessionId). Plain asks fall through to
-        // the normal foreground run below. The intent decision runs on the RAW
-        // `input` (not attachment-folded `turnInput`) so dropped-file contents
-        // can't trip it; the FULL `turnInput` is what the worker receives.
+        // Durable background promotion (gap C1): explicit durable asks AND
+        // high-confidence unattended data pipelines go to the daemon's durable
+        // lane instead of an ephemeral in-process run. The task then survives a
+        // window close / daemon restart, surfaces on the Tasks board, and reports
+        // back into THIS session on completion (originSessionId). Plain asks fall
+        // through to the normal foreground run below. The intent decision runs on
+        // the RAW `input` (not attachment-folded `turnInput`) so dropped-file
+        // contents can't trip it; the FULL `turnInput` is what the worker receives.
         // Skips approval-resume, a session paused on approval, and /goal runs.
         if (!intent && !isPausedOnApproval && !goalRunInput && shouldPromoteToDurable(input)) {
           const task = enqueueDurableChatTask({

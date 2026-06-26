@@ -270,6 +270,8 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
     'You are running a durable Clementine background task.',
     `Autonomy mode: ${policy.mode}.`,
     'Work autonomously through the request. Use available tools when useful.',
+    'For independent batch enrichment, resolve shared tools/credentials once, then use run_worker fan-out in bounded waves instead of doing every item serially in this context.',
+    'For batch external writes, gather and verify source data first, then request one batch approval before writing; never ship placeholder or partial records as complete.',
     'If you are blocked by missing credentials, missing approvals, or ambiguity that could cause damage, stop and explain the blocker.',
     policy.allowComputerActions ? '' : 'Policy: do not modify local files, run shell commands, or operate the computer unless the user explicitly re-enables computer actions.',
     policy.allowComposioActions ? '' : 'Policy: do not use connected-app or Composio actions unless the user explicitly re-enables connected-app actions.',

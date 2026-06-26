@@ -1991,11 +1991,11 @@ export async function runDiscordHarnessConversation(opts: {
         });
         if (continuity.handled) return;
       }
-      // Durable background promotion (gap C1) — desktop↔Discord parity. An
-      // explicit "run this to completion / overnight / keep working" hands the
-      // turn to the daemon's durable lane (board-visible, restart-recoverable,
-      // reports back into THIS channel's session) instead of an ephemeral
-      // in-process run. Plain asks fall through to the normal foreground run.
+      // Durable background promotion (gap C1) — desktop↔Discord parity. Explicit
+      // durable asks AND high-confidence unattended data pipelines go to the
+      // daemon's durable lane (board-visible, restart-recoverable, reports back
+      // into THIS channel's session) instead of an ephemeral in-process run.
+      // Plain asks fall through to the normal foreground run.
       // Decide on the RAW text (not folded attachments); enqueue the FULL
       // `prompt`. Skip when the session is paused on an approval so a stray
       // durable phrase can't orphan an in-flight gated workflow.

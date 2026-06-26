@@ -3,7 +3,8 @@
  *
  * Covers the C1 durable-promotion decision + enqueue shared by the desktop
  * dock, Discord harness, and the gateway:
- *   - hasDurableExecutionIntent fires ONLY on explicit user intent
+ *   - hasDurableExecutionIntent fires on explicit user intent OR a high-confidence
+ *     unattended data-pipeline shape
  *   - stripBackgroundPrefix removes a leading /background command
  *   - enqueueDurableChatTask creates a pending durable task wired for
  *     report-back (originSessionId) with the stripped prompt + derived title
@@ -34,7 +35,7 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-test('hasDurableExecutionIntent fires only on explicit durable intent', () => {
+test('hasDurableExecutionIntent fires on explicit durable intent and broad data pipelines', () => {
   // Explicit intent → promote.
   assert.equal(hasDurableExecutionIntent('/background build the site'), true);
   assert.equal(hasDurableExecutionIntent('bg: refactor the auth module'), true);
@@ -45,18 +46,36 @@ test('hasDurableExecutionIntent fires only on explicit durable intent', () => {
   assert.equal(hasDurableExecutionIntent('queue this overnight'), true);
   assert.equal(hasDurableExecutionIntent('build the landing page end to end'), true);
 
-  // No explicit intent → stay foreground. "build me a site" alone must NOT
-  // promote (that's the conservative-by-design contract; v2 may offer it).
+  // High-confidence unattended pipeline → promote without forcing the user to
+  // say "background" explicitly.
+  assert.equal(
+    hasDurableExecutionIntent(
+      'Pull full data from Salesforce via the CLI, then scrape all of it with Apify MCP, run subagents for 5 different actors including Google reviews, SEO data, and lead info, then add the results to my Airtable CRM via MCP.',
+    ),
+    true,
+  );
+  assert.equal(
+    hasDurableExecutionIntent('Pull every Salesforce account, enrich each with Google reviews and SEO data, then write the leads to Airtable CRM.'),
+    true,
+  );
+
+  // No durable/background intent → stay foreground.
   assert.equal(hasDurableExecutionIntent('build me a site'), false);
   assert.equal(hasDurableExecutionIntent('what is the weather today?'), false);
   assert.equal(hasDurableExecutionIntent('summarize this email'), false);
   assert.equal(hasDurableExecutionIntent('end to end encryption — how does it work?'), false); // no build verb
+  assert.equal(hasDurableExecutionIntent('research Salesforce and Airtable integration options'), false);
+  assert.equal(hasDurableExecutionIntent('pull 5 salesforce accounts for me please just as a test'), false);
 });
 
 test('shouldPromoteToDurable requires intent AND a non-empty instruction', () => {
   // Real durable asks promote.
   assert.equal(shouldPromoteToDurable('/background build the site'), true);
   assert.equal(shouldPromoteToDurable('keep working until the audit is done'), true);
+  assert.equal(
+    shouldPromoteToDurable('Pull all Salesforce leads, enrich them through Apify and Google reviews, then sync the cleaned records into Airtable.'),
+    true,
+  );
   // A bare command with no task must NOT queue a content-free worker.
   assert.equal(shouldPromoteToDurable('/background'), false);
   assert.equal(shouldPromoteToDurable('bg:'), false);
