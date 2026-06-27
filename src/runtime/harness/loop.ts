@@ -1241,6 +1241,17 @@ export function buildStallRetryMessage(sessionId: string, stall: StallInfo): str
  */
 function emitRuntimeTerminalEvent(sessionId: string, result: RunConversationResult): void {
   try {
+    // Bake the judge corpus (Lane A) — harvest this run's advisory judge verdicts
+    // (goal_alignment / output_grounding) into candidate gold-set cases for later
+    // human labeling, so κ-calibration can grow from real verdicts. Fires on EVERY
+    // run (verdicts occur on clean completions too), once per run (terminal), via a
+    // dynamic import + fire-and-forget so it never touches the loop's hot path.
+    // Reuses the corpus gate (CLEMMY_EVAL_AUTO_PROMOTE); judges stay advisory.
+    if ((process.env.CLEMMY_EVAL_AUTO_PROMOTE ?? 'on').toLowerCase() !== 'off') {
+      void import('../eval/eval-corpus-promote.js')
+        .then((m) => { try { m.snapshotJudgeCandidates(sessionId); } catch { /* best-effort */ } })
+        .catch(() => { /* best-effort */ });
+    }
     if (result.status === 'failed') {
       const message = result.error ?? 'unknown error';
       const err = new BoundaryError({
