@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   approvalSummaryMetadataForBrief,
+  blockedTaskBriefLine,
   discordUserIdForProactiveBrief,
   isActiveBackgroundTaskForBrief,
   shouldSendBrief,
@@ -62,6 +63,26 @@ test('brief metadata summarizes approvals without creating Discord action button
 test('proactive briefs do not fan out to Discord by default', () => {
   assert.equal(discordUserIdForProactiveBrief(true), undefined);
   assert.equal(discordUserIdForProactiveBrief(false), undefined);
+});
+
+test('blockedTaskBriefLine surfaces a blocked task with its typed blocker + reason', () => {
+  const line = blockedTaskBriefLine({
+    id: 'task-abc123def',
+    title: 'Pull D&B credit data for the prospect list',
+    prompt: 'job prompt',
+    error: 'The Dun & Bradstreet pull came back empty for all 40 accounts.',
+  });
+  assert.match(line, /^- Blocked task:/);
+  assert.match(line, /Pull D&B credit data/);
+  assert.match(line, /\[missing_data\]/, 'the deterministic blocker KIND is shown');
+  assert.match(line, /came back empty/);
+});
+
+test('blockedTaskBriefLine falls back to a label + unknown type when detail is absent', () => {
+  const line = blockedTaskBriefLine({ id: 'task-zzzz9999', error: undefined });
+  assert.match(line, /Task task-zzz/, 'falls back to a short id label');
+  assert.match(line, /\[unknown\]/);
+  assert.match(line, /blocked, no detail given/);
 });
 
 test('brief dedupe suppresses same urgent attention when active work churns', () => {

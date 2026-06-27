@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyDelivered, matchesBlockedText } from './verify-delivered.js';
+import { verifyDelivered, matchesBlockedText, classifyBlocker } from './verify-delivered.js';
 import type { ObjectiveJudgeVerdict } from './objective-judge.js';
 
 // A judge stub that records whether it was invoked, so we can assert the
@@ -138,4 +138,59 @@ test('matchesBlockedText: true on blocked shapes, false on a clean result', () =
   assert.equal(matchesBlockedText('Added 5 rows to the sheet.'), false);
   assert.equal(matchesBlockedText(''), false);
   assert.equal(matchesBlockedText(undefined), false);
+});
+
+test('classifyBlocker: structured stoppedReason signals win', () => {
+  assert.equal(classifyBlocker('anything', 'pending-approval'), 'needs_approval');
+  assert.equal(classifyBlocker('anything', 'max-turns-with-grace'), 'budget');
+  assert.equal(classifyBlocker('no useful text', 'error'), 'runtime_error');
+  assert.equal(classifyBlocker('', 'cancelled'), 'unknown');
+});
+
+test('classifyBlocker: tags the blocker text by KIND (ordered, most-specific-first)', () => {
+  assert.equal(classifyBlocker('Rate limit exceeded, back off.'), 'rate_limited');
+  assert.equal(classifyBlocker('429 too many requests'), 'rate_limited');
+  assert.equal(classifyBlocker('Approval required to send the emails.'), 'needs_approval');
+  assert.equal(classifyBlocker('Permission denied on the CRM.'), 'permission');
+  assert.equal(classifyBlocker('Missing credentials for Salesforce.'), 'permission');
+  assert.equal(classifyBlocker('The service is unavailable (503).'), 'external_down');
+  assert.equal(classifyBlocker('connection reset by peer'), 'external_down');
+  assert.equal(classifyBlocker('I hit the run budget before finishing.'), 'budget');
+  assert.equal(classifyBlocker('The Salesforce pull came back empty.'), 'missing_data');
+  assert.equal(classifyBlocker('no rows found in the export'), 'missing_data');
+  assert.equal(classifyBlocker('I need your input on which option to pick.'), 'needs_user_input');
+  assert.equal(classifyBlocker('waiting on your confirmation'), 'needs_user_input');
+  // A genuine blocker with no recognizable class is still typed (never untyped).
+  assert.equal(classifyBlocker('I am blocked.'), 'unknown');
+  assert.equal(classifyBlocker(''), 'unknown');
+  assert.equal(classifyBlocker(undefined), 'unknown');
+});
+
+test('classifyBlocker: a specific text cause beats a generic error stop', () => {
+  // stoppedReason=error would default to runtime_error, but the text names a
+  // more actionable cause — the text wins.
+  assert.equal(classifyBlocker('Rate limited by the upstream API.', 'error'), 'rate_limited');
+  assert.equal(classifyBlocker('Permission denied.', 'error'), 'permission');
+});
+
+test('verifyDelivered carries a routable blockerType on every blocked verdict', async () => {
+  const judge = judgeStub(true);
+  const err = await verifyDelivered('pull the data', 'connection reset by peer', { stoppedReason: 'error', judgeFn: judge.fn });
+  assert.equal(err.delivered, false);
+  assert.equal(err.blockerType, 'external_down');
+
+  const appr = await verifyDelivered('do it', 'x', { stoppedReason: 'pending-approval' });
+  assert.equal(appr.blockerType, 'needs_approval');
+
+  const budget = await verifyDelivered('finish', 'hit the run budget', { stoppedReason: 'max-turns-with-grace' });
+  assert.equal(budget.blockerType, 'budget');
+
+  const blockedText = await verifyDelivered('pull salesforce', 'Missing credentials for the CRM.', { stoppedReason: 'success' });
+  assert.equal(blockedText.delivered, false);
+  assert.equal(blockedText.blockerType, 'permission');
+
+  // A clean delivery carries no blockerType.
+  const ok = await verifyDelivered('write a doc', 'Done — wrote /tmp/out.md https://x/y', { stoppedReason: 'success', judgeFn: judge.fn });
+  assert.equal(ok.delivered, true);
+  assert.equal(ok.blockerType, undefined);
 });

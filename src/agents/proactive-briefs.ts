@@ -11,6 +11,7 @@ import { addNotification } from '../runtime/notifications.js';
 import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
 import { isActionable as isActionableApproval, listPending as listApprovalRegistry, type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
+import { classifyBlocker } from '../runtime/harness/verify-delivered.js';
 
 const logger = pino({ name: 'clementine-next.proactive-briefs' });
 
@@ -58,6 +59,16 @@ export function approvalSummaryMetadataForBrief(approvals: PendingApprovalRow[])
     approvalIds: approvals.map((approval) => approval.approvalId),
     approvalSubjects: approvals.slice(0, 4).map((approval) => approval.subject),
   };
+}
+
+/** One brief line for a blocked background task, carrying the deterministic
+ *  blocker KIND (1B taxonomy) so the user sees *what kind* of blocker, not just
+ *  prose. Pure + exported for test. */
+export function blockedTaskBriefLine(
+  task: { id: string; title?: string; prompt?: string; error?: string },
+): string {
+  const label = humanLabel(task.title, task.prompt, `Task ${shortId(task.id)}`);
+  return `- Blocked task: ${label} — [${classifyBlocker(task.error)}] ${clean(task.error ?? 'blocked, no detail given', 160)}`;
 }
 
 export function discordUserIdForProactiveBrief(allowDiscordCheckIns: boolean): string | undefined {
@@ -215,6 +226,13 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
   });
   const blockedGoals = readGoals().filter((goal) => goal.status === 'blocked');
   const blockedExecutions = executions.filter((execution) => execution.status === 'blocked');
+  // Blocked BACKGROUND TASKS were the radar gap: markBackgroundTaskBlocked fires
+  // ONE notification at block-time, but 'blocked' is in none of the brief's
+  // recurring buckets (activeTasks excludes it, recentFailures is failed/aborted
+  // only) — so an unattended hard-5% task the user missed once fell off the
+  // surface entirely. Surface them like blocked goals/executions (stale ones are
+  // archived out of listBackgroundTasks, so this stays bounded).
+  const blockedTasks = backgroundTasks.filter((task) => task.status === 'blocked');
   // Same idea for attention-needing background tasks: a task that's
   // ONLY awaiting_approval is already represented by the approval row
   // above (one card, one mention). Drop the duplicate "task needs
@@ -230,6 +248,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     recentFailures.length > 0 ||
     blockedGoals.length > 0 ||
     blockedExecutions.length > 0 ||
+    blockedTasks.length > 0 ||
     attentionTasks.length > 0;
 
   // ORDER-INDEPENDENT signal. The source lists are sorted by `updatedAt`
@@ -248,6 +267,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     recentFailures: sortedBriefTuples(recentFailures.map((task) => [task.id, task.status, task.error])),
     approvals: sortedBriefTuples(approvals.map((approval) => [approval.approvalId, approval.subject, approval.sessionId])),
     blockedGoals: sortedBriefTuples(blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]])),
+    blockedTasks: sortedBriefTuples(blockedTasks.map((task) => [task.id, task.status, task.error])),
   };
   const attentionSignal = {
     approvals: sortedBriefTuples(approvals.map((approval) => [approval.approvalId, approval.sessionId, approval.subject])),
@@ -255,8 +275,9 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     attentionTasks: sortedBriefTuples(attentionTasks.map((task) => [task.id, task.status, task.pendingApprovalId])),
     recentFailures: sortedBriefTuples(recentFailures.map((task) => [task.id, task.status, task.error])),
     blockedGoals: sortedBriefTuples(blockedGoals.map((goal) => [goal.id, goal.title, goal.blockers?.[0]])),
+    blockedTasks: sortedBriefTuples(blockedTasks.map((task) => [task.id, task.status, task.error])),
   };
-  const hasSignal = executions.length > 0 || activeTasks.length > 0 || recentFailures.length > 0 || approvals.length > 0 || blockedGoals.length > 0;
+  const hasSignal = executions.length > 0 || activeTasks.length > 0 || recentFailures.length > 0 || approvals.length > 0 || blockedGoals.length > 0 || blockedTasks.length > 0;
   if (!hasSignal) return;
 
   const state = loadState();
@@ -294,6 +315,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
     ...blockedExecutions.slice(0, 4).map((execution) =>
       `- Blocked run: ${humanLabel(execution.title, execution.objective, `Run ${shortId(execution.id)}`)}${execution.blocker ? ` — ${clean(execution.blocker, 160)}` : ''}`,
     ),
+    ...blockedTasks.slice(0, 4).map(blockedTaskBriefLine),
     ...attentionTasks.slice(0, 4).map((task) =>
       `- Task needs attention: ${humanLabel(task.title, task.prompt, `Task ${shortId(task.id)}`)} (${task.status.replace('_', ' ')}).`,
     ),
@@ -337,6 +359,7 @@ export async function processProactiveBriefs(assistant: ClementineAssistant): Pr
       activeBackgroundTaskCount: activeTasks.length,
       pendingApprovalCount: approvals.length,
       blockedGoalCount: blockedGoals.length,
+      blockedTaskCount: blockedTasks.length,
       attentionSignature,
       ...approvalMetadata,
     },

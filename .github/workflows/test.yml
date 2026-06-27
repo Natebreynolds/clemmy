@@ -54,6 +54,35 @@ jobs:
       - name: Run gate benchmark
         run: npm run bench:gates
 
+  eval-suites:
+    name: Eval suites (pass^k consistency + job evals)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # pass^k over the gate-benchmark TRAPS + golden JOB-run replays. Both are
+      # fully offline/deterministic (stub judges / fixture replay under a temp
+      # CLEMENTINE_HOME — no model, no network, no auth). STRICT mode exits
+      # non-zero when pass^k drops below threshold, so a regressed trap or job
+      # fails the build. BLOCKING by design — the eval IS the harness; this turns
+      # forward-only into a build gate. Run locally: EVAL_PASSK_STRICT=on npm run
+      # eval:passk  /  EVAL_JOBS_STRICT=on npm run eval:jobs
+      - name: pass^k consistency (strict)
+        run: EVAL_PASSK_STRICT=on npm run eval:passk
+
+      - name: Job evals (strict)
+        run: EVAL_JOBS_STRICT=on npm run eval:jobs
+
   typecheck:
     name: TypeScript check
     runs-on: ubuntu-latest

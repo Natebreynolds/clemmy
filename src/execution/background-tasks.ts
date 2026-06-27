@@ -21,7 +21,7 @@ import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
-import { BLOCKED_TEXT_PATTERNS, verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { BLOCKED_TEXT_PATTERNS, classifyBlocker, verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 
@@ -663,6 +663,9 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
     approvalResolution: undefined,
   });
   if (updated) {
+    // Tag the blocker by KIND (deterministic, zero-token) so the dashboard /
+    // proactive brief / future routing can act on the class, not just the prose.
+    const blockerType = classifyBlocker(reason);
     addNotification({
       id: `${Date.now()}-background-${updated.id}-blocked`,
       kind: 'approval',
@@ -670,13 +673,13 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
       body: [
         `I couldn't finish this — I'm blocked, so I did NOT ship a partial/empty result.`,
         ``,
-        `Blocker: ${clean(reason, 600)}`,
+        `Blocker (${blockerType}): ${clean(reason, 600)}`,
         ``,
         `Re-run once that's resolved and I'll continue.`,
       ].join('\n'),
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated, { status: 'blocked' }),
+      metadata: taskNotificationMetadata(updated, { status: 'blocked', blockerType }),
     });
     // Report-back without fail: a BLOCKED task must reach Clementine's context,
     // not just a notification — so she can surface the blocker or resolve it.
