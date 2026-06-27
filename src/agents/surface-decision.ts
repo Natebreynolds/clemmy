@@ -8,21 +8,11 @@
  * escalate. The monitors (inbox/calendar/…) build a SurfaceSignal from their
  * existing reason heuristics and feed it here instead of `score = reasons.length`
  * — so every surface decision uses ONE tuned, testable policy. This module is
- * pure + side-effect-free; wiring the monitors to it (and gating notifications on
- * ask/escalate only) is a later phase, validated by the firehose/true-positive
- * eval set.
+ * pure + side-effect-free. The monitors (inbox/calendar) call decideSurface
+ * unconditionally — the scorer graduated to the default 2026-06-27 (validated by
+ * surface-monitor-wiring.test.ts: firehose suppressed, true positives surface),
+ * replacing the legacy score=reasons.length.
  */
-
-import { getRuntimeEnv } from '../config.js';
-
-/** Gate the monitors' use of the multi-axis scorer (vs the legacy
- *  score=reasons.length). Default OFF — live monitor behavior is byte-identical
- *  until the firehose/true-positive eval validates a flip. DELETE-WHEN-VALIDATED:
- *  once firehose-suppression holds + Fault-Trigger-Rate ≤ baseline, default on
- *  then remove. */
-export function surfaceDecisionV2Enabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_SURFACE_DECISION_V2', 'off') || 'off').trim().toLowerCase() === 'on';
-}
 
 export interface SurfaceSignal {
   /** 0-1 time pressure — how soon it matters. */

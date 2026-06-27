@@ -41,7 +41,7 @@ import {
   type ComposioConnectionSuppression,
 } from './composio-connection-suppression.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
-import { decideSurface, shouldSurface, surfaceDecisionV2Enabled, type SurfaceDecision } from './surface-decision.js';
+import { decideSurface, shouldSurface, type SurfaceDecision } from './surface-decision.js';
 
 const logger = pino({ name: 'clementine-next.inbox-monitor' });
 
@@ -190,8 +190,8 @@ export interface MessageScore {
   needsYou: boolean;
   reasons: string[];
   score: number;
-  /** The surface-decision verdict (only set under CLEMMY_SURFACE_DECISION_V2) —
-   *  drives triage typing + the anti-firehose gate. */
+  /** The surface-decision verdict — drives triage typing + the anti-firehose
+   *  gate. Always set (the multi-axis scorer is the default). */
   decision?: SurfaceDecision;
 }
 export function scoreMessage(m: UnreadMessage): MessageScore {
@@ -212,22 +212,20 @@ export function scoreMessage(m: UnreadMessage): MessageScore {
   // them even without a canned ask phrase.
   if (replyQ) reasons.push('a reply in your thread');
 
-  // V2: feed the multi-axis surface-decision scorer instead of the binary
-  // reasons.length. risk=0.4 → an inbox item routes to ask/escalate (surface to
+  // Multi-axis surface-decision scorer (graduated to the default 2026-06-27 —
+  // validated by surface-monitor-wiring.test.ts; replaced the binary
+  // reasons.length). risk=0.4 → an inbox item routes to ask/escalate (surface to
   // the user) vs watch/ignore (stay silent) — never autonomous 'act'.
-  if (surfaceDecisionV2Enabled()) {
-    const v = decideSurface({
-      urgency: hasUrgent ? 0.85 : 0.1,
-      impact: hasAsk ? 0.7 : replyQ ? 0.6 : 0.15,
-      specificity: hasAsk ? 0.8 : replyQ ? 0.55 : 0.2,
-      novelty: 0.8,
-      risk: 0.4,
-      confidence: hasAsk ? 0.8 : hasUrgent ? 0.6 : 0.4,
-      conflict: 0,
-    });
-    return { needsYou: shouldSurface(v.decision), reasons, score: reasons.length, decision: v.decision };
-  }
-  return { needsYou: reasons.length > 0, reasons, score: reasons.length };
+  const v = decideSurface({
+    urgency: hasUrgent ? 0.85 : 0.1,
+    impact: hasAsk ? 0.7 : replyQ ? 0.6 : 0.15,
+    specificity: hasAsk ? 0.8 : replyQ ? 0.55 : 0.2,
+    novelty: 0.8,
+    risk: 0.4,
+    confidence: hasAsk ? 0.8 : hasUrgent ? 0.6 : 0.4,
+    conflict: 0,
+  });
+  return { needsYou: shouldSurface(v.decision), reasons, score: reasons.length, decision: v.decision };
 }
 
 // ── state ───────────────────────────────────────────────────────────────────
