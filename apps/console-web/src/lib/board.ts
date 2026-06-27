@@ -11,7 +11,21 @@ import { apiGet, apiPost } from './api';
 import type { Tone } from '@/components/ui/StatusPill';
 
 export type BoardColumnId = 'queued' | 'running' | 'needs_you' | 'done';
-export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow';
+export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval';
+export type BoardPrimaryAction = 'approve' | 'continue' | 'retry_failed_items' | 'open_result' | 'none';
+export type BoardContinueMode = 'approval' | 'background' | 'workflow_failed_items' | 'workflow_resume' | 'open_result' | 'none';
+
+export interface BoardArtifactSummary {
+  files: string[];
+  urls: string[];
+  counts: string[];
+}
+
+export interface BoardFailureSummary {
+  failedItems: number;
+  retryable: boolean;
+  reason: string;
+}
 
 export interface BoardCard {
   id: string;
@@ -23,8 +37,14 @@ export interface BoardCard {
   sessionId: string | null;
   ageMs: number;
   updatedAt: string;
-  /** Allowed actions: 'cancel' | 'resume' | 'promote' | 'archive' | 'restore'. */
+  /** Allowed actions. Drag uses cancel/resume/promote; buttons may use the rest. */
   actions: string[];
+  primaryAction?: BoardPrimaryAction;
+  continueMode?: BoardContinueMode;
+  approvalId?: string;
+  nextSafeAction?: string;
+  artifactSummary?: BoardArtifactSummary;
+  failureSummary?: BoardFailureSummary;
   /** A finished/parked background task idle past the stale threshold (>7d). */
   stale?: boolean;
   staleKind?: 'finished' | 'parked';
@@ -40,6 +60,9 @@ export interface BoardCard {
     objective?: string;
     resultPreview?: string;
     pendingApprovalId?: string;
+    approvalKind?: string;
+    workflowSlug?: string;
+    needsAttention?: boolean;
   };
 }
 
@@ -77,9 +100,28 @@ export function rejectReason(card: BoardCard, target: BoardColumnId): string {
 }
 
 export type BoardActionIntent = 'cancel' | 'resume' | 'promote' | 'archive' | 'restore';
+export type BoardButtonIntent = BoardActionIntent | 'approve' | 'reject' | 'retry_failed_items' | 'resume_safe';
 
-export async function runBoardAction(card: BoardCard, intent: BoardActionIntent): Promise<{ ok: boolean; reason?: string }> {
+export async function runBoardAction(card: BoardCard, intent: BoardButtonIntent): Promise<{ ok: boolean; reason?: string }> {
   try {
+    if ((intent === 'approve' || intent === 'reject') && (card.approvalId || card.raw.pendingApprovalId)) {
+      const id = card.approvalId || card.raw.pendingApprovalId!;
+      return await apiPost<{ ok: boolean; reason?: string }>(
+        `/api/console/board/approval/${encodeURIComponent(id)}/${intent}`,
+      );
+    }
+    if (card.sourceKind === 'workflow' && intent === 'retry_failed_items' && card.raw.runId) {
+      const workflowName = card.raw.workflowSlug || card.raw.workflowName || card.title;
+      return await apiPost<{ ok: boolean; reason?: string }>(
+        `/api/console/board/workflow/${encodeURIComponent(workflowName)}/runs/${encodeURIComponent(card.raw.runId)}/retry-failed-items`,
+      );
+    }
+    if ((card.sourceKind === 'workflow' || card.sourceKind === 'run') && intent === 'resume_safe' && card.raw.runId) {
+      const workflowName = card.raw.workflowSlug || card.raw.workflowName || card.title;
+      return await apiPost<{ ok: boolean; reason?: string }>(
+        `/api/console/board/workflow/${encodeURIComponent(workflowName)}/runs/${encodeURIComponent(card.raw.runId)}/resume-safe`,
+      );
+    }
     if (card.sourceKind === 'background') {
       // archive/restore + cancel/resume/promote all route to the same per-id action endpoint.
       return await apiPost<{ ok: boolean; reason?: string }>(`/api/console/board/background/${encodeURIComponent(card.id)}/${intent}`);
@@ -111,6 +153,7 @@ export function sourceLabel(kind: BoardSourceKind): string {
     case 'workflow': return 'Workflow';
     case 'execution': return 'Goal';
     case 'run': return 'Run';
+    case 'approval': return 'Approval';
   }
 }
 

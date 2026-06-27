@@ -58,6 +58,11 @@ test('buildActionsForNotification: checkInId attaches answer buttons', () => {
   assert.ok(ids.some((id) => id.includes('checkin-reject:chk-abc123')));
 });
 
+test('buildActionsForNotification: stale goalDraftId does not attach dead buttons', () => {
+  const rows = buildActionsForNotification({ goalDraftId: 'gd-abc123' });
+  assert.equal(customIds(rows).length, 0, 'missing goal draft records should not render buttons');
+});
+
 test('buildActionsForNotification: stale planProposalId suppresses lower-level approvalId', () => {
   const rows = buildActionsForNotification({
     planProposalId: 'plan-p1',
@@ -71,8 +76,19 @@ test('buildActionsForNotification: stale planProposalId suppresses lower-level a
   assert.ok(!ids.some((id) => /\bclementine:approve:appr-a1\b/.test(id)));
 });
 
+test('buildActionsForNotification: stale goalDraftId suppresses lower-level approvalId', () => {
+  const rows = buildActionsForNotification({
+    goalDraftId: 'gd-missing',
+    approvalId: 'appr-a1',
+  });
+  const ids = customIds(rows);
+  assert.equal(ids.length, 0);
+  assert.ok(!ids.some((id) => /\bclementine:approve:appr-a1\b/.test(id)));
+});
+
 test('buildActionsForNotification: ignores non-string ids', () => {
   assert.equal(buildActionsForNotification({ planProposalId: 42 as unknown as string }), undefined);
+  assert.equal(buildActionsForNotification({ goalDraftId: 42 as unknown as string }), undefined);
   assert.equal(buildActionsForNotification({ approvalId: null as unknown as string }), undefined);
 });
 

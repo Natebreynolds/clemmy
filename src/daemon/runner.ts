@@ -19,6 +19,7 @@ import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRu
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
+import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
@@ -979,6 +980,14 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // exist on disk (disabled). Re-runs are no-ops because the seeder
   // skips seededIds it already created.
   ensureSeedTemplates();
+  try {
+    const seeded = ensureBuiltInWorkflows();
+    if (seeded.installed.length > 0) {
+      logger.info({ workflows: seeded.installed }, 'Seeded built-in workflows');
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Built-in workflow seeding failed (continuing)');
+  }
 
   // One-time migration: convert any legacy flat workflow .md files
   // into <name>/SKILL.md directories so the rest of the loader can

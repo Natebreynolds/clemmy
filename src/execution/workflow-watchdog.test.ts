@@ -10,6 +10,7 @@ import {
   findStalledRuns,
   dropReportedBackTerminalRuns,
   reportedBackRunIdsFrom,
+  recommendedRecoveryForStalledRun,
   type WatchdogRunView,
   type StalledRun,
 } from './workflow-watchdog.js';
@@ -17,6 +18,30 @@ import {
 const T0 = 1_780_000_000_000; // fixed reference "now"
 const iso = (msAgo: number) => new Date(T0 - msAgo).toISOString();
 const FIVE_MIN = 5 * 60_000;
+
+test('recommendedRecoveryForStalledRun maps every watchdog reason to a concrete Tasks action', () => {
+  assert.deepEqual(
+    recommendedRecoveryForStalledRun({ id: 'q1', workflow: 'wf', reason: 'queued_not_draining' }),
+    {
+      action: 'open_tasks',
+      label: 'Open Tasks',
+      detail: 'Open Tasks to start or reprioritize the queued run; restart the daemon if the queue still does not drain.',
+      href: '/tasks',
+    },
+  );
+  assert.equal(
+    recommendedRecoveryForStalledRun({ id: 'p1', workflow: 'wf', reason: 'parked_awaiting_approval' }).action,
+    'approve_or_reject',
+  );
+  assert.equal(
+    recommendedRecoveryForStalledRun({ id: 'r1', workflow: 'wf', reason: 'running_silent' }).action,
+    'cancel_and_resume',
+  );
+  assert.equal(
+    recommendedRecoveryForStalledRun({ id: 't1', workflow: 'wf', reason: 'terminal_unnotified' }).action,
+    'open_result',
+  );
+});
 
 test('flags a run queued past the threshold', () => {
   const runs: WatchdogRunView[] = [

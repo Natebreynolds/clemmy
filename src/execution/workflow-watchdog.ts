@@ -83,6 +83,13 @@ export interface StalledRun {
   reason: 'queued_not_draining' | 'parked_awaiting_approval' | 'terminal_unnotified' | 'running_silent';
 }
 
+export interface WorkflowRecommendedRecovery {
+  action: 'open_tasks' | 'approve_or_reject' | 'cancel_and_resume' | 'open_result';
+  label: string;
+  detail: string;
+  href: string;
+}
+
 /**
  * Pure: given the run records, find the ones stuck `queued` past the
  * threshold. Exported for tests — no I/O, no clock dependency (caller
@@ -170,6 +177,42 @@ export function dropReportedBackTerminalRuns(
   return stalled.filter(
     (run) => !(run.reason === 'terminal_unnotified' && reportedBackRunIds.has(run.id)),
   );
+}
+
+export function recommendedRecoveryForStalledRun(
+  run: Pick<StalledRun, 'id' | 'workflow' | 'reason'>,
+): WorkflowRecommendedRecovery {
+  switch (run.reason) {
+    case 'parked_awaiting_approval':
+      return {
+        action: 'approve_or_reject',
+        label: 'Review approval',
+        detail: 'Approve or reject the parked step from Tasks; the workflow runner will resume from the approval checkpoint.',
+        href: '/tasks',
+      };
+    case 'running_silent':
+      return {
+        action: 'cancel_and_resume',
+        label: 'Cancel and resume safely',
+        detail: 'Cancel the silent run, then continue it from Tasks; completed workflow items stay cached so Clementine avoids duplicating work.',
+        href: '/tasks',
+      };
+    case 'terminal_unnotified':
+      return {
+        action: 'open_result',
+        label: 'Open result',
+        detail: 'Open Tasks to inspect the terminal run result and confirm the user-visible report-back state.',
+        href: '/tasks',
+      };
+    case 'queued_not_draining':
+    default:
+      return {
+        action: 'open_tasks',
+        label: 'Open Tasks',
+        detail: 'Open Tasks to start or reprioritize the queued run; restart the daemon if the queue still does not drain.',
+        href: '/tasks',
+      };
+  }
 }
 
 /**
@@ -351,7 +394,14 @@ export function runWorkflowWatchdog(now: number = Date.now()): { stalled: number
       body: alert.body,
       createdAt: new Date(now).toISOString(),
       read: false,
-      metadata: { workflow: run.workflow, runId: run.id, stalled: true, reason: run.reason, ageMs: run.ageMs },
+      metadata: {
+        workflow: run.workflow,
+        runId: run.id,
+        stalled: true,
+        reason: run.reason,
+        ageMs: run.ageMs,
+        recommendedRecovery: recommendedRecoveryForStalledRun(run),
+      },
     });
   }
 

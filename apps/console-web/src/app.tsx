@@ -6,6 +6,7 @@ import { ChatScreen } from './features/conversations/ChatScreen';
 import { ConversationThread } from './features/conversations/chat/ConversationThread';
 import { Inbox } from './screens/Inbox';
 import { BackgroundTasks } from './screens/BackgroundTasks';
+import { Goals } from './screens/Goals';
 import { Automate } from './screens/Automate';
 import { Connect } from './screens/Connect';
 import { Memory } from './screens/Memory';
@@ -35,6 +36,7 @@ export function App() {
             </Route>
             <Route path="/inbox" element={<Inbox />} />
             <Route path="/tasks" element={<BackgroundTasks />} />
+            <Route path="/goals" element={<Goals />} />
             <Route path="/automate" element={<Automate />} />
             <Route path="/connect" element={<Connect />} />
             <Route path="/memory" element={<Memory />} />

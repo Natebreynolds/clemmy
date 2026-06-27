@@ -5,6 +5,7 @@ import { getToolOutputContext } from '../runtime/harness/tool-output-context.js'
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
 import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
+import { surfaceGoalDraftFromNotes, type GoalDraftRecord } from '../agents/goal-drafts.js';
 import { surfacePlan } from '../agents/plan-proposals.js';
 import { PlanSchema, type Plan } from '../agents/planner.js';
 import { textResult } from './shared.js';
@@ -65,7 +66,46 @@ function renderSharedPlan(plan: Plan, message?: string): string {
     .join('\n');
 }
 
+function renderGoalDraft(record: GoalDraftRecord): string {
+  const draft = record.draft;
+  const block = (title: string, values: string[]) => values.length > 0
+    ? [title, ...values.slice(0, 6).map((item) => `- ${compactLine(item, 220)}`)].join('\n')
+    : '';
+  return [
+    `Goal draft queued: ${record.id}`,
+    [`Objective: ${compactLine(draft.objective, 260)}`, `Confidence: ${draft.confidence}`].join('\n'),
+    block('Success criteria:', draft.successCriteria),
+    block('Next actions:', draft.nextActions),
+    block('Risks:', draft.risks),
+    block('Missing inputs to review:', draft.missingInputs),
+    `Rationale: ${compactLine(draft.rationale, 260)}`,
+    'Ask the user to review or edit this draft before creating a durable goal or starting execution. The draft is visible in Goals.',
+  ].filter(Boolean).join('\n\n');
+}
+
 export function registerAutonomyActionTools(server: McpServer): void {
+  server.tool(
+    'draft_goal_from_notes',
+    [
+      'Draft a durable goal from raw notes, meeting context, or a user-stated desired outcome.',
+      'This is a review surface only: it does NOT create, activate, or self-drive a goal.',
+      'Use when the user is exploring a longer-lived outcome and the notes need to become an objective, success criteria, next actions, risks, and missing inputs.',
+    ].join(' '),
+    {
+      notes: z.string().min(8).max(8000).describe('Raw meeting notes, transcript excerpt, chat context, or user instructions.'),
+      desiredOutcome: z.string().min(3).max(600).optional().describe('Optional user-stated outcome to prefer as the objective.'),
+      sessionId: z.string().optional().describe('Optional current chat/session id so the created goal can remain linked to the conversation.'),
+      channel: z.string().optional().describe('Optional channel label such as discord:<channelId>.'),
+    },
+    async ({ notes, desiredOutcome, sessionId, channel }) => {
+      try {
+        return textResult(renderGoalDraft(surfaceGoalDraftFromNotes({ notes, desiredOutcome, sessionId, channel })));
+      } catch (err) {
+        return textResult(`draft_goal_from_notes failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  );
+
   server.tool(
     'notify_user',
     'Send a notification to the user via the notification queue. Use for meaningful status updates, blockers, or anything the user genuinely wants surfaced. Avoid spamming — one notification per real signal.',

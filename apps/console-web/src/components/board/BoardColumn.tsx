@@ -6,7 +6,7 @@
 import { useDroppable } from '@dnd-kit/core';
 import { cn } from '@/lib/cn';
 import { BoardCard } from './BoardCard';
-import { intentForDrop, type BoardCard as BoardCardT, type BoardColumnId } from '@/lib/board';
+import { intentForDrop, type BoardButtonIntent, type BoardCard as BoardCardT, type BoardColumnId } from '@/lib/board';
 
 export function BoardColumn({
   id,
@@ -15,6 +15,7 @@ export function BoardColumn({
   activeCard,
   onOpen,
   onArchive,
+  onAction,
 }: {
   id: BoardColumnId;
   label: string;
@@ -22,6 +23,7 @@ export function BoardColumn({
   activeCard: BoardCardT | null;
   onOpen: (card: BoardCardT) => void;
   onArchive?: (card: BoardCardT) => void;
+  onAction?: (card: BoardCardT, intent: BoardButtonIntent) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id });
   const validHover = activeCard && isOver ? intentForDrop(activeCard, id) !== null : null;
@@ -44,7 +46,9 @@ export function BoardColumn({
         {cards.length === 0 ? (
           <p className="px-1 py-6 text-center text-caption text-faint">Nothing here</p>
         ) : (
-          cards.map((card) => <BoardCard key={card.id} card={card} onOpen={onOpen} onArchive={onArchive} />)
+          cards.map((card) => (
+            <BoardCard key={card.id} card={card} onOpen={onOpen} onArchive={onArchive} onAction={onAction} />
+          ))
         )}
       </div>
     </div>

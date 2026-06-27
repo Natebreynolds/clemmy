@@ -8,7 +8,6 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
-import { renderConsoleHtml } from './console.js';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
 import {
   BASE_DIR,
@@ -44,7 +43,7 @@ import {
 } from '../memory/focus.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
-import { ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   deleteWorkflow,
   listWorkflows,
@@ -142,13 +141,30 @@ import {
   rejectProposal,
 } from '../agents/check-in-proposals.js';
 import {
+  createGoalContract,
   deletePlanProposal,
+  disableGoalSelfDrive,
+  enableGoalSelfDrive,
+  expireGoal,
+  getCurrentGoalStage,
   getPlanProposal,
   listPlanProposals,
+  parkGoal,
   planProposalNeedsUserInput,
   rejectPlanProposal,
+  satisfyGoal,
   supersedePlanProposal,
+  unparkGoal,
+  type PlanProposal,
 } from '../agents/plan-proposals.js';
+import { draftGoalFromNotes } from '../agents/goal-intake.js';
+import {
+  createGoalFromDraft,
+  dismissGoalDraft,
+  getGoalDraft,
+  listGoalDrafts,
+  surfaceGoalDraftFromNotes,
+} from '../agents/goal-drafts.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import {
   parseGoalCommand,
@@ -170,6 +186,7 @@ import {
   getBackgroundTask,
   listBackgroundTasks,
   processBackgroundTasks,
+  queueBackgroundTaskApprovalResolution,
   queueBackgroundTaskContinue,
   queueBackgroundTaskInputResolution,
   restoreBackgroundTask,
@@ -243,7 +260,7 @@ import { listMcpServerHealth } from '../runtime/mcp-namespace-shim.js';
 import { collectDiagnostics } from './diagnostics.js';
 import { collectHarnessAudit } from './harness-audit.js';
 import { collectAgentSystemMetrics } from './agent-system-metrics.js';
-import { requeueWorkflowFailedItemsFromRun } from '../tools/workflow-run-queue.js';
+import { requeueWorkflowFailedItemsFromRun, requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -520,6 +537,112 @@ function approvalReasonFromArgs(args: Record<string, unknown> | undefined): stri
   return trimConsoleTitle(pickApprovalString(args, ['reason', 'why', 'description']), 260);
 }
 
+function compactBoardStrings(value: unknown, limit: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((item) => trimConsoleTitle(item, 180))
+    .slice(0, limit);
+}
+
+function boardArtifactSummaryFrom(value: unknown): BoardArtifactSummary | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const summary = {
+    files: compactBoardStrings(raw.files, 6),
+    urls: compactBoardStrings(raw.urls, 6),
+    counts: compactBoardStrings(raw.counts, 8),
+  };
+  return summary.files.length || summary.urls.length || summary.counts.length ? summary : undefined;
+}
+
+function workflowRunSummary(workflowSlug: string, runId: string): {
+  artifactSummary?: BoardArtifactSummary;
+  because?: string;
+  needsAttention?: boolean;
+} {
+  const summaries = readWorkflowEvents(workflowSlug, runId)
+    .filter((ev) => ev.kind === 'run_summary' && ev.meta);
+  const latest = summaries[summaries.length - 1];
+  const meta = latest?.meta;
+  if (!meta) return {};
+  return {
+    artifactSummary: boardArtifactSummaryFrom(meta.artifacts),
+    because: typeof meta.because === 'string' ? trimConsoleTitle(meta.because, 180) : undefined,
+    needsAttention: meta.needsAttention === true,
+  };
+}
+
+function workflowFailureSummary(workflowSlug: string, runId: string): BoardFailureSummary | undefined {
+  const failed = listFinalFailedItems(workflowSlug, runId);
+  if (failed.length === 0) return undefined;
+  return {
+    failedItems: failed.length,
+    retryable: true,
+    reason: `${failed.length} failed item${failed.length === 1 ? '' : 's'} can be retried without rerunning successful items.`,
+  };
+}
+
+function workflowRunRecovery(workflowSlug: string, runId: string): {
+  artifactSummary?: BoardArtifactSummary;
+  failureSummary?: BoardFailureSummary;
+  primaryAction: BoardPrimaryAction;
+  continueMode: BoardContinueMode;
+  nextSafeAction: string;
+} {
+  const summary = workflowRunSummary(workflowSlug, runId);
+  const failureSummary = workflowFailureSummary(workflowSlug, runId);
+  if (failureSummary?.retryable) {
+    return {
+      artifactSummary: summary.artifactSummary,
+      failureSummary,
+      primaryAction: 'retry_failed_items',
+      continueMode: 'workflow_failed_items',
+      nextSafeAction: 'Retry only the failed items; completed items stay cached.',
+    };
+  }
+  if (summary.artifactSummary) {
+    return {
+      artifactSummary: summary.artifactSummary,
+      primaryAction: 'open_result',
+      continueMode: 'open_result',
+      nextSafeAction: 'Review the produced files, URLs, and counts.',
+    };
+  }
+  return {
+    artifactSummary: undefined,
+    failureSummary: undefined,
+    primaryAction: 'none',
+    continueMode: 'none',
+    nextSafeAction: summary.because ? `Run summary: ${summary.because}` : 'Open the trace to review the run.',
+  };
+}
+
+function boardActionForStatus(sourceKind: BoardCard['sourceKind'], status: string, hasApproval: boolean): {
+  primaryAction: BoardPrimaryAction;
+  continueMode: BoardContinueMode;
+  nextSafeAction?: string;
+} {
+  if (hasApproval || status === 'awaiting_approval') {
+    return {
+      primaryAction: 'approve',
+      continueMode: 'approval',
+      nextSafeAction: sourceKind === 'workflow'
+        ? 'Approve or reject; the workflow runner resumes the parked step.'
+        : 'Approve or reject; Clementine continues from the paused tool call.',
+    };
+  }
+  if (status === 'awaiting_continue' || status === 'paused'
+    || (sourceKind === 'background' && (status === 'interrupted' || status === 'failed' || status === 'aborted'))) {
+    return {
+      primaryAction: 'continue',
+      continueMode: sourceKind === 'background' ? 'background' : 'workflow_resume',
+      nextSafeAction: 'Continue with a fresh budget from the last saved state.',
+    };
+  }
+  return { primaryAction: 'none', continueMode: 'none' };
+}
+
 const CONSOLE_HARNESS_REPLAY_TYPES = new Set<HarnessEventRow['type']>([
   'turn_started',
   'tool_called',
@@ -620,6 +743,120 @@ function readContextGoals(): Array<Record<string, unknown>> {
     })
     .filter((goal): goal is Record<string, unknown> => goal !== null)
     .sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
+}
+
+function stringsFromBody(value: unknown, limit = 12): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean).slice(0, limit);
+  if (typeof value === 'string') {
+    return value
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^[-*]\s*/, '').trim())
+      .filter(Boolean)
+      .slice(0, limit);
+  }
+  return [];
+}
+
+function numberFromBody(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function deadlineFromBody(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const t = Date.parse(value);
+  return Number.isFinite(t) ? new Date(t).toISOString() : undefined;
+}
+
+function isGoalContract(record: PlanProposal): boolean {
+  if (record.status === 'active' || record.status === 'satisfied' || record.status === 'expired') return true;
+  return Boolean(record.origin || record.evidence?.length || record.progressLedger?.length || record.selfDriving || record.parked);
+}
+
+function goalUpdatedAt(record: PlanProposal): string {
+  return record.lastActivityAt ?? record.resolvedAt ?? record.proposedAt;
+}
+
+function goalActions(record: PlanProposal): string[] {
+  if (record.status !== 'active') return [];
+  return [
+    record.selfDriving ? 'disable_self_drive' : 'enable_self_drive',
+    record.parked ? 'unpark' : 'park',
+    'satisfy',
+    'expire',
+  ];
+}
+
+function summarizeGoal(record: PlanProposal): Record<string, unknown> {
+  const plan = record.approvedPlan ?? record.plan;
+  const currentStage = getCurrentGoalStage(record);
+  const stages = record.stages ?? [];
+  const stageDone = stages.filter((stage) => stage.status === 'done').length;
+  const evidence = record.evidence ?? [];
+  const active = record.status === 'active';
+  const selfDriving = active && record.selfDriving === true;
+  return {
+    id: record.id,
+    status: record.status,
+    objective: plan.objective,
+    successCriteria: plan.successCriteria ?? [],
+    steps: plan.steps ?? [],
+    risks: plan.risks ?? [],
+    origin: record.origin ?? null,
+    sessionId: record.sessionId ?? null,
+    channel: record.channel ?? null,
+    createdAt: record.proposedAt,
+    updatedAt: goalUpdatedAt(record),
+    resolvedAt: record.resolvedAt ?? null,
+    doneReason: record.doneReason ?? record.rejectionReason ?? null,
+    selfDriving,
+    nextResumeAt: selfDriving ? record.nextResumeAt ?? null : null,
+    resumeEveryMs: selfDriving ? record.resumeEveryMs ?? null : null,
+    resumeCount: record.resumeCount ?? 0,
+    maxResumes: record.maxResumes ?? null,
+    noProgressStreak: record.noProgressStreak ?? 0,
+    deadlineAt: record.deadlineAt ?? null,
+    parked: record.parked ?? null,
+    attempt: record.attempt ?? 0,
+    maxAttempts: record.maxAttempts ?? null,
+    progressLedger: (record.progressLedger ?? []).slice(-8),
+    stages,
+    currentStage,
+    stageProgress: stages.length > 0 ? { done: stageDone, total: stages.length } : null,
+    evidenceSummary: {
+      total: evidence.length,
+      passed: evidence.filter((item) => item.pass).length,
+      failed: evidence.filter((item) => !item.pass).length,
+      latest: evidence.slice(-5),
+    },
+    actions: goalActions(record),
+  };
+}
+
+function buildGoalsPayload(filter: string | undefined): Record<string, unknown> {
+  const all = listPlanProposals({ status: 'all' })
+    .filter(isGoalContract)
+    .sort((a, b) => goalUpdatedAt(b).localeCompare(goalUpdatedAt(a)));
+  const goals = all.filter((goal) => {
+    if (filter === 'active') return goal.status === 'active' && !goal.parked;
+    if (filter === 'parked') return goal.status === 'active' && Boolean(goal.parked);
+    if (filter === 'terminal') return goal.status === 'satisfied' || goal.status === 'expired';
+    if (filter === 'self_driving') return goal.status === 'active' && Boolean(goal.selfDriving);
+    return true;
+  });
+  return {
+    goals: goals.map(summarizeGoal),
+    counts: {
+      total: all.length,
+      active: all.filter((goal) => goal.status === 'active' && !goal.parked).length,
+      parked: all.filter((goal) => goal.status === 'active' && Boolean(goal.parked)).length,
+      selfDriving: all.filter((goal) => goal.status === 'active' && Boolean(goal.selfDriving)).length,
+      satisfied: all.filter((goal) => goal.status === 'satisfied').length,
+      expired: all.filter((goal) => goal.status === 'expired').length,
+    },
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 function realtimeNumberEnv(name: string, fallback: number, min: number, max: number): number {
@@ -923,11 +1160,25 @@ export function grepProjectFiles(
 
 /** The four columns of the unified background-work board. */
 type BoardColumnId = 'queued' | 'running' | 'needs_you' | 'done';
+type BoardPrimaryAction = 'approve' | 'continue' | 'retry_failed_items' | 'open_result' | 'none';
+type BoardContinueMode = 'approval' | 'background' | 'workflow_failed_items' | 'workflow_resume' | 'open_result' | 'none';
+
+interface BoardArtifactSummary {
+  files: string[];
+  urls: string[];
+  counts: string[];
+}
+
+interface BoardFailureSummary {
+  failedItems: number;
+  retryable: boolean;
+  reason: string;
+}
 
 /** One normalized card on the Tasks board (see GET /api/console/board). */
 interface BoardCard {
   id: string;
-  sourceKind: 'background' | 'run' | 'execution' | 'workflow';
+  sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval';
   title: string;
   column: BoardColumnId;
   /** Raw source status, for the pill label / tooltip. */
@@ -938,8 +1189,14 @@ interface BoardCard {
   sessionId: string | null;
   ageMs: number;
   updatedAt: string;
-  /** Drag/button actions the card allows: 'cancel' | 'resume' | 'promote' | 'archive' | 'restore'. */
+  /** Drag/button actions the card allows. Drag uses only cancel/resume/promote; buttons may use the rest. */
   actions: string[];
+  primaryAction?: BoardPrimaryAction;
+  continueMode?: BoardContinueMode;
+  approvalId?: string;
+  nextSafeAction?: string;
+  artifactSummary?: BoardArtifactSummary;
+  failureSummary?: BoardFailureSummary;
   /** A finished/parked task idle past the stale threshold (background only) — the
    *  board flags it and the heartbeat offers to archive it. */
   stale?: boolean;
@@ -955,12 +1212,10 @@ export function registerConsoleRoutes(
   assistant: ClementineAssistant,
   opts?: { serveLegacyAtRoot?: boolean },
 ): void {
-  // Renders the legacy inlined-HTML console. Bound to /console-legacy
-  // always, and to /console unless the new React SPA (console-spa.ts) is
-  // serving there (controlled by the CLEMENTINE_CONSOLE_NEXT flag in
-  // webhook.ts). This keeps the old console one URL away during the
-  // staged migration.
-  const serveLegacyConsole = (req: Request, res: Response): void => {
+  // Renders the legacy inlined-HTML console only when explicitly requested.
+  // The renderer is intentionally lazy-loaded because it is a large inline
+  // HTML module and should not sit on the normal React console startup path.
+  const serveLegacyConsole = async (req: Request, res: Response): Promise<void> => {
     if (!isAuthorized(req)) {
       res.status(401).send('Unauthorized');
       return;
@@ -969,7 +1224,12 @@ export function registerConsoleRoutes(
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    res.type('html').send(renderConsoleHtml(queryToken));
+    try {
+      const { renderConsoleHtml } = await import('./console.js');
+      res.type('html').send(renderConsoleHtml(queryToken));
+    } catch (err) {
+      res.status(500).type('text').send(err instanceof Error ? err.message : String(err));
+    }
   };
   app.get('/console-legacy', serveLegacyConsole);
   if (opts?.serveLegacyAtRoot ?? true) {
@@ -1851,6 +2111,29 @@ export function registerConsoleRoutes(
       });
 
       res.json({ crons: result });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/crons/:name/trigger', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const jobName = Array.isArray(req.params.name) ? req.params.name[0] : req.params.name;
+    const trimmed = typeof jobName === 'string' ? jobName.trim() : '';
+    if (!trimmed) {
+      res.status(400).json({ error: 'cron job name is required' });
+      return;
+    }
+    try {
+      ensureDir(CRON_TRIGGERS_DIR);
+      const safeName = trimmed.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const file = `${Date.now()}-${safeName}.json`;
+      writeFileSync(
+        path.join(CRON_TRIGGERS_DIR, file),
+        JSON.stringify({ jobName: trimmed, triggeredAt: new Date().toISOString() }, null, 2),
+        'utf-8',
+      );
+      res.json({ ok: true, jobName: trimmed, file });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -4757,6 +5040,177 @@ export function registerConsoleRoutes(
     res.json({ deleted: true });
   });
 
+  // ─── Goals (activated plan-contracts) ───────────────────────────
+
+  app.get('/api/console/goals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const filter = ['active', 'parked', 'terminal', 'self_driving', 'all'].includes(status ?? '') ? status : 'all';
+    try {
+      res.json(buildGoalsPayload(filter));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/goals/draft', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim() : '';
+    if (notes.length < 8) { res.status(400).json({ error: 'notes required' }); return; }
+    const desiredOutcome = typeof req.body?.desiredOutcome === 'string' ? req.body.desiredOutcome.trim() : undefined;
+    try {
+      res.json({ draft: draftGoalFromNotes({ notes, desiredOutcome }) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/goal-drafts', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const wanted = (status === 'pending' || status === 'created' || status === 'dismissed' || status === 'all')
+      ? status
+      : 'pending';
+    try {
+      res.json({ drafts: listGoalDrafts({ status: wanted, limit: 50 }) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/goal-drafts', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim() : '';
+    if (notes.length < 8) { res.status(400).json({ error: 'notes required' }); return; }
+    const desiredOutcome = typeof req.body?.desiredOutcome === 'string' ? req.body.desiredOutcome.trim() : undefined;
+    try {
+      const draft = surfaceGoalDraftFromNotes({
+        notes,
+        desiredOutcome,
+        channel: 'console',
+        proposedByAgent: 'user',
+        notify: req.body?.notify === true,
+      });
+      res.json({ draft, drafts: listGoalDrafts({ status: 'pending', limit: 50 }) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/goal-drafts/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const draft = getGoalDraft(req.params.id);
+    if (!draft) { res.status(404).json({ error: 'goal draft not found' }); return; }
+    res.json({ draft });
+  });
+
+  app.post('/api/console/goal-drafts/:id/create', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const resumeEveryMinutes = numberFromBody(req.body?.resumeEveryMinutes, 30, 5, 1440);
+    const maxResumes = numberFromBody(req.body?.maxResumes ?? req.body?.maxAutoResumes, 12, 1, 100);
+    const maxAttempts = numberFromBody(req.body?.maxAttempts, 3, 1, 10);
+    const deadlineAt = deadlineFromBody(req.body?.deadlineAt);
+    const result = createGoalFromDraft(req.params.id, {
+      selfDriving: req.body?.selfDriving === true,
+      resumeEveryMs: resumeEveryMinutes * 60_000,
+      maxResumes,
+      maxAttempts,
+      deadlineAt,
+      channel: 'console',
+    });
+    if (!result) { res.status(404).json({ error: 'pending goal draft not found' }); return; }
+    res.json({
+      draft: result.draft,
+      goal: summarizeGoal(result.goal),
+      drafts: listGoalDrafts({ status: 'pending', limit: 50 }),
+      ...buildGoalsPayload('all'),
+    });
+  });
+
+  app.post('/api/console/goal-drafts/:id/dismiss', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'Dismissed from Goals.';
+    const draft = dismissGoalDraft(req.params.id, reason);
+    if (!draft) { res.status(404).json({ error: 'pending goal draft not found' }); return; }
+    res.json({ draft, drafts: listGoalDrafts({ status: 'pending', limit: 50 }) });
+  });
+
+  app.post('/api/console/goals', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const objective = typeof req.body?.objective === 'string' ? req.body.objective.trim() : '';
+    if (!objective) { res.status(400).json({ error: 'objective required' }); return; }
+    const successCriteria = stringsFromBody(req.body?.successCriteria, 8);
+    const nextActions = stringsFromBody(req.body?.nextActions, 12);
+    const risks = stringsFromBody(req.body?.risks, 8);
+    const selfDriving = req.body?.selfDriving === true;
+    const resumeEveryMinutes = numberFromBody(req.body?.resumeEveryMinutes, 30, 5, 1440);
+    const maxResumes = numberFromBody(req.body?.maxResumes ?? req.body?.maxAutoResumes, 12, 1, 100);
+    const maxAttempts = numberFromBody(req.body?.maxAttempts, 3, 1, 10);
+    const deadlineAt = deadlineFromBody(req.body?.deadlineAt);
+    try {
+      const goal = createGoalContract({
+        objective,
+        successCriteria,
+        nextActions,
+        risks,
+        selfDriving,
+        resumeEveryMs: resumeEveryMinutes * 60_000,
+        maxResumes,
+        maxAttempts,
+        deadlineAt,
+        channel: 'console',
+      });
+      if (!goal) { res.status(400).json({ error: 'could not create goal' }); return; }
+      res.json({ goal: summarizeGoal(goal), ...buildGoalsPayload('all') });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/goals/:id/self-drive', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const enabled = req.body?.enabled !== false;
+    const resumeEveryMinutes = numberFromBody(req.body?.resumeEveryMinutes, 30, 5, 1440);
+    const maxResumes = numberFromBody(req.body?.maxResumes ?? req.body?.maxAutoResumes, 12, 1, 100);
+    const deadlineAt = deadlineFromBody(req.body?.deadlineAt);
+    const goal = enabled
+      ? enableGoalSelfDrive(req.params.id, { resumeEveryMs: resumeEveryMinutes * 60_000, maxResumes, deadlineAt })
+      : disableGoalSelfDrive(req.params.id);
+    if (!goal) { res.status(404).json({ error: 'active goal not found' }); return; }
+    res.json({ goal: summarizeGoal(goal), ...buildGoalsPayload('all') });
+  });
+
+  app.post('/api/console/goals/:id/park', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim() : 'Paused from Goals.';
+    const goal = parkGoal(req.params.id, 'blocker', note);
+    if (!goal) { res.status(404).json({ error: 'active goal not found' }); return; }
+    res.json({ goal: summarizeGoal(goal), ...buildGoalsPayload('all') });
+  });
+
+  app.post('/api/console/goals/:id/unpark', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const goal = unparkGoal(req.params.id);
+    if (!goal) { res.status(404).json({ error: 'active goal not found' }); return; }
+    res.json({ goal: summarizeGoal(goal), ...buildGoalsPayload('all') });
+  });
+
+  app.post('/api/console/goals/:id/satisfy', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'Marked complete from Goals.';
+    const goal = satisfyGoal(req.params.id, reason);
+    if (!goal) { res.status(404).json({ error: 'active goal not found' }); return; }
+    res.json({ goal: summarizeGoal(goal), ...buildGoalsPayload('all') });
+  });
+
+  app.post('/api/console/goals/:id/expire', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'Stopped from Goals.';
+    const goal = expireGoal(req.params.id, reason);
+    if (!goal) { res.status(404).json({ error: 'active goal not found' }); return; }
+    res.json({ goal: summarizeGoal(goal), ...buildGoalsPayload('all') });
+  });
+
   // ─── Plan proposals (Planner sub-agent → user review) ──────────
 
   app.get('/api/console/plan-proposals', (req, res) => {
@@ -5407,6 +5861,9 @@ export function registerConsoleRoutes(
         return Number.isFinite(t) ? Math.max(0, now - t) : 0;
       };
       const cards: BoardCard[] = [];
+      const coveredApprovalIds = new Set<string>();
+      const workflowByDisplayName = new Map(listWorkflows().map((entry) => [entry.data.name, entry]));
+      const workflowBySlug = new Map(listWorkflows().map((entry) => [entry.name, entry]));
 
       // 1) Background tasks — the autonomous "go do this while I'm away" work.
       //    ?includeArchived=1 surfaces soft-deleted tasks (restore-only) for a
@@ -5428,7 +5885,8 @@ export function registerConsoleRoutes(
           if (task.status === 'pending') actions.push('promote', 'cancel');
           else if (task.status === 'awaiting_continue') actions.push('resume', 'cancel');
           else if (task.status === 'running' || task.status === 'cancelling'
-            || task.status === 'awaiting_approval' || task.status === 'blocked') actions.push('cancel');
+            || task.status === 'blocked') actions.push('cancel');
+          else if (task.status === 'awaiting_approval') actions.push('approve', 'reject', 'cancel');
           else if (task.status === 'interrupted' || task.status === 'failed' || task.status === 'aborted') {
             if (!task.resumedIntoTaskId) actions.push('resume');
           }
@@ -5436,6 +5894,8 @@ export function registerConsoleRoutes(
           // one — soft-delete, always restorable.
           if (terminal || sKind) actions.push('archive');
         }
+        if (task.pendingApprovalId) coveredApprovalIds.add(task.pendingApprovalId);
+        const action = boardActionForStatus('background', task.status, Boolean(task.pendingApprovalId));
         cards.push({
           id: task.id,
           sourceKind: 'background',
@@ -5447,6 +5907,10 @@ export function registerConsoleRoutes(
           ageMs: ageMs(task.updatedAt),
           updatedAt: task.updatedAt,
           actions,
+          primaryAction: action.primaryAction,
+          continueMode: action.continueMode,
+          approvalId: task.pendingApprovalId,
+          nextSafeAction: action.nextSafeAction,
           stale: Boolean(sKind),
           staleKind: sKind ?? undefined,
           archived: task.archived || undefined,
@@ -5464,6 +5928,7 @@ export function registerConsoleRoutes(
       for (const run of listRuns(80)) {
         if (run.id.startsWith('run-bg-')) continue; // background task's own run record
         const needsAttention = run.needsAttention === true;
+        if (run.pendingApprovalId) coveredApprovalIds.add(run.pendingApprovalId);
         const column: BoardColumnId =
           needsAttention ? 'needs_you'
             : run.status === 'queued' || run.status === 'received' ? 'queued'
@@ -5471,6 +5936,15 @@ export function registerConsoleRoutes(
               : run.status === 'awaiting_approval' ? 'needs_you'
                 : 'done';
         const live = column === 'queued' || column === 'running' || column === 'needs_you';
+        const workflowName = run.source === 'workflow' ? run.title.replace(/^Workflow:\s*/, '').trim() : '';
+        const workflowEntry = workflowName ? workflowByDisplayName.get(workflowName) : undefined;
+        const workflowRecovery = workflowEntry ? workflowRunRecovery(workflowEntry.name, run.id) : undefined;
+        const action = run.pendingApprovalId
+          ? boardActionForStatus('run', run.status, true)
+          : workflowRecovery ?? boardActionForStatus('run', run.status, false);
+        const actions = run.pendingApprovalId
+          ? ['approve', 'reject', ...(live && !needsAttention ? ['cancel'] : [])]
+          : (live && !needsAttention ? ['cancel'] : []);
         cards.push({
           id: run.id,
           sourceKind: 'run',
@@ -5482,8 +5956,25 @@ export function registerConsoleRoutes(
           sessionId: run.sessionId,
           ageMs: ageMs(run.updatedAt),
           updatedAt: run.updatedAt,
-          actions: live && !needsAttention ? ['cancel'] : [],
-          raw: { error: run.error, source: run.source, pendingApprovalId: run.pendingApprovalId, needsAttention: needsAttention || undefined },
+          actions,
+          primaryAction: action.primaryAction,
+          continueMode: action.continueMode,
+          approvalId: run.pendingApprovalId,
+          nextSafeAction: action.nextSafeAction,
+          artifactSummary: workflowRecovery?.artifactSummary,
+          failureSummary: workflowRecovery?.failureSummary ?? (needsAttention ? {
+            failedItems: 0,
+            retryable: false,
+            reason: run.outputPreview || run.error || 'This run needs human review before Clementine continues.',
+          } : undefined),
+          raw: {
+            error: run.error,
+            source: run.source,
+            pendingApprovalId: run.pendingApprovalId,
+            needsAttention: needsAttention || undefined,
+            workflowName: workflowEntry?.data.name,
+            runId: workflowEntry ? run.id : undefined,
+          },
         });
       }
 
@@ -5496,6 +5987,7 @@ export function registerConsoleRoutes(
         const actions: string[] = [];
         if (exec.status === 'active' || exec.status === 'blocked') actions.push('cancel');
         else if (exec.status === 'paused') actions.push('resume', 'cancel');
+        const action = boardActionForStatus('execution', exec.status, false);
         cards.push({
           id: exec.id,
           sourceKind: 'execution',
@@ -5507,6 +5999,14 @@ export function registerConsoleRoutes(
           ageMs: ageMs(exec.updatedAt),
           updatedAt: exec.updatedAt,
           actions,
+          primaryAction: action.primaryAction,
+          continueMode: action.continueMode,
+          nextSafeAction: action.nextSafeAction,
+          failureSummary: exec.status === 'blocked' ? {
+            failedItems: 0,
+            retryable: false,
+            reason: exec.blocker || 'This goal needs human input before Clementine continues.',
+          } : undefined,
           raw: { blocker: exec.blocker, pausedBy: exec.pausedBy, objective: exec.objective },
         });
       }
@@ -5516,19 +6016,91 @@ export function registerConsoleRoutes(
       //    these uses the run-events poll, not the session SSE (workflow steps
       //    run under per-step `workflow:<suffix>` sessions we can't address).
       for (const pending of listPendingRuns()) {
+        const workflowEntry = workflowBySlug.get(pending.workflowName) ?? workflowByDisplayName.get(pending.workflowName);
+        const recovery = workflowRunRecovery(pending.workflowName, pending.runId);
         const column: BoardColumnId = pending.inFlightStepId ? 'running' : 'queued';
         cards.push({
           id: `wf:${pending.workflowName}:${pending.runId}`,
           sourceKind: 'workflow',
-          title: pending.workflowName,
+          title: workflowEntry?.data.name ?? pending.workflowName,
           column,
           status: pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
           progressHint: pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
           sessionId: null,
           ageMs: ageMs(pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
-          actions: ['cancel'],
-          raw: { workflowName: pending.workflowName, runId: pending.runId },
+          actions: recovery.failureSummary?.retryable ? ['retry_failed_items', 'cancel'] : ['cancel'],
+          primaryAction: recovery.primaryAction,
+          continueMode: recovery.continueMode,
+          nextSafeAction: recovery.nextSafeAction,
+          artifactSummary: recovery.artifactSummary,
+          failureSummary: recovery.failureSummary,
+          raw: { workflowName: workflowEntry?.data.name ?? pending.workflowName, workflowSlug: pending.workflowName, runId: pending.runId },
+        });
+      }
+
+      // 5) Standalone approvals — approvals not already represented by a
+      // background task or run still need to be actionable from Tasks.
+      for (const row of approvalRegistry.listPending({ status: 'pending' })) {
+        if (coveredApprovalIds.has(row.approvalId)) continue;
+        coveredApprovalIds.add(row.approvalId);
+        const session = getHarnessSession(row.sessionId);
+        const isWorkflowApproval = session?.kind === 'workflow';
+        const workflowName = typeof session?.metadata?.workflowName === 'string' ? session.metadata.workflowName : undefined;
+        const workflowRunId = typeof session?.metadata?.workflowRunId === 'string' ? session.metadata.workflowRunId : undefined;
+        cards.push({
+          id: `approval:${row.approvalId}`,
+          sourceKind: 'approval',
+          title: row.subject || 'Approval required',
+          column: 'needs_you',
+          status: 'awaiting_approval',
+          progressHint: approvalSummaryFromArgs(row.args ?? undefined, row.subject),
+          sessionId: row.sessionId,
+          ageMs: ageMs(row.requestedAt),
+          updatedAt: row.requestedAt,
+          actions: ['approve', 'reject'],
+          primaryAction: 'approve',
+          continueMode: 'approval',
+          approvalId: row.approvalId,
+          nextSafeAction: isWorkflowApproval
+            ? 'Approve or reject; the workflow runner resumes the parked step.'
+            : 'Approve or reject; Clementine resumes the paused run.',
+          raw: {
+            approvalKind: 'harness',
+            tool: row.tool,
+            reason: approvalReasonFromArgs(row.args ?? undefined),
+            workflowName,
+            runId: workflowRunId,
+          },
+        });
+      }
+
+      let runtimeApprovals: PendingApproval[] = [];
+      try {
+        runtimeApprovals = assistant.getRuntime().listPendingApprovals();
+      } catch {
+        runtimeApprovals = [];
+      }
+      for (const approval of runtimeApprovals) {
+        if (coveredApprovalIds.has(approval.id)) continue;
+        coveredApprovalIds.add(approval.id);
+        const args = extractRuntimeApprovalArgs(approval);
+        cards.push({
+          id: `approval:${approval.id}`,
+          sourceKind: 'approval',
+          title: `Approve: ${summarizeApprovalAction(approval)}`,
+          column: 'needs_you',
+          status: 'awaiting_approval',
+          progressHint: approvalSummaryFromArgs(args, summarizeApprovalAction(approval)),
+          sessionId: approval.sessionId,
+          ageMs: ageMs(approval.createdAt),
+          updatedAt: approval.createdAt,
+          actions: ['approve', 'reject'],
+          primaryAction: 'approve',
+          continueMode: 'approval',
+          approvalId: approval.id,
+          nextSafeAction: 'Approve or reject; Clementine resumes the paused runtime approval.',
+          raw: { approvalKind: 'runtime', tool: approval.toolName, reason: approvalReasonFromArgs(args) },
         });
       }
 
@@ -5660,6 +6232,185 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  app.post('/api/console/board/approval/:id/:decision', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const id = req.params.id;
+    const decision = req.params.decision;
+    if (decision !== 'approve' && decision !== 'reject') {
+      res.status(400).json({ ok: false, reason: 'decision must be approve or reject' });
+      return;
+    }
+    const approved = decision === 'approve';
+
+    try {
+      // Background tasks park the SDK run and need a queued continuation; a
+      // direct resolve would skip the task state machine and strand the card.
+      const queued = queueBackgroundTaskApprovalResolution(id, approved);
+      if (queued) {
+        res.json({
+          ok: true,
+          approvalId: id,
+          status: approved ? 'approved' : 'rejected',
+          queuedTaskId: queued.id,
+          sessionId: queued.runSessionId,
+          message: `Queued background task continuation: ${queued.id}.`,
+        });
+        return;
+      }
+
+      const existing = approvalRegistry.get(id);
+      if (existing) {
+        if (existing.status !== 'pending') {
+          res.status(409).json({ ok: false, reason: 'approval already resolved', approval: existing });
+          return;
+        }
+        const auditResolution = approved ? 'approved' : 'rejected';
+        const harnessSession = HarnessSession.load(existing.sessionId);
+        const sessionRowForKind = getHarnessSession(existing.sessionId);
+        const shouldResume = sessionRowForKind?.kind !== 'workflow'
+          && !!harnessSession?.loadInterruptState();
+
+        if (!shouldResume) {
+          const result = approvalRegistry.resolve(id, auditResolution, 'desktop-tasks-board');
+          if (!result.ok) {
+            res.status(409).json({ ok: false, reason: result.reason ?? 'could not resolve approval', approval: result.row });
+            return;
+          }
+          res.json({
+            ok: true,
+            approval: result.row,
+            status: sessionRowForKind?.kind === 'workflow' ? 'resolved-workflow-runner-resumes' : 'resolved-stale',
+            message: `${approved ? 'Approved' : 'Rejected'} ${id}.`,
+          });
+          return;
+        }
+
+        const auth = await configureHarnessRuntime();
+        if (!auth.ok) { res.status(412).json({ ok: false, reason: auth.reason }); return; }
+
+        const result = approvalRegistry.resolve(id, auditResolution, 'desktop-tasks-board');
+        if (!result.ok) {
+          res.status(409).json({ ok: false, reason: result.reason ?? 'could not resolve approval', approval: result.row });
+          return;
+        }
+
+        const sessionId = existing.sessionId;
+        res.status(202).json({
+          ok: true,
+          approval: result.row,
+          sessionId,
+          streamUrl: `/api/sessions/${sessionId}/events`,
+          status: 'resuming',
+          message: `${approved ? 'Approved' : 'Rejected'} ${id}; resuming the run.`,
+        });
+
+        setImmediate(async () => {
+          try {
+            const agent = await buildOrchestratorAgent({ sessionId });
+            await runConversationFromResume({
+              agent,
+              sessionId,
+              decision,
+              resolver: 'desktop-tasks-board',
+            });
+          } catch (err) {
+            try {
+              appendHarnessEvent({
+                sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'run_failed',
+                data: {
+                  error: err instanceof Error ? err.message : String(err),
+                  stage: 'tasks_board_approval_resume',
+                },
+              });
+            } catch { /* best effort */ }
+          }
+        });
+        return;
+      }
+
+      const result = await assistant.getRuntime().resolveApproval(id, approved);
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/board/workflow/:name/runs/:runId/retry-failed-items', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ ok: false, reason: 'workflow not found' }); return; }
+    const runId = req.params.runId;
+    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ ok: false, reason: 'workflow run not found' });
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ ok: false, reason: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      const stepIds = Array.from(new Set(listFinalFailedItems(entry.name, runId).map((item) => item.stepId)));
+      const stepId = typeof req.body?.stepId === 'string' && req.body.stepId.trim()
+        ? req.body.stepId.trim()
+        : stepIds.length === 1 ? stepIds[0] : undefined;
+      const result = requeueWorkflowFailedItemsFromRun(runId, { stepId });
+      res.json({
+        ok: result.status === 'queued' || result.status === 'duplicate',
+        status: result.status,
+        id: result.id,
+        message: result.message,
+        failedItems: result.failedItems ?? [],
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/board/workflow/:name/runs/:runId/resume-safe', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ ok: false, reason: 'workflow not found' }); return; }
+    const runId = req.params.runId;
+    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ ok: false, reason: 'workflow run not found' });
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ ok: false, reason: 'workflow run does not belong to this workflow' });
+        return;
+      }
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    const failedItems = listFinalFailedItems(entry.name, runId);
+    if (failedItems.length > 0) {
+      res.status(409).json({
+        ok: false,
+        reason: 'This run has failed forEach items; retry failed items only to avoid duplicating successful work.',
+        failedItems,
+      });
+      return;
+    }
+    const result = requeueWorkflowFromRun(runId);
+    res.status(result.status === 'not_found' ? 404 : 200).json({
+      ok: result.status === 'queued' || result.status === 'duplicate',
+      status: result.status,
+      id: result.id,
+      message: result.message,
+    });
   });
 
   /**

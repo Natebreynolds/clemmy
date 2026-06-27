@@ -4272,7 +4272,8 @@ async function processOneRunFile(
       // partial TRY runs (no full deliverable) and runs with blocked steps
       // (those route to diagnosis/self-heal first — validating a half-run
       // would always fail and burn a re-pursuit attempt for nothing).
-      const runGoal = declaredRunGoal && !run.targetStepId && blockedSteps.length === 0 ? declaredRunGoal : null;
+      const runGoalContractEnabled = (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
+      const runGoal = runGoalContractEnabled && declaredRunGoal && !run.targetStepId && blockedSteps.length === 0 ? declaredRunGoal : null;
       let goalVerdict: GoalValidationResult | null = null;
       let goalDecision: GoalRunDecision | null = null;
       let goalFeedbackNext = '';

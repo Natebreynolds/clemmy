@@ -69,6 +69,7 @@ import {
 } from '../runtime/notifications.js';
 import { buildDiscordInstallUrl } from './discord-install.js';
 import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { createGoalFromDraft, dismissGoalDraft, getGoalDraft } from '../agents/goal-drafts.js';
 import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
@@ -1053,6 +1054,25 @@ function buildPlanClarificationActions(planProposalId: string) {
   ];
 }
 
+function buildGoalDraftActions(goalDraftId: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:goal-draft-review:${goalDraftId}`)
+        .setLabel('Review in Goals')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:goal-draft-create:${goalDraftId}`)
+        .setLabel('Create Goal')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:goal-draft-dismiss:${goalDraftId}`)
+        .setLabel('Dismiss')
+        .setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
 function buildCheckInActions(checkInId: string) {
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -1088,6 +1108,12 @@ export function buildActionsForNotification(metadata: Record<string, unknown> | 
     if (!proposal) return undefined;
     if (planProposalNeedsUserInput(proposal)) return buildPlanClarificationActions(planProposalId);
     return buildPlanProposalActions(planProposalId);
+  }
+  const goalDraftId = typeof metadata.goalDraftId === 'string' ? metadata.goalDraftId : undefined;
+  if (goalDraftId) {
+    const draft = getGoalDraft(goalDraftId);
+    if (!draft || draft.status !== 'pending') return undefined;
+    return buildGoalDraftActions(goalDraftId);
   }
   const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
   if (approvalId) return buildApprovalActions(approvalId);
@@ -2332,6 +2358,45 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         ].join('\n'),
         ephemeral: true,
       });
+      return;
+    }
+
+    if (action === 'goal-draft-review') {
+      const draft = getGoalDraft(targetId);
+      if (!draft || draft.status !== 'pending') {
+        await interaction.reply({ content: `Goal draft \`${targetId}\` was not found or is already resolved.`, ephemeral: true });
+        return;
+      }
+      await interaction.reply({
+        content: [
+          `**${draft.draft.objective}**`,
+          draft.draft.missingInputs.length > 0
+            ? `Needs review: ${draft.draft.missingInputs.join(', ')}`
+            : 'Ready to review and create.',
+          'Open Clementine Desktop -> Goals to edit, create, or dismiss this draft.',
+        ].join('\n'),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (action === 'goal-draft-create') {
+      const result = createGoalFromDraft(targetId);
+      if (!result) {
+        await interaction.reply({ content: `Goal draft \`${targetId}\` was not found or is already resolved.`, ephemeral: true });
+        return;
+      }
+      await collapseApprovalCard(interaction, 'approved', `created goal ${result.goal.id}`);
+      return;
+    }
+
+    if (action === 'goal-draft-dismiss') {
+      const result = dismissGoalDraft(targetId, 'dismissed via Discord button');
+      if (!result) {
+        await interaction.reply({ content: `Goal draft \`${targetId}\` was not found or is already resolved.`, ephemeral: true });
+        return;
+      }
+      await collapseApprovalCard(interaction, 'rejected', 'goal draft dismissed');
       return;
     }
 

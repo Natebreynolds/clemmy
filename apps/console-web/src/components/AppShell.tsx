@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { TopBar } from './TopBar';
@@ -17,9 +17,19 @@ function titleForPath(pathname: string): string {
 }
 
 export function AppShell() {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => (
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 720px)').matches : false
+  ));
   const location = useLocation();
   const title = titleForPath(location.pathname);
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 720px)');
+    const sync = () => { if (media.matches) setCollapsed(true); };
+    sync();
+    media.addEventListener('change', sync);
+    return () => media.removeEventListener('change', sync);
+  }, []);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-canvas text-fg">

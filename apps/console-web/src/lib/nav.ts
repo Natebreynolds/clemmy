@@ -1,7 +1,7 @@
 import {
   MessageCircle, Inbox, Zap, Plug, Brain, Video, LayoutDashboard,
   BarChart3, Wrench, Stethoscope, Gauge, Sliders, Sparkles,
-  Settings, HelpCircle, ListChecks, Users, FlaskConical,
+  Settings, HelpCircle, ListChecks, Users, FlaskConical, Goal,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -18,6 +18,7 @@ export const PRIMARY_NAV: NavDest[] = [
   { path: '/chat', label: 'Chat', icon: MessageCircle, hint: 'Talk to Clementine' },
   { path: '/inbox', label: 'Inbox', icon: Inbox, hint: 'Approvals, activity & notifications' },
   { path: '/tasks', label: 'Tasks', icon: ListChecks, hint: 'Live board of everything Clem is working on' },
+  { path: '/goals', label: 'Goals', icon: Goal, hint: 'Long-running outcomes and self-drive' },
   { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows, schedules & skills' },
   { path: '/workspaces', label: 'Workspaces', icon: LayoutDashboard, hint: 'Live surfaces Clem built for you' },
   { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },

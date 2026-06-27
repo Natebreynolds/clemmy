@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MessageCircle, Keyboard, RefreshCw, ExternalLink } from 'lucide-react';
+import { MessageCircle, Keyboard, RefreshCw } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -62,9 +62,6 @@ export function Help() {
               <RefreshCw className={checking ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} aria-hidden /> Check for updates
             </Button>
           )}
-          <a href="/console-legacy" target="_self">
-            <Button variant="ghost" size="sm"><ExternalLink className="h-4 w-4" aria-hidden /> Classic view</Button>
-          </a>
         </Card>
       </div>
     </Page>

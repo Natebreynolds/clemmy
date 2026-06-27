@@ -27,7 +27,7 @@ import { BoardColumn } from '@/components/board/BoardColumn';
 import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
 import {
   listBoard, COLUMNS, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
-  type BoardCard, type BoardColumnId,
+  type BoardCard, type BoardColumnId, type BoardButtonIntent,
 } from '@/lib/board';
 
 interface Toast { tone: 'success' | 'danger'; text: string; }
@@ -79,6 +79,19 @@ export function BackgroundTasks() {
     flash({ tone: 'success', text: `Archived “${card.title}”.` });
     const res = await runBoardAction(card, 'archive');
     if (!res.ok) flash({ tone: 'danger', text: res.reason || 'Couldn’t archive that task.' });
+    void qc.invalidateQueries({ queryKey: ['board'] });
+  };
+
+  const onCardAction = async (card: BoardCard, intent: BoardButtonIntent) => {
+    const label = intent === 'approve' ? 'Approving'
+      : intent === 'reject' ? 'Rejecting'
+        : intent === 'retry_failed_items' ? 'Retrying failed items for'
+          : intent === 'resume_safe' || intent === 'resume' ? 'Continuing'
+            : intent === 'cancel' ? 'Cancelling'
+              : 'Updating';
+    flash({ tone: 'success', text: `${label} “${card.title}”…` });
+    const res = await runBoardAction(card, intent);
+    if (!res.ok) flash({ tone: 'danger', text: res.reason || 'That action didn’t go through.' });
     void qc.invalidateQueries({ queryKey: ['board'] });
   };
 
@@ -147,6 +160,7 @@ export function BackgroundTasks() {
                 activeCard={active}
                 onOpen={setOpen}
                 onArchive={(card) => void onArchive(card)}
+                onAction={(card, intent) => void onCardAction(card, intent)}
               />
             ))}
           </div>

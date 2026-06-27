@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -29,12 +29,24 @@ const {
 const { startRun, finishRun } = await import('../runtime/run-events.js');
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
-const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { CRON_TRIGGERS_DIR, WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
-interface BoardCard { id: string; column: string; actions: string[]; sourceKind: string; status: string }
+interface BoardCard {
+  id: string;
+  column: string;
+  actions: string[];
+  sourceKind: string;
+  status: string;
+  primaryAction?: string;
+  approvalId?: string;
+  failureSummary?: { failedItems: number; retryable: boolean; reason: string };
+  raw?: Record<string, unknown>;
+}
 
 async function boot(authorized = { v: true }) {
   const app = express();
@@ -93,12 +105,87 @@ test('GET /api/console/board normalizes every background-task status into the ri
     };
     expect(pending.id, 'queued', ['promote', 'cancel']);
     expect(running.id, 'running', ['cancel']);
-    expect(awaiting.id, 'needs_you', ['cancel']);
+    expect(awaiting.id, 'needs_you', ['approve', 'reject', 'cancel']);
     expect(blocked.id, 'needs_you', ['cancel']);
     expect(awaitingContinue.id, 'needs_you', ['resume', 'cancel']);
     // Terminal tasks now also offer `archive` (declutter the Done column).
     expect(done.id, 'done', ['archive']);
     expect(interrupted.id, 'done', ['resume', 'archive']);
+    assert.equal(byId.get(awaiting.id)?.primaryAction, 'approve');
+    assert.equal(byId.get(awaiting.id)?.approvalId, 'appr-1');
+    assert.equal(byId.get(awaitingContinue.id)?.primaryAction, 'continue');
+  } finally {
+    await h.close();
+  }
+});
+
+test('POST /api/console/crons/:name/trigger queues a JSON cron trigger without dashboard redirect HTML', async () => {
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/crons/nightly%20sync/trigger`, { method: 'POST' });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /application\/json/);
+    const body = await res.json() as { ok: boolean; jobName: string; file: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.jobName, 'nightly sync');
+    assert.ok(body.file.endsWith('-nightly_sync.json'), body.file);
+
+    const files = readdirSync(CRON_TRIGGERS_DIR).filter((name) => name.endsWith('-nightly_sync.json'));
+    assert.equal(files.length, 1);
+    const trigger = JSON.parse(readFileSync(path.join(CRON_TRIGGERS_DIR, files[0]), 'utf-8')) as {
+      jobName: string;
+      triggeredAt: string;
+    };
+    assert.equal(trigger.jobName, 'nightly sync');
+    assert.ok(Number.isFinite(Date.parse(trigger.triggeredAt)));
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/board surfaces standalone pending approvals as actionable cards', async () => {
+  createHarnessSession({ id: 'sess-standalone-approval', kind: 'chat', channel: 'desktop' });
+  const approval = approvalRegistry.register({
+    sessionId: 'sess-standalone-approval',
+    channel: 'desktop',
+    subject: 'Send social calendar draft',
+    tool: 'composio_execute_tool',
+    args: { reason: 'Publish to the review channel first.' },
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: BoardCard[] };
+    const card = body.cards.find((c) => c.id === `approval:${approval.approvalId}`);
+    assert.ok(card, 'standalone approval card is present');
+    assert.equal(card!.sourceKind, 'approval');
+    assert.equal(card!.column, 'needs_you');
+    assert.equal(card!.primaryAction, 'approve');
+    assert.equal(card!.approvalId, approval.approvalId);
+    assert.deepEqual(card!.actions, ['approve', 'reject']);
+  } finally {
+    await h.close();
+  }
+});
+
+test('board approval action queues a parked background task continuation', async () => {
+  const task = createBackgroundTask({ title: 'approve from board', prompt: 'p' });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskAwaitingApproval(task.id, 'appr-board-bg', 'needs approval');
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board/approval/appr-board-bg/approve`, { method: 'POST' });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { ok: boolean; queuedTaskId?: string; status?: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.queuedTaskId, task.id);
+    assert.equal(body.status, 'approved');
+    const after = getBackgroundTask(task.id);
+    assert.equal(after?.status, 'pending');
+    assert.equal(after?.approvalResolution?.approved, true);
   } finally {
     await h.close();
   }
@@ -296,6 +383,13 @@ test('workflow failed-item recovery endpoints list and requeue only final failed
 
   const h = await boot();
   try {
+    const board = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: BoardCard[] };
+    const wfCard = board.cards.find((c) => c.sourceKind === 'workflow' && c.raw?.runId === runId);
+    assert.ok(wfCard, 'workflow run appears on the Tasks board');
+    assert.equal(wfCard!.primaryAction, 'retry_failed_items');
+    assert.equal(wfCard!.failureSummary?.failedItems, 1);
+    assert.equal(wfCard!.failureSummary?.retryable, true);
+
     const listed = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}/runs/${runId}/failed-items`);
     assert.equal(listed.status, 200);
     const listBody = await listed.json() as {
@@ -312,7 +406,7 @@ test('workflow failed-item recovery endpoints list and requeue only final failed
       [{ stepId: 'send', itemKey: 'b', error: 'still failed' }],
     );
 
-    const retry = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}/runs/${runId}/retry-failed-items`, {
+    const retry = await fetch(`${h.url}/api/console/board/workflow/${encodeURIComponent(workflowSlug)}/runs/${runId}/retry-failed-items`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ stepId: 'send' }),

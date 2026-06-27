@@ -1,6 +1,6 @@
 {
   "name": "clemmy",
-  "version": "0.12.17",
+  "version": "0.12.18",
   "description": "Lightweight background agent system — proactive, customizable, runs out of the box",
   "license": "MIT",
   "homepage": "https://github.com/Natebreynolds/clemmy",
@@ -50,6 +50,7 @@
     "probe:judge:live": "tsx scripts/probe-judge-live.ts",
     "stress:memory": "tsx scripts/memory-roundtrip-stress.ts",
     "smoke:fusion-readiness": "tsx scripts/smoke-fusion-readiness.ts",
+    "smoke:objective-workflow": "tsx scripts/smoke-objective-workflow.mts",
     "test:smoke": "node scripts/smoke-fresh-install.mjs && node scripts/smoke-fresh-install-e2e.mjs",
     "test:smoke:gate": "node scripts/smoke-fresh-install.mjs",
     "smoke:codex-native-compaction": "node scripts/smoke-codex-native-compaction.mjs",

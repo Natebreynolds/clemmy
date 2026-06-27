@@ -989,6 +989,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'note_create',
       // Notifications + user input
       'notify_user',
+      'draft_goal_from_notes',
       'share_plan',
       // Composio surface (search + execute + status)
       'composio_list_tools',

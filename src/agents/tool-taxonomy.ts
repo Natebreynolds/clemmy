@@ -229,6 +229,7 @@ const ALWAYS_READ = new Set<string>([
   // draft_plan / share_plan / propose_check_in_template / surface_plan — planning
   // surfaces, agent-internal. Not network mutations.
   'draft_plan',
+  'draft_goal_from_notes',
   'share_plan',
   'surface_plan',
   'propose_check_in_template',

@@ -817,6 +817,22 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     res.json({ notifications: listNotifications(limit) });
   });
 
+  app.post('/api/notifications/:id/read', requireAuth, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const notification = markNotificationRead(id);
+    if (!notification) {
+      res.status(404).json({ error: 'Notification not found' });
+      return;
+    }
+    res.json({ ok: true, notification });
+  });
+
+  app.post('/api/notifications/:id/retry', requireAuth, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    requeueNotificationDelivery(id);
+    res.json({ ok: true });
+  });
+
   app.get('/api/notifications/destinations', requireAuth, (_req, res) => {
     res.json({ destinations: listNotificationDestinations() });
   });

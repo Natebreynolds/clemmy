@@ -87,6 +87,7 @@ test('classifyTool: local-side-effect tools never gate on approval', () => {
   assert.equal(classifyTool('notify_user'), 'read');
   assert.equal(classifyTool('ask_user_question'), 'read');
   assert.equal(classifyTool('draft_plan'), 'read');
+  assert.equal(classifyTool('draft_goal_from_notes'), 'read');
   assert.equal(classifyTool('share_plan'), 'read');
   assert.equal(classifyTool('surface_plan'), 'read');
   assert.equal(classifyTool('propose_check_in_template'), 'read');

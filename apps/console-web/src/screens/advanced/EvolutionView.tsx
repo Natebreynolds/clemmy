@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { ArrowRight, ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck, GitPullRequest, Check, X } from 'lucide-react';
+import { ArrowRight, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck, GitPullRequest, Check, X } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -709,8 +709,7 @@ function MemoryRefinementsCard({ data, onCleaned }: { data: MemoryRefinements; o
       )}
 
       <p className="mt-5 border-t border-border/60 pt-3 text-caption text-faint">
-        Every approval is soft and reversible — undo anytime in{' '}
-        <a className="text-accent underline-offset-2 hover:underline" href="/console-legacy" target="_self">Classic › Memory › Show forgotten</a>.
+        Every approval is soft and reversible.
       </p>
     </Card>
   );
@@ -887,14 +886,9 @@ export function EvolutionView() {
   };
 
   const actions = (
-    <>
-      <Button variant="primary" size="sm" onClick={onRun} disabled={running}>
-        <RefreshCw className={`h-4 w-4 ${running ? 'animate-spin' : ''}`} aria-hidden /> {running ? 'Running…' : 'Run now'}
-      </Button>
-      <a href="/console-legacy" target="_self">
-        <Button variant="secondary" size="sm"><ExternalLink className="h-4 w-4" aria-hidden /> Classic</Button>
-      </a>
-    </>
+    <Button variant="primary" size="sm" onClick={onRun} disabled={running}>
+      <RefreshCw className={`h-4 w-4 ${running ? 'animate-spin' : ''}`} aria-hidden /> {running ? 'Running…' : 'Run now'}
+    </Button>
   );
 
   return (

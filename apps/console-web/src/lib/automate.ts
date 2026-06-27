@@ -89,7 +89,7 @@ export const setWorkflowEnabled = (name: string, enabled: boolean) =>
 
 export const listCrons = () => apiGet<{ crons: CronRow[] }>('/api/console/crons');
 export const triggerCron = (jobName: string) =>
-  apiPost('/dashboard/actions/trigger-cron', { job_name: jobName });
+  apiPost(`/api/console/crons/${encodeURIComponent(jobName)}/trigger`, {});
 
 export const listSkills = () => apiGet<{ skills: SkillRow[]; count: number }>('/api/console/skills');
 export const installSkill = (url: string) => apiPost('/api/console/skills/install', { url });

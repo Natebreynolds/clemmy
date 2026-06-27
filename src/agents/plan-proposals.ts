@@ -293,10 +293,10 @@ function renderPlanNotificationBody(proposal: PlanProposal): string {
     : '';
   const closing = proposal.plan.needsUserInput.length > 0
     ? '\n\nReply with the missing detail. I will not start until this is clear.'
-    : '\n\nApprove when you want me to start, or reject if this is not the right plan.';
+    : '\n\nReview it, edit it, or approve me to proceed.';
 
   return [
-    'I made a plan before starting.',
+    'I drafted this for review before I start.',
     '',
     `Goal: ${truncateForNotification(proposal.plan.objective, 260)}`,
     '',
@@ -847,6 +847,85 @@ export function createDirectGoal(input: {
   return activateGoal(proposal.id, { origin: { kind: 'chat' }, maxAttempts: input.maxAttempts });
 }
 
+export interface CreateGoalContractInput {
+  objective: string;
+  successCriteria?: string[];
+  nextActions?: string[];
+  risks?: string[];
+  stages?: Array<{ title: string; criteria: string[] }> | null;
+  sessionId?: string;
+  channel?: string;
+  originatingRequest?: string;
+  maxAttempts?: number;
+  selfDriving?: boolean;
+  resumeEveryMs?: number;
+  maxResumes?: number;
+  deadlineAt?: string;
+}
+
+/**
+ * Console/API front door for a durable goal contract. This uses the same
+ * plan-proposal store and activation path as chat-approved plans, but it does
+ * not need an intermediate pending approval because the user is explicitly
+ * creating the goal from the Goals surface.
+ */
+export function createGoalContract(input: CreateGoalContractInput): PlanProposal | null {
+  const objective = input.objective.trim();
+  if (objective.length < 4) return null;
+  const criteria = (input.successCriteria ?? []).map((c) => c.trim()).filter(Boolean).slice(0, 8);
+  const nextActions = (input.nextActions ?? []).map((a) => a.trim()).filter(Boolean).slice(0, 12);
+  const risks = (input.risks ?? []).map((r) => r.trim()).filter(Boolean).slice(0, 8);
+  const stages = Array.isArray(input.stages)
+    ? input.stages
+        .map((stage) => ({
+          title: stage.title.trim(),
+          criteria: stage.criteria.map((c) => c.trim()).filter((c) => criteria.includes(c)),
+        }))
+        .filter((stage) => stage.title.length > 0 && stage.criteria.length > 0)
+        .slice(0, 6)
+    : null;
+  const now = new Date().toISOString();
+  const sessionId = input.sessionId?.trim() || `goal:${randomUUID().slice(0, 8)}`;
+  const proposal: PlanProposal = {
+    id: `goal-${randomUUID().slice(0, 8)}`,
+    proposedAt: now,
+    proposedByAgent: 'user',
+    status: 'pending',
+    originatingRequest: input.originatingRequest?.trim() || objective,
+    sessionId,
+    channel: input.channel?.trim() || 'console',
+    plan: {
+      objective,
+      steps: (nextActions.length > 0 ? nextActions : [`Pursue the objective: ${objective}`]).map((action, i) => ({
+        n: i + 1,
+        action,
+        rationale: i === 0 ? 'Next concrete action toward the goal.' : 'Follow-on action toward the goal.',
+        verification: null,
+      })),
+      successCriteria: criteria,
+      stages,
+      risks,
+      estimatedComplexity: nextActions.length > 3 || criteria.length > 3 ? 'significant' : 'moderate',
+      recommendsTrackedExecution: true,
+      needsUserInput: [],
+      appliedInstructions: [],
+      externalSends: null,
+    },
+    version: 'v1',
+  };
+  writeProposal(proposal);
+  const active = activateGoal(proposal.id, { origin: { kind: 'chat' }, maxAttempts: input.maxAttempts });
+  if (!active) return null;
+  if (input.selfDriving) {
+    return enableGoalSelfDrive(active.id, {
+      resumeEveryMs: input.resumeEveryMs,
+      maxResumes: input.maxResumes,
+      deadlineAt: input.deadlineAt,
+    }) ?? active;
+  }
+  return active;
+}
+
 /** Synthetic session key for a workflow's run-level goal contract — one
  *  active goal per workflow, shared across re-pursuit runs. */
 export function workflowGoalSessionId(workflowName: string): string {
@@ -1052,6 +1131,21 @@ export function enableGoalSelfDrive(id: string, options: EnableSelfDriveOptions 
   };
   writeProposal(updated);
   logger.info({ goalId: id, resumeEveryMs, maxResumes: updated.maxResumes }, 'goal self-drive enabled');
+  return updated;
+}
+
+export function disableGoalSelfDrive(id: string): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'active') return null;
+  const updated: PlanProposal = {
+    ...proposal,
+    selfDriving: false,
+    nextResumeAt: undefined,
+    resumeEveryMs: undefined,
+    lastActivityAt: new Date().toISOString(),
+  };
+  writeProposal(updated);
+  logger.info({ goalId: id }, 'goal self-drive disabled');
   return updated;
 }
 

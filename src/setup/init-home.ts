@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BASE_DIR, VAULT_DIR } from '../config.js';
 import { CRON_FILE, ensureTodayNote, ensureVaultScaffold, WORKFLOWS_DIR } from '../memory/vault.js';
 import { ensureTasksFile, ensureToolDirectories, replaceFile } from '../tools/shared.js';
+import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 
 function ensureDir(dir: string): void {
   if (!existsSync(dir)) {
@@ -137,6 +138,8 @@ async function main(): Promise<void> {
       '',
     ].join('\n'),
   );
+
+  ensureBuiltInWorkflows();
 
   // Example goal to show the format
   const exampleGoalPath = path.join(goalsDir, 'example.json');

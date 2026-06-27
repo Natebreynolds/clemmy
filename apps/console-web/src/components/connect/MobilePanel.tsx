@@ -99,7 +99,6 @@ export function MobilePanel() {
             Disconnect all
           </Button>
         )}
-        <a href="/console-legacy" target="_self" className="text-small text-primary hover:underline">Custom domain →</a>
       </div>
     </Card>
   );

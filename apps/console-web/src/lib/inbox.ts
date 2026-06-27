@@ -77,10 +77,10 @@ export const dismissInboxItem = (kind: string, id: string) =>
   apiPost(`/api/console/inbox/dismiss`, { kind, id });
 
 export const markNotificationRead = (id: string) =>
-  apiPost(`/dashboard/actions/notifications/${encodeURIComponent(id)}/read`);
+  apiPost(`/api/notifications/${encodeURIComponent(id)}/read`);
 
 export const retryNotification = (id: string) =>
-  apiPost(`/dashboard/actions/notifications/${encodeURIComponent(id)}/retry`);
+  apiPost(`/api/notifications/${encodeURIComponent(id)}/retry`);
 
 /** Friendly relative time ("4m", "2h", "3d", "now"). */
 export function relativeTime(value?: string | number | null): string {
