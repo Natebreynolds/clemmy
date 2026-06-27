@@ -13,8 +13,8 @@
  *   --live also runs the Claude subscription transport, Claude Agent SDK local
  *   MCP + memory-read + brain-route + brain workflow-authoring + worker-skill
  *   + workflow-step smokes, Codex-brain→Claude-design workflow smoke, chat
- *   worker routing, and debate live smokes using the user's real Clementine
- *   home/auth. Live mode spends model calls.
+ *   worker routing, BYO backend smoke, and debate live smokes using the user's
+ *   real Clementine home/auth. Live mode spends model calls.
  *
  * Run:
  *   npm run smoke:fusion-readiness
@@ -142,7 +142,7 @@ async function main(): Promise<void> {
   const { listEvents, resetEventLog } = await import('../src/runtime/harness/eventlog.js');
   const { closeMemoryDb } = await import('../src/memory/db.js');
 
-  await check('role picker filters BYO worker/judge capabilities', () => {
+  await check('role picker exposes connected BYO models for non-brain roles', () => {
     withEnv({
       AUTH_MODE: 'codex_oauth',
       MODEL_ROUTING_MODE: 'off',
@@ -155,14 +155,18 @@ async function main(): Promise<void> {
     }, () => {
       const workerIds = new Set(connectedModelGroupsForRole('worker').flatMap((g) => g.models.map((m) => m.id)));
       const judgeIds = new Set(connectedModelGroupsForRole('judge').flatMap((g) => g.models.map((m) => m.id)));
+      assert.equal(workerIds.has('deepseek-chat'), true);
       assert.equal(workerIds.has('qwen-worker'), true);
-      assert.equal(workerIds.has('minimax-judge'), false);
+      assert.equal(workerIds.has('minimax-judge'), true);
+      assert.equal(judgeIds.has('deepseek-chat'), true);
       assert.equal(judgeIds.has('minimax-judge'), true);
-      assert.equal(judgeIds.has('qwen-worker'), false);
-      assert.equal(validateRoleModelBinding('worker', 'minimax-judge').ok, false);
-      assert.equal(validateRoleModelBinding('judge', 'qwen-worker').ok, false);
+      assert.equal(judgeIds.has('qwen-worker'), true);
+      assert.equal(validateRoleModelBinding('worker', 'minimax-judge').ok, true);
+      assert.equal(validateRoleModelBinding('judge', 'qwen-worker').ok, true);
+      assert.equal(validateRoleModelBinding('worker', 'not-connected').ok, false);
+      assert.equal(validateRoleModelBinding('judge', 'not-connected').ok, false);
     });
-    return 'worker-only and judge-only BYO ids stay in their lanes';
+    return 'all connected BYO ids are selectable for worker and judge; unconnected ids still reject';
   });
 
   await check('stale role binding falls back instead of dispatching dead BYO', () => {
@@ -290,6 +294,7 @@ async function main(): Promise<void> {
     runCommand('live Claude Agent SDK worker skill smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-worker-skill.ts'], liveEnv);
     runCommand('live Claude Agent SDK workflow-step skill smoke', 'npx', ['tsx', 'scripts/smoke-claude-agent-sdk-workflow-step.ts'], liveEnv);
     runCommand('live Codex brain → Claude design workflow smoke', 'npx', ['tsx', 'scripts/smoke-codex-brain-claude-design-workflow.ts'], liveEnv);
+    runCommand('live BYO backend smoke', 'npx', ['tsx', 'scripts/smoke-byo-live.ts'], liveEnv);
     runCommand(
       'live chat worker intent-routing smoke',
       'npx',

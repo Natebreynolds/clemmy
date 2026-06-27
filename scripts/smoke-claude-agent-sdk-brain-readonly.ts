@@ -8,6 +8,9 @@ const query = 'claude-agent-sdk-brain-readonly-smoke-48ad9e';
 
 process.env.AUTH_MODE = 'claude_oauth';
 process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+process.env.MODEL_ROUTING_MODE = 'off';
+process.env.CLEMMY_MODEL_ROLES = '';
+process.env.CLAUDE_MODEL = process.env.CLEMMY_LIVE_CLAUDE_MODEL || 'claude-sonnet-4-6';
 
 const { respondPreferHarness } = await import('../src/runtime/harness/respond-bridge.js');
 
