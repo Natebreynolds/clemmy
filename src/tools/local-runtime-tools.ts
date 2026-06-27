@@ -22,6 +22,7 @@ import { registerGoalTools } from './goal-tools.js';
 import { registerMemoryTools } from './memory-tools.js';
 import { registerFocusTools } from './focus-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
+import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
 import { registerStepResultTool } from './step-result-tool.js';
 import { registerPlanTools } from './plan-tools.js';
@@ -146,6 +147,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   if (isSpacesEnabled()) registerSpaceTools(server);
   registerBrowserHarnessTools(server);
   registerMcpStatusTools(server);
+  registerMcpServerTools(server);
   const dynamicToolStart = captured.length;
   registerDynamicTools(server);
   for (const dynamicTool of captured.slice(dynamicToolStart)) {

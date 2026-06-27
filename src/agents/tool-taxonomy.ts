@@ -68,6 +68,10 @@ const ALWAYS_ADMIN = new Set<string>([
   'plugin_install',
   'plugin_uninstall',
   'request_destructive_action',
+  // MCP self-heal: creating/editing an external MCP server config is a runtime
+  // infra change — ALWAYS confirm-first (no secret VALUES pass through these).
+  'mcp_add',
+  'mcp_configure',
 ]);
 
 /**
@@ -164,6 +168,7 @@ const ALWAYS_READ = new Set<string>([
   'composio_list_tools',
   'mcp_status',
   'mcp_list_tools',
+  'mcp_reconnect',
   'local_cli_probe',
   'ping',
   // 2026-05-21: explicit reads that previously fell through to the

@@ -850,6 +850,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'composio_search_tools',
       'composio_execute_tool',
       'desktop_status',
+      // MCP self-heal surface: diagnose (status), recover (reconnect), and
+      // create/edit server configs (add/configure — approval-gated). Secrets are
+      // entered by the user in the dashboard, never by these tools.
+      'mcp_status',
+      'mcp_reconnect',
+      'mcp_add',
+      'mcp_configure',
       'skill_list',
       'skill_read',
       'local_cli_list',

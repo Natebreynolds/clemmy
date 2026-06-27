@@ -23,6 +23,7 @@ import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
 import { registerSpaceTools } from './space-tools.js';
 import { isSpacesEnabled } from '../spaces/store.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
+import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
 import { registerRecallTools } from './recall-tools.js';
@@ -119,6 +120,7 @@ registerSkillTools(server);
 registerWorkflowScheduleTools(server);
 if (isSpacesEnabled()) registerSpaceTools(server);
 registerMcpStatusTools(server);
+registerMcpServerTools(server);
 registerToolChoiceTools(server);
 registerModelRoleTools(server);
 // Recall tools (read-only): pull the verbatim/sliced payload of a clipped tool
