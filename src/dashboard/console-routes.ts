@@ -19,6 +19,7 @@ import {
   getRuntimeEnv,
   normalizeModelId,
   getByoBackendConfig,
+  getByoProviderApiKey,
   getModelRoutingMode,
   getActiveAuthMode,
   type ModelTier,
@@ -229,6 +230,7 @@ import {
   byoProviderKeyEnvKey,
   slugifyProviderId,
   serializeExtraProviders,
+  discoverProviderModels,
   type ByoProvider,
 } from '../runtime/harness/byo-providers.js';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
@@ -4493,6 +4495,34 @@ export function registerConsoleRoutes(
       resetByoModelCache();
       clearAutonomyAgentCache();
       res.json({ providers: getByoProviderSnapshots(), mode: getModelRoutingMode() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // List a provider's model catalog (generic — any OpenAI-compatible endpoint).
+  // Lets the settings UI offer a PICKER instead of hand-typed ids. For a SAVED
+  // provider, pass `providerId` and the key is read from the vault (browser never
+  // resends it); for a not-yet-saved one (the add form), pass baseURL + apiKey in
+  // the body. The key is never echoed back — only `{ models }` or `{ error }`.
+  app.post('/api/console/settings/model-providers/models', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as { baseURL?: string; apiKey?: string; providerId?: string };
+      const providerId = typeof body.providerId === 'string' ? body.providerId.trim() : '';
+      let baseURL = '';
+      let apiKey = '';
+      if (providerId) {
+        const provider = getByoProviders().find((p) => p.id === providerId);
+        if (!provider) { res.status(404).json({ error: 'Unknown provider.' }); return; }
+        baseURL = provider.baseURL;
+        apiKey = getByoProviderApiKey(providerId);
+      } else {
+        baseURL = typeof body.baseURL === 'string' ? body.baseURL.trim() : '';
+        apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+      }
+      const result = await discoverProviderModels({ baseURL, apiKey });
+      res.status(result.status).json(result.body);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

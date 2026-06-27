@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   getByoProviders, resolveByoProviderForModel,
   byoProviderKeyEnvKey, slugifyProviderId, serializeExtraProviders, getByoProviderSnapshots,
+  normalizeModelsList,
 } from './byo-providers.js';
 
 // These read process.env (getRuntimeEnv checks process.env before BASE_DIR/.env),
@@ -13,6 +14,7 @@ const ENV_KEYS = [
   'BYO_PROVIDERS', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_ID', 'BYO_MODEL_JUDGE_ID',
   'BYO_MODEL_API_KEY', 'BYO_MODEL_PROVIDER', 'OPENAI_MODEL_WORKER',
   'BYO_PROVIDER_MINIMAX_API_KEY', 'BYO_PROVIDER_DEEPSEEK_API_KEY',
+  'BYO_PROVIDER_TOGETHER_API_KEY',
 ];
 function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
   const saved: Record<string, string | undefined> = {};
@@ -27,6 +29,7 @@ function withEnv(vars: Record<string, string | undefined>, fn: () => void): void
 const ZAI = 'https://api.z.ai/api/paas/v4';
 const MINIMAX = 'https://api.minimax.io/v1';
 const DEEPSEEK = 'https://api.deepseek.com';
+const TOGETHER = 'https://api.together.ai/v1';
 
 // 'default' = the legacy single backend; extras = the BYO_PROVIDERS registry.
 const DEFAULT_ENV = {
@@ -177,4 +180,52 @@ test('getByoProviderSnapshots: hasKey/configured/isDefault reflect the stored ke
     // snapshots never leak the secret
     assert.equal('apiKey' in (byId.get('minimax') as object), false);
   });
+});
+
+// ── Together AI: an OpenAI-compatible provider with namespaced (org/model) ids ──
+
+test('Together AI provider round-trips: namespaced org/model ids route to the Together key+endpoint', () => {
+  withEnv({
+    ...DEFAULT_ENV,
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'together', label: 'Together AI', baseURL: TOGETHER, modelIds: ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'deepseek-ai/DeepSeek-V3'] },
+    ]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'together-key',
+  }, () => {
+    const cfg = resolveByoProviderForModel('meta-llama/Llama-3.3-70B-Instruct-Turbo');
+    assert.equal(cfg?.baseURL, TOGETHER);
+    assert.equal(cfg?.apiKey, 'together-key');
+    assert.equal(cfg?.configured, true);
+    // the second namespaced id resolves to the same provider
+    assert.equal(resolveByoProviderForModel('deepseek-ai/DeepSeek-V3')?.baseURL, TOGETHER);
+  });
+});
+
+test('Together slug + key env-key', () => {
+  assert.equal(slugifyProviderId('Together AI'), 'together-ai');
+  assert.equal(byoProviderKeyEnvKey('together'), 'BYO_PROVIDER_TOGETHER_API_KEY');
+});
+
+// ── normalizeModelsList: tolerate every /models shape, never throw ──────────
+
+test('normalizeModelsList: OpenAI/Together {object:list, data:[...]} → sorted id/label list', () => {
+  const out = normalizeModelsList({ object: 'list', data: [{ id: 'b-model' }, { id: 'a-model', display_name: 'A Model' }] });
+  assert.deepEqual(out, [{ id: 'a-model', label: 'A Model' }, { id: 'b-model', label: undefined }]);
+});
+
+test('normalizeModelsList: bare array of strings or objects', () => {
+  assert.deepEqual(normalizeModelsList(['y', 'x']), [{ id: 'x', label: undefined }, { id: 'y', label: undefined }]);
+  assert.deepEqual(normalizeModelsList([{ id: 'x' }]), [{ id: 'x', label: undefined }]);
+});
+
+test('normalizeModelsList: dedupes repeated ids', () => {
+  assert.deepEqual(normalizeModelsList({ data: [{ id: 'dup' }, { id: 'dup' }] }), [{ id: 'dup', label: undefined }]);
+});
+
+test('normalizeModelsList: garbage / bad ids → [] without throwing', () => {
+  assert.deepEqual(normalizeModelsList(null), []);
+  assert.deepEqual(normalizeModelsList({}), []);
+  assert.deepEqual(normalizeModelsList('nope'), []);
+  // ids with illegal chars (space) are dropped by cleanId
+  assert.deepEqual(normalizeModelsList([{ id: 'bad id' }, { id: 'good-id' }]), [{ id: 'good-id', label: undefined }]);
 });

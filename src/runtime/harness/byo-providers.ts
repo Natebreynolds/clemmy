@@ -182,3 +182,97 @@ export function getByoProviderSnapshots(): ByoProviderSnapshot[] {
     };
   });
 }
+
+// ── model discovery (generic — any OpenAI-compatible provider) ──────────────
+// A provider exposes its catalog at `GET {baseURL}/models`. We fetch it with the
+// provider's key and normalize to a flat id/label list so the settings UI can let
+// users PICK models instead of hand-typing long namespaced ids. Pure + injectable
+// so it unit-tests without Express or a live provider.
+
+export interface DiscoveredModel {
+  id: string;
+  /** Optional human label (provider `display_name`), falls back to id in the UI. */
+  label?: string;
+}
+
+/**
+ * Normalize a `/models` payload into a flat, sorted, deduped id/label list.
+ * Accepts the OpenAI/Together shape `{ object:'list', data:[{ id, ... }] }` OR a
+ * bare array (of strings or objects). Drops ids failing `cleanId` (so every
+ * returned id is routable). Never throws — returns `[]` on garbage.
+ */
+export function normalizeModelsList(raw: unknown): DiscoveredModel[] {
+  const arr = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === 'object' && Array.isArray((raw as { data?: unknown }).data)
+      ? (raw as { data: unknown[] }).data
+      : [];
+  const out: DiscoveredModel[] = [];
+  const seen = new Set<string>();
+  for (const item of arr) {
+    const id = cleanId(typeof item === 'string' ? item : (item as { id?: unknown } | null)?.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const dn = item && typeof item === 'object' ? (item as { display_name?: unknown }).display_name : undefined;
+    out.push({ id, label: typeof dn === 'string' && dn.trim() ? dn.trim() : undefined });
+  }
+  out.sort((a, b) => a.id.localeCompare(b.id));
+  return out;
+}
+
+/** http(s)-only URL parse; null on anything else (other protocols / unparseable). */
+function safeParseHttpUrl(raw: string): URL | null {
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface DiscoverModelsResult {
+  status: number;
+  body: { models: DiscoveredModel[] } | { error: string };
+}
+
+/**
+ * Fetch + normalize a provider's model catalog. Plain `fetch` (not getByoModel's
+ * wrapped client — `/models` is a plain GET, the chat-completions wrapper is
+ * irrelevant). Maps provider failures to precise statuses and NEVER echoes the
+ * key. `fetchImpl` is injectable for tests. localhost is intentionally allowed
+ * (local Ollama/vLLM is a legit BYO setup; the route's auth gate guards access).
+ */
+export async function discoverProviderModels(
+  input: { baseURL: string; apiKey: string },
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = 10_000,
+): Promise<DiscoverModelsResult> {
+  const baseURL = (input.baseURL || '').trim();
+  const apiKey = (input.apiKey || '').trim();
+  if (!safeParseHttpUrl(baseURL)) return { status: 400, body: { error: 'A valid http(s) base URL is required.' } };
+  if (!apiKey) return { status: 400, body: { error: 'An API key is required to list models.' } };
+
+  const url = `${baseURL.replace(/\/+$/, '')}/models`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let resp: Response;
+  try {
+    resp = await fetchImpl(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    const aborted = err instanceof Error && err.name === 'AbortError';
+    return { status: 504, body: { error: aborted ? 'The provider timed out listing models.' : 'Could not reach the provider.' } };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (resp.status === 401 || resp.status === 403) return { status: 401, body: { error: 'The provider rejected the API key.' } };
+  if (resp.status === 404) return { status: 404, body: { error: 'This provider has no /models endpoint — enter model ids manually.' } };
+  if (!resp.ok) return { status: 502, body: { error: `The provider returned ${resp.status} listing models.` } };
+
+  const json = (await resp.json().catch(() => null)) as unknown;
+  return { status: 200, body: { models: normalizeModelsList(json) } };
+}

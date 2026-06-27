@@ -193,6 +193,14 @@ export const addModelProvider = (p: AddModelProviderInput) =>
 export const removeModelProvider = (id: string) =>
   api<ModelProvidersSnapshot>(`/api/console/settings/model-providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
 
+// Generic model-catalog discovery — fetches a provider's GET {baseURL}/models so
+// the add form can offer a PICKER instead of hand-typed ids. For a saved provider
+// pass `providerId` (key read from the vault); for the add form pass baseURL +
+// apiKey. The key is never echoed back.
+export interface DiscoveredModel { id: string; label?: string }
+export const listProviderModels = (p: { baseURL?: string; apiKey?: string; providerId?: string }) =>
+  api<{ models: DiscoveredModel[] }>('/api/console/settings/model-providers/models', { method: 'POST', body: JSON.stringify(p) });
+
 // Claude (Anthropic) subscription OAuth login.
 export interface ClaudeAuth { configured: boolean; reason?: string; plan?: string; expiresAt?: string }
 export const beginClaudeLogin = () =>
