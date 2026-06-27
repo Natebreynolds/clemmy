@@ -185,7 +185,7 @@ export const EVENT_TYPES = [
   // re-reads the world before continuing instead of re-pursuing blind. Carries
   // {phase:'reorient', scope:'goal', observationsInjected}. Sibling of
   // tool_jit_scope / rubric_variant — pure telemetry, never alters behavior; the
-  // measurement spine for CLEMMY_GOAL_REORIENT_OBS. (2026-06-24.)
+  // measurement spine for the goal re-Orient feature (default since 2026-06-27). (2026-06-24.)
   'ooda_cycle',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];

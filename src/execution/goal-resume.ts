@@ -39,20 +39,13 @@ function selfDriveEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_SELF_DRIVE', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
-/**
- * OODA re-Orient gate (default OFF). When on, a self-driving goal resume folds
- * fresh monitor observations (inbox/calendar needs-you items that landed since
- * the last cycle and overlap the goal) into the resume directive — closing the
- * "Act → prepare to reassess" feedback edge. OFF ⇒ zero added work: no
- * notification read, no telemetry, and the directive is byte-identical to today.
- * Rides the master CLEMMY_GOAL_CONTRACT kill-switch like self-drive.
- */
-function reorientObsEnabled(): boolean {
-  if ((getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() === 'off') return false;
-  return (getRuntimeEnv('CLEMMY_GOAL_REORIENT_OBS', 'off') ?? 'off').toLowerCase() === 'on';
-}
-
 // ── re-Orient: fresh monitor observations relevant to the goal ────────────────
+// OODA re-Orient graduated to the default 2026-06-27 (CLEMMY_GOAL_REORIENT_OBS
+// deleted): a self-driving goal resume always folds fresh, goal-relevant monitor
+// observations into the directive — closing the "Act → prepare to reassess" edge.
+// It rides the surrounding self-drive path, which already honors the master
+// CLEMMY_GOAL_CONTRACT kill-switch; best-effort, capped, and byte-identical to the
+// pre-feature directive whenever there are no relevant observations.
 /** Monitor sources whose notifications are already anti-firehose'd needs-you
  *  items by construction (the monitor only cards an item it scored as needing
  *  the user) — so the re-Orient injector reuses that verdict instead of
@@ -146,8 +139,8 @@ export interface GoalResumeDeps {
   escalate: (goal: PlanProposal, reason: string, body: string) => void;
   /** Fresh monitor observations (inbox/calendar needs-you items) that landed
    *  since the goal's last cycle and overlap its objective — the OODA re-Orient
-   *  input. Optional + best-effort (omitted in tests; never throws). Only read
-   *  when CLEMMY_GOAL_REORIENT_OBS is on. */
+   *  input. Read on every resume (re-orient is the default). Optional +
+   *  best-effort (omitted in tests; never throws). */
   recentObservations?: (goal: PlanProposal) => string[];
   /** Emit the ooda_cycle re-Orient telemetry marker (pure observability). */
   emitReorient?: (goal: PlanProposal, payload: { observationsInjected: number }) => void;
@@ -256,16 +249,14 @@ export function evaluateGoalResumptions(deps: GoalResumeDeps): {
     });
     // Re-Orient (OODA feedback edge): before resuming, fold in fresh monitor
     // observations that landed since the last cycle so the turn re-reads the world
-    // instead of continuing blind. Flag-gated (default off) ⇒ no read, no event, and
-    // a byte-identical directive when off. Best-effort — a reader/telemetry hiccup
-    // never affects the resume itself.
+    // instead of continuing blind. Graduated to the default 2026-06-27. Best-effort
+    // — a reader/telemetry hiccup never affects the resume; when there are no
+    // relevant observations the directive is byte-identical to the pre-feature form.
     let injectedObs: string[] = [];
-    if (reorientObsEnabled()) {
-      try { injectedObs = deps.recentObservations?.(goal) ?? []; } catch { injectedObs = []; }
-      if (injectedObs.length > 0) {
-        try { deps.emitReorient?.(goal, { observationsInjected: injectedObs.length }); }
-        catch { /* telemetry is best-effort */ }
-      }
+    try { injectedObs = deps.recentObservations?.(goal) ?? []; } catch { injectedObs = []; }
+    if (injectedObs.length > 0) {
+      try { deps.emitReorient?.(goal, { observationsInjected: injectedObs.length }); }
+      catch { /* telemetry is best-effort */ }
     }
     try {
       deps.fireResume(goal, buildResumeDirective(goal, injectedObs));

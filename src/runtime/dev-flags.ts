@@ -71,14 +71,12 @@ export const DEV_FLAG_REGISTRY: DevFlagDef[] = [
   // ── Goals & autonomy ──
   { key: 'CLEMMY_GOAL_CONTRACT', label: 'Goal contracts (master)', category: 'Goals & autonomy', type: 'boolean', default: 'on', description: 'The parked-goal contract loop. OFF disables self-drive + re-orient too.' },
   { key: 'CLEMMY_GOAL_SELF_DRIVE', label: 'Self-driving goal resume', category: 'Goals & autonomy', type: 'boolean', default: 'on', description: 'The daemon re-enters an active goal on a cadence across session ends / sleep.' },
-  { key: 'CLEMMY_GOAL_REORIENT_OBS', label: 'Goal re-Orient (fresh observations)', category: 'Goals & autonomy', type: 'boolean', default: 'off', description: 'On resume, fold fresh, goal-relevant monitor observations into the directive (OODA feedback edge).' },
   { key: 'CLEMMY_ATTEMPT_RECORDS', label: 'Attempt records', category: 'Goals & autonomy', type: 'boolean', default: 'on', description: 'Record per-attempt change/cost on loopUntil retries for self-improvement.' },
   { key: 'CLEMMY_IMPROVEMENT_PROPOSER', label: 'Improvement proposer', category: 'Goals & autonomy', type: 'boolean', default: 'off', description: 'Nightly Phase-C proposals from run history (human-gated apply).' },
 
   // ── Proactive / ambient ──
   { key: 'CLEMMY_INBOX_MONITOR', label: 'Inbox monitor', category: 'Proactive & ambient', type: 'boolean', default: 'on', description: 'Ambient read-only inbox watch that surfaces needs-you mail.' },
   { key: 'CLEMMY_CALENDAR_MONITOR', label: 'Calendar monitor', category: 'Proactive & ambient', type: 'boolean', default: 'on', description: 'Ambient read-only calendar watch (conflicts, unanswered invites, imminent meetings).' },
-  { key: 'CLEMMY_SURFACE_DECISION_V2', label: 'Surface-decision scorer v2', category: 'Proactive & ambient', type: 'boolean', default: 'off', description: 'Route monitor signals through the 7-axis act/ask/watch/ignore scorer.' },
   { key: 'CLEMMY_AUTO_FOCUS', label: 'Session auto-focus', category: 'Proactive & ambient', type: 'boolean', default: 'on', description: 'Auto-pin the session focus so recall favors facts about the active task.' },
 
   // ── Memory ──

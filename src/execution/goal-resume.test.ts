@@ -222,7 +222,7 @@ test('kill-switch CLEMMY_GOAL_SELF_DRIVE=off makes the pass inert', () => {
   }
 });
 
-// ── OODA re-Orient: fresh-observation injection (CLEMMY_GOAL_REORIENT_OBS) ─────
+// ── OODA re-Orient: fresh-observation injection (default since 2026-06-27) ─────
 
 test('selectReorientObservations: source-filters, time-windows, overlaps objective, caps + orders newest-first', () => {
   const now = 10_000_000;
@@ -261,66 +261,48 @@ test('selectReorientObservations: dedupes identical lines', () => {
   assert.equal(selectReorientObservations(items, 'prospect outreach', now - 1000, now).length, 1);
 });
 
-test('re-orient: flag OFF → reader never called, directive byte-identical (no "What changed" block)', () => {
+test('re-orient (default): a self-driving resume reads fresh observations (no flag gate)', () => {
   const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
   let called = 0;
   const deps = makeDeps({
     nowMs: Date.now() + 60 * 60 * 1000,
-    recentObservations: () => { called++; return ['📥 Jane: should NOT appear (asks you something)']; },
+    recentObservations: () => { called++; return ['📥 Jane: Re: prospect (asks you something)']; },
   });
   const r = evaluateGoalResumptions(deps);
   assert.equal(r.fired, goal.id);
-  assert.equal(called, 0, 'recentObservations is never read when the flag is off');
-  assert.equal(deps.captured.length, 1);
-  assert.ok(!deps.captured[0].includes('What changed since your last cycle'), 'no re-orient block');
-  assert.ok(!deps.captured[0].includes('should NOT appear'));
-  assert.deepEqual(deps.reorients, [], 'no telemetry emitted when off');
+  assert.equal(called, 1, 're-orient is the default — the observation reader is consulted on every resume');
+  assert.ok(deps.captured[0].includes('What changed since your last cycle'), 're-orient block present by default');
 });
 
-test('re-orient: flag ON + fresh observations → injected into directive + ooda_cycle telemetry', () => {
+test('re-orient: fresh observations → injected into directive + ooda_cycle telemetry', () => {
   const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
-  process.env.CLEMMY_GOAL_REORIENT_OBS = 'on';
-  try {
-    const deps = makeDeps({
-      nowMs: Date.now() + 60 * 60 * 1000,
-      recentObservations: () => ['📥 Jane: Re: contract (asks you something)'],
-    });
-    const r = evaluateGoalResumptions(deps);
-    assert.equal(r.fired, goal.id);
-    assert.ok(deps.captured[0].includes('What changed since your last cycle'), 're-orient block present');
-    assert.ok(deps.captured[0].includes('Jane: Re: contract'), 'observation injected');
-    assert.deepEqual(deps.reorients, [1], 'telemetry records the injected count');
-  } finally {
-    delete process.env.CLEMMY_GOAL_REORIENT_OBS;
-  }
+  const deps = makeDeps({
+    nowMs: Date.now() + 60 * 60 * 1000,
+    recentObservations: () => ['📥 Jane: Re: contract (asks you something)'],
+  });
+  const r = evaluateGoalResumptions(deps);
+  assert.equal(r.fired, goal.id);
+  assert.ok(deps.captured[0].includes('What changed since your last cycle'), 're-orient block present');
+  assert.ok(deps.captured[0].includes('Jane: Re: contract'), 'observation injected');
+  assert.deepEqual(deps.reorients, [1], 'telemetry records the injected count');
 });
 
-test('re-orient: flag ON but no relevant observations → no block, no telemetry', () => {
+test('re-orient: no relevant observations → no block, no telemetry (byte-identical directive)', () => {
   const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
-  process.env.CLEMMY_GOAL_REORIENT_OBS = 'on';
-  try {
-    const deps = makeDeps({ nowMs: Date.now() + 60 * 60 * 1000, recentObservations: () => [] });
-    const r = evaluateGoalResumptions(deps);
-    assert.equal(r.fired, goal.id);
-    assert.ok(!deps.captured[0].includes('What changed since your last cycle'));
-    assert.deepEqual(deps.reorients, [], 'no telemetry when nothing was injected');
-  } finally {
-    delete process.env.CLEMMY_GOAL_REORIENT_OBS;
-  }
+  const deps = makeDeps({ nowMs: Date.now() + 60 * 60 * 1000, recentObservations: () => [] });
+  const r = evaluateGoalResumptions(deps);
+  assert.equal(r.fired, goal.id);
+  assert.ok(!deps.captured[0].includes('What changed since your last cycle'));
+  assert.deepEqual(deps.reorients, [], 'no telemetry when nothing was injected');
 });
 
 test('re-orient: a throwing observation reader never blocks the resume (best-effort)', () => {
   const { goal } = makeSelfDrivingGoal({ resumeEveryMs: 30 * 60 * 1000 });
-  process.env.CLEMMY_GOAL_REORIENT_OBS = 'on';
-  try {
-    const deps = makeDeps({
-      nowMs: Date.now() + 60 * 60 * 1000,
-      recentObservations: () => { throw new Error('boom'); },
-    });
-    const r = evaluateGoalResumptions(deps);
-    assert.equal(r.fired, goal.id, 'resume still fires despite a reader error');
-    assert.ok(!deps.captured[0].includes('What changed'));
-  } finally {
-    delete process.env.CLEMMY_GOAL_REORIENT_OBS;
-  }
+  const deps = makeDeps({
+    nowMs: Date.now() + 60 * 60 * 1000,
+    recentObservations: () => { throw new Error('boom'); },
+  });
+  const r = evaluateGoalResumptions(deps);
+  assert.equal(r.fired, goal.id, 'resume still fires despite a reader error');
+  assert.ok(!deps.captured[0].includes('What changed'));
 });

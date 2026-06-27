@@ -22,7 +22,7 @@ const {
   setDevMode, isDevModeEnabled, DEV_FLAG_REGISTRY,
 } = await import('./dev-flags.js');
 
-const TOUCHED = ['CLEMMY_DEV_FLAG_TEST_XYZ', 'CLEMMY_GOAL_REORIENT_OBS', 'CLEMMY_DEV_MODE'];
+const TOUCHED = ['CLEMMY_DEV_FLAG_TEST_XYZ', 'CLEMMY_DEBATE_MODE', 'CLEMMY_DEV_MODE'];
 afterEach(() => { for (const k of TOUCHED) delete process.env[k]; });
 
 test('isSafeDevFlagKey: CLEMMY_* only, never dev-mode or secrets, case-sensitive', () => {
@@ -34,15 +34,15 @@ test('isSafeDevFlagKey: CLEMMY_* only, never dev-mode or secrets, case-sensitive
 });
 
 test('set then clear a curated flag is live (process.env) + reflected in the snapshot', () => {
-  setDevFlag('CLEMMY_GOAL_REORIENT_OBS', 'on');
-  assert.equal(process.env.CLEMMY_GOAL_REORIENT_OBS, 'on', 'mirrored to live process.env');
-  const f = buildDevFlagsSnapshot().flags.find((x) => x.key === 'CLEMMY_GOAL_REORIENT_OBS');
+  setDevFlag('CLEMMY_DEBATE_MODE', 'on');
+  assert.equal(process.env.CLEMMY_DEBATE_MODE, 'on', 'mirrored to live process.env');
+  const f = buildDevFlagsSnapshot().flags.find((x) => x.key === 'CLEMMY_DEBATE_MODE');
   assert.ok(f);
   assert.equal(f!.value, 'on');
   assert.equal(f!.overridden, true);
 
-  clearDevFlag('CLEMMY_GOAL_REORIENT_OBS');
-  assert.equal(process.env.CLEMMY_GOAL_REORIENT_OBS, undefined, 'override removed from live env');
+  clearDevFlag('CLEMMY_DEBATE_MODE');
+  assert.equal(process.env.CLEMMY_DEBATE_MODE, undefined, 'override removed from live env');
 });
 
 test('escape-hatch (non-curated) key surfaces under custom + clears', () => {
