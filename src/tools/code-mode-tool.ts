@@ -82,11 +82,28 @@ export function _setCodeModeToolsForTests(map: Map<string, InvokableTool> | null
   toolsByName = map;
 }
 
-/** Whether a clem.<method> is reachable: read-only always; mutating only when
- *  writes are enabled (Phase 2). Everything else is refused (the safety boundary). */
+/**
+ * An external MCP tool routed through the namespaced shim, e.g.
+ * "dataforseo__serp_organic_live_advanced". Shape check only (a `<server>__<tool>`
+ * with non-empty halves; no local tool name contains a double underscore). These
+ * are dispatched through the SAME shim the SDK Runner uses, so they inherit its
+ * `decideToolApproval` gating — a destructive/admin MCP tool throws
+ * `mcp.approval_blocked`; a read passes — i.e. full gate-parity with a discrete
+ * MCP call. That shim gate (not the CODE_MODE_WRITES flag) is the safety boundary
+ * for MCP, so MCP reads stay available even when in-program writes are off.
+ */
+export function isMcpNamespacedTool(method: string): boolean {
+  const i = method.indexOf('__');
+  return i > 0 && i + 2 < method.length && !READ_ONLY_TOOLS.has(method) && !WRITE_TOOLS.has(method);
+}
+
+/** Whether a clem.<method> is reachable: read-only local tools always; mutating
+ *  local tools only when writes are enabled (Phase 2); external MCP tools always
+ *  (gated by the shim's approval taxonomy). Everything else is refused. */
 export function isCodeModeToolAllowed(method: string): boolean {
   if (READ_ONLY_TOOLS.has(method)) return true;
   if (codeModeWritesEnabled() && WRITE_TOOLS.has(method)) return true;
+  if (isMcpNamespacedTool(method)) return true;
   return false;
 }
 
@@ -101,22 +118,15 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
     const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
     throw new Error(`code-mode: tool "${method}" is not available — ${why}`);
   }
-  const real = (await realToolsByName()).get(method);
-  if (!real || typeof real.invoke !== 'function') {
-    throw new Error(`code-mode: unknown tool "${method}"`);
-  }
-  const wrapped = wrapToolForHarness(real as never) as InvokableTool;
   const callId = `codemode-${randomUUID()}`;
-  const runContext = { context: { sessionId } };
-  const details = { toolCall: { callId } };
   // Observability: emit tool_called/tool_returned for each in-program call so the
   // trace drawer / Tasks board shows what a code-mode program did (parity with
   // discrete calls; `codeMode:true` tags them for adoption measurement).
   try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, codeMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
-    const out = await withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000) }, () =>
-      wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
-    );
+    const out = isMcpNamespacedTool(method)
+      ? await dispatchCodeModeMcpTool(method, args)
+      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, codeMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;
     try { return JSON.parse(out); } catch { return out; }
@@ -124,6 +134,42 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, codeMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
     throw err;
   }
+}
+
+/** A local clem tool: route through wrapToolForHarness (the full bracket gate
+ *  battery) under the shared run-context, exactly as before. */
+async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter): Promise<unknown> {
+  const real = (await realToolsByName()).get(method);
+  if (!real || typeof real.invoke !== 'function') {
+    throw new Error(`code-mode: unknown tool "${method}"`);
+  }
+  const wrapped = wrapToolForHarness(real as never) as InvokableTool;
+  const runContext = { context: { sessionId } };
+  const details = { toolCall: { callId } };
+  return withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000) }, () =>
+    wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
+  );
+}
+
+/** An external MCP tool: route through the SAME namespaced shim the SDK Runner
+ *  uses, so it inherits the shim's `decideToolApproval` gating + server-health
+ *  checks — gate-parity with a discrete MCP call (a destructive/admin tool throws
+ *  `mcp.approval_blocked`; a read passes). The shim is loaded lazily to keep the
+ *  MCP/SDK module graph off code-mode's static surface. */
+async function dispatchCodeModeMcpTool(method: string, args: unknown): Promise<unknown> {
+  const { getOrCreateExternalMcpServers } = await import('../runtime/mcp-servers.js');
+  const shim = getOrCreateExternalMcpServers() as unknown as {
+    listTools?: () => Promise<unknown>;
+    callTool: (name: string, args: Record<string, unknown> | null) => Promise<unknown>;
+  } | null;
+  if (!shim || typeof shim.callTool !== 'function') {
+    throw new Error(`code-mode: no MCP servers are configured (cannot call "${method}")`);
+  }
+  // The SDK Runner always lists before it calls; mirror that so the shim's
+  // tool→server routing map exists before callTool resolves the name.
+  if (typeof shim.listTools === 'function') { try { await shim.listTools(); } catch { /* routing rebuilds on call */ } }
+  const argObj = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+  return shim.callTool(method, argObj);
 }
 
 /** Run a code-mode program for a session. ONE counter spans all in-program calls
@@ -136,14 +182,17 @@ export async function runCodeModeForSession(program: string, sessionId: string):
 export function codeModeDescription(): string {
   const writes = codeModeWritesEnabled();
   const surface = [...READ_ONLY_TOOLS, ...(writes ? WRITE_TOOLS : [])].join(', ');
+  const fetchTools = writes ? 'composio_execute_tool(...) and MCP tools' : 'MCP tools';
   return [
     'Run ONE short JavaScript program (the body of an async function — use `return` for the result) against the `clem` API instead of emitting many separate tool calls.',
     'Use this for DATA-HEAVY or MULTI-STEP work — loop/filter/paginate/aggregate over many items and `return` only the distilled result, so the large intermediate tool outputs never enter the conversation.',
-    'The API is `clem.<tool>(args)` returning a Promise; available: ' + surface + '.',
+    'The API is `clem.<tool>(args)` returning a Promise; built-in tools: ' + surface + '.',
+    'You can ALSO call any connected external MCP tool here by its `<server>__<tool>` name — e.g. `await clem["dataforseo__serp_organic_live_advanced"]({...})` — and they run through the SAME gates as a normal MCP call.',
+    'BEST USE — do the FETCHES inside the program: for several DataForSEO / SEO / analytics / Salesforce lookups, call ' + fetchTools + ' here (Promise.all the independent ones), distill, and `return` only the small result — NOT many discrete tool calls each dumping raw JSON into the conversation.',
     writes
       ? 'Writes ARE allowed and pass the SAME approval/grounding/destination gates as a normal tool call — a blocked write throws inside your program (catch it or let it surface).'
-      : 'Read-only: no writes/sends from a program.',
-    'Example: `const r = await clem.memory_search({query:"acme"}); return { matches: r.length };`',
+      : 'Local writes are off, but MCP reads work; a destructive MCP tool is still blocked by its approval gate.',
+    'Example: `const [a,b] = await Promise.all([clem["dataforseo__serp_organic_live_advanced"]({...}), clem["dataforseo__serp_organic_live_advanced"]({...})]); return { aTop: a.items?.[0], bTop: b.items?.[0] };`',
     'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Bounded time + tool-call budget.',
   ].join(' ');
 }

@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { READ_ONLY_TOOLS, dispatchCodeModeTool, buildCodeModeTool } from './code-mode-tool.js';
+import { READ_ONLY_TOOLS, dispatchCodeModeTool, buildCodeModeTool, isCodeModeToolAllowed, isMcpNamespacedTool } from './code-mode-tool.js';
 
 test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () => {
   for (const writeTool of ['composio_execute_tool', 'write_file', 'run_shell_command', 'request_approval', 'execution_create', 'memory_remember']) {
@@ -29,6 +29,29 @@ test('dispatchCodeModeTool refuses a mutating tool when writes are OFF (kill-swi
       /not available|writes are disabled/,
     );
     await assert.rejects(() => dispatchCodeModeTool('write_file', { path: '/tmp/x', content: 'y' }, 'sess'), /not available|writes are disabled/);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prev;
+  }
+});
+
+test('isMcpNamespacedTool: true for <server>__<tool>, false for local tool names', () => {
+  assert.equal(isMcpNamespacedTool('dataforseo__serp_organic_live_advanced'), true);
+  assert.equal(isMcpNamespacedTool('supabase__query'), true);
+  // local tools (single underscores, or a name that IS in an allowlist) never route to MCP
+  assert.equal(isMcpNamespacedTool('memory_search'), false);
+  assert.equal(isMcpNamespacedTool('composio_execute_tool'), false);
+  assert.equal(isMcpNamespacedTool('run_tool_program'), false);
+  assert.equal(isMcpNamespacedTool('__leading'), false, 'empty server half is not namespaced');
+});
+
+test('MCP tools are allowed in-sandbox even when local writes are OFF (gated by the shim, not the writes flag)', () => {
+  const prev = process.env.CLEMMY_CODE_MODE_WRITES;
+  process.env.CLEMMY_CODE_MODE_WRITES = 'off';
+  try {
+    assert.equal(isCodeModeToolAllowed('dataforseo__serp_organic_live_advanced'), true, 'MCP read reachable with writes off');
+    assert.equal(isCodeModeToolAllowed('memory_search'), true, 'local read still allowed');
+    assert.equal(isCodeModeToolAllowed('composio_execute_tool'), false, 'local write still blocked with writes off');
+    assert.equal(isCodeModeToolAllowed('totally_made_up_tool'), false, 'a non-namespaced unknown is refused');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prev;
   }
