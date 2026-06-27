@@ -9,8 +9,6 @@ import { usePoll } from '@/lib/poll';
 import { getSettings, addModelProvider, removeModelProvider, listProviderModels, type DiscoveredModel } from '@/lib/settings';
 import { PROVIDER_PRESETS } from './ModelBackendForm';
 
-type RunAs = 'worker' | 'all_in';
-
 /**
  * The connected API-key models, as a flat strip — add GLM/Z.ai, DeepSeek,
  * MiniMax, or any OpenAI-compatible endpoint and it instantly shows here with a
@@ -29,7 +27,6 @@ export function ConnectedModelsStrip() {
   const [baseURL, setBaseURL] = useState(PROVIDER_PRESETS[0].baseURL);
   const [apiKey, setApiKey] = useState('');
   const [models, setModels] = useState(PROVIDER_PRESETS[0].workerModel);
-  const [runAs, setRunAs] = useState<RunAs>('worker');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [justConnected, setJustConnected] = useState(false);
@@ -41,12 +38,14 @@ export function ConnectedModelsStrip() {
   const [fetchingModels, setFetchingModels] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [catalogError, setCatalogError] = useState<string | null>(null);
+  // Filter the live catalog — Together AI etc. return hundreds of models.
+  const [catalogQuery, setCatalogQuery] = useState('');
 
   if (settings.isLoading) return <Skeleton className="h-28 w-full" />;
 
   const refresh = () => void qc.invalidateQueries({ queryKey: ['settings'] });
 
-  const resetCatalog = () => { setCatalog(null); setPicked(new Set()); setCatalogError(null); };
+  const resetCatalog = () => { setCatalog(null); setPicked(new Set()); setCatalogError(null); setCatalogQuery(''); };
 
   const applyPreset = (id: string) => {
     const p = PROVIDER_PRESETS.find((x) => x.id === id);
@@ -117,26 +116,41 @@ export function ConnectedModelsStrip() {
     setError(null);
   };
 
-  // The catalog checklist, shared by the add form and the edit panel.
-  const catalogChecklist = () => (
-    <>
-      {catalog && catalog.length > 0 && (
-        <div className="mt-2">
-          <div className="mb-1 text-caption text-muted">{picked.size} selected · click to toggle</div>
-          <div className="max-h-48 overflow-y-auto rounded-lg border border-border">
-            {catalog.map((m) => (
-              <label key={m.id} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-small hover:bg-surface">
-                <input type="checkbox" checked={picked.has(m.id)} onChange={() => toggleModel(m.id)} />
-                <span className="truncate text-fg" title={m.id}>{m.label ?? m.id}</span>
-              </label>
-            ))}
-          </div>
+  // The catalog checklist, shared by the add form and the edit panel. Searchable
+  // because providers like Together AI return hundreds of models.
+  const catalogChecklist = () => {
+    if (!catalog || catalog.length === 0) {
+      return (
+        <>
+          {fetchingModels && <p className="mt-1 text-caption text-muted">Loading catalog…</p>}
+          {catalogError && <p className="mt-1 text-small text-warning">{catalogError}</p>}
+        </>
+      );
+    }
+    const q = catalogQuery.trim().toLowerCase();
+    const filtered = q ? catalog.filter((m) => `${m.id} ${m.label ?? ''}`.toLowerCase().includes(q)) : catalog;
+    return (
+      <div className="mt-2">
+        <div className="mb-1 flex items-center gap-2">
+          <Input value={catalogQuery} onChange={(e) => setCatalogQuery(e.target.value)}
+            placeholder={`Search ${catalog.length} models…`} aria-label="Search models" className="flex-1" />
+          <span className="shrink-0 text-caption text-muted">{picked.size} selected</span>
         </div>
-      )}
-      {fetchingModels && <p className="mt-1 text-caption text-muted">Loading catalog…</p>}
-      {catalogError && <p className="mt-1 text-small text-warning">{catalogError}</p>}
-    </>
-  );
+        <div className="max-h-48 overflow-y-auto rounded-lg border border-border">
+          {filtered.length === 0 ? (
+            <div className="px-3 py-2 text-caption text-muted">No models match “{catalogQuery}”.</div>
+          ) : filtered.map((m) => (
+            <label key={m.id} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-small hover:bg-surface">
+              <input type="checkbox" checked={picked.has(m.id)} onChange={() => toggleModel(m.id)} />
+              <span className="truncate text-fg" title={m.id}>{m.label ?? m.id}</span>
+            </label>
+          ))}
+        </div>
+        {q && <div className="mt-1 text-caption text-muted">{filtered.length} of {catalog.length} shown</div>}
+        {catalogError && <p className="mt-1 text-small text-warning">{catalogError}</p>}
+      </div>
+    );
+  };
 
   const onAdd = async () => {
     const modelIds = models.split(',').map((s) => s.trim()).filter(Boolean);
@@ -146,7 +160,11 @@ export function ConnectedModelsStrip() {
     }
     setBusy(true); setError(null);
     try {
-      await addModelProvider({ label: label.trim(), baseURL: baseURL.trim(), apiKey: apiKey.trim(), modelIds, mode: runAs });
+      // No `mode`: a connected model is eligible for ANY role (it appears in the
+      // brain/worker/judge pickers above). The route keeps current routing and
+      // only bumps a first provider off 'off' — it never force-reassigns the
+      // brain. Pick which model is the brain/worker/judge in the pickers above.
+      await addModelProvider({ label: label.trim(), baseURL: baseURL.trim(), apiKey: apiKey.trim(), modelIds });
       setApiKey(''); setAdding(false); setJustConnected(true);
       refresh();
     } catch (err) {
@@ -262,14 +280,7 @@ export function ConnectedModelsStrip() {
             )}</Field>
           </div>
           {catalogChecklist()}
-          <div className="mt-1 sm:max-w-[18rem]">
-            <Field label="Run it as">{(id) => (
-              <Select id={id} value={runAs} onChange={(e) => setRunAs(e.target.value as RunAs)}>
-                <option value="worker">Workers (Codex stays the brain)</option>
-                <option value="all_in">Everything (brain + judge too)</option>
-              </Select>
-            )}</Field>
-          </div>
+          <p className="mt-2 text-caption text-muted">Once connected, this model is selectable for any role (brain, workers, or judge) in the pickers above.</p>
           <div className="mt-2 flex items-center gap-2">
             <Button onClick={onAdd} disabled={busy}>{busy ? 'Connecting…' : 'Connect'}</Button>
             <Button variant="secondary" size="sm" onClick={() => { setAdding(false); setError(null); }}>Cancel</Button>
