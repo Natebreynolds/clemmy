@@ -1,0 +1,21 @@
+{
+  "id": "fanout-convergence-grounded",
+  "objective": "Fan out read-only lookups across three regions and converge into one summary whose per-region figures all trace to the captured tool outputs.",
+  "maxToolCalls": 20,
+  "events": [
+    { "type": "user_input_received", "role": "user", "data": { "text": "Pull the lead counts for the East, West, and Central regions and give me the per-region numbers. Read only." } },
+    { "type": "tool_called", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_e", "arguments": "query east region leads" } },
+    { "type": "tool_returned", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_e", "output": "East region: 1,240 leads" } },
+    { "type": "tool_called", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_w", "arguments": "query west region leads" } },
+    { "type": "tool_returned", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_w", "output": "West region: 860 leads" } },
+    { "type": "tool_called", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_c", "arguments": "query central region leads" } },
+    { "type": "tool_returned", "role": "orchestrator", "data": { "tool": "run_shell_command", "callId": "c_c", "output": "Central region: 415 leads" } },
+    { "type": "conversation_completed", "role": "Clem", "data": { "reply": "Per-region lead counts: East 1,240, West 860, Central 415. Read-only — nothing was modified.", "summary": "three-region fanout converged; every figure grounded to a captured tool output" } }
+  ],
+  "toolOutputs": [
+    { "callId": "c_e", "tool": "run_shell_command", "output": "East region: 1,240 leads" },
+    { "callId": "c_w", "tool": "run_shell_command", "output": "West region: 860 leads" },
+    { "callId": "c_c", "tool": "run_shell_command", "output": "Central region: 415 leads" }
+  ],
+  "finalAnswerText": "Per-region lead counts: East 1,240, West 860, Central 415. Read-only — nothing was modified."
+}
