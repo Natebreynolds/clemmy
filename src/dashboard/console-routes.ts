@@ -258,7 +258,8 @@ import {
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
-import { listMcpServerHealth } from '../runtime/mcp-namespace-shim.js';
+import { listMcpServerHealth, slugifyServerName } from '../runtime/mcp-namespace-shim.js';
+import { serverEnvStatus } from '../tools/mcp-server-tools.js';
 import { collectDiagnostics } from './diagnostics.js';
 import { collectHarnessAudit } from './harness-audit.js';
 import { collectAgentSystemMetrics } from './agent-system-metrics.js';
@@ -5377,7 +5378,16 @@ export function registerConsoleRoutes(
     try {
       const discovered = discoverMcpServers();
       const user = loadUserMcpServers();
-      res.json({ servers: discovered, userOverrides: user });
+      // Enrich each server with connection state + which declared credential keys
+      // are still UNSET (names only, never values) so the dashboard can show a
+      // "needs credentials" badge + an entry field. Mirrors the mcp_status tool.
+      const health = listMcpServerHealth();
+      const servers = discovered.map((s) => {
+        const h = health.find((x) => x.slug === slugifyServerName(s.name) || x.name === s.name);
+        const { declaredEnvKeys, unsetEnvKeys } = serverEnvStatus(s);
+        return { ...s, state: h?.state ?? 'unknown', failureCount: h?.failureCount ?? 0, lastError: h?.lastError, declaredEnvKeys, unsetEnvKeys };
+      });
+      res.json({ servers, userOverrides: user });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -5533,6 +5543,38 @@ export function registerConsoleRoutes(
       await invalidateConfiguredMcpServers();
       clearAutonomyAgentCache();
       res.json({ server: current[name] });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Human-only credential entry for an MCP server. The brain can CREATE/flag a
+   * server (mcp_add) but never writes secrets; this is where the human supplies
+   * the value. Writes to the daemon .env via updateEnvKey (mirrors process.env +
+   * persists 0600) — where the MCP subprocess resolves its declared env keys —
+   * then reconnects so the server picks it up. Scoped to the server's DECLARED
+   * env keys (no arbitrary env writes). The value is never logged or echoed back.
+   */
+  app.post('/api/console/mcp-servers/:name/credential', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = req.params.name;
+    const body = (req.body ?? {}) as { key?: unknown; value?: unknown };
+    const key = typeof body.key === 'string' ? body.key.trim() : '';
+    const value = typeof body.value === 'string' ? body.value : '';
+    try {
+      if (!key) { res.status(400).json({ error: 'key required' }); return; }
+      if (!value) { res.status(400).json({ error: 'value required' }); return; }
+      const server = discoverMcpServers().find((s) => s.name === name);
+      if (!server) { res.status(404).json({ error: 'server not found' }); return; }
+      const { declaredEnvKeys } = serverEnvStatus(server);
+      if (!declaredEnvKeys.includes(key)) {
+        res.status(400).json({ error: `"${key}" is not a declared env key for "${name}". Declared: ${declaredEnvKeys.join(', ') || '(none)'}` });
+        return;
+      }
+      updateEnvKey(key, value); // writes .env + mirrors process.env (value never logged)
+      await invalidateConfiguredMcpServers(); // reconnect picks up the new credential
+      res.json({ ok: true, server: name, key, set: true });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

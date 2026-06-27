@@ -55,7 +55,7 @@ export function searchToolkits(snap: ComposioSnapshot | undefined, q: string, li
 // `required`/`description` metadata lives in the separate `descriptors` map.
 export interface CredentialRow { name?: string; status?: string; hasValue?: boolean; source?: string; [k: string]: unknown }
 export interface CredentialDescriptor { required?: boolean; description?: string; setupHint?: string; label?: string; [k: string]: unknown }
-export interface McpServer { slug?: string; name?: string; status?: string; enabled?: boolean; [k: string]: unknown }
+export interface McpServer { slug?: string; name?: string; status?: string; enabled?: boolean; state?: string; failureCount?: number; lastError?: string; declaredEnvKeys?: string[]; unsetEnvKeys?: string[]; [k: string]: unknown }
 export interface CliRow { command?: string; path?: string; isLikelyCli?: boolean; version?: string; helpHead?: string; [k: string]: unknown }
 
 export const getComposioStatus = () => apiGet<ComposioStatus>('/api/composio/status');
@@ -109,6 +109,10 @@ export interface McpServerInput {
 export const addMcpServer = (body: McpServerInput) => apiPost('/api/console/mcp-servers', body);
 export const deleteMcpServer = (name: string) =>
   api(`/api/console/mcp-servers/${encodeURIComponent(name)}`, { method: 'DELETE' });
+// Human-only credential entry for an MCP server's declared env key. The value is
+// written to the daemon env + the server reconnects. Never echoed back.
+export const setMcpCredential = (name: string, key: string, value: string) =>
+  apiPost(`/api/console/mcp-servers/${encodeURIComponent(name)}/credential`, { key, value });
 export const getClis = () => apiGet<{ clis?: CliRow[]; cliCount?: number; detectedCount?: number }>('/api/console/clis');
 // User-saved CLIs the user explicitly told Clementine they use.
 export const getSavedClis = () => apiGet<{ saved: string[] }>('/api/console/clis/saved');

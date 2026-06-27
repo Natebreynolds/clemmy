@@ -7,7 +7,7 @@ import { Input, Select } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
-import { getMcpServers, addMcpServer, deleteMcpServer, type McpServerInput } from '@/lib/connect';
+import { getMcpServers, addMcpServer, deleteMcpServer, setMcpCredential, type McpServerInput, type McpServer } from '@/lib/connect';
 import { cn } from '@/lib/cn';
 
 export function McpManager() {
@@ -89,17 +89,69 @@ export function McpManager() {
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {servers.map((s, i) => (
-            <Card key={s.name || s.slug || i} className="flex items-center gap-3 p-4">
-              <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{s.name || s.slug}</span>
-              <StatusPill tone={s.enabled !== false ? 'success' : 'neutral'}>{s.enabled !== false ? 'Enabled' : 'Disabled'}</StatusPill>
-              <Button variant="ghost" size="icon" aria-label={`Remove ${s.name || s.slug}`} title="Remove"
-                onClick={async () => { await deleteMcpServer(String(s.name || s.slug)); refresh(); }}>
-                <Trash2 className="h-4 w-4" aria-hidden />
-              </Button>
-            </Card>
+            <McpServerCard key={s.name || s.slug || i} server={s} refresh={refresh} />
           ))}
         </div>
       )}
     </section>
+  );
+}
+
+const STATE_TONE: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> = {
+  connected: 'success', connecting: 'warning', degraded: 'warning', unavailable: 'danger',
+};
+
+function McpServerCard({ server, refresh }: { server: McpServer; refresh: () => void }) {
+  const label = String(server.name || server.slug || '');
+  const unset = server.unsetEnvKeys ?? [];
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [savingKey, setSavingKey] = useState('');
+  const [error, setError] = useState('');
+
+  const saveCred = async (key: string) => {
+    const value = (values[key] ?? '').trim();
+    if (!value) return;
+    setError(''); setSavingKey(key);
+    try {
+      await setMcpCredential(label, key, value);
+      setValues((v) => ({ ...v, [key]: '' }));
+      refresh();
+    } catch (e) { setError((e as Error).message); }
+    finally { setSavingKey(''); }
+  };
+
+  return (
+    <Card className="flex flex-col gap-2 p-4">
+      <div className="flex items-center gap-3">
+        <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{label}</span>
+        {server.state && server.state !== 'unknown' && (
+          <StatusPill tone={STATE_TONE[server.state] ?? 'neutral'}>{server.state}</StatusPill>
+        )}
+        <StatusPill tone={server.enabled !== false ? 'success' : 'neutral'}>{server.enabled !== false ? 'Enabled' : 'Disabled'}</StatusPill>
+        <Button variant="ghost" size="icon" aria-label={`Remove ${label}`} title="Remove"
+          onClick={async () => { await deleteMcpServer(label); refresh(); }}>
+          <Trash2 className="h-4 w-4" aria-hidden />
+        </Button>
+      </div>
+      {unset.length > 0 && (
+        <div className="rounded-md border border-warning/40 bg-warning/5 p-2.5">
+          <p className="mb-1.5 text-small font-medium text-warning">Needs credentials</p>
+          <div className="flex flex-col gap-1.5">
+            {unset.map((key) => (
+              <div key={key} className="flex items-center gap-1.5">
+                <Input type="password" autoComplete="off" value={values[key] ?? ''}
+                  onChange={(e) => setValues((v) => ({ ...v, [key]: e.target.value }))}
+                  placeholder={key} aria-label={`${key} for ${label}`} className="flex-1" />
+                <Button size="sm" variant="secondary" disabled={savingKey === key || !(values[key] ?? '').trim()} onClick={() => saveCred(key)}>
+                  {savingKey === key ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : 'Save'}
+                </Button>
+              </div>
+            ))}
+          </div>
+          {error && <p className="mt-1.5 text-small text-danger">{error}</p>}
+          <p className="mt-1.5 text-caption text-muted">Stored locally + the server reconnects. Values are never shown again.</p>
+        </div>
+      )}
+    </Card>
   );
 }
