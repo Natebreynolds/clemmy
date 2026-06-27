@@ -63,6 +63,13 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // work, it doesn't (re)schedule or unschedule workflows
   'workflow_schedule',
   'workflow_unschedule',
+  // agent authoring / swarm topology: a step can use work tools, but it must
+  // not create durable agents or fan out work through the team substrate
+  'agent_propose',
+  'create_agent',
+  'update_agent',
+  'delete_agent',
+  'delegate_task',
   // scheduling / cron: a step doesn't schedule or trigger future work
   'add_cron_job',
   'trigger_cron_job',

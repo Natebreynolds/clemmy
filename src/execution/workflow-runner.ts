@@ -83,6 +83,11 @@ import { deliverOutcome } from '../runtime/outcome.js';
 import { rewriteInClementineVoice } from './voice-rewrite.js';
 import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
 import {
+  recallWorkflowPatterns,
+  recordSuccessfulWorkflowPattern,
+  renderWorkflowPatternHint,
+} from '../memory/workflow-pattern-store.js';
+import {
   claudeAgentSdkWorkflowStepEnabled,
   runClaudeAgentSdkWorkflowStep,
 } from '../runtime/harness/claude-agent-workflow-step.js';
@@ -896,6 +901,15 @@ interface StepExecutionContext {
   // every LLM step prompt gets a PRIOR ATTEMPT FEEDBACK block so the re-run
   // addresses the unmet criteria instead of repeating the same output.
   goalFeedback?: string;
+  // Procedural recall from prior clean workflow runs. Injected as a short
+  // advisory into LLM steps only; deterministic helpers stay byte-identical.
+  learnedPatternHint?: string;
+}
+
+function applyWorkflowPatternHint(ctx: Pick<StepExecutionContext, 'learnedPatternHint'>, prompt: string): string {
+  const hint = ctx.learnedPatternHint?.trim();
+  if (!hint) return prompt;
+  return `${prompt}\n\n${hint}`;
 }
 
 /** A non-blocking quality heads-up attached to a COMPLETED run. The deliverable
@@ -2415,7 +2429,10 @@ export async function executeStep(
             // when the step declares no `inputs`). `item` is in scope here.
             const itemContext = bindStepContext(step, ctx, item);
             const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
-            const prompt = applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent)));
+            const prompt = applyWorkflowPatternHint(
+              ctx,
+              applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent))),
+            );
             let output: unknown;
             let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
             if (workflowHarnessEnabled(step)) {
@@ -2535,6 +2552,7 @@ export async function executeStep(
     ctx,
     applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs))),
   );
+  const promptedWithPatterns = applyWorkflowPatternHint(ctx, prompt);
   let output: unknown;
   let stepSessionId = `workflow:${ctx.runId}:${step.id}`;
   if (workflowHarnessEnabled(step)) {
@@ -2542,7 +2560,7 @@ export async function executeStep(
       const result = await runStepViaHarness(
         step,
         `${ctx.runId}:${step.id}`,
-        prompt,
+        promptedWithPatterns,
         ctx.workflow.name,
         workflowAutoApprovalTools(ctx.workflow, step),
         ctx.runId,
@@ -2572,7 +2590,7 @@ export async function executeStep(
     const response = await respondPreferHarness('workflow', {
       sessionId: `workflow:${ctx.runId}:${step.id}`,
       channel: 'workflow',
-      message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${prompt}`,
+      message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}`,
       // A plain (non-forEach) step is ORCHESTRATION work (multi-tool, strict
       // structured output, e.g. Outlook triage) — it stays on the brain/primary
       // tier (Codex in worker mode), NOT the cheap worker tier. Only forEach
@@ -3056,6 +3074,25 @@ async function executeWorkflow(
     );
   }
 
+  const learnedPatternMatches = targetStepId
+    ? []
+    : recallWorkflowPatterns(`${workflow.name} ${workflow.description ?? ''}`, 2);
+  const learnedPatternHint = renderWorkflowPatternHint(learnedPatternMatches);
+  if (learnedPatternMatches.length > 0) {
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'step_advisory',
+      stepId: '(workflow)',
+      meta: {
+        reason: 'learned_pattern_recalled',
+        patterns: learnedPatternMatches.map((match) => ({
+          workflow: match.record.workflowName,
+          score: match.score,
+          successCount: match.record.successCount,
+        })),
+      },
+    });
+  }
+
   // Single-step "TRY" mode: execute only the named step. Upstream
   // references in the prompt resolve to empty strings — the user is
   // explicitly asking to see this step in isolation. Synthesis is
@@ -3080,7 +3117,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback,
+        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -3101,7 +3138,7 @@ async function executeWorkflow(
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
         const output = await executeStepVerified(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback,
+          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint,
         });
         return { step, output };
       }));
@@ -4413,6 +4450,16 @@ async function processOneRunFile(
             });
           } catch { /* distillation never affects the run */ }
         })();
+        if (!run.targetStepId) {
+          try {
+            recordSuccessfulWorkflowPattern({
+              workflow: workflow.data,
+              workflowSlug: workflow.name,
+              runId: run.id,
+              finalOutput,
+            });
+          } catch { /* pattern learning never affects the run */ }
+        }
       }
       const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
       const escalationBanner = autoHealPaused

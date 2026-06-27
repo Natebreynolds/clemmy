@@ -78,9 +78,224 @@ export interface AutoresearchRunResponse {
   improvementProposals?: { ran: boolean; added: number; total: number } | null;
 }
 
+export type HarnessAuditStatus = 'pass' | 'warn' | 'fail';
+export interface HarnessAuditCheck {
+  id: string;
+  title: string;
+  status: HarnessAuditStatus;
+  detail: string;
+  impact: 'low' | 'medium' | 'high';
+}
+export interface HarnessAuditSection {
+  id: 'tools' | 'workflows' | 'approvals' | 'agents' | 'learning';
+  title: string;
+  score: number;
+  checks: HarnessAuditCheck[];
+}
+export interface HarnessAuditSnapshot {
+  generatedAt: string;
+  score: number;
+  summary: { pass: number; warn: number; fail: number };
+  sections: HarnessAuditSection[];
+}
+
+export interface AgentSystemMetrics {
+  generatedAt: string;
+  coordination: CoordinationPolicySnapshot;
+  trend: AgentSystemTrendSnapshot;
+  swarm: {
+    agentCount: number;
+    v2OptInCount: number;
+    peerCommsEnabled: boolean;
+    comms24h: { total: number; requests: number; responses: number; messages: number };
+    pendingInboxItems: number;
+    blockedAgents: number;
+    autonomyRuns: { total: number; completed: number; failed: number; active: number; successRatePct: number };
+    workerSessions: number;
+    workerRoutes: number;
+    workerCapped: number;
+    effectiveness: SwarmEffectivenessSnapshot;
+    topology: SwarmTopologySnapshot;
+    readiness: SwarmReadinessSnapshot;
+    scorecards: AgentScorecard[];
+    recommendation: string;
+  };
+  loops: {
+    workflowRuns: { total: number; clean: number; needsAttention: number; failed: number; successRatePct: number };
+    attemptRecords: number;
+    retryEvents: number;
+    selfHealRuns: number;
+    goalRepursuits: number;
+    goalSatisfied: number;
+    goalEscalated: number;
+    forEachItems: { completed: number; failed: number; failureRatePct: number };
+    averageRunSeconds: number | null;
+    loopEffectivenessScore: number;
+    interventions: LoopInterventionSnapshot;
+    learning: WorkflowLearningSnapshot;
+    issueCauses: LoopIssueCause[];
+    recommendation: string;
+  };
+  recentWarnings: Array<{ kind: 'swarm' | 'loop'; message: string }>;
+  recommendations: AgentSystemRecommendation[];
+}
+export type CoordinationMode = 'single-orchestrator' | 'bounded-fanout' | 'review-swarm' | 'repair-loop' | 'learning-loop';
+export type CoordinationStatus = 'expand' | 'watch' | 'constrain' | 'repair' | 'learn';
+export type FanoutPosture = 'allow' | 'soft' | 'constrain' | 'block';
+export interface CoordinationPolicySnapshot {
+  mode: CoordinationMode;
+  status: CoordinationStatus;
+  fanoutPosture: FanoutPosture;
+  recommendedWorkerWaveSize: number;
+  confidence: number;
+  reasons: string[];
+  guardrails: string[];
+  nextAction: string;
+}
+export interface AgentSystemTrendSnapshot {
+  status: 'improving' | 'stable' | 'regressing' | 'unproven';
+  baselineAt: string | null;
+  samples: number;
+  recent: AgentSystemTrendSeriesPoint[];
+  delta: {
+    swarmReadinessScore: number;
+    loopEffectivenessScore: number;
+    interventionScore: number;
+    workflowRecallHitRatePct: number;
+    workerCapRatePct: number;
+    blockedAgents: number;
+    itemFailures: number;
+  };
+  signals: string[];
+  recommendation: string;
+}
+export interface AgentSystemTrendSeriesPoint {
+  at: string;
+  swarmReadinessScore: number;
+  loopEffectivenessScore: number;
+  interventionScore: number;
+  workflowRecallHitRatePct: number;
+  workerCapRatePct: number;
+  blockedAgents: number;
+  itemFailures: number;
+  healthScore: number;
+}
+export interface SwarmEffectivenessSnapshot {
+  sampleSessions: number;
+  workerRoutes: number;
+  workerCapped: number;
+  capRatePct: number;
+  policyDecisions: number;
+  fanoutOffered: number;
+  fanoutBlockedByPolicy: number;
+  fanoutSuppressedByPolicyPct: number;
+  averageRecommendedWaveSize: number | null;
+  postureSpread: Array<{ posture: FanoutPosture | 'unknown'; count: number }>;
+  intentRoutes: number;
+  intentMatches: number;
+  intentMatchRatePct: number;
+  modelSpread: Array<{ modelId: string; count: number }>;
+  providerSpread: Array<{ provider: string; count: number }>;
+  transportSpread: Array<{ transport: string; count: number }>;
+  recentCappedItems: string[];
+  recommendation: string;
+}
+export type SwarmTopologyKind = 'none' | 'single' | 'isolated' | 'mesh' | 'hub-and-spoke' | 'partial';
+export interface SwarmTopologySnapshot {
+  kind: SwarmTopologyKind;
+  agentCount: number;
+  configuredEdges: number;
+  possibleEdges: number;
+  densityPct: number;
+  reciprocalEdges: number;
+  reciprocityPct: number;
+  isolatedAgents: string[];
+  unknownTargets: Array<{ from: string; to: string }>;
+  hubAgents: Array<{ slug: string; outgoing: number; incoming: number; recentComms: number }>;
+  recentRequests: number;
+  recentResponses: number;
+  requestResponsePct: number;
+  recommendation: string;
+}
+export interface SwarmReadinessSnapshot {
+  score: number;
+  status: 'ready' | 'watch' | 'blocked' | 'unproven';
+  strengths: string[];
+  risks: string[];
+  recommendation: string;
+}
+export interface LoopInterventionSnapshot {
+  score: number;
+  status: 'productive' | 'watch' | 'thrashing' | 'unproven';
+  retryPressurePct: number;
+  retryEvents: number;
+  attemptRecords: number;
+  selfHeal: { runs: number; clean: number; needsAttention: number; successRatePct: number };
+  goalRepursuit: { runs: number; satisfied: number; escalated: number; successRatePct: number };
+  forEachRecovery: { completed: number; failed: number; failureRatePct: number };
+  strengths: string[];
+  risks: string[];
+  recommendation: string;
+}
+export interface WorkflowLearningSnapshot {
+  status: 'compounding' | 'watch' | 'stale' | 'unproven';
+  patternCount: number;
+  totalCleanPatternRuns: number;
+  recallHits: number;
+  recallMisses: number;
+  recallHitRatePct: number;
+  remembers: number;
+  recentRecallSamples: number;
+  topPatterns: Array<{
+    workflowName: string;
+    workflowSlug: string;
+    successCount: number;
+    lastSuccessAt: string;
+    toolCount: number;
+    stepCount: number;
+  }>;
+  strengths: string[];
+  risks: string[];
+  recommendation: string;
+}
+export interface AgentScorecard {
+  slug: string;
+  name: string;
+  role: string | null;
+  status: 'healthy' | 'watch' | 'blocked' | 'unproven';
+  score: number;
+  comms24h: { sent: number; received: number; requests: number; responses: number };
+  pendingInbox: number;
+  autonomyRuns: { total: number; completed: number; failed: number; active: number; successRatePct: number };
+  lastRunAt: string | null;
+  lastError: string | null;
+  recommendation: string;
+}
+export type LoopIssueCauseSource = 'contract' | 'item' | 'step' | 'run' | 'goal';
+export interface LoopIssueCause {
+  key: string;
+  label: string;
+  count: number;
+  sources: LoopIssueCauseSource[];
+  examples: string[];
+}
+export interface AgentSystemRecommendation {
+  id: string;
+  kind: 'swarm' | 'loop';
+  severity: 'info' | 'warn' | 'critical';
+  title: string;
+  detail: string;
+  action: string;
+  target: 'agents' | 'workflows' | 'settings' | 'observability';
+  href: string;
+  cta: string;
+}
+
 export const getAutoresearchReport = () => apiGet<AutoresearchReportResponse>('/api/console/autoresearch/report');
 export const runAutoresearch = () => apiPost<AutoresearchRunResponse>('/api/console/autoresearch/run');
 export const runMemoryCleanup = () => apiPost<AutoCleanResult>('/api/console/autoresearch/memory-cleanup');
+export const getHarnessAudit = () => apiGet<HarnessAuditSnapshot>('/api/console/harness/audit');
+export const getAgentSystemMetrics = () => apiGet<AgentSystemMetrics>('/api/console/agent-system/metrics');
 
 // ─── Human-gated self-improvement proposals ────────────────────────────────
 export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact' | 'workflow_step';

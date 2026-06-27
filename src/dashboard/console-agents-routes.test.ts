@@ -161,6 +161,50 @@ test('GET /api/console/agents/:slug/runs returns an array; unknown run → 404',
   }
 });
 
+test('agent proposal endpoints create, list, approve, and reject drafts', async () => {
+  const h = await boot();
+  const post = (path: string, body: unknown = {}, method = 'POST') =>
+    fetch(`${h.url}${path}`, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  try {
+    const created = await post('/api/console/agents/proposals', {
+      originatingRequest: 'Any time we review an artifact, use a durable QA reviewer agent.',
+      name: 'Artifact QA Reviewer',
+      description: 'Reviews artifacts for claims, evidence, and missing checks.',
+      role: 'review',
+      rationale: 'The request describes repeated review work and a reusable specialist.',
+      evalCriteria: ['Flags unsupported claims'],
+    });
+    assert.equal(created.status, 200);
+    const cb = await created.json() as { proposal: { id: string; status: string; decision: { kind: string } } };
+    assert.equal(cb.proposal.status, 'pending');
+    assert.equal(cb.proposal.decision.kind, 'agent');
+
+    const pending = await (await fetch(`${h.url}/api/console/agents/proposals`)).json() as { proposals: Array<{ id: string }> };
+    assert.ok(pending.proposals.some((proposal) => proposal.id === cb.proposal.id), 'proposal listed as pending');
+
+    const approved = await post(`/api/console/agents/proposals/${cb.proposal.id}/approve`);
+    assert.equal(approved.status, 200);
+    const ab = await approved.json() as { proposal: { status: string }; agent: { slug: string } };
+    assert.equal(ab.proposal.status, 'approved');
+    assert.equal(ab.agent.slug, 'artifact-qa-reviewer');
+
+    const second = await post('/api/console/agents/proposals', {
+      originatingRequest: 'Maybe make a temporary reviewer agent for one quick task.',
+      name: 'Temporary Reviewer',
+      description: 'Reviews one temporary artifact.',
+      rationale: 'Testing rejection over HTTP.',
+    });
+    const sb = await second.json() as { proposal: { id: string } };
+    const rejected = await post(`/api/console/agents/proposals/${sb.proposal.id}/reject`, { reason: 'one-off' });
+    assert.equal(rejected.status, 200);
+    const rb = await rejected.json() as { proposal: { status: string; rejectionReason: string } };
+    assert.equal(rb.proposal.status, 'rejected');
+    assert.equal(rb.proposal.rejectionReason, 'one-off');
+  } finally {
+    await h.close();
+  }
+});
+
 test('POST creates an agent; duplicate → 409; PATCH edits; DELETE removes; auth gated', async () => {
   const authorized = { v: true };
   const h = await boot(authorized);

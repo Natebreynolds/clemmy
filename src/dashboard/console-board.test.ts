@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -30,6 +30,7 @@ const { startRun, finishRun } = await import('../runtime/run-events.js');
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -260,6 +261,75 @@ test('GET /api/console/workflows exposes needs-attention last-run status', async
     assert.ok(row, 'workflow row is present');
     assert.equal(row!.lastRunStatus, 'needs_attention');
     assert.equal(row!.lastRunNeedsAttention, true);
+  } finally {
+    await h.close();
+  }
+});
+
+test('workflow failed-item recovery endpoints list and requeue only final failed forEach items', async () => {
+  const workflowName = 'Failed Item Recovery';
+  const workflowSlug = 'failed-item-recovery';
+  const runId = 'wf-failed-items-1';
+  writeWorkflow(workflowSlug, {
+    name: workflowName,
+    description: 'failed item retry test',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Return records.' },
+      { id: 'send', prompt: 'Process one record.', dependsOn: ['pull'], forEach: 'pull' },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'completed_with_errors',
+    needsAttention: true,
+    inputs: { list: 'A' },
+    createdAt: '2026-06-24T13:00:00.000Z',
+    finishedAt: '2026-06-24T13:02:00.000Z',
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'item_failed', stepId: 'send', itemKey: 'a', error: 'transient a failure' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'item_failed', stepId: 'send', itemKey: 'b', error: 'still failed' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'item_completed', stepId: 'send', itemKey: 'a', output: 'recovered' });
+
+  const h = await boot();
+  try {
+    const listed = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}/runs/${runId}/failed-items`);
+    assert.equal(listed.status, 200);
+    const listBody = await listed.json() as {
+      count: number;
+      ambiguous: boolean;
+      stepIds: string[];
+      failedItems: Array<{ stepId: string; itemKey: string; error: string }>;
+    };
+    assert.equal(listBody.count, 1);
+    assert.equal(listBody.ambiguous, false);
+    assert.deepEqual(listBody.stepIds, ['send']);
+    assert.deepEqual(
+      listBody.failedItems.map((item) => ({ stepId: item.stepId, itemKey: item.itemKey, error: item.error })),
+      [{ stepId: 'send', itemKey: 'b', error: 'still failed' }],
+    );
+
+    const retry = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}/runs/${runId}/retry-failed-items`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ stepId: 'send' }),
+    });
+    assert.equal(retry.status, 200);
+    const retryBody = await retry.json() as { ok: boolean; status: string; id?: string; failedItems: Array<{ itemKey: string }> };
+    assert.equal(retryBody.ok, true);
+    assert.equal(retryBody.status, 'queued');
+    assert.equal(retryBody.failedItems.length, 1);
+    assert.equal(retryBody.failedItems[0]?.itemKey, 'b');
+    assert.ok(retryBody.id, 'retry run id returned');
+
+    const queued = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${retryBody.id}.json`), 'utf-8')) as Record<string, unknown>;
+    assert.equal(queued.workflow, workflowName);
+    assert.equal(queued.retryFailedItemsFromRunId, runId);
+    assert.equal(queued.retryFailedItemsStepId, 'send');
+    assert.deepEqual(queued.retryFailedItemKeys, ['b']);
   } finally {
     await h.close();
   }

@@ -230,7 +230,7 @@ function countWrongPickHints(events: ToolEvent[], targetTool: string): number {
 // table + totalToolCalls so they don't appear as phantom "tools" or inflate
 // counts. tool_choice → computeToolChoiceHealth; reflection/recursive_reflection
 // → computeBrainHealth.
-const SYNTHETIC_TOOL_EVENTS = new Set(['tool_choice', 'reflection', 'recursive_reflection']);
+const SYNTHETIC_TOOL_EVENTS = new Set(['tool_choice', 'workflow_pattern', 'reflection', 'recursive_reflection']);
 
 function computeToolHealth(events: ToolEvent[]): ToolHealth[] {
   // Group by toolName, only consider start-phase events for total count,

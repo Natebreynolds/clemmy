@@ -3224,10 +3224,34 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       toolScope: contextPacket.toolScope,
       mcp: contextPacket.mcp,
       healthWarnings: contextPacket.healthWarnings,
+      agentSystem: contextPacket.agentSystem,
       multiItem: contextPacket.multiItem,
       injectedBytes: contextPacket.text.length,
     },
   });
+  if (contextPacket.multiItem.detected) {
+    const policy = contextPacket.agentSystem.policy;
+    safeAppend({
+      sessionId: options.sessionId,
+      turn,
+      role: 'system',
+      type: 'fanout_policy_decision',
+      data: {
+        inputPreview: contextPacket.inputPreview,
+        sessionKind: session.sessionRow.kind,
+        complexity: contextPacket.complexity,
+        detected: contextPacket.multiItem.detected,
+        itemCount: contextPacket.multiItem.itemCount,
+        offered: contextPacket.multiItem.offered,
+        blockedByPolicy: contextPacket.multiItem.blockedByPolicy,
+        fanoutPosture: contextPacket.multiItem.fanoutPosture,
+        recommendedWorkerWaveSize: contextPacket.multiItem.recommendedWorkerWaveSize,
+        policyMode: policy?.mode ?? null,
+        policyStatus: policy?.status ?? null,
+        policyConfidence: policy?.confidence ?? null,
+      },
+    });
+  }
 
   // v0.5.19 Bug H + callModelInputFilter adoption — build the closure
   // the SDK will invoke just before the LLM call. It appends transient

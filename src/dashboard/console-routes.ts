@@ -54,7 +54,7 @@ import {
 } from '../memory/workflow-store.js';
 import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
 import { extractArchitectDiff } from './architect-diff.js';
-import { appendWorkflowEvent, listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
+import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
 import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
@@ -241,6 +241,9 @@ import {
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import { listMcpServerHealth } from '../runtime/mcp-namespace-shim.js';
 import { collectDiagnostics } from './diagnostics.js';
+import { collectHarnessAudit } from './harness-audit.js';
+import { collectAgentSystemMetrics } from './agent-system-metrics.js';
+import { requeueWorkflowFailedItemsFromRun } from '../tools/workflow-run-queue.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -1869,6 +1872,8 @@ export function registerConsoleRoutes(
         .sort((a, b) => a.data.name.localeCompare(b.data.name))
         .map((entry) => {
           const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
+          const lastRunFailedItems = lastRun ? listFinalFailedItems(entry.name, lastRun.id) : [];
+          const lastRunFailedItemStepIds = Array.from(new Set(lastRunFailedItems.map((item) => item.stepId)));
           return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
@@ -1884,6 +1889,9 @@ export function registerConsoleRoutes(
           whenToUse: entry.data.whenToUse ?? null,
           lastRunStatus: lastRun ? (lastRun.needsAttention ? 'needs_attention' : lastRun.status) : null,
           lastRunNeedsAttention: lastRun?.needsAttention === true || undefined,
+          lastRunId: lastRun?.id ?? null,
+          lastRunFailedItemCount: lastRunFailedItems.length,
+          lastRunFailedItemStepIds,
           lastRunAt: lastRun ? (lastRun.finishedAt ?? lastRun.startedAt ?? lastRun.createdAt) : null,
           };
         });
@@ -2291,6 +2299,71 @@ export function registerConsoleRoutes(
     if (targetStepId) payload.targetStepId = targetStepId;
     writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
     res.json({ queued: !dryRun, dryRun, id, targetStepId });
+  });
+
+  app.get('/api/console/workflows/:name/runs/:runId/failed-items', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const runId = req.params.runId;
+    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'workflow run not found' });
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      const failedItems = listFinalFailedItems(entry.name, runId);
+      const stepIds = Array.from(new Set(failedItems.map((item) => item.stepId)));
+      res.json({
+        runId,
+        workflow: entry.data.name,
+        failedItems,
+        count: failedItems.length,
+        stepIds,
+        ambiguous: stepIds.length > 1,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/workflows/:name/runs/:runId/retry-failed-items', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const runId = req.params.runId;
+    const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'workflow run not found' });
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      const stepId = typeof req.body?.stepId === 'string' && req.body.stepId.trim()
+        ? req.body.stepId.trim()
+        : undefined;
+      const result = requeueWorkflowFailedItemsFromRun(runId, { stepId });
+      res.json({
+        ok: result.status === 'queued' || result.status === 'duplicate',
+        status: result.status,
+        id: result.id,
+        message: result.message,
+        failedItems: result.failedItems ?? [],
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/console/workflows/:name/runs/:runId/cancel', (req, res) => {
@@ -4836,6 +4909,36 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       res.json(collectDiagnostics());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Ruflo-inspired harness audit: read-only scorecard over the concrete
+   * Clementine substrate (tools, workflows, approvals, agents, learning).
+   * This is intentionally separate from diagnostics: diagnostics shows raw
+   * state; the audit turns those signals into prioritized fixes.
+   */
+  app.get('/api/console/harness/audit', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(collectHarnessAudit());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Agent-system effectiveness: swarm coordination + workflow loop health.
+   * Reads existing logs only. This is the measurement spine for deciding when
+   * to use fanout/review/debate swarms and when a workflow loop should replan
+   * instead of retrying blindly.
+   */
+  app.get('/api/console/agent-system/metrics', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(collectAgentSystemMetrics());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

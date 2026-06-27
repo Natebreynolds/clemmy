@@ -16,6 +16,7 @@ import {
   textResult,
   writeTeamAgent,
 } from './shared.js';
+import { proposeAgentDefinition } from '../agents/agent-proposals.js';
 
 interface TeamMessageRecord {
   id: string;
@@ -256,8 +257,95 @@ export function registerTeamTools(server: McpServer): void {
   );
 
   server.tool(
+    'agent_propose',
+    [
+      'Draft a reusable team-agent proposal for user review. Use this when the user describes a durable specialist, repeated role, stable tool/memory boundary, or a workflow step that should become reusable.',
+      'This does NOT create or enable an agent. It queues a proposal the user can approve from the Agents UI. For one-off work, do the task. For repeatable step sequences, create a workflow instead.',
+    ].join(' '),
+    {
+      originating_request: z.string().min(8),
+      name: z.string().min(3),
+      description: z.string().min(8),
+      rationale: z.string().min(8),
+      role: z.string().optional(),
+      personality: z.string().optional(),
+      model: z.string().optional(),
+      project: z.string().optional(),
+      tools: z.array(z.string()).optional(),
+      can_message: z.array(z.string()).optional(),
+      skills: z.array(z.string()).optional(),
+      workflows: z.array(z.string()).optional(),
+      memory_scope: z.string().optional(),
+      approval_policy: z.string().optional(),
+      eval_criteria: z.array(z.string()).optional(),
+      suggested_workflows: z.array(z.string()).optional(),
+      autonomy_enabled: z.boolean().optional(),
+      proactive: z.boolean().optional(),
+      cadence_minutes: z.number().optional(),
+      session_id: z.string().optional(),
+    },
+    async ({
+      originating_request,
+      name,
+      description,
+      rationale,
+      role,
+      personality,
+      model,
+      project,
+      tools,
+      can_message,
+      skills,
+      workflows,
+      memory_scope,
+      approval_policy,
+      eval_criteria,
+      suggested_workflows,
+      autonomy_enabled,
+      proactive,
+      cadence_minutes,
+      session_id,
+    }) => {
+      assertPrimaryOnly('propose agents');
+
+      const proposal = proposeAgentDefinition({
+        originatingRequest: originating_request,
+        name,
+        description,
+        rationale,
+        role,
+        personality,
+        model,
+        project,
+        allowedTools: tools,
+        canMessage: can_message,
+        skills,
+        workflows,
+        memoryScope: memory_scope,
+        approvalPolicy: approval_policy,
+        evalCriteria: eval_criteria,
+        suggestedWorkflows: suggested_workflows,
+        autonomyEnabled: autonomy_enabled,
+        proactive,
+        cadenceMinutes: cadence_minutes,
+        sessionId: session_id,
+        proposedByAgent: currentAgentSlug(),
+        source: 'chat',
+      });
+
+      return textResult([
+        `Agent proposal queued: ${proposal.id}`,
+        `Name: ${proposal.agent.name}`,
+        `Decision: ${proposal.decision.kind} (${proposal.decision.confidence}/100)`,
+        `Rationale: ${proposal.rationale}`,
+        'Review it in Agents → Agent drafts before it becomes active.',
+      ].join('\n'));
+    },
+  );
+
+  server.tool(
     'create_agent',
-    'Create a new team agent with its own personality, tools, and project binding.',
+    'Create a new active team agent with its own personality, tools, and project binding. Use only when the user explicitly asked to create/enable the agent now; otherwise prefer agent_propose.',
     {
       name: z.string().min(1),
       description: z.string().min(1),

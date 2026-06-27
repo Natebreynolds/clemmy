@@ -27,6 +27,7 @@ test('eventVisibility hides internal noise and keeps milestones', () => {
   for (const noise of [
     'turn_started', 'turn_ended', 'heartbeat', 'condenser_applied',
     'native_compaction_applied', 'mcp_tool_scope', 'agent_context_packet',
+    'fanout_policy_decision',
     'memory_signals_captured', 'turn_memory_primer', 'budget_elevated',
     'cross_session_prefix', 'guardrail_tripped', 'some_future_type',
   ]) {

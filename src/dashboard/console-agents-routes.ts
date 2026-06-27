@@ -17,6 +17,13 @@ import {
 import { listAutonomyRuns, getAutonomyRun } from '../agents/run-tracking.js';
 import { listSkills } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
+import {
+  approveAgentProposal,
+  listAgentProposals,
+  proposeAgentDefinition,
+  rejectAgentProposal,
+  type AgentProposalStatus,
+} from '../agents/agent-proposals.js';
 
 /**
  * Read-only "Agents" workspace API (multi-agent workspace, slice 1).
@@ -302,6 +309,63 @@ export function registerConsoleAgentsRoutes(
     }
   });
 
+  app.get('/api/console/agents/proposals', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const rawStatus = typeof req.query.status === 'string' ? req.query.status : 'pending';
+      const status = ['pending', 'approved', 'rejected', 'all'].includes(rawStatus)
+        ? rawStatus as AgentProposalStatus | 'all'
+        : 'pending';
+      const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
+      const proposals = listAgentProposals({ status, limit });
+      res.json({ proposals, generatedAt: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/agents/proposals', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = coerceAgentProposalBody(req.body);
+      const proposal = proposeAgentDefinition({ ...body, source: 'console', proposedByAgent: 'clementine' });
+      res.json({ proposal, generatedAt: new Date().toISOString() });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/console/agents/proposals/:id/approve', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const result = approveAgentProposal(String(req.params.id));
+      if (!result) { res.status(404).json({ error: 'pending proposal not found' }); return; }
+      res.json({
+        proposal: result.proposal,
+        agent: summarizeAgent(result.agent, activeRunSlugs()),
+        generatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(message.includes('already exists') ? 409 : 400).json({ error: message });
+    }
+  });
+
+  app.post('/api/console/agents/proposals/:id/reject', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const reason = typeof (req.body as { reason?: unknown } | undefined)?.reason === 'string'
+        ? String((req.body as { reason?: string }).reason)
+        : undefined;
+      const proposal = rejectAgentProposal(String(req.params.id), reason);
+      if (!proposal) { res.status(404).json({ error: 'pending proposal not found' }); return; }
+      res.json({ proposal, generatedAt: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/agents/:slug/runs', (req: Request, res: Response) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -460,5 +524,39 @@ function coerceAgentBody(body: unknown): AgentBodyFields {
     tier: num(b.tier),
     proactive: bool(b.proactive),
     autonomyEnabled: bool(b.autonomyEnabled),
+  };
+}
+
+function coerceAgentProposalBody(body: unknown) {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
+  const optStr = (v: unknown): string | undefined => {
+    const s = str(v);
+    return s ? s : undefined;
+  };
+  const strList = (v: unknown): string[] | undefined =>
+    Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : undefined;
+  const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+  const bool = (v: unknown): boolean | undefined => (typeof v === 'boolean' ? v : undefined);
+  return {
+    originatingRequest: str(b.originatingRequest),
+    name: str(b.name),
+    description: str(b.description),
+    rationale: str(b.rationale),
+    role: optStr(b.role),
+    personality: optStr(b.personality),
+    model: optStr(b.model),
+    project: optStr(b.project),
+    canMessage: strList(b.canMessage),
+    allowedTools: strList(b.allowedTools),
+    skills: strList(b.skills),
+    workflows: strList(b.workflows),
+    memoryScope: optStr(b.memoryScope),
+    approvalPolicy: optStr(b.approvalPolicy),
+    evalCriteria: strList(b.evalCriteria),
+    suggestedWorkflows: strList(b.suggestedWorkflows),
+    proactive: bool(b.proactive),
+    autonomyEnabled: bool(b.autonomyEnabled),
+    cadenceMinutes: num(b.cadenceMinutes),
   };
 }

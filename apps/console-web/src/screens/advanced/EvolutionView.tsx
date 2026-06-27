@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from 'react';
-import { ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck, GitPullRequest, Check, X } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { ArrowRight, ExternalLink, RefreshCw, Brain, Wrench, Lightbulb, TrendingUp, Sparkles, ShieldCheck, GitPullRequest, Check, X } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -9,11 +10,13 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
 import {
   getAutoresearchReport, runAutoresearch, runMemoryCleanup,
+  getHarnessAudit, getAgentSystemMetrics,
   approveDuplicates, liftRecallGaps, retireInternalNoise,
   getImprovementProposals, approveImprovementProposal, dismissImprovementProposal,
   fmtNum, fmtPct, fmtWhen,
   type ObservatoryReport, type ToolHealth, type MemoryRefinements, type AutoCleanResult, type ApproveResult,
   type ImprovementProposal, type ImprovementProposalResponse, type ApplyImprovementResult,
+  type HarnessAuditSnapshot, type AgentScorecard, type AgentSystemMetrics, type AgentSystemRecommendation,
 } from '@/lib/advanced';
 
 const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
@@ -53,6 +56,327 @@ function ToolHealthRow({ t }: { t: ToolHealth }) {
           {t.wrongPickHints} wrong-pick
         </span>
       )}
+    </div>
+  );
+}
+
+function scoreTone(score: number): 'success' | 'warning' | 'danger' {
+  if (score < 60) return 'danger';
+  if (score < 80) return 'warning';
+  return 'success';
+}
+
+function recommendationTone(severity: AgentSystemRecommendation['severity']): 'info' | 'warning' | 'danger' {
+  if (severity === 'critical') return 'danger';
+  if (severity === 'warn') return 'warning';
+  return 'info';
+}
+
+function scorecardStatusTone(status: AgentScorecard['status']): 'success' | 'warning' | 'danger' | 'neutral' {
+  if (status === 'blocked') return 'danger';
+  if (status === 'watch') return 'warning';
+  if (status === 'healthy') return 'success';
+  return 'neutral';
+}
+
+function workflowLearningTone(status: AgentSystemMetrics['loops']['learning']['status']): 'success' | 'warning' | 'danger' | 'neutral' {
+  if (status === 'compounding') return 'success';
+  if (status === 'watch') return 'warning';
+  if (status === 'stale') return 'danger';
+  return 'neutral';
+}
+
+function coordinationTone(status: AgentSystemMetrics['coordination']['status']): 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'expand') return 'success';
+  if (status === 'repair' || status === 'constrain') return 'danger';
+  if (status === 'learn') return 'info';
+  return 'warning';
+}
+
+function fanoutPostureTone(posture: AgentSystemMetrics['coordination']['fanoutPosture']): 'success' | 'warning' | 'danger' | 'info' {
+  if (posture === 'allow') return 'success';
+  if (posture === 'soft') return 'info';
+  if (posture === 'constrain') return 'warning';
+  return 'danger';
+}
+
+function trendTone(status: AgentSystemMetrics['trend']['status']): 'success' | 'warning' | 'danger' | 'neutral' {
+  if (status === 'improving') return 'success';
+  if (status === 'regressing') return 'danger';
+  if (status === 'stable') return 'warning';
+  return 'neutral';
+}
+
+function SystemStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-md border border-border bg-surface p-3">
+      <div className="truncate text-h3 text-fg" title={value}>{value}</div>
+      <div className="mt-0.5 truncate text-caption text-faint" title={label}>{label}</div>
+    </div>
+  );
+}
+
+function TrendSparkline({ trend }: { trend: AgentSystemMetrics['trend'] }) {
+  const points = trend.recent.slice(-12);
+  if (points.length === 0) return null;
+  return (
+    <div className="mt-3">
+      <div className="mb-1 flex items-center justify-between text-caption text-faint">
+        <span>Recent health</span>
+        <span>{points[0]?.healthScore ?? 0} → {points[points.length - 1]?.healthScore ?? 0}</span>
+      </div>
+      <div className="flex h-14 items-end gap-1 rounded-md border border-border bg-subtle px-2 py-2">
+        {points.map((point) => (
+          <div
+            key={point.at}
+            className="min-w-0 flex-1 rounded-sm bg-primary"
+            style={{ height: `${Math.max(8, Math.min(100, point.healthScore))}%` }}
+            title={`${fmtWhen(point.at)} · health ${point.healthScore}`}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HarnessAuditCard({ audit }: { audit: HarnessAuditSnapshot }) {
+  const issues = audit.sections
+    .flatMap((section) => section.checks.filter((check) => check.status !== 'pass').map((check) => `${check.title}: ${check.detail}`))
+    .slice(0, 3);
+
+  return (
+    <Card className="p-5">
+      <div className="mb-3 flex items-start gap-3">
+        <ShieldCheck className="mt-0.5 h-4 w-4 text-faint" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <h3 className="text-h3 text-fg">Harness audit</h3>
+          <p className="mt-1 text-small text-muted">Tools, workflows, approvals, agents, and learning guardrails.</p>
+        </div>
+        <StatusPill tone={scoreTone(audit.score)}>{audit.score}/100</StatusPill>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-4">
+        <SystemStat label="Pass" value={fmtNum(audit.summary.pass)} />
+        <SystemStat label="Warn" value={fmtNum(audit.summary.warn)} />
+        <SystemStat label="Fail" value={fmtNum(audit.summary.fail)} />
+        <SystemStat label="Areas" value={fmtNum(audit.sections.length)} />
+      </div>
+      {issues.length > 0 ? (
+        <ul className="mt-3 space-y-1.5">
+          {issues.map((issue) => (
+            <li key={issue} className="text-small text-warning">{issue}</li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-3 text-small text-muted">No harness issues flagged.</p>
+      )}
+    </Card>
+  );
+}
+
+function AgentSystemCard({ metrics }: { metrics: AgentSystemMetrics }) {
+  const coordination = metrics.coordination;
+  const trend = metrics.trend;
+  const loops = metrics.loops;
+  const swarm = metrics.swarm;
+  const topology = swarm.topology;
+  const fanout = swarm.effectiveness;
+  const readiness = swarm.readiness;
+  const interventions = loops.interventions;
+  const learning = loops.learning;
+  const runs = loops.workflowRuns;
+  const foreach = loops.forEachItems;
+  const recommendations = metrics.recommendations.slice(0, 4);
+  const scorecards = swarm.scorecards.slice(0, 3);
+  const issueCauses = loops.issueCauses.slice(0, 3);
+
+  return (
+    <Card className="p-5">
+      <div className="mb-3 flex items-start gap-3">
+        <GitPullRequest className="mt-0.5 h-4 w-4 text-faint" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <h3 className="text-h3 text-fg">Swarms &amp; loops</h3>
+          <p className="mt-1 text-small text-muted">Agent coordination, worker routing, retries, and workflow loop health.</p>
+        </div>
+        <StatusPill tone={scoreTone(loops.loopEffectivenessScore)}>{loops.loopEffectivenessScore}/100</StatusPill>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-4">
+        <SystemStat label="Policy" value={`${coordination.mode} · ${coordination.confidence}/100`} />
+        <SystemStat label="Trend" value={`${trend.status} · ${trend.samples}`} />
+        <SystemStat label="Agents" value={fmtNum(swarm.agentCount)} />
+        <SystemStat label="Swarm readiness" value={`${readiness.score}/100 · ${readiness.status}`} />
+        <SystemStat label="Worker routes" value={fmtNum(swarm.workerRoutes)} />
+        <SystemStat label="Topology" value={`${topology.kind} · ${topology.densityPct}%`} />
+        <SystemStat label="Fanout cap rate" value={`${fanout.capRatePct}%`} />
+        <SystemStat label="Fanout policy" value={`${fmtNum(fanout.fanoutOffered)} / ${fmtNum(fanout.policyDecisions)}`} />
+        <SystemStat label="Policy blocks" value={`${fanout.fanoutSuppressedByPolicyPct}% · wave ${fanout.averageRecommendedWaveSize ?? '—'}`} />
+        <SystemStat label="Interventions" value={`${interventions.score}/100 · ${interventions.status}`} />
+        <SystemStat label="Workflow learning" value={`${learning.status} · ${learning.recallHitRatePct}%`} />
+        <SystemStat label="Clean runs" value={`${fmtNum(runs.clean)} / ${fmtNum(runs.total)}`} />
+        <SystemStat label="Item failures" value={fmtNum(foreach.failed)} />
+      </div>
+      {(trend.signals.length > 0 || coordination.reasons.length > 0 || scorecards.length > 0 || issueCauses.length > 0 || interventions.risks.length > 0 || learning.topPatterns.length > 0 || learning.risks.length > 0) && (
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <div className="rounded-md border border-border bg-surface p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="text-caption font-semibold uppercase tracking-wide text-faint">Agent-system trend</div>
+              <StatusPill tone={trendTone(trend.status)}>{trend.status}</StatusPill>
+            </div>
+            <p className="text-small text-muted">{trend.recommendation}</p>
+            <TrendSparkline trend={trend} />
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              <SystemStat label="Loop delta" value={`${trend.delta.loopEffectivenessScore > 0 ? '+' : ''}${trend.delta.loopEffectivenessScore}`} />
+              <SystemStat label="Readiness delta" value={`${trend.delta.swarmReadinessScore > 0 ? '+' : ''}${trend.delta.swarmReadinessScore}`} />
+              <SystemStat label="Recall delta" value={`${trend.delta.workflowRecallHitRatePct > 0 ? '+' : ''}${trend.delta.workflowRecallHitRatePct}%`} />
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2 text-caption">
+              {trend.signals.slice(0, 3).map((signal) => (
+                <span key={signal} className="rounded-full bg-subtle px-2 py-0.5 text-muted">{signal}</span>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-md border border-border bg-surface p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="text-caption font-semibold uppercase tracking-wide text-faint">Coordination policy</div>
+              <StatusPill tone={coordinationTone(coordination.status)}>{coordination.status}</StatusPill>
+              <StatusPill tone={fanoutPostureTone(coordination.fanoutPosture)}>fanout {coordination.fanoutPosture}</StatusPill>
+              <StatusPill tone={coordination.recommendedWorkerWaveSize >= 8 ? 'success' : coordination.recommendedWorkerWaveSize > 0 ? 'info' : 'danger'}>
+                wave {coordination.recommendedWorkerWaveSize}
+              </StatusPill>
+            </div>
+            <p className="text-small text-muted">{coordination.nextAction}</p>
+            {(coordination.reasons.length > 0 || coordination.guardrails.length > 0) && (
+              <div className="mt-2 flex flex-wrap gap-2 text-caption">
+                {coordination.reasons.slice(0, 2).map((reason) => (
+                  <span key={reason} className="rounded-full bg-info-tint px-2 py-0.5 text-info">{reason}</span>
+                ))}
+                {coordination.guardrails.slice(0, 2).map((guardrail) => (
+                  <span key={guardrail} className="rounded-full bg-warning-tint px-2 py-0.5 text-warning">{guardrail}</span>
+                ))}
+              </div>
+            )}
+          </div>
+          {scorecards.length > 0 && (
+            <div className="rounded-md border border-border bg-surface p-3">
+              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Weakest agents</div>
+              <div className="space-y-2">
+                {scorecards.map((scorecard) => (
+                  <div key={scorecard.slug} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-small font-medium text-fg">{scorecard.name}</div>
+                      <div className="truncate text-caption text-faint">{scorecard.recommendation}</div>
+                    </div>
+                    <StatusPill tone={scorecardStatusTone(scorecard.status)}>{scorecard.score}/100</StatusPill>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {issueCauses.length > 0 && (
+            <div className="rounded-md border border-border bg-surface p-3">
+              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Loop causes</div>
+              <div className="space-y-2">
+                {issueCauses.map((cause) => (
+                  <div key={cause.key} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-small font-medium text-fg" title={cause.label}>{cause.label}</div>
+                      <div className="truncate text-caption text-faint" title={cause.examples.join(' · ')}>{cause.sources.join(', ')}</div>
+                    </div>
+                    <StatusPill tone="warning">{cause.count}</StatusPill>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {(learning.topPatterns.length > 0 || learning.risks.length > 0 || learning.strengths.length > 0) && (
+            <div className="rounded-md border border-border bg-surface p-3">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="text-caption font-semibold uppercase tracking-wide text-faint">Workflow learning</div>
+                <StatusPill tone={workflowLearningTone(learning.status)}>{learning.status}</StatusPill>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <SystemStat label="Patterns" value={fmtNum(learning.patternCount)} />
+                <SystemStat label="Recall hits" value={`${fmtNum(learning.recallHits)} / ${fmtNum(learning.recentRecallSamples)}`} />
+                <SystemStat label="Remembered" value={fmtNum(learning.remembers)} />
+              </div>
+              {learning.topPatterns.length > 0 ? (
+                <div className="mt-2 space-y-2">
+                  {learning.topPatterns.slice(0, 3).map((pattern) => (
+                    <div key={pattern.workflowSlug} className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate text-small font-medium text-fg" title={pattern.workflowName}>{pattern.workflowName}</div>
+                        <div className="truncate text-caption text-faint">
+                          {pattern.stepCount} steps · {pattern.toolCount} tools · {fmtWhen(pattern.lastSuccessAt)}
+                        </div>
+                      </div>
+                      <StatusPill tone="info">{pattern.successCount}</StatusPill>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-2 text-small text-muted">{learning.recommendation}</p>
+              )}
+              {learning.risks.length > 0 && (
+                <p className="mt-2 text-caption text-warning">{learning.risks[0]}</p>
+              )}
+            </div>
+          )}
+          {interventions.risks.length > 0 && (
+            <div className="rounded-md border border-border bg-surface p-3">
+              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Intervention risks</div>
+              <div className="space-y-2">
+                {interventions.risks.slice(0, 3).map((risk) => (
+                  <div key={risk} className="flex items-center justify-between gap-3">
+                    <span className="min-w-0 truncate text-small font-medium text-fg" title={risk}>{risk}</span>
+                    <StatusPill tone={interventions.status === 'thrashing' ? 'danger' : 'warning'}>{interventions.status}</StatusPill>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {recommendations.length > 0 ? (
+        <ul className="mt-3 space-y-1.5">
+          {recommendations.map((rec) => (
+            <li key={rec.id} className="rounded-md border border-border bg-surface p-3">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <StatusPill tone={recommendationTone(rec.severity)}>{rec.kind}</StatusPill>
+                <span className="text-small font-semibold text-fg">{rec.title}</span>
+              </div>
+              <p className="text-small text-muted">{rec.detail}</p>
+              <p className="mt-1 text-caption text-faint">{rec.action}</p>
+              <Link
+                to={rec.href}
+                className="mt-2 inline-flex h-9 items-center justify-center gap-2 rounded-md px-3 text-small font-semibold text-muted transition-colors duration-fast hover:bg-hover hover:text-fg"
+              >
+                {rec.cta}
+                <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+              </Link>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="mt-3 space-y-1.5 text-small text-muted">
+          <p>{swarm.recommendation}</p>
+          <p>{loops.recommendation}</p>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function SystemHealthCards({
+  audit,
+  metrics,
+}: {
+  audit?: HarnessAuditSnapshot;
+  metrics?: AgentSystemMetrics;
+}) {
+  if (!audit && !metrics) return null;
+  return (
+    <div className="grid gap-4 xl:grid-cols-2">
+      {audit && <HarnessAuditCard audit={audit} />}
+      {metrics && <AgentSystemCard metrics={metrics} />}
     </div>
   );
 }
@@ -530,6 +854,8 @@ function ImprovementProposalsCard({
 
 export function EvolutionView() {
   const q = usePoll(['autoresearch-report'], getAutoresearchReport, 0);
+  const audit = usePoll(['harness-audit'], getHarnessAudit, 15000);
+  const agentMetrics = usePoll(['agent-system-metrics'], getAgentSystemMetrics, 15000);
   const improvements = usePoll(['autoresearch-improvements'], getImprovementProposals, 0);
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -542,6 +868,9 @@ export function EvolutionView() {
   const refinements = mr && typeof mr.totalCandidates === 'number' ? mr : null;
   const improvementData = improvements.data;
   const showImprovementsCard = !!improvementData && (!improvementData.enabled || improvementData.proposals.length > 0);
+  const hasSystemHealth = Boolean(audit.data || agentMetrics.data);
+  const auditError = audit.error instanceof Error ? audit.error.message : null;
+  const metricsError = agentMetrics.error instanceof Error ? agentMetrics.error.message : null;
 
   const onRun = async () => {
     setRunning(true);
@@ -575,15 +904,23 @@ export function EvolutionView() {
           <p className="text-small text-danger">Couldn’t run self-research: {runError}</p>
         </Card>
       )}
-      {q.isLoading ? (
+      {(auditError || metricsError) && (
+        <Card className="mb-4 p-4">
+          <p className="text-small text-danger">
+            {auditError ? `Harness audit failed: ${auditError}` : `Agent metrics failed: ${metricsError}`}
+          </p>
+        </Card>
+      )}
+      {q.isLoading && !hasSystemHealth ? (
         <Skeleton className="h-64 w-full" />
-      ) : !report && !refinements && !showImprovementsCard ? (
+      ) : !hasSystemHealth && !report && !refinements && !showImprovementsCard ? (
         <EmptyState
           title="No self-research yet"
           description="Clementine builds this nightly from how it worked for you. Hit “Run now” to generate the first report."
         />
       ) : (
         <div className="space-y-4">
+          {hasSystemHealth && <SystemHealthCards audit={audit.data} metrics={agentMetrics.data} />}
           {showImprovementsCard && improvementData && (
             <ImprovementProposalsCard data={improvementData} onChanged={improvements.refetch} />
           )}

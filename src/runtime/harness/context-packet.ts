@@ -6,6 +6,8 @@ import { listSkills } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
+import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-system-guidance.js';
+import type { FanoutPosture } from '../../dashboard/agent-system-metrics.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
 import { classifyTurnIntent } from './turn-intent.js';
 
@@ -51,12 +53,20 @@ export interface AgentContextPacket {
   toolScope: Pick<McpToolScope, 'reason' | 'allowAll' | 'allowedServerSlugs' | 'maxTools'>;
   mcp: Array<Pick<MCPServerHealthSnapshot, 'slug' | 'state' | 'toolCount' | 'failureCount' | 'lastError'>>;
   healthWarnings: string[];
+  agentSystem: Pick<AgentSystemGuidance, 'injected' | 'recommendationCount' | 'recommendations' | 'policy'>;
   /**
    * Telemetry for the turn-start fan-out directive. `detected` = the pure
    * detector fired; `offered` = the directive was actually injected (detected
    * AND chat session AND flag on). Used to measure adherence lift.
    */
-  multiItem: { detected: boolean; itemCount: number; offered: boolean };
+  multiItem: {
+    detected: boolean;
+    itemCount: number;
+    offered: boolean;
+    blockedByPolicy: boolean;
+    fanoutPosture: FanoutPosture | 'unknown';
+    recommendedWorkerWaveSize: number;
+  };
   text: string;
 }
 
@@ -192,21 +202,34 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
  * imperative "do NOT serialize" + a one-line forEach-workflow suggestion (P2);
  * 3<=N<8 gets a soft offer that leaves the model's per-item judgment intact.
  */
-function fanoutDirectiveLine(intent: MultiItemIntent): string {
+function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): string {
   const kind = intent.itemKind ? ` ${intent.itemKind}` : ' items';
   const n = intent.itemCount;
+  const cappedWaveSize = Math.max(1, Math.min(8, Math.round(waveSize || 8)));
   if (n >= 8) {
     return (
       `Fan-out directive: this turn names ${n} independent same-shape${kind} to process. `
       + 'Do NOT serialize them in this context — that balloons tokens and forces the harness to clip your freshly-fetched data mid-run. '
-      + 'Resolve any shared tool/connection ONCE, then call run_worker once per item in parallel waves of up to 8 so each worker keeps its own lean context. '
+      + `Resolve any shared tool/connection ONCE, then call run_worker once per item in parallel waves of up to ${cappedWaveSize} so each worker keeps its own lean context. `
       + 'This is a large/recurring shape: after you finish, offer in ONE line to save it as a forEach workflow — do not create or run a workflow unless the user says yes.'
     );
   }
   return (
     `Fan-out hint: this turn names ${n} independent same-shape${kind}. `
-    + 'If each item needs its own multi-step work or large payloads, fan out with run_worker (one per item, in parallel) to keep this context lean. '
+    + `If each item needs its own multi-step work or large payloads, fan out with run_worker (one per item, parallel waves of up to ${cappedWaveSize}) to keep this context lean. `
     + 'If they are quick lookups, just batch the calls in parallel here. Use your judgment.'
+  );
+}
+
+function fanoutPolicyLine(intent: MultiItemIntent, guidance: AgentSystemGuidance): string {
+  const policy = guidance.policy;
+  const kind = intent.itemKind ? ` ${intent.itemKind}` : ' items';
+  const n = intent.itemCount;
+  if (!policy) return STATIC_PARALLELISM_LINE;
+  return (
+    `Fan-out constrained by coordination policy: this turn names ${n} independent same-shape${kind}, `
+    + `but current mode is ${policy.mode} (${policy.status}, fanout ${policy.fanoutPosture}, wave size ${policy.recommendedWorkerWaveSize}). `
+    + `${policy.nextAction} Keep work centralized or use only small explicit batches until the policy changes.`
   );
 }
 
@@ -439,8 +462,21 @@ export function buildAgentContextPacket(
   // parallelism directive. Only the health probes (below) are safe to skip on qa.
   const fanoutEnabled = fanoutDirectiveEnabled();
   const multiItem = fanoutEnabled ? detectMultiItemIntent(input) : NO_MULTI_ITEM;
-  const offerFanout = fanoutEnabled && multiItem.isMultiItem && opts?.sessionKind === 'chat';
-  const parallelismLine = offerFanout ? fanoutDirectiveLine(multiItem) : STATIC_PARALLELISM_LINE;
+  const agentSystem = renderAgentSystemGuidance(input, opts?.sessionKind);
+  const fanoutPosture = agentSystem.policy?.fanoutPosture ?? 'unknown';
+  const recommendedWorkerWaveSize = agentSystem.policy?.recommendedWorkerWaveSize ?? 8;
+  const fanoutBlockedByPolicy = Boolean(
+    multiItem.isMultiItem &&
+    opts?.sessionKind === 'chat' &&
+    agentSystem.policy &&
+    (agentSystem.policy.fanoutPosture === 'block' || agentSystem.policy.fanoutPosture === 'constrain'),
+  );
+  const offerFanout = fanoutEnabled && multiItem.isMultiItem && opts?.sessionKind === 'chat' && !fanoutBlockedByPolicy;
+  const parallelismLine = offerFanout
+    ? fanoutDirectiveLine(multiItem, recommendedWorkerWaveSize)
+    : fanoutBlockedByPolicy
+      ? fanoutPolicyLine(multiItem, agentSystem)
+      : STATIC_PARALLELISM_LINE;
 
   const lines = [
     '[AGENT CONTEXT PACKET]',
@@ -452,6 +488,7 @@ export function buildAgentContextPacket(
     ...renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.'),
     ...renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.'),
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
+    agentSystem.text,
     parallelismLine,
     'Approval reminder: batch related writes/sends under one clear approval with a preview whenever possible.',
   ].filter((line): line is string => Boolean(line));
@@ -466,7 +503,20 @@ export function buildAgentContextPacket(
     toolScope,
     mcp,
     healthWarnings,
-    multiItem: { detected: multiItem.isMultiItem, itemCount: multiItem.itemCount, offered: offerFanout },
+    agentSystem: {
+      injected: agentSystem.injected,
+      recommendationCount: agentSystem.recommendationCount,
+      recommendations: agentSystem.recommendations,
+      policy: agentSystem.policy,
+    },
+    multiItem: {
+      detected: multiItem.isMultiItem,
+      itemCount: multiItem.itemCount,
+      offered: offerFanout,
+      blockedByPolicy: fanoutBlockedByPolicy,
+      fanoutPosture,
+      recommendedWorkerWaveSize,
+    },
     text: lines.join('\n'),
   };
 }

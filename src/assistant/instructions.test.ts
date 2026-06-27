@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderChannelDirective, renderActionDisciplineDirective, hasScopedLanguage, EXECUTE_DIRECTIVE } from './instructions.js';
+import { renderChannelDirective, renderActionDisciplineDirective, hasScopedLanguage, EXECUTE_DIRECTIVE, AGENT_CREATION_DIRECTIVE } from './instructions.js';
 
 test('EXECUTE_DIRECTIVE: tells the model to act in-turn + preview-as-sample, and stays artifact-agnostic', () => {
   // The two code-backed rules must be present.
@@ -18,6 +18,14 @@ test('EXECUTE_DIRECTIVE: tells the model to act in-turn + preview-as-sample, and
   assert.doesNotMatch(EXECUTE_DIRECTIVE, /\bsend(s|ing)?\b/i);
   assert.doesNotMatch(EXECUTE_DIRECTIVE, /\b(reversible|irreversible)\b/i);
   assert.doesNotMatch(EXECUTE_DIRECTIVE, /\bemail/i);
+});
+
+test('AGENT_CREATION_DIRECTIVE: keeps agents, workflows, and runs separate and proposal-first', () => {
+  assert.match(AGENT_CREATION_DIRECTIVE, /Agent = reusable capability\/role/);
+  assert.match(AGENT_CREATION_DIRECTIVE, /Workflow = repeatable process/);
+  assert.match(AGENT_CREATION_DIRECTIVE, /Run = one execution/);
+  assert.match(AGENT_CREATION_DIRECTIVE, /agent_propose/);
+  assert.match(AGENT_CREATION_DIRECTIVE, /Do NOT silently create\/enable persistent agents/);
 });
 
 test('discord: requests tight conversational replies under ~500 chars', () => {

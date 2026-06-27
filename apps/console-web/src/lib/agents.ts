@@ -93,6 +93,52 @@ export interface AgentRun {
   events: AgentRunEvent[];
 }
 
+export type AgentProposalStatus = 'pending' | 'approved' | 'rejected';
+export type AgentCreationDecisionKind = 'one_off' | 'agent' | 'workflow' | 'workflow_with_agent';
+
+export interface AgentCreationDecision {
+  kind: AgentCreationDecisionKind;
+  agentScore: number;
+  workflowScore: number;
+  oneOffScore: number;
+  confidence: number;
+  reasons: string[];
+}
+
+export interface AgentProposal {
+  id: string;
+  proposedAt: string;
+  proposedByAgent: string;
+  status: AgentProposalStatus;
+  source: 'chat' | 'console' | 'system' | 'tool';
+  originatingRequest: string;
+  sessionId?: string;
+  rationale: string;
+  decision: AgentCreationDecision;
+  agent: {
+    name: string;
+    description: string;
+    role?: string;
+    personality?: string;
+    model?: string;
+    project?: string;
+    canMessage: string[];
+    allowedTools: string[];
+    skills: string[];
+    workflows: string[];
+    proactive: boolean;
+    autonomyEnabled: boolean;
+    cadenceMinutes: number;
+  };
+  memoryScope?: string;
+  approvalPolicy?: string;
+  evalCriteria: string[];
+  suggestedWorkflows: string[];
+  resolvedAt?: string;
+  resolvedAgentSlug?: string;
+  rejectionReason?: string;
+}
+
 export const listAgents = () =>
   apiGet<{ agents: AgentSummary[]; generatedAt: string }>('/api/console/agents').then((r) => r.agents);
 
@@ -109,6 +155,11 @@ export const getAgentRuns = (slug: string, limit = 20) =>
   apiGet<{ runs: AgentRun[]; generatedAt: string }>(
     `/api/console/agents/${encodeURIComponent(slug)}/runs?limit=${limit}`,
   ).then((r) => r.runs);
+
+export const listAgentProposals = (status: AgentProposalStatus | 'all' = 'pending', limit = 20) =>
+  apiGet<{ proposals: AgentProposal[]; generatedAt: string }>(
+    `/api/console/agents/proposals?status=${encodeURIComponent(status)}&limit=${limit}`,
+  ).then((r) => r.proposals);
 
 /** Editable fields for create/update (slice 2). All optional on PATCH. */
 export interface AgentInput {
@@ -129,6 +180,29 @@ export interface AgentInput {
 
 export const createAgent = (input: AgentInput) =>
   apiPost<{ agent: AgentSummary }>('/api/console/agents', input).then((r) => r.agent);
+
+export interface AgentProposalInput extends AgentInput {
+  originatingRequest: string;
+  rationale: string;
+  memoryScope?: string;
+  approvalPolicy?: string;
+  evalCriteria?: string[];
+  suggestedWorkflows?: string[];
+}
+
+export const createAgentProposal = (input: AgentProposalInput) =>
+  apiPost<{ proposal: AgentProposal }>('/api/console/agents/proposals', input).then((r) => r.proposal);
+
+export const approveAgentProposal = (id: string) =>
+  apiPost<{ proposal: AgentProposal; agent: AgentSummary }>(
+    `/api/console/agents/proposals/${encodeURIComponent(id)}/approve`,
+  );
+
+export const rejectAgentProposal = (id: string, reason?: string) =>
+  apiPost<{ proposal: AgentProposal }>(
+    `/api/console/agents/proposals/${encodeURIComponent(id)}/reject`,
+    reason ? { reason } : {},
+  ).then((r) => r.proposal);
 
 export const updateAgent = (slug: string, input: AgentInput) =>
   apiPatch<{ agent: AgentSummary }>(`/api/console/agents/${encodeURIComponent(slug)}`, input).then((r) => r.agent);

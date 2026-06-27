@@ -1203,6 +1203,14 @@ export function renderConsoleHtml(token: string): string {
                 </div>
               </div>
               <div class="evolution-meta" data-evolution-meta>— loading —</div>
+              <div class="evolution-system-grid">
+                <section class="evolution-system-card" data-harness-audit-summary>
+                  <div class="settings-info">— loading harness audit —</div>
+                </section>
+                <section class="evolution-system-card" data-agent-system-metrics>
+                  <div class="settings-info">— loading agent system metrics —</div>
+                </section>
+              </div>
               <div class="evolution-report" data-evolution-report>
                 <div class="settings-info">— no report yet · click <strong>Run now</strong> to generate one —</div>
               </div>
@@ -10072,6 +10080,84 @@ body {
   font-size: 10.5px;
   color: var(--fg-3);
   letter-spacing: 0.08em;
+}
+.evolution-system-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  min-height: 0;
+}
+.evolution-system-card {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  padding: 12px;
+  min-width: 0;
+}
+.evo-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+.evo-card-title {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.evo-score {
+  font-size: 18px;
+  line-height: 1;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.evo-score.warn { color: var(--accent-warn); }
+.evo-score.fail { color: var(--accent-fail); }
+.evo-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.evo-stat {
+  min-width: 0;
+}
+.evo-stat em {
+  display: block;
+  font-style: normal;
+  font-size: 16px;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.evo-stat span {
+  display: block;
+  margin-top: 2px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.evo-note {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--fg-3);
+}
+.evo-warning-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.evo-warning {
+  font-size: 10.5px;
+  color: var(--accent-warn);
+}
+@media (max-width: 980px) {
+  .evolution-system-grid { grid-template-columns: 1fr; }
 }
 .evolution-report {
   flex: 1;
@@ -24638,10 +24724,102 @@ const CONSOLE_JS = `
     const historyPick = document.querySelector('[data-evolution-history]');
     const reportEl = document.querySelector('[data-evolution-report]');
     const metaEl = document.querySelector('[data-evolution-meta]');
+    const auditEl = document.querySelector('[data-harness-audit-summary]');
+    const agentMetricsEl = document.querySelector('[data-agent-system-metrics]');
     if (!reportEl) return;
     evolutionBooted = true;
 
+    function scoreClass(score) {
+      return score < 60 ? 'fail' : score < 80 ? 'warn' : '';
+    }
+
+    function renderHarnessAuditSummary(audit) {
+      if (!auditEl) return;
+      const score = Number(audit && audit.score) || 0;
+      const summary = audit.summary || {};
+      const failing = (audit.sections || []).flatMap((section) =>
+        (section.checks || [])
+          .filter((check) => check.status !== 'pass')
+          .slice(0, 2)
+          .map((check) => check.title + ': ' + check.detail)
+      ).slice(0, 3);
+      auditEl.innerHTML = [
+        '<div class="evo-card-head">',
+        '  <div class="evo-card-title">Harness Audit</div>',
+        '  <div class="evo-score ' + scoreClass(score) + '">' + score + '</div>',
+        '</div>',
+        '<div class="evo-stat-grid">',
+        '  <div class="evo-stat"><em>' + (summary.pass || 0) + '</em><span>pass</span></div>',
+        '  <div class="evo-stat"><em>' + (summary.warn || 0) + '</em><span>warn</span></div>',
+        '  <div class="evo-stat"><em>' + (summary.fail || 0) + '</em><span>fail</span></div>',
+        '  <div class="evo-stat"><em>' + ((audit.sections || []).length) + '</em><span>areas</span></div>',
+        '</div>',
+        failing.length ? '<div class="evo-warning-list">' + failing.map((msg) => '<div class="evo-warning">• ' + escMem(msg) + '</div>').join('') + '</div>' : '<div class="evo-note">No harness issues flagged.</div>',
+      ].join('');
+    }
+
+    function renderAgentSystemMetrics(metrics) {
+      if (!agentMetricsEl) return;
+      const coordination = metrics.coordination || {};
+      const trend = metrics.trend || {};
+      const trendDelta = trend.delta || {};
+      const swarm = metrics.swarm || {};
+      const loops = metrics.loops || {};
+      const readiness = swarm.readiness || {};
+      const effectiveness = swarm.effectiveness || {};
+      const interventions = loops.interventions || {};
+      const learning = loops.learning || {};
+      const workflowRuns = loops.workflowRuns || {};
+      const foreach = loops.forEachItems || {};
+      const score = Number(loops.loopEffectivenessScore);
+      const scoreText = Number.isFinite(score) ? String(score) : '—';
+      const warnings = metrics.recentWarnings || [];
+      agentMetricsEl.innerHTML = [
+        '<div class="evo-card-head">',
+        '  <div class="evo-card-title">Swarms & Loops</div>',
+        '  <div class="evo-score ' + scoreClass(Number.isFinite(score) ? score : 100) + '">' + scoreText + '</div>',
+        '</div>',
+        '<div class="evo-stat-grid">',
+        '  <div class="evo-stat"><em>' + escMem(coordination.mode || '—') + '</em><span>policy</span></div>',
+        '  <div class="evo-stat"><em>' + escMem(coordination.fanoutPosture || '—') + '</em><span>fanout</span></div>',
+        '  <div class="evo-stat"><em>' + escMem(String(coordination.recommendedWorkerWaveSize ?? '—')) + '</em><span>wave</span></div>',
+        '  <div class="evo-stat"><em>' + escMem(trend.status || '—') + '</em><span>trend</span></div>',
+        '  <div class="evo-stat"><em>' + (swarm.agentCount || 0) + '</em><span>agents</span></div>',
+        '  <div class="evo-stat"><em>' + (readiness.score ?? '—') + '</em><span>readiness</span></div>',
+        '  <div class="evo-stat"><em>' + escMem(String(effectiveness.fanoutOffered ?? 0)) + '/' + escMem(String(effectiveness.policyDecisions ?? 0)) + '</em><span>policy offers</span></div>',
+        '  <div class="evo-stat"><em>' + escMem(String(effectiveness.fanoutSuppressedByPolicyPct ?? 0)) + '%</em><span>policy blocks</span></div>',
+        '  <div class="evo-stat"><em>' + (interventions.score ?? '—') + '</em><span>interventions</span></div>',
+        '  <div class="evo-stat"><em>' + (learning.recallHitRatePct ?? '—') + '%</em><span>learning recall</span></div>',
+        '  <div class="evo-stat"><em>' + (workflowRuns.clean || 0) + '/' + (workflowRuns.total || 0) + '</em><span>clean runs</span></div>',
+        '  <div class="evo-stat"><em>' + (foreach.failed || 0) + '</em><span>item fails</span></div>',
+        '</div>',
+        coordination.nextAction ? '<div class="evo-note">' + escMem(coordination.nextAction) + '</div>' : '',
+        trend.recommendation ? '<div class="evo-note">' + escMem(trend.recommendation) + '</div>' : '',
+        trend.signals && trend.signals.length ? '<div class="evo-warning-list">' + trend.signals.slice(0, 3).map((msg) => '<div class="evo-warning">Δ ' + escMem(msg || '') + '</div>').join('') + '</div>' : '',
+        Number.isFinite(Number(trendDelta.loopEffectivenessScore)) ? '<div class="evo-note">Loop Δ ' + escMem(String(trendDelta.loopEffectivenessScore)) + ' · readiness Δ ' + escMem(String(trendDelta.swarmReadinessScore ?? 0)) + '</div>' : '',
+        '<div class="evo-note">' + escMem(swarm.recommendation || '') + '</div>',
+        '<div class="evo-note">' + escMem(loops.recommendation || '') + '</div>',
+        warnings.length ? '<div class="evo-warning-list">' + warnings.slice(0, 3).map((w) => '<div class="evo-warning">• ' + escMem(w.message || '') + '</div>').join('') + '</div>' : '',
+      ].join('');
+    }
+
+    async function refreshSystemMetrics() {
+      try {
+        const pair = await Promise.allSettled([
+          fetchJSON('/api/console/harness/audit'),
+          fetchJSON('/api/console/agent-system/metrics'),
+        ]);
+        if (pair[0].status === 'fulfilled') renderHarnessAuditSummary(pair[0].value);
+        else if (auditEl) auditEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Harness audit failed: ' + escMem(pair[0].reason && pair[0].reason.message || pair[0].reason) + '</div>';
+        if (pair[1].status === 'fulfilled') renderAgentSystemMetrics(pair[1].value);
+        else if (agentMetricsEl) agentMetricsEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Agent metrics failed: ' + escMem(pair[1].reason && pair[1].reason.message || pair[1].reason) + '</div>';
+      } catch (err) {
+        if (agentMetricsEl) agentMetricsEl.innerHTML = '<div class="settings-info" style="color:var(--accent-fail);">Metrics failed: ' + escMem((err && err.message) || err) + '</div>';
+      }
+    }
+
     async function refresh() {
+      refreshSystemMetrics();
       try {
         const data = await fetchJSON('/api/console/autoresearch/report');
         const latest = data.latest;

@@ -9,6 +9,9 @@ export interface WorkflowRow {
   stepCount?: number;
   lastRunStatus?: string | null;
   lastRunNeedsAttention?: boolean;
+  lastRunId?: string | null;
+  lastRunFailedItemCount?: number;
+  lastRunFailedItemStepIds?: string[];
 }
 
 export interface WorkflowStep {
@@ -69,6 +72,18 @@ export const updateSkill = (name: string) => apiPost(`/api/console/skills/${enco
 
 export const listWorkflows = () => apiGet<{ workflows: WorkflowRow[] }>('/api/console/workflows');
 export const runWorkflow = (name: string) => apiPost(`/api/console/workflows/${encodeURIComponent(name)}/run`, {});
+export interface FailedItemRetryResult {
+  ok: boolean;
+  status: 'queued' | 'duplicate' | 'not_found' | 'no_failed_items' | 'ambiguous';
+  id?: string;
+  message: string;
+  failedItems: Array<{ stepId: string; itemKey: string; error: string }>;
+}
+export const retryWorkflowFailedItems = (name: string, runId: string, stepId?: string) =>
+  apiPost<FailedItemRetryResult>(
+    `/api/console/workflows/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/retry-failed-items`,
+    stepId ? { stepId } : {},
+  );
 export const setWorkflowEnabled = (name: string, enabled: boolean) =>
   apiPost(`/api/console/workflows/${encodeURIComponent(name)}/set-enabled`, { enabled });
 

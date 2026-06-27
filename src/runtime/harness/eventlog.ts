@@ -151,6 +151,10 @@ export const EVENT_TYPES = [
   // role registry) — records the attempted intent, whether it matched, and the
   // resolved model/provider, so a trace can show "ran on Opus because 'design'".
   'worker_model_routed',
+  // Turn-start swarm governance decision: the context packet detected a
+  // multi-item request and either offered fanout, constrained it, or kept the
+  // work centralized under the current coordination policy. Pure telemetry.
+  'fanout_policy_decision',
   // Engine-over-prompt A/B substrate: emitted at agent construction with the
   // rubric variant in force (CLEMMY_RUBRIC_VARIANT) so a live session is
   // attributable to an arm (legacy vs a future lean prune). Sibling of

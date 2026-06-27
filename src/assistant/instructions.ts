@@ -24,6 +24,17 @@ import type { MessageIntent } from './message-intent.js';
  */
 export const EXECUTE_DIRECTIVE = 'ALIGN, THEN ACT IN THE SAME TURN. Once the user greenlights an agreed action ("go ahead", "do it", "let\'s get them ready", "make it happen"), CARRY IT OUT this turn using your tools and report the real result. Do NOT reply with a future-tense plan ("I\'ll prep those next", "going to put that together") and stop — a turn that promises work but produces no artifact is a failure. Either produce the actual result now, or, if something genuinely blocks you, name the SPECIFIC blocker and do the part you can. When the user asks to PREVIEW or "show me what you\'d make", produce a real representative SAMPLE of the actual output (one concrete example, not a description of it), then produce the full thing on their go-ahead. Same shape for ANY artifact — a report, a file, a dataset, a batch of messages.';
 
+export const AGENT_CREATION_DIRECTIVE = [
+  'AGENTS / WORKFLOWS / RUNS — keep these distinct.',
+  'Agent = reusable capability/role ("who does this work") with stable tools, model routing, memory scope, and behavior.',
+  'Workflow = repeatable process ("how this work runs") with steps, inputs, outputs, gates, retries, and runs.',
+  'Run = one execution. Most temporary tasks should be runs, not new durable objects.',
+  'Suggest an agent when the user asks for a repeated specialist, durable behavior, stable tool permissions, memory/preferences, or a workflow step that should be reused across workflows.',
+  'Suggest a workflow when the user describes a repeatable sequence, trigger, schedule, approval gate, retry loop, or output contract.',
+  'If both apply, propose a workflow that uses an agent. If neither applies, do the one-off task.',
+  'Use `agent_propose` to draft a reusable agent for review. Do NOT silently create/enable persistent agents from inference. Use `create_agent` only when the user explicitly asks to create/enable the agent now or approves a proposal.',
+].join('\n');
+
 function section(title: string, body?: string): string {
   if (!body?.trim()) return '';
   return `## ${title}\n${body.trim()}`;
@@ -248,6 +259,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const toolBehavior = 'Tools have real schemas. Just call them when the work fits. The runtime classifies each call (read/write/execute/send/admin) and applies the trust gradient automatically — do not pre-ask "want me to proceed?" for reads or for actions inside the user\'s current scope policy. If a call fails, report the real error and propose a fix.';
   const clarify = 'Ask ONE clarifying question only when two interpretations lead to materially different work AND guessing wrong means redoing it. Otherwise pick the obvious option, mention it, and proceed. Never re-ask a clarification the user already answered ("yes", "go ahead", "default is fine") — act on the answer.';
   const executeDirective = EXECUTE_DIRECTIVE;
+  const agentCreation = AGENT_CREATION_DIRECTIVE;
   const capture = 'Persist durable signals as they appear: `memory_remember` for facts/preferences that should carry across sessions; `user_profile_update` for how-to-communicate preferences (tone, timezone, hours, addressing); `propose_check_in_template` for recurring rhythms the user describes ("every Friday I deploy"). Don\'t announce these writes; behave better next turn.';
   const handoffs = [
     'You orchestrate sub-agents. Hand off when the work fits a specialist:',
@@ -278,7 +290,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   const standingFacts = renderFactsForInstructions(12, 2000, undefined, 'pinned');
 
   const tier1 = [
-    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack, workspaces,
+    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, agentCreation, capture, handoffs, planner, focus, reportBack, workspaces,
     channelDirective, actionDirective, userPreferences, standingFacts, proposalFeedback,
     // Stable parity blocks (Now/Focus are dynamic → per-turn tail, not here).
     autonomyBlock, skillsBlock,
@@ -298,7 +310,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   return [
     // Date FIRST so the model reads it before any other context (matches harness).
     nowBlock,
-    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, capture, handoffs, planner, focus, reportBack, workspaces,
+    identityVoice, contextDiscipline, toolBehavior, clarify, executeDirective, agentCreation, capture, handoffs, planner, focus, reportBack, workspaces,
     channelDirective, actionDirective,
     autonomyBlock,
     userPreferences,

@@ -45,6 +45,7 @@ writeFileSync(
 );
 
 const { buildAgentContextPacket, detectMultiItemIntent } = await import('./context-packet.js');
+const { __resetAgentSystemGuidanceCacheForTests } = await import('../agent-system-guidance.js');
 
 test.after(() => {
   try {
@@ -160,6 +161,41 @@ test('detectMultiItemIntent is total — never throws, handles junk input', () =
 
 const NO_MEMORY = { enabled: false, hitCount: 0, source: null, injected: false } as const;
 
+test('packet injects bounded agent-system guidance for chat turns', () => {
+  const packet = buildAgentContextPacket(
+    'Can you create an agent swarm to review this workflow retry issue?',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-agent-guidance' },
+  );
+
+  assert.equal(packet.agentSystem.injected, true);
+  assert.ok(packet.agentSystem.recommendationCount > 0);
+  assert.ok(packet.agentSystem.policy);
+  assert.match(packet.text, /AGENT SYSTEM GUIDANCE/);
+  assert.match(packet.text, /run-shaping guidance only/);
+  assert.match(packet.text, /State: Swarm readiness \d+\/100/);
+  assert.match(packet.text, /loop effectiveness \d+\/100/);
+  assert.match(packet.text, /interventions \d+\/100/);
+  assert.match(packet.text, /learning \w+ \d+% recall/);
+  assert.match(packet.text, /trend \w+/);
+  assert.match(packet.text, /mode [a-z-]+ \([a-z]+\)/);
+  assert.match(packet.text, /Recommended mode: [a-z-]+ \([a-z]+, confidence \d+\/100\)/);
+  assert.match(packet.text, /Fanout posture: [a-z]+; worker wave size \d+/);
+});
+
+test('packet suppresses agent-system guidance for workflow turns', () => {
+  const packet = buildAgentContextPacket(
+    'Research these 10 prospects and capture each firm’s SEO posture.',
+    NO_MEMORY,
+    { sessionKind: 'workflow', sessionId: 'workflow:run-x:step' },
+  );
+
+  assert.equal(packet.agentSystem.injected, false);
+  assert.equal(packet.agentSystem.recommendationCount, 0);
+  assert.equal(packet.agentSystem.policy, null);
+  assert.doesNotMatch(packet.text, /AGENT SYSTEM GUIDANCE/);
+});
+
 test('packet injects the IMPERATIVE fan-out directive for chat sessions with N>=8', () => {
   const packet = buildAgentContextPacket(
     'Research these 10 prospects and capture each firm’s SEO posture.',
@@ -169,8 +205,11 @@ test('packet injects the IMPERATIVE fan-out directive for chat sessions with N>=
   assert.equal(packet.multiItem.detected, true);
   assert.equal(packet.multiItem.itemCount, 10);
   assert.equal(packet.multiItem.offered, true);
+  assert.equal(packet.multiItem.fanoutPosture, 'soft');
+  assert.equal(packet.multiItem.recommendedWorkerWaveSize, 4);
   assert.match(packet.text, /Fan-out directive: this turn names 10 independent same-shape/);
   assert.match(packet.text, /Do NOT serialize/);
+  assert.match(packet.text, /parallel waves of up to 4/);
   // P2 — the N>=8 workflow-suggestion clause rides along.
   assert.match(packet.text, /save it as a forEach workflow/);
   // The static reminder must be GONE when the directive is offered.
@@ -184,9 +223,46 @@ test('packet uses the SOFT hint for 3<=N<8 (no imperative, no workflow clause)',
     { sessionKind: 'chat', sessionId: 'sess-chat-soft' },
   );
   assert.equal(packet.multiItem.offered, true);
+  assert.equal(packet.multiItem.recommendedWorkerWaveSize, 4);
   assert.match(packet.text, /Fan-out hint: this turn names 4 independent same-shape/);
+  assert.match(packet.text, /parallel waves of up to 4/);
   assert.ok(!/Do NOT serialize/.test(packet.text), 'small-N must not be imperative');
   assert.ok(!/save it as a forEach workflow/.test(packet.text), 'small-N must not offer a workflow');
+});
+
+test('packet blocks fan-out directive when coordination policy is in repair mode', () => {
+  mkdirSync(path.join(TMP_HOME, 'workflows', 'runs'), { recursive: true });
+  writeFileSync(path.join(TMP_HOME, 'workflows', 'runs', 'repair-loop-run.json'), JSON.stringify({
+    id: 'repair-loop-run',
+    workflow: 'repair-loop-wf',
+    status: 'completed_with_errors',
+    createdAt: '2026-06-26T11:00:00.000Z',
+    startedAt: '2026-06-26T11:00:10.000Z',
+    finishedAt: '2026-06-26T11:03:10.000Z',
+    needsAttention: true,
+    selfHealAttempt: 1,
+    goalAttempt: 1,
+    goalOutcome: 'escalate',
+    goalReason: 'output contract still failed',
+  }), 'utf-8');
+  __resetAgentSystemGuidanceCacheForTests();
+
+  const packet = buildAgentContextPacket(
+    'Research these 10 prospects and capture each firm’s SEO posture.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-policy-block' },
+  );
+
+  assert.equal(packet.agentSystem.policy?.mode, 'repair-loop');
+  assert.equal(packet.agentSystem.policy?.fanoutPosture, 'block');
+  assert.equal(packet.multiItem.detected, true);
+  assert.equal(packet.multiItem.offered, false);
+  assert.equal(packet.multiItem.blockedByPolicy, true);
+  assert.equal(packet.multiItem.fanoutPosture, 'block');
+  assert.equal(packet.multiItem.recommendedWorkerWaveSize, 0);
+  assert.match(packet.text, /Fan-out constrained by coordination policy/);
+  assert.match(packet.text, /wave size 0/);
+  assert.doesNotMatch(packet.text, /Fan-out directive: this turn names 10 independent same-shape/);
 });
 
 test('packet keeps the static line (no directive) for NON-chat sessions even when multi-item', () => {

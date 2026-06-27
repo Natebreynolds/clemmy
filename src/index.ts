@@ -32,6 +32,7 @@ import { runSetupWizard } from './setup/setup.js';
 import { PLUGINS_DIR } from './plugins/loader.js';
 import { getConfiguredDiscordInstallInfo } from './channels/discord-install.js';
 import { readMemoryIndexStatus, rebuildVaultIndex } from './memory/indexer.js';
+import { collectHarnessAudit } from './dashboard/harness-audit.js';
 
 const logger = pino({ name: 'clementine-next' });
 
@@ -88,6 +89,7 @@ Mobile (PWA companion)
 Harness (0.3, local smoke test)
   harness run "<prompt>"     Run one turn through the Orchestrator + loop
   harness events <session>   Pretty-print the event log for a session
+  harness-audit [--json]     Score tools, workflows, approvals, agents, learning
 
 Setup
   setup               Interactive setup wizard
@@ -325,6 +327,27 @@ function cmdMemoryReindex(): number {
   }
 }
 
+function cmdHarnessAudit(): number {
+  const audit = collectHarnessAudit();
+  if (process.argv.includes('--json')) {
+    console.log(JSON.stringify(audit, null, 2));
+    return audit.summary.fail > 0 ? 1 : 0;
+  }
+  console.log(`Harness audit: ${audit.score}/100 (${audit.summary.pass} pass, ${audit.summary.warn} warn, ${audit.summary.fail} fail)`);
+  for (const section of audit.sections) {
+    console.log(`\n[${section.score}/100] ${section.title}`);
+    const actionable = section.checks.filter((item) => item.status !== 'pass');
+    if (actionable.length === 0) {
+      console.log('  PASS all checks');
+      continue;
+    }
+    for (const item of actionable) {
+      console.log(`  ${item.status.toUpperCase()} ${item.title}: ${item.detail}`);
+    }
+  }
+  return audit.summary.fail > 0 ? 1 : 0;
+}
+
 async function main(): Promise<void> {
   // NOTE: an earlier attempt called process.chdir(os.homedir()) here to
   // dodge a `shell-init: getcwd` warning. That broke previously-working
@@ -349,6 +372,10 @@ async function main(): Promise<void> {
   }
   if (command === 'doctor') {
     process.exitCode = await runDoctor();
+    return;
+  }
+  if (command === 'harness-audit') {
+    process.exitCode = cmdHarnessAudit();
     return;
   }
   if (command === 'init-home') {

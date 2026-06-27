@@ -107,6 +107,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'team_request',
   'team_pending_requests',
   'team_reply',
+  'agent_propose',
   'create_agent',
   'update_agent',
   'delete_agent',
