@@ -22,6 +22,7 @@ import { harnessInstructions } from './harness-context.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
+import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
@@ -616,6 +617,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   if (typeof options.userInput === 'string' && options.userInput.trim() && !mcpToolScope.queryText) {
     mcpToolScope.queryText = options.userInput;
   }
+  // JIT Code Mode adoption mandate: on a data-heavy turn (MCP data servers in
+  // scope) inject a directive steering multi-fetch work to run_tool_program.
+  // '' (byte-identical prompt) on non-data turns or when the kill-switch is off.
+  const codeModeMandate = codeModeMandateDirective({
+    mcpServersInScope: mcpToolScope.allowedServerSlugs?.length ?? 0,
+    allowAllMcp: !!mcpToolScope.allowAll,
+  });
   if (options.sessionId) {
     try {
       appendEvent({
@@ -628,6 +636,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           allowAll: !!mcpToolScope.allowAll,
           allowedServerSlugs: mcpToolScope.allowedServerSlugs ?? [],
           maxTools: mcpToolScope.maxTools ?? null,
+          // Adoption-measurement hook: did the Code Mode mandate fire this turn?
+          codeModeMandate: !!codeModeMandate,
         },
       });
     } catch {
@@ -1129,7 +1139,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // (SOUL, MEMORY, IDENTITY, working memory, facts, goals) each
     // turn — vault edits and new facts surface immediately without
     // restarting the daemon.
-    instructions: harnessInstructions(rubricChoice.instructions),
+    instructions: harnessInstructions(rubricChoice.instructions) + (codeModeMandate ? `\n\n${codeModeMandate}` : ''),
     // Per-call override (dormant — no caller passes it yet) so worker-model
     // routing survives a workflow-step conversion onto the harness loop.
     model: options.model ?? resolveRoleModel('brain').modelId,

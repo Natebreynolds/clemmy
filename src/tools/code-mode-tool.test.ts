@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { READ_ONLY_TOOLS, dispatchCodeModeTool, buildCodeModeTool, isCodeModeToolAllowed, isMcpNamespacedTool } from './code-mode-tool.js';
+import { READ_ONLY_TOOLS, dispatchCodeModeTool, buildCodeModeTool, isCodeModeToolAllowed, isMcpNamespacedTool, codeModeMandateDirective } from './code-mode-tool.js';
 
 test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () => {
   for (const writeTool of ['composio_execute_tool', 'write_file', 'run_shell_command', 'request_approval', 'execution_create', 'memory_remember']) {
@@ -54,6 +54,46 @@ test('MCP tools are allowed in-sandbox even when local writes are OFF (gated by 
     assert.equal(isCodeModeToolAllowed('totally_made_up_tool'), false, 'a non-namespaced unknown is refused');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prev;
+  }
+});
+
+test('codeModeMandateDirective: fires on a data-heavy turn (MCP servers in scope), silent otherwise', () => {
+  // non-data turn → byte-identical prompt (empty directive)
+  assert.equal(codeModeMandateDirective({ mcpServersInScope: 0 }), '');
+  // data-heavy turn → a directive that steers to run_tool_program
+  const d = codeModeMandateDirective({ mcpServersInScope: 2 });
+  assert.match(d, /run_tool_program/);
+  assert.match(d, /DATA-HEAVY/);
+  assert.match(d, /MORE THAN ONE/);
+  // allowAll also triggers it
+  assert.match(codeModeMandateDirective({ allowAllMcp: true }), /run_tool_program/);
+});
+
+test('codeModeMandateDirective: mentions composio_execute_tool only when writes are on', () => {
+  const prev = process.env.CLEMMY_CODE_MODE_WRITES;
+  try {
+    process.env.CLEMMY_CODE_MODE_WRITES = 'on';
+    assert.match(codeModeMandateDirective({ mcpServersInScope: 1 }), /composio_execute_tool/);
+    process.env.CLEMMY_CODE_MODE_WRITES = 'off';
+    assert.doesNotMatch(codeModeMandateDirective({ mcpServersInScope: 1 }), /composio_execute_tool/);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prev;
+  }
+});
+
+test('codeModeMandateDirective: kill-switches respect CODE_MODE_MANDATE and CODE_MODE', () => {
+  const prevM = process.env.CLEMMY_CODE_MODE_MANDATE;
+  const prevC = process.env.CLEMMY_CODE_MODE;
+  try {
+    process.env.CLEMMY_CODE_MODE = 'on';
+    process.env.CLEMMY_CODE_MODE_MANDATE = 'off';
+    assert.equal(codeModeMandateDirective({ mcpServersInScope: 3 }), '', 'mandate kill-switch silences it');
+    process.env.CLEMMY_CODE_MODE_MANDATE = 'on';
+    process.env.CLEMMY_CODE_MODE = 'off';
+    assert.equal(codeModeMandateDirective({ mcpServersInScope: 3 }), '', 'no mandate when code mode itself is off');
+  } finally {
+    if (prevM === undefined) delete process.env.CLEMMY_CODE_MODE_MANDATE; else process.env.CLEMMY_CODE_MODE_MANDATE = prevM;
+    if (prevC === undefined) delete process.env.CLEMMY_CODE_MODE; else process.env.CLEMMY_CODE_MODE = prevC;
   }
 });
 

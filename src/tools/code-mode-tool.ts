@@ -42,6 +42,44 @@ export function codeModeWritesEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CODE_MODE_WRITES', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
+/** JIT adoption mandate (default ON; requires code mode). The tool DESCRIPTION
+ *  nudge alone didn't move adoption (live: 0 run_tool_program on a textbook
+ *  multi-fetch SEO turn), so on a clearly data-heavy turn we inject a per-turn
+ *  DIRECTIVE that steers multi-fetch work to Code Mode. Soft by construction — a
+ *  prompt steer, not a hard gate (the model still controls execution).
+ *  DELETE-WHEN-VALIDATED: once telemetry shows the mandate lifts the
+ *  run_tool_program rate on mandate-fired turns without false-firing on non-data
+ *  turns, fold it in unconditionally. Kill-switch: CLEMMY_CODE_MODE_MANDATE=off. */
+export function codeModeMandateEnabled(): boolean {
+  if (!codeModeEnabled()) return false;
+  return (getRuntimeEnv('CLEMMY_CODE_MODE_MANDATE', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+/**
+ * Per-turn Code Mode steering directive, or '' when not applicable (so the prompt
+ * is byte-identical on non-data turns). Fires only when the turn already has
+ * external MCP data servers in scope (the JIT scoper only admits them on a
+ * data-relevant intent, so this is an intent-gated "data-heavy turn" signal) —
+ * exactly the case where discrete calls dump large JSON into context. Mentions
+ * composio_execute_tool as an in-program option only when writes are on. Pure +
+ * exported for test.
+ */
+export function codeModeMandateDirective(opts: { mcpServersInScope?: number; allowAllMcp?: boolean }): string {
+  if (!codeModeMandateEnabled()) return '';
+  const hasMcpData = !!opts.allowAllMcp || (opts.mcpServersInScope ?? 0) >= 1;
+  if (!hasMcpData) return '';
+  const fetchTools = codeModeWritesEnabled()
+    ? 'MCP tools (`<server>__<tool>`) and `composio_execute_tool`'
+    : 'MCP tools (`<server>__<tool>`)';
+  return [
+    'DATA-HEAVY TURN — USE CODE MODE:',
+    `external data-fetch tools are in scope this turn (${fetchTools}).`,
+    'If you need MORE THAN ONE data fetch (several sources, or one source several times), you MUST call `run_tool_program` and do the fetches INSIDE one program',
+    '(Promise.all the independent ones), distill, and return ONLY the small result — do NOT emit several discrete data-fetch calls that each push raw JSON into the conversation.',
+    'A SINGLE read is fine to call directly.',
+  ].join(' ');
+}
+
 /** Phase 2 mutating surface. Each routes through wrapToolForHarness, so the
  *  write-boundary gates cover it with NO new gate code. run_worker is excluded
  *  (worker-of-worker recursion is out of scope for v1). */
