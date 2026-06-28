@@ -8,6 +8,7 @@ import {
   rememberFact,
   updateFact,
   deleteFact,
+  demoteRolledUpSource,
   getFact,
   setFactPinned,
   findSimilarFacts,
@@ -56,8 +57,19 @@ import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory
 
 const logger = pino({ name: 'clementine.memory.reflection' });
 
-export const REFLECTION_MIN_CONTENT_CHARS = 500;
+// Intake throttle (memory-optimization 2026-06-28): raised 500 → 800 so more
+// short, low-signal tool returns (status JSON, brief acks) are skipped before the
+// extractor runs. User-stated facts come through the SEPARATE auto-capture path
+// (not gated by this floor), so high-trust signal is unaffected.
+export const REFLECTION_MIN_CONTENT_CHARS = 800;
 const REFLECTION_MAX_INPUT_CHARS = 8_000;
+
+// Max facts the extractor may pull from a SINGLE tool return. Lowered 8 → 5: most
+// high-signal returns yield 1–3 facts; the higher ceiling mostly let verbose
+// returns (search results, long docs) dump marginal facts. The conflict resolver
+// NOOPs duplicates and the per-session importance gate keeps the top facts, so a
+// tighter cap trims the low-value tail without losing what matters.
+export const EXTRACTOR_MAX_FACTS = 5;
 
 const FACT_KIND_VALUES = ['user', 'project', 'feedback', 'reference'] as const;
 const ENTITY_TYPE_VALUES = ['person', 'company', 'project', 'place', 'thing'] as const;
@@ -98,14 +110,14 @@ const ExtractedRelationshipSchema = z.object({
   object: z.string().min(1).max(120),
 });
 const ExtractionSchema = z.object({
-  facts: z.array(ExtractedFactSchema).max(8),
+  facts: z.array(ExtractedFactSchema).max(EXTRACTOR_MAX_FACTS),
   entities: z.array(ExtractedEntitySchema).max(12),
   pointers: z.array(ExtractedPointerSchema).max(4),
 });
 // Variant used only when CLEMMY_SOURCE_MAP is on, so the flag-off extractor
 // schema + prompt stay byte-identical to today.
 const ExtractionSchemaWithResources = z.object({
-  facts: z.array(ExtractedFactSchema).max(8),
+  facts: z.array(ExtractedFactSchema).max(EXTRACTOR_MAX_FACTS),
   entities: z.array(ExtractedEntitySchema).max(12),
   pointers: z.array(ExtractedPointerSchema).max(4),
   resources: z.array(ExtractedResourceSchema).max(6),
@@ -215,9 +227,16 @@ function readDisableFlag(): boolean {
 // these. KEEP read_file / run_shell_command / skill_read / workflow_run
 // reflectable — they surface real user/external content.
 const SELF_TOOL_DENY_EXACT = new Set<string>([
-  'recall_tool_result', 'tool_output_query',
+  'recall_tool_result', 'tool_output_query', 'unified_recall',
   'draft_plan', 'task_list', 'task_get', 'task_create', 'task_update',
-  'workflow_get', 'workflow_list', 'workflow_schedule',
+  'workflow_get', 'workflow_list', 'workflow_schedule', 'workflow_step',
+  // Introspection of Clem's OWN state (goals / spaces / learning records) — these
+  // surface no external/user content, so reflecting on them only re-mints
+  // self-referential facts. NOTE: goal_create/goal_draft carry the user's stated
+  // goal text and are intentionally NOT here (that content is reflectable).
+  'goal_get', 'goal_list', 'goal_status',
+  'space_get', 'space_get_runner', 'space_get_view',
+  'attempt_record',
 ]);
 const SELF_TOOL_DENY_PREFIXES = ['memory_', 'background_task', 'execution_'];
 
@@ -330,7 +349,7 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
   let instructions = withResources ? PROMPT_PREAMBLE_WITH_RESOURCES : PROMPT_PREAMBLE;
   if (withRelationships) {
     const shape: Record<string, z.ZodTypeAny> = {
-      facts: z.array(ExtractedFactSchema).max(8),
+      facts: z.array(ExtractedFactSchema).max(EXTRACTOR_MAX_FACTS),
       entities: z.array(ExtractedEntitySchema).max(12),
       pointers: z.array(ExtractedPointerSchema).max(4),
       relationships: z.array(ExtractedRelationshipSchema).max(8),
@@ -1081,6 +1100,10 @@ interface RecursiveReflectionResult {
   patternsWritten: number;
   patternsUpdated: number;
   patternsNoop: number;
+  /** Depth-0 source atoms demoted (importance clamped down) after being rolled up
+   *  into a higher-order pattern, so importance-aware decay consolidates them
+   *  later instead of synthesis just growing the store. */
+  sourcesDemoted: number;
   groupsProcessed: number;
   groupsSkipped: number;
   factsConsidered: number;
@@ -1134,6 +1157,7 @@ export async function runRecursiveReflection(
     patternsWritten: 0,
     patternsUpdated: 0,
     patternsNoop: 0,
+    sourcesDemoted: 0,
     groupsProcessed: 0,
     groupsSkipped: 0,
     factsConsidered: 0,
@@ -1153,7 +1177,7 @@ export async function runRecursiveReflection(
       // broken (auth/quota/model) — surface that as 'error' so a dark compounding
       // layer can't hide behind written=0 like it did before.
       outcome: skipped ? 'cancelled' : (result.groupsFailed > 0 && result.patternsWritten === 0 && result.patternsUpdated === 0 ? 'error' : 'success'),
-      argsSummary: `groups=${result.groupsProcessed}/${result.groupsProcessed + result.groupsSkipped + result.groupsFailed} failed=${result.groupsFailed} facts=${result.factsConsidered} written=${result.patternsWritten} updated=${result.patternsUpdated} noop=${result.patternsNoop}${skipped ? ` skipped=${skipped}` : ''}`,
+      argsSummary: `groups=${result.groupsProcessed}/${result.groupsProcessed + result.groupsSkipped + result.groupsFailed} failed=${result.groupsFailed} facts=${result.factsConsidered} written=${result.patternsWritten} updated=${result.patternsUpdated} noop=${result.patternsNoop} demoted=${result.sourcesDemoted}${skipped ? ` skipped=${skipped}` : ''}`,
     });
     return result;
   };
@@ -1202,6 +1226,10 @@ export async function runRecursiveReflection(
     const sourceIds = rows.map((r) => r.id);
     const maxSourceDepth = rows.reduce((m, r) => Math.max(m, r.derivation_depth ?? 0), 0);
     const targetDepth = Math.min(RECURSIVE_REFLECTION_MAX_DEPTH, maxSourceDepth + 1);
+    // Track whether this group actually produced a higher-order fact, so we only
+    // demote the source atoms once (after the pattern loop) and only when the
+    // signal genuinely got rolled up.
+    let groupRolledUp = false;
 
     for (const pattern of extraction.patterns) {
       try {
@@ -1242,6 +1270,7 @@ export async function runRecursiveReflection(
           });
           if (updated) {
             result.patternsUpdated += 1;
+            groupRolledUp = true;
             continue;
           }
         }
@@ -1253,9 +1282,31 @@ export async function runRecursiveReflection(
           derivationDepth: targetDepth,
           derivedFromFactIds: sourceIds,
         });
-        if (remembered) result.patternsWritten += 1;
+        if (remembered) {
+          result.patternsWritten += 1;
+          groupRolledUp = true;
+        }
       } catch (err) {
         logger.warn({ err: err instanceof Error ? err.message : String(err), kind, pattern }, 'recursive-reflection: write failed');
+      }
+    }
+
+    // CONSOLIDATE (not just add): once this group's signal is carried forward in a
+    // higher-order pattern, demote the depth-0 source atoms so importance-aware
+    // decay retires the now-redundant granular facts on a LATER night. Strictly
+    // guarded — only depth-0, unpinned, non-user-trust (trustLevel < 1.0) atoms;
+    // user-stated facts (trust 1.0) and pinned standing rules are never demoted.
+    // Demotion only clamps importance DOWN; nothing is deleted here (the atom must
+    // still go idle to decay, and access reinforcement protects one that stays
+    // useful). Rides the decay default — no separate flag.
+    if (groupRolledUp) {
+      for (const r of rows) {
+        const depth = r.derivation_depth ?? 0;
+        const trust = r.trust_level ?? 0;
+        if (depth !== 0) continue;        // only roll up atomic facts
+        if (r.pinned) continue;           // never demote a pinned standing rule
+        if (trust >= 1.0) continue;       // never demote a user-stated fact
+        if (demoteRolledUpSource(r.id)) result.sourcesDemoted += 1;
       }
     }
   }

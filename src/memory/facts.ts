@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
 import { cosine, embedQuery, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
+import { getRecallStats } from './recall.js';
 
 /**
  * Floor for the Stanford recall candidate pool. The pool is pre-filtered by
@@ -373,6 +374,35 @@ export function updateFact(
   const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(id) as ConsolidatedFactRow;
   return rowToFact(refreshed);
+}
+
+/**
+ * Demote a depth-0 atom that has been ROLLED UP into a higher-order synthesized
+ * fact (recursive reflection): clamp its importance DOWN into the decay-eligible
+ * band so importance-aware decay retires the now-redundant atom on a LATER
+ * nightly pass. This is what makes synthesis *consolidate* (carry the signal
+ * forward in the depth-1 pattern, let the granular atoms fade) instead of just
+ * *adding* a fact.
+ *
+ * Deliberately the INVERSE of updateFact (which only lifts importance) and
+ * deliberately conservative:
+ *  - clamps DOWN only (never raises), and only if currently above the target;
+ *  - never touches pinned facts (defense-in-depth; the caller also guards);
+ *  - does NOT touch recency/access — a rolled-up atom that turns out to stay
+ *    useful keeps getting accessed, and access reinforcement protects it, so it
+ *    won't actually decay. Nothing is evicted here; it only becomes *eligible*
+ *    once it also goes idle.
+ */
+export function demoteRolledUpSource(id: number, targetImportance = 3): boolean {
+  const db = openMemoryDb();
+  const row = db.prepare('SELECT importance, pinned FROM consolidated_facts WHERE id = ? AND active = 1')
+    .get(id) as { importance: number | null; pinned: number } | undefined;
+  if (!row || row.pinned) return false;
+  const current = typeof row.importance === 'number' ? row.importance : 5;
+  const target = Math.max(1, Math.min(10, targetImportance));
+  if (current <= target) return false; // already low — nothing to do
+  db.prepare('UPDATE consolidated_facts SET importance = ? WHERE id = ?').run(target, id);
+  return true;
 }
 
 /**
@@ -1167,6 +1197,50 @@ export function countActiveFacts(): number {
   }
 }
 
+export interface MemoryHealthSummary {
+  /** Active (non-deleted) facts. */
+  activeFacts: number;
+  /** Active pinned (always-rendered standing) facts. */
+  pinned: number;
+  /** Active fact counts per kind (user/project/feedback/reference/constraint). */
+  byKind: Record<string, number>;
+  /** The most recently learned active fact, for an at-a-glance "newest". */
+  newest: { content: string; kind: string } | null;
+  /** Recall hit-rate this process (0..1), or null when no recall calls yet. */
+  recallHitRate: number | null;
+}
+
+/**
+ * One at-a-glance memory-health summary — counts + pinned + per-kind + newest +
+ * recall hit-rate — so surfaces (Slack App Home, etc.) show a TRUSTWORTHY picture
+ * instead of a bare "N facts" number. Single source of truth for that summary;
+ * best-effort (degrades to zeros, never throws). Reuses getRecallStats() so the
+ * hit-rate matches the dashboard Memory health strip.
+ */
+export function getMemoryHealthSummary(): MemoryHealthSummary {
+  const empty: MemoryHealthSummary = { activeFacts: 0, pinned: 0, byKind: {}, newest: null, recallHitRate: null };
+  try {
+    const db = openMemoryDb();
+    const activeFacts = (db.prepare('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1').get() as { c: number }).c;
+    const pinned = (db.prepare('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1 AND pinned = 1').get() as { c: number }).c;
+    const byKind: Record<string, number> = {};
+    for (const r of db.prepare('SELECT kind, COUNT(*) AS c FROM consolidated_facts WHERE active = 1 GROUP BY kind').all() as Array<{ kind: string; c: number }>) {
+      byKind[r.kind] = r.c;
+    }
+    const newestRow = db.prepare(
+      'SELECT content, kind FROM consolidated_facts WHERE active = 1 ORDER BY COALESCE(extracted_at, updated_at, created_at) DESC, id DESC LIMIT 1',
+    ).get() as { content: string; kind: string } | undefined;
+    let recallHitRate: number | null = null;
+    try {
+      const stats = getRecallStats();
+      recallHitRate = stats.calls > 0 ? stats.hitRate : null;
+    } catch { /* recall stats optional */ }
+    return { activeFacts, pinned, byKind, newest: newestRow ?? null, recallHitRate };
+  } catch {
+    return empty;
+  }
+}
+
 export interface DecayOptions {
   /** Max facts to soft-delete in a single pass (blast-radius cap). */
   maxDeactivate?: number;
@@ -1198,17 +1272,21 @@ export interface DecayResult {
 }
 
 /**
- * Forgetting / staleness eviction (Tier A2). Soft-deletes (active=0)
- * active, NON-PINNED facts that are simultaneously (a) idle past
- * `minIdleDays`, (b) low-importance (<= `importanceCeil`, default 4 — below
- * the 5.0 default so the bulk of the store is protected), and (c) below the
- * Stanford recall-score floor. Bounded by `maxDeactivate` per run.
+ * Forgetting / staleness eviction (Tier A2). Soft-deletes (active=0) active,
+ * NON-PINNED facts that have gone idle. The DEFAULT path is importance-aware
+ * (`decayImportanceAwareEnabled()` on): the idle threshold scales by importance ×
+ * access (see `importanceAwareIdleThresholdDays`), so the idle low-value tail —
+ * including the bulk that sits at the 5.0 default importance — finally fades,
+ * while high-importance and proven-useful (high access) facts are protected
+ * longer. The kill-switch (`CLEMMY_DECAY_IMPORTANCE_AWARE=off`) reverts to the
+ * BINARY path: idle past `minIdleDays`, low-importance (<= `importanceCeil`,
+ * default 4), and below the Stanford recall-score floor. Bounded by
+ * `maxDeactivate` per run in both paths.
  *
  * Decay is a STORAGE complement to the existing RANKING-time recency decay
  * (`stanfordRecallScore`): ranking demotes stale facts in the prompt; this
  * actually retires the long, low-value tail so the fact store stops growing
- * unbounded. Conservative by design and flag-gated off — the owner tunes the
- * thresholds from telemetry, mirroring CLEMMY_REFLECTION_THRESHOLD.
+ * unbounded.
  *
  * Soft delete only (active=0): the row, its embedding, and its audit trail
  * survive for re-activation, exactly like `deleteFact`/Mem0 DELETE.
@@ -1225,7 +1303,15 @@ export function importanceAwareIdleThresholdDays(fact: ConsolidatedFact, baseIdl
 }
 
 function decayImportanceAwareEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_DECAY_IMPORTANCE_AWARE', 'off') || 'off').toLowerCase() === 'on';
+  // Default-ON now (per feedback_no_rollout_flags: validated behavior becomes the
+  // default). The binary path (importance<=4 ceiling) leaves the bulk of the store
+  // — everything at the 5.0 default importance — STRUCTURALLY IMMORTAL, so the
+  // active fact count only ever grew. The importance-aware path scales the idle
+  // threshold by importance × access so the idle low-value tail (including default
+  // 5.0 facts) finally fades, while proven-useful and high-importance facts are
+  // protected longer. CLEMMY_DECAY_IMPORTANCE_AWARE=off remains an operator
+  // kill-switch that reverts to the (immortal-tail) binary path.
+  return (getRuntimeEnv('CLEMMY_DECAY_IMPORTANCE_AWARE', 'on') || 'on').toLowerCase() !== 'off';
 }
 
 export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {

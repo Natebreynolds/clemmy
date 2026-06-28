@@ -43,6 +43,38 @@ test('buildAppHomeBlocks renders a valid home view and never throws', () => {
   }
 });
 
+test('App Home shows an activity snapshot, an accurate "waiting on you", and stays under Slack block limits', () => {
+  const blocks = buildAppHomeBlocks() as Array<{ type: string; text?: { text?: string }; elements?: Array<{ text?: string }> }>;
+  const contextText = blocks
+    .filter((b) => b.type === 'context')
+    .flatMap((b) => (b.elements ?? []).map((e) => e.text ?? ''))
+    .join(' || ');
+  // The activity snapshot pulse.
+  assert.match(contextText, /done today/, 'activity snapshot line present');
+  assert.match(contextText, /waiting on you/, 'consolidated "waiting on you" present');
+  // Slack renders at most 100 blocks per view — the capped sections must stay under.
+  assert.ok(blocks.length <= 100, `home view has ${blocks.length} blocks, must be <= 100`);
+});
+
+test('App Home shows a meaningful memory health line (facts, not a bare count) and never throws', () => {
+  const blocks = buildAppHomeBlocks() as Array<{ type: string; elements?: Array<{ text?: string }> }>;
+  // A context block carries the memory summary: 🧠 + a fact count. Even on an
+  // empty memory store it renders "🧠 *0* facts" rather than throwing.
+  const contextText = blocks
+    .filter((b) => b.type === 'context')
+    .flatMap((b) => (b.elements ?? []).map((e) => e.text ?? ''))
+    .join(' || ');
+  assert.match(contextText, /🧠/, 'memory health line present');
+  assert.match(contextText, /facts/, 'memory line reports a fact count');
+  // The bare "N facts learned" phrasing is replaced by the richer summary.
+  assert.doesNotMatch(contextText, /facts learned/, 'no bare "facts learned" count');
+  // Bounded: every context element stays well under Slack's limits.
+  for (const b of blocks) {
+    if (b.type !== 'context') continue;
+    for (const e of b.elements ?? []) assert.ok((e.text ?? '').length <= 1000);
+  }
+});
+
 test('App Home approval buttons use the shared clementine:* action ids (gated path)', () => {
   // With no real approvals the actions block is absent; assert the SHAPE the
   // builder emits by checking the action-id convention is wired in source.

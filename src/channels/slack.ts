@@ -21,13 +21,15 @@ import { buildSlackHarnessTransport, handleSlackHarnessMessage, toSlackMrkdwn } 
 import { ClementineAssistant } from '../assistant/core.js';
 import { claimInbound, completeInbound } from './inbox-store.js';
 import type { ApprovalResolutionResult } from '../types.js';
-import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal, listActiveGoalContracts } from '../agents/plan-proposals.js';
-import { createGoalFromDraft, dismissGoalDraft, getGoalDraft } from '../agents/goal-drafts.js';
-import { answerCheckIn, getCheckIn } from '../agents/check-ins.js';
+import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal, listActiveGoalContracts, listPlanProposals } from '../agents/plan-proposals.js';
+import { createGoalFromDraft, dismissGoalDraft, getGoalDraft, listGoalDrafts } from '../agents/goal-drafts.js';
+import { answerCheckIn, getCheckIn, listOpenCheckIns } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { queueBackgroundTaskApprovalResolution, listBackgroundTasks, createBackgroundTask } from '../execution/background-tasks.js';
-import { rememberFact, countActiveFacts } from '../memory/facts.js';
+import { rememberFact, getMemoryHealthSummary } from '../memory/facts.js';
 import { getNotification, markNotificationRead, requeueNotificationDelivery } from '../runtime/notifications.js';
+import { loadCronJobs, loadWorkflows } from '../dashboard/state.js';
+import { getNextRun } from '../shared/cron.js';
 
 const logger = pino({ name: 'clementine-next.slack' });
 
@@ -86,32 +88,96 @@ function buildAppHomeBlocks(): KnownBlock[] {
   const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
   const safe = <T,>(fn: () => T, fallback: T): T => { try { return fn(); } catch { return fallback; } };
 
-  // ── Gather everything up front (best-effort) so the summary line is accurate ──
+  // ── Gather everything up front (best-effort) so every count is accurate ──
+  // "Needs you" = the consolidated set of everything genuinely blocked on the
+  // user. Approvals (from the registry) ALREADY cover awaiting_approval tasks, so
+  // those tasks are intentionally NOT counted again — that double-count is the
+  // accuracy bug this fixes.
   const approvals = safe(() => approvalRegistry.listPending().map((a) => ({ approvalId: a.approvalId, subject: a.subject })), []);
-  const goals = safe(() => listActiveGoalContracts(), [] as Array<{ originatingRequest?: string }>);
-  const running = safe(() => listBackgroundTasks({ status: 'running' }), []);
-  const awaitingApproval = safe(() => listBackgroundTasks({ status: 'awaiting_approval' }), []);
-  const needsInput = [
+  const checkIns = safe(() => listOpenCheckIns(), []);
+  const goalDrafts = safe(() => listGoalDrafts({ status: 'pending' }), []);
+  const plansNeedInput = safe(() => listPlanProposals({ status: 'all' }).filter(planProposalNeedsUserInput), []);
+  const blockedTasks = [
+    ...safe(() => listBackgroundTasks({ status: 'blocked' }), []),
     ...safe(() => listBackgroundTasks({ status: 'awaiting_input' }), []),
     ...safe(() => listBackgroundTasks({ status: 'awaiting_continue' }), []),
-    ...safe(() => listBackgroundTasks({ status: 'blocked' }), []),
   ];
-  const doneRecent = safe(() => listBackgroundTasks({ status: 'done' })
-    .sort((a, b) => (b.completedAt ?? b.updatedAt ?? '').localeCompare(a.completedAt ?? a.updatedAt ?? '')), []);
-  const factCount = safe(() => countActiveFacts(), 0);
-  const waitingOnYou = approvals.length + needsInput.length;
+  const running = safe(() => listBackgroundTasks({ status: 'running' }), []);
+  const recent = (a: { completedAt?: string; updatedAt?: string }, b: { completedAt?: string; updatedAt?: string }) =>
+    (b.completedAt ?? b.updatedAt ?? '').localeCompare(a.completedAt ?? a.updatedAt ?? '');
+  // Failures the user should SEE (previously invisible) — scoped to the last 14
+  // days so "Needs attention" stays actionable instead of accreting ancient,
+  // water-under-the-bridge failures forever.
+  const FAILED_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+  const failed = [
+    ...safe(() => listBackgroundTasks({ status: 'failed' }), []),
+    ...safe(() => listBackgroundTasks({ status: 'aborted' }), []),
+    ...safe(() => listBackgroundTasks({ status: 'interrupted' }), []),
+  ]
+    .filter((t) => {
+      const ts = Date.parse(t.completedAt ?? t.updatedAt ?? '');
+      return !Number.isFinite(ts) || ts >= Date.now() - FAILED_WINDOW_MS;
+    })
+    .sort(recent);
+  const doneAll = safe(() => listBackgroundTasks({ status: 'done' }).sort(recent), []);
+  const goals = safe(() => listActiveGoalContracts(), [] as Array<{ originatingRequest?: string }>);
+  const mem = safe(() => getMemoryHealthSummary(), { activeFacts: 0, pinned: 0, byKind: {} as Record<string, number>, newest: null, recallHitRate: null });
+
+  // Upcoming scheduled runs: cron jobs + workflows carrying a schedule, soonest first.
+  const formatNextRun = (iso: string): string => {
+    const ms = Date.parse(iso) - Date.now();
+    if (!Number.isFinite(ms) || ms < 0) return 'soon';
+    const min = Math.round(ms / 60000);
+    if (min < 60) return `in ${Math.max(1, min)}m`;
+    const hr = Math.round(min / 60);
+    if (hr < 24) return `in ${hr}h`;
+    return `in ${Math.round(hr / 24)}d`;
+  };
+  const upcoming = safe(() => {
+    const items: Array<{ name: string; when: string; at: number }> = [];
+    const add = (name: string, schedule: string | undefined, enabled: boolean): void => {
+      if (!enabled || !schedule) return;
+      const iso = getNextRun(schedule);
+      if (!iso) return;
+      items.push({ name, when: formatNextRun(iso), at: Date.parse(iso) });
+    };
+    for (const j of safe(() => loadCronJobs(), [])) add(j.name, j.schedule, j.enabled !== false);
+    for (const w of safe(() => loadWorkflows(), [])) add(w.name, w.trigger?.schedule, w.enabled !== false);
+    return items.sort((a, b) => a.at - b.at);
+  }, [] as Array<{ name: string; when: string; at: number }>);
+
+  const needsYou = approvals.length + checkIns.length + goalDrafts.length + plansNeedInput.length + blockedTasks.length;
+  const today = new Date().toISOString().slice(0, 10);
+  const doneToday = doneAll.filter((t) => (t.completedAt ?? t.updatedAt ?? '').slice(0, 10) === today).length;
+
+  // A TRUSTWORTHY memory summary, not a bare count: total + per-kind breakdown +
+  // pinned (always-on standing facts) + recall hit-rate + the newest thing learned.
+  const kindLabel: Record<string, string> = { user: 'about you', project: 'projects', feedback: 'prefs', reference: 'refs', constraint: 'rules' };
+  const kindBits = Object.entries(mem.byKind)
+    .filter(([, c]) => c > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([k, c]) => `${c} ${kindLabel[k] ?? k}`);
+  const memBits = [`🧠 *${mem.activeFacts}* facts${kindBits.length ? ` (${kindBits.join(' · ')})` : ''}`];
+  if (mem.pinned > 0) memBits.push(`*${mem.pinned}* pinned`);
+  if (mem.recallHitRate !== null) memBits.push(`recall *${Math.round(mem.recallHitRate * 100)}%*`);
+  if (mem.newest) memBits.push(`newest: "${clip(mem.newest.content.trim(), 60)}"`);
 
   const blocks: KnownBlock[] = [
     { type: 'header', text: { type: 'plain_text', text: '🍊 Clementine — command center', emoji: true } },
     { type: 'context', elements: [{ type: 'mrkdwn', text:
-      `🎯 *${goals.length}* goals   ·   ⚙️ *${running.length}* running   ·   ⏸️ *${waitingOnYou}* waiting on you   ·   🧠 *${factCount}* facts learned` }] },
+      `🎯 *${goals.length}* goals   ·   ⚙️ *${running.length}* running   ·   ⏸️ *${needsYou}* waiting on you` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text:
+      `📊 *${doneToday}* done today   ·   *${running.length}* running${failed.length ? `   ·   ❌ *${failed.length}* failed` : ''}${upcoming.length ? `   ·   ⏰ next ${upcoming[0].when}` : ''}` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: memBits.join('   ·   ') }] },
     { type: 'context', elements: [{ type: 'mrkdwn', text: '💬 Open the *Messages* tab to talk to me, or type `/clem` anywhere.' }] },
     { type: 'divider' },
   ];
 
-  // ── Waiting on you: approvals (actionable, inline buttons) ──
-  if (approvals.length > 0) {
-    blocks.push({ type: 'header', text: { type: 'plain_text', text: `Approve or reject (${approvals.length})`, emoji: true } });
+  // ── Needs you: the accurate, consolidated set of everything blocked on you ──
+  if (needsYou > 0) {
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: `Needs you (${needsYou})`, emoji: true } });
+    // Approvals — actionable inline buttons (these already cover awaiting_approval tasks).
     for (const a of approvals.slice(0, 5)) {
       blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${clip(a.subject || 'Approval', 140)}*` } });
       blocks.push({
@@ -123,15 +189,38 @@ function buildAppHomeBlocks(): KnownBlock[] {
         ],
       });
     }
+    // Questions she asked you (open check-ins) — answer in the Messages tab.
+    for (const c of checkIns.slice(0, 4)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `🙋 *Question:* ${clip((c.question || '').trim(), 150)}` } });
+    }
+    // Goal drafts awaiting your confirmation.
+    for (const d of goalDrafts.slice(0, 3)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `📝 *Draft to confirm:* ${clip((d.desiredOutcome || d.notes || 'Goal draft').trim(), 150)}` } });
+    }
+    // Plans paused for your input.
+    for (const p of plansNeedInput.slice(0, 3)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `📋 *Plan needs input:* ${clip((p.originatingRequest || 'Plan').trim(), 150)}` } });
+    }
+    // Tasks stuck waiting on you (blocked / paused for a question or budget).
+    for (const t of blockedTasks.slice(0, 5)) {
+      const icon = t.status === 'blocked' ? '🚧' : '🙋';
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} ${clip(t.title || 'Task', 150)}  \`${t.status}\`` } });
+    }
+    // Honest overflow: the count above is the TRUE total; sections are capped, so
+    // tell the user when there's more than what's rendered.
+    const shownNeedsYou = Math.min(approvals.length, 5) + Math.min(checkIns.length, 4)
+      + Math.min(goalDrafts.length, 3) + Math.min(plansNeedInput.length, 3) + Math.min(blockedTasks.length, 5);
+    if (needsYou > shownNeedsYou) {
+      blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_…and ${needsYou - shownNeedsYou} more — open the Messages tab to see everything._` }] });
+    }
     blocks.push({ type: 'divider' });
   }
 
-  // ── Needs your input: blocked / paused-for-a-question / budget-paused ──
-  if (needsInput.length > 0) {
-    blocks.push({ type: 'header', text: { type: 'plain_text', text: `Needs your input (${needsInput.length})`, emoji: true } });
-    for (const t of needsInput.slice(0, 6)) {
-      const icon = t.status === 'blocked' ? '🚧' : '🙋';
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} ${clip(t.title || 'Task', 160)}  \`${t.status}\`` } });
+  // ── Needs attention: failures the user should see (previously invisible) ──
+  if (failed.length > 0) {
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: `Needs attention (${failed.length})`, emoji: true } });
+    for (const t of failed.slice(0, 5)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `❌ ${clip(t.title || 'Task', 150)}  \`${t.status}\`` } });
     }
     blocks.push({ type: 'divider' });
   }
@@ -145,25 +234,32 @@ function buildAppHomeBlocks(): KnownBlock[] {
       blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `🎯 ${clip((g.originatingRequest || 'Goal').trim(), 160)}` } });
     }
   }
-  blocks.push({ type: 'divider' });
 
-  // ── In flight: running + awaiting-approval work ──
-  const inFlight = [...running, ...awaitingApproval];
-  blocks.push({ type: 'header', text: { type: 'plain_text', text: `In flight (${inFlight.length})`, emoji: true } });
-  if (inFlight.length === 0) {
+  // ── In flight: genuinely-running work ONLY (awaiting_approval now lives under Needs you) ──
+  blocks.push({ type: 'divider' });
+  blocks.push({ type: 'header', text: { type: 'plain_text', text: `In flight (${running.length})`, emoji: true } });
+  if (running.length === 0) {
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Nothing running right now._' } });
   } else {
-    for (const t of inFlight.slice(0, 8)) {
-      const icon = t.status === 'awaiting_approval' ? '⏸️' : '⚙️';
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} ${clip(t.title || 'Task', 160)}  \`${t.status}\`` } });
+    for (const t of running.slice(0, 8)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `⚙️ ${clip(t.title || 'Task', 160)}  \`running\`` } });
+    }
+  }
+
+  // ── Upcoming: next scheduled runs ──
+  if (upcoming.length > 0) {
+    blocks.push({ type: 'divider' });
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: `Upcoming (${upcoming.length})`, emoji: true } });
+    for (const u of upcoming.slice(0, 5)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `⏰ ${clip(u.name || 'Scheduled', 120)}  —  *${u.when}*` } });
     }
   }
 
   // ── Recently completed (read-only history, so the home tells a full story) ──
-  if (doneRecent.length > 0) {
+  if (doneAll.length > 0) {
     blocks.push({ type: 'divider' });
     blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Recently completed', emoji: true } });
-    for (const t of doneRecent.slice(0, 4)) {
+    for (const t of doneAll.slice(0, 4)) {
       blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `✅ ${clip(t.title || 'Task', 160)}` } });
     }
   }

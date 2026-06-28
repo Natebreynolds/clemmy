@@ -35,6 +35,7 @@ const {
   reflectOnToolReturn,
   isSelfReferentialTool,
   REFLECTION_MIN_CONTENT_CHARS,
+  EXTRACTOR_MAX_FACTS,
   getReflectionThreshold,
   runRecursiveReflection,
   consolidateActiveFacts,
@@ -203,6 +204,11 @@ test('REFLECTION_MIN_CONTENT_CHARS: gate constant exposed for hooks.ts use', () 
   assert.ok(REFLECTION_MIN_CONTENT_CHARS <= 2000, 'threshold should not exclude typical tool returns');
 });
 
+test('EXTRACTOR_MAX_FACTS: bounds facts-per-return to a small cap (intake throttle)', () => {
+  assert.ok(EXTRACTOR_MAX_FACTS >= 1 && EXTRACTOR_MAX_FACTS <= 6, 'a few facts per tool return, not a dump');
+  assert.ok(EXTRACTOR_MAX_FACTS < 8, 'tighter than the legacy 8 ceiling so the low-value tail is trimmed');
+});
+
 test('getReflectionThreshold: default is Stanford/2 (75), env override accepted', () => {
   const prev = process.env.CLEMMY_REFLECTION_THRESHOLD;
   try {
@@ -285,6 +291,36 @@ test('depth/provenance: rememberFact persists derivationDepth + derivedFromFactI
   assert.equal(pattern.importance, 7);
 });
 
+test('recursive reflection CONSOLIDATES: rolled-up depth-0 sources are demoted (derived only; user-trust + pinned protected)', async () => {
+  resetMemoryDb();
+  const prev = process.env.CLEMMY_REFLECTION;
+  delete process.env.CLEMMY_REFLECTION; // reflection ENABLED
+  try {
+    // 5 derived (trust 0.6) depth-0 sources at the default importance 5 → demotable.
+    const derived = [];
+    for (let i = 0; i < 5; i += 1) {
+      derived.push(rememberFact({ kind: 'user', content: `Derived signal number ${i} observed from a tool return`, importance: 5, trustLevel: 0.6 }));
+    }
+    // A user-STATED fact (trust 1.0) and a pinned source must NOT be demoted.
+    const userStated = rememberFact({ kind: 'user', content: 'User explicitly stated a standing preference here', importance: 5, trustLevel: 1.0 });
+    const pinnedSrc = rememberFact({ kind: 'user', content: 'A pinned standing-rule source fact', importance: 5, trustLevel: 0.6 });
+    setFactPinned(pinnedSrc.id, true);
+
+    // Deterministic extractor → one higher-order pattern, token-disjoint from the
+    // sources so findSimilarFacts returns nothing → resolveConflict ADDs (no network).
+    const stub = async () => ({ patterns: [{ text: 'ZZZ QQQ XYZZY consolidated rollup token', importance: 7 }] });
+    const result = await runRecursiveReflection({ extractor: stub as never });
+
+    assert.ok(result.patternsWritten >= 1, 'a higher-order pattern was written');
+    assert.equal(result.sourcesDemoted, 5, 'only the 5 derived depth-0 sources are demoted');
+    for (const f of derived) assert.equal(getFact(f.id)?.importance, 3, 'derived source clamped down to 3');
+    assert.equal(getFact(userStated.id)?.importance, 5, 'user-stated (trust 1.0) source untouched');
+    assert.equal(getFact(pinnedSrc.id)?.importance, 5, 'pinned source untouched');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prev;
+  }
+});
+
 test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-data tools', () => {
   // Self/introspective → denied (no reflection).
   for (const t of [
@@ -292,8 +328,11 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     'memory_list_facts', 'memory_remember', 'memory_forget',
     'recall_tool_result', 'tool_output_query', 'draft_plan',
     'task_list', 'task_get', 'task_create', 'task_update',
-    'workflow_get', 'workflow_list', 'workflow_schedule',
+    'workflow_get', 'workflow_list', 'workflow_schedule', 'workflow_step',
     'background_task_status', 'execution_get', 'execution_list',
+    'unified_recall',
+    'goal_get', 'goal_list', 'goal_status',
+    'space_get', 'space_get_runner', 'space_get_view', 'attempt_record',
     'MEMORY_READ', // case-insensitive
   ]) {
     assert.equal(isSelfReferentialTool(t), true, `${t} should be denied`);
@@ -302,7 +341,10 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
   for (const t of [
     'read_file', 'run_shell_command', 'skill_read', 'workflow_run',
     'firecrawl_search', 'OUTLOOK_SEND_EMAIL', 'SALESFORCE_GET_RECORD',
-    'composio_execute_tool', null, undefined, '',
+    'composio_execute_tool',
+    // goal_create / goal_draft carry the user's STATED goal text — reflectable.
+    'goal_create', 'goal_draft',
+    null, undefined, '',
   ]) {
     assert.equal(isSelfReferentialTool(t as string | null | undefined), false, `${t} should be reflectable`);
   }

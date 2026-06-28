@@ -19,7 +19,7 @@ import {
 import { workflowExecutionSurfaceChanged, prepareWorkflowForWrite, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron, deriveStepDataSources, renderWorkflowDataSources } from '../execution/workflow-describe.js';
 import { applyStepPromptEdit, revertStepEdit } from '../execution/workflow-step-edit.js';
-import { validateCronExpression } from '../shared/cron.js';
+import { validateCronExpression, getNextRun } from '../shared/cron.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
@@ -518,46 +518,10 @@ interface CronJobRecord {
 // them keeps the three surfaces in lock-step on field defaults.
 
 
-function fieldMatch(field: string, value: number): boolean {
-  if (field === '*') return true;
-  if (field.startsWith('*/')) {
-    const step = parseInt(field.slice(2), 10);
-    return !Number.isNaN(step) && step > 0 && value % step === 0;
-  }
-  for (const part of field.split(',')) {
-    if (part.includes('-')) {
-      const [a, b] = part.split('-').map(Number);
-      if (!Number.isNaN(a) && !Number.isNaN(b) && value >= a && value <= b) return true;
-    } else if (parseInt(part, 10) === value) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Cron → human recurrence. Canonical implementation lives in
 // workflow-describe.ts (describeCron); this local alias keeps the cron_list
 // call site readable while removing the duplicate humanizer.
 const describeCronSchedule = describeCron;
-
-function getNextRun(expr: string): string | null {
-  if (!validateCronExpression(expr)) return null;
-  const [minF, hourF, domF, monF, dowF] = expr.trim().split(/\s+/);
-  const now = new Date();
-  for (let offset = 1; offset <= 2880; offset += 1) {
-    const t = new Date(now.getTime() + offset * 60_000);
-    const matches =
-      fieldMatch(minF, t.getMinutes()) &&
-      fieldMatch(hourF, t.getHours()) &&
-      fieldMatch(domF, t.getDate()) &&
-      fieldMatch(monF, t.getMonth() + 1) &&
-      fieldMatch(dowF, t.getDay());
-    if (matches) {
-      return t.toISOString();
-    }
-  }
-  return null;
-}
 
 function loadCronJobs(): CronJobRecord[] {
   if (!existsSync(CRON_FILE)) return [];

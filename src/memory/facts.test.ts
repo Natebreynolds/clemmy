@@ -19,6 +19,7 @@ const { resetMemoryDb, openMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
 const {
   decayAndEvictFacts,
+  demoteRolledUpSource,
   findSimilarFactsScored,
   forgetFact,
   getFact,
@@ -352,18 +353,45 @@ test('decayAndEvictFacts soft-deletes idle, low-importance, unpinned facts', () 
   assert.equal(after?.active, false, 'stale fact is soft-deleted (active=0)');
 });
 
-test('decayAndEvictFacts protects pinned, high-importance, and default-importance facts', () => {
+test('decayAndEvictFacts (binary kill-switch path) protects pinned, high-importance, and default-importance facts', () => {
+  // The binary path (importanceAware:false, the CLEMMY_DECAY_IMPORTANCE_AWARE=off
+  // kill-switch) only ever evicts importance<=4: pinned + high-importance + the
+  // 5.0-default tail are all immortal here. (The default path is importance-aware
+  // now — see the importance-aware tests below — which DOES retire the idle tail.)
   const pinnedLow = rememberFact({ kind: 'feedback', content: 'Always CC the partner on client emails.', importance: 2 });
   setFactPinned(pinnedLow.id, true);
   const important = rememberFact({ kind: 'project', content: 'Flagship Q3 launch is the top priority.', importance: 9 });
   const defaultImp = rememberFact({ kind: 'user', content: 'Nathan works in the Pacific timezone.' }); // importance defaults to 5.0
 
   const future = Date.now() + 120 * DAY_MS;
-  decayAndEvictFacts({ nowMs: future });
+  decayAndEvictFacts({ nowMs: future, importanceAware: false });
 
   assert.equal(getFact(pinnedLow.id)?.active, true, 'pinned fact survives regardless of importance/idle');
   assert.equal(getFact(important.id)?.active, true, 'high-importance fact survives');
   assert.equal(getFact(defaultImp.id)?.active, true, 'default-importance (5.0) fact is above the ceil (4) and survives');
+});
+
+test('demoteRolledUpSource clamps importance down and makes a rolled-up atom decay sooner than a peer', () => {
+  // The synthesis→decay composition: a rolled-up atom (importance clamped to 3)
+  // becomes decay-eligible at 50 days idle, while an un-demoted importance-5 peer
+  // survives (imp3 threshold ≈ 48d < 50d < imp5 threshold 60d).
+  const demoted = rememberFact({ kind: 'project', content: 'Rolled-up granular atom alpha.', importance: 5, trustLevel: 0.6 });
+  assert.equal(demoteRolledUpSource(demoted.id), true, 'demotion clamps importance down');
+  assert.equal(getFact(demoted.id)?.importance, 3, 'importance clamped to 3');
+  assert.equal(demoteRolledUpSource(demoted.id), false, 'idempotent — already at/below target');
+  const keep = rememberFact({ kind: 'project', content: 'Independent importance-5 fact beta.', importance: 5, trustLevel: 0.6 });
+
+  const future = Date.now() + 50 * DAY_MS;
+  const decayed = new Set(decayAndEvictFacts({ nowMs: future }).ids); // importance-aware default
+  assert.ok(decayed.has(demoted.id), 'demoted (imp3) atom decays at 50d idle');
+  assert.ok(!decayed.has(keep.id), 'un-demoted imp5 peer survives at 50d idle');
+});
+
+test('demoteRolledUpSource never demotes a pinned fact', () => {
+  const f = rememberFact({ kind: 'project', content: 'Pinned source that got rolled up.', importance: 6, trustLevel: 0.6 });
+  setFactPinned(f.id, true);
+  assert.equal(demoteRolledUpSource(f.id), false, 'pinned fact is not demoted');
+  assert.equal(getFact(f.id)?.importance, 6, 'importance unchanged');
 });
 
 test('decayAndEvictFacts does not evict recently-accessed facts', () => {
@@ -670,12 +698,28 @@ test('importance-aware decay: pinned facts are exempt even when ancient', () => 
   assert.ok(!decayAndEvictFacts({ importanceAware: true }).ids.includes(f.id), 'pinned fact exempt even at 300 days idle');
 });
 
-test('importance-aware decay is OFF by default — binary behavior unchanged (high-importance never evicted)', () => {
+test('importance-aware decay is ON by default — the idle tail fades even for high-importance; the kill-switch reverts to binary (immortal)', () => {
   const db = openMemoryDb();
-  const f = rememberFact({ kind: 'project', content: 'High importance ancient.' });
-  db.prepare('UPDATE consolidated_facts SET updated_at=?, created_at=?, importance=9 WHERE id=?')
-    .run(new Date(Date.now() - 300 * DAY_MS).toISOString(), new Date(Date.now() - 300 * DAY_MS).toISOString(), f.id);
-  assert.ok(!decayAndEvictFacts({}).ids.includes(f.id), 'binary (default) mode never evicts a high-importance fact');
+  const setAncient = (id: number, importance: number) => db.prepare(
+    'UPDATE consolidated_facts SET updated_at=?, created_at=?, last_accessed_at=NULL, importance=? WHERE id=?'
+  ).run(new Date(Date.now() - 300 * DAY_MS).toISOString(), new Date(Date.now() - 300 * DAY_MS).toISOString(), importance, id);
+
+  // DEFAULT (no importanceAware option) is now the importance-aware path: a fact
+  // unused for ~300 days fades even at importance 9 (threshold ~84d), and the
+  // default-5.0 tail (the bulk of the store) finally retires too.
+  const ancientHigh = rememberFact({ kind: 'project', content: 'High importance ancient (default path).' });
+  setAncient(ancientHigh.id, 9);
+  const ancientDefault = rememberFact({ kind: 'project', content: 'Default importance ancient (default path).' });
+  setAncient(ancientDefault.id, 5);
+  const decayedDefault = new Set(decayAndEvictFacts({}).ids);
+  assert.ok(decayedDefault.has(ancientHigh.id), 'default path retires a high-importance fact unused for ~300 days');
+  assert.ok(decayedDefault.has(ancientDefault.id), 'default path retires the idle default-5.0 tail');
+
+  // KILL-SWITCH (importanceAware:false) reverts to the binary path: importance>4
+  // is immortal regardless of idle age.
+  const ancientHigh2 = rememberFact({ kind: 'project', content: 'High importance ancient (kill-switch).' });
+  setAncient(ancientHigh2.id, 9);
+  assert.ok(!decayAndEvictFacts({ importanceAware: false }).ids.includes(ancientHigh2.id), 'binary kill-switch never evicts a high-importance fact');
 });
 
 // ─── 2026-06-12 audit: singleton must survive rogue close + nightly merge ───
