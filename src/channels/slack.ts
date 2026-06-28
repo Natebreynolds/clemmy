@@ -1,5 +1,5 @@
 import pino from 'pino';
-import { App } from '@slack/bolt';
+import { App, Assistant } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { KnownBlock, Button, ActionsBlock } from '@slack/types';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
@@ -21,11 +21,12 @@ import { buildSlackHarnessTransport, handleSlackHarnessMessage, toSlackMrkdwn } 
 import { ClementineAssistant } from '../assistant/core.js';
 import { claimInbound, completeInbound } from './inbox-store.js';
 import type { ApprovalResolutionResult } from '../types.js';
-import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal } from '../agents/plan-proposals.js';
+import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal, listActiveGoalContracts } from '../agents/plan-proposals.js';
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft } from '../agents/goal-drafts.js';
 import { answerCheckIn, getCheckIn } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
-import { queueBackgroundTaskApprovalResolution } from '../execution/background-tasks.js';
+import { queueBackgroundTaskApprovalResolution, listBackgroundTasks, createBackgroundTask } from '../execution/background-tasks.js';
+import { rememberFact, countActiveFacts } from '../memory/facts.js';
 import { getNotification, markNotificationRead, requeueNotificationDelivery } from '../runtime/notifications.js';
 
 const logger = pino({ name: 'clementine-next.slack' });
@@ -47,6 +48,128 @@ let teamName = '';
 let startedAt: string | undefined;
 let connected = false;
 let startPromise: Promise<void> | null = null;
+// Threads we've already named via assistant.threads.setTitle (once per thread;
+// in-memory is fine — the title persists in Slack, this just avoids re-titling).
+const titledThreads = new Set<string>();
+
+/** Recall-sharpened starter prompts for the assistant pane: real active goals +
+ *  in-flight tasks first, then evergreen starters. Best-effort; never throws.
+ *  Slack renders up to 4. */
+function buildSuggestedPrompts(): Array<{ title: string; message: string }> {
+  const prompts: Array<{ title: string; message: string }> = [];
+  const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+  try {
+    for (const g of listActiveGoalContracts().slice(0, 2)) {
+      const t = (g.originatingRequest || 'your goal').trim();
+      prompts.push({ title: clip(`Resume: ${t}`, 44), message: `Resume the goal "${t}" — where does it stand and what's the next step?` });
+    }
+  } catch { /* goals are optional */ }
+  try {
+    const live = listBackgroundTasks({ status: 'awaiting_approval' }).concat(listBackgroundTasks({ status: 'running' }));
+    for (const task of live.slice(0, 1)) {
+      const t = (task.title || 'your task').trim();
+      prompts.push({ title: clip(`Check: ${t}`, 44), message: `What's the status of "${t}"?` });
+    }
+  } catch { /* tasks are optional */ }
+  prompts.push({ title: "What's on my plate?", message: 'Give me a quick brief of my goals, tasks, and anything that needs my attention.' });
+  prompts.push({ title: 'Draft my morning brief', message: 'Put together my morning brief.' });
+  return prompts.slice(0, 4);
+}
+
+/** The App Home command-center view: a live at-a-glance summary, pending approvals
+ *  (with inline Approve/Reject buttons that reuse the clementine:* action router),
+ *  anything blocked on your input, active goals, in-flight work, and recently
+ *  completed tasks. Republished on app_home_opened. Best-effort; every data source
+ *  is wrapped so a failure degrades to an empty section, never throws. The premium,
+ *  persistent, app-owned dashboard Discord has no equivalent for. */
+function buildAppHomeBlocks(): KnownBlock[] {
+  const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+  const safe = <T,>(fn: () => T, fallback: T): T => { try { return fn(); } catch { return fallback; } };
+
+  // ── Gather everything up front (best-effort) so the summary line is accurate ──
+  const approvals = safe(() => approvalRegistry.listPending().map((a) => ({ approvalId: a.approvalId, subject: a.subject })), []);
+  const goals = safe(() => listActiveGoalContracts(), [] as Array<{ originatingRequest?: string }>);
+  const running = safe(() => listBackgroundTasks({ status: 'running' }), []);
+  const awaitingApproval = safe(() => listBackgroundTasks({ status: 'awaiting_approval' }), []);
+  const needsInput = [
+    ...safe(() => listBackgroundTasks({ status: 'awaiting_input' }), []),
+    ...safe(() => listBackgroundTasks({ status: 'awaiting_continue' }), []),
+    ...safe(() => listBackgroundTasks({ status: 'blocked' }), []),
+  ];
+  const doneRecent = safe(() => listBackgroundTasks({ status: 'done' })
+    .sort((a, b) => (b.completedAt ?? b.updatedAt ?? '').localeCompare(a.completedAt ?? a.updatedAt ?? '')), []);
+  const factCount = safe(() => countActiveFacts(), 0);
+  const waitingOnYou = approvals.length + needsInput.length;
+
+  const blocks: KnownBlock[] = [
+    { type: 'header', text: { type: 'plain_text', text: '🍊 Clementine — command center', emoji: true } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text:
+      `🎯 *${goals.length}* goals   ·   ⚙️ *${running.length}* running   ·   ⏸️ *${waitingOnYou}* waiting on you   ·   🧠 *${factCount}* facts learned` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: '💬 Open the *Messages* tab to talk to me, or type `/clem` anywhere.' }] },
+    { type: 'divider' },
+  ];
+
+  // ── Waiting on you: approvals (actionable, inline buttons) ──
+  if (approvals.length > 0) {
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: `Approve or reject (${approvals.length})`, emoji: true } });
+    for (const a of approvals.slice(0, 5)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${clip(a.subject || 'Approval', 140)}*` } });
+      blocks.push({
+        type: 'actions',
+        block_id: `clementine:approval:${a.approvalId}`,
+        elements: [
+          { type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Approve' }, action_id: `clementine:approve:${a.approvalId}`, value: a.approvalId },
+          { type: 'button', style: 'danger', text: { type: 'plain_text', text: 'Reject' }, action_id: `clementine:reject:${a.approvalId}`, value: a.approvalId },
+        ],
+      });
+    }
+    blocks.push({ type: 'divider' });
+  }
+
+  // ── Needs your input: blocked / paused-for-a-question / budget-paused ──
+  if (needsInput.length > 0) {
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: `Needs your input (${needsInput.length})`, emoji: true } });
+    for (const t of needsInput.slice(0, 6)) {
+      const icon = t.status === 'blocked' ? '🚧' : '🙋';
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} ${clip(t.title || 'Task', 160)}  \`${t.status}\`` } });
+    }
+    blocks.push({ type: 'divider' });
+  }
+
+  // ── Goals ──
+  blocks.push({ type: 'header', text: { type: 'plain_text', text: `Goals (${goals.length})`, emoji: true } });
+  if (goals.length === 0) {
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_No active goals. Tell me one in the Messages tab and I\'ll hold it._' } });
+  } else {
+    for (const g of goals.slice(0, 8)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `🎯 ${clip((g.originatingRequest || 'Goal').trim(), 160)}` } });
+    }
+  }
+  blocks.push({ type: 'divider' });
+
+  // ── In flight: running + awaiting-approval work ──
+  const inFlight = [...running, ...awaitingApproval];
+  blocks.push({ type: 'header', text: { type: 'plain_text', text: `In flight (${inFlight.length})`, emoji: true } });
+  if (inFlight.length === 0) {
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Nothing running right now._' } });
+  } else {
+    for (const t of inFlight.slice(0, 8)) {
+      const icon = t.status === 'awaiting_approval' ? '⏸️' : '⚙️';
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${icon} ${clip(t.title || 'Task', 160)}  \`${t.status}\`` } });
+    }
+  }
+
+  // ── Recently completed (read-only history, so the home tells a full story) ──
+  if (doneRecent.length > 0) {
+    blocks.push({ type: 'divider' });
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Recently completed', emoji: true } });
+    for (const t of doneRecent.slice(0, 4)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `✅ ${clip(t.title || 'Task', 160)}` } });
+    }
+  }
+
+  return blocks;
+}
 
 export function getSlackRuntimeStatus(): SlackRuntimeStatus {
   return {
@@ -69,6 +192,17 @@ function channelAllowedSlack(channelId: string | undefined): boolean {
   if (!channelId) return false;
   if (SLACK_ALLOWED_CHANNELS.length === 0) return true; // empty = all invited channels
   return SLACK_ALLOWED_CHANNELS.includes(channelId);
+}
+
+/** True when a `message` event belongs to the native AI-Assistant container (a
+ *  threaded im with no real subtype). Mirrors Bolt's internal isAssistantMessage
+ *  (not exported), so the generic message.im handler can SKIP these — the
+ *  Assistant userMessage handler already owns them. Without this skip the same
+ *  message is answered twice (one reply from each handler). */
+export function isAssistantContainerMessage(msg: { channel_type?: string; thread_ts?: string; subtype?: string }): boolean {
+  return Boolean(msg.thread_ts)
+    && msg.channel_type === 'im'
+    && (!msg.subtype || msg.subtype === 'file_share');
 }
 
 // Strip a leading "<@BOTID>" mention from an app_mention's text.
@@ -226,6 +360,12 @@ async function dispatchInbound(opts: {
   threadTs?: string;
   prompt: string;
   files?: Array<{ name?: string; url_private?: string }>;
+  /** When present, this turn runs through the native AI-Assistant transport
+   *  (setStatus drives the pane indicator). Passed by the assistant userMessage
+   *  handler. The plain DM/mention paths omit it. Either way BOTH paths share the
+   *  ONE claimInbound dedup below, keyed on the unique message ts — so a message
+   *  delivered to two listeners is answered exactly once, never doubled. */
+  setStatus?: (status: string) => Promise<unknown>;
 }): Promise<void> {
   const inboxKey = { channel: `slack:${opts.channelId}`, sourceMessageId: opts.ts };
   const claim = claimInbound({ ...inboxKey, userId: opts.userId });
@@ -255,6 +395,7 @@ async function dispatchInbound(opts: {
       threadTs: opts.threadTs,
       prompt: opts.prompt,
       files: opts.files,
+      setStatus: opts.setStatus,
     });
     completeInbound({ ...inboxKey, status: 'replied' });
   } catch (err) {
@@ -544,6 +685,73 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
       socketMode: true,
     });
 
+    // ── Native AI Assistant pane (Agents & AI Apps) ─────────────────────────
+    // The premium, app-owned assistant container Discord has no equivalent for:
+    // a docked pane that follows the user, shows live "Clem is …" status during
+    // autonomous runs, and offers recall-sharpened starter prompts. It runs on
+    // the SAME shared harness runner as DMs/mentions (gates, approvals, brain) —
+    // it only adds setStatus narration, suggested prompts, and thread titles.
+    // Registered first so it intercepts assistant-container messages (Bolt stops
+    // them propagating to the message.im handler below).
+    const aiAssistant = new Assistant({
+      threadStarted: async ({ event, say, setSuggestedPrompts, saveThreadContext }) => {
+        const user = (event as { assistant_thread?: { user_id?: string } }).assistant_thread?.user_id;
+        if (user && !userAllowedSlack(user)) {
+          await say("I'm not set up to chat with you yet — ask the workspace owner to add your Slack member ID in Clementine's Connect → Slack settings.");
+          return;
+        }
+        try {
+          await say("Hey, I'm Clem — your AI chief of staff. Ask me anything, or pick a starter below. I'll show what I'm doing as I work, and pause for your approval before anything irreversible.");
+          await setSuggestedPrompts({ title: 'Try one of these', prompts: buildSuggestedPrompts() });
+          await saveThreadContext();
+        } catch (err) {
+          logger.warn({ err }, 'assistant threadStarted failed');
+        }
+      },
+      threadContextChanged: async ({ saveThreadContext }) => {
+        try { await saveThreadContext(); } catch { /* best effort */ }
+      },
+      userMessage: async ({ message, client, setStatus, setTitle, getThreadContext }) => {
+        const m = message as {
+          user?: string; text?: string; channel?: string; thread_ts?: string; ts?: string;
+          bot_id?: string; subtype?: string; files?: Array<{ name?: string; url_private?: string }>;
+        };
+        if (m.bot_id || m.subtype || !m.user || m.user === botUserId) return;
+        if (!userAllowedSlack(m.user)) {
+          await client.chat.postMessage({ channel: m.channel ?? '', thread_ts: m.thread_ts ?? m.ts, text: "I'm not authorized to chat with you yet." });
+          return;
+        }
+        const prompt = (m.text ?? '').trim();
+        if (!prompt && !(m.files && m.files.length > 0)) return;
+        const threadTs = m.thread_ts ?? m.ts;
+        // Name the thread from the first message (once per thread).
+        if (threadTs && !titledThreads.has(threadTs)) {
+          titledThreads.add(threadTs);
+          try { await setTitle(prompt.slice(0, 60) || 'New conversation'); } catch { /* title is best-effort */ }
+        }
+        let teamId: string | null = null;
+        try { teamId = (await getThreadContext())?.team_id ?? null; } catch { /* context optional */ }
+        // Route through the SHARED dispatchInbound so this turn passes the SAME
+        // claimInbound dedup as the DM/mention paths (keyed on the unique message
+        // ts). If Slack ever delivers the same message to both this handler and
+        // the message.im listener, only the first claim runs — the message is
+        // answered exactly once. Presence of setStatus selects the assistant
+        // transport so run activity drives the native pane's status line.
+        await dispatchInbound({
+          client,
+          channelId: m.channel ?? '',
+          userId: m.user,
+          teamId,
+          ts: m.ts ?? threadTs ?? '',
+          threadTs,
+          prompt,
+          files: m.files,
+          setStatus: (status: string) => setStatus(status),
+        });
+      },
+    });
+    app.assistant(aiAssistant);
+
     // DMs: only message.im events (per the app manifest). Ignore bots, our own
     // messages, and edits/joins (subtype set).
     app.event('message', async ({ event, client }) => {
@@ -553,6 +761,9 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
         files?: Array<{ name?: string; url_private?: string }>;
       };
       if (e.channel_type !== 'im') return;
+      // Assistant-pane messages are threaded ims — the app.assistant userMessage
+      // handler owns them. Skip here so a single message isn't answered twice.
+      if (isAssistantContainerMessage(e)) return;
       if (e.bot_id || e.subtype || !e.user || e.user === botUserId) return;
       if (!userAllowedSlack(e.user)) return;
       const prompt = (e.text ?? '').trim();
@@ -561,7 +772,10 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
         client,
         channelId: e.channel ?? '',
         userId: e.user,
-        ts: e.ts ?? '',
+        // Mirror the assistant handler's fallback so the two never compute a
+        // different dedup key for the same message (defensive — the skip above
+        // should already keep them mutually exclusive).
+        ts: e.ts ?? e.thread_ts ?? '',
         threadTs: e.thread_ts,
         prompt,
         files: e.files,
@@ -649,6 +863,115 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
       else await ack({ response_action: 'errors', errors: { args_block: result.message.slice(0, 150) } });
     });
 
+    // ── App Home: persistent command center (goals · in-flight · approvals) ──
+    app.event('app_home_opened', async ({ event, client }) => {
+      const e = event as { user?: string; tab?: string };
+      if (e.tab && e.tab !== 'home') return;
+      if (!e.user || !userAllowedSlack(e.user)) return;
+      try {
+        await client.views.publish({ user_id: e.user, view: { type: 'home', blocks: buildAppHomeBlocks() } });
+      } catch (err) {
+        logger.warn({ err }, 'app_home publish failed');
+      }
+    });
+
+    // ── /clem <anything> — global free-text launcher ────────────────────────
+    app.command('/clem', async ({ command, ack, respond, client }) => {
+      await ack();
+      const c = command as { user_id?: string; channel_id?: string; text?: string; trigger_id?: string };
+      if (!c.user_id || !userAllowedSlack(c.user_id)) {
+        await respond({ response_type: 'ephemeral', text: "You're not authorized to use Clementine yet." });
+        return;
+      }
+      const text = (c.text ?? '').trim();
+      if (!text) {
+        await respond({ response_type: 'ephemeral', text: 'Usage: `/clem [what you want done]` — e.g. `/clem summarize my unread emails`.' });
+        return;
+      }
+      await respond({ response_type: 'ephemeral', text: `On it — working on: “${text}”. I'll reply here.` });
+      // sourceMessageId must be UNIQUE per invocation — a slash command has no
+      // message ts, so key on the per-invocation trigger_id. An empty key would
+      // collide every /clem in this channel through the shared claimInbound dedup,
+      // silently dropping the 2nd onward. trigger_id is also stable across a Slack
+      // redelivery, so it dedups a genuine retry too.
+      await dispatchInbound({ client, channelId: c.channel_id ?? '', userId: c.user_id, ts: `slash:${c.trigger_id || Date.now()}`, prompt: text });
+    });
+
+    // ── Message shortcut: Summarize this thread ─────────────────────────────
+    app.shortcut({ callback_id: 'clementine:summarize_thread', type: 'message_action' }, async ({ shortcut, ack, client }) => {
+      await ack();
+      const s = shortcut as { user?: { id?: string }; channel?: { id?: string }; trigger_id?: string; message?: { ts?: string; thread_ts?: string; text?: string } };
+      if (!s.user?.id || !userAllowedSlack(s.user.id)) return;
+      const channel = s.channel?.id ?? '';
+      const rootTs = s.message?.thread_ts ?? s.message?.ts;
+      if (!channel || !rootTs) return;
+      let convo = s.message?.text ?? '';
+      try {
+        const r = await client.conversations.replies({ channel, ts: rootTs, limit: 50 });
+        const msgs = (r.messages ?? []).map((m) => (m as { text?: string }).text ?? '').filter(Boolean);
+        if (msgs.length) convo = msgs.join('\n');
+      } catch { /* fall back to the single message */ }
+      await dispatchInbound({
+        // Unique per invocation (trigger_id) so back-to-back shortcuts don't
+        // collide on an empty key in the shared dedup; falls back to the message ts.
+        client, channelId: channel, userId: s.user.id, ts: `shortcut:summarize:${s.trigger_id || rootTs}`, threadTs: rootTs,
+        prompt: `Summarize this Slack thread concisely — key points, decisions, and any open action items:\n\n${convo}`,
+      });
+    });
+
+    // ── Message shortcut: Turn into a task ──────────────────────────────────
+    app.shortcut({ callback_id: 'clementine:make_task', type: 'message_action' }, async ({ shortcut, ack, client }) => {
+      await ack();
+      const s = shortcut as { user?: { id?: string }; channel?: { id?: string }; message?: { ts?: string; text?: string } };
+      if (!s.user?.id || !userAllowedSlack(s.user.id)) return;
+      const channel = s.channel?.id ?? '';
+      const text = (s.message?.text ?? '').trim();
+      if (!text) return;
+      const title = text.length > 60 ? `${text.slice(0, 57)}...` : text;
+      try {
+        createBackgroundTask({ title, prompt: text, userId: s.user.id, channel: `slack:${channel}`, source: 'slack' });
+        if (channel) await client.chat.postEphemeral({ channel, user: s.user.id, text: `Got it — started a background task: *${title}*. I'll report back when it's done.` });
+      } catch (err) {
+        logger.warn({ err }, 'make_task shortcut failed');
+      }
+    });
+
+    // ── Reactions as commands: 📌 (pushpin) save to memory · 📝 (memo) summarize ──
+    app.event('reaction_added', async ({ event, client }) => {
+      const e = event as { user?: string; reaction?: string; item?: { type?: string; channel?: string; ts?: string } };
+      if (!e.user || e.user === botUserId || !userAllowedSlack(e.user)) return;
+      if (e.item?.type !== 'message' || !e.item.channel || !e.item.ts) return;
+      const { channel, ts } = { channel: e.item.channel, ts: e.item.ts };
+      const reaction = e.reaction ?? '';
+      if (reaction !== 'pushpin' && reaction !== 'memo') return;
+      const fetchText = async (): Promise<string> => {
+        try {
+          const r = await client.conversations.history({ channel, latest: ts, inclusive: true, limit: 1 });
+          return ((r.messages ?? [])[0] as { text?: string } | undefined)?.text ?? '';
+        } catch { return ''; }
+      };
+      if (reaction === 'pushpin') {
+        const text = (await fetchText()).trim();
+        if (!text) return;
+        try {
+          rememberFact({ kind: 'user', content: text });
+          await client.chat.postEphemeral({ channel, user: e.user, text: '📌 Saved that to your memory.' });
+        } catch (err) { logger.warn({ err }, 'reaction save-to-memory failed'); }
+      } else {
+        let convo = await fetchText();
+        try {
+          const r = await client.conversations.replies({ channel, ts, limit: 50 });
+          const msgs = (r.messages ?? []).map((m) => (m as { text?: string }).text ?? '').filter(Boolean);
+          if (msgs.length) convo = msgs.join('\n');
+        } catch { /* fall back */ }
+        if (!convo.trim()) return;
+        // Stable, unique key per reaction event (message ts + user + emoji): dedups
+        // a Slack redelivery of the same reaction, but never collides with other
+        // reactions/commands in the channel (an empty key would).
+        await dispatchInbound({ client, channelId: channel, userId: e.user, ts: `reaction:${ts}:${e.user}:${reaction}`, threadTs: ts, prompt: `Summarize this concisely:\n\n${convo}` });
+      }
+    });
+
     app.error(async (error) => {
       logger.error({ err: error }, 'Slack app error');
     });
@@ -677,4 +1000,6 @@ export const __test__ = {
   userAllowedSlack,
   channelAllowedSlack,
   stripMention,
+  buildSuggestedPrompts,
+  buildAppHomeBlocks,
 };

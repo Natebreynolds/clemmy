@@ -1,3 +1,4 @@
+import pino from 'pino';
 import type { WebClient } from '@slack/web-api';
 import type { KnownBlock, Button } from '@slack/types';
 import {
@@ -6,6 +7,8 @@ import {
   type DisplayState,
 } from './discord-harness.js';
 import { SLACK_BOT_TOKEN } from '../config.js';
+
+const logger = pino({ name: 'clementine-next.slack-harness' });
 
 /**
  * Slack entry into the SHARED harness conversation runner.
@@ -126,6 +129,176 @@ export function buildSlackHarnessTransport(opts: {
   };
 }
 
+/** A tool id → a short human phrase for the assistant status line. Strips the
+ *  `ns__tool` / snake_case shape down to something glanceable. */
+function prettyTool(tool: string): string {
+  const base = (tool || '').split('__').pop() ?? tool;
+  return base.replace(/_/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+}
+
+/**
+ * Map the live harness DisplayState to a concise Slack AI-Assistant status line
+ * (what shows under "Clem" in the native pane while she works). Returns '' to
+ * CLEAR the status — done turns clear it so the pane settles on the answer.
+ * Mirrors what renderBody shows in the rolling message, but in one short phrase.
+ */
+export function deriveAssistantStatus(state: DisplayState): string {
+  if (state.done) return '';
+  if ((state.pendingApprovalIds && state.pendingApprovalIds.length > 0) || state.pendingApprovalId) {
+    return 'is waiting for your approval…';
+  }
+  const agent = (state.currentAgent ?? '').trim();
+  const detail = (state.status ?? '').trim();
+  const lastTool = state.toolsCalled && state.toolsCalled.length > 0
+    ? state.toolsCalled[state.toolsCalled.length - 1]
+    : '';
+  if (agent && detail) return `${agent}: ${detail}`.slice(0, 100);
+  if (detail) return detail.slice(0, 100);
+  if (agent) return `${agent} is working…`.slice(0, 100);
+  if (lastTool) return `is using ${prettyTool(lastTool)}…`;
+  return 'is thinking…';
+}
+
+/**
+ * The RICH in-message play-by-play for the AI-Assistant pane: a compact, premium
+ * progress block streamed INTO the one reply message while Clem works, so the
+ * user sees the actual activity — current agent, what she's doing, the tools she's
+ * running — not just the generic one-line Slack status. Replaced in-place by the
+ * final answer when the run completes (so it never reads as a "double"). This is
+ * the rich-data streaming Discord can't do natively.
+ *
+ * Deliberately CALM: no elapsed-time counter. The body changes only when the
+ * agent / status / tool set changes, so the dedup in renderReply collapses the
+ * runner's per-second "still working" pulses into nothing — no flicker.
+ */
+export function renderAssistantProgress(state: DisplayState): string {
+  const agent = (state.currentAgent ?? '').trim();
+  const detail = (state.status ?? '').trim() || 'working…';
+  const tools = (state.toolsCalled ?? []).map(prettyTool).filter(Boolean).slice(-8);
+  const head = agent ? `🍊 *${agent}*` : '🍊 *Clem is working…*';
+  const meta = [detail, state.toolCount >= 3 ? `${state.toolCount} tools` : '']
+    .filter(Boolean)
+    .join('  ·  ');
+  const lines = [head, `_${meta}_`];
+  if (tools.length > 0) lines.push(tools.map((t) => `\`${t}\``).join(' · '));
+  return lines.join('\n');
+}
+
+/**
+ * The native AI-Assistant transport. It streams the RICH play-by-play (the real
+ * data — current agent, the exact tools she's running, elapsed time) INTO one
+ * live-edited message while Clem works, then replaces that block in-place with
+ * the final answer — so the user always sees what's going on, and there is never
+ * more than one message (no "double"). In parallel it drives
+ * assistant.threads.setStatus so the docked pane ALSO shows a native indicator
+ * under "Clem" — the premium touch Discord can't do. Block Kit approvals ride
+ * the same shared clementine:* action ids.
+ */
+export function buildSlackAssistantTransport(opts: {
+  client: WebClient;
+  channel: string;
+  threadTs?: string;
+  setStatus: (status: string) => Promise<unknown>;
+}): DiscordHarnessTransport {
+  const { client, channel, threadTs } = opts;
+  let messageTs: string | null = null;
+  let lastRenderedBody: string | null = null;
+  let lastStatus: string | null = null;
+  // A LIVE reference to the runner's DisplayState — the runner mutates this same
+  // object in place (applyEventToState), so reading latestState.done in edit()
+  // below tells us, even at finalFlush (which never calls onState), whether this
+  // edit is a mid-run progress tick or the final answer.
+  let latestState: DisplayState | null = null;
+  // Serialize posts/edits so concurrent flushes can't double-post before the
+  // first postMessage resolves (which is what assigns messageTs).
+  let chain: Promise<void> = Promise.resolve();
+  const enqueue = (fn: () => Promise<void>): Promise<void> => {
+    // Swallow so one failed Slack edit can't break the run, but LOG it — a silent
+    // postMessage/update failure would otherwise leave the message frozen with no
+    // trace (the bug class this whole transport was rewritten to fix).
+    const p = chain.then(fn).catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err), channel }, 'slack assistant edit failed');
+    });
+    chain = p;
+    return p;
+  };
+
+  const pushStatus = (s: string): void => {
+    if (s === lastStatus) return;
+    lastStatus = s;
+    void Promise.resolve(opts.setStatus(s)).catch(() => { /* status is best-effort */ });
+  };
+
+  const renderReply = (reply: string, blocks: KnownBlock[] | null): Promise<void> => {
+    const body = (toSlackMrkdwn(reply) || '…').slice(0, SECTION_MAX);
+    const withBlocks = blocks && blocks.length > 0;
+    // Dedup identical text edits (Slack throttles ~1 update/sec/message). Never
+    // dedup when buttons are attached — those must always re-render.
+    if (!withBlocks && messageTs && body === lastRenderedBody) return Promise.resolve();
+    return enqueue(async () => {
+      if (!messageTs) {
+        const posted = await client.chat.postMessage({
+          channel, thread_ts: threadTs, text: body, mrkdwn: true,
+          ...(withBlocks ? { blocks: [sectionBlock(body), ...blocks!] } : {}),
+        });
+        messageTs = posted.ts as string;
+      } else {
+        await client.chat.update({
+          channel, ts: messageTs, text: body,
+          ...(withBlocks ? { blocks: [sectionBlock(body), ...blocks!] } : { blocks: [] }),
+        });
+      }
+      lastRenderedBody = body;
+    });
+  };
+
+  return {
+    async sendInitial() {
+      // Post the one message immediately so there's no dead air, then live-edit it
+      // via edit()/onState. The native pane indicator runs in parallel.
+      pushStatus('is thinking…');
+      await renderReply('🍊 *Clem is working…*', null);
+      return {
+        // edit() is the SINGLE in-message renderer — it's what the runner's
+        // finalFlush uses to deliver the answer, so it must NOT be a no-op. While
+        // the run is live (latestState && !done) we substitute the RICH
+        // play-by-play (agent · what she's doing · tools · elapsed); once the run
+        // is done we render the runner's content verbatim (the final answer, or
+        // an approval prompt with its buttons). One message throughout.
+        edit: async (next, options) => {
+          const blocks = (options?.components as KnownBlock[] | undefined) ?? null;
+          const inProgress = !!latestState && !latestState.done;
+          const body = inProgress ? renderAssistantProgress(latestState!) : next;
+          await renderReply(body, blocks);
+        },
+      };
+    },
+    async sendError(content) {
+      pushStatus('');
+      await client.chat.postMessage({ channel, thread_ts: threadTs, text: toSlackMrkdwn(content) || '…', mrkdwn: true });
+    },
+    async sendFollowup(content) {
+      await client.chat.postMessage({ channel, thread_ts: threadTs, text: toSlackMrkdwn(content) || '…', mrkdwn: true });
+    },
+    buildApprovalComponents(state) {
+      return approvalBlocksForState(state);
+    },
+    onState(state) {
+      try {
+        // Capture the live state reference (edit() reads .done off it). In-message
+        // rendering is owned by edit(). The native pane indicator is kept STABLE —
+        // a single steady "is working…" (or approval prompt) rather than churning
+        // per step — so it doesn't flicker/"pop" in the plain DM view. The rich
+        // per-step play-by-play lives in the one message, not the status line.
+        latestState = state;
+        if (state.done) { pushStatus(''); return; }
+        const hasApproval = (state.pendingApprovalIds?.length ?? 0) > 0 || !!state.pendingApprovalId;
+        pushStatus(hasApproval ? 'is waiting for your approval…' : 'is working…');
+      } catch { /* a progress sink must never break the run */ }
+    },
+  };
+}
+
 interface SlackFileRef {
   name?: string;
   url_private?: string;
@@ -144,6 +317,9 @@ export async function handleSlackHarnessMessage(opts: {
   threadTs?: string;
   prompt: string;
   files?: SlackFileRef[];
+  /** When present, this turn ran from the native AI-Assistant pane: use the
+   *  assistant transport so run activity drives assistant.threads.setStatus. */
+  setStatus?: (status: string) => Promise<unknown>;
 }): Promise<void> {
   let effectivePrompt = opts.prompt;
   try {
@@ -173,11 +349,18 @@ export async function handleSlackHarnessMessage(opts: {
     // Attachment ingestion is best-effort; fall back to the plain prompt.
   }
 
-  const transport = buildSlackHarnessTransport({
-    client: opts.client,
-    channel: opts.channelId,
-    threadTs: opts.threadTs,
-  });
+  const transport = opts.setStatus
+    ? buildSlackAssistantTransport({
+        client: opts.client,
+        channel: opts.channelId,
+        threadTs: opts.threadTs,
+        setStatus: opts.setStatus,
+      })
+    : buildSlackHarnessTransport({
+        client: opts.client,
+        channel: opts.channelId,
+        threadTs: opts.threadTs,
+      });
 
   await runDiscordHarnessConversation({
     prompt: effectivePrompt,

@@ -61,6 +61,9 @@ export function SlackConnect() {
           <p className="mb-2 text-caption text-faint">
             Open Slack’s app builder, choose <strong>From a manifest</strong>, pick your workspace, and paste this:
           </p>
+          <div className="mb-2 rounded-md border border-warning/40 bg-warning-tint px-3 py-2 text-caption text-warning">
+            <strong>Select the YAML tab before pasting.</strong> Slack’s manifest editor defaults to <strong>JSON</strong> — pasting this YAML there shows a “Fix errors on line 1” error. (Already have a Slack app? Open it → <strong>App Manifest</strong> → <strong>YAML</strong> tab → replace &amp; Save, then reinstall.)
+          </div>
           <ManifestBlock manifest={status.data?.manifest} />
           <div className="mt-2 flex gap-2">
             <a href="https://api.slack.com/apps?new_app=1" target="_blank" rel="noreferrer">

@@ -1242,6 +1242,14 @@ export interface DiscordHarnessTransport {
    * straight to handle.edit({ components }).
    */
   buildApprovalComponents?(state: DisplayState): unknown[] | null;
+  /**
+   * Optional progress sink, called on every flush with the live DisplayState.
+   * The Slack AI-Assistant transport uses it to drive assistant.threads.setStatus
+   * ("Clem is verifying numbers…") so the native pane shows real run activity.
+   * Omitted by Discord (and the plain Slack transport) → no-op, behavior stays
+   * byte-identical. Implementations must swallow their own errors.
+   */
+  onState?(state: DisplayState): void;
 }
 
 export interface DiscordHarnessReplyHandle {
@@ -1757,6 +1765,9 @@ export async function runDiscordHarnessConversation(opts: {
   const flush = async (): Promise<void> => {
     pendingEdit = null;
     lastEditAt = Date.now();
+    // Progress sink (Slack AI-Assistant setStatus). Fires on every flush with the
+    // live state, independent of message-edit token expiry. No-op for Discord.
+    try { transport.onState?.(state); } catch { /* progress sink must never break the run */ }
     // If the interaction token already expired, intermediate progress
     // edits are silently dropped — the user wouldn't see them. But
     // v0.5.19 F8 keeps the user informed by posting one "still working"
