@@ -53,6 +53,49 @@ test('relax: schema is folded into the system message so the model still returns
   assert.match(sys!.content, /"done"/);
 });
 
+test('relax: json_schema + TOOLS drops response_format (strict backend can\'t do both) but keeps schema-in-prompt', () => {
+  const prev = process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT;
+  process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT = 'on';
+  try {
+    const out = relaxRequestForCompatBackend({
+      messages: [{ role: 'system', content: 'You are Clem.' }],
+      tools: [{ type: 'function', function: { name: 'get_x', parameters: { type: 'object' } } }],
+      response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object', properties: { done: { type: 'boolean' } } } } },
+    }) as { response_format?: unknown; messages: Array<{ role: string; content: string }> };
+    // The conflicting response_format is GONE so the model can emit real tool_calls…
+    assert.equal('response_format' in out, false, 'response_format dropped when tools present');
+    // …but the schema is still folded into the system prompt + tools survive.
+    const sys = out.messages.find((m) => m.role === 'system');
+    assert.match(sys!.content, /JSON Schema/);
+    assert.match(sys!.content, /"done"/);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT; else process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT = prev;
+  }
+});
+
+test('relax: json_schema + TOOLS with the kill-switch OFF keeps the legacy json_object downgrade', () => {
+  const prev = process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT;
+  process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT = 'off';
+  try {
+    const out = relaxRequestForCompatBackend({
+      messages: [{ role: 'system', content: 'sys' }],
+      tools: [{ type: 'function', function: { name: 'get_x', parameters: { type: 'object' } } }],
+      response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object' } } },
+    }) as { response_format?: { type?: string } };
+    assert.equal(out.response_format?.type, 'json_object', 'kill-switch off → legacy downgrade');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT; else process.env.CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT = prev;
+  }
+});
+
+test('relax: json_schema WITHOUT tools still downgrades to json_object (no behavior change)', () => {
+  const out = relaxRequestForCompatBackend({
+    messages: [{ role: 'system', content: 'sys' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'V', strict: true, schema: { type: 'object' } } },
+  }) as { response_format?: { type?: string } };
+  assert.equal(out.response_format?.type, 'json_object');
+});
+
 test('relax: a system message is created when none exists', () => {
   const out = relaxRequestForCompatBackend({
     messages: [{ role: 'user', content: 'hi' }],

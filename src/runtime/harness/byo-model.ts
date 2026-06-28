@@ -43,6 +43,20 @@ const logger = pino({ name: 'clementine.byo-model' });
 // OpenAI-only request fields many compatible backends reject with a 400.
 const OPENAI_ONLY_FIELDS = ['store', 'prompt_cache_retention', 'reasoning_effort', 'verbosity'] as const;
 
+/** Kill-switch (default ON) for dropping `response_format` on tool-bearing turns.
+ *  A STRICT OpenAI-compatible backend (e.g. Together AI) cannot satisfy
+ *  `response_format` AND `tools` on the same call: forcing JSON suppresses
+ *  `tool_calls` (the model NARRATES the call as text → the harness's
+ *  `A_zero_tools` / `structured_narration_deferral` loop) or corrupts output on
+ *  `json_object` (`finish_reason: abort`). z.ai's GLM serving is lenient and
+ *  emits tool_calls anyway, so this is a no-op there in practice — but the flag
+ *  lets us revert to the legacy json_object downgrade if any backend regresses.
+ *  Forcing JSON while passing tools is contradictory even on real OpenAI, so the
+ *  default-on behavior is the generally-correct one. DELETE-WHEN-VALIDATED. */
+function dropResponseFormatWithToolsEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT', 'on') || 'on') !== 'off';
+}
+
 /** Map the harness's per-turn reasoning-effort tier onto GLM (Z.ai)'s
  *  OpenAI-compatible `thinking` switch, so a GLM brain/worker actually responds
  *  to Clementine's dynamic effort instead of running at the backend default.
@@ -153,8 +167,18 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
       messages.unshift({ role: 'system', content: instruction.trim() });
     }
     next.messages = messages;
-    next.response_format = { type: 'json_object' };
     downgradedBodies.add(next);
+    // Strict backends can't do response_format + tools at once. When tools are in
+    // scope, DROP response_format entirely so the model can emit real tool_calls
+    // OR a final JSON envelope — the schema is already folded into the system
+    // prompt above and the response side repairs the JSON. Without tools, keep the
+    // legacy json_object downgrade (schema-in-prompt + enforced JSON object).
+    const hasTools = Array.isArray(next.tools) && next.tools.length > 0;
+    if (hasTools && dropResponseFormatWithToolsEnabled()) {
+      delete next.response_format;
+    } else {
+      next.response_format = { type: 'json_object' };
+    }
   }
 
   return next;
