@@ -115,16 +115,22 @@ export function chunkMarkdown(raw: string): Chunk[] {
   const text = raw.trim();
   if (!text) return [];
 
-  // Split on H1/H2/H3 boundaries. Keep the heading line with the section
-  // that follows it so each chunk carries its own title.
-  const sections: { heading: string | null; body: string }[] = [];
+  // Split on H1/H2/H3 boundaries. Keep the heading line with the section that
+  // follows it, and track the full heading ANCESTRY (H1 > H2 > H3) so every chunk
+  // can carry its section breadcrumb into the INDEXED text — not just the first
+  // window of a long section. Without this, windows 2+ were indexed with no
+  // heading context (FTS5 and the embedding both lost the section), the cheapest
+  // hybrid-retrieval quality bug.
+  const sections: { heading: string | null; breadcrumb: string; body: string }[] = [];
   const lines = text.split('\n');
+  const headingStack: string[] = []; // headingStack[level-1] = that level's current title
   let currentHeading: string | null = null;
+  let currentBreadcrumb = '';
   let buffer: string[] = [];
 
   const flush = () => {
     const body = buffer.join('\n').trim();
-    if (body) sections.push({ heading: currentHeading, body });
+    if (body) sections.push({ heading: currentHeading, breadcrumb: currentBreadcrumb, body });
     buffer = [];
   };
 
@@ -132,7 +138,11 @@ export function chunkMarkdown(raw: string): Chunk[] {
     const headerMatch = line.match(/^(#{1,3})\s+(.+)$/);
     if (headerMatch) {
       flush();
+      const level = headerMatch[1].length; // 1..3
       currentHeading = headerMatch[2].trim();
+      headingStack.length = level - 1;       // drop deeper + sibling levels
+      headingStack[level - 1] = currentHeading;
+      currentBreadcrumb = headingStack.filter(Boolean).join(' > ');
       buffer.push(line);
     } else {
       buffer.push(line);
@@ -150,6 +160,8 @@ export function chunkMarkdown(raw: string): Chunk[] {
 
   const chunks: Chunk[] = [];
   for (const section of sections) {
+    // Short sections fit in one chunk whose body already opens with the heading
+    // line — leave them byte-identical (no churn, no preview-budget cost).
     if (section.body.length <= TARGET_CHUNK_CHARS) {
       chunks.push({
         content: section.body,
@@ -158,17 +170,23 @@ export function chunkMarkdown(raw: string): Chunk[] {
       });
       continue;
     }
-    // Window long sections with overlap.
+    // Window long sections with overlap. The FIRST window contains the heading
+    // line; windows 2+ slice PAST it and used to be indexed with no section
+    // context at all (the bug). Prepend the full ancestry breadcrumb to those
+    // windows only — so they regain context for FTS5 + the embedding — and budget
+    // for the prefix so a window never overshoots TARGET_CHUNK_CHARS. The first
+    // window stays byte-identical, so short/normal content + previews don't change.
+    const breadcrumbPrefix = section.breadcrumb ? `${section.breadcrumb}\n` : '';
     let cursor = 0;
+    let isFirst = true;
     while (cursor < section.body.length) {
-      const slice = section.body.slice(cursor, cursor + TARGET_CHUNK_CHARS);
-      chunks.push({
-        content: slice,
-        title: section.heading,
-        contentHash: hashString(slice),
-      });
-      if (cursor + TARGET_CHUNK_CHARS >= section.body.length) break;
-      cursor += TARGET_CHUNK_CHARS - OVERLAP_CHARS;
+      const prefix = isFirst ? '' : breadcrumbPrefix;
+      const budget = Math.max(1, TARGET_CHUNK_CHARS - prefix.length);
+      const content = prefix + section.body.slice(cursor, cursor + budget);
+      chunks.push({ content, title: section.heading, contentHash: hashString(content) });
+      if (cursor + budget >= section.body.length) break;
+      cursor += Math.max(1, budget - OVERLAP_CHARS);
+      isFirst = false;
     }
   }
 
