@@ -44,7 +44,7 @@ import {
 } from '../memory/focus.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
-import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
   deleteWorkflow,
   listWorkflows,
@@ -236,7 +236,7 @@ import {
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain } from '../runtime/harness/model-role-options.js';
+import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue } from '../runtime/harness/model-role-options.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
@@ -3975,6 +3975,7 @@ export function registerConsoleRoutes(
       },
       brainOptions: brainOptions(),
       effectiveBrain: effectiveBrain(),
+      effectiveBrainValue: effectiveBrainValue(),
       activeBrain: getActiveAuthMode(),
     };
   };
@@ -7800,6 +7801,10 @@ export function registerConsoleRoutes(
       const raw = typeof req.body?.brain === 'string' ? req.body.brain : '';
       const brain = raw === 'claude_oauth' ? 'claude_oauth' : raw === 'codex_oauth' ? 'codex_oauth' : raw === 'api_key' ? 'api_key' : '';
       if (!brain) { res.status(400).json({ error: 'brain must be "codex_oauth", "claude_oauth", or "api_key" (a BYO model).' }); return; }
+      // Optional: which SPECIFIC connected BYO model orchestrates (so any provider's
+      // model — e.g. a Together AI model in an extra slot — can be the brain, not
+      // just the default slot). The router routes this id to its owning provider.
+      const brainModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
 
       // A BYO brain runs all-in (every role on the BYO backend unless a role is
       // bound elsewhere); a Codex/Claude brain cannot coexist with all-in, so step
@@ -7809,11 +7814,32 @@ export function registerConsoleRoutes(
           res.status(409).json({ error: 'No BYO model is configured. Add one under Settings → Models → Connected models first.', needsLogin: true });
           return;
         }
+        // Pin the chosen model as the brain. Validate it against the eligible set
+        // (every connected, configured BYO model) so a stale/unknown id can't be
+        // written. Empty modelId → clear the override (default slot is the brain).
+        if (brainModelId) {
+          const eligible = brainOptions().some((o) => o.id === 'api_key' && o.modelId === brainModelId);
+          if (!eligible) {
+            res.status(400).json({ error: `Model "${brainModelId}" is not a connected BYO model. Add it to a provider in Settings → Models first.` });
+            return;
+          }
+          updateEnvKey('BYO_BRAIN_MODEL_ID', brainModelId);
+          process.env.BYO_BRAIN_MODEL_ID = brainModelId;
+        } else {
+          removeEnvKey('BYO_BRAIN_MODEL_ID');
+          delete process.env.BYO_BRAIN_MODEL_ID;
+        }
         updateEnvKey('MODEL_ROUTING_MODE', 'all_in');
         process.env.MODEL_ROUTING_MODE = 'all_in';
-      } else if (getModelRoutingMode() === 'all_in') {
-        updateEnvKey('MODEL_ROUTING_MODE', 'off');
-        process.env.MODEL_ROUTING_MODE = 'off';
+      } else {
+        // Switching to a Codex/Claude brain: drop the BYO brain-model override so a
+        // later switch back to a BYO brain doesn't silently reuse a stale model.
+        removeEnvKey('BYO_BRAIN_MODEL_ID');
+        delete process.env.BYO_BRAIN_MODEL_ID;
+        if (getModelRoutingMode() === 'all_in') {
+          updateEnvKey('MODEL_ROUTING_MODE', 'off');
+          process.env.MODEL_ROUTING_MODE = 'off';
+        }
       }
 
       if (brain === 'claude_oauth') {

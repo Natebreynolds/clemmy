@@ -146,7 +146,15 @@ export function defaultForRole(role: ModelRole): string {
       const w = getWorkerModel();
       return resolveProvider(w) === 'codex' ? byo.primaryId : w;
     }
-    return byo.primaryId;
+    // role === 'brain': honor an explicit per-model brain override (set when the
+    // user picks a SPECIFIC connected model as the brain — e.g. a Together AI
+    // model living in an EXTRA provider, not the default slot). The router routes
+    // this id to its OWNING provider's baseURL+key via resolveByoProviderForModel
+    // — no credential moves, no slot reshuffle. The active-brain route validates
+    // it's a real, configured connected model before writing it; if a stale id
+    // ever slipped through, the router falls back to the default BYO backend.
+    const brainOverride = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim();
+    return brainOverride || byo.primaryId;
   }
 
   switch (role) {

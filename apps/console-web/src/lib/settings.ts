@@ -136,10 +136,13 @@ export interface ModelRolesSnapshot {
     worker: { provider: string; label: string; models: { id: string; label: string }[] }[];
     judge: { provider: string; label: string; models: { id: string; label: string }[] }[];
   };
-  // The brain picker: Codex / Claude / a BYO model, each flagged by availability.
-  brainOptions?: { id: ActiveBrain; label: string; available: boolean; modelId?: string }[];
+  // The brain picker: Codex / Claude / every connected BYO model, each flagged by
+  // availability. `value` is the unique selector (BYO models = `api_key:<modelId>`).
+  brainOptions?: { id: ActiveBrain; value: string; label: string; available: boolean; modelId?: string; providerId?: string }[];
   // The brain the wire actually uses (all-in BYO → 'api_key' regardless of AUTH_MODE).
   effectiveBrain?: ActiveBrain;
+  // The selector VALUE for the active brain — matches a brainOptions().value.
+  effectiveBrainValue?: string;
   activeBrain: ActiveBrain;
 }
 // Set (or clear) a worker/judge role model. Brain is a provider login switch
@@ -212,8 +215,10 @@ export const completeClaudeLogin = (flowId: string, code: string) =>
 // default; 'claude_oauth' runs Clementine on the Claude subscription. Switching
 // applies live on the next message — no daemon restart.
 export type ActiveBrain = 'codex_oauth' | 'claude_oauth' | 'api_key';
-export const setActiveBrain = (brain: ActiveBrain) =>
-  patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', { brain });
+// modelId pins WHICH connected BYO model is the brain (only meaningful for
+// brain==='api_key'); omitted for Codex/Claude.
+export const setActiveBrain = (brain: ActiveBrain, modelId?: string) =>
+  patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', modelId ? { brain, modelId } : { brain });
 
 export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding';
 export type JudgeMetricOutcome = 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error';

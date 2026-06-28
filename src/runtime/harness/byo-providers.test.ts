@@ -19,7 +19,12 @@ const ENV_KEYS = [
 function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
   const saved: Record<string, string | undefined> = {};
   for (const k of ENV_KEYS) saved[k] = process.env[k];
-  for (const k of ENV_KEYS) delete process.env[k];
+  // MASK with '' rather than delete: getRuntimeEnv returns process.env[key] ??
+  // <.env files>, so a deleted key falls through to the developer's live
+  // ~/.clementine-next/.env (which may have real BYO_PROVIDERS/keys) and pollutes
+  // the test. '' is a defined value that masks the .env (and reads as unset for
+  // the configured/JSON checks). Keeps local runs == CI's clean env.
+  for (const k of ENV_KEYS) process.env[k] = '';
   for (const [k, v] of Object.entries(vars)) { if (v !== undefined) process.env[k] = v; }
   try { fn(); } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]!; }

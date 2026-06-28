@@ -196,7 +196,10 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
     } finally { setBusy(null); }
   };
 
-  const onBrain = (v: ActiveBrain) => run('brain', () => setActiveBrain(v));
+  // The option value is the unique selector: a BYO model is `api_key:<modelId>`
+  // (so any connected model can be the brain), Codex/Claude are their plain ids.
+  const onBrain = (value: string) => run('brain', () =>
+    value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length)) : setActiveBrain(value as ActiveBrain));
   const onRole = (role: 'worker', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
   const onClearJudge = () => run('judge', () => patchModelRole({ role: 'judge', clear: true }));
@@ -235,13 +238,13 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
         <RoleRow icon={BrainCircuit} label="Brain" hint="Orchestrates every turn — Codex, Claude, or a BYO model (all-in)." resolved={mr.roles.brain}>
           {(id) => (
             <Select id={id} disabled={busy === 'brain'}
-              value={mr.effectiveBrain ?? (mr.activeBrain === 'claude_oauth' ? 'claude_oauth' : 'codex_oauth')}
-              onChange={(e) => onBrain(e.target.value as ActiveBrain)}>
+              value={mr.effectiveBrainValue ?? mr.effectiveBrain ?? (mr.activeBrain === 'claude_oauth' ? 'claude_oauth' : 'codex_oauth')}
+              onChange={(e) => onBrain(e.target.value)}>
               {(mr.brainOptions ?? [
-                { id: 'codex_oauth' as ActiveBrain, label: 'Codex — GPT-5.x', available: connected('codex') },
-                { id: 'claude_oauth' as ActiveBrain, label: 'Claude — Opus', available: connected('claude') },
+                { id: 'codex_oauth' as ActiveBrain, value: 'codex_oauth', label: 'Codex — GPT-5.x', available: connected('codex') },
+                { id: 'claude_oauth' as ActiveBrain, value: 'claude_oauth', label: 'Claude — Opus', available: connected('claude') },
               ]).map((o) => (
-                <option key={o.id} value={o.id} disabled={!o.available}>{o.label}{o.available ? '' : ' (not connected)'}</option>
+                <option key={o.value} value={o.value} disabled={!o.available}>{o.label}{o.available ? '' : ' (not connected)'}</option>
               ))}
             </Select>
           )}

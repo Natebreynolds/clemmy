@@ -10,7 +10,7 @@ import {
 } from '../../config.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
-import type { ModelRole } from './model-roles.js';
+import { defaultForRole, type ModelRole } from './model-roles.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import { getByoProviders, providerToBackendConfig } from './byo-providers.js';
 
@@ -188,24 +188,64 @@ export function validateRoleModelBinding(role: ModelRole, modelId: string): Role
 export type BrainChoice = ReturnType<typeof getActiveAuthMode>; // 'codex_oauth' | 'claude_oauth' | 'api_key'
 export interface BrainOption {
   id: BrainChoice;
+  /** Unique selector value (codex/claude = the id; a BYO model = `api_key:<modelId>`
+   *  so several BYO models can coexist under the single 'api_key' brain class). */
+  value: string;
   label: string;
   available: boolean;
-  /** For the BYO brain: the model id that will orchestrate. */
+  /** For a BYO brain option: the model id that will orchestrate + its provider. */
   modelId?: string;
+  providerId?: string;
 }
 
-/** The brain choices to show in the picker — Codex, Claude, and (if a BYO backend
- *  is configured) the BYO model — each flagged available based on its connection. */
+/** The brain choices to show in the picker — Codex, Claude, and EVERY connected
+ *  BYO model (across all configured providers, not just the default slot). Any
+ *  connected model can be the brain: the router resolves a chosen model id to its
+ *  OWNING provider's baseURL+key via resolveByoProviderForModel, so selecting an
+ *  extra-provider model (e.g. a Together AI model) just works — no slot reshuffle. */
 export function brainOptions(): BrainOption[] {
-  const byo = getByoBackendConfig();
   const opts: BrainOption[] = [
-    { id: 'codex_oauth', label: 'Codex — GPT-5.x', available: codexModelsAvailable() },
-    { id: 'claude_oauth', label: 'Claude — Opus', available: claudeModelsAvailable() },
+    { id: 'codex_oauth', value: 'codex_oauth', label: 'Codex — GPT-5.x', available: codexModelsAvailable() },
+    { id: 'claude_oauth', value: 'claude_oauth', label: 'Claude — Opus', available: claudeModelsAvailable() },
   ];
-  if (byo.configured) {
-    opts.push({ id: 'api_key', label: `${byo.providerLabel || 'Custom'} — ${byo.primaryId}`, available: true, modelId: byo.primaryId });
+  const seen = new Set<string>();
+  for (const provider of getByoProviders()) {
+    if (!providerToBackendConfig(provider).configured) continue;
+    for (const raw of provider.modelIds) {
+      const modelId = raw.trim();
+      if (!modelId || seen.has(modelId)) continue;
+      seen.add(modelId);
+      opts.push({
+        id: 'api_key',
+        value: `api_key:${modelId}`,
+        modelId,
+        providerId: provider.id,
+        available: true,
+        label: `${provider.label || 'Custom'} — ${modelId}`,
+      });
+    }
   }
   return opts;
+}
+
+/** The selector VALUE for the brain the wire actually uses — matches one of
+ *  brainOptions().value so the picker highlights the right row. For a BYO brain
+ *  it is `api_key:<the orchestrating model id>` (the per-model override if set,
+ *  else the default slot's primary). */
+export function effectiveBrainValue(): string {
+  // SINGLE SOURCE OF TRUTH: the model id the wire actually orchestrates with.
+  // defaultForRole('brain') already encodes every case — all_in BYO (the per-model
+  // BYO_BRAIN_MODEL_ID override or the default-slot primary), claude_oauth → the
+  // Claude brain, else MODELS.primary (which the harness config COLLAPSES to the
+  // BYO primary when AUTH_MODE=api_key, so a BYO brain still resolves to its BYO
+  // model even in worker mode). Map that id back to the picker's selector value so
+  // the highlighted option is ALWAYS the real brain — never a bare, unmatchable
+  // 'api_key' nor a BYO model that isn't actually orchestrating.
+  const brainModelId = defaultForRole('brain');
+  const provider = resolveProvider(brainModelId);
+  if (provider === 'claude') return 'claude_oauth';
+  if (provider === 'codex') return 'codex_oauth';
+  return `api_key:${brainModelId}`; // byo → matches its api_key:<modelId> option
 }
 
 /** The brain the wire actually uses, for the picker's selected value: all-in BYO
