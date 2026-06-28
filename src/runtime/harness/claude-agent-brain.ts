@@ -150,7 +150,7 @@ function judgeMaxContinuations(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 1;
 }
 
-export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' | 'discord';
+export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' | 'discord' | 'slack';
 export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring' | 'full';
 
 function configuredMode(): ClaudeAgentBrainMode | null {
@@ -179,7 +179,7 @@ export function claudeAgentSdkBrainMode(): ClaudeAgentBrainMode | null {
 }
 
 export function isClaudeAgentBrainSurface(surface: string): surface is ClaudeAgentBrainSurface {
-  return surface === 'webhook' || surface === 'cli' || surface === 'dashboard' || surface === 'home' || surface === 'discord';
+  return surface === 'webhook' || surface === 'cli' || surface === 'dashboard' || surface === 'home' || surface === 'discord' || surface === 'slack';
 }
 
 export function claudeAgentSdkBrainEnabled(surface: string): surface is ClaudeAgentBrainSurface {

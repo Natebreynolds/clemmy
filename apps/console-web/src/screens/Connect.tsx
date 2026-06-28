@@ -10,6 +10,7 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/cn';
 import { MobilePanel } from '@/components/connect/MobilePanel';
 import { McpManager } from '@/components/connect/McpManager';
+import { SlackConnect } from '@/components/connect/SlackConnect';
 import { ProjectsPanel } from '@/components/connect/ProjectsPanel';
 import { CliTools } from '@/components/connect/CliTools';
 import { BrowserHarness } from '@/components/connect/BrowserHarness';
@@ -173,6 +174,9 @@ export function Connect() {
           </div>
         )}
       </Section>
+
+      {/* Slack — guided two-way chat setup (manifest + 2 tokens) */}
+      <SlackConnect />
 
       {/* MCP */}
       <McpManager />

@@ -391,6 +391,29 @@ export const DISCORD_ALLOWED_USERS = parseCsvEnv(
 export const DISCORD_DM_POLL_INTERVAL_MS = parseInt(getEnv('DISCORD_DM_POLL_INTERVAL_MS', '5000'), 10);
 export const DISCORD_ALLOWED_CHANNELS = parseCsvEnv(getEnv('DISCORD_ALLOWED_CHANNELS', ''));
 export const DISCORD_PUSH_PROACTIVE_BRIEFS = getEnv('DISCORD_PUSH_PROACTIVE_BRIEFS', 'false').toLowerCase() === 'true';
+// --- Slack (mirrors the Discord channel: vault-first token reads + auto-enable
+// from token presence, so "paste tokens → bot connects" works on every setup
+// surface). Slack uses Socket Mode, which needs BOTH a bot token (xoxb-) AND an
+// app-level token (xapp-) — so SLACK_ENABLED auto-decides on both being present.
+// resolveDiscordEnabled is channel-agnostic ((rawEnabled, hasToken) → bool); an
+// explicit SLACK_ENABLED=false still force-disables while keeping tokens saved.
+const SLACK_ENABLED_RAW = getEnv('SLACK_ENABLED', '').toLowerCase();
+export const SLACK_BOT_TOKEN = readSecretFromFileVaultSync('slack_bot_token') || getEnv('SLACK_BOT_TOKEN', '') || '';
+export const SLACK_APP_TOKEN = readSecretFromFileVaultSync('slack_app_token') || getEnv('SLACK_APP_TOKEN', '') || '';
+export const SLACK_ENABLED = resolveDiscordEnabled(
+  SLACK_ENABLED_RAW,
+  SLACK_BOT_TOKEN.length > 0 && SLACK_APP_TOKEN.length > 0,
+);
+// Only respond in channels when @mentioned (app_mention). Kept for parity with
+// DISCORD_REQUIRE_MENTION, though Slack's app_mention event already implies it.
+export const SLACK_REQUIRE_MENTION = getEnv('SLACK_REQUIRE_MENTION', 'true').toLowerCase() === 'true';
+// Slack user IDs (U…/W…) allowed to talk to the bot. Empty = nobody (mirrors
+// Discord's allowlist-required default; discovered at runtime, never hardcoded).
+export const SLACK_ALLOWED_USERS = parseCsvEnv(getEnv('SLACK_ALLOWED_USERS', ''));
+// Slack channel IDs (C…/G…) the bot may respond in. Empty = all invited channels.
+export const SLACK_ALLOWED_CHANNELS = parseCsvEnv(getEnv('SLACK_ALLOWED_CHANNELS', ''));
+// Optional channel ID for proactive posts (briefs, surfaced items). Empty = off.
+export const SLACK_PROACTIVE_CHANNEL = getEnv('SLACK_PROACTIVE_CHANNEL', '').trim();
 export const LOCAL_MCP_ENABLED = getEnv('LOCAL_MCP_ENABLED', 'true').toLowerCase() === 'true';
 export const MCP_AUTO_IMPORT_ENABLED = getEnv('MCP_AUTO_IMPORT_ENABLED', 'false').toLowerCase() === 'true';
 export const MCP_SERVERS_FILE = path.join(BASE_DIR, 'mcp', 'servers.json');

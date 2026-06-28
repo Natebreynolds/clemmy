@@ -7,6 +7,12 @@ import {
   sendDiscordChannelMessageWithComponents,
   sendDiscordDirectMessage,
 } from '../channels/discord.js';
+import {
+  buildSlackActionsForNotification,
+  sendSlackChannelMessage,
+  sendSlackChannelMessageWithBlocks,
+  sendSlackDirectMessage,
+} from '../channels/slack.js';
 import { getVapidKeys } from './web-push-keys.js';
 
 // Discord caps a single message at 2000 chars. We aim slightly lower
@@ -95,16 +101,14 @@ function buildWebPushPayload(notification: NotificationRecord): {
   };
 }
 
-function shouldDeliverDiscordNotification(notification: NotificationRecord): boolean {
+// Shared bot-path delivery gate. `inlineKey` names the metadata flag set when
+// a live chat transport already showed an INLINE approval card for this same
+// approval (so the duplicate notification-delivery card is suppressed and the
+// surface matches the desktop's single-card behavior). The title-prefix
+// suppressions are channel-agnostic.
+function shouldDeliverBotNotification(notification: NotificationRecord, inlineKey: 'discordInlineHandled' | 'slackInlineHandled'): boolean {
   if (notification.silent) return false;
-
-  // The Discord harness transport already showed an INLINE approval card
-  // (Approve/Reject buttons on the conversational reply). Suppress the
-  // duplicate notification-delivery card for the same approval so Discord
-  // matches the desktop app's single-surface behavior. Set in
-  // loop.ts registerAndEmitApprovals only for live Discord sessions; a
-  // non-Discord or non-conversational approval still delivers normally.
-  if (notification.metadata?.discordInlineHandled === true) return false;
+  if (notification.metadata?.[inlineKey] === true) return false;
 
   const title = notification.title.trim().toLowerCase();
   if (notification.kind === 'system' && title.startsWith('plan approved:')) return false;
@@ -117,9 +121,29 @@ function shouldDeliverDiscordNotification(notification: NotificationRecord): boo
   return true;
 }
 
+function shouldDeliverDiscordNotification(notification: NotificationRecord): boolean {
+  return shouldDeliverBotNotification(notification, 'discordInlineHandled');
+}
+
+function shouldDeliverSlackNotification(notification: NotificationRecord): boolean {
+  return shouldDeliverBotNotification(notification, 'slackInlineHandled');
+}
+
 function buildDiscordComponentsForNotification(notification: NotificationRecord) {
   if (notification.kind !== 'approval') return undefined;
   return buildActionsForNotification(notification.metadata);
+}
+
+function buildSlackBlocksForNotification(notification: NotificationRecord) {
+  if (notification.kind !== 'approval') return undefined;
+  return buildSlackActionsForNotification(notification.metadata);
+}
+
+// Slack mrkdwn uses *bold* (one asterisk), not Discord's **bold** — the title
+// emphasis is applied inside the send helpers' toSlackMrkdwn pass, so here we
+// emit the same `**title**\nbody` shape the Discord path uses for symmetry.
+function buildSlackBotMessage(notification: NotificationRecord): string {
+  return `**${notification.title}**\n${notification.body}`;
 }
 
 export async function deliverNotificationToDestination(
@@ -188,6 +212,44 @@ export async function deliverNotificationToDestination(
     } else {
       await sendDiscordChannelMessage(destination.channelId, buildDiscordBotMessage(notification));
     }
+    return;
+  }
+
+  if (destination.type === 'slack_user') {
+    if (!destination.userId) {
+      throw new Error('Slack user destination is missing userId.');
+    }
+    if (!shouldDeliverSlackNotification(notification)) return;
+    const blocks = buildSlackBlocksForNotification(notification);
+    await sendSlackDirectMessage(destination.userId, buildSlackBotMessage(notification), { blocks });
+    return;
+  }
+
+  if (destination.type === 'slack_channel') {
+    if (!destination.channelId) {
+      throw new Error('Slack channel destination is missing channelId.');
+    }
+    if (!shouldDeliverSlackNotification(notification)) return;
+    const blocks = buildSlackBlocksForNotification(notification);
+    if (blocks && blocks.length > 0) {
+      await sendSlackChannelMessageWithBlocks(destination.channelId, buildSlackBotMessage(notification), blocks);
+    } else {
+      await sendSlackChannelMessage(destination.channelId, buildSlackBotMessage(notification));
+    }
+    return;
+  }
+
+  if (destination.type === 'slack_webhook') {
+    // Slack Incoming Webhook — the near-zero-setup outbound path. A single
+    // POST with { text } renders mrkdwn. (Approval buttons require the bot
+    // token path above; a raw webhook can't carry interactive actions.)
+    if (!destination.url) throw new Error(`Destination ${destination.name} is missing a URL.`);
+    const response = await fetch(destination.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: `*${notification.title}*\n${notification.body}` }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return;
   }
 

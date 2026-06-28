@@ -221,6 +221,8 @@ import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
+import { getSlackRuntimeStatus } from '../channels/slack.js';
+import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { configureHarnessRuntime, resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
@@ -236,7 +238,9 @@ import {
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue } from '../runtime/harness/model-role-options.js';
+import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
+import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
+import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
 import { summarizeApprovalAction } from '../runtime/approval-summary.js';
@@ -4428,6 +4432,33 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Live model status for the top-bar chips: Codex/Claude 5h+weekly quota windows
+  // (captured from provider rate-limit headers) + connection status for OpenAI and
+  // Together (whose balances aren't exposed by their APIs → status-only). Returns
+  // only booleans + percentages + reset times — never a key or secret.
+  app.get('/api/console/model-status', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const rl = getRateLimitSnapshot();
+      const claudeConnected = claudeModelsAvailable();
+      // Claude windows come from the dedicated oauth/usage endpoint (cached,
+      // lazily refreshed) — only poke it when Claude is actually connected.
+      const claudeUsage = claudeConnected ? getClaudeUsageSnapshot() : null;
+      const togetherConnected = getByoProviderSnapshots().some(
+        (p) => p.configured && (p.id === 'together' || p.id === 'together-ai' || /together/i.test(p.label)),
+      );
+      res.json({
+        codex: { connected: codexModelsAvailable(), ...(rl.codex ?? {}) },
+        claude: { connected: claudeConnected, ...(claudeUsage ?? {}) },
+        openai: { connected: Boolean(getOpenAiApiKey()) },
+        together: { connected: togetherConnected },
+        updatedAt: Date.now(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/settings/model-providers', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -4821,7 +4852,8 @@ export function registerConsoleRoutes(
       // — see shouldRespond() in channels/discord.ts.
       const env = readBaseEnv();
       const discordAllowedUsers = (env.DISCORD_ALLOWED_USERS || env.DISCORD_DM_ALLOWED_USERS || '').trim();
-      res.json({ rows, descriptors, auth: getAuthStatus(), discordAllowedUsers });
+      const slackAllowedUsers = (env.SLACK_ALLOWED_USERS || '').trim();
+      res.json({ rows, descriptors, auth: getAuthStatus(), discordAllowedUsers, slackAllowedUsers });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -4847,6 +4879,36 @@ export function registerConsoleRoutes(
       updateEnvKey('DISCORD_ALLOWED_USERS', value);
       updateEnvKey('DISCORD_DM_ALLOWED_USERS', value);
       res.json({ ok: true, discordAllowedUsers: value, appliesOnRestart: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Save the Slack allowed user id(s). Same model as discord-owner: env-backed
+  // allow-list gate (not a secret), applies on restart. Slack member IDs are
+  // alphanumeric (U…/W…), not numeric — so the validation differs from Discord.
+  app.post('/api/console/credentials/slack-owner', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const raw = typeof req.body?.ownerId === 'string' ? req.body.ownerId : '';
+    const ids = raw.split(',').map((s: string) => s.trim()).filter((s: string) => /^[UW][A-Z0-9]{6,}$/.test(s));
+    if (raw.trim() && ids.length === 0) {
+      res.status(400).json({ error: 'Enter a Slack member ID (Profile → ⋮ → Copy member ID). It looks like U01ABCDEF.' });
+      return;
+    }
+    try {
+      const value = ids.join(',');
+      updateEnvKey('SLACK_ALLOWED_USERS', value);
+      res.json({ ok: true, slackAllowedUsers: value, appliesOnRestart: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Live Slack connection status + the setup manifest for the guided panel.
+  app.get('/api/console/slack/status', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json({ ...getSlackRuntimeStatus(), manifest: SLACK_APP_MANIFEST_YAML });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

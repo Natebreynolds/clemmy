@@ -40,6 +40,8 @@ export type SecretStatus =
 export type SecretName =
   | 'openai_api_key'
   | 'discord_bot_token'
+  | 'slack_bot_token'
+  | 'slack_app_token'
   | 'composio_api_key'
   | 'recall_api_key'
   | 'browser_use_api_key'

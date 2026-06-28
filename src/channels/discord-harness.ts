@@ -157,22 +157,22 @@ const CONTINUITY_WINDOW_MS = 30 * 60_000;
  * approval state lives in the durable event log, but the channel-id
  * → session-id mapping was process-local.
  */
-function findMostRecentChannelSession(channelId: string): { sessionId: string; updatedAt: number } | null {
+function findMostRecentChannelSession(channelId: string, channel: string = 'discord'): { sessionId: string; updatedAt: number } | null {
   try {
     const db = openEventLog();
     const row = db
       .prepare(
         `SELECT id, updated_at FROM sessions
            WHERE (
-             (channel = 'discord' AND json_extract(metadata_json, '$.channelId') = ?)
-             OR json_extract(metadata_json, '$.source') = 'discord'
+             (channel = ? AND json_extract(metadata_json, '$.channelId') = ?)
+             OR json_extract(metadata_json, '$.source') = ?
                 AND json_extract(metadata_json, '$.channelId') = ?
              OR json_extract(metadata_json, '$.discordChannelId') = ?
            )
            ORDER BY updated_at DESC
            LIMIT 1`,
       )
-      .get(channelId, channelId, channelId) as { id?: string; updated_at?: string } | undefined;
+      .get(channel, channelId, channel, channelId, channelId) as { id?: string; updated_at?: string } | undefined;
     if (!row?.id || !row.updated_at) return null;
     return { sessionId: row.id, updatedAt: new Date(row.updated_at).getTime() };
   } catch {
@@ -185,7 +185,7 @@ function findMostRecentChannelSession(channelId: string): { sessionId: string; u
  * already in the in-memory map. Returns null if no recent session
  * exists OR the most recent one is past the continuity window.
  */
-function getOrHydrateChannelSession(channelId: string): ChannelSessionEntry | null {
+function getOrHydrateChannelSession(channelId: string, channel: string = 'discord'): ChannelSessionEntry | null {
   const now = Date.now();
   const existing = channelSessions.get(channelId);
   if (existing && now - existing.lastUsedAt < CONTINUITY_WINDOW_MS) {
@@ -193,7 +193,7 @@ function getOrHydrateChannelSession(channelId: string): ChannelSessionEntry | nu
     if (row) return existing;
     channelSessions.delete(channelId);
   }
-  const recent = findMostRecentChannelSession(channelId);
+  const recent = findMostRecentChannelSession(channelId, channel);
   if (!recent) return null;
   if (now - recent.updatedAt > CONTINUITY_WINDOW_MS) return null;
   const entry: ChannelSessionEntry = { sessionId: recent.sessionId, lastUsedAt: recent.updatedAt };
@@ -226,9 +226,13 @@ function resolveOrCreateSession(opts: {
   userId: string;
   guildId: string | null;
   prompt: string;
+  /** Channel kind for the harness session (default 'discord'). Slack passes
+   *  'slack' so sessions/continuity/activity stay correctly attributed. */
+  channel?: string;
 }): { id: string; isContinuation: boolean } {
+  const channel = opts.channel ?? 'discord';
   const now = Date.now();
-  const existing = getOrHydrateChannelSession(opts.channelId);
+  const existing = getOrHydrateChannelSession(opts.channelId, channel);
   if (existing) {
     // Continuation is intentional ONLY when the channel was actively
     // engaged recently. After STALE_SESSION_MS without traffic, fresh
@@ -248,11 +252,11 @@ function resolveOrCreateSession(opts: {
   }
   const session = createHarnessSession({
     kind: 'chat',
-    channel: 'discord',
+    channel,
     userId: opts.userId,
     title: opts.prompt.length > 60 ? `${opts.prompt.slice(0, 57)}...` : opts.prompt,
     metadata: {
-      source: 'discord',
+      source: channel,
       channelId: opts.channelId,
       userId: opts.userId,
       guildId: opts.guildId,
@@ -275,7 +279,7 @@ function resolveOrCreateSession(opts: {
   // conversation; the new session asked for clarification on something
   // the prior session had already specified — 25/batch via firecrawl.)
   try {
-    seedCrossSessionPrefix(session.id, opts.channelId, now, opts.prompt);
+    seedCrossSessionPrefix(session.id, opts.channelId, now, opts.prompt, channel);
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err), channelId: opts.channelId }, 'cross-session prefix seed failed (non-fatal)');
   }
@@ -294,7 +298,7 @@ const CROSS_SESSION_PREFIX_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 const PREFIX_LOOKBACK_SESSIONS = 4;
 const PREFIX_MAX_TURNS_PER_SESSION = 6;
 
-function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: number, newMessage?: string): void {
+function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: number, newMessage?: string, channel: string = 'discord'): void {
   const db = openEventLog();
   // Find the most recent N prior sessions for this channel (exclude
   // the newly-created one). We walk multiple sessions because the
@@ -303,12 +307,12 @@ function seedCrossSessionPrefix(newSessionId: string, channelId: string, now: nu
   // can land 30+ minutes after the planning turn it points to.
   const priorRows = db.prepare(
     `SELECT id, updated_at FROM sessions
-       WHERE channel = 'discord'
+       WHERE channel = ?
          AND id != ?
          AND json_extract(metadata_json, '$.channelId') = ?
        ORDER BY updated_at DESC
        LIMIT ?`,
-  ).all(newSessionId, channelId, PREFIX_LOOKBACK_SESSIONS) as Array<{ id: string; updated_at: string }>;
+  ).all(channel, newSessionId, channelId, PREFIX_LOOKBACK_SESSIONS) as Array<{ id: string; updated_at: string }>;
   if (priorRows.length === 0) return;
 
   // Filter to those still inside the prefix window.
@@ -542,8 +546,10 @@ export function bindDiscordHarnessSession(input: {
 async function handleHarnessCancel(opts: {
   channelId: string;
   transport: DiscordHarnessTransport;
+  channel?: string;
 }): Promise<void> {
-  const entry = getOrHydrateChannelSession(opts.channelId);
+  const channel = opts.channel ?? 'discord';
+  const entry = getOrHydrateChannelSession(opts.channelId, channel);
   if (!entry) {
     await opts.transport.sendError('Nothing to cancel — no paused session on this channel.');
     return;
@@ -558,7 +564,7 @@ async function handleHarnessCancel(opts: {
   // Resolve any pending registry rows for this session as cancelled_by_user.
   let cancelledCount = 0;
   for (const row of approvalRegistry.listPending({ sessionId: session.id, status: 'pending' })) {
-    const result = approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', 'discord-user');
+    const result = approvalRegistry.resolve(row.approvalId, 'cancelled_by_user', `${channel}-user`);
     if (result.ok) cancelledCount++;
   }
   // Clear interrupt state + mark session cancelled. The next message
@@ -613,8 +619,9 @@ async function handleHarnessCancel(opts: {
 async function handleHarnessNew(opts: {
   channelId: string;
   transport: DiscordHarnessTransport;
+  channel?: string;
 }): Promise<void> {
-  const entry = getOrHydrateChannelSession(opts.channelId);
+  const entry = getOrHydrateChannelSession(opts.channelId, opts.channel ?? 'discord');
   channelSessions.delete(opts.channelId);
 
   if (entry) {
@@ -651,7 +658,7 @@ function sessionTitle(row: SessionRow): string {
   return title.length > 72 ? `${title.slice(0, 69)}...` : title;
 }
 
-function collectDiscordSessionOptions(channelId: string): DiscordSessionOption[] {
+function collectDiscordSessionOptions(channelId: string, channel: string = 'discord'): DiscordSessionOption[] {
   const byId = new Map<string, DiscordSessionOption>();
   const pendingRows = approvalRegistry
     .listPending({ status: 'pending' })
@@ -678,7 +685,7 @@ function collectDiscordSessionOptions(channelId: string): DiscordSessionOption[]
 
   const memoryBound = channelSessions.get(channelId);
   if (memoryBound) add(getHarnessSession(memoryBound.sessionId), 0, true);
-  const persistedBound = findMostRecentChannelSession(channelId);
+  const persistedBound = findMostRecentChannelSession(channelId, channel);
   if (persistedBound) add(getHarnessSession(persistedBound.sessionId), 1, true);
 
   for (const row of pendingRows) add(getHarnessSession(row.sessionId), 2, false);
@@ -757,8 +764,9 @@ export async function handleHarnessSessions(opts: {
   userId?: string | null;
   guildId?: string | null;
   transport: DiscordHarnessTransport;
+  channel?: string;
 }): Promise<void> {
-  const options = collectDiscordSessionOptions(opts.channelId);
+  const options = collectDiscordSessionOptions(opts.channelId, opts.channel ?? 'discord');
   const body = renderSessionPickerText(options, opts.channelId);
   const handle = await opts.transport.sendInitial(body);
   const components = sessionPickerComponents(options);
@@ -931,15 +939,17 @@ function buildContinueInput(lastSummary: string | undefined): string {
  * cleared (e.g. by a daemon restart) so the durable interrupt state
  * stays addressable through "approve" / "reject" replies.
  */
-export function isChannelSessionAwaitingApproval(channelId: string): boolean {
-  const entry = getOrHydrateChannelSession(channelId);
+export function isChannelSessionAwaitingApproval(channelId: string, channel: string = 'discord'): boolean {
+  const entry = getOrHydrateChannelSession(channelId, channel);
   if (!entry) return false;
   const sess = HarnessSession.load(entry.sessionId);
   return !!sess && !!sess.loadInterruptState();
 }
 
-function isDiscordApproval(row: approvalRegistry.PendingApprovalRow): boolean {
-  return row.channel === 'discord' || row.channel === 'discord-dm';
+// True when an approval row originated from the given chat channel. Slack
+// approvals are tagged 'slack'/'slack-dm', Discord's 'discord'/'discord-dm'.
+function isDiscordApproval(row: approvalRegistry.PendingApprovalRow, channel: string = 'discord'): boolean {
+  return row.channel === channel || row.channel === `${channel}-dm`;
 }
 
 /** Gate-unification Step 5 kill-switch. Off ⇒ a typed "yes/approve" no longer
@@ -961,12 +971,12 @@ function typedPlanApprovalEnabled(): boolean {
  * can never shadow a registry row. Returns 'approved' | 'rejected' | null
  * (no pending plan / not an approval phrase / disabled).
  */
-export function maybeResolvePendingPlanProposal(channelId: string, prompt: string): 'approved' | 'rejected' | null {
+export function maybeResolvePendingPlanProposal(channelId: string, prompt: string, channel: string = 'discord'): 'approved' | 'rejected' | null {
   if (!typedPlanApprovalEnabled()) return null;
   const intent = parseApprovalIntent(prompt);
   // An intent carrying an apr- id is a registry approval, not a plan approval.
   if (!intent || intent.approvalId) return null;
-  const entry = getOrHydrateChannelSession(channelId);
+  const entry = getOrHydrateChannelSession(channelId, channel);
   if (!entry) return null;
   let pending: ReturnType<typeof listPlanProposals>;
   try {
@@ -990,31 +1000,32 @@ export function maybeResolvePendingPlanProposal(channelId: string, prompt: strin
 function approvalBelongsToDiscordChannel(
   row: approvalRegistry.PendingApprovalRow,
   channelId: string,
+  channel: string = 'discord',
 ): boolean {
-  if (!isDiscordApproval(row)) return false;
+  if (!isDiscordApproval(row, channel)) return false;
   if (!approvalRegistry.isActionable(row)) return false;
   if (row.channelId) return row.channelId === channelId;
 
   // Legacy rows created before channel_id was populated may still be
   // valid, but only if they are the currently-hydrated paused session
   // for this channel. This keeps pre-migration approvals usable
-  // without letting old approvals from another Discord thread bleed in.
-  const entry = getOrHydrateChannelSession(channelId);
+  // without letting old approvals from another thread bleed in.
+  const entry = getOrHydrateChannelSession(channelId, channel);
   return entry?.sessionId === row.sessionId;
 }
 
-function pendingDiscordApprovalsForChannel(channelId: string): approvalRegistry.PendingApprovalRow[] {
+function pendingDiscordApprovalsForChannel(channelId: string, channel: string = 'discord'): approvalRegistry.PendingApprovalRow[] {
   return approvalRegistry
     .listPending({ status: 'pending' })
-    .filter((row) => approvalBelongsToDiscordChannel(row, channelId));
+    .filter((row) => approvalBelongsToDiscordChannel(row, channelId, channel));
 }
 
-function globalApprovalRowsForDm(channelId: string): approvalRegistry.PendingApprovalRow[] {
+function globalApprovalRowsForDm(channelId: string, channel: string = 'discord'): approvalRegistry.PendingApprovalRow[] {
   return approvalRegistry
     .listPending({ status: 'pending' })
     .filter((row) => {
       if (!approvalRegistry.isActionable(row)) return false;
-      if (!isDiscordApproval(row)) return true;
+      if (!isDiscordApproval(row, channel)) return true;
       return row.channelId === channelId;
     });
 }
@@ -1084,7 +1095,11 @@ export async function tryHandleHarnessApprovalReply(opts: {
   prompt: string;
   transport: DiscordHarnessTransport;
   allowGlobalApprovalFallback?: boolean;
+  /** Originating chat channel (default 'discord'). Slack passes 'slack' so
+   *  approval matching + resume target the right channel's sessions. */
+  channel?: string;
 }): Promise<boolean> {
+  const channel = opts.channel ?? 'discord';
   const intent = parseApprovalIntent(opts.prompt);
   if (!intent) return false;
   // T-WF-1 addendum: when the user types `approve apr-xxxx`, the
@@ -1103,23 +1118,24 @@ export async function tryHandleHarnessApprovalReply(opts: {
     const row = approvalRegistry.get(intent.approvalId);
     if (row && row.status === 'pending') {
       if (approvalRegistry.isExpired(row)) {
-        approvalRegistry.resolve(row.approvalId, 'expired', 'discord-user');
+        approvalRegistry.resolve(row.approvalId, 'expired', `${channel}-user`);
         await opts.transport.sendError(`Approval \`${row.approvalId}\` has expired. Re-ask and I'll redo that work.`);
         return true;
       }
-      const canResumeInDiscord = approvalBelongsToDiscordChannel(row, opts.channelId);
-      if (canResumeInDiscord && isChannelSessionAwaitingApproval(opts.channelId)) {
+      const canResumeInDiscord = approvalBelongsToDiscordChannel(row, opts.channelId, channel);
+      if (canResumeInDiscord && isChannelSessionAwaitingApproval(opts.channelId, channel)) {
         await runDiscordHarnessResume({
           channelId: opts.channelId,
           decision: intent.decision,
           approvalId: intent.approvalId,
           transport: opts.transport,
+          channel,
         });
         return true;
       }
 
-      if (isDiscordApproval(row)) {
-        await opts.transport.sendError(`Approval \`${row.approvalId}\` belongs to a different or stale Discord conversation.`);
+      if (isDiscordApproval(row, channel)) {
+        await opts.transport.sendError(`Approval \`${row.approvalId}\` belongs to a different or stale conversation.`);
         return true;
       }
 
@@ -1131,12 +1147,13 @@ export async function tryHandleHarnessApprovalReply(opts: {
           approvalId: intent.approvalId,
           transport: opts.transport,
           allowDetachedNonDiscord: true,
+          channel,
         });
         return true;
       }
 
       const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
-      const result = approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
+      const result = approvalRegistry.resolve(row.approvalId, resolution, `${channel}-user`);
       try {
         await opts.transport.sendInitial(
           result.ok
@@ -1148,22 +1165,23 @@ export async function tryHandleHarnessApprovalReply(opts: {
     }
   }
   if (opts.allowGlobalApprovalFallback) {
-    const rows = globalApprovalRowsForDm(opts.channelId);
+    const rows = globalApprovalRowsForDm(opts.channelId, channel);
     if (rows.length === 1) {
       const row = rows[0];
       const detachedSession = HarnessSession.load(row.sessionId);
-      if (!isDiscordApproval(row) && row.channel !== 'workflow' && detachedSession?.loadInterruptState()) {
+      if (!isDiscordApproval(row, channel) && row.channel !== 'workflow' && detachedSession?.loadInterruptState()) {
         await runDiscordHarnessResume({
           channelId: opts.channelId,
           decision: intent.decision,
           approvalId: row.approvalId,
           transport: opts.transport,
           allowDetachedNonDiscord: true,
+          channel,
         });
         return true;
       }
       const resolution = intent.decision === 'approve' ? 'approved' : 'rejected';
-      const result = approvalRegistry.resolve(row.approvalId, resolution, 'discord-user');
+      const result = approvalRegistry.resolve(row.approvalId, resolution, `${channel}-user`);
       try {
         await opts.transport.sendInitial(
           result.ok
@@ -1178,12 +1196,13 @@ export async function tryHandleHarnessApprovalReply(opts: {
       return true;
     }
   }
-  if (!isChannelSessionAwaitingApproval(opts.channelId)) return false;
+  if (!isChannelSessionAwaitingApproval(opts.channelId, channel)) return false;
   await runDiscordHarnessResume({
     channelId: opts.channelId,
     decision: intent.decision,
     approvalId: intent.approvalId,
     transport: opts.transport,
+    channel,
   });
   return true;
 }
@@ -1214,13 +1233,22 @@ export interface DiscordHarnessTransport {
    * cap, so the user sees the whole answer instead of `…obje…`.
    */
   sendFollowup?(content: string): Promise<void>;
+  /**
+   * Build the approval-button UI for the current display state, returning
+   * the channel-native component payload (or null when no approval is
+   * pending). When omitted, the runner falls back to Discord ActionRow
+   * components (approvalComponentsForState). Slack supplies this to emit
+   * Block Kit `actions` blocks instead. The returned array is passed
+   * straight to handle.edit({ components }).
+   */
+  buildApprovalComponents?(state: DisplayState): unknown[] | null;
 }
 
 export interface DiscordHarnessReplyHandle {
   edit(content: string, options?: { components?: unknown[] }): Promise<void>;
 }
 
-interface DisplayState {
+export interface DisplayState {
   summary: string;
   status: string;
   done: boolean;
@@ -1555,8 +1583,22 @@ export async function runDiscordHarnessConversation(opts: {
    * `prompt` when a caller doesn't fold attachments.
    */
   rawPrompt?: string;
+  /**
+   * Chat-channel kind for this conversation (default 'discord'). Slack passes
+   * 'slack' so sessions, continuity, approvals, durable tasks, and the agentic
+   * brain surface are all attributed to Slack. Defaults preserve byte-identical
+   * Discord behavior.
+   */
+  channel?: string;
+  /**
+   * Routing label used for continuity/durable/plan-first channel keys
+   * (default `discord:${channelId}`). Slack passes `slack:${channelId}`.
+   */
+  channelLabel?: string;
 }): Promise<void> {
   const { channelId, userId, guildId, transport } = opts;
+  const channel = opts.channel ?? 'discord';
+  const channelLabel = opts.channelLabel ?? `${channel}:${channelId}`;
   // `prompt` is `let` (not destructured const) because the /continue
   // command path rewrites it from the bare "continue" the user typed
   // into a structured continuation directive the orchestrator can
@@ -1580,11 +1622,11 @@ export async function runDiscordHarnessConversation(opts: {
   // "resolving" the action).
   const command = parseHarnessCommand(prompt);
   if (command === 'cancel') {
-    await handleHarnessCancel({ channelId, transport });
+    await handleHarnessCancel({ channelId, transport, channel });
     return;
   }
   if (command === 'new') {
-    await handleHarnessNew({ channelId, transport });
+    await handleHarnessNew({ channelId, transport, channel });
     // Fall through is intentional — /new just clears the
     // channel-cached session; the rest of this function then creates
     // a fresh one. But the user's actual prompt was "/new", not
@@ -1593,7 +1635,7 @@ export async function runDiscordHarnessConversation(opts: {
     return;
   }
   if (command === 'sessions') {
-    await handleHarnessSessions({ channelId, userId, guildId, transport });
+    await handleHarnessSessions({ channelId, userId, guildId, transport, channel });
     return;
   }
   if (command === 'continue') {
@@ -1603,7 +1645,7 @@ export async function runDiscordHarnessConversation(opts: {
     // may still carry limit_exceeded. Rewrite only those cases into a
     // structured continuation directive; otherwise leave `continue` as
     // a regular user message.
-    const entry = getOrHydrateChannelSession(channelId);
+    const entry = getOrHydrateChannelSession(channelId, channel);
     if (entry) {
       const lastCompletion = readLastConversationCompletion(entry.sessionId);
       if (lastCompletion && isContinueCompletionReason(lastCompletion.reason)) {
@@ -1617,7 +1659,7 @@ export async function runDiscordHarnessConversation(opts: {
   // approval and continue THAT session instead of starting fresh.
   // Anything else while paused is treated as a regular new turn
   // (which will append on top of the existing session via continuity).
-  if (isChannelSessionAwaitingApproval(channelId)) {
+  if (isChannelSessionAwaitingApproval(channelId, channel)) {
     const intent = parseApprovalIntent(prompt);
     if (intent) {
       await runDiscordHarnessResume({
@@ -1625,6 +1667,7 @@ export async function runDiscordHarnessConversation(opts: {
         decision: intent.decision,
         approvalId: intent.approvalId,
         transport,
+        channel,
       });
       return;
     }
@@ -1636,14 +1679,14 @@ export async function runDiscordHarnessConversation(opts: {
   // pending plan. Resolve it, then re-engage the SAME turn with a clear
   // directive so Clem proceeds with the now-active goal (approvePlanProposal
   // activated it + opened its scope).
-  const planConsent = maybeResolvePendingPlanProposal(channelId, prompt);
+  const planConsent = maybeResolvePendingPlanProposal(channelId, prompt, channel);
   if (planConsent === 'approved') {
     prompt = 'Plan approved — proceed with the plan now, and report back when done.';
   } else if (planConsent === 'rejected') {
     prompt = 'I rejected that plan. Do NOT proceed with it — ask me what to change.';
   }
 
-  const session = resolveOrCreateSession({ channelId, userId, guildId, prompt });
+  const session = resolveOrCreateSession({ channelId, userId, guildId, prompt, channel });
   const autonomy = loadProactivityPolicy().autoApproveScope;
   const planFirst = shouldUsePlanFirst({ input: prompt, freshSession: !session.isContinuation, autonomy });
 
@@ -1743,7 +1786,7 @@ export async function runDiscordHarnessConversation(opts: {
       return;
     }
     try {
-      const components = approvalComponentsForState(state);
+      const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
       const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
       if (components || needsUpdate) {
         // Pass components (or an empty array when we need to clear
@@ -1795,7 +1838,7 @@ export async function runDiscordHarnessConversation(opts: {
     await refreshPendingApprovalDisplay(state, session.id);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
-    const components = approvalComponentsForState(state);
+    const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
     const needsComponentUpdate = state.pendingApprovalId !== lastAttachedApprovalId || !!components;
 
     // Token-expired path: skip handle.edit entirely and route the full
@@ -1977,7 +2020,7 @@ export async function runDiscordHarnessConversation(opts: {
         goalRunInput = outcome.runInput;
       }
       {
-        const channelKey = `discord:${channelId}`;
+        const channelKey = channelLabel;
         const continuity = await routeOpenQuestionPlan({
           channel: channelKey,
           input: prompt,
@@ -1999,12 +2042,12 @@ export async function runDiscordHarnessConversation(opts: {
       // Decide on the RAW text (not folded attachments); enqueue the FULL
       // `prompt`. Skip when the session is paused on an approval so a stray
       // durable phrase can't orphan an in-flight gated workflow.
-      if (!goalRunInput && !isChannelSessionAwaitingApproval(channelId) && shouldPromoteToDurable(rawPromptForIntent)) {
+      if (!goalRunInput && !isChannelSessionAwaitingApproval(channelId, channel) && shouldPromoteToDurable(rawPromptForIntent)) {
         const task = enqueueDurableChatTask({
           message: prompt,
           sessionId: session.id,
-          channel: `discord:${channelId}`,
-          source: 'discord',
+          channel: channelLabel,
+          source: channel as 'discord' | 'slack',
         });
         const queuedReply = renderDurableTaskQueued(task);
         appendHarnessEvent({
@@ -2026,7 +2069,7 @@ export async function runDiscordHarnessConversation(opts: {
         const preflight = await runPlanFirstPreflight({
           input: prompt,
           sessionId: session.id,
-          channel: `discord:${channelId}`,
+          channel: channelLabel,
           freshSession: !session.isContinuation,
           autonomy,
           onChunk,
@@ -2042,11 +2085,11 @@ export async function runDiscordHarnessConversation(opts: {
       // identically to runConversation (the brain is the single terminal-event
       // emitter, so we do NOT also flush — no double-render). Flag off ⇒ the
       // harness path is byte-identical. Kill-switch = set the brain flag off.
-      if (claudeAgentSdkBrainEnabled('discord')) {
-        await respondViaClaudeAgentSdkBrain('discord', {
+      if (claudeAgentSdkBrainEnabled(channel)) {
+        await respondViaClaudeAgentSdkBrain(channel as Parameters<typeof respondViaClaudeAgentSdkBrain>[0], {
           message: effectiveInput,
           sessionId: session.id,
-          channel: `discord:${channelId}`,
+          channel: channelLabel,
           userId,
           // Live streaming: the brain emits PLAIN prose (not the {reply,objective,
           // action} JSON the Codex field-streamer parses), so accumulate raw deltas
@@ -2101,8 +2144,10 @@ async function runDiscordHarnessResume(opts: {
   approvalId?: string;
   transport: DiscordHarnessTransport;
   allowDetachedNonDiscord?: boolean;
+  channel?: string;
 }): Promise<void> {
   const { channelId, decision, approvalId, transport } = opts;
+  const channel = opts.channel ?? 'discord';
 
   // Configure the codex bridge BEFORE driving the SDK runner. The
   // resume path can be the first thing the daemon does after a
@@ -2142,25 +2187,25 @@ async function runDiscordHarnessResume(opts: {
       return;
     }
     if (approvalRegistry.isExpired(row)) {
-      approvalRegistry.resolve(row.approvalId, 'expired', 'discord-user');
+      approvalRegistry.resolve(row.approvalId, 'expired', `${channel}-user`);
       await transport.sendError(`Approval \`${approvalId}\` has expired. Re-ask and I'll redo that work.`);
       return;
     }
-    if (!approvalBelongsToDiscordChannel(row, channelId)) {
-      if (opts.allowDetachedNonDiscord && !isDiscordApproval(row) && row.channel !== 'workflow') {
+    if (!approvalBelongsToDiscordChannel(row, channelId, channel)) {
+      if (opts.allowDetachedNonDiscord && !isDiscordApproval(row, channel) && row.channel !== 'workflow') {
         sessionId = row.sessionId;
       } else {
-        // Cross-channel approvals are intentionally blocked for Discord
-        // sessions. Workflow approvals are resolved by
+        // Cross-channel approvals are intentionally blocked for interactive
+        // chat sessions. Workflow approvals are resolved by
         // tryHandleHarnessApprovalReply before this resume helper runs.
-        await transport.sendError(`Approval \`${approvalId}\` belongs to a different or stale Discord conversation.`);
+        await transport.sendError(`Approval \`${approvalId}\` belongs to a different or stale conversation.`);
         return;
       }
     } else {
       sessionId = row.sessionId;
     }
   } else {
-    const pendingOnChannel = pendingDiscordApprovalsForChannel(channelId);
+    const pendingOnChannel = pendingDiscordApprovalsForChannel(channelId, channel);
     const distinctSessions = [...new Set(pendingOnChannel.map((r) => r.sessionId))];
     const fallback = channelSessions.get(channelId);
     if (distinctSessions.length > 1) {
@@ -2253,7 +2298,7 @@ async function runDiscordHarnessResume(opts: {
     pendingEdit = null;
     lastEditAt = Date.now();
     try {
-      const components = approvalComponentsForState(state);
+      const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
       const needsUpdate = state.pendingApprovalId !== lastAttachedApprovalId;
       if (components || needsUpdate) {
         await handle.edit(renderBody(state), { components: components ?? [] });
@@ -2275,7 +2320,7 @@ async function runDiscordHarnessResume(opts: {
     await refreshPendingApprovalDisplay(state, sessionId);
     const fullBody = renderFullBody(state);
     const chunks = splitForLongReply(fullBody);
-    const components = approvalComponentsForState(state);
+    const components = transport.buildApprovalComponents?.(state) ?? approvalComponentsForState(state);
     const needsComponentUpdate = state.pendingApprovalId !== lastAttachedApprovalId || !!components;
     try {
       if (needsComponentUpdate) {

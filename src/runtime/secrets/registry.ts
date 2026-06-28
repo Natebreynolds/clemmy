@@ -30,6 +30,30 @@ async function probeBearer(url: string, key: string, authStyle: 'bearer' | 'x-ap
   }
 }
 
+// Slack auth.test returns HTTP 200 with { ok: false, error } for a bad token
+// (it does not use 401/403), so probeBearer can't judge it. This checks the
+// JSON `ok` field instead. Network/parse failures → unknown (save-through).
+async function probeSlackAuth(key: string): Promise<SecretValidationResult> {
+  const trimmed = key.trim();
+  if (!trimmed) return { result: 'invalid', message: 'Empty value.' };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const res = await fetch('https://slack.com/api/auth.test', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${trimmed}`, accept: 'application/json' },
+      signal: controller.signal,
+    });
+    const body = await res.json() as { ok?: boolean; error?: string };
+    if (body?.ok) return { result: 'valid' };
+    return { result: 'invalid', message: `Slack rejected token (${body?.error ?? 'auth_failed'}).` };
+  } catch (err) {
+    return { result: 'unknown', message: `Could not reach Slack to validate (${err instanceof Error ? err.message : String(err)}); saved without confirmation.` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /**
  * The canonical registry of credentials this project recognizes.
  *
@@ -62,6 +86,21 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     envVarName: 'DISCORD_BOT_TOKEN',
     required: false,
     setupHint: 'Create a bot at https://discord.com/developers/applications and copy its token.',
+  },
+  {
+    name: 'slack_bot_token',
+    description: 'Slack bot token (xoxb-) — lets Clementine read & reply in Slack DMs and channels.',
+    envVarName: 'SLACK_BOT_TOKEN',
+    required: false,
+    setupHint: 'In your Slack app: OAuth & Permissions → Bot User OAuth Token. Starts with xoxb-.',
+    validate: (value) => probeSlackAuth(value),
+  },
+  {
+    name: 'slack_app_token',
+    description: 'Slack app-level token (xapp-) — enables Socket Mode so Clementine receives messages with no public URL.',
+    envVarName: 'SLACK_APP_TOKEN',
+    required: false,
+    setupHint: 'In your Slack app: Basic Information → App-Level Tokens → Generate, scope connections:write. Starts with xapp-.',
   },
   {
     name: 'composio_api_key',

@@ -1,7 +1,16 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { BASE_DIR, DISCORD_BOT_TOKEN, DISCORD_DM_ALLOWED_USERS, DISCORD_ENABLED } from '../config.js';
+import {
+  BASE_DIR,
+  DISCORD_BOT_TOKEN,
+  DISCORD_DM_ALLOWED_USERS,
+  DISCORD_ENABLED,
+  SLACK_ALLOWED_USERS,
+  SLACK_BOT_TOKEN,
+  SLACK_ENABLED,
+  SLACK_PROACTIVE_CHANNEL,
+} from '../config.js';
 import { actionBus } from './action-bus.js';
 
 /**
@@ -122,7 +131,7 @@ export interface NotificationRecord {
 export interface NotificationDestination {
   id: string;
   name: string;
-  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'web_push';
+  type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'slack_webhook' | 'slack_channel' | 'slack_user' | 'web_push';
   url?: string;
   channelId?: string;
   guildId?: string;
@@ -617,6 +626,8 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
   const metadata = notification.metadata ?? {};
   const explicitDiscordUserId = typeof metadata.discordUserId === 'string' ? metadata.discordUserId : '';
   const explicitDiscordChannelId = typeof metadata.discordChannelId === 'string' ? metadata.discordChannelId : '';
+  const explicitSlackUserId = typeof metadata.slackUserId === 'string' ? metadata.slackUserId : '';
+  const explicitSlackChannelId = typeof metadata.slackChannelId === 'string' ? metadata.slackChannelId : '';
 
   const derived: NotificationDestination[] = [];
   if (explicitDiscordUserId) {
@@ -639,6 +650,40 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
       createdAt: notification.createdAt,
     });
   }
+  if (explicitSlackUserId) {
+    derived.push({
+      id: `derived-slack-user:${explicitSlackUserId}`,
+      name: `Slack User ${explicitSlackUserId}`,
+      type: 'slack_user',
+      userId: explicitSlackUserId,
+      enabled: true,
+      createdAt: notification.createdAt,
+    });
+  }
+  if (explicitSlackChannelId) {
+    derived.push({
+      id: `derived-slack-channel:${explicitSlackChannelId}`,
+      name: `Slack Channel ${explicitSlackChannelId}`,
+      type: 'slack_channel',
+      channelId: explicitSlackChannelId,
+      enabled: true,
+      createdAt: notification.createdAt,
+    });
+  }
+  // Proactive posts: when a default Slack channel is configured, mirror
+  // non-silent notifications into it (the "both: chat + proactive posts"
+  // surface). Approval/check-in cards still route to the originating user/
+  // channel above; this is the broadcast lane for briefs + surfaced items.
+  if (SLACK_ENABLED && SLACK_BOT_TOKEN && SLACK_PROACTIVE_CHANNEL && !notification.silent) {
+    derived.push({
+      id: `derived-slack-proactive:${SLACK_PROACTIVE_CHANNEL}`,
+      name: `Slack proactive channel`,
+      type: 'slack_channel',
+      channelId: SLACK_PROACTIVE_CHANNEL,
+      enabled: true,
+      createdAt: notification.createdAt,
+    });
+  }
 
   // Fallback: if nothing else routes this notification, ship it to the
   // primary allowlisted Discord DM user. Only fires when Discord is
@@ -655,6 +700,23 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
       name: `Discord DM (allowlist primary)`,
       type: 'discord_user',
       userId: DISCORD_DM_ALLOWED_USERS[0],
+      enabled: true,
+      createdAt: notification.createdAt,
+    });
+  }
+
+  // Same fallback for Slack: when nothing else routes this AND Slack is the
+  // configured chat surface, DM the primary allowlisted Slack user so cron /
+  // background output set up from Slack reports back into Slack.
+  if (combined.length === 0
+      && SLACK_ENABLED
+      && SLACK_BOT_TOKEN
+      && SLACK_ALLOWED_USERS.length > 0) {
+    combined.push({
+      id: `fallback-slack-user:${SLACK_ALLOWED_USERS[0]}`,
+      name: `Slack DM (allowlist primary)`,
+      type: 'slack_user',
+      userId: SLACK_ALLOWED_USERS[0],
       enabled: true,
       createdAt: notification.createdAt,
     });

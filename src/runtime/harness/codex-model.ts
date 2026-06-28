@@ -55,6 +55,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
 import { restoreLegacyInstructionOrder } from './model-wire-registry.js';
+import { recordCodexRateLimit } from './rate-limit-store.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.codex-model' });
@@ -790,6 +791,10 @@ export class CodexResponsesModel implements Model {
         diag.responseHeaders = collectDiagnosticHeaders(res.headers);
         diag.firstByteTs = Date.now();
       }
+      // Best-effort capture of the ChatGPT-plan 5h/weekly quota windows for the
+      // desktop status bar (x-codex-primary/secondary-*). No-op + keeps last-known
+      // when the headers are dropped (the streaming case); never throws.
+      recordCodexRateLimit(res.headers);
 
       if (!res.ok) {
         const detail = await safeReadErrorBody(res);

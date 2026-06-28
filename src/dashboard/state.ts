@@ -7,6 +7,7 @@ import { listNotificationDestinations, listNotifications, listQueuedNotification
 import { getWorkspaceDirs, listWorkspaceProjects, loadTeamAgents } from '../tools/shared.js';
 import { countDiscordSessions, listDiscordSessions } from '../channels/discord-store.js';
 import { getDiscordRuntimeStatus } from '../channels/discord.js';
+import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
 import { listAgentInboxCounts, listAgentStates } from '../agents/agent-state.js';
 import { getConfiguredDiscordInstallInfo } from '../channels/discord-install.js';
@@ -186,6 +187,7 @@ export async function buildDashboardSnapshot() {
       ...getConfiguredDiscordInstallInfo(),
       ...getDiscordRuntimeStatus(),
     },
+    slack: getSlackRuntimeStatus(),
     auth: getAuthStatus(),
     agentStates: listAgentStates(),
     agentInboxCounts: listAgentInboxCounts(),

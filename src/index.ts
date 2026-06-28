@@ -3,9 +3,11 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { execSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import pino from 'pino';
-import { ASSISTANT_NAME, BASE_DIR, DISCORD_ENABLED, WEBHOOK_ENABLED } from './config.js';
+import { ASSISTANT_NAME, BASE_DIR, DISCORD_ENABLED, SLACK_ENABLED, WEBHOOK_ENABLED } from './config.js';
 import { ClementineAssistant } from './assistant/core.js';
 import { startDiscordBot } from './channels/discord.js';
+import { startSlackBot } from './channels/slack.js';
+import { SLACK_APP_MANIFEST_YAML } from './channels/slack-manifest.js';
 import { startWebhookServer } from './channels/webhook.js';
 import { startChatCli } from './cli/chat.js';
 import { startDaemon } from './daemon/runner.js';
@@ -398,6 +400,17 @@ async function main(): Promise<void> {
     }
   }
 
+  if (command === 'slack') {
+    const subcommand = process.argv[3] ?? '';
+    if (subcommand === 'scopes' || subcommand === 'manifest') {
+      console.log(SLACK_APP_MANIFEST_YAML);
+      console.log('\nCreate the app: https://api.slack.com/apps?new_app=1 → "From a manifest" → paste the above.');
+      console.log('Then: Install to Workspace → copy the Bot token (xoxb-) and App-level token (xapp-, scope connections:write)');
+      console.log('into the Clementine dashboard (Connect → Slack), and /invite @Clementine to any channel you want it in.');
+      return;
+    }
+  }
+
   // --- Auth ---
   if (command === 'auth') {
     const subcommand = process.argv[3] ?? 'status';
@@ -462,6 +475,7 @@ async function main(): Promise<void> {
       const assistant = new ClementineAssistant(createRuntimeFromConfig());
       if (WEBHOOK_ENABLED) await startWebhookServer(assistant);
       if (DISCORD_ENABLED) await startDiscordBot(assistant);
+      if (SLACK_ENABLED) await startSlackBot(assistant);
       await startDaemon(assistant);
       return;
     }
@@ -539,6 +553,11 @@ async function main(): Promise<void> {
     await new Promise(() => undefined);
     return;
   }
+  if (command === 'slack') {
+    await startSlackBot(assistant);
+    await new Promise(() => undefined);
+    return;
+  }
   if (command === 'service') {
     // Idempotent home scaffold — creates SOUL.md / MEMORY.md / cron
     // jobs / working-memory / example workflow if they don't already
@@ -560,6 +579,11 @@ async function main(): Promise<void> {
       await startDiscordBot(assistant);
     } else {
       logger.info('Skipping Discord bot (DISCORD_ENABLED=false)');
+    }
+    if (SLACK_ENABLED) {
+      await startSlackBot(assistant);
+    } else {
+      logger.info('Skipping Slack bot (SLACK_ENABLED=false)');
     }
     writeDaemonPid(process.pid);
     registerShutdownHandlers(async () => { clearDaemonPid(); });

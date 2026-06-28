@@ -82,7 +82,7 @@ export interface AuthStatusLite { mode?: string; configured?: boolean; codexOaut
 export const CODEX_MANAGED_SECRETS = new Set(['codex_oauth_access_token', 'codex_oauth_refresh_token']);
 
 export const getCredentials = () =>
-  apiGet<{ rows?: unknown; descriptors?: Record<string, CredentialDescriptor>; discordAllowedUsers?: string; auth?: AuthStatusLite }>('/api/console/credentials');
+  apiGet<{ rows?: unknown; descriptors?: Record<string, CredentialDescriptor>; discordAllowedUsers?: string; slackAllowedUsers?: string; auth?: AuthStatusLite }>('/api/console/credentials');
 
 // ─── Codex re-auth — the SAME proven daemon endpoints the legacy console uses ──
 // Local: opens a browser + loopback callback on the daemon (desktop only).
@@ -96,6 +96,13 @@ export const codexDevicePoll = (loginId: string) =>
   apiPost<{ status?: 'complete' | 'pending' | 'expired'; message?: string; error?: string }>('/api/console/auth/codex-device/poll', { loginId });
 export const setDiscordOwner = (ownerId: string) =>
   apiPost<{ ok: boolean; discordAllowedUsers?: string; appliesOnRestart?: boolean }>('/api/console/credentials/discord-owner', { ownerId });
+export const setSlackOwner = (ownerId: string) =>
+  apiPost<{ ok: boolean; slackAllowedUsers?: string; appliesOnRestart?: boolean }>('/api/console/credentials/slack-owner', { ownerId });
+export interface SlackStatus {
+  enabled?: boolean; connected?: boolean; listening?: boolean;
+  botUserId?: string; teamName?: string; startedAt?: string; manifest?: string;
+}
+export const getSlackStatus = () => apiGet<SlackStatus>('/api/console/slack/status');
 export const getMcpServers = () => apiGet<{ servers?: McpServer[] }>('/api/console/mcp-servers');
 
 export interface McpServerInput {

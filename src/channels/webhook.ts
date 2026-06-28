@@ -104,6 +104,12 @@ function isDiscordHarnessSession(session: HarnessSessionRow): boolean {
     || session.metadata.source === 'discord';
 }
 
+function isSlackHarnessSession(session: HarnessSessionRow): boolean {
+  return session.channel === 'slack'
+    || session.channel === 'slack-dm'
+    || session.metadata.source === 'slack';
+}
+
 // A workflow runs each step in its own harness session (see
 // getWorkflowHarnessSession in workflow-runner.ts: id `workflow:<suffix>`,
 // title `<workflow>::<stepId>`, metadata.workflowRunId+stepId). Those are
@@ -124,13 +130,16 @@ function isActivityVisibleHarnessSession(session: HarnessSessionRow): boolean {
     || session.status === 'active'
     || session.status === 'paused'
     || isDiscordHarnessSession(session)
+    || isSlackHarnessSession(session)
     || session.channel === 'workflow'
     || session.metadata.source === 'workflow'
     || session.metadata.source === 'desktop';
 }
 
 function harnessSource(session: HarnessSessionRow) {
-  return isDiscordHarnessSession(session) ? 'discord' : 'daemon';
+  if (isDiscordHarnessSession(session)) return 'discord';
+  if (isSlackHarnessSession(session)) return 'slack';
+  return 'daemon';
 }
 
 // Friendly per-event phrasing lives in the shared activity-format module so it

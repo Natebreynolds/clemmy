@@ -2,6 +2,7 @@ import { PanelLeftClose, PanelLeft, Search, Mic } from 'lucide-react';
 import { Button } from './ui/Button';
 import { ThemeToggle } from './ThemeToggle';
 import { HealthIndicator } from './HealthIndicator';
+import { ModelStatusChips } from './ModelStatusChips';
 import { cn } from '@/lib/cn';
 
 const modKey = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl';
@@ -31,6 +32,8 @@ export function TopBar({
       </Button>
 
       <h1 className="truncate text-h3 font-semibold text-fg">{title}</h1>
+
+      <ModelStatusChips />
 
       <div className="ml-auto flex items-center gap-1.5">
         <button

@@ -104,3 +104,16 @@ test('listInbound filters by status', () => {
 test('getInbound returns undefined for unknown row', () => {
   assert.equal(getInbound('discord:c', 'never-seen'), undefined);
 });
+
+test('Slack channel label dedups a redelivered message ts (Events-API retry)', () => {
+  // Slack retries event delivery on timeout; claimInbound is what stops the
+  // duplicate from being processed twice. Same (channel, ts) → no reprocess
+  // once replied.
+  const first = claimInbound({ channel: 'slack:C123', sourceMessageId: '1700000000.000100', userId: 'U1' });
+  assert.equal(first.isNew, true);
+  assert.equal(first.shouldProcess, true);
+  completeInbound({ channel: 'slack:C123', sourceMessageId: '1700000000.000100', status: 'replied' });
+  const retry = claimInbound({ channel: 'slack:C123', sourceMessageId: '1700000000.000100', userId: 'U1' });
+  assert.equal(retry.isNew, false);
+  assert.equal(retry.shouldProcess, false, 'a redelivered Slack ts must not be reprocessed');
+});
