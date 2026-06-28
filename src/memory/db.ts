@@ -1,7 +1,14 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, unlinkSync, readdirSync, statSync, statfsSync, copyFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { BASE_DIR } from '../config.js';
+
+// The real default home (~/.clementine-next). A full memory-DB reset against THIS
+// permanently destroys the user's long-term memory (facts/entities/embeddings are
+// not rebuildable). Tests and sandboxes always point CLEMENTINE_HOME at a temp
+// dir, so their BASE_DIR differs and they are never blocked.
+const REAL_DEFAULT_HOME = path.join(os.homedir(), '.clementine-next');
 
 /**
  * SQLite-backed memory index for the markdown vault.
@@ -680,6 +687,33 @@ export function closeMemoryDb(): void {
 }
 
 /**
+ * Guard for {@link resetMemoryDb}. Throws if a full destructive reset is aimed at
+ * the REAL default home without an explicit `force`. Extracted as a pure function
+ * (baseDir injected) so it's unit-testable without touching the live DB.
+ *
+ * Rationale (2026-06-28 incident): an ad-hoc script that forgot to set
+ * CLEMENTINE_HOME defaulted to ~/.clementine-next and `resetMemoryDb()` wiped the
+ * user's real facts. Tests/sandboxes set CLEMENTINE_HOME to a temp dir, so their
+ * baseDir ≠ realDefaultHome and they pass freely. `clementine doctor`-style
+ * deliberate resets pass `force: true`.
+ */
+export function assertMemoryResetAllowed(
+  baseDir: string,
+  force: boolean,
+  realDefaultHome: string = REAL_DEFAULT_HOME,
+): void {
+  if (!force && baseDir === realDefaultHome) {
+    throw new Error(
+      'resetMemoryDb refused: this would PERMANENTLY WIPE the real memory database at '
+      + `${path.join(baseDir, 'state', 'memory.db')} — consolidated_facts, entities, and `
+      + 'embeddings are NOT rebuildable. Set CLEMENTINE_HOME to a temp dir BEFORE importing '
+      + '(tests and sandboxes do this), or call resetMemoryDb({ force: true }) if you truly '
+      + 'intend to reset the live home.',
+    );
+  }
+}
+
+/**
  * Drop and re-open the memory DB. Used by tests and the `clementine doctor
  * --rebuild-index` path.
  *
@@ -691,8 +725,12 @@ export function closeMemoryDb(): void {
  * unless a `backupMemoryDb` snapshot is restored first (see
  * {@link restoreMemoryDb}). Callers that only want the rebuildable index
  * should reindex the vault, not reset the whole DB.
+ *
+ * GUARDED: refuses to wipe the real default home unless `{ force: true }` — see
+ * {@link assertMemoryResetAllowed}.
  */
-export function resetMemoryDb(): void {
+export function resetMemoryDb(opts: { force?: boolean } = {}): void {
+  assertMemoryResetAllowed(BASE_DIR, opts.force ?? false);
   closeMemoryDb();
   for (const suffix of ['', '-wal', '-shm']) {
     const file = MEMORY_DB_PATH + suffix;
