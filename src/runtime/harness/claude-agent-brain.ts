@@ -364,7 +364,7 @@ export function renderClaudeAgentBrainSystemAppend(
   request: AssistantRequest,
   mode: ClaudeAgentBrainMode = claudeAgentSdkBrainMode() ?? 'read_only',
 ): string {
-  const persistentContext = renderHarnessMemoryContext({ sessionId: request.sessionId });
+  const persistentContext = renderHarnessMemoryContext({ sessionId: request.sessionId, query: request.message });
   const spaceSlug = workspaceSlugFromSessionId(request.sessionId);
   const workspacePrimer = spaceSlug ? buildWorkspaceContextPrimer(spaceSlug) : null;
   return [

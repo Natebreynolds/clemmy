@@ -26,7 +26,8 @@
  * snapshot.
  */
 import { loadMemoryContext } from '../memory/vault.js';
-import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, listConstraints } from '../memory/facts.js';
+import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, listConstraints, searchFactsByText } from '../memory/facts.js';
+import { getRuntimeEnv } from '../config.js';
 import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
 import { renderSkillsIndex } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
@@ -252,7 +253,14 @@ function renderHeldTasks(sessionId?: string): string {
   }
 }
 
-export function renderHarnessMemoryContext(opts?: { sessionId?: string }): string {
+// Query-driven recall: how many request-relevant facts to surface. Parity with
+// the main harness loop's per-turn memory primer.
+const QUERY_RECALL_LIMIT = 6;
+function queryRecallEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: string }): string {
   let memContext;
   try {
     memContext = loadMemoryContext();
@@ -312,6 +320,23 @@ export function renderHarnessMemoryContext(opts?: { sessionId?: string }): strin
 
   const constraints = renderActiveConstraints();
 
+  // Query-driven recall (parity with the main harness loop's buildTurnMemoryPrimer):
+  // surface the consolidated facts MOST RELEVANT to the user's CURRENT message. A
+  // brain that runs on this self-assembled context (the Claude Agent SDK lane) only
+  // got the GENERAL top-N "Persistent Facts" block, so it was blind to request-
+  // specific knowledge — e.g. "market leader = Account.Market_Leader__c is true" —
+  // and rediscovered it via tool thrash (2026-06-29). Recall it up front so the brain
+  // KNOWS instead of relearning. Caller passes the user's message; kill-switch
+  // CLEMMY_BRAIN_QUERY_RECALL. Empty query / flag off ⇒ '' (byte-identical).
+  let requestRecall = '';
+  const recallQuery = (opts?.query ?? '').replace(/\s+/g, ' ').trim();
+  if (recallQuery && queryRecallEnabled()) {
+    try {
+      const hits = searchFactsByText(recallQuery, QUERY_RECALL_LIMIT);
+      if (hits.length > 0) requestRecall = hits.map((f) => `- ${String(f.content ?? '').trim()}`).filter((l) => l.length > 2).join('\n');
+    } catch { requestRecall = ''; }
+  }
+
   const blocks = [
     // Current date/time goes FIRST so the model reads it before any
     // other context. Without this the model defaults to its training
@@ -319,6 +344,7 @@ export function renderHarnessMemoryContext(opts?: { sessionId?: string }): strin
     section('Now', nowLine),
     section('Autonomy', renderAutonomy()),
     section('Standing Constraints', constraints),
+    section('Relevant To Your Request', requestRecall),
     section('User Preferences', profile),
     section('Persistent Facts', facts),
     recentlyLearned,

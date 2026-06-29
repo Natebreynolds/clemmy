@@ -16,6 +16,34 @@ const { resetMemoryDb } = await import('../memory/db.js');
 const { createFocus } = await import('../memory/focus.js');
 const { renderHarnessMemoryContext } = await import('./harness-context.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
+const { rememberFact } = await import('../memory/facts.js');
+
+test('query-driven recall: a request-relevant fact is surfaced UP FRONT for a matching message (never knowledge-starve the brain)', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'project', content: 'The daily-prospect-outreach workflow targets Salesforce Accounts owned by Nathan Reynolds where Market_Leader__c is true and a usable website exists.' });
+  // The Claude SDK lane passes the user's message → the matching fact is recalled
+  // into its own section instead of the model rediscovering the schema via tool thrash.
+  const ctx = renderHarnessMemoryContext({ query: 'pull 10 of my market leader accounts I have not touched in 15 days' });
+  assert.match(ctx, /## Relevant To Your Request/);
+  assert.match(ctx, /Market_Leader__c/);
+});
+
+test('query-driven recall: kill-switch off ⇒ no per-request recall section', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'project', content: 'Market_Leader__c is the Salesforce field marking market leader accounts.' });
+  process.env.CLEMMY_BRAIN_QUERY_RECALL = 'off';
+  try {
+    assert.doesNotMatch(renderHarnessMemoryContext({ query: 'market leader accounts' }), /## Relevant To Your Request/);
+  } finally {
+    delete process.env.CLEMMY_BRAIN_QUERY_RECALL;
+  }
+});
+
+test('query-driven recall: no query ⇒ no per-request recall section (byte-identical to before)', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts.' });
+  assert.doesNotMatch(renderHarnessMemoryContext({ sessionId: 's' }), /## Relevant To Your Request/);
+});
 
 test('Autonomy section: YOLO tells the model it has STANDING approval and not to seek sign-off', () => {
   saveProactivityPolicy({ autoApproveScope: 'yolo' });

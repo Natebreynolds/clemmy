@@ -21,7 +21,6 @@ import {
   extractDuplicateIdentityKeys,
   evaluateGrounding,
   detectDuplicateTarget,
-  markDuplicateWarned,
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
 } from './grounding-gate.js';
@@ -1161,8 +1160,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             }
           } catch { /* fail toward not-a-duplicate */ }
           const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: shape.shapeKey, targets: dupTargets, priorWrites });
-          if (dup.duplicate && dup.warnedKey) {
-            markDuplicateWarned(dup.warnedKey);
+          if (dup.duplicate) {
             try {
               appendEvent({
                 sessionId: ctx.sessionId,
@@ -1457,8 +1455,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               }
             } catch { /* fail toward not-a-duplicate */ }
             const dup = detectDuplicateTarget({ sessionId: ctx.sessionId, shapeKey: mutation.shapeKey, targets: dupTargets, priorWrites });
-            if (dup.duplicate && dup.warnedKey) {
-              markDuplicateWarned(dup.warnedKey);
+            if (dup.duplicate) {
               throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: mutation.shapeKey, target: dup.target ?? 'unknown' });
             }
           }

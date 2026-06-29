@@ -352,8 +352,13 @@ export class GroundingCheckFailedError extends Error {
 /** (session,shape,target) combos already warned once — the second attempt
  *  passes (conscious re-send after the model surfaced it / got user
  *  confirmation). A speed bump, not a wall. */
-const duplicateWarned = new Set<string>();
-export function _resetDuplicateStateForTests(): void { duplicateWarned.clear(); }
+// A duplicate irreversible send to a (shape, target) already written THIS session
+// is a HARD WALL, not a speed bump. The old "retry once and it passes" behavior let
+// a model re-run a stale send it picked up from conversation context — the
+// 2026-06-29 incident sent 3 client emails TWICE. The only way past this is the user
+// EXPLICITLY re-confirming a fresh send; the model can never self-bypass by retrying.
+// Stateless: a (shape, target) already in priorWrites is always a duplicate.
+export function _resetDuplicateStateForTests(): void { /* stateless now — kept for test-import compatibility */ }
 
 export interface DuplicateCheckInput {
   sessionId: string;
@@ -363,35 +368,27 @@ export interface DuplicateCheckInput {
   priorWrites: Array<{ shapeKey?: string; targets?: string[] }>;
 }
 
-/** Pure: does this write hit a (shape, target) pair already written this
- *  session, and has the model not yet been warned about it? */
-export function detectDuplicateTarget(input: DuplicateCheckInput): { duplicate: boolean; target?: string; warnedKey?: string } {
+/** Pure + STATELESS: does this write hit a (shape, target) pair already written this
+ *  session? Every hit is a HARD duplicate — there is no warn-then-pass. */
+export function detectDuplicateTarget(input: DuplicateCheckInput): { duplicate: boolean; target?: string } {
   if (!input.shapeKey || input.targets.length === 0) return { duplicate: false };
   for (const target of input.targets) {
-    const hit = input.priorWrites.some((w) => w.shapeKey === input.shapeKey && (w.targets ?? []).includes(target));
-    if (!hit) continue;
-    const warnedKey = `${input.sessionId}::${input.shapeKey}::${target}`;
-    // Already warned about THIS target — keep scanning the remaining targets; a
-    // later recipient in the same multi-target send may be a fresh, un-warned
-    // duplicate that must still trip (integrity audit #2.5). `return` here
-    // abandoned the scan and let other duplicates slip through.
-    if (duplicateWarned.has(warnedKey)) continue;
-    return { duplicate: true, target, warnedKey };
+    if (input.priorWrites.some((w) => w.shapeKey === input.shapeKey && (w.targets ?? []).includes(target))) {
+      return { duplicate: true, target };
+    }
   }
   return { duplicate: false };
 }
-
-export function markDuplicateWarned(warnedKey: string): void { duplicateWarned.add(warnedKey); }
 
 export class DuplicateExternalWriteError extends Error {
   public readonly toolName: string;
   public readonly target: string;
   constructor(opts: { toolName: string; shapeKey: string | undefined; target: string }) {
     super(
-      `DUPLICATE_EXTERNAL_WRITE: this session already performed a ${opts.shapeKey ?? opts.toolName} write to ${opts.target}. ` +
-        'An approved batch is NOT standing permission to contact the same target twice. ' +
-        'If the user explicitly asked for a re-send, retry this call once and it will go through. ' +
-        'Otherwise STOP and confirm with the user (ask_user_question) before re-contacting — include who already received what.',
+      `DUPLICATE_EXTERNAL_WRITE (REFUSED): this session ALREADY sent a ${opts.shapeKey ?? opts.toolName} to ${opts.target}, and that send SUCCEEDED. ` +
+        'This duplicate is REFUSED to prevent a double-send — retrying will be refused again, so do NOT retry. ' +
+        'An approved batch is NOT standing permission to contact the same target twice, and a prior turn that errored AFTER sending was NOT a failed send. ' +
+        'If the user EXPLICITLY asked to contact this target a SECOND time, confirm via ask_user_question first; otherwise STOP and tell the user exactly what already went out.',
     );
     this.name = 'DuplicateExternalWriteError';
     this.toolName = opts.toolName;

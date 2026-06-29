@@ -100,16 +100,15 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
       'an mcp external_write was recorded in the shared ledger',
     );
 
-    // 3. Re-send to the SAME target → duplicate bump fires once…
+    // 3. Re-send to the SAME target → HARD WALL: refused, and stays refused on
+    // retry (the model can no longer self-bypass into a double-send).
     await assert.rejects(
       () => Promise.resolve(send('Denver comp search gap')),
       (err: Error) => { assert.match(err.message, /DUPLICATE_EXTERNAL_WRITE/); assert.match(err.message, /cliff@eleylawfirm\.com/); return true; },
     );
     assert.equal(server._calls.length, 1, 'duplicate blocked before dispatch');
-
-    // …and the conscious retry passes (speed bump, not a wall).
-    await send('Denver comp search gap');
-    assert.equal(server._calls.length, 2, 'conscious re-send went through');
+    await assert.rejects(() => Promise.resolve(send('Denver comp search gap')), /DUPLICATE_EXTERNAL_WRITE/);
+    assert.equal(server._calls.length, 1, 'the retry is STILL refused — no double-send');
   } finally {
     grounding._setGroundingJudgeForTests(null);
   }

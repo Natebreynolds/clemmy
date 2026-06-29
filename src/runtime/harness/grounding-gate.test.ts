@@ -22,7 +22,6 @@ const {
   extractTargetKeys,
   rankSources,
   detectDuplicateTarget,
-  markDuplicateWarned,
   buildGroundingPrompt,
   renderPayloadForJudge,
   evaluateGrounding,
@@ -149,9 +148,9 @@ test('evaluateGrounding: judge infra error fails open', async () => {
   }
 });
 
-// ─── duplicate-target speed bump ──────────────────────────────────
+// ─── duplicate-target HARD WALL (no speed bump) ───────────────────
 
-test('detectDuplicateTarget: same shape+target trips once, passes after warned (speed bump not wall)', () => {
+test('detectDuplicateTarget: same shape+target is a HARD duplicate EVERY time — no warn-then-pass (2026-06-29 double-send)', () => {
   _resetDuplicateStateForTests();
   const input = {
     sessionId: 's1',
@@ -162,9 +161,9 @@ test('detectDuplicateTarget: same shape+target trips once, passes after warned (
   const first = detectDuplicateTarget(input);
   assert.equal(first.duplicate, true);
   assert.equal(first.target, 'cliff@eleylawfirm.com');
-  // After warning, the conscious retry passes.
-  markDuplicateWarned(first.warnedKey!);
-  assert.equal(detectDuplicateTarget(input).duplicate, false);
+  // A retry must STILL be a duplicate — the model can no longer self-bypass.
+  assert.equal(detectDuplicateTarget(input).duplicate, true, 'retry is still refused — hard wall, not speed bump');
+  assert.equal(detectDuplicateTarget(input).duplicate, true, 'and again');
 });
 
 test('detectDuplicateTarget: different target or shape is not a duplicate', () => {
@@ -175,23 +174,17 @@ test('detectDuplicateTarget: different target or shape is not a duplicate', () =
   assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: undefined, targets: ['a@x.com'], priorWrites: prior }).duplicate, false);
 });
 
-test('detectDuplicateTarget: an already-warned target does NOT mask a fresh duplicate later in the same multi-recipient send (#2.5)', () => {
+test('detectDuplicateTarget: a multi-recipient send trips on ANY recipient already written this session', () => {
   _resetDuplicateStateForTests();
-  const priorWrites = [
-    { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['warned@x.com'] },
-    { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['fresh@y.com'] },
-  ];
-  // The first recipient was already warned (a conscious re-send).
-  markDuplicateWarned('s1::OUTLOOK_OUTLOOK_SEND_EMAIL::warned@x.com');
-  // A multi-recipient send hits the warned target FIRST, then a fresh duplicate.
+  const priorWrites = [{ shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['already@x.com'] }];
+  // A multi-recipient send where one recipient was already contacted this session
+  // hard-trips on that recipient (a fresh recipient alone would pass).
   const res = detectDuplicateTarget({
     sessionId: 's1',
     shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-    targets: ['warned@x.com', 'fresh@y.com'],
+    targets: ['fresh@y.com', 'already@x.com'],
     priorWrites,
   });
-  // Before the fix the warned target short-circuited the scan and the fresh
-  // duplicate slipped through; now the loop continues and the gate trips.
   assert.equal(res.duplicate, true);
-  assert.equal(res.target, 'fresh@y.com');
+  assert.equal(res.target, 'already@x.com');
 });

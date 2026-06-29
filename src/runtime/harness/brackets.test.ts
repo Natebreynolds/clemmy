@@ -893,8 +893,8 @@ test('grounding gate: an irreversible send contradicting the target\'s own artif
       assert.match(err.message, /cliff@eleylawfirm\.com/);
       return true;
     });
-    // …and the conscious retry passes (speed bump, not a wall).
-    assert.equal(await send('Denver comp search gap'), 'sent');
+    // …and the retry is STILL refused — a HARD WALL, not a speed bump (no double-send).
+    await assert.rejects(() => Promise.resolve(send('Denver comp search gap')), /DUPLICATE_EXTERNAL_WRITE/);
   } finally {
     grounding._setGroundingJudgeForTests(null);
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;

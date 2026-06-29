@@ -11,7 +11,6 @@ import {
   evaluateGrounding,
   detectDuplicateTarget,
   extractDuplicateIdentityKeys,
-  markDuplicateWarned,
   GroundingCheckFailedError,
   DuplicateExternalWriteError,
 } from './harness/grounding-gate.js';
@@ -917,8 +916,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               if (idx >= 0) priorWrites.splice(idx, 1);
             }
             const dup = detectDuplicateTarget({ sessionId: integritySessionId, shapeKey: integrityShapeKey, targets: dupTargets, priorWrites });
-            if (dup.duplicate && dup.warnedKey) {
-              markDuplicateWarned(dup.warnedKey);
+            if (dup.duplicate) {
               throw new DuplicateExternalWriteError({ toolName, shapeKey: integrityShapeKey, target: dup.target ?? 'unknown' });
             }
           }
