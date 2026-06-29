@@ -295,6 +295,26 @@ test('Claude SDK brain overload (uncommitted) falls the turn over to the harness
   assert.equal(runConversationCalled, 1);
 });
 
+test('Claude SDK brain UNPARSEABLE-TOOL-CALL (parse failure) also falls the turn over to the harness brain', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  let runConversationCalled = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string }) => {
+      runConversationCalled += 1;
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, lastDecision: { reply: 'harness-fallover', summary: 's', done: true, nextAction: 'completed' } };
+    }) as never,
+    // The exact error that killed the 2026-06-29 turn — now fallover-eligible.
+    claudeAgentBrain: (async () => { throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed)."); }) as never,
+  });
+
+  const res = await respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-parse' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+  assert.equal(res.text, 'harness-fallover', 'a parse failure now recovers on the harness brain instead of "Didn\'t finish"');
+  assert.equal(runConversationCalled, 1);
+});
+
 test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';

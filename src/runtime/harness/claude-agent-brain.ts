@@ -68,7 +68,7 @@ function claudeSdkSalvageEnabled(): boolean {
  *  already failed — when the model emits a tool call whose JSON can't be parsed.
  *  Surfaced via the "Claude Code returned an error result:" prefix. A flaky, often
  *  transient model stumble, NOT a deterministic bad request. */
-function isClaudeSdkUnparseableToolCall(err: unknown): boolean {
+export function isClaudeSdkUnparseableToolCall(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   return /tool call could not be parsed|could not be parsed \(retry also failed\)/i.test(msg);
 }

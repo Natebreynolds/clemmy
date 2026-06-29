@@ -39,7 +39,7 @@ import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
 import { configureHarnessRuntime } from './codex-client.js';
 import { clearKill, createSession, getSession, listEvents, requestKill, type EventRow } from './eventlog.js';
 import { listPending } from './approval-registry.js';
-import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from './claude-agent-brain.js';
+import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { getRuntimeEnv } from '../../config.js';
@@ -421,20 +421,8 @@ export async function respondPreferHarness(
     try {
       return await claudeAgentBrainImpl(surface, request);
     } catch (err) {
-      // Claude SDK brain gave up on a provider overload BEFORE committing
-      // anything this turn (no tool ran, nothing streamed) → fall the WHOLE turn
-      // over to the standard harness brain (Codex→GLM via RouterModelProvider,
-      // which has its own first-byte fallover). committed=true → surface it (a
-      // re-run could double-act / duplicate the partial reply). This brings the
-      // Claude SDK chat lane to parity with how the Codex/GLM brains already
-      // fall over. Kill-switch: CLEMMY_BRAIN_FALLOVER=off.
-      if (chatBrainFalloverEnabled() && err instanceof ClaudeSdkProviderOverloadError && !err.committed) {
-        bridgeLogger.warn({ surface }, 'Claude brain overloaded at turn start — falling the turn over to the harness brain (Codex→GLM)');
-        detach();
-        return respondViaHarness(surface, request, {
-          reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
-        });
-      }
+      const recovered = await recoverChatBrainFailure(surface, request, err, detach);
+      if (recovered) return recovered;
       throw err;
     } finally {
       detach();
@@ -447,6 +435,46 @@ const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
 
 function chatBrainFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * UNIFIED chat-brain fallover decision, shared by respondPreferHarness AND the
+ * surfaces that call the Claude SDK brain DIRECTLY (desktop dock, Discord, Slack).
+ * On a FALLOVER-ELIGIBLE terminal Claude failure where nothing harmful committed,
+ * re-run the WHOLE turn on the standard harness brain (Codex→GLM, which has its own
+ * first-byte fallover) — ONE model switch instead of a dead turn or 6 same-model
+ * re-runs. Returns the recovered response, or null (caller surfaces the error).
+ *
+ * Eligible classes:
+ *  - provider overload (ClaudeSdkProviderOverloadError) when !committed.
+ *  - unparseable-tool-call ("could not be parsed (retry also failed)") — a flaky
+ *    model stumble a DIFFERENT brain usually doesn't reproduce. The SDK lane's
+ *    salvage already returns a success for the COMMITTED case (so a propagated
+ *    parse-failure is the uncommitted one), and the duplicate-send HARD WALL blocks
+ *    any re-send on the re-run, so the switch is safe.
+ * Kill-switch: CLEMMY_BRAIN_FALLOVER=off.
+ */
+export function isChatBrainFalloverEligible(err: unknown): boolean {
+  if (!chatBrainFalloverEnabled()) return false;
+  return (
+    (err instanceof ClaudeSdkProviderOverloadError && !err.committed) ||
+    isClaudeSdkUnparseableToolCall(err)
+  );
+}
+
+export async function recoverChatBrainFailure(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  err: unknown,
+  detach?: () => void,
+): Promise<AssistantResponse | null> {
+  if (!isChatBrainFalloverEligible(err)) return null;
+  bridgeLogger.warn({ surface, kind: err instanceof ClaudeSdkProviderOverloadError ? 'overload' : 'parse_failure' },
+    'Claude brain terminal failure with nothing harmful committed — falling the turn over to the harness brain (Codex→GLM)');
+  detach?.();
+  return respondViaHarness(surface, request, {
+    reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
+  });
 }
 
 type BuiltAgent = Awaited<ReturnType<typeof buildOrchestratorAgent>>;

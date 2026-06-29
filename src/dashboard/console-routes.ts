@@ -215,7 +215,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
-import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { respondPreferHarness, recoverChatBrainFailure } from '../runtime/harness/respond-bridge.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from '../runtime/harness/claude-agent-brain.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
@@ -8537,28 +8537,35 @@ export function registerConsoleRoutes(
         // to its own assistant turn. Flag-gated + auth-gated, so Codex / API-key
         // users are byte-identical (branch never taken).
         if (!intent && claudeAgentSdkBrainEnabled('home')) {
+          // Stream brain text deltas to the desktop SSE (raw — the brain emits
+          // plain prose, not the {reply,…} JSON the field-streamer parses).
+          // Final reply still arrives via the conversation_completed event.
+          const brainReq = {
+            message: effectiveInput,
+            sessionId,
+            channel: 'desktop',
+            userId: 'desktop',
+            onChunk: emitToken,
+          };
           try {
-            await respondViaClaudeAgentSdkBrain('home', {
-              message: effectiveInput,
-              sessionId,
-              channel: 'desktop',
-              userId: 'desktop',
-              // Stream brain text deltas to the desktop SSE (raw — the brain emits
-              // plain prose, not the {reply,…} JSON the field-streamer parses).
-              // Final reply still arrives via the conversation_completed event.
-              onChunk: emitToken,
-            });
+            await respondViaClaudeAgentSdkBrain('home', brainReq);
           } catch (err) {
-            appendHarnessEvent({
-              sessionId,
-              turn: 0,
-              role: 'system',
-              type: 'run_failed',
-              data: {
-                error: err instanceof Error ? err.message : String(err),
-                stage: 'claude_agent_sdk_brain',
-              },
-            });
+            // Unify the dock with the harness path: a terminal Claude failure
+            // (overload / unparseable tool call) with nothing harmful committed
+            // falls the turn over to the Codex/GLM brain instead of "Didn't finish".
+            const recovered = await recoverChatBrainFailure('home', brainReq, err).catch(() => null);
+            if (!recovered) {
+              appendHarnessEvent({
+                sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'run_failed',
+                data: {
+                  error: err instanceof Error ? err.message : String(err),
+                  stage: 'claude_agent_sdk_brain',
+                },
+              });
+            }
           }
           return;
         }

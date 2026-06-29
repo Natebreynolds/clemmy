@@ -32,7 +32,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
-import { buildChatFalloverWiring } from '../runtime/harness/respond-bridge.js';
+import { buildChatFalloverWiring, isChatBrainFalloverEligible } from '../runtime/harness/respond-bridge.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
@@ -2118,27 +2118,14 @@ export async function runDiscordHarnessConversation(opts: {
       // identically to runConversation (the brain is the single terminal-event
       // emitter, so we do NOT also flush — no double-render). Flag off ⇒ the
       // harness path is byte-identical. Kill-switch = set the brain flag off.
-      if (claudeAgentSdkBrainEnabled(channel)) {
-        await respondViaClaudeAgentSdkBrain(channel as Parameters<typeof respondViaClaudeAgentSdkBrain>[0], {
-          message: effectiveInput,
-          sessionId: session.id,
-          channel: channelLabel,
-          userId,
-          // Live streaming: the brain emits PLAIN prose (not the {reply,objective,
-          // action} JSON the Codex field-streamer parses), so accumulate raw deltas
-          // and live-edit. The conversation_completed event replaces this with the
-          // authoritative final reply (settle() cancels any pending stream flush),
-          // so streaming can't garble the final message.
-          onChunk: (delta: string): void => {
-            streamBuffer += delta;
-            state.summary = streamBuffer;
-            scheduleEdit();
-          },
-        });
-      } else {
+      // The Codex/GLM harness path for this channel — also the FALLOVER target when
+      // the Claude brain hits a terminal failure (so Discord/Slack reach the same
+      // "no single model failing kills the turn" parity the bridge gives other
+      // surfaces). HarnessSurface has no 'discord'/'slack' member, so the Claude
+      // lane can't use respondViaHarness; it falls over to this local Codex path.
+      const runCodexPath = async (): Promise<void> => {
         const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId: session.id });
-        // W1a — chat step-boundary brain fallover for the Discord/Slack lane (the
-        // primary external chat surface), parity with respondViaHarness.
+        // W1a — chat step-boundary brain fallover for the Discord/Slack lane.
         const fallover = buildChatFalloverWiring({
           userInput: effectiveInput,
           sessionId: session.id,
@@ -2149,6 +2136,36 @@ export async function runDiscordHarnessConversation(opts: {
           falloverModelIds: fallover.falloverModelIds,
           rebuildAgentForBrain: fallover.rebuildAgentForBrain,
         });
+      };
+      if (claudeAgentSdkBrainEnabled(channel)) {
+        try {
+          await respondViaClaudeAgentSdkBrain(channel as Parameters<typeof respondViaClaudeAgentSdkBrain>[0], {
+            message: effectiveInput,
+            sessionId: session.id,
+            channel: channelLabel,
+            userId,
+            // Live streaming: the brain emits PLAIN prose (not the {reply,objective,
+            // action} JSON the Codex field-streamer parses), so accumulate raw deltas
+            // and live-edit. The conversation_completed event replaces this with the
+            // authoritative final reply (settle() cancels any pending stream flush),
+            // so streaming can't garble the final message.
+            onChunk: (delta: string): void => {
+              streamBuffer += delta;
+              state.summary = streamBuffer;
+              scheduleEdit();
+            },
+          });
+        } catch (err) {
+          // A terminal Claude failure (overload / unparseable tool call) with
+          // nothing harmful committed → fall the turn over to the Codex/GLM brain
+          // instead of "run failed". Otherwise re-throw to the outer run_failed.
+          if (!isChatBrainFalloverEligible(err)) throw err;
+          logger.warn({ channel, err: err instanceof Error ? err.message : String(err) },
+            'Claude brain terminal failure on Discord/Slack — falling over to the Codex/GLM brain');
+          await runCodexPath();
+        }
+      } else {
+        await runCodexPath();
       }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
