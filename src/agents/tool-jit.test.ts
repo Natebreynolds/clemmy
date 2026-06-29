@@ -128,6 +128,56 @@ test('TOOL_JIT_CORE includes the acquisition escape-hatch + execution lane', () 
   }
 });
 
+test('workspace authoring intents pin the space tools even under a worst-case JIT ranker', async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5' }, async () => {
+    const spaceTools = [
+      'space_get',
+      'space_get_view',
+      'space_get_runner',
+      'space_list',
+      'space_save',
+      'space_edit_view',
+      'space_edit_runner',
+      'space_revert_runner',
+      'space_refresh',
+      'space_try_runner',
+      'space_set_data',
+    ];
+    const otherDroppable = ['workflow_create', 'git_status', 'task_add'];
+    const tools: JitTool[] = [...CORE_SAMPLE, ...spaceTools, ...otherDroppable]
+      .map((name) => ({ name, description: name }));
+    const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
+
+    const sel = await selectToolsForTurn({
+      userInput: 'Build a live dashboard workspace for my pipeline with a follow-up action',
+      tools,
+      rankFn: zero,
+    });
+
+    assert.equal(sel.reduced, true, 'the test must still prove JIT reduced unrelated tools');
+    for (const must of spaceTools) assert.ok(sel.exposed.has(must), `${must} must survive workspace-intent JIT`);
+    for (const dropped of otherDroppable) assert.ok(!sel.exposed.has(dropped), `${dropped} should still be droppable`);
+  });
+});
+
+test('workspace intent pinning also catches natural dashboard requests that omit the word workspace', async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5' }, async () => {
+    const tools: JitTool[] = [...CORE_SAMPLE, 'space_save', 'space_refresh', 'workflow_create']
+      .map((name) => ({ name, description: name }));
+    const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
+
+    const sel = await selectToolsForTurn({
+      userInput: 'Make me a live dashboard for my sales pipeline',
+      tools,
+      rankFn: zero,
+    });
+
+    assert.ok(sel.exposed.has('space_save'), 'space_save must survive natural workspace-build wording');
+    assert.ok(sel.exposed.has('space_refresh'), 'space_refresh must survive natural workspace-build wording');
+    assert.ok(!sel.exposed.has('workflow_create'), 'unrelated JIT-able tools should still drop');
+  });
+});
+
 // --- Live A/B: bucketing + decision ---------------------------------------
 
 test('assignToolJitArm is deterministic + stable per session', () => {

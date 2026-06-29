@@ -153,6 +153,29 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
  */
 export const TOOL_JIT_CORE: ReadonlySet<string> = TOOL_JIT_MANDATED;
 
+const WORKSPACE_INTENT_TOOLS: ReadonlySet<string> = new Set<string>([
+  'space_get',
+  'space_get_view',
+  'space_get_runner',
+  'space_list',
+  'space_save',
+  'space_edit_view',
+  'space_edit_runner',
+  'space_revert_runner',
+  'space_refresh',
+  'space_try_runner',
+  'space_set_data',
+]);
+
+function looksLikeWorkspaceAuthoringIntent(query: string): boolean {
+  const q = query.toLowerCase();
+  if (/\b(workspace|workspaces)\b/.test(q)) return true;
+  const verbs = String.raw`(?:build|create|make|new|edit|update|fix|improve|refresh|change|wire|author)`;
+  const nouns = String.raw`(?:space|spaces|dashboard|tracker|planner|cockpit|surface|live report|mini[- ]app|board)`;
+  return new RegExp(String.raw`\b${verbs}\b[\s\S]{0,100}\b${nouns}\b`).test(q)
+    || new RegExp(String.raw`\b${nouns}\b[\s\S]{0,100}\b${verbs}\b`).test(q);
+}
+
 const DEFAULT_TOP_K = 16;
 // MEASURED (measure-tool-jit-accuracy.ts, text-embedding-3-small): real domain-named
 // intents score their needed tool ≥0.33 (median 0.44); noise/weak matches sit ≤0.19.
@@ -261,6 +284,9 @@ export async function selectToolsForTurn(opts: {
   if (!query) return exposeAll('no-query');
 
   const present = opts.tools.filter((t) => TOOL_JIT_CORE.has(t.name)).map((t) => t.name);
+  const intentPinned = looksLikeWorkspaceAuthoringIntent(query)
+    ? opts.tools.filter((t) => WORKSPACE_INTENT_TOOLS.has(t.name)).map((t) => t.name)
+    : [];
   const candidates = opts.tools.filter((t) => !TOOL_JIT_CORE.has(t.name));
   if (candidates.length === 0) return exposeAll('no-jit-candidates');
 
@@ -277,12 +303,12 @@ export async function selectToolsForTurn(opts: {
     .slice(0, k)
     .map((r) => r.name);
 
-  const exposed = new Set<string>([...present, ...selected]);
+  const exposed = new Set<string>([...present, ...intentPinned, ...selected]);
   const droppedCount = all.size - exposed.size;
   return {
     exposed,
     reduced: droppedCount > 0,
-    reason: `jit top${k}@${floor} (${present.length} core + ${selected.length} retrieved)`,
+    reason: `jit top${k}@${floor} (${present.length} core + ${intentPinned.length} intent + ${selected.length} retrieved)`,
     droppedCount,
   };
 }
