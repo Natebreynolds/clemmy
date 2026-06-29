@@ -8,7 +8,7 @@ import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
-import { pullRecentTurnsForSession } from './session-transcript.js';
+import { pullRecentTurnsForSession, renderRecentSessionActions } from './session-transcript.js';
 import { actionBus } from '../action-bus.js';
 import {
   judgeObjectiveComplete,
@@ -367,11 +367,21 @@ export function renderClaudeAgentBrainSystemAppend(
   const persistentContext = renderHarnessMemoryContext({ sessionId: request.sessionId, query: request.message });
   const spaceSlug = workspaceSlugFromSessionId(request.sessionId);
   const workspacePrimer = spaceSlug ? buildWorkspaceContextPrimer(spaceSlug) : null;
+  // Visibility into THIS session's completed irreversible actions. The text
+  // transcript doesn't carry tool results, so without this the brain is blind to
+  // its own prior sends and can re-run them (the 2026-06-29 double-send). Gated by
+  // the same session-history kill-switch.
+  let sessionActions = '';
+  if (sessionHistoryEnabled()) {
+    try { sessionActions = renderRecentSessionActions(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
+  }
   return [
     'You are Clementine running as the main brain through the official Claude Agent SDK inside the Clementine harness.',
     'You are using the user\'s Claude subscription auth. Stay inside Clementine\'s product identity, memory, skills, workflows, and workspace expectations.',
     '',
     renderCapabilityBoundary(mode),
+    '',
+    sessionActions,
     '',
     `Surface: ${surface}`,
     `Session: ${request.sessionId}`,

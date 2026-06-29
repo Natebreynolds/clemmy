@@ -19,8 +19,33 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { pullRecentTurnsForSession, renderTranscriptTurns } = await import('./session-transcript.js');
+const { pullRecentTurnsForSession, renderTranscriptTurns, renderRecentSessionActions } = await import('./session-transcript.js');
 const { resetEventLog, createSession, appendEvent, openEventLog } = await import('./eventlog.js');
+
+test('renderRecentSessionActions surfaces this session\'s completed sends so the brain knows it already did them', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  for (const t of ['chris@macgilliswiemer.com', 'jhintermeister@okoonlaw.com', 'marvinm@mitchelldickmcnelis.com']) {
+    appendEvent({ sessionId: sid, turn: 1, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
+  }
+  const block = renderRecentSessionActions(openEventLog(), sid);
+  assert.match(block, /ALREADY DONE/);
+  assert.match(block, /Do NOT repeat/i);
+  for (const t of ['chris@macgilliswiemer.com', 'jhintermeister@okoonlaw.com', 'marvinm@mitchelldickmcnelis.com']) {
+    assert.ok(block.includes(t), `${t} must be listed as already-sent`);
+  }
+  // Dedup: a repeated external_write for the same target appears once.
+  appendEvent({ sessionId: sid, turn: 1, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['chris@macgilliswiemer.com'] } });
+  const block2 = renderRecentSessionActions(openEventLog(), sid);
+  assert.equal((block2.match(/chris@macgilliswiemer\.com/g) ?? []).length, 1, 'deduped by (shape, target)');
+});
+
+test('renderRecentSessionActions is empty when nothing was sent (byte-identical no-op)', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'hi' } });
+  assert.equal(renderRecentSessionActions(openEventLog(), sid), '');
+});
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 

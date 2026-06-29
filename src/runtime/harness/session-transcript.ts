@@ -11,6 +11,49 @@ import { openEventLog } from './eventlog.js';
 
 export interface PriorTurn { who: 'user' | 'assistant'; text: string; at: string }
 
+/**
+ * Render the IRREVERSIBLE external actions that already SUCCEEDED in this session,
+ * so a brain returning to an existing chat KNOWS what it already did. The text
+ * transcript (user_input/conversation_completed) does NOT include tool results, so
+ * without this the brain is blind to its own completed sends — the 2026-06-29
+ * double-send (it re-ran a send because the prior turn's text didn't record it,
+ * and an errored turn emits no conversation_completed at all). Reads external_write
+ * events; deduped by (shape, target), newest first. '' when nothing was sent.
+ */
+export function renderRecentSessionActions(
+  db: ReturnType<typeof openEventLog>,
+  sessionId: string,
+  limit = 20,
+): string {
+  let rows: Array<{ data_json: string }>;
+  try {
+    rows = db.prepare(
+      `SELECT data_json FROM events WHERE session_id = ? AND type = 'external_write' ORDER BY seq DESC LIMIT ?`,
+    ).all(sessionId, limit) as Array<{ data_json: string }>;
+  } catch { return ''; }
+  if (rows.length === 0) return '';
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const row of rows) {
+    try {
+      const d = JSON.parse(row.data_json) as { shapeKey?: string; toolName?: string; targets?: string[] };
+      const shape = String(d.shapeKey ?? d.toolName ?? 'action');
+      const targets = (d.targets ?? []).filter((t): t is string => typeof t === 'string' && t.trim().length > 0);
+      for (const t of (targets.length ? targets : ['(no target)'])) {
+        const key = `${shape}::${t}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        lines.push(`- ${shape} → ${t}`);
+      }
+    } catch { /* skip malformed rows */ }
+  }
+  if (lines.length === 0) return '';
+  return [
+    'ALREADY DONE in THIS conversation — these external actions SUCCEEDED earlier in this same session. Do NOT repeat any of them unless the user EXPLICITLY asks you to do it AGAIN. A prior turn that errored AFTER one of these still COUNTS as done — it was NOT cancelled:',
+    ...lines,
+  ].join('\n');
+}
+
 /** Read the recent user+assistant turns for ONE session, chronological order. */
 export function pullRecentTurnsForSession(
   db: ReturnType<typeof openEventLog>,
