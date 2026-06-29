@@ -1014,13 +1014,13 @@ test('forEach batching attributes item failures to their original keys across wi
   }
 });
 
-test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds when CLEMMY_FOREACH_ITEM_RETRY=on', async () => {
+test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds BY DEFAULT (flag unset)', async () => {
   const prevH = process.env.WORKFLOW_USE_HARNESS;
   const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  process.env.CLEMMY_FOREACH_ITEM_RETRY = 'on';
+  delete process.env.CLEMMY_FOREACH_ITEM_RETRY; // default-ON: retry is the shipped behavior
   try {
     const attempts: Record<string, number> = {};
     const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
@@ -1059,13 +1059,13 @@ test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds when CLEMM
   }
 });
 
-test('W1b: with the flag OFF (default), a transient item failure is NOT retried — byte-identical to today', async () => {
+test('W1b: CLEMMY_FOREACH_ITEM_RETRY=off is the kill-switch — a transient item failure is NOT retried', async () => {
   const prevH = process.env.WORKFLOW_USE_HARNESS;
   const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  delete process.env.CLEMMY_FOREACH_ITEM_RETRY; // default = off
+  process.env.CLEMMY_FOREACH_ITEM_RETRY = 'off'; // explicit kill-switch
   try {
     const attempts: Record<string, number> = {};
     const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];

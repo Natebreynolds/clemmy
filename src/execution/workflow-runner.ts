@@ -1787,13 +1787,14 @@ function transientRetryFloor(): number {
 }
 
 /** W1b — per-item transient retry for forEach. A single item that hits a network/
- *  infra blip currently fails fast and is dropped into the quality advisory
- *  (silent loss on, e.g., a 10%-of-items 5xx). With this on, that item retries
- *  (transient-only, same `transientRetryFloor` budget) — guarded so an item that
+ *  infra blip would otherwise fail fast and be dropped into the quality advisory
+ *  (silent loss on, e.g., a 10%-of-items 5xx). Now it retries (transient-only,
+ *  same `transientRetryFloor` budget as plain steps) — guarded so an item that
  *  already recorded an external_write is NEVER re-run (no double-act, reusing the
- *  crash-resume idempotency check). Default-off → validate → graduate. */
+ *  crash-resume idempotency check). Default-ON (validated: guarded, transient-only,
+ *  unit-tested, review-clean); CLEMMY_FOREACH_ITEM_RETRY=off is the kill-switch. */
 function forEachItemRetryEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_FOREACH_ITEM_RETRY', 'off') || 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('CLEMMY_FOREACH_ITEM_RETRY', 'on') || 'on').toLowerCase() !== 'off';
 }
 
 /**
