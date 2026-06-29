@@ -136,6 +136,11 @@ export class ToolCallsCounter {
     }
   }
 
+  /** Tool calls made so far this runTurn (read-only). */
+  get calls(): number {
+    return this.count;
+  }
+
   /** Increment; throws once the per-turn cap is exceeded. */
   increment(): void {
     this.count += 1;
@@ -552,6 +557,10 @@ export class RecallBudget {
 export interface HarnessRunContext {
   sessionId: string;
   counter: ToolCallsCounter;
+  /** Inc A2 — set once per runTurn after the mid-step background-offer nudge has
+   *  been evaluated, so a long grind nudges AT MOST once per step (the context is
+   *  rebuilt per Runner.run, so this naturally resets each runTurn). */
+  backgroundOfferNudged?: boolean;
   /** Per-turn budget for recall_tool_result calls. Optional — when
    *  absent (e.g. tests, non-harness call paths), recall is unmetered. */
   recallBudget?: RecallBudget;
@@ -626,6 +635,29 @@ export interface WrapToolOptions {
 // under launchd too (where process.env isn't merged).
 export function harnessToolBracketsEnabled(): boolean {
   return (getRuntimeEnv('HARNESS_TOOL_BRACKETS', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+// Inc A2 — mid-runTurn background-offer nudge. The loop's between-steps nudge
+// can't catch a model that grinds a long task in a SINGLE runTurn (many tool
+// calls, then done/ask — no continuation). This rail fires WITHIN the runTurn,
+// appended to a tool result like the fan-out nudge, so the model reads it
+// mid-stride and can offer to move the work to the background. Same kill-switch
+// as the loop nudge (CLEMMY_BG_OFFER_NUDGE). Defined locally to avoid a
+// brackets→loop import cycle.
+function backgroundOfferNudgeEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
+
+/** True if a background offer was already posted in this session — never re-offer
+ *  after the user has seen the choice. Best-effort. */
+function backgroundOfferAlreadyMadeInSession(sessionId: string): boolean {
+  try {
+    return listEvents(sessionId, { types: ['awaiting_user_input'] })
+      .some((e) => (e.data as { source?: string } | undefined)?.source === 'offer_background');
+  } catch {
+    return false;
+  }
 }
 
 // Pre-write LATENCY: the irreversible-write/send path runs three independent,
@@ -1638,9 +1670,35 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // (sessionId arg is unused — included for future per-session
     // behavior without forcing callers to refactor.)
     void sessionId;
-    // Both nudges ride the same advisory rail (appended to the tool result by
-    // the caller). Combine so a turn that trips both still delivers both.
-    const nudges = [fanoutNudge, cacheNudge].filter(Boolean);
+    // Inc A2 — mid-runTurn background-offer nudge. Once this runTurn has made
+    // enough tool calls in a FOREGROUND chat without offering/dispatching, append
+    // a one-time "offer to move this to the background" nudge so the model reads
+    // it mid-grind. Evaluated AT MOST once per runTurn (ctx flag); skipped in
+    // worker scopes, non-chat sessions, and once an offer was already posted.
+    let bgOfferNudge: string | undefined;
+    if (
+      !ctx.backgroundOfferNudged
+      && backgroundOfferNudgeEnabled()
+      && !ctx.guardrailScopeId
+      && ctx.counter.calls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS
+    ) {
+      ctx.backgroundOfferNudged = true; // evaluate the (slightly heavier) checks once per runTurn
+      try {
+        if (
+          !ctx.sessionId.startsWith('background:')
+          && getSession(ctx.sessionId)?.kind === 'chat'
+          && !backgroundOfferAlreadyMadeInSession(ctx.sessionId)
+        ) {
+          bgOfferNudge =
+            '[background offer] You have already made several tool calls on this in the foreground while the user waits. '
+            + 'If finishing will take more than a step or two, call `offer_background` now with the objective so they can move it to the background (or hold it for later) — then STOP. '
+            + 'If you are nearly done (a step or two left), just finish; do not offer.';
+        }
+      } catch { /* advisory only — never block the tool */ }
+    }
+    // All nudges ride the same advisory rail (appended to the tool result by the
+    // caller). Combine so a turn that trips several still delivers each.
+    const nudges = [fanoutNudge, cacheNudge, bgOfferNudge].filter(Boolean);
     return nudges.length > 0 ? nudges.join('\n\n') : undefined;
   };
 

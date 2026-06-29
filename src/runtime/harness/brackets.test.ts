@@ -910,11 +910,16 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
   const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
   const prevDest = process.env.CLEMMY_DESTINATION_GATE;
+  const prevOffer = process.env.CLEMMY_BG_OFFER_NUDGE;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   process.env.CLEMMY_CONFIRM_FIRST = 'off';
   process.env.CLEMMY_EXECUTION_GATE = 'off';
   process.env.CLEMMY_GROUNDING_GATE = 'off';
   process.env.CLEMMY_DESTINATION_GATE = 'on';
+  // This test drives 7+ tool calls in one chat session, crossing the background-
+  // offer nudge floor — orthogonal to the destination gate under test, so disable
+  // it here to keep the exact-output assertions byte-stable.
+  process.env.CLEMMY_BG_OFFER_NUDGE = 'off';
   resetEventLog();
   const destination = await import('./destination-gate.js');
   destination._resetDestinationStateForTests();
@@ -1033,6 +1038,7 @@ test('destination gate: a PROD ambient publish HARD-blocks every attempt until e
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
     if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
     if (prevDest === undefined) delete process.env.CLEMMY_DESTINATION_GATE; else process.env.CLEMMY_DESTINATION_GATE = prevDest;
+    if (prevOffer === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE; else process.env.CLEMMY_BG_OFFER_NUDGE = prevOffer;
   }
 });
 
@@ -1259,5 +1265,59 @@ test('duplicate-target gate: a FAILED dispatch is netted out — the corrected r
     process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
     process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
     if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
+
+// ─── Inc A2: mid-runTurn background-offer nudge ──────────────────────────────
+
+test('Inc A2: background-offer nudge appends once after the tool-call floor in a foreground chat', async () => {
+  const prevB = process.env.HARNESS_TOOL_BRACKETS;
+  const prevN = process.env.CLEMMY_BG_OFFER_NUDGE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  delete process.env.CLEMMY_BG_OFFER_NUDGE; // default on
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const counter = new ToolCallsCounter(50);
+    for (let i = 0; i < 5; i++) counter.increment(); // 5 prior calls this runTurn
+    const wrapped = wrapToolForHarness({ name: 'probe', execute: async () => 'tool-output' });
+    const ctx = { sessionId: sess.id, counter } as { sessionId: string; counter: ToolCallsCounter; backgroundOfferNudged?: boolean };
+    // 6th call crosses the floor → nudge appended to the tool result.
+    const res = (await withHarnessRunContext(ctx, async () => wrapped.execute!({}))) as string;
+    assert.match(res, /tool-output/, 'real tool output preserved');
+    assert.match(res, /\[background offer\]/, 'crossing the 6-call floor appends the offer nudge');
+    assert.match(res, /offer_background/, 'nudge names the tool to call');
+    // At most once per runTurn (same ctx → flag set).
+    const res2 = (await withHarnessRunContext(ctx, async () => wrapped.execute!({}))) as string;
+    assert.doesNotMatch(res2, /\[background offer\]/, 'nudge fires at most once per runTurn');
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevB;
+    if (prevN === undefined) delete process.env.CLEMMY_BG_OFFER_NUDGE; else process.env.CLEMMY_BG_OFFER_NUDGE = prevN;
+  }
+});
+
+test('Inc A2: no offer nudge below the floor, with the kill-switch off, or in a non-chat session', async () => {
+  const prevB = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const run = async (sessionId: string, priorCalls: number): Promise<string> => {
+    const counter = new ToolCallsCounter(50);
+    for (let i = 0; i < priorCalls; i++) counter.increment();
+    const wrapped = wrapToolForHarness({ name: 'probe', execute: async () => 'out' });
+    return (await withHarnessRunContext({ sessionId, counter }, async () => wrapped.execute!({}))) as string;
+  };
+  try {
+    // below the floor (2 calls) → no nudge
+    const chatA = createSession({ kind: 'chat' });
+    assert.doesNotMatch(await run(chatA.id, 1), /\[background offer\]/, 'below floor → no nudge');
+    // kill-switch off → no nudge even past the floor
+    process.env.CLEMMY_BG_OFFER_NUDGE = 'off';
+    const chatB = createSession({ kind: 'chat' });
+    assert.doesNotMatch(await run(chatB.id, 5), /\[background offer\]/, '=off → no nudge');
+    delete process.env.CLEMMY_BG_OFFER_NUDGE;
+    // non-chat (execution) session → no nudge (offering to background a background run is nonsensical)
+    const exec = createSession({ kind: 'execution' });
+    assert.doesNotMatch(await run(exec.id, 5), /\[background offer\]/, 'non-chat → no nudge');
+  } finally {
+    process.env.HARNESS_TOOL_BRACKETS = prevB;
+    delete process.env.CLEMMY_BG_OFFER_NUDGE;
   }
 });
