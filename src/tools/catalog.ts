@@ -85,6 +85,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'resume_held_task',
   'notify_user',
   'ask_user_question',
+  'offer_background',
   'list_pending_check_ins',
   'answer_check_in',
   'draft_goal_from_notes',

@@ -134,7 +134,10 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   // text, so retrieval can't be trusted to surface them. CORE is the reliable fix.
   'browser_harness_status', 'browser_harness_run',
   // conversation primitives (also added structurally outside JIT — belt-and-suspenders).
-  'ask_user_question', 'request_approval', 'run_worker',
+  // offer_background is the proactive run-in-bg/hold/now offer + the target of the
+  // background-offer code nudge — it can land on ANY turn after alignment and is NOT
+  // evident from the message keywords, so CORE is the reliable fix (mirrors ask_user_question).
+  'ask_user_question', 'request_approval', 'run_worker', 'offer_background',
   // CODE MODE — when present (CLEMMY_CODE_MODE=on), the programmatic-tool-calling
   // entry must stay reachable every turn; its value is data-heavy/multi-tool work
   // the message text won't always semantically match. No-op when off (JIT only

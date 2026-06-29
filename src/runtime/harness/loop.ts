@@ -1449,6 +1449,9 @@ async function runConversationCore(
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
   let totalToolCalls = 0;
+  // Inc A code trigger: fire the "offer to move this to the background" nudge at
+  // most ONCE per run (a foreground chat grinding through a long action task).
+  let backgroundOfferNudged = false;
 
   // W1a chat step-boundary brain fallover state. `currentAgent` swaps to a
   // rebuilt agent on the next brain when a turn fails transiently; tried ids
@@ -2560,7 +2563,29 @@ async function runConversationCore(
     }
 
     // 'awaiting_handoff_result' or any other non-terminal state → loop.
-    nextInput = CONTINUATION_INPUT;
+    // Inc A code trigger: if a FOREGROUND chat turn has ground through
+    // substantial multi-step ACTION work without offering/dispatching, nudge it
+    // ONCE to offer moving the task to the background (or holding it) so the user
+    // isn't silently blocked. Conservative gates (chat-only, action-intent,
+    // tool-call floor, one-shot, skip-if-already-offered) keep it off quick work;
+    // the nudge itself tells the model to just finish if it's nearly done.
+    let bgOfferNudge = '';
+    if (
+      !backgroundOfferNudged
+      && backgroundOfferNudgeEnabled()
+      && objectiveJudgeActionIntent
+      && totalToolCalls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS
+      && !options.sessionId.startsWith('background:')
+    ) {
+      let isForegroundChat = false;
+      try { isForegroundChat = HarnessSession.load(options.sessionId)?.sessionRow.kind === 'chat'; } catch { isForegroundChat = false; }
+      if (isForegroundChat && !backgroundOfferAlreadyMade(options.sessionId)) {
+        backgroundOfferNudged = true;
+        bgOfferNudge =
+          ' NOTE: you have already done substantial work on this in the foreground. If finishing it will take more than a step or two, call `offer_background` NOW with the objective so the user can move it to the background (or hold it) instead of waiting here — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
+      }
+    }
+    nextInput = CONTINUATION_INPUT + bgOfferNudge;
   }
 
   // Max steps without resolution.
@@ -2707,6 +2732,29 @@ function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | nul
 
 function goalContractEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Inc A code trigger (kill-switch, default ON): the one-time "offer to move
+ *  this to the background" nudge for a foreground chat grinding through a long
+ *  multi-step action task without offering/dispatching. `=off` reverts to the
+ *  plain continuation. */
+function backgroundOfferNudgeEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Tool-call floor before the background-offer nudge can fire — enough work that
+ *  the task is clearly substantial (not a quick 1-3 tool wrap-up). */
+const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
+
+/** True if a background offer was ALREADY posted in this session (so we never
+ *  re-offer after the user has already seen the choice). Best-effort. */
+function backgroundOfferAlreadyMade(sessionId: string): boolean {
+  try {
+    return listEvents(sessionId, { limit: 80, desc: true })
+      .some((e) => e.type === 'awaiting_user_input' && (e.data as { source?: string } | undefined)?.source === 'offer_background');
+  } catch {
+    return false;
+  }
 }
 
 /** Stream-inactivity threshold for the turn-stall watchdog. Default 5 min —

@@ -464,6 +464,42 @@ export function buildAskUserQuestionTool() {
   });
 }
 
+const offerBackgroundParams = z.object({
+  objective: z.string().min(4).describe('The agreed task you are offering to run — one line, e.g. "scrape 100 net-new Salesforce accounts".'),
+});
+
+/** The canonical, consistent "run it in the background / hold / now" offer. A
+ *  structured beat (not free-form prose) so the choice is always the same and
+ *  routes cleanly. Mirrors ask_user_question's halt: posts the choice + pauses
+ *  for the reply, which the model routes next turn. */
+export function buildOfferBackgroundTool() {
+  return tool({
+    name: 'offer_background',
+    description:
+      'Offer to run an AGREED multi-step or longer task in the BACKGROUND — call this AFTER you and the user have aligned on what to do, INSTEAD of grinding it out in the foreground and blocking the chat. It posts a 3-way choice and pauses for the reply. On their answer next turn: "Run it in the background" → call dispatch_background_task (the run is goal-bound and reports back HERE); "Hold it for later" → call hold_task_for_later; "Do it now here" → just do it in the chat. Do NOT use this for a quick task, a pure question, or a read-only lookup. After calling it, STOP this turn — do not also start the work.',
+    parameters: offerBackgroundParams,
+    execute: async (args, runContext) => {
+      const sessionId = extractSessionId(runContext);
+      const question = `Want me to run "${args.objective}" in the background and report back here when it's done, hold it for later, or just do it now here?`;
+      const options = ['Run it in the background', 'Hold it for later', 'Do it now here'];
+      if (sessionId) {
+        appendEvent({
+          sessionId,
+          turn: extractTurn(runContext),
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: { question, options, source: 'offer_background' },
+        });
+      }
+      return (
+        `Offer posted (background / hold / now) for "${args.objective}". STOP now — on the user's pick next turn: `
+        + '"Run it in the background" → dispatch_background_task; "Hold it for later" → hold_task_for_later; '
+        + '"Do it now here" → do it in the chat. Do NOT start the work this turn.'
+      );
+    },
+  });
+}
+
 // ---------- orchestrator factory ----------
 
 // Brain rubric CONTENT now lives in ./clem-rubric.ts (Phase 3 — ONE shared source
@@ -1172,7 +1208,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // kill check + pre-increment limit check. No-op when
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even
     // before the flag flips default-on.
-    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool, ...jitDiscoveryTools]
+    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), buildOfferBackgroundTool(), runWorkerTool, ...jitDiscoveryTools]
       // Per-call tool-exclusion (narrowed surface for architect / autonomy lanes
       // riding the harness loop). No-op when excludeToolNames is absent/empty.
       .filter((t) => {
