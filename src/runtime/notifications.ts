@@ -691,7 +691,15 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
   // destination was found — this is the "you set the cron from Discord,
   // you'd expect the cron's output to show up in Discord" path.
   const combined = [...configured, ...derived];
-  if (combined.length === 0
+  // Per-surface DM fallback, fired when NO explicit/derived destination routed
+  // this notification. Evaluate Discord and Slack INDEPENDENTLY against the
+  // pre-fallback set: previously both gated on `combined.length === 0`, and since
+  // Discord is pushed first it made `combined` non-empty and SHADOWED the Slack
+  // fallback — so a scheduled workflow with no origin channel (run.channel null,
+  // no routing metadata) only ever reached Discord. With both surfaces configured
+  // the user expects parity (the 2026-06-29 "Discord but not Slack" incident).
+  const hasRoutedDestination = combined.length > 0;
+  if (!hasRoutedDestination
       && DISCORD_ENABLED
       && DISCORD_BOT_TOKEN
       && DISCORD_DM_ALLOWED_USERS.length > 0) {
@@ -708,7 +716,7 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
   // Same fallback for Slack: when nothing else routes this AND Slack is the
   // configured chat surface, DM the primary allowlisted Slack user so cron /
   // background output set up from Slack reports back into Slack.
-  if (combined.length === 0
+  if (!hasRoutedDestination
       && SLACK_ENABLED
       && SLACK_BOT_TOKEN
       && SLACK_ALLOWED_USERS.length > 0) {

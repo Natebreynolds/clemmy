@@ -7,8 +7,8 @@ import {
 } from '../runtime/sandboxed-script.js';
 import pino from 'pino';
 import type { ClementineAssistant } from '../assistant/core.js';
-import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel } from '../config.js';
-import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel, DEFAULT_CODEX_MODEL } from '../config.js';
+import { resolveRoleModel, defaultForRole } from '../runtime/harness/model-roles.js';
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
@@ -1063,6 +1063,28 @@ function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRou
         modelId,
         provider: 'claude',
         source: 'claude-brain-default',
+      },
+    };
+  }
+  // Untagged step: preserve the {} contract — the agent builder falls back to
+  // MODELS.primary, and the claude_oauth full-lane + kill-switch semantics above
+  // stay byte-identical. EXCEPT the one broken state: a Codex brain whose
+  // OPENAI_MODEL_* slot was repurposed for a BYO model id (e.g. glm-5.2 → Z.ai).
+  // There a {} → MODELS.primary fallback would route the step to the BYO endpoint
+  // (the 2026-06-29 scorpion/Apify step silently ran on GLM for exactly this
+  // reason), so steer it to the canonical Codex model. Only fires for codex_oauth
+  // with a non-Codex primary; a healthy Codex setup still returns {}.
+  if (getActiveAuthMode() === 'codex_oauth' && resolveProvider(MODELS.primary) !== 'codex') {
+    return {
+      model: DEFAULT_CODEX_MODEL,
+      trace: {
+        seam: 'workflow',
+        stepId: step.id,
+        attemptedIntent: step.intent ?? '',
+        matchedIntent: null,
+        modelId: DEFAULT_CODEX_MODEL,
+        provider: 'codex',
+        source: 'codex-safe-default',
       },
     };
   }
@@ -2467,13 +2489,16 @@ export async function executeStep(
                 // FORK collapse (staged): forEach item through the gated harness loop
                 // (default-OFF `workflow` surface → byte-identical to legacy until
                 // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
-                // honorModel preserves the worker-model routing.
                 output = (await respondPreferHarness('workflow', {
                   sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
                   channel: 'workflow',
                   message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
-                  // forEach fan-out item = delegated grunt-work labor → BYO worker model when routed.
-                  model: step.model || getWorkerModel(),
+                  // ONE model resolution for every run/lane: explicit step.model →
+                  // intent-routed worker → codex-safe brain. Resolving here (not raw
+                  // getWorkerModel()) keeps this legacy lane identical to the harness
+                  // lane so a single brain setting governs all runs. {} (untagged) →
+                  // the codex-safe brain default.
+                  model: resolveWorkflowStepModel(step).model ?? defaultForRole('brain'),
                   maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
                 }, (r) => ctx.assistant.respond(r))).text;
               }
@@ -2628,12 +2653,13 @@ export async function executeStep(
       sessionId: `workflow:${ctx.runId}:${step.id}`,
       channel: 'workflow',
       message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}`,
-      // A plain (non-forEach) step is ORCHESTRATION work (multi-tool, strict
-      // structured output, e.g. Outlook triage) — it stays on the brain/primary
-      // tier (Codex in worker mode), NOT the cheap worker tier. Only forEach
-      // per-item labor (above) routes to the worker model. An author can still
-      // pin a specific step via step.model.
-      model: step.model || MODELS.primary,
+      // ONE model resolution for every run/lane: explicit step.model →
+      // intent-routed worker → codex-safe brain. Resolving here (not raw
+      // MODELS.primary) keeps this legacy lane identical to the harness lane so a
+      // single brain setting governs all runs (and never silently runs on a BYO
+      // id that leaked into the OPENAI_MODEL_* slot). {} (untagged) → the
+      // codex-safe brain default.
+      model: resolveWorkflowStepModel(step).model ?? defaultForRole('brain'),
       maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
     }, (r) => ctx.assistant.respond(r));
     output = response.text;
@@ -3240,8 +3266,11 @@ async function executeWorkflow(
       // Follow the active brain: under claude_oauth the synthesis pass runs on
       // Claude (via the SDK workflow-step lane) like every other step, instead of
       // hardcoding MODELS.primary (gpt-*) which routed synthesis to Codex — or to
-      // text-only headless for a Claude-only user.
-      model: claudeIsActiveWorkflowBrain() ? getClaudeBrainModel() : MODELS.primary,
+      // text-only headless for a Claude-only user. Use defaultForRole('brain')
+      // (not raw MODELS.primary) so the codex-safe guard applies — otherwise a BYO
+      // id polluting the OPENAI_MODEL_* slot would run synthesis on the BYO
+      // endpoint even after the brain was switched to Codex.
+      model: claudeIsActiveWorkflowBrain() ? getClaudeBrainModel() : defaultForRole('brain'),
       maxTurns: 8,
     };
     const synthesisResult = await runStepViaHarness(

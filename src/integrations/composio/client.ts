@@ -1105,7 +1105,20 @@ export async function executeComposioTool(
   // up via the dashboard.
   const userId = await getPreferredUserId();
 
-  if (backend !== 'sdk' && !connectedAccountId) {
+  // A model (esp. a BYO/GLM backend) can serialize a null account id as the
+  // LITERAL string "null"/"undefined"/"none" — truthy, so it both bypasses the
+  // live-connection auto-resolver below AND is forwarded to Composio as a bogus
+  // account id it cannot resolve, surfacing only as a generic dispatch error
+  // (the 2026-06-29 Apify incident: every call carried connected_account_id:"null").
+  // Treat those as "no pinned account" so resolveToolkitConnectionId picks the
+  // real live connection. Mirrors the same junk-string guard in computer-tools.ts.
+  const pinnedAccountId =
+    connectedAccountId
+    && !['null', 'undefined', 'none', ''].includes(connectedAccountId.trim().toLowerCase())
+      ? connectedAccountId
+      : undefined;
+
+  if (backend !== 'sdk' && !pinnedAccountId) {
     const cliOptions = { ...composioCliOptions(), userId };
     const cliStatus = await getComposioCliStatus(cliOptions);
     if (cliStatus.installed && (backend === 'cli' || cliStatus.authenticated)) {
@@ -1130,7 +1143,7 @@ export async function executeComposioTool(
   // from connectedAccounts rather than relying on a stale baked id or an opaque
   // default. resolveToolkitConnectionId only picks when UNAMBIGUOUS, so it can
   // never guess wrong (falls back to composio's default otherwise).
-  const resolvedConnection = connectedAccountId ?? (await resolveToolkitConnectionId(toolSlug));
+  const resolvedConnection = pinnedAccountId ?? (await resolveToolkitConnectionId(toolSlug));
   const body: Record<string, unknown> = {
     userId,
     arguments: args,

@@ -32,6 +32,7 @@ import {
   getByoBackendConfig,
   judgeChoice,
   MODELS,
+  DEFAULT_CODEX_MODEL,
 } from '../../config.js';
 import { validateRoleModelBinding } from './model-role-options.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
@@ -130,6 +131,21 @@ export function judgeDefaultModel(
   return cross?.modelId ?? '';
 }
 
+/** MODELS.primary, guarded for a Codex brain. When codex_oauth is the active
+ *  brain but the OPENAI_MODEL_* slot was repurposed for a BYO model id (e.g.
+ *  glm-5.2, which resolveProvider routes to a BYO endpoint), returning it would
+ *  silently send the "Codex" brain straight back to the BYO provider — the
+ *  "switched the brain to Codex but everything still ran on GLM" bug. Fall back
+ *  to the canonical Codex default so the turn actually runs on Codex. Non-codex
+ *  brains (claude_oauth handled by callers; api_key/all-in handled above) and a
+ *  correctly-set Codex primary are unaffected (byte-identical). */
+function codexSafePrimary(): string {
+  if (getActiveAuthMode() === 'codex_oauth' && resolveProvider(MODELS.primary) !== 'codex') {
+    return DEFAULT_CODEX_MODEL;
+  }
+  return MODELS.primary;
+}
+
 export function defaultForRole(role: ModelRole): string {
   const byo = getByoBackendConfig();
   const mode = getModelRoutingMode();
@@ -162,7 +178,7 @@ export function defaultForRole(role: ModelRole): string {
       // claude_oauth ⇒ the Claude brain; all_in+byo ⇒ the BYO primary; else the
       // Codex primary — exactly the configureHarnessRuntime outcomes.
       if (getActiveAuthMode() === 'claude_oauth') return getClaudeBrainModel();
-      return MODELS.primary;
+      return codexSafePrimary();
     }
     case 'judge': {
       // Cross-family by default (feedback: the judge should be a DIFFERENT LLM
@@ -171,14 +187,17 @@ export function defaultForRole(role: ModelRole): string {
       // and a different family is logged in, default the judge to a cheap model
       // from that other family. Otherwise fall through to the legacy choice:
       // judge=claude ⇒ the checker model (Sonnet); judge=codex ⇒ the Codex primary.
+      // Use codexSafePrimary() (not raw MODELS.primary) so the brain-provider read
+      // matches the brain the wire ACTUALLY runs — otherwise a BYO id leaked into
+      // the OPENAI_MODEL_* slot would mislabel a Codex brain as 'byo' here.
       const brainProvider: ModelProviderClass =
-        getActiveAuthMode() === 'claude_oauth' ? 'claude' : resolveProvider(MODELS.primary);
+        getActiveAuthMode() === 'claude_oauth' ? 'claude' : resolveProvider(codexSafePrimary());
       const crossFamily = judgeDefaultModel(brainProvider, debateBrainsAvailable(), {
         crossFamilyEnabled: judgeCrossFamilyEnabled(),
         explicitJudgeChoice: getRuntimeEnv('CLEMMY_DEBATE_JUDGE', '') || '',
       });
       if (crossFamily) return crossFamily;
-      return judgeChoice() === 'claude' ? getDebateCheckerModel() : MODELS.primary;
+      return judgeChoice() === 'claude' ? getDebateCheckerModel() : codexSafePrimary();
     }
     case 'worker':
     default:
@@ -187,7 +206,7 @@ export function defaultForRole(role: ModelRole): string {
       // "Default (follow the brain)" UI truthful.
       if (getActiveAuthMode() === 'claude_oauth') return getClaudeBrainModel();
       if (mode === 'worker' && byo.configured) return getWorkerModel();
-      return MODELS.primary;
+      return codexSafePrimary();
   }
 }
 

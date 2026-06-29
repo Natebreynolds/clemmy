@@ -4,7 +4,7 @@ import type { ApprovalResolutionResult, PendingApproval, RunRequest, RunResult }
 import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRuntime, type AgentRuntimeCallbacks } from './provider.js';
 import { ApprovalStore } from './approval-store.js';
 import { addNotification, getNotification } from './notifications.js';
-import { ASSISTANT_NAME, BASE_DIR } from '../config.js';
+import { ASSISTANT_NAME, BASE_DIR, DEFAULT_CODEX_MODEL } from '../config.js';
 import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, isCodexAuthDead, getCodexAuthDead } from './auth-store.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from './mcp-servers.js';
@@ -21,7 +21,6 @@ const logger = pino({ name: 'clementine-next.codex-native-runtime' });
 
 const CODEX_RESPONSES_URL = 'https://chatgpt.com/backend-api/codex/responses';
 const CODEX_USER_AGENT = 'Codex/0.118.0';
-const DEFAULT_CODEX_MODEL = 'gpt-5.4';
 
 interface CodexSseEvent {
   event?: string;

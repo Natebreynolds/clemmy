@@ -116,3 +116,19 @@ test('REGRESSION GUARD: kill-switch off ⇒ Claude-only routing disabled (untagg
     delete process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE;
   }
 });
+
+test('FIX: codex_oauth with a BYO id polluting OPENAI_MODEL_PRIMARY steers untagged steps to the Codex default (not the BYO endpoint)', () => {
+  // The 2026-06-29 incident: AUTH_MODE=codex_oauth but OPENAI_MODEL_PRIMARY=glm-5.2
+  // (a BYO id) → a {} fallback would route the step to the Z.ai endpoint. The
+  // surgical guard returns the canonical Codex default instead. Healthy Codex
+  // (gpt primary) still returns {} (proven by the HEADLINE/REGRESSION guards above).
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.OPENAI_MODEL_PRIMARY = 'glm-5.2';
+  try {
+    const routed = resolveWorkflowStepModel(readStep as never);
+    assert.equal(routed.model, 'gpt-5.4', 'polluted Codex brain steers untagged steps to the Codex default, not glm-5.2');
+  } finally {
+    process.env.AUTH_MODE = 'claude_oauth';
+    delete process.env.OPENAI_MODEL_PRIMARY;
+  }
+});

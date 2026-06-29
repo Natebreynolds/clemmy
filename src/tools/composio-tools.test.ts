@@ -203,6 +203,30 @@ test('composioThrownErrorOutput: a THROWN composio error (not-found/auth/APIErro
   assert.match(out, /DISCOVER the real options first|composio_search_tools/);
 });
 
+test('composioThrownErrorOutput: surfaces the SDK-hidden real cause/status instead of the generic stub (2026-06-29 Apify masking)', () => {
+  resetEventLog();
+  // The Composio SDK collapses .message to a generic stub and hangs the real
+  // upstream detail on .cause / .statusCode / .possibleFixes. The old code read
+  // only .message → the model saw nothing and fabricated an "auth issue".
+  const sdkErr = Object.assign(new Error('Error executing the tool APIFY_RUN_ACTOR'), {
+    statusCode: 400,
+    cause: { message: 'Actor input invalid: startUrls[0].url must be a valid URL' },
+    possibleFixes: ['Re-check the actor input schema'],
+  });
+  const out = composioThrownErrorOutput(sdkErr, { toolName: 'composio_execute_tool', toolSlug: 'APIFY_RUN_ACTOR' });
+  // The real cause + status are now visible to the model (no more silent masking).
+  assert.match(out, /HTTP 400/);
+  assert.match(out, /Actor input invalid: startUrls/);
+  assert.match(out, /Re-check the actor input schema/);
+});
+
+test('composioThrownErrorOutput: a plain error with no .cause is unchanged (no enrichment noise)', () => {
+  resetEventLog();
+  const out = composioThrownErrorOutput(new Error('boom'), { toolSlug: 'X_Y' });
+  assert.match(out, /boom/);
+  assert.doesNotMatch(out, /HTTP \d|fixes:/); // nothing fabricated when there's no detail to surface
+});
+
 
 // ─── Ever-learning: tool choices memorize themselves (auto-commit) ──────
 const { noteComposioSearchIntent, maybeAutoRememberComposioChoice } = await import('./composio-tools.js');

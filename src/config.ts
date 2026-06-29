@@ -214,6 +214,12 @@ export const MODEL_PRESETS = [
   { id: 'gpt-5.5', label: 'GPT-5.5' },
 ];
 
+/** The Codex (gpt-5.x) brain's default model — used both by the Codex runtime
+ *  and as the fallback when a Codex brain is selected but the OPENAI_MODEL_* slot
+ *  was repurposed for a BYO model id (which would otherwise route the "Codex"
+ *  brain back to the BYO endpoint). Single source of truth. */
+export const DEFAULT_CODEX_MODEL = 'gpt-5.4';
+
 export function normalizeModelId(value: unknown, fallback: string): string {
   const raw = typeof value === 'string' ? value.trim() : '';
   if (!raw) return fallback;

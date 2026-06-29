@@ -299,3 +299,28 @@ test('defaultForRole matches resolveRoleModel default path for every role', () =
     }
   });
 });
+
+// ── Codex-brain guard: a BYO model id leaked into the OPENAI_MODEL_* slot must
+//    not silently route a Codex brain back to the BYO endpoint (the 2026-06-29
+//    "switched the brain to Codex but everything still ran on GLM" incident). ──
+test('codex_oauth brain: a BYO id polluting OPENAI_MODEL_PRIMARY falls back to the Codex default', () => {
+  withEnv({ AUTH_MODE: 'codex_oauth', OPENAI_MODEL_PRIMARY: 'glm-5.2', MODEL_ROUTING_MODE: 'off' }, () => {
+    assert.equal(getActiveAuthMode(), 'codex_oauth');
+    assert.equal(defaultForRole('brain'), 'gpt-5.4', 'brain steers to the Codex default, not glm-5.2');
+    assert.equal(resolveProvider(defaultForRole('brain')), 'codex', 'and it actually routes to Codex');
+    // worker default follows the same guard
+    assert.equal(resolveProvider(defaultForRole('worker')), 'codex', 'untagged worker also runs on Codex');
+  });
+});
+
+test('codex_oauth brain: a healthy gpt primary is unchanged (byte-identical, not forced to the default)', () => {
+  withEnv({ AUTH_MODE: 'codex_oauth', OPENAI_MODEL_PRIMARY: 'gpt-5.5', MODEL_ROUTING_MODE: 'off' }, () => {
+    assert.equal(defaultForRole('brain'), 'gpt-5.5');
+  });
+});
+
+test('the guard ONLY fires for codex_oauth — an api_key brain still reports its BYO primary', () => {
+  withEnv({ AUTH_MODE: 'api_key', OPENAI_MODEL_PRIMARY: 'glm-5.2', MODEL_ROUTING_MODE: 'off' }, () => {
+    assert.equal(defaultForRole('brain'), 'glm-5.2', 'api_key brain is untouched by the Codex guard');
+  });
+});

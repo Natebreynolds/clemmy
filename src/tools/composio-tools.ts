@@ -295,11 +295,51 @@ export function formatComposioExecuteOutput(
  * throw at the execute wrapper and route it through the same loud corrective so
  * BOTH channels (returned error envelope + thrown error) make the model adapt.
  */
+/**
+ * Composio's SDK collapses real dispatch failures to a hardcoded generic
+ * `message` ("Error executing the tool <SLUG>") and hangs the actual upstream
+ * detail (HTTP status, response body, fix hints) off `.cause` / `.statusCode` /
+ * `.possibleFixes` / `getErrorData()`. Reading only `.message` discards all of
+ * it — which is how the 2026-06-29 Apify failure reached the user as a fabricated
+ * "re-authorize Apify" auth diagnosis. Fold the hidden detail back into the
+ * message so the corrective classifier AND the model see the true cause.
+ */
+function enrichComposioErrorMessage(err: unknown, fallback: string): string {
+  if (!err || typeof err !== 'object') return fallback;
+  const e = err as Record<string, unknown> & { getErrorData?: () => unknown };
+  let data: Record<string, unknown> | undefined;
+  try {
+    if (typeof e.getErrorData === 'function') {
+      const d = e.getErrorData();
+      if (d && typeof d === 'object') data = d as Record<string, unknown>;
+    }
+  } catch { /* getErrorData is best-effort */ }
+  const parts: string[] = [];
+  const statusCode = e.statusCode ?? data?.statusCode;
+  if (statusCode) parts.push(`HTTP ${String(statusCode)}`);
+  const cause = e.cause ?? data?.cause;
+  let causeMsg: string | undefined;
+  if (cause instanceof Error) causeMsg = cause.message;
+  else if (typeof cause === 'string') causeMsg = cause;
+  else if (cause && typeof cause === 'object') {
+    const c = cause as Record<string, unknown>;
+    causeMsg = typeof c.message === 'string' ? c.message
+      : typeof c.error === 'string' ? c.error
+      : JSON.stringify(c);
+  }
+  if (causeMsg && causeMsg.trim() && causeMsg.trim() !== fallback) parts.push(causeMsg.trim().slice(0, 600));
+  const fixes = e.possibleFixes ?? data?.possibleFixes;
+  if (Array.isArray(fixes) && fixes.length) parts.push(`fixes: ${fixes.map(String).join('; ').slice(0, 300)}`);
+  const enriched = parts.join(' — ');
+  return enriched ? `${fallback} (${enriched})` : fallback;
+}
+
 export function composioThrownErrorOutput(
   err: unknown,
   options: FormatComposioToolOutputOptions = {},
 ): string {
-  const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
+  const rawMessage = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
+  const message = enrichComposioErrorMessage(err, rawMessage).replace(/\s+/g, ' ').trim();
   const summary = message.slice(0, 240) || 'unknown error';
   const notFound = COMPOSIO_NOT_FOUND_RE.test(message);
   const body = formatComposioToolOutput({ error: message, toolSlug: options.toolSlug ?? null }, options);
