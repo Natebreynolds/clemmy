@@ -219,10 +219,21 @@ export interface BrainOption {
  *  OWNING provider's baseURL+key via resolveByoProviderForModel, so selecting an
  *  extra-provider model (e.g. a Together AI model) just works — no slot reshuffle. */
 export function brainOptions(): BrainOption[] {
-  const opts: BrainOption[] = [
-    { id: 'codex_oauth', value: 'codex_oauth', label: 'Codex — GPT-5.x', available: codexModelsAvailable() },
-    { id: 'claude_oauth', value: 'claude_oauth', label: 'Claude — Opus', available: claudeModelsAvailable() },
-  ];
+  const opts: BrainOption[] = [];
+  // Codex brain: offer the SPECIFIC gpt-5.x model (like the worker picker) so the
+  // brain can be pinned to gpt-5.5 vs gpt-5.4 — not just "Codex". Sourced from the
+  // same connected-Codex model list the worker uses; value `codex_oauth:<id>` so
+  // the active-brain route persists the exact model. Falls back to the generic
+  // entry when Codex isn't connected so the row still renders.
+  const codexGroup = connectedModelGroups().find((g) => g.provider === 'codex');
+  if (codexGroup && codexGroup.models.length > 0) {
+    for (const m of codexGroup.models) {
+      opts.push({ id: 'codex_oauth', value: `codex_oauth:${m.id}`, modelId: m.id, label: `Codex — ${m.label}`, available: true });
+    }
+  } else {
+    opts.push({ id: 'codex_oauth', value: 'codex_oauth', label: 'Codex — GPT-5.x', available: false });
+  }
+  opts.push({ id: 'claude_oauth', value: 'claude_oauth', label: 'Claude — Opus', available: claudeModelsAvailable() });
   const seen = new Set<string>();
   for (const provider of getByoProviders()) {
     if (!providerToBackendConfig(provider).configured) continue;
@@ -259,7 +270,10 @@ export function effectiveBrainValue(): string {
   const brainModelId = defaultForRole('brain');
   const provider = resolveProvider(brainModelId);
   if (provider === 'claude') return 'claude_oauth';
-  if (provider === 'codex') return 'codex_oauth';
+  // codex → the SPECIFIC model value so the picker highlights the right gpt-5.x row
+  // (brainOptions lists every connected Codex model; the resolved id is always one
+  // of them — MODEL_PRESETS includes the DEFAULT_CODEX_MODEL fallback).
+  if (provider === 'codex') return `codex_oauth:${brainModelId}`;
   return `api_key:${brainModelId}`; // byo → matches its api_key:<modelId> option
 }
 

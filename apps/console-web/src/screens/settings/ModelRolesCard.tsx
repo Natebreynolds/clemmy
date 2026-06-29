@@ -160,7 +160,9 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   // The option value is the unique selector: a BYO model is `api_key:<modelId>`
   // (so any connected model can be the brain), Codex/Claude are their plain ids.
   const onBrain = (value: string) => run('brain', () =>
-    value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length)) : setActiveBrain(value as ActiveBrain));
+    value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length))
+      : value.startsWith('codex_oauth:') ? setActiveBrain('codex_oauth', value.slice('codex_oauth:'.length))
+        : setActiveBrain(value as ActiveBrain));
   const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
 

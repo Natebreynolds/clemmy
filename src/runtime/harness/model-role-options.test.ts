@@ -16,6 +16,7 @@ const {
   validateRoleModelBinding,
   brainOptions,
   effectiveBrain,
+  effectiveBrainValue,
   falloverBrainModelIds,
 } = await import('./model-role-options.js');
 
@@ -209,6 +210,28 @@ test('brainOptions hides BYO when no backend; effectiveBrain follows AUTH_MODE o
   }, () => {
     assert.equal(brainOptions().some((o) => o.id === 'api_key'), false, 'no BYO brain option without a backend');
     assert.equal(effectiveBrain(), 'codex_oauth');
+  });
+});
+
+test('brainOptions offers SPECIFIC Codex models (codex_oauth:<id>) so the brain can be pinned to gpt-5.5 vs gpt-5.4', () => {
+  writeAuthFiles();
+  // The polluted real-world case: a BYO id left in the OPENAI_MODEL_* slot while
+  // the brain is Codex. The picker must still offer the real gpt-5.x models, and
+  // effectiveBrainValue must stay one of them (the codexSafePrimary fallback).
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.z.ai/api/paas/v4', BYO_MODEL_ID: 'glm-5.2',
+    BYO_MODEL_API_KEY: 'zai-key', BYO_MODEL_PROVIDER: 'GLM (Z.ai)',
+    OPENAI_MODEL_PRIMARY: 'glm-5.2', MODEL_ROUTING_MODE: 'off', AUTH_MODE: 'codex_oauth',
+  }, () => {
+    const opts = brainOptions();
+    const codexValues = opts.filter((o) => o.id === 'codex_oauth').map((o) => o.value);
+    assert.ok(codexValues.includes('codex_oauth:gpt-5.5'), 'gpt-5.5 is a selectable Codex brain');
+    assert.ok(codexValues.includes('codex_oauth:gpt-5.4'), 'gpt-5.4 is a selectable Codex brain');
+    // The invariant: the highlighted value is always a real picker option. With the
+    // slot polluted by glm-5.2, the Codex brain resolves to the gpt-5.4 default.
+    const value = effectiveBrainValue();
+    assert.ok(value.startsWith('codex_oauth:'), `codex brain value is model-specific, got ${value}`);
+    assert.ok(opts.map((o) => o.value).includes(value), `effectiveBrainValue ${value} must be a real option`);
   });
 });
 

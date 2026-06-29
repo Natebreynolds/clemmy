@@ -22,6 +22,7 @@ import {
   getByoProviderApiKey,
   getModelRoutingMode,
   getActiveAuthMode,
+  DEFAULT_CODEX_MODEL,
   type ModelTier,
   type ModelRoutingMode,
 } from '../config.js';
@@ -7902,6 +7903,25 @@ export function registerConsoleRoutes(
         if (getModelRoutingMode() === 'all_in') {
           updateEnvKey('MODEL_ROUTING_MODE', 'off');
           process.env.MODEL_ROUTING_MODE = 'off';
+        }
+        if (brain === 'codex_oauth') {
+          // A Codex brain orchestrates with a gpt-5.x model. Two jobs:
+          //  (1) honor an explicit model pick from the brain dropdown
+          //      (value `codex_oauth:<id>` → brainModelId), e.g. gpt-5.5; and
+          //  (2) SCRUB any BYO model id that leaked into the OPENAI_MODEL_* slots
+          //      (e.g. glm-5.2 from a prior BYO brain) back to the Codex default —
+          //      otherwise the "Codex" brain resolves to (and the router sends it to)
+          //      the BYO endpoint, or codexSafePrimary pins it to the gpt-5.4 fallback
+          //      forever. A valid gpt-5.x slot is left exactly as-is.
+          const wantedPrimary = /^gpt-5/i.test(brainModelId) ? brainModelId : '';
+          for (const key of ['OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_FAST', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER'] as const) {
+            const cur = (getRuntimeEnv(key, '') || '').trim();
+            const polluted = cur !== '' && resolveProvider(cur) !== 'codex';
+            const next = key === 'OPENAI_MODEL_PRIMARY' && wantedPrimary
+              ? wantedPrimary
+              : (polluted ? DEFAULT_CODEX_MODEL : cur);
+            if (next && next !== cur) { updateEnvKey(key, next); process.env[key] = next; }
+          }
         }
       }
 
