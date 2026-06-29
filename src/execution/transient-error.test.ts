@@ -9,7 +9,19 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isTransientStepError } from './transient-error.js';
+import { isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
+
+test('isUnparseableToolCallError: parse-failure is FALLOVER-eligible but NOT same-model retryable', () => {
+  const pf = new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed).");
+  // It is a parse-failure → fall over to a DIFFERENT brain…
+  assert.equal(isUnparseableToolCallError(pf), true);
+  // …but it is NOT transient (so it never triggers a wasteful same-model retry).
+  assert.equal(isTransientStepError(pf), false);
+  // A plain overload is the opposite: transient-retryable, not a parse failure.
+  assert.equal(isUnparseableToolCallError(new Error('API Error: 529 Overloaded')), false);
+  // A deterministic error is neither.
+  assert.equal(isUnparseableToolCallError(new Error('missing required field actorId')), false);
+});
 
 test('provider overloads surfaced in the message are transient (the 529 regression)', () => {
   // The exact strings from the two failed scheduled runs.

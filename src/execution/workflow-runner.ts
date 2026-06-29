@@ -1757,7 +1757,7 @@ const RETRY_BACKOFF_BASE_MS = parseInt(
 // (transient-error.ts) so low-level tool modules (composio-tools) can share it
 // without importing this high-level runner. Imported for internal step-retry
 // use + re-exported for back-compat with existing importers.
-import { isTransientStepError } from './transient-error.js';
+import { isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
 export { isTransientStepError };
 
 /**
@@ -1985,10 +1985,12 @@ async function executeStepVerified(
       return await runStepVerifiedAttempt(attemptStep, ctx);
     } catch (err) {
       if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
-      // Only a transient PROVIDER failure justifies switching brains; a real
-      // deterministic error (bad input, contract, 4xx) repeats identically on
-      // any model — fail fast, don't burn the whole chain.
-      if (!isTransientStepError(err)) throw err;
+      // A transient PROVIDER failure OR an unparseable-tool-call (a flaky model
+      // stumble) justifies switching brains; a real deterministic error (bad input,
+      // contract, 4xx) repeats identically on any model — fail fast, don't burn the
+      // whole chain. Parse-failure used to fall over NOWHERE — the workflow lane
+      // died on it (2026-06-29 gap analysis).
+      if (!isTransientStepError(err) && !isUnparseableToolCallError(err)) throw err;
       lastErr = err;
     }
   }

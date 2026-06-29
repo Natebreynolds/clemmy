@@ -6,6 +6,7 @@ import {
 } from '../../spaces/workspace-context.js';
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
+import { isUnparseableToolCallError } from '../../execution/transient-error.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { pullRecentTurnsForSession, renderRecentSessionActions } from './session-transcript.js';
@@ -64,14 +65,11 @@ function narrationRetryEnabled(): boolean {
 function claudeSdkSalvageEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SALVAGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
-/** The Claude Agent SDK's `query()` throws this — its OWN internal parse-retry
- *  already failed — when the model emits a tool call whose JSON can't be parsed.
- *  Surfaced via the "Claude Code returned an error result:" prefix. A flaky, often
- *  transient model stumble, NOT a deterministic bad request. */
-export function isClaudeSdkUnparseableToolCall(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err ?? '');
-  return /tool call could not be parsed|could not be parsed \(retry also failed\)/i.test(msg);
-}
+/** SDK-named alias for the SHARED fallover classifier (transient-error.ts), so the
+ *  chat lane and the workflow step-boundary fallover classify a parse-failure
+ *  identically. The SDK's `query()` throws this — its own parse-retry already failed
+ *  — when the model emits a tool call whose JSON can't be parsed. */
+export const isClaudeSdkUnparseableToolCall = isUnparseableToolCallError;
 /** When the SDK throws AFTER side effects already committed this turn (the work is
  *  done — only the SDK's final wrap-up failed), synthesize a SUCCESS result from
  *  the turn's own external_write ledger so the normal terminal block delivers a

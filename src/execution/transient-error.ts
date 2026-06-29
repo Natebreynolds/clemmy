@@ -38,3 +38,17 @@ export function isTransientStepError(err: unknown, depth = 0): boolean {
   if (depth < 3 && code?.cause && code.cause !== err) return isTransientStepError(code.cause, depth + 1);
   return false;
 }
+
+/**
+ * The Claude Agent SDK throws this (its OWN internal parse-retry already failed)
+ * when the model emits a tool call whose JSON can't be parsed. It is NOT same-model
+ * retryable (the SDK just exhausted that) and NOT a deterministic bad request — it's
+ * a flaky model stumble a DIFFERENT brain usually doesn't reproduce. So it is
+ * FALLOVER-eligible: switch model, don't retry the same one. Shared by the chat
+ * fallover (respond-bridge) and the workflow step-boundary fallover so both lanes
+ * classify it identically.
+ */
+export function isUnparseableToolCallError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /tool call could not be parsed|could not be parsed \(retry also failed\)/i.test(msg);
+}
