@@ -656,3 +656,54 @@ test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local a
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('composio_execute_tool'), false);
 });
+
+test('salvage A: a parse error AFTER work committed returns a SUCCESS confirmation and NEVER re-runs (no double-send)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE; // default on
+  createSession({ id: 'salvage-committed', kind: 'chat', title: 'salvage' });
+  // The 3 emails already sent this turn — recorded as external_write events.
+  for (const t of ['a@x.com', 'b@y.com', 'c@z.com']) {
+    appendEvent({ sessionId: 'salvage-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
+  }
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed)."); });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'sent' }));
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send those 3 emails', sessionId: 'salvage-committed' });
+  assert.equal(calls, 1, 'must NOT re-run after a committed send (no double-send)');
+  assert.equal(res.stoppedReason, 'success');
+  assert.match(res.text, /3 emails/);
+  assert.match(res.text, /a@x\.com/);
+  assert.doesNotMatch(res.text, /could not be parsed|went wrong/i);
+});
+
+test('salvage B: a parse error with NOTHING committed retries once and succeeds', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
+  createSession({ id: 'salvage-retry', kind: 'chat', title: 'salvage retry' });
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed).");
+    return { text: 'Here is your answer.', sessionId: 'sdk', model: 'claude-opus-4-8', toolUses: [] };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'what is 2+2', sessionId: 'salvage-retry' });
+  assert.equal(calls, 2, 'retried once after a pre-commit parse error');
+  assert.match(res.text, /Here is your answer/);
+});
+
+test('salvage: kill-switch off ⇒ the parse error propagates (byte-identical to before)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_CLAUDE_SDK_SALVAGE = 'off';
+  createSession({ id: 'salvage-off', kind: 'chat', title: 'off' });
+  appendEvent({ sessionId: 'salvage-off', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'X', toolName: 'composio_execute_tool', targets: ['a@x.com'] } });
+  setClaudeAgentSdkBrainRunForTest(async () => { throw new Error("Claude Code returned an error result: The model's tool call could not be parsed (retry also failed)."); });
+  await assert.rejects(
+    () => respondViaClaudeAgentSdkBrain('home', { message: 'go', sessionId: 'salvage-off' }),
+    /could not be parsed/,
+  );
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
+});

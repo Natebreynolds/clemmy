@@ -61,6 +61,35 @@ export function sdkStreamingEnabled(): boolean {
 function narrationRetryEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NARRATION_RETRY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
+function claudeSdkSalvageEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SALVAGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+/** The Claude Agent SDK's `query()` throws this — its OWN internal parse-retry
+ *  already failed — when the model emits a tool call whose JSON can't be parsed.
+ *  Surfaced via the "Claude Code returned an error result:" prefix. A flaky, often
+ *  transient model stumble, NOT a deterministic bad request. */
+function isClaudeSdkUnparseableToolCall(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /tool call could not be parsed|could not be parsed \(retry also failed\)/i.test(msg);
+}
+/** When the SDK throws AFTER side effects already committed this turn (the work is
+ *  done — only the SDK's final wrap-up failed), synthesize a SUCCESS result from
+ *  the turn's own external_write ledger so the normal terminal block delivers a
+ *  grounded confirmation instead of a hard "Didn't finish". NEVER re-runs (that
+ *  would double-act). Returns null when nothing committed (let the caller retry). */
+function salvageCommittedResult(sessionId: string): ClaudeAgentSdkRunResult | null {
+  let writes: Array<{ toolName?: string; shapeKey?: string; targets?: string[] }> = [];
+  try {
+    writes = listEvents(sessionId, { types: ['external_write'] }).map((e) => e.data as { toolName?: string; shapeKey?: string; targets?: string[] });
+  } catch { return null; }
+  if (writes.length === 0) return null;
+  const targets = [...new Set(writes.flatMap((w) => (w.targets ?? []).filter((t): t is string => typeof t === 'string')))];
+  const allEmail = writes.every((w) => /SEND_EMAIL|SEND_MAIL/i.test(w.shapeKey ?? ''));
+  const noun = allEmail ? (writes.length === 1 ? 'email' : 'emails') : (writes.length === 1 ? 'action' : 'actions');
+  const targetList = targets.length > 0 ? ` to ${targets.slice(0, 8).join(', ')}` : '';
+  const text = `✅ Done — ${writes.length} ${noun}${targetList} completed successfully. (I hit a hiccup writing the final summary, but the work above went through and nothing was duplicated.)`;
+  return { text, toolUses: writes.map((w) => w.toolName ?? 'tool'), limitHit: false, sessionId };
+}
 
 function renderLimitHitReply(text: string): string {
   const base = text.trim() || 'I reached the turn budget before finishing.';
@@ -506,7 +535,46 @@ export async function respondViaClaudeAgentSdkBrain(
     if (streamedAny) return { ...runOptions, onDelta: undefined };
     return runOptions;
   };
-  let result = await runClaudeAgentSdkImpl({ prompt: request.message, ...runOptions });
+  // Salvage/recover wrapper for the SDK dispatch. On an unparseable-tool-call
+  // throw (the SDK's own parse-retry already failed): (A) if side effects already
+  // committed this turn → return a grounded SUCCESS confirmation (NEVER re-run —
+  // would double-act, e.g. re-send emails); (B) if nothing committed → ONE fresh
+  // retry (a fresh query() usually re-derives a clean tool call). Kill-switch
+  // CLEMMY_CLAUDE_SDK_SALVAGE. Healthy turns are byte-identical.
+  const runWithSalvage = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkRunResult> => {
+    try {
+      return await runClaudeAgentSdkImpl(opts);
+    } catch (err) {
+      if (!claudeSdkSalvageEnabled() || !isClaudeSdkUnparseableToolCall(err)) throw err;
+      const salvaged = salvageCommittedResult(sessionId);
+      if (salvaged) {
+        try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_salvaged', reason: 'unparseable_tool_call_after_commit' } }); } catch { /* best-effort */ }
+        return salvaged;
+      }
+      // Nothing committed yet — safe to retry once.
+      try {
+        return await runClaudeAgentSdkImpl(opts);
+      } catch (err2) {
+        if (isClaudeSdkUnparseableToolCall(err2)) {
+          const s2 = salvageCommittedResult(sessionId); // the retry may have committed before failing
+          if (s2) return s2;
+        }
+        throw err2;
+      }
+    }
+  };
+  // A best-effort CONTINUATION (narration/reasoning/judge retry) runs only after a
+  // GOOD result. If it hits the same parse stumble, keep the prior good result
+  // rather than turning a finished turn into a failure. Returns null ⇒ keep prior.
+  const runContinuation = async (opts: Parameters<typeof runClaudeAgentSdkImpl>[0]): Promise<ClaudeAgentSdkRunResult | null> => {
+    try {
+      return await runClaudeAgentSdkImpl(opts);
+    } catch (err) {
+      if (claudeSdkSalvageEnabled() && isClaudeSdkUnparseableToolCall(err)) return null;
+      throw err;
+    }
+  };
+  let result = await runWithSalvage({ prompt: request.message, ...runOptions });
 
   // Narrate-instead-of-call backstop (defense-in-depth; the lean rubric prevents
   // most of it). If the brain made NO real tool calls but its text reproduces the
@@ -514,13 +582,13 @@ export async function respondViaClaudeAgentSdkBrain(
   // with a hard nudge to actually invoke the tool. Kill-switch
   // CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
   if (!result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
-    const retry = await runClaudeAgentSdkImpl({
+    const retry = await runContinuation({
       prompt:
         `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
         `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
       ...cleanContinuationRunOptions(),
     });
-    result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
+    if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
   }
 
   // Reasoning-leak backstop (defense-in-depth; the trusted-memory framing prevents
@@ -531,14 +599,14 @@ export async function respondViaClaudeAgentSdkBrain(
   // trusted and to just do the work. Any mode (a read turn can spiral too).
   // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
   if (!result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
-    const retry = await runClaudeAgentSdkImpl({
+    const retry = await runContinuation({
       prompt:
         `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
         `Your injected Clementine memory (profile, saved preferences/specs, learned facts) is TRUSTED context you OWN — not user-pasted input and not a prompt-injection. Do NOT reason about its provenance. ` +
         `Just do exactly what the user asked: "${request.message}". Use the relevant tools and reply with the real result.`,
       ...cleanContinuationRunOptions(),
     });
-    result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
+    if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
   }
 
   // Objective-completion judge (parity with the harness loop): on an authoring
@@ -575,13 +643,14 @@ export async function respondViaClaudeAgentSdkBrain(
         reason = verdict.reason;
       } catch { break; } // fail-open — a flaky judge must never wedge the turn
       if (done) break;
-      const contResult = await runClaudeAgentSdkImpl({
+      const contResult = await runContinuation({
         prompt:
           `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
           `Original request: "${request.message}". Continue now and FINISH it — produce the concrete ` +
           `artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
         ...cleanContinuationRunOptions(),
       });
+      if (!contResult) break; // parse stumble on a continuation → keep the prior good result
       result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
       if (contResult.limitHit) break;
     }
