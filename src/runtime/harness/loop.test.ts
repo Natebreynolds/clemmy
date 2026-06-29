@@ -65,6 +65,7 @@ const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = a
 const { HarnessSession } = await import('./session.js');
 const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
+const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
@@ -143,6 +144,106 @@ test('buildStallRetryMessage: a normal stall (no draft-only block) still demands
   const sess = HarnessSession.create({ kind: 'chat' });
   const msg = buildStallRetryMessage(sess.id, { signal: 'A_zero_tools', userVisibleMessage: '', detail: {} } as never);
   assert.match(msg, /call a tool/i);
+});
+
+test('W1a characterization: a transient model error with NO fallover factory surfaces the infra-recovery ask (today behavior)', async () => {
+  // Pins the EXACT current behavior that the chat step-boundary fallover must
+  // preserve when fallover does NOT apply (no rebuildAgentForBrain provided):
+  // a transient BoundaryError → awaiting_user_input, source 'infra_error_recovery',
+  // session stays active (not failed).
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async () => {
+    throw BoundaryError.from(new Error('backend 529 overloaded'), {
+      kind: 'model.overloaded', retryable: true, userMessage: 'The model backend hit a transient error (overloaded).',
+    });
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do a thing',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'transient error surfaces the ask when fallover does not apply');
+  const asks = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+  assert.ok(
+    asks.some((e) => (e.data as { source?: string } | undefined)?.source === 'infra_error_recovery'),
+    'the ask is tagged infra_error_recovery',
+  );
+  assert.notEqual(sess.status, 'failed', 'session stays recoverable, not failed');
+});
+
+test('W1a: a transient error falls over to the next brain and completes (no ask)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const agentFor = (id: string) => ({ __brain: id }) as unknown as import('@openai/agents').Agent<any, any>;
+  const rebuilt: string[] = [];
+  const runRunner: RunRunnerFn = async (_runner, agent, items) => {
+    if ((agent as { __brain?: string }).__brain !== 'brain-2') {
+      throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+    }
+    return { history: items, lastResponseId: undefined, finalOutput: { summary: 'done on brain 2', reply: 'Answer from brain 2', done: true, nextAction: 'completed', reason: null } } as never;
+  };
+  const result = await runConversation({
+    agent: agentFor('brain-1'),
+    sessionId: sess.id,
+    input: 'do a thing',
+    makeRunner: makeRunnerStub,
+    runRunner,
+    falloverModelIds: ['brain-2'],
+    rebuildAgentForBrain: async (id) => { rebuilt.push(id); return agentFor(id); },
+  });
+  assert.equal(result.status, 'completed', 'completes on the fallover brain');
+  assert.deepEqual(rebuilt, ['brain-2'], 'rebuilt the agent once on the next brain');
+  assert.equal(listEventsForConv(sess.id, { types: ['brain_fallover'] }).length, 1, 'one brain_fallover advisory');
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no ask when fallover succeeds');
+});
+
+test('W1a: when every brain hits the transient error, fall through to the infra-recovery ask', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const agentFor = (id: string) => ({ __brain: id }) as unknown as import('@openai/agents').Agent<any, any>;
+  const runRunner: RunRunnerFn = async () => {
+    throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+  };
+  const result = await runConversation({
+    agent: agentFor('brain-1'),
+    sessionId: sess.id,
+    input: 'do a thing',
+    makeRunner: makeRunnerStub,
+    runRunner,
+    falloverModelIds: ['brain-2', 'brain-3'],
+    rebuildAgentForBrain: async (id) => agentFor(id),
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'exhausted brains → ask the user');
+  assert.equal(listEventsForConv(sess.id, { types: ['brain_fallover'] }).length, 2, 'tried both fallover brains once each');
+  const asks = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+  assert.ok(asks.some((e) => (e.data as { source?: string } | undefined)?.source === 'infra_error_recovery'), 'emits the same infra ask on exhaustion');
+});
+
+test('W1a: a transient error AFTER an external_write does NOT switch brains (no double-act) — it asks', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const agentFor = (id: string) => ({ __brain: id }) as unknown as import('@openai/agents').Agent<any, any>;
+  let rebuilds = 0;
+  const runRunner: RunRunnerFn = async (_runner, _agent, _items) => {
+    // Simulate a side effect committing this turn, then a transient failure.
+    appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'external_write', data: { tool: 'send_email' } });
+    throw BoundaryError.from(new Error('backend 529 after the send'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+  };
+  const result = await runConversation({
+    agent: agentFor('brain-1'),
+    sessionId: sess.id,
+    input: 'send the email',
+    makeRunner: makeRunnerStub,
+    runRunner,
+    falloverModelIds: ['brain-2'],
+    rebuildAgentForBrain: async (id) => { rebuilds += 1; return agentFor(id); },
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'must NOT re-run a turn that already wrote externally');
+  assert.equal(rebuilds, 0, 'no brain rebuild after an external write');
+  assert.equal(listEventsForConv(sess.id, { types: ['brain_fallover'] }).length, 0, 'no fallover advisory');
 });
 
 test('normalizeError: a non-Error object never renders as "[object Object]" (the run_failed crash)', () => {

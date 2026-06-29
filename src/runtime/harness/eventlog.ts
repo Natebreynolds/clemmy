@@ -187,6 +187,11 @@ export const EVENT_TYPES = [
   // tool_jit_scope / rubric_variant — pure telemetry, never alters behavior; the
   // measurement spine for the goal re-Orient feature (default since 2026-06-27). (2026-06-24.)
   'ooda_cycle',
+  // W1a chat step-boundary brain fallover: a transient model/codex error on one
+  // brain was re-dispatched to the next brain mid-conversation (carries
+  // {reason, kind, toModel, attempt}). Telemetry + the visible parity twin of the
+  // workflow runner's step_advisory{reason:'brain_fallover'}.
+  'brain_fallover',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

@@ -32,6 +32,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
+import { buildChatFalloverWiring } from '../runtime/harness/respond-bridge.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
@@ -2115,7 +2116,18 @@ export async function runDiscordHarnessConversation(opts: {
         });
       } else {
         const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId: session.id });
-        await runConversation({ agent, sessionId: session.id, input: effectiveInput, judgeCompletion: true, onChunk });
+        // W1a — chat step-boundary brain fallover for the Discord/Slack lane (the
+        // primary external chat surface), parity with respondViaHarness.
+        const fallover = buildChatFalloverWiring({
+          userInput: effectiveInput,
+          sessionId: session.id,
+          buildAgent: buildOrchestratorAgent,
+        });
+        await runConversation({
+          agent, sessionId: session.id, input: effectiveInput, judgeCompletion: true, onChunk,
+          falloverModelIds: fallover.falloverModelIds,
+          rebuildAgentForBrain: fallover.rebuildAgentForBrain,
+        });
       }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);

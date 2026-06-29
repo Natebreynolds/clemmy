@@ -72,7 +72,22 @@ export function falloverBrainModelIds(current: BrainProviderClass): Array<{ prov
   if (current !== 'claude' && claudeModelsAvailable()) out.push({ provider: 'claude', modelId: getClaudeBrainModel() });
   const byo = getByoBackendConfig();
   if (current !== 'byo' && byo.configured) out.push({ provider: 'byo', modelId: byo.primaryId || MODELS.primary });
-  return out;
+  // Correctness guard: every entry's modelId must actually ROUTE to its claimed
+  // provider, and no two entries may collapse to the same wire provider. The
+  // codex entry borrows MODELS.primary, which is normally a gpt-* (codex) id —
+  // but if a config overrides it to a BYO model (e.g. OPENAI_MODEL_PRIMARY=glm-*),
+  // that entry would resolve to BYO and duplicate the BYO target (a redundant
+  // same-brain "fallover" that re-hits the failing provider). Drop mis-routed +
+  // duplicate entries so a fallover always reaches a genuinely DIFFERENT brain.
+  const seen = new Set<string>([current]);
+  return out.filter((e) => {
+    let resolved: string;
+    try { resolved = resolveProvider(e.modelId); } catch { return false; }
+    if (resolved !== e.provider) return false; // modelId doesn't actually route to its provider
+    if (seen.has(resolved)) return false;       // already covered by an earlier (or current) brain
+    seen.add(resolved);
+    return true;
+  });
 }
 
 export function claudeModelsAvailable(): boolean {

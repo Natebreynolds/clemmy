@@ -631,6 +631,10 @@ export interface RunTurnOptions {
   suppressMemoryCapture?: boolean;
   /** See RunConversationOptions.reuseRecordedUserInput. */
   reuseRecordedUserInput?: boolean;
+  /** W1a: when true, a TRANSIENT model/codex error returns `infraTransientKind`
+   *  WITHOUT writing the infra-recovery ask, so runConversation can attempt
+   *  cross-brain fallover first. Off (default) = today's behavior verbatim. */
+  deferInfraAsk?: boolean;
 }
 
 export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
@@ -645,6 +649,14 @@ export interface RunTurnResult {
    *  outer loop to detect sub-agent stalls (zero tools + short generic
    *  output = the model punted on the directive). */
   toolCalls?: number;
+  /** W1a chat step-boundary fallover: set to the BoundaryError kind when the turn
+   *  failed on a TRANSIENT model/codex error AND the caller asked to defer the
+   *  infra ask (deferInfraAsk) so it can try cross-brain fallover first. The ask
+   *  event is NOT written in this case — runConversation decides switch-vs-ask. */
+  infraTransientKind?: string;
+  /** The deferred ask's user-facing message, so the exhausted-fallover path emits
+   *  the byte-identical ask the direct path would have. */
+  infraTransientUserMessage?: string;
 }
 
 // ---------- runConversation ----------
@@ -733,6 +745,18 @@ export interface RunConversationOptions {
    * committed. Reuse that row instead of duplicating it on the fallback lane.
    */
   reuseRecordedUserInput?: boolean;
+  /**
+   * W1a chat step-boundary brain fallover. When BOTH are provided, a turn that
+   * fails on a TRANSIENT model/codex error (and has NOT written externally this
+   * turn) is re-attempted on the next brain instead of immediately asking the
+   * user. `falloverModelIds` is the ordered list of next-brain model ids (the
+   * caller computes it via falloverBrainModelIds); `rebuildAgentForBrain` rebuilds
+   * the orchestrator agent bound to a given model. Absent → today's ask behavior.
+   * The caller (respond-bridge, chat surfaces only) owns the CLEMMY_BRAIN_FALLOVER
+   * gate by choosing whether to pass these.
+   */
+  falloverModelIds?: string[];
+  rebuildAgentForBrain?: (modelId: string) => Promise<Agent<any, any>>;
 }
 
 export interface RunConversationResult {
@@ -1426,6 +1450,17 @@ async function runConversationCore(
   let objectiveJudgeContinuations = 0;
   let totalToolCalls = 0;
 
+  // W1a chat step-boundary brain fallover state. `currentAgent` swaps to a
+  // rebuilt agent on the next brain when a turn fails transiently; tried ids
+  // prevent re-trying the same brain. Capability = caller passed both hooks.
+  let currentAgent = options.agent;
+  const triedFalloverModelIds = new Set<string>();
+  const falloverCapable = !!options.rebuildAgentForBrain && (options.falloverModelIds?.length ?? 0) > 0;
+  // True for the iteration immediately following a brain switch — the input for
+  // this step was already recorded (and memory-captured) by the failed attempt,
+  // so the re-attempt must not duplicate either.
+  let falloverReattempt = false;
+
   // One-way budget elevation (standard → long). Shared by the token-fraction
   // trigger (preflight warn/block) and the step-progress trigger below. Rebinds
   // the cached ceilings so the next loop iteration picks them up. No-op when
@@ -1456,22 +1491,84 @@ async function runConversationCore(
   while (stepIndex < maxSteps) {
     stepIndex += 1;
 
+    // Baseline for the canSwitch guard: if this turn records an external_write,
+    // we must NOT re-dispatch it to another brain (would double-act).
+    const extWritesBefore = falloverCapable
+      ? listEvents(options.sessionId, { types: ['external_write'] }).length
+      : 0;
+    const canStillFallover = falloverCapable
+      && triedFalloverModelIds.size < (options.falloverModelIds?.length ?? 0);
+
     const turnResult = await runTurn({
-      agent: options.agent,
+      agent: currentAgent,
       sessionId: options.sessionId,
       input: nextInput,
       // Only the first step carries the real user message; every later step is a
       // harness continuation (judge/stall/grounding re-prompt) → don't learn it.
-      suppressMemoryCapture: stepIndex > 1,
-      reuseRecordedUserInput: stepIndex === 1 ? options.reuseRecordedUserInput : false,
+      // A fallover re-attempt re-runs the SAME step → its input is already
+      // recorded + captured, so suppress both regardless of stepIndex.
+      suppressMemoryCapture: stepIndex > 1 || falloverReattempt,
+      reuseRecordedUserInput: falloverReattempt
+        ? true
+        : (stepIndex === 1 ? options.reuseRecordedUserInput : false),
       maxTurns,
       toolCallsPerTurn,
       makeRunner: options.makeRunner,
       runRunner: options.runRunner,
       onChunk: options.onChunk,
+      // Defer the infra ask only while another brain is still available to try.
+      deferInfraAsk: canStillFallover,
     });
+    falloverReattempt = false;
     lastTurn = turnResult.turn;
     totalToolCalls += turnResult.toolCalls ?? 0;
+
+    // W1a — chat step-boundary brain fallover. A deferred transient model/codex
+    // error (infraTransientKind set, ask NOT yet written) → re-attempt on the next
+    // brain, guarded so a turn that already wrote externally is never re-run.
+    if (turnResult.infraTransientKind && falloverCapable) {
+      const extWritesAfter = listEvents(options.sessionId, { types: ['external_write'] }).length;
+      const canSwitch = extWritesAfter === extWritesBefore;
+      const nextModelId = canSwitch
+        ? (options.falloverModelIds ?? []).find((m) => !triedFalloverModelIds.has(m))
+        : undefined;
+      if (nextModelId) {
+        triedFalloverModelIds.add(nextModelId);
+        let rebuilt: Agent<any, any> | null = null;
+        try { rebuilt = await options.rebuildAgentForBrain!(nextModelId); } catch { rebuilt = null; }
+        if (rebuilt) {
+          currentAgent = rebuilt;
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'brain_fallover',
+            data: { reason: 'chat_step_boundary', kind: turnResult.infraTransientKind, toModel: nextModelId, attempt: triedFalloverModelIds.size },
+          });
+          stepIndex -= 1; // re-attempt the SAME step on the next brain
+          falloverReattempt = true; // its input is already recorded — don't duplicate
+          continue;
+        }
+      }
+      // Brains exhausted / external write already happened / rebuild failed →
+      // emit the same infra-recovery ask the non-fallover path would have, then return.
+      emitInfraTransientAsk(
+        options.sessionId,
+        turnResult.turn,
+        turnResult.infraTransientKind,
+        turnResult.infraTransientUserMessage ?? '',
+        undefined,
+        turnResult.error ?? '',
+      );
+      return {
+        sessionId: options.sessionId,
+        status: 'awaiting_user_input',
+        steps: stepIndex,
+        lastDecision,
+        lastTurn,
+        error: turnResult.error,
+      };
+    }
 
     // v0.5.19 F2 — elevate budget mid-conversation if the preflight
     // gate just emitted warn/block AND we're still on `standard`.
@@ -3516,7 +3613,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       toolCalls: toolCounter.currentCount,
     };
   } catch (err) {
-    return handleRunError(options.sessionId, turn, session, err);
+    return handleRunError(options.sessionId, turn, session, err, { deferInfraAsk: options.deferInfraAsk });
   } finally {
     detachLogHooks();
     (runner as unknown as RunHooksLike).off(
@@ -4438,11 +4535,67 @@ export function isCodexAuthRevoked(err: unknown, message: string): boolean {
   return classifyCodexAuthError({ message, status, source: 'model' }) === 'terminal';
 }
 
+// Transient model/codex error kinds where switching to a DIFFERENT brain can
+// actually recover (overload / 5xx / timeout / rate-limit on a different provider).
+// NOT mcp.* (a down MCP server isn't fixed by changing brain).
+const TRANSIENT_FALLOVER_KINDS = new Set<string>([
+  'model.overloaded', 'model.rate_limited', 'model.http_5xx', 'model.transport_timeout',
+  'codex.http_5xx', 'codex.sse_truncated', 'codex.wall_clock', 'codex.transport_timeout',
+]);
+
+/**
+ * Emit the infra-error "retry / switch / stop" ask (the F4-twin recovery). Single
+ * source of truth so both the direct path (handleRunError) and the
+ * fallover-exhausted path (runConversation) produce the byte-identical ask with
+ * the same retry_context capture.
+ */
+function emitInfraTransientAsk(
+  sessionId: string,
+  turn: number,
+  kind: string,
+  userMessage: string,
+  operatorMessage: string | undefined,
+  rawMessage: string,
+): void {
+  const userMsg = userMessage || 'A backend error interrupted this turn.';
+  let retryContext: Record<string, unknown> | null = null;
+  try {
+    const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
+    if (recentToolCalls.length > 0) {
+      const tc = recentToolCalls[recentToolCalls.length - 1];
+      const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
+      if (tcData?.tool) {
+        retryContext = {
+          failed_tool: tcData.tool,
+          failed_args: tcData.arguments ?? null,
+          failed_call_id: tcData.callId ?? null,
+          failed_turn: tc.turn ?? turn,
+        };
+      }
+    }
+  } catch { /* best-effort */ }
+  safeAppend({
+    sessionId,
+    turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: `${userMsg} Should I retry the same call, switch approach, or stop here?`,
+      options: ['Retry', 'Switch approach', 'Stop'],
+      source: 'infra_error_recovery',
+      boundaryKind: kind,
+      operatorMessage: clip(operatorMessage ?? rawMessage, 400),
+      retry_context: retryContext,
+    },
+  });
+}
+
 function handleRunError(
   sessionId: string,
   turn: number,
   session: HarnessSession,
   err: unknown,
+  opts: { deferInfraAsk?: boolean } = {},
 ): RunTurnResult {
   // A kill that lands while a tool call is in flight throws KillRequested
   // INSIDE the SDK's tool execution, and the SDK re-wraps it as a plain
@@ -4641,51 +4794,19 @@ function handleRunError(
     const askUserEnabled =
       (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
     if (askUserEnabled && askUserKinds.has(err.kind)) {
-      const userMsg = err.userMessage || 'A backend error interrupted this turn.';
-      // v0.5.19 Bug H — capture retry context: which call was in
-      // flight when the infra error fired. The next turn (after the
-      // user replies "Retry") will read this and inject the exact
-      // failed call args as a system message, so the model can't
-      // pivot to a different task. This is the fix for the Bug B
-      // regression we saw on sess-mpkmiy4j: after a Codex 5xx the
-      // model lost the LinkedIn task context and proposed work on
-      // the wrong sheet entirely.
-      let retryContext: Record<string, unknown> | null = null;
-      try {
-        // desc:true + limit:1 → the single most recent tool_called
-        // event. Without desc, listEvents returns ASC oldest first
-        // and we'd capture the wrong call.
-        const recentToolCalls = listEvents(sessionId, { types: ['tool_called'], limit: 1, desc: true });
-        if (recentToolCalls.length > 0) {
-          const tc = recentToolCalls[recentToolCalls.length - 1];
-          const tcData = tc.data as { tool?: string; arguments?: string; callId?: string } | undefined;
-          if (tcData?.tool) {
-            retryContext = {
-              failed_tool: tcData.tool,
-              failed_args: tcData.arguments ?? null,
-              failed_call_id: tcData.callId ?? null,
-              failed_turn: tc.turn ?? turn,
-            };
-          }
-        }
-      } catch {
-        // best-effort
+      // W1a chat step-boundary fallover: if the caller can fall over to another
+      // brain AND this is a transient kind that switching can fix, DEFER the ask —
+      // return the kind so runConversation tries the next brain first and only
+      // emits the ask if every brain is exhausted. Otherwise: today's behavior
+      // verbatim (emit the F4-twin "retry/switch/stop" ask, session stays active).
+      if (opts.deferInfraAsk && TRANSIENT_FALLOVER_KINDS.has(err.kind)) {
+        bumpTurnNumber(sessionId, turn);
+        return {
+          sessionId, turn, status: 'awaiting_user_input', error: message,
+          infraTransientKind: err.kind, infraTransientUserMessage: err.userMessage ?? '',
+        };
       }
-      safeAppend({
-        sessionId,
-        turn,
-        role: 'Clem',
-        type: 'awaiting_user_input',
-        data: {
-          question:
-            `${userMsg} Should I retry the same call, switch approach, or stop here?`,
-          options: ['Retry', 'Switch approach', 'Stop'],
-          source: 'infra_error_recovery',
-          boundaryKind: err.kind,
-          operatorMessage: clip(err.operatorMessage ?? message, 400),
-          retry_context: retryContext,
-        },
-      });
+      emitInfraTransientAsk(sessionId, turn, err.kind, err.userMessage ?? '', err.operatorMessage, message);
       bumpTurnNumber(sessionId, turn);
       // Session stays active so the next user message resumes it; do
       // NOT mark failed. Status returned to caller is

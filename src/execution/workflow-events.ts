@@ -52,6 +52,7 @@ export type WorkflowEventKind =
   | 'step_skipped'        // step was a no-op (forEach over empty list, condition)
   | 'item_started'        // one iteration of a forEach step started
   | 'item_completed'      // one iteration of a forEach step done
+  | 'item_retry'          // one iteration failed TRANSIENTLY; retrying that item after backoff (W1b)
   | 'item_failed'         // one iteration of a forEach step failed
   | 'tool_called'         // diagnostic — tool name + args (truncated)
   | 'tool_result'         // diagnostic — tool result (truncated)

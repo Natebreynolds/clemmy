@@ -178,9 +178,10 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
           const last = listEvents(sessionId, { limit: 1, desc: true })[0];
           const ageMs = last ? Date.now() - Date.parse(last.createdAt) : null;
           if (!shouldProactivelyReport(hs.sessionRow.kind, ageMs)) return;
-          const [{ runConversation }, { buildOrchestratorAgent }] = await Promise.all([
+          const [{ runConversation }, { buildOrchestratorAgent }, { buildChatFalloverWiring }] = await Promise.all([
             import('./harness/loop.js'),
             import('../agents/orchestrator.js'),
+            import('./harness/respond-bridge.js'),
           ]);
           // If the origin session has an active goal, this finished sub-work may
           // unblock it — tell the model to continue the goal rather than just
@@ -205,7 +206,16 @@ export function deliverOutcome(outcome: Outcome, ctx: DeliverContext): boolean {
             + 'If it failed, say exactly what you will fix. Do not re-run anything in this turn.'
             + goalTail;
           const agent = await buildOrchestratorAgent({ userInput: directive, sessionId });
-          await runConversation({ agent, sessionId, input: directive, judgeCompletion: false });
+          // W1c — the report-back already runs on the DEFAULT brain (= the origin
+          // chat's brain, since no model override). Give it the same chat
+          // step-boundary fallover as a normal chat turn so a transient on that
+          // brain doesn't drop the report. Best-effort; absent = today's behavior.
+          const fallover = buildChatFalloverWiring({ userInput: directive, sessionId, buildAgent: buildOrchestratorAgent });
+          await runConversation({
+            agent, sessionId, input: directive, judgeCompletion: false,
+            falloverModelIds: fallover.falloverModelIds,
+            rebuildAgentForBrain: fallover.rebuildAgentForBrain,
+          });
         } catch (err) {
           logger.warn(
             { err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId },

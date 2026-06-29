@@ -1014,6 +1014,94 @@ test('forEach batching attributes item failures to their original keys across wi
   }
 });
 
+test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds when CLEMMY_FOREACH_ITEM_RETRY=on', async () => {
+  const prevH = process.env.WORKFLOW_USE_HARNESS;
+  const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_FOREACH_ITEM_RETRY = 'on';
+  try {
+    const attempts: Record<string, number> = {};
+    const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
+    const ctx = {
+      workflow: { name: 'W1b Item Retry Test', steps: [] },
+      workflowSlug: 'w1b-item-retry',
+      runId: 'w1b-1',
+      inputs: {},
+      stepOutputs: { pull: ['a', 'd'] },
+      assistant: {
+        respond: async (req: { message?: string }) => {
+          const k = (req.message ?? '').match(/\bItem:\s*(\w+)\b/)?.[1] ?? '?';
+          attempts[k] = (attempts[k] ?? 0) + 1;
+          // item 'd' hits a transient 503 on its FIRST attempt, recovers on retry.
+          if (k === 'd' && attempts[k] === 1) throw new Error('upstream 503 service unavailable');
+          return { text: 'done' };
+        },
+      },
+      completedItems: new Map(),
+      forEachFailures,
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
+
+    const output = await executeStep(step, ctx) as Array<{ itemKey: string }>;
+
+    assert.deepEqual(output.map((i) => i.itemKey).sort(), ['a', 'd'], 'the transient item recovered on retry');
+    assert.equal(forEachFailures.length, 0, 'no item failure after a successful retry');
+    assert.equal(attempts.d, 2, 'item d ran twice — fail then retry-success');
+    const retried = readWorkflowEvents('w1b-item-retry', 'w1b-1').find((e) => e.kind === 'item_retry');
+    assert.equal(retried?.itemKey, 'd', 'an item_retry advisory was recorded');
+  } finally {
+    if (prevH === undefined) delete process.env.WORKFLOW_USE_HARNESS; else process.env.WORKFLOW_USE_HARNESS = prevH;
+    if (prevB === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW; else process.env.CLEMMY_HARNESS_WORKFLOW = prevB;
+    if (prevR === undefined) delete process.env.CLEMMY_FOREACH_ITEM_RETRY; else process.env.CLEMMY_FOREACH_ITEM_RETRY = prevR;
+  }
+});
+
+test('W1b: with the flag OFF (default), a transient item failure is NOT retried — byte-identical to today', async () => {
+  const prevH = process.env.WORKFLOW_USE_HARNESS;
+  const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  delete process.env.CLEMMY_FOREACH_ITEM_RETRY; // default = off
+  try {
+    const attempts: Record<string, number> = {};
+    const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
+    const ctx = {
+      workflow: { name: 'W1b Flag Off Test', steps: [] },
+      workflowSlug: 'w1b-flagoff',
+      runId: 'w1b-off-1',
+      inputs: {},
+      stepOutputs: { pull: ['a', 'd'] },
+      assistant: {
+        respond: async (req: { message?: string }) => {
+          const k = (req.message ?? '').match(/\bItem:\s*(\w+)\b/)?.[1] ?? '?';
+          attempts[k] = (attempts[k] ?? 0) + 1;
+          if (k === 'd') throw new Error('upstream 503 service unavailable');
+          return { text: 'done' };
+        },
+      },
+      completedItems: new Map(),
+      forEachFailures,
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
+
+    const output = await executeStep(step, ctx) as Array<{ itemKey: string }>;
+
+    assert.deepEqual(output.map((i) => i.itemKey), ['a'], 'flag off → failed item is dropped, not retried');
+    assert.deepEqual(forEachFailures.map((f) => f.itemKey), ['d']);
+    assert.equal(attempts.d, 1, 'item d ran exactly once (no retry when flag off)');
+    assert.equal(readWorkflowEvents('w1b-flagoff', 'w1b-off-1').some((e) => e.kind === 'item_retry'), false, 'no item_retry when flag off');
+  } finally {
+    if (prevH === undefined) delete process.env.WORKFLOW_USE_HARNESS; else process.env.WORKFLOW_USE_HARNESS = prevH;
+    if (prevB === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW; else process.env.CLEMMY_HARNESS_WORKFLOW = prevB;
+    if (prevR === undefined) delete process.env.CLEMMY_FOREACH_ITEM_RETRY; else process.env.CLEMMY_FOREACH_ITEM_RETRY = prevR;
+  }
+});
+
 test('failed-item retry seeding inherits upstream + completed items but not stale downstream outputs', () => {
   const workflow = {
     name: 'Retry Seed Test',

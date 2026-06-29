@@ -23,6 +23,7 @@ import { ClaudeModelProvider } from './claude-model.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { codexModelsAvailable, claudeModelsAvailable } from './model-role-options.js';
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
+import { maybeWrapWithFaultInjection } from './fault-inject.js';
 import { getActiveAuthMode, getByoBackendConfig, getClaudeBrainModel, getModelRoutingMode, getRuntimeEnv, MODELS } from '../../config.js';
 import pino from 'pino';
 
@@ -49,6 +50,11 @@ export class RouterModelProvider implements ModelProvider {
 
   getModel(modelName?: string): Model {
     const primary = this.resolvePrimary(modelName);
+    // Dev-only fault injection (no-op unless CLEMMY_FAULT_INJECT_BRAIN names this
+    // provider): wrap the resolved primary so a live transient failure can be
+    // forced to prove cross-brain fallover. The lazily-built fallover targets in
+    // buildBrainChain are different providers → not wrapped → they recover.
+    primary.model = maybeWrapWithFaultInjection(primary.model, primary.provider);
     if (!brainFalloverEnabled()) return primary.model;
     // Wrap in a cross-provider fallover chain (primary -> other connected brains)
     // so an overloaded/rate-limited/HUNG provider switches brains instead of

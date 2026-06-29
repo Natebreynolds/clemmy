@@ -43,6 +43,9 @@ import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from './cla
 import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import { getRuntimeEnv } from '../../config.js';
+import { resolveProvider } from './model-wire-registry.js';
+import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
+import { resolveRoleModel } from './model-roles.js';
 import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
@@ -289,6 +292,21 @@ export async function respondViaHarness(
       // tool, so they keep the full surface. Still default-off via CLEMMY_TOOL_JIT.
       allowToolJit: config.kind === 'chat',
     });
+    // W1a — chat step-boundary brain fallover (shared with the Discord/Slack
+    // runner). On a CHAT surface, hand runConversation the ordered next-brain
+    // model ids + a rebuild factory so a transient model/codex error mid-turn
+    // re-dispatches to the next brain instead of immediately asking. Best-effort
+    // + gated by CLEMMY_BRAIN_FALLOVER; absence = today's ask behavior.
+    const fallover = config.kind === 'chat'
+      ? buildChatFalloverWiring({
+          userInput: request.message,
+          sessionId,
+          excludeToolNames: request.excludeToolNames,
+          allowToolJit: true,
+          buildAgent: buildAgentImpl,
+        })
+      : {};
+
     const result = await runConversationImpl({
       agent,
       sessionId,
@@ -297,6 +315,8 @@ export async function respondViaHarness(
       judgeCompletion: config.judgeCompletion,
       onChunk: request.onChunk,
       reuseRecordedUserInput: opts.reuseRecordedUserInput,
+      falloverModelIds: fallover.falloverModelIds,
+      rebuildAgentForBrain: fallover.rebuildAgentForBrain,
     });
 
     const replyText =
@@ -427,4 +447,42 @@ const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
 
 function chatBrainFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+type BuiltAgent = Awaited<ReturnType<typeof buildOrchestratorAgent>>;
+
+/**
+ * W1a — compute the chat step-boundary brain-fallover wiring for runConversation,
+ * shared by respondViaHarness AND the Discord/Slack runner so BOTH chat lanes get
+ * the same parity. Returns the ordered next-brain model ids + a factory that
+ * rebuilds the orchestrator agent on a given brain. Gated by CLEMMY_BRAIN_FALLOVER
+ * and best-effort — any resolution failure (or no other brain available) returns
+ * {} so the caller keeps today's ask behavior. `buildAgent` is injected so the
+ * caller supplies its own agent builder (and tests can stub it).
+ */
+export function buildChatFalloverWiring(opts: {
+  userInput: string;
+  sessionId: string;
+  excludeToolNames?: string[];
+  allowToolJit?: boolean;
+  buildAgent: (o: { userInput?: string; sessionId: string; excludeToolNames?: string[]; model?: string; allowToolJit?: boolean }) => Promise<BuiltAgent>;
+}): { falloverModelIds?: string[]; rebuildAgentForBrain?: (modelId: string) => Promise<BuiltAgent> } {
+  if (!chatBrainFalloverEnabled()) return {};
+  try {
+    const currentProvider = resolveProvider(resolveRoleModel('brain').modelId) as BrainProviderClass;
+    const nextBrains = falloverBrainModelIds(currentProvider);
+    if (nextBrains.length === 0) return {};
+    return {
+      falloverModelIds: nextBrains.map((b) => b.modelId),
+      rebuildAgentForBrain: (modelId: string) => opts.buildAgent({
+        userInput: opts.userInput,
+        sessionId: opts.sessionId,
+        excludeToolNames: opts.excludeToolNames,
+        model: modelId,
+        allowToolJit: opts.allowToolJit ?? true,
+      }),
+    };
+  } catch {
+    return {};
+  }
 }

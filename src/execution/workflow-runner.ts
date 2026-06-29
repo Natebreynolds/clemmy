@@ -1786,6 +1786,16 @@ function transientRetryFloor(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 2;
 }
 
+/** W1b — per-item transient retry for forEach. A single item that hits a network/
+ *  infra blip currently fails fast and is dropped into the quality advisory
+ *  (silent loss on, e.g., a 10%-of-items 5xx). With this on, that item retries
+ *  (transient-only, same `transientRetryFloor` budget) — guarded so an item that
+ *  already recorded an external_write is NEVER re-run (no double-act, reusing the
+ *  crash-resume idempotency check). Default-off → validate → graduate. */
+function forEachItemRetryEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_FOREACH_ITEM_RETRY', 'off') || 'off').toLowerCase() === 'on';
+}
+
 /**
  * Goal-contract Phase 2: is this step eligible to loopUntil its contract?
  * The SIDE-EFFECT LAW, enforced at runtime (belt) on top of the authoring
@@ -2435,32 +2445,58 @@ export async function executeStep(
             );
             let output: unknown;
             let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
-            if (workflowHarnessEnabled(step)) {
-              const r = await runStepViaHarness(
-                step,
-                `${ctx.runId}:${step.id}:${key}`,
-                `Item: ${key}\n\n${prompt}`,
-                ctx.workflow.name,
-                workflowAutoApprovalTools(ctx.workflow, step),
-                ctx.runId,
-                itemContext,
-              );
-              output = r.output;
-              itemSessionId = r.sessionId;
-            } else {
-              // FORK collapse (staged): forEach item through the gated harness loop
-              // (default-OFF `workflow` surface → byte-identical to legacy until
-              // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
-              // honorModel preserves the worker-model routing.
-              output = (await respondPreferHarness('workflow', {
-                sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
-                channel: 'workflow',
-                message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
-                // forEach fan-out item = delegated grunt-work labor → BYO worker model when routed.
-                model: step.model || getWorkerModel(),
-                maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
-              }, (r) => ctx.assistant.respond(r))).text;
-            }
+            // W1b — run the item, retrying a TRANSIENT failure for THIS item only
+            // (read items freely; write/send items NEVER re-run once they recorded
+            // an external_write — the same double-act guard as crash-resume). Budget
+            // 0 unless the flag is on → byte-identical to today by default.
+            const runItemOnce = async (): Promise<void> => {
+              if (workflowHarnessEnabled(step)) {
+                const r = await runStepViaHarness(
+                  step,
+                  `${ctx.runId}:${step.id}:${key}`,
+                  `Item: ${key}\n\n${prompt}`,
+                  ctx.workflow.name,
+                  workflowAutoApprovalTools(ctx.workflow, step),
+                  ctx.runId,
+                  itemContext,
+                );
+                output = r.output;
+                itemSessionId = r.sessionId;
+              } else {
+                // FORK collapse (staged): forEach item through the gated harness loop
+                // (default-OFF `workflow` surface → byte-identical to legacy until
+                // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
+                // honorModel preserves the worker-model routing.
+                output = (await respondPreferHarness('workflow', {
+                  sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
+                  channel: 'workflow',
+                  message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
+                  // forEach fan-out item = delegated grunt-work labor → BYO worker model when routed.
+                  model: step.model || getWorkerModel(),
+                  maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
+                }, (r) => ctx.assistant.respond(r))).text;
+              }
+            };
+            await runWithStepRetry(runItemOnce, {
+              budget: forEachItemRetryEnabled() ? transientRetryFloor() : 0,
+              backoffBaseMs: RETRY_BACKOFF_BASE_MS,
+              isRetryable: (err) =>
+                !(err instanceof ParkRunSignal)
+                && !(err instanceof WorkflowRunCancelledError)
+                && isTransientStepError(err)
+                // double-act guard: never re-run an item that already wrote externally.
+                && !itemSendAlreadyFired(ctx.runId, step.id, key),
+              onRetry: ({ attempt, budget, delayMs, err }) => {
+                appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+                  kind: 'item_retry',
+                  stepId: step.id,
+                  itemKey: key,
+                  error: err instanceof Error ? err.message : String(err),
+                  meta: { attempt, budget, delayMs, reason: 'transient' },
+                });
+              },
+              afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
+            });
             // Per-item skill-execution check (forEach): advisory, DETECTION-ONLY —
             // a `usesSkill` item that couldn't be confirmed to produce the skill's
             // deliverables records a non-failing quality advisory. The item still
