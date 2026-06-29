@@ -19,7 +19,13 @@ import {
   isGoalFidelityGateEnabled,
   evaluateGoalFidelity,
   GoalFidelityCheckFailedError,
+  extractMessageBody,
 } from './harness/goal-fidelity-gate.js';
+import {
+  isOutputGroundingGateEnabled,
+  evaluateOutputGrounding,
+  OutputGroundingCheckFailedError,
+} from './harness/output-grounding-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
@@ -954,6 +960,44 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           }
         } catch (err) {
           if (err instanceof GoalFidelityCheckFailedError) throw err;
+          // Any other evaluation error is fail-open — never block a legit send.
+        }
+      }
+
+      // Output-grounding for irreversible MCP SENDS — NUMERIC integrity: every
+      // figure in the outgoing body must trace to the session's own captured tool
+      // results. This is the THIRD send-time gate the brackets paths (composio +
+      // shell) enforce but the shim was missing (integrity audit 2026-06-29 #2.3):
+      // a fabricated/source-contradicted figure in a native Gmail/kernel send
+      // sailed through while the byte-identical Composio/shell send was checked.
+      // Same fail-open contract as the mirrors above; a contradiction bounces as a
+      // soft tool error the model recovers from.
+      if (gateAsSend && isOutputGroundingGateEnabled() && integritySessionId) {
+        try {
+          const body = extractMessageBody(args ?? {});
+          if (body && body.trim().length > 0) {
+            const verdict = await evaluateOutputGrounding(integritySessionId, body, { kind: 'write', toolName });
+            if (verdict.action === 'bounce') {
+              try {
+                appendEvent({
+                  sessionId: integritySessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                  data: { kind: 'output_grounding_blocked', toolName, figures: verdict.figures.slice(0, 5), sources: verdict.sourceCallIds.slice(0, 5), reason: verdict.reason, failureCount: verdict.failureCount ?? 1, mcp: true },
+                });
+              } catch { /* telemetry must never block the gate */ }
+              throw new OutputGroundingCheckFailedError({
+                toolName, reason: verdict.reason, figures: verdict.figures, sourceCallIds: verdict.sourceCallIds, failureCount: verdict.failureCount ?? 1,
+              });
+            } else if (verdict.action === 'advisory') {
+              try {
+                appendEvent({
+                  sessionId: integritySessionId, turn: 0, role: 'system', type: 'output_grounding_judged',
+                  data: { toolName, grounded: false, advisory: true, figures: verdict.figures.slice(0, 5), reason: verdict.reason, mcp: true },
+                });
+              } catch { /* telemetry must never block the gate */ }
+            }
+          }
+        } catch (err) {
+          if (err instanceof OutputGroundingCheckFailedError) throw err;
           // Any other evaluation error is fail-open — never block a legit send.
         }
       }

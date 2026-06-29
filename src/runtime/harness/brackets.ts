@@ -1123,12 +1123,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const preGateIrreversible = preGateShape.mutating && preGateShape.irreversible;
     const parallelGates = parallelPreWriteGatesEnabled();
     const goalFidelityPromise = (parallelGates && preGateIrreversible && isGoalFidelityGateEnabled())
-      ? startGate(evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput))
+      // deferCommit: an eagerly-started judge must NOT persist its failure bump —
+      // if an earlier gate short-circuits and this verdict is discarded, the bump
+      // would leak and trip a premature "STOP" on retry (integrity audit #2.4).
+      // The block branch below commits via verdict.commitFailure?.() only when reached.
+      ? startGate(evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput, { deferCommit: true }))
       : null;
     const preGateBody = (parallelGates && preGateIrreversible && isOutputGroundingGateEnabled())
       ? extractMessageBody(parsedInput) : '';
     const outputGroundingPromise = (preGateBody && preGateBody.trim().length > 0)
-      ? startGate(evaluateOutputGrounding(ctx.sessionId, preGateBody, { kind: 'write', toolName: tool.name }))
+      ? startGate(evaluateOutputGrounding(ctx.sessionId, preGateBody, { kind: 'write', toolName: tool.name, deferCommit: true }))
       : null;
     try {
       if (isGroundingGateEnabled()) {
@@ -1220,6 +1224,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           // parallel flag is off) — same verdict either way.
           const verdict = await (goalFidelityPromise ?? evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput));
           if (verdict.action === 'block') {
+            verdict.commitFailure?.(); // commit the deferred failure bump only now that we actually surface it (#2.4)
             try {
               appendEvent({
                 sessionId: ctx.sessionId,
@@ -1305,6 +1310,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           if (body && body.trim().length > 0) {
             const verdict = await (outputGroundingPromise ?? evaluateOutputGrounding(ctx.sessionId, body, { kind: 'write', toolName: tool.name }));
             if (verdict.action === 'bounce') {
+              verdict.commitFailure?.(); // commit the deferred bounce bump only now that we surface it (#2.4)
               try {
                 appendEvent({
                   sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
@@ -1425,9 +1431,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const shellPreMutation = shellPreCommand ? classifyShellNetworkMutation(shellPreCommand) : { isNetworkMutation: false as const };
     const shellPreShapeKey = shellPreMutation.isNetworkMutation ? shellPreMutation.shapeKey : undefined;
     const shellGoalFidelityPromise = (parallelGates && isGoalFidelityGateEnabled() && tool.name === 'run_shell_command' && shellPreMutation.isNetworkMutation && shellPreShapeKey)
-      ? startGate(evaluateGoalFidelity(ctx.sessionId, tool.name, shellPreCommand)) : null;
+      ? startGate(evaluateGoalFidelity(ctx.sessionId, tool.name, shellPreCommand, { deferCommit: true })) : null;
     const shellOutputGroundingPromise = (parallelGates && isOutputGroundingGateEnabled() && tool.name === 'run_shell_command' && shellPreMutation.isNetworkMutation && shellPreCommand)
-      ? startGate(evaluateOutputGrounding(ctx.sessionId, shellPreCommand, { kind: 'write', toolName: tool.name })) : null;
+      ? startGate(evaluateOutputGrounding(ctx.sessionId, shellPreCommand, { kind: 'write', toolName: tool.name, deferCommit: true })) : null;
     try {
       if (isGroundingGateEnabled() && tool.name === 'run_shell_command') {
         const command = typeof (parsedInput as { command?: unknown })?.command === 'string'
@@ -1496,6 +1502,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (mutation.isNetworkMutation && mutation.shapeKey) {
           const verdict = await (shellGoalFidelityPromise ?? evaluateGoalFidelity(ctx.sessionId, tool.name, command));
           if (verdict.action === 'block') {
+            verdict.commitFailure?.(); // commit the deferred failure bump only now that we surface it (#2.4)
             try {
               appendEvent({
                 sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
@@ -1527,6 +1534,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (mutation.isNetworkMutation && command) {
           const verdict = await (shellOutputGroundingPromise ?? evaluateOutputGrounding(ctx.sessionId, command, { kind: 'write', toolName: tool.name }));
           if (verdict.action === 'bounce') {
+            verdict.commitFailure?.(); // commit the deferred bounce bump only now that we surface it (#2.4)
             try {
               appendEvent({
                 sessionId: ctx.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',

@@ -88,6 +88,20 @@ test('a PRE-CONTENT stall is retried and self-heals when the retry streams (Clau
   assert.ok(Date.now() - started < 5_000, 'recovered promptly');
 });
 
+test('disablePreContentRetry (approval-resume): a pre-content stall does NOT replay — no duplicate approved write', async () => {
+  // On resume the run input is a RunState whose first act is an already-approved,
+  // side-effecting tool. A pre-content stall there must surface as an error, NOT
+  // replay the state (which would re-fire the approved external write a second
+  // time). The opts flag forces 0 retries; the runner is invoked exactly once.
+  let call = 0;
+  const wedgedRunner = { run: async () => { call++; return makeStreamResult({ events: 0, hang: true }); } } as unknown as Runner;
+  await assert.rejects(
+    __defaultRunRunner(wedgedRunner, {} as never, [], { disablePreContentRetry: true } as never),
+    (err: unknown) => err instanceof Error && /timed out/.test(err.message),
+  );
+  assert.equal(call, 1, 'the approved-tool RunState was NOT replayed');
+});
+
 test('a superseded (stalled) attempt does NOT stream its late tokens into the live retry (no garble)', async () => {
   // The race that produced garbled output ("importportance") on a recovered
   // heavy Claude turn: the stalled attempt's stream delivers a late token RIGHT

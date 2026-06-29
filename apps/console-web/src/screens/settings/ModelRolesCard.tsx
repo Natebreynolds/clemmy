@@ -5,7 +5,6 @@ import { Card } from '@/components/ui/Card';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { Switch } from '@/components/ui/Switch';
-import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
 import {
   getSettings,
@@ -40,48 +39,6 @@ function RoleRow({
   return (
     <div className="grid items-center gap-2 sm:grid-cols-[1fr_1.2fr] sm:gap-4">
       <Field label={label} hint={hint}>{children}</Field>
-      <div className="min-w-0 pb-1">
-        <div className="flex min-w-0 items-center gap-2 text-small text-muted">
-          <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-          <span className="truncate text-fg" title={resolved.modelId}>{resolved.modelId}</span>
-          <span className="shrink-0 rounded bg-canvas px-1.5 py-0.5 text-caption text-muted">{resolved.provider}</span>
-          <span className="shrink-0 text-caption text-muted">· {SOURCE_LABEL[resolved.source]}</span>
-        </div>
-        {resolved.inactiveBinding && (
-          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-caption text-warning" title={resolved.inactiveBinding.reason}>
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
-            <span className="truncate">Saved {resolved.inactiveBinding.modelId} is unavailable; using default.</span>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function RoleStatus({
-  icon: Icon,
-  label,
-  hint,
-  resolved,
-  action,
-}: {
-  icon: typeof Users;
-  label: string;
-  hint: string;
-  resolved: ResolvedRole;
-  action?: React.ReactNode;
-}) {
-  return (
-    <div className="grid items-center gap-2 sm:grid-cols-[1fr_1.2fr] sm:gap-4">
-      <div className="mb-4">
-        <div className="mb-1.5 block text-label text-fg">{label}</div>
-        <div className="flex min-h-11 items-center gap-2 rounded-md border border-border bg-canvas px-3 text-body text-fg">
-          <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-          <span>Automatic</span>
-          {action}
-        </div>
-        <p className="mt-1 text-caption text-muted">{hint}</p>
-      </div>
       <div className="min-w-0 pb-1">
         <div className="flex min-w-0 items-center gap-2 text-small text-muted">
           <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
@@ -170,6 +127,10 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['settings'] }); };
   const workerOptions = mr.roleOptions?.worker ?? mr.available;
   const workerFlat = workerOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
+  // The judge picker offers the SAME connected models as the worker (the backend
+  // accepts role:'judge' with any connected model); "Automatic" stays the default.
+  const judgeOptions = mr.roleOptions?.judge ?? mr.available;
+  const judgeFlat = judgeOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
   const connected = (prov: string) => mr.available.some((p) => p.provider === prov);
 
   // ── Second opinion (fusion) — one user-facing judge path. The resolved Judge
@@ -200,9 +161,8 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
   // (so any connected model can be the brain), Codex/Claude are their plain ids.
   const onBrain = (value: string) => run('brain', () =>
     value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length)) : setActiveBrain(value as ActiveBrain));
-  const onRole = (role: 'worker', v: string) =>
+  const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
-  const onClearJudge = () => run('judge', () => patchModelRole({ role: 'judge', clear: true }));
 
   // Task-specific (intent-scoped) worker routing — e.g. "design" → Claude. Reads
   // the same bindings the chat tool writes; routes only workers tagged with that
@@ -227,9 +187,10 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
         <>
           <h3 className="mb-1 text-h3 text-fg">Models — who does what</h3>
           <p className="mb-4 text-small text-muted">
-            Pick the active brain provider and which connected models serve workers.
-            The judge/checker is automatic and uses one visible route for completion checks,
-            write gates, and Second opinion. Applies on the next message; no restart.
+            Pick the active brain provider and which connected models serve workers and
+            the judge/checker (used for completion checks, write gates, and Second opinion).
+            Leave the judge on “Automatic” for a fast different-family check, or pick a
+            stronger model. Applies on the next message; no restart.
           </p>
         </>
       )}
@@ -260,17 +221,15 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
           )}
         </RoleRow>
 
-        <RoleStatus
-          icon={Scale}
-          label="Judge / checker"
-          hint="One automatic checker for completion, write-boundary gates, and Second opinion. Auto prefers a fast different model family when available."
-          resolved={mr.roles.judge}
-          action={mr.roles.judge.source !== 'default' ? (
-            <Button className="ml-auto h-7 px-2 text-caption" size="sm" variant="secondary" disabled={busy === 'judge'} onClick={onClearJudge}>
-              <X className="h-3.5 w-3.5" aria-hidden /> Reset
-            </Button>
-          ) : undefined}
-        />
+        <RoleRow icon={Scale} label="Judge / checker" hint="Checks completion, write-boundary gates, and Second opinion. “Automatic” auto-picks a fast different model family; pick a specific model to override (e.g. a stronger judge)." resolved={mr.roles.judge}>
+          {(id) => (
+            <Select id={id} disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
+              onChange={(e) => onRole('judge', e.target.value)}>
+              <option value="__default__">Automatic (different family, fast)</option>
+              {judgeFlat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {m.provider}</option>)}
+            </Select>
+          )}
+        </RoleRow>
         <JudgeMetrics metrics={judgeMetrics} />
 
         {/* Second opinion — whether the one judge above checks the brain's draft. */}

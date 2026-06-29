@@ -419,6 +419,12 @@ export interface GoalFidelityGateResult {
   /** Why the block fired: 'present_for_approval' (draft-only skill — present the
    *  draft + ask, do NOT count as a failure) vs 'other' (genuine violation). */
   blockKind?: 'present_for_approval' | 'other';
+  /** Set ONLY when evaluated with { deferCommit: true } (the parallel pre-write
+   *  path): persists the failure increment. The caller invokes it exactly when it
+   *  actually surfaces this block — so an eagerly-started verdict that is DISCARDED
+   *  because an earlier gate short-circuited never bumps the counter (integrity
+   *  audit #2.4). Undefined on the inline path (already committed). */
+  commitFailure?: () => void;
 }
 
 /**
@@ -429,7 +435,9 @@ export async function evaluateGoalFidelity(
   sessionId: string,
   toolName: string,
   rawArgs: unknown,
+  opts: { deferCommit?: boolean } = {},
 ): Promise<GoalFidelityGateResult> {
+  const deferCommit = opts.deferCommit === true;
   const targets = extractTargetKeys(rawArgs);
   const skills = gatherSessionSkills(sessionId);
 
@@ -442,7 +450,7 @@ export async function evaluateGoalFidelity(
     let gap;
     try { gap = skillBodyExecutionShortfall(skill.name, skill.body, sessionId); } catch { gap = null; }
     if (gap) {
-      const failures = bumpFailure(sessionId, targets[0] ?? skill.name);
+      const { failures, commitFailure } = recordFailure(sessionId, targets[0] ?? skill.name, deferCommit);
       return {
         action: 'block',
         mode: 'renderer',
@@ -451,6 +459,7 @@ export async function evaluateGoalFidelity(
         gap: `Run the ${gap.skill} skill's producer (${gap.prescribed.join(', ')}) to GENERATE the deliverable, then retry this write. Do not hand-roll what the skill is meant to produce.`,
         targets,
         failureCount: failures,
+        commitFailure,
       };
     }
   }
@@ -530,7 +539,7 @@ export async function evaluateGoalFidelity(
     };
   }
 
-  const failures = bumpFailure(sessionId, targetKey);
+  const { failures, commitFailure } = recordFailure(sessionId, targetKey, deferCommit);
   return {
     action: 'block',
     mode: 'judge',
@@ -538,15 +547,22 @@ export async function evaluateGoalFidelity(
     gap: verdict.gap,
     targets,
     failureCount: failures,
+    commitFailure,
     blockKind: 'other',
   };
 }
 
-function bumpFailure(sessionId: string, target: string): number {
+/** Compute the would-be consecutive-failure count for (session,target). When
+ *  defer is false (inline path) the increment is committed immediately and
+ *  commitFailure is undefined — byte-identical to the old bumpFailure. When defer
+ *  is true (parallel eager-start) NOTHING is persisted; the returned commitFailure
+ *  thunk does the increment, and the caller invokes it only if it actually
+ *  surfaces this block (integrity audit #2.4). */
+function recordFailure(sessionId: string, target: string, defer: boolean): { failures: number; commitFailure?: () => void } {
   const key = `${sessionId}::${target}`;
   const next = (failureCounts.get(key) ?? 0) + 1;
-  failureCounts.set(key, next);
-  return next;
+  if (!defer) { failureCounts.set(key, next); return { failures: next }; }
+  return { failures: next, commitFailure: () => failureCounts.set(key, next) };
 }
 
 /**

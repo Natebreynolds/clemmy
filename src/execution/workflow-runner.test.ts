@@ -58,6 +58,7 @@ const {
   stepSideEffectClass,
   finalizeStepOutput,
   sendAlreadyClaimed,
+  stepSendAlreadyFired,
   seedFailedItemRetryRun,
   detectEmptyDeliverableReads,
   stepConsumesOutput,
@@ -66,7 +67,7 @@ const {
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
-const { resetEventLog, listEvents } = await import('../runtime/harness/eventlog.js');
+const { resetEventLog, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
 const { setClaudeAgentSdkWorkflowStepRunForTest } = await import('../runtime/harness/claude-agent-workflow-step.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
@@ -1745,6 +1746,24 @@ test('Lane B (bug #8 FIXED): a crashed forEach SEND auto-resumes (no halt) — n
     null,
     'forEach send auto-resumes (no halt); the per-item dedup, not a halt, prevents the double-send',
   );
+});
+
+test('Lane B (bug #8 / audit #2.2): stepSendAlreadyFired — a PLAIN step whose send fired is detected, so a transient error does NOT re-run it (no double-send)', () => {
+  resetEventLog();
+  const runId = 'r-step-dup';
+  const stepId = 'notify_nate';
+  const sid = `workflow:${runId}:${stepId}`;
+  // Nothing fired yet → a transient error IS retryable.
+  assert.equal(stepSendAlreadyFired(runId, stepId), false, 'no send yet → not claimed');
+  // The send fires: an external_write is recorded under the step's deterministic
+  // session id. A later transient model error (e.g. 529 before step_completed)
+  // must NOT re-run the step — the guard catches the prior send.
+  HarnessSession.create({ id: sid, kind: 'workflow', channel: 'workflow', title: runId, metadata: { source: 'workflow' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'GMAIL_SEND', targets: ['x@y.com'] } });
+  assert.equal(stepSendAlreadyFired(runId, stepId), true, 'a fired send suppresses the transient retry (no double-send)');
+  // A failure compensation nets it back out → the send did NOT claim → retry ok.
+  appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write_failed', data: { shapeKey: 'GMAIL_SEND', targets: ['x@y.com'] } });
+  assert.equal(stepSendAlreadyFired(runId, stepId), false, 'a netted failure means the send did not claim → retry allowed');
 });
 
 test('Lane B (bug #8): sendAlreadyClaimed — more external_writes than failures ⇒ a send fired', () => {

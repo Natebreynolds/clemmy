@@ -378,6 +378,12 @@ export interface OutputGroundingGateResult {
   sourceCallIds: string[];
   /** Consecutive bounces for the first offending figure including this one. */
   failureCount?: number;
+  /** Set ONLY when evaluated with { deferCommit: true } (the parallel pre-write
+   *  path): persists the bounce increment. The caller invokes it exactly when it
+   *  surfaces this bounce — so an eagerly-started verdict discarded because an
+   *  earlier gate short-circuited never bumps the counter (integrity audit #2.4).
+   *  Undefined on the inline path (already committed). */
+  commitFailure?: () => void;
 }
 
 /**
@@ -387,8 +393,9 @@ export interface OutputGroundingGateResult {
 export async function evaluateOutputGrounding(
   sessionId: string,
   deliverableText: string,
-  _opts: { kind?: 'chat' | 'write'; toolName?: string } = {},
+  _opts: { kind?: 'chat' | 'write'; toolName?: string; deferCommit?: boolean } = {},
 ): Promise<OutputGroundingGateResult> {
+  const deferCommit = _opts.deferCommit === true;
   const claims = extractNumericClaims(deliverableText);
   if (claims.length === 0) {
     return { action: 'allow', reason: 'no load-bearing figures in the deliverable', figures: [], sourceCallIds: [] };
@@ -434,9 +441,15 @@ export async function evaluateOutputGrounding(
   }
   // Contradicted — the trust-killer. Bounce + escalate on repeat.
   const figKey = `${sessionId}::${figures[0] ?? 'deliverable'}`;
+  // Deferred-commit (integrity audit #2.4): on the parallel eager-start path do
+  // NOT persist the increment here — return a commitFailure thunk the caller runs
+  // only if it actually surfaces this bounce. Inline path commits now (identical).
   const failures = (failureCounts.get(figKey) ?? 0) + 1;
-  failureCounts.set(figKey, failures);
-  return { action: 'bounce', reason: verdict.reason, figures, sourceCallIds, failureCount: failures };
+  if (!deferCommit) {
+    failureCounts.set(figKey, failures);
+    return { action: 'bounce', reason: verdict.reason, figures, sourceCallIds, failureCount: failures };
+  }
+  return { action: 'bounce', reason: verdict.reason, figures, sourceCallIds, failureCount: failures, commitFailure: () => failureCounts.set(figKey, failures) };
 }
 
 /**

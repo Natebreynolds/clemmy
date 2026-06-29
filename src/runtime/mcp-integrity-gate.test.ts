@@ -31,6 +31,7 @@ const { createMcpNamespaceShim } = await import('./mcp-namespace-shim.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
 const { createSession, writeToolOutput, listEvents, resetEventLog } = await import('./harness/eventlog.js');
 const grounding = await import('./harness/grounding-gate.js');
+const outputGrounding = await import('./harness/output-grounding-gate.js');
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -150,6 +151,51 @@ test('MCP EXEC tool with a network-mutation command gets grounding too (audit #6
     assert.equal((server as any)._calls.length, 1, 'faithful exec dispatched');
   } finally {
     grounding._setGroundingJudgeForTests(null);
+  }
+});
+
+test('MCP send gets the OUTPUT-GROUNDING gate too — a fabricated figure bounces (integrity audit #2.3)', async () => {
+  // The third send-time gate the brackets paths enforce but the shim was missing:
+  // numeric integrity. A native Gmail send whose body figure contradicts the
+  // session's own tool results must bounce, exactly like the same send via
+  // Composio/shell would.
+  resetEventLog();
+  grounding._resetGroundingStateForTests();
+  grounding._resetDuplicateStateForTests();
+  outputGrounding._resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  // Source: campaign spend sums to $11,000 (labels include "spend"/"campaign").
+  writeToolOutput({
+    sessionId: sess.id, callId: 'call_spend', tool: 'composio_execute_tool',
+    output: 'Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000.',
+  });
+  // Identity grounding always passes here — isolate the output-grounding gate.
+  grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'target ok' }));
+  // Output-grounding judge: contradict iff the body claims $24.5K.
+  outputGrounding._setOutputGroundingJudgeForTests(async (claims) =>
+    claims.some((c) => Math.abs(c.value - 24500) < 1)
+      ? { verdict: 'contradicted', offending: [{ figure: '$24.5K', kind: 'contradicted', note: 'rows sum to $11,000' }], reason: 'Reported $24.5K contradicts the $11,000 campaign total.' }
+      : { verdict: 'grounded', offending: [], reason: 'consistent' });
+  const server = makeSendServer('gmail');
+  const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
+  await shim.listTools();
+  const counter = new ToolCallsCounter(100);
+  const send = (body: string) =>
+    withHarnessRunContext({ sessionId: sess.id, counter }, () =>
+      shim.callTool('gmail__send_email', { to_email: 'cliff@eleylawfirm.com', subject: 'Q report', body }));
+  try {
+    // Fabricated figure → output-grounding soft-blocks BEFORE dispatch.
+    await assert.rejects(
+      () => Promise.resolve(send('Total ad spend across campaigns was $24.5K this quarter.')),
+      (err: Error) => { assert.match(err.message, /OUTPUT_GROUNDING_CHECK_FAILED/); return true; },
+    );
+    assert.equal(server._calls.length, 0, 'fabricated-figure send never reached the server');
+    // Faithful figure that matches the source total → passes.
+    await send('Total ad spend across campaigns was $11,000 this quarter.');
+    assert.equal(server._calls.length, 1, 'grounded send dispatched');
+  } finally {
+    grounding._setGroundingJudgeForTests(null);
+    outputGrounding._setOutputGroundingJudgeForTests(null);
   }
 });
 

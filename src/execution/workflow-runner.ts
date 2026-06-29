@@ -2026,7 +2026,11 @@ async function runStepVerifiedAttempt(
       isRetryable: (err) =>
         !(err instanceof ParkRunSignal) &&
         !(err instanceof WorkflowRunCancelledError) &&
-        isTransientStepError(err),
+        isTransientStepError(err) &&
+        // Bug #8: never transient-retry a step whose send already fired — a retry
+        // re-prompts the session from turn 0 and re-issues the send. Surface the
+        // error instead (mirrors the forEach itemSendAlreadyFired guard). #2.2
+        !stepSendAlreadyFired(ctx.runId, step.id),
       onRetry: ({ attempt, budget: b, delayMs, err }) => {
         appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
           kind: 'step_retry',
@@ -2960,6 +2964,25 @@ export function sendAlreadyClaimed(externalWriteCount: number, failedCount: numb
 function itemSendAlreadyFired(runId: string, stepId: string, itemKey: string): boolean {
   try {
     const sid = `workflow:${runId}:${stepId}:${itemKey}`;
+    const writes = listHarnessEvents(sid, { types: ['external_write'] }).length;
+    const fails = listHarnessEvents(sid, { types: ['external_write_failed'] }).length;
+    return sendAlreadyClaimed(writes, fails);
+  } catch {
+    return false;
+  }
+}
+
+/** Bug #8 guard for PLAIN (non-forEach) steps: has THIS step's send already
+ *  fired? The forEach item retry already nets writes-vs-failures under the
+ *  item's session id (itemSendAlreadyFired); a plain send/write step had NO such
+ *  guard, so a transient model error (e.g. a 529 between the send's
+ *  external_write and step_completed) re-ran executeStep → re-prompted the same
+ *  session from turn 0 → re-issued the send (the double-send class the codebase
+ *  was hardened against — integrity audit #2.2). Same deterministic session id
+ *  as the plain step (`workflow:<runId>:<stepId>`, no itemKey). Fail-open. */
+export function stepSendAlreadyFired(runId: string, stepId: string): boolean {
+  try {
+    const sid = `workflow:${runId}:${stepId}`;
     const writes = listHarnessEvents(sid, { types: ['external_write'] }).length;
     const fails = listHarnessEvents(sid, { types: ['external_write_failed'] }).length;
     return sendAlreadyClaimed(writes, fails);

@@ -195,3 +195,35 @@ test('buildOutputGroundingChatRetry: names the figures + recompute instruction; 
   const repeat = buildOutputGroundingChatRetry({ action: 'bounce', reason: 'spend mismatch', figures: ['$24.5K'], sourceCallIds: ['c1'], failureCount: 2 });
   assert.match(repeat, /ask_user_question/);
 });
+
+test('deferCommit (#2.4 leak fix): an eagerly-evaluated bounce does NOT persist until commitFailure() is called', async () => {
+  resetEventLog();
+  _resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id, callId: 'call_spend', tool: 'composio_execute_tool',
+    output: 'Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000.',
+  });
+  _setOutputGroundingJudgeForTests(async () => ({
+    verdict: 'contradicted', offending: [{ figure: '$24.5K', kind: 'contradicted', note: 'rows sum to $11,000' }],
+    reason: 'Reported $24.5K contradicts the $11,000 total.',
+  }));
+  const body = 'Total ad spend across campaigns was $24.5K this quarter.';
+  try {
+    // Eager (deferred) eval bounces with count 1 but must NOT persist.
+    const a = await evaluateOutputGrounding(sess.id, body, { kind: 'write', deferCommit: true });
+    assert.equal(a.action, 'bounce');
+    assert.equal(a.failureCount, 1);
+    // The verdict was DISCARDED (an earlier gate short-circuited) — commitFailure
+    // never called. A second eager eval must STILL read 1: no leak, no premature
+    // "STOP" escalation on a later turn.
+    const b = await evaluateOutputGrounding(sess.id, body, { kind: 'write', deferCommit: true });
+    assert.equal(b.failureCount, 1, 'discarded eager verdict did NOT bump the counter');
+    // Now actually surface it (the gate reached its block) → commit → next escalates.
+    b.commitFailure?.();
+    const c = await evaluateOutputGrounding(sess.id, body, { kind: 'write', deferCommit: true });
+    assert.equal(c.failureCount, 2, 'a committed failure escalates the next evaluation');
+  } finally {
+    _setOutputGroundingJudgeForTests(null);
+  }
+});

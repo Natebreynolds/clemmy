@@ -3916,6 +3916,12 @@ export async function resumePendingApproval(
     // parallel. Keep resumed approval runs on the same bounded local
     // concurrency path so a resumed batch cannot spike tool payloads.
     toolExecution: { maxFunctionToolConcurrency: 8 },
+    // The resumed RunState replays an already-APPROVED (often side-effecting)
+    // tool as the run's first act — before any stream event flips yieldedContent.
+    // A pre-content stall here must NOT trigger the clean-replay retry, or that
+    // approved external write fires a SECOND time (integrity audit #2.1). Surface
+    // the stall as an error (the user re-sends) instead of silently duplicating.
+    disablePreContentRetry: true,
   };
 
   try {
@@ -5631,7 +5637,15 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // stall is a hard failure (no replay — content was already emitted).
   const streamMs = modelStreamStallMs();
   const firstByteMs = modelFirstByteStallMs();
-  const maxStallRetries = modelStreamStallRetries();
+  // The pre-content retry REPLAYS the run input. On the approval-resume path that
+  // input is a RunState whose first act is an already-APPROVED, often
+  // side-effecting tool — so a replay would fire that external write a SECOND
+  // time. resumePendingApproval threads disablePreContentRetry to force 0 retries
+  // there (the stall surfaces as an error → the user re-sends), while FRESH turns
+  // keep the self-heal. (integrity audit #2.1)
+  const disablePreContentRetry =
+    (opts as unknown as { disablePreContentRetry?: boolean })?.disablePreContentRetry === true;
+  const maxStallRetries = disablePreContentRetry ? 0 : modelStreamStallRetries();
   // result is reassigned per attempt; the post-drain code reads the winner.
   let result!: Awaited<ReturnType<typeof run>>;
   let structuredOutputFailed = false;

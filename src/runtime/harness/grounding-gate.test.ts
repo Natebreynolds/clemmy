@@ -174,3 +174,24 @@ test('detectDuplicateTarget: different target or shape is not a duplicate', () =
   assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@x.com'], priorWrites: prior }).duplicate, false);
   assert.equal(detectDuplicateTarget({ sessionId: 's', shapeKey: undefined, targets: ['a@x.com'], priorWrites: prior }).duplicate, false);
 });
+
+test('detectDuplicateTarget: an already-warned target does NOT mask a fresh duplicate later in the same multi-recipient send (#2.5)', () => {
+  _resetDuplicateStateForTests();
+  const priorWrites = [
+    { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['warned@x.com'] },
+    { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', targets: ['fresh@y.com'] },
+  ];
+  // The first recipient was already warned (a conscious re-send).
+  markDuplicateWarned('s1::OUTLOOK_OUTLOOK_SEND_EMAIL::warned@x.com');
+  // A multi-recipient send hits the warned target FIRST, then a fresh duplicate.
+  const res = detectDuplicateTarget({
+    sessionId: 's1',
+    shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    targets: ['warned@x.com', 'fresh@y.com'],
+    priorWrites,
+  });
+  // Before the fix the warned target short-circuited the scan and the fresh
+  // duplicate slipped through; now the loop continues and the gate trips.
+  assert.equal(res.duplicate, true);
+  assert.equal(res.target, 'fresh@y.com');
+});

@@ -371,7 +371,11 @@ export function detectDuplicateTarget(input: DuplicateCheckInput): { duplicate: 
     const hit = input.priorWrites.some((w) => w.shapeKey === input.shapeKey && (w.targets ?? []).includes(target));
     if (!hit) continue;
     const warnedKey = `${input.sessionId}::${input.shapeKey}::${target}`;
-    if (duplicateWarned.has(warnedKey)) return { duplicate: false };
+    // Already warned about THIS target — keep scanning the remaining targets; a
+    // later recipient in the same multi-target send may be a fresh, un-warned
+    // duplicate that must still trip (integrity audit #2.5). `return` here
+    // abandoned the scan and let other duplicates slip through.
+    if (duplicateWarned.has(warnedKey)) continue;
     return { duplicate: true, target, warnedKey };
   }
   return { duplicate: false };
