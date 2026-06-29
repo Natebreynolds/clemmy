@@ -176,6 +176,15 @@ export interface PlanProposal {
   requiredInputs?: string[];
   /** workflow_pending_inputs: inputs accumulated so far across replies. */
   pendingInputValues?: Record<string, string>;
+  /**
+   * Hold-for-later marker. A pending proposal the user asked Clem to KEEP (not
+   * run now, not a review-approval) — "hold it and bring it back when I ask."
+   * It stays pending, surfaces in the session's Current Focus as a held task,
+   * and the user resumes it by reference ("pick up the Salesforce scrape") →
+   * dispatched goal-bound to the background. Distinguishes a held task from an
+   * approval-pending plan so the two don't get confused.
+   */
+  heldForLater?: boolean;
   // ── Goal-contract fields (present only once a proposal is ACTIVATED) ──
   /** Where the goal came from; absent ⇒ treated as chat-origin. */
   origin?: GoalOrigin;
@@ -974,6 +983,74 @@ export function bindBackgroundRunGoal(
   } catch {
     return null;
   }
+}
+
+export interface HoldTaskInput {
+  objective: string;
+  /** Agreed steps/approach (markdown bullets or discrete lines). */
+  steps?: string[];
+  successCriteria?: string[];
+  sessionId: string;
+  channel?: string;
+  originatingRequest?: string;
+}
+
+/**
+ * Hold an AGREED task for later instead of running it now — the "or you can ask
+ * me later and I'll bring it back up" path. Persists the agreed objective + steps
+ * + criteria as a PENDING, held-for-later plan bound to the session. It does NOT
+ * run and does NOT enter the approval queue; the user resumes it by reference
+ * (see resumeHeldTask), at which point it dispatches goal-bound to the background.
+ * Returns the held proposal, or null on invalid input.
+ */
+export function holdTaskForLater(input: HoldTaskInput): PlanProposal | null {
+  const objective = (input.objective ?? '').trim();
+  if (objective.length < 4 || !input.sessionId) return null;
+  const criteria = (input.successCriteria ?? []).map((c) => c.trim()).filter(Boolean).slice(0, 8);
+  const steps = (input.steps ?? []).map((s) => s.trim()).filter(Boolean).slice(0, 12);
+  const now = new Date().toISOString();
+  const proposal: PlanProposal = {
+    id: `held-${randomUUID().slice(0, 8)}`,
+    proposedAt: now,
+    proposedByAgent: 'clementine',
+    status: 'pending',
+    heldForLater: true,
+    originatingRequest: input.originatingRequest?.trim() || objective,
+    sessionId: input.sessionId,
+    channel: input.channel,
+    plan: {
+      objective,
+      steps: (steps.length > 0 ? steps : [`Pursue the objective: ${objective}`]).map((action, i) => ({
+        n: i + 1,
+        action,
+        rationale: i === 0 ? 'Agreed first step (held for later).' : 'Agreed follow-on step (held for later).',
+        verification: null,
+      })),
+      successCriteria: criteria,
+      stages: null,
+      risks: [],
+      estimatedComplexity: steps.length > 3 || criteria.length > 3 ? 'significant' : 'moderate',
+      recommendsTrackedExecution: true,
+      needsUserInput: [],
+      appliedInstructions: [],
+      externalSends: null,
+    },
+    version: 'v1',
+  };
+  writeProposal(proposal);
+  return proposal;
+}
+
+/** The session's held-for-later tasks (pending + heldForLater), newest first. */
+export function listHeldTasks(sessionId: string): PlanProposal[] {
+  if (!sessionId) return [];
+  return listPlanProposals({ status: 'pending', sessionId }).filter((p) => p.heldForLater === true);
+}
+
+/** Look up one held task by id (must still be pending + held). */
+export function getHeldTask(id: string): PlanProposal | null {
+  const p = readProposal(id);
+  return p && p.heldForLater === true && p.status === 'pending' ? p : null;
 }
 
 /** Synthetic session key for a workflow's run-level goal contract — one

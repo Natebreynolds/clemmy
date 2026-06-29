@@ -33,6 +33,7 @@ import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderEstablishedDestinationsForContext } from '../runtime/harness/published-destinations.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
 import { listActiveGoalSummaries } from '../memory/goals-list.js';
+import { listHeldTasks } from './plan-proposals.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import { modelParityEnabled, CACHE_BREAK_SENTINEL } from '../runtime/harness/model-wire-registry.js';
@@ -234,7 +235,24 @@ export function renderLearnedBlocks(objective?: string): { recentlyLearned: stri
   return { recentlyLearned, toolChoices, establishedDestinations };
 }
 
-export function renderHarnessMemoryContext(): string {
+/** Held-for-later tasks for THIS session, so the model can resurface one when
+ *  the user references it ("pick up the Salesforce scrape"). Session-scoped so a
+ *  held task from another chat never leaks in. '' when none. */
+function renderHeldTasks(sessionId?: string): string {
+  if (!sessionId) return '';
+  try {
+    const held = listHeldTasks(sessionId);
+    if (held.length === 0) return '';
+    return [
+      'Tasks you agreed to HOLD for later (the user can resume one by reference — then call resume_held_task with its id):',
+      ...held.slice(0, 8).map((h) => `  - ${h.id} — ${h.plan.objective}`),
+    ].join('\n');
+  } catch {
+    return '';
+  }
+}
+
+export function renderHarnessMemoryContext(opts?: { sessionId?: string }): string {
   let memContext;
   try {
     memContext = loadMemoryContext();
@@ -276,6 +294,7 @@ export function renderHarnessMemoryContext(): string {
   }
 
   const goals = renderActiveGoals();
+  const heldTasks = renderHeldTasks(opts?.sessionId);
   const nowLine = renderCurrentTimeForInstructions();
 
   let skills = '';
@@ -311,6 +330,7 @@ export function renderHarnessMemoryContext(): string {
     section('Core Personality', memContext.soul),
     section('Long-Term Memory', memContext.memory),
     section('Active Goals', goals),
+    section('Held For Later', heldTasks),
     section('Current Focus', focus),
     section('Available Skills', skills),
   ].filter(Boolean);
@@ -330,9 +350,9 @@ export function renderHarnessMemoryContext(): string {
  * once per turn via getSystemPrompt, so vault edits surface
  * immediately on the next turn.
  */
-export function harnessInstructions(roleInstructions: string): () => string {
+export function harnessInstructions(roleInstructions: string, opts?: { sessionId?: string }): () => string {
   return () => {
-    const ctx = renderHarnessMemoryContext();
+    const ctx = renderHarnessMemoryContext({ sessionId: opts?.sessionId });
     if (!ctx) return roleInstructions;
     // Parity (default): STABLE role instructions FIRST so the whole prefix
     // (identity + role + tools) can be prompt-cached; the per-turn DYNAMIC

@@ -135,6 +135,8 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'background_tasks_recent',
   'background_task_status',
   'dispatch_background_task',
+  'hold_task_for_later',
+  'resume_held_task',
   'skill_list',
   'skill_read',
   'tool_choice_recall',

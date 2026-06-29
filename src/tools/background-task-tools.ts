@@ -6,7 +6,8 @@ import {
   renderBackgroundTaskStatus,
 } from '../execution/background-task-status.js';
 import { enqueueDurableChatTask } from '../execution/background-promote.js';
-import { bindBackgroundRunGoal } from '../agents/plan-proposals.js';
+import { bindBackgroundRunGoal, holdTaskForLater, listHeldTasks, getHeldTask } from '../agents/plan-proposals.js';
+import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
 
@@ -137,6 +138,74 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         + (goal ? ' with a goal contract — it will keep working until the success criteria are met, not just run once' : '')
         + `. It's running in the daemon now and will report its result back HERE automatically when it finishes — or pause and ask you here if it needs a decision. `
         + `Tell the user it's on it and that you'll report back; do NOT wait, poll, or do the work yourself this turn — you're free to take their next request right now. It's also watchable on the Tasks board.`,
+      );
+    },
+  );
+
+  server.tool(
+    'hold_task_for_later',
+    [
+      'HOLD an agreed multi-step task for later instead of running it now — the "or you can ask me later and I\'ll bring it back up" choice.',
+      'Call this ONLY after you and the user aligned on the task AND they chose to hold it (not run it now, not background it now).',
+      'Pass the AGREED objective + steps + success criteria you settled on. It is saved against this chat and shown in your Current Focus as a held task.',
+      'The user resumes it whenever by reference ("pick up the Salesforce scrape") — you then call resume_held_task with its id, which dispatches it to the background bound to its goal. Confirm it is held, tell them how to bring it back, and STOP.',
+    ].join('\n'),
+    {
+      objective: z.string().min(4).describe('One line: what the held task must achieve.'),
+      steps: z.array(z.string()).nullable().describe('The agreed steps/approach (settled with the user).'),
+      success_criteria: z.array(z.string()).nullable().describe('Concrete done-checks for when it is eventually run.'),
+    },
+    async ({ objective, steps, success_criteria }) => {
+      const sessionId = getToolOutputContext()?.sessionId;
+      if (!sessionId) {
+        return textResult('I can only hold a task from a live chat session (no session context here).');
+      }
+      const held = holdTaskForLater({
+        objective,
+        steps: steps ?? undefined,
+        successCriteria: success_criteria ?? undefined,
+        sessionId,
+        originatingRequest: objective,
+      });
+      if (!held) {
+        return textResult('I could not hold that — give me a short objective and I\'ll keep it for later.');
+      }
+      return textResult(
+        `Held "${held.plan.objective}" for later (id ${held.id}). It won't run until you bring it back — `
+        + `just say "pick up ${held.plan.objective.slice(0, 40)}…" (or "what's on hold?") and I'll resume it, running it in the background then. `
+        + `Tell the user it's saved + how to resume, and STOP.`,
+      );
+    },
+  );
+
+  server.tool(
+    'resume_held_task',
+    [
+      'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list), now that they want it run.',
+      'Pass the held task id (held-xxxx). It dispatches the held plan to the background bound to its goal contract — it runs until its criteria are met and reports back HERE.',
+      'After it returns: confirm it is now running in the background and that you will report back, then STOP — do not do the work yourself this turn.',
+    ].join('\n'),
+    {
+      id: z.string().min(1).describe('The held task id (held-xxxx) from your Current Focus held list.'),
+    },
+    async ({ id }) => {
+      const held = getHeldTask(id);
+      if (!held) {
+        const sessionId = getToolOutputContext()?.sessionId;
+        const open = sessionId ? listHeldTasks(sessionId) : [];
+        return textResult(
+          open.length > 0
+            ? `No held task "${id}". Held right now: ${open.map((h) => `${h.id} — ${h.plan.objective.slice(0, 60)}`).join('; ')}.`
+            : `No held task "${id}", and nothing is currently on hold.`,
+        );
+      }
+      const result = approvePlanAndQueueBackgroundTask(id);
+      if (!result) {
+        return textResult(`I found the held task "${id}" but could not queue it — try again or re-state the task.`);
+      }
+      return textResult(
+        `Picking "${result.task.title}" back up — it's now running in the background (task ${result.task.id}) bound to its goal, and will report back HERE when done. `
+        + `Tell the user it's resumed + running; do NOT do the work yourself this turn.`,
       );
     },
   );

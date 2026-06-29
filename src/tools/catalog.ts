@@ -81,6 +81,8 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'background_tasks_recent',
   'background_task_status',
   'dispatch_background_task',
+  'hold_task_for_later',
+  'resume_held_task',
   'notify_user',
   'ask_user_question',
   'list_pending_check_ins',

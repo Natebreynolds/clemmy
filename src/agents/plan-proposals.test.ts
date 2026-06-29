@@ -28,6 +28,9 @@ const {
   deriveEnumeratedSends,
   bindBackgroundRunGoal,
   getActiveGoalForSession,
+  holdTaskForLater,
+  listHeldTasks,
+  getHeldTask,
 } = await import('./plan-proposals.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { getPlanScope, isAutoApprovedByScope, closePlanScope } = await import('./plan-scope.js');
@@ -403,4 +406,41 @@ test('bindBackgroundRunGoal: goal has a run-owned background origin (exempt from
   const goal = bindBackgroundRunGoal('background:task-origin', { objective: 'A long background objective with criteria', successCriteria: ['done'] });
   assert.ok(goal);
   assert.equal(goal!.origin?.kind, 'background', 'origin is background, not chat — owned by the task wall-clock');
+});
+
+// ── holdTaskForLater / listHeldTasks / getHeldTask (Inc C: hold-for-later) ────
+
+test('holdTaskForLater: saves a pending, held-for-later plan bound to the session', () => {
+  const sessionId = 'sess-hold-1';
+  const held = holdTaskForLater({
+    objective: 'Scrape 100 net-new Salesforce accounts',
+    steps: ['Pull existing customers as seed', 'Find lookalikes', 'Dedupe', 'Create accounts'],
+    successCriteria: ['100 net-new', 'no dupes'],
+    sessionId,
+  });
+  assert.ok(held);
+  assert.equal(held!.status, 'pending');
+  assert.equal(held!.heldForLater, true);
+  assert.equal(held!.sessionId, sessionId);
+  assert.match(held!.id, /^held-/);
+  assert.equal(held!.plan.steps.length, 4, 'agreed steps carried onto the held plan');
+  assert.deepEqual(held!.plan.successCriteria, ['100 net-new', 'no dupes']);
+});
+
+test('listHeldTasks: returns only this session\'s held tasks; getHeldTask fetches a held pending one', () => {
+  const sessionId = 'sess-hold-2';
+  const a = holdTaskForLater({ objective: 'Build the competitor brief deck', sessionId });
+  holdTaskForLater({ objective: 'A held task in another session', sessionId: 'sess-other' });
+  // a plain (non-held) pending proposal in the same session must NOT appear
+  surfacePlan({ plan: aPlan(), originatingRequest: 'a normal review-pending plan', sessionId });
+  const held = listHeldTasks(sessionId);
+  assert.equal(held.length, 1, 'only the held task in THIS session');
+  assert.equal(held[0].id, a!.id);
+  assert.ok(getHeldTask(a!.id), 'getHeldTask returns the held pending proposal');
+  assert.equal(getHeldTask('held-nope'), null, 'unknown id → null');
+});
+
+test('holdTaskForLater: invalid input (short objective / no session) → null', () => {
+  assert.equal(holdTaskForLater({ objective: 'no', sessionId: 'sess-x' }), null);
+  assert.equal(holdTaskForLater({ objective: 'a valid long objective', sessionId: '' }), null);
 });

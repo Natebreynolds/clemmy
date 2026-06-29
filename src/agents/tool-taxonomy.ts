@@ -185,6 +185,12 @@ const ALWAYS_READ = new Set<string>([
   // task_add below). The work it dispatches is still gated normally inside the
   // background run.
   'dispatch_background_task',
+  // hold_task_for_later saves an agreed plan locally (reversible, no external
+  // effect); resume_held_task queues work the user EXPLICITLY asked to pick back
+  // up — both are consent-given like dispatch_background_task. Work stays gated
+  // inside the resulting background run.
+  'hold_task_for_later',
+  'resume_held_task',
   'memory_list_facts',
   'memory_search_facts',
   'memory_read',

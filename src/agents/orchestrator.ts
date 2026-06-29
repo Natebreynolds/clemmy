@@ -1018,6 +1018,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'background_task_status',
       'background_tasks_recent',
       'dispatch_background_task',
+      'hold_task_for_later',
+      'resume_held_task',
       // Profile writes
       'user_profile_update',
       // ── Instructed-but-omitted repair, 2026-06-11 ──────────────────
@@ -1146,7 +1148,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // (SOUL, MEMORY, IDENTITY, working memory, facts, goals) each
     // turn — vault edits and new facts surface immediately without
     // restarting the daemon.
-    instructions: harnessInstructions(rubricChoice.instructions) + (codeModeMandate ? `\n\n${codeModeMandate}` : ''),
+    instructions: harnessInstructions(rubricChoice.instructions, { sessionId: options.sessionId ?? undefined }) + (codeModeMandate ? `\n\n${codeModeMandate}` : ''),
     // Per-call override (dormant — no caller passes it yet) so worker-model
     // routing survives a workflow-step conversion onto the harness loop.
     model: options.model ?? resolveRoleModel('brain').modelId,
