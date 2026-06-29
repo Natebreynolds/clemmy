@@ -26,6 +26,8 @@ const {
   supersedePlanProposal,
   planNeedsUserInput,
   deriveEnumeratedSends,
+  bindBackgroundRunGoal,
+  getActiveGoalForSession,
 } = await import('./plan-proposals.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 const { getPlanScope, isAutoApprovedByScope, closePlanScope } = await import('./plan-scope.js');
@@ -349,4 +351,56 @@ test('no enumerated sends → today\'s time-boxed scope (no goal scope, no send 
   assert.ok(!scope.goalScoped, 'but it is NOT goal-scoped');
   assert.ok(!scope.allowedSends || scope.allowedSends.length === 0, 'and blesses no sends');
   closePlanScope(sessionId, 'test cleanup');
+});
+
+// ── bindBackgroundRunGoal (Inc B: goal-bound background dispatch) ─────────────
+
+test('bindBackgroundRunGoal: creates + activates a goal on the run-session with the criteria', () => {
+  delete process.env.CLEMMY_BG_GOAL_CONTRACT;
+  const runSessionId = 'background:task-abc';
+  const goal = bindBackgroundRunGoal(runSessionId, {
+    objective: 'Scrape 100 net-new Salesforce accounts similar to existing customers',
+    successCriteria: ['100 net-new accounts created', 'no duplicates against existing accounts', 'each has name + domain + industry'],
+    nextActions: ['Pull existing customers as the lookalike seed', 'Find similar companies', 'Dedupe', 'Create accounts'],
+    originatingRequest: 'scrape me 100 new accounts',
+  });
+  assert.ok(goal, 'a goal contract is created');
+  assert.equal(goal!.status, 'active');
+  assert.equal(goal!.sessionId, runSessionId, 'bound to the RUN session, not the chat');
+  const active = getActiveGoalForSession(runSessionId);
+  assert.ok(active, 'retrievable as the run-session active goal');
+  const plan = active!.approvedPlan ?? active!.plan;
+  assert.match(plan.objective, /Scrape 100 net-new Salesforce accounts/);
+  assert.equal(plan.successCriteria.length, 3, 'criteria carried onto the contract');
+  assert.ok(plan.successCriteria.includes('no duplicates against existing accounts'));
+});
+
+test('bindBackgroundRunGoal: CLEMMY_BG_GOAL_CONTRACT=off → no goal (kill-switch, one-shot run)', () => {
+  process.env.CLEMMY_BG_GOAL_CONTRACT = 'off';
+  const runSessionId = 'background:task-off';
+  const goal = bindBackgroundRunGoal(runSessionId, { objective: 'do a long thing with clear criteria', successCriteria: ['done'] });
+  assert.equal(goal, null, 'disabled → returns null');
+  assert.equal(getActiveGoalForSession(runSessionId), null, 'no goal created on the run-session');
+  delete process.env.CLEMMY_BG_GOAL_CONTRACT;
+});
+
+test('bindBackgroundRunGoal: invalid input (short objective / empty session) → null, never throws', () => {
+  delete process.env.CLEMMY_BG_GOAL_CONTRACT;
+  assert.equal(bindBackgroundRunGoal('background:x', { objective: 'no' }), null, 'too-short objective');
+  assert.equal(bindBackgroundRunGoal('', { objective: 'a valid long objective here' }), null, 'empty run-session');
+});
+
+test('bindBackgroundRunGoal: criteria-less goal still binds (validates against the objective)', () => {
+  delete process.env.CLEMMY_BG_GOAL_CONTRACT;
+  const runSessionId = 'background:task-nocrit';
+  const goal = bindBackgroundRunGoal(runSessionId, { objective: 'Build and deploy the one-pager site' });
+  assert.ok(goal, 'binds even with no explicit criteria');
+  assert.equal(goal!.sessionId, runSessionId);
+});
+
+test('bindBackgroundRunGoal: goal has a run-owned background origin (exempt from the idle reaper)', () => {
+  delete process.env.CLEMMY_BG_GOAL_CONTRACT;
+  const goal = bindBackgroundRunGoal('background:task-origin', { objective: 'A long background objective with criteria', successCriteria: ['done'] });
+  assert.ok(goal);
+  assert.equal(goal!.origin?.kind, 'background', 'origin is background, not chat — owned by the task wall-clock');
 });

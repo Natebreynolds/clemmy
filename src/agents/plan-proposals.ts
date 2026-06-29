@@ -128,9 +128,11 @@ export interface GoalStage {
 }
 
 /** Where a goal contract came from. Chat goals are session-pinned and subject
- *  to the daily idle reaper; workflow goals live and die with their run. */
+ *  to the daily idle reaper; workflow AND background goals live and die with
+ *  their run (their lifetime is the task's wall-clock, not chat idleness), so
+ *  both are exempt from the idle reaper. */
 export interface GoalOrigin {
-  kind: 'chat' | 'workflow';
+  kind: 'chat' | 'workflow' | 'background';
   runId?: string;
   stepId?: string;
 }
@@ -861,6 +863,9 @@ export interface CreateGoalContractInput {
   resumeEveryMs?: number;
   maxResumes?: number;
   deadlineAt?: string;
+  /** Goal provenance. Defaults to chat (session-pinned, idle-reaped). Pass a
+   *  run-owned origin (workflow/background) to exempt it from the idle reaper. */
+  origin?: GoalOrigin;
 }
 
 /**
@@ -914,7 +919,7 @@ export function createGoalContract(input: CreateGoalContractInput): PlanProposal
     version: 'v1',
   };
   writeProposal(proposal);
-  const active = activateGoal(proposal.id, { origin: { kind: 'chat' }, maxAttempts: input.maxAttempts });
+  const active = activateGoal(proposal.id, { origin: input.origin ?? { kind: 'chat' }, maxAttempts: input.maxAttempts });
   if (!active) return null;
   if (input.selfDriving) {
     return enableGoalSelfDrive(active.id, {
@@ -924,6 +929,51 @@ export function createGoalContract(input: CreateGoalContractInput): PlanProposal
     }) ?? active;
   }
   return active;
+}
+
+/** Kill-switch (default ON) for binding a goal contract to a backgrounded
+ *  task's run-session. When on, a task pushed to the background runs against a
+ *  DURABLE goal — it keeps working until the success criteria validate (not one
+ *  pass), tracks progress, and reports back against them. `=off` reverts to a
+ *  one-shot prompt run (the legacy behavior). */
+export function backgroundGoalContractEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BG_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Bind a durable goal contract to a background task's RUN session, so the
+ * unattended run is goal-driven (the goal re-injects each turn, completion is
+ * VALIDATED against the criteria, and a not-yet-met run re-attempts up to the
+ * goal cap) instead of executing a prompt once — the "have the goal defined
+ * before pushing to the background" guarantee. The goal is created on
+ * `runSessionId` (unique per task), so it never collides with the originating
+ * chat's own goal. Shared by BOTH background entry paths (the conversational
+ * dispatch_background_task tool AND the plan-first approve→queue path) so the
+ * guarantee is a property of backgrounding, not of which path queued it.
+ * Best-effort: a binding failure never blocks the task — it just falls back to
+ * the prompt-only run. Returns the activated goal, or null when disabled/invalid.
+ */
+export function bindBackgroundRunGoal(
+  runSessionId: string,
+  input: { objective: string; successCriteria?: string[]; nextActions?: string[]; originatingRequest?: string; channel?: string },
+): PlanProposal | null {
+  if (!backgroundGoalContractEnabled()) return null;
+  if (!runSessionId || (input.objective ?? '').trim().length < 4) return null;
+  try {
+    return createGoalContract({
+      objective: input.objective,
+      successCriteria: input.successCriteria,
+      nextActions: input.nextActions,
+      originatingRequest: input.originatingRequest ?? input.objective,
+      sessionId: runSessionId,
+      channel: input.channel ?? 'background',
+      // Run-owned: the goal's lifetime is the task's wall-clock, so exempt it
+      // from the daily chat-idle reaper (same treatment as workflow goals).
+      origin: { kind: 'background' },
+    });
+  } catch {
+    return null;
+  }
 }
 
 /** Synthetic session key for a workflow's run-level goal contract — one
@@ -1291,7 +1341,8 @@ export function reapExpiredGoals(now: Date = new Date()): GoalReapStats {
   const stats: GoalReapStats = { expired: 0, purged: 0, notified: 0 };
   for (const p of listPlanProposals({ status: 'all' })) {
     if (p.status === 'active') {
-      if ((p.origin?.kind ?? 'chat') === 'workflow') continue; // run-owned
+      const originKind = p.origin?.kind ?? 'chat';
+      if (originKind === 'workflow' || originKind === 'background') continue; // run-owned: lifetime is the task wall-clock, not chat idleness
       const last = Date.parse(p.lastActivityAt ?? p.proposedAt);
       if (!Number.isFinite(last) || now.getTime() - last < GOAL_IDLE_TTL_MS) continue;
       const wasMidFlight = (p.attempt ?? 0) > 0 || (p.progressLedger?.length ?? 0) > 0;

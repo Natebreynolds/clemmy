@@ -6,8 +6,19 @@ import {
   renderBackgroundTaskStatus,
 } from '../execution/background-task-status.js';
 import { enqueueDurableChatTask } from '../execution/background-promote.js';
+import { bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
+
+/** Split an agreed plan (markdown bullets / numbered lines) into discrete next
+ *  actions for the goal contract's step list. Best-effort + bounded. */
+function planToNextActions(plan: string): string[] {
+  return plan
+    .split('\n')
+    .map((line) => line.replace(/^\s*(?:[-*+]|\d+[.)])\s*/, '').trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 12);
+}
 
 const statusSchema = z.enum([
   'active',
@@ -110,8 +121,21 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         maxMinutes: max_minutes ?? undefined,
       });
 
+      // Bind a durable goal contract to the task's RUN session so the unattended
+      // run is goal-DRIVEN: it works until the success criteria validate (not one
+      // pass) and reports back against them — "have the goal defined" before
+      // backgrounding. Best-effort; on failure the task still runs on its prompt.
+      const goal = bindBackgroundRunGoal(task.runSessionId, {
+        objective,
+        successCriteria: success_criteria ?? undefined,
+        nextActions: planToNextActions(plan),
+        originatingRequest: objective,
+      });
+
       return textResult(
-        `Dispatched "${task.title}" to the background (task ${task.id}). It's running in the daemon now and will report its result back HERE automatically when it finishes — or pause and ask you here if it needs a decision. `
+        `Dispatched "${task.title}" to the background (task ${task.id})`
+        + (goal ? ' with a goal contract — it will keep working until the success criteria are met, not just run once' : '')
+        + `. It's running in the daemon now and will report its result back HERE automatically when it finishes — or pause and ask you here if it needs a decision. `
         + `Tell the user it's on it and that you'll report back; do NOT wait, poll, or do the work yourself this turn — you're free to take their next request right now. It's also watchable on the Tasks board.`,
       );
     },

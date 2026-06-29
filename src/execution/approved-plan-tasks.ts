@@ -3,6 +3,7 @@ import { finishRun, startRun, type RunRecord } from '../runtime/run-events.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import {
   approvePlanProposal,
+  bindBackgroundRunGoal,
   type ApprovePlanProposalOptions,
   type PlanProposal,
 } from '../agents/plan-proposals.js';
@@ -70,6 +71,18 @@ export function approvePlanAndQueueBackgroundTask(
     model: undefined,
     maxMinutes: loadProactivityPolicy().defaultLongTaskMinutes,
     source: proposal.channel?.startsWith('discord:') ? 'discord' : 'daemon',
+  });
+
+  // Same guarantee as the conversational dispatch path: bind a durable goal
+  // contract to the background RUN session so the approved plan runs until its
+  // success criteria validate (not one pass) and reports back against them.
+  // The approved plan's own criteria/steps are the contract. Best-effort.
+  bindBackgroundRunGoal(task.runSessionId, {
+    objective: plan.objective,
+    successCriteria: plan.successCriteria,
+    nextActions: plan.steps.map((s) => s.action),
+    originatingRequest: proposal.originatingRequest,
+    channel: proposal.channel,
   });
 
   const run = startRun({
