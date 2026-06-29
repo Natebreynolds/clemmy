@@ -33,7 +33,7 @@ import {
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
 import { buildChatFalloverWiring } from '../runtime/harness/respond-bridge.js';
-import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
+import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { pullRecentTurnsForSession, renderTranscriptTurns } from '../runtime/harness/session-transcript.js';
@@ -2054,7 +2054,28 @@ export async function runDiscordHarnessConversation(opts: {
       // Decide on the RAW text (not folded attachments); enqueue the FULL
       // `prompt`. Skip when the session is paused on an approval so a stray
       // durable phrase can't orphan an in-flight gated workflow.
-      if (!goalRunInput && !isChannelSessionAwaitingApproval(channelId, channel) && shouldPromoteToDurable(rawPromptForIntent)) {
+      // User-initiated "background it" control (Claude Code ctrl+b model) —
+      // desktop↔Discord↔Slack parity. Push the running task to the background on
+      // demand; handled before the run. Skip while awaiting approval.
+      const isBackgroundItControl =
+        !goalRunInput && !isChannelSessionAwaitingApproval(channelId, channel) && detectBackgroundItIntent(rawPromptForIntent);
+      if (isBackgroundItControl) {
+        const detached = detachRunningTurnToBackground(session.id);
+        if (detached) {
+          appendHarnessEvent({
+            sessionId: session.id,
+            turn: 0,
+            role: 'Clem',
+            type: 'conversation_completed',
+            data: { reason: 'moved_to_background', summary: detached.text, reply: detached.text, steps: 0, queuedTaskId: detached.taskId },
+          });
+          return;
+        }
+        // Matched the control but there's nothing to background → fall to a NORMAL
+        // turn (parity with the console), NOT the durable-promotion gate below
+        // (which would enqueue a nonsense task from the bare "background it" text).
+      }
+      if (!goalRunInput && !isBackgroundItControl && !isChannelSessionAwaitingApproval(channelId, channel) && shouldPromoteToDurable(rawPromptForIntent)) {
         const task = enqueueDurableChatTask({
           message: prompt,
           sessionId: session.id,

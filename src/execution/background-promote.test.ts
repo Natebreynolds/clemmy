@@ -28,8 +28,11 @@ const {
   shouldPromoteToDurable,
   enqueueDurableChatTask,
   renderDurableTaskQueued,
+  detectBackgroundItIntent,
+  detachRunningTurnToBackground,
 } = await import('./background-promote.js');
 const { getBackgroundTask, listBackgroundTasks } = await import('./background-tasks.js');
+const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -133,4 +136,43 @@ test('renderDurableTaskQueued states the three trust-earning facts', () => {
   // Survives a close/restart + reports back here.
   assert.match(msg, /close this window|restart/i);
   assert.match(msg, /report back/i);
+});
+
+// ── Inc A4: user-initiated "background it" control ───────────────────────────
+
+test('detectBackgroundItIntent: matches the imperative forms, ignores normal mentions', () => {
+  for (const yes of [
+    'background it', 'Background it.', 'run it in the background', 'take it to the background',
+    'move this to the background', 'do it in the background', 'finish it in the background',
+    '/background it', 'send it to the background',
+  ]) assert.equal(detectBackgroundItIntent(yes), true, `should match: ${yes}`);
+  for (const no of [
+    'what is running in the background?', 'tell me about background tasks',
+    'the background color should be blue', 'run a background check on this company',
+    'hello', 'background',
+  ]) assert.equal(detectBackgroundItIntent(no), false, `should NOT match: ${no}`);
+});
+
+test('detachRunningTurnToBackground: stops the run + enqueues a goal-bound resume task from the recent objective', () => {
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: sess.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'scrape 100 net-new Salesforce accounts similar to my customers' } });
+  // a later background-it message must NOT be picked as the objective
+  appendEvent({ sessionId: sess.id, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'background it' } });
+  const before = listBackgroundTasks().length;
+  const res = detachRunningTurnToBackground(sess.id);
+  assert.ok(res, 'returns a result');
+  assert.equal(res!.handled, true);
+  assert.match(res!.text, /background/i);
+  const tasks = listBackgroundTasks();
+  assert.equal(tasks.length, before + 1, 'one background task enqueued');
+  const task = getBackgroundTask(res!.taskId);
+  assert.ok(task);
+  assert.match(task!.prompt, /scrape 100 net-new Salesforce accounts/, 'objective = the recent real request, not "background it"');
+  assert.match(task!.prompt, /session_history/, 'prompt tells it to resume from recorded progress');
+  assert.equal(task!.originSessionId, sess.id, 'reports back to the originating chat');
+});
+
+test('detachRunningTurnToBackground: null when there is nothing to background', () => {
+  const sess = createSession({ kind: 'chat' });
+  assert.equal(detachRunningTurnToBackground(sess.id), null, 'no objective → null (caller treats as a normal turn)');
 });

@@ -194,7 +194,7 @@ import {
   resumeBackgroundTask,
   staleTaskKind,
 } from '../execution/background-tasks.js';
-import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable } from '../execution/background-promote.js';
+import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { finishRun, getRun, listRuns } from '../runtime/run-events.js';
 import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
@@ -8896,6 +8896,16 @@ export function registerConsoleRoutes(
           sessionId,
           text: `Continuing background task "${continueTask.title}". It will report back here when it's done.`,
         });
+        return;
+      }
+    }
+    // User-initiated "background it" control (Claude Code ctrl+b model): push the
+    // currently-running foreground task to the background on demand, freeing the
+    // chat. Handled here (before the model) so it works even mid-run.
+    if (detectBackgroundItIntent(message)) {
+      const detached = detachRunningTurnToBackground(sessionId);
+      if (detached) {
+        res.json({ sessionId, text: detached.text });
         return;
       }
     }

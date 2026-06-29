@@ -25,6 +25,8 @@ import { MODELS } from '../config.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import { createBackgroundTask, type BackgroundTaskRecord } from './background-tasks.js';
+import { requestKill, listEvents } from '../runtime/harness/eventlog.js';
+import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 
 /**
  * Explicit or high-confidence intent to run this work as a durable background job.
@@ -174,6 +176,79 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',
   });
+}
+
+// ── User-initiated "background it" control (the Claude Code ctrl+b model) ──────
+//
+// An ALWAYS-available user control to push the CURRENTLY-RUNNING foreground task
+// to the background — the user decides WHEN, so there's no system guessing about
+// timing. Handled at the inbound-message layer (before the model), like the
+// needs_input / continue controls, so it works even mid-run.
+
+/** Detect the explicit "push the running task to the background" control. Tight
+ *  on purpose — only clear imperative forms — so it never eats a normal message
+ *  that merely mentions "background". */
+export function detectBackgroundItIntent(message: string): boolean {
+  const m = message.trim().toLowerCase().replace(/[.!]+$/, '');
+  return /^\/?(background (?:it|this)|run (?:it|this) in the background|take (?:it|this) to the background|move (?:it|this) to the background|do (?:it|this) in the background|send (?:it|this) to the background|finish (?:it|this) in the background)$/.test(m);
+}
+
+/** Resolve the objective of the in-flight / just-run task for this session: the
+ *  pinned goal if any, else the most recent real user request (never the
+ *  background-it control itself). Null when there's nothing to background. */
+function resolveBackgroundableObjective(sessionId: string): string | null {
+  try {
+    const goal = getActiveGoalForSession(sessionId);
+    const goalObj = goal ? (goal.approvedPlan ?? goal.plan).objective?.trim() : '';
+    if (goalObj) return goalObj;
+  } catch { /* fall through to recent input */ }
+  try {
+    const inputs = listEvents(sessionId, { types: ['user_input_received'] })
+      .map((e) => String((e.data as { text?: string } | undefined)?.text ?? '').trim())
+      .filter((t) => t.length > 0 && !detectBackgroundItIntent(t));
+    return inputs.length > 0 ? inputs[inputs.length - 1] : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface BackgroundItResult { handled: true; text: string; taskId: string; }
+
+/**
+ * Handle the "background it" control: STOP the in-flight foreground run (so it
+ * doesn't double-execute) and continue the SAME objective as a goal-bound
+ * background task that RESUMES from this session's recorded progress, then free
+ * the chat. Returns null when there's no resolvable objective to background (the
+ * caller then treats the message as an ordinary turn). Shared by every surface.
+ *
+ * Dedup across the origin→background boundary is SOFT and BOUNDED, not hard:
+ * requestKill stops the foreground at its NEXT assertNotKilled (tool-call edge),
+ * so one already-in-flight foreground tool call can still complete; and the
+ * background task avoids redo only by being told to read session_history first
+ * (LLM-honored). So the overlap is bounded to ≤1 in-flight foreground action +
+ * soft progress-diffing — acceptable for v1 (this is the resume-not-restart
+ * tradeoff). A hard cross-session idempotency key would be the stronger fix.
+ */
+export function detachRunningTurnToBackground(sessionId: string): BackgroundItResult | null {
+  const objective = resolveBackgroundableObjective(sessionId);
+  if (!objective) return null;
+  // Stop the foreground run so the same work doesn't run twice.
+  try { requestKill(sessionId, 'moved to background by user'); } catch { /* best effort */ }
+  const composedPrompt = [
+    `Objective: ${objective}`,
+    '',
+    'You are CONTINUING this task in the background — the user just moved it here from a live chat.',
+    `Your progress so far is recorded in session "${sessionId}". Call session_history with that id FIRST to see what is already done, then continue from there — do NOT redo completed work.`,
+    'Work through to completion, then report the result back.',
+  ].join('\n');
+  const task = enqueueDurableChatTask({ message: objective, composedPrompt, sessionId, source: 'desktop' });
+  // Goal-bind so the background run works until its criteria hold + reports back (Inc B).
+  try { bindBackgroundRunGoal(task.runSessionId, { objective, originatingRequest: objective }); } catch { /* best effort */ }
+  return {
+    handled: true,
+    taskId: task.id,
+    text: `On it — moving "${task.title}" to the background now. It picks up where it was and reports back here when it's done. You're free to move on to something else.`,
+  };
 }
 
 /**
