@@ -128,22 +128,25 @@ test('proposal ids are stable across runs (dedup substrate)', () => {
 
 // ── gating ─────────────────────────────────────────────────────────────────
 
-test('proposerEnabled: OFF by default; on only with CLEMMY_IMPROVEMENT_PROPOSER=on', () => {
+test('proposerEnabled: ON by default (graduated); only CLEMMY_IMPROVEMENT_PROPOSER=off disables', () => {
   delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
-  assert.equal(proposerEnabled(), false);
+  assert.equal(proposerEnabled(), true, 'default ON');
+  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'off';
+  assert.equal(proposerEnabled(), false, '=off kill-switch');
   process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'on';
   assert.equal(proposerEnabled(), true);
   delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
 });
 
-test('proposeFromReport is a no-op when the flag is off, drafts when on', () => {
+test('proposeFromReport drafts by default, no-op only with the =off kill-switch', () => {
   const r = report([{ toolName: 'flaky_tool', calls: 10, successes: 4, errors: 6, emptyResults: 0, wrongPickHints: 0 }]);
-  delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
-  assert.equal(proposeFromReport(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE }).ran, false);
-  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'on';
-  const res = proposeFromReport(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE });
-  assert.equal(res.ran, true);
-  assert.ok(res.added >= 1);
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+  delete process.env.CLEMMY_IMPROVEMENT_PROPOSER; // unset = default ON now
+  const onByDefault = proposeFromReport(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE });
+  assert.equal(onByDefault.ran, true, 'drafts by default');
+  assert.ok(onByDefault.added >= 1);
+  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'off';
+  assert.equal(proposeFromReport(r, { listSkills: NO_SKILLS, countRetirableNoise: NO_NOISE }).ran, false, '=off no-op');
   delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
 });
 

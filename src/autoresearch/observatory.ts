@@ -619,8 +619,9 @@ export function tickAutoresearchObservatory(): void {
       );
     }
     // Phase C: turn the just-built observations into human-gated improvement
-    // proposals. No-op (no model/skill reads) unless CLEMMY_IMPROVEMENT_PROPOSER
-    // is on; applying a proposal is always a separate explicit human click.
+    // proposals. Drafts by default (CLEMMY_IMPROVEMENT_PROPOSER graduated to
+    // default-on 2026-06-28; =off makes this a no-op); applying a proposal is
+    // ALWAYS a separate explicit human click — drafting only fills a review queue.
     // Lazy import keeps observatory free of a runtime dependency on the proposer.
     void import('./improvement-proposer.js')
       .then(({ proposeFromReport }) => {

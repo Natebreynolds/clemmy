@@ -9,11 +9,13 @@
  * SAME journaled, reversible primitives the memory-approve flow already uses.
  *
  * Two safety walls, deliberately separate:
- *   - PROPOSE is gated by CLEMMY_IMPROVEMENT_PROPOSER (default OFF). When off,
- *     no proposals are ever drafted and the nightly tick is byte-identical.
+ *   - PROPOSE is gated by CLEMMY_IMPROVEMENT_PROPOSER (DEFAULT ON kill-switch,
+ *     graduated 2026-06-28 after live validation). `=off` reverts to never
+ *     drafting (the nightly tick becomes byte-identical). Drafting is read-only.
  *   - APPLY is gated by approveEnabled() (CLEMMY_MEMORY_APPROVE) AND requires an
  *     explicit human approve call. The proposer's own logic NEVER applies its own
- *     drafts — a separate human gate is the framework's "never self-grade".
+ *     drafts — a separate human gate is the framework's "never self-grade". This
+ *     is why PROPOSE can be on by default: it only fills a review queue.
  *
  * Apply paths, by kind:
  *   - skill_pitfall → appendSkillPitfall (skill-store) — auto-appliable, reversible
@@ -68,9 +70,14 @@ export interface ImprovementProposal {
 const STORE_DIR = path.join(BASE_DIR, 'state', 'autoresearch');
 const STORE_FILE = path.join(STORE_DIR, 'improvement-proposals.json');
 
-/** Phase-C PROPOSE gate (default OFF until live-validated on real reports). */
+/** Phase-C PROPOSE gate — DEFAULT ON (kill-switch). Graduated 2026-06-28 after
+ *  live validation on real run history (sane, deduped, useful proposals; zero
+ *  auto-apply). `=off` reverts to never drafting. Drafting is read-only +
+ *  reversible-by-construction; APPLY remains a separate explicit human gate
+ *  (approveEnabled + an approve call), so default-on only populates a review
+ *  queue — it never changes anything on its own. */
 export function proposerEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_IMPROVEMENT_PROPOSER', 'off') || 'off').toLowerCase() === 'on';
+  return (getRuntimeEnv('CLEMMY_IMPROVEMENT_PROPOSER', 'on') || 'on').toLowerCase() !== 'off';
 }
 
 function proposalId(kind: ImprovementKind, target: string, proposedText: string): string {
