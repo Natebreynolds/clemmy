@@ -34,7 +34,7 @@ test('REL-5 guard: selectToolsForTurn does NOT re-gate on the global flag (A/B j
   // Whether JIT runs is decided by resolveToolJitDecision at the call site, NOT here.
   // With the global CLEMMY_TOOL_JIT OFF but a real ranking, selection MUST still reduce —
   // otherwise the A/B jit arm (which activates without the global flag) is a silent no-op.
-  await withEnv({ CLEMMY_TOOL_JIT: 'off' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'off', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     assert.equal(toolJitEnabled(), false);
     const ranker: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, t.name === 'workflow_create' ? 0.9 : 0]));
     const sel = await selectToolsForTurn({ userInput: 'create a workflow', tools: TOOLS, rankFn: ranker });
@@ -54,7 +54,7 @@ test('flag ON but empty query: exposes everything (no signal to retrieve on)', a
 });
 
 test('flag ON, ranker returns no signal: falls back to the full surface', async () => {
-  await withEnv({ CLEMMY_TOOL_JIT: 'on' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const noSignal: JitRankFn = async () => undefined;
     const sel = await selectToolsForTurn({ userInput: 'create a workflow', tools: TOOLS, rankFn: noSignal });
     assert.equal(sel.reduced, false);
@@ -64,7 +64,7 @@ test('flag ON, ranker returns no signal: falls back to the full surface', async 
 });
 
 test('flag ON with a real ranking: CORE kept + relevant retrieved, irrelevant dropped', async () => {
-  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_TOPK: undefined, CLEMMY_TOOL_JIT_MIN_SCORE: undefined }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_TOPK: undefined, CLEMMY_TOOL_JIT_MIN_SCORE: undefined, CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const ranker: JitRankFn = async (_q, tools) => {
       const m = new Map<string, number>();
       for (const t of tools) m.set(t.name, 0); // default low
@@ -91,7 +91,7 @@ test('flag ON with a real ranking: CORE kept + relevant retrieved, irrelevant dr
 });
 
 test('CORE is never dropped even when scored below the floor', async () => {
-  await withEnv({ CLEMMY_TOOL_JIT: 'on' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     // Force the ranker to score a core tool at 0 — it must still be exposed.
     const ranker: JitRankFn = async (_q, tools) => new Map(tools.map((t) => [t.name, 0]));
     const sel = await selectToolsForTurn({ userInput: 'anything', tools: TOOLS, rankFn: ranker });
@@ -100,7 +100,7 @@ test('CORE is never dropped even when scored below the floor', async () => {
 });
 
 test('topK env caps the retrieved set', async () => {
-  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_TOPK: '1', CLEMMY_TOOL_JIT_MIN_SCORE: '0' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_TOPK: '1', CLEMMY_TOOL_JIT_MIN_SCORE: '0', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const ranker: JitRankFn = async (_q, tools) => {
       const m = new Map<string, number>();
       tools.forEach((t, i) => m.set(t.name, (tools.length - i) / tools.length)); // decreasing
@@ -129,7 +129,7 @@ test('TOOL_JIT_CORE includes the acquisition escape-hatch + execution lane', () 
 });
 
 test('workspace authoring intents pin the space tools even under a worst-case JIT ranker', async () => {
-  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const spaceTools = [
       'space_get',
       'space_get_view',
@@ -161,7 +161,7 @@ test('workspace authoring intents pin the space tools even under a worst-case JI
 });
 
 test('workspace intent pinning also catches natural dashboard requests that omit the word workspace', async () => {
-  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const tools: JitTool[] = [...CORE_SAMPLE, 'space_save', 'space_refresh', 'workflow_create']
       .map((name) => ({ name, description: name }));
     const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
@@ -270,7 +270,7 @@ test('Claude SDK brain: the agentic profile execution tools survive a worst-case
   // AGENTIC profile. Even when NOTHING ranks (zero-score), the execution tools the
   // agentic brain depends on must survive — else JIT would brick real work.
   const { CLAUDE_AGENT_SDK_FULL_TOOLS } = await import('../runtime/harness/claude-agent-sdk.js');
-  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const profile = [...new Set(CLAUDE_AGENT_SDK_FULL_TOOLS)] as string[];
     const tools: JitTool[] = profile.map((name) => ({ name, description: name }));
     const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
@@ -287,7 +287,7 @@ test('worst-case ranker (every candidate scores 0): all MANDATED tools still sur
   // The real safety guarantee: even if semantic retrieval surfaces NOTHING, no
   // mandated tool is ever dropped. Build a surface of all mandated tools + some
   // droppable ones, score everything 0, and assert mandated all survive.
-  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5' }, async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const droppable = ['workflow_create', 'space_save', 'git_status'];
     const tools: JitTool[] = [...TOOL_JIT_MANDATED, ...droppable].map((name) => ({ name, description: name }));
     const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
@@ -297,5 +297,30 @@ test('worst-case ranker (every candidate scores 0): all MANDATED tools still sur
     }
     // and the droppable ones are gone (proves the reduction actually happened)
     for (const d of droppable) assert.ok(!sel.exposed.has(d), `droppable ${d} should be dropped at score 0 < 0.5`);
+  });
+});
+
+test('NEVER STARVE: a normal-sized toolset is fully exposed even with zero ranker scores (no pruning when it fits the budget)', async () => {
+  // The 2026-06-29 incident: a Salesforce turn whose ranker found nothing relevant
+  // got pruned to core-only and thrashed 27 shell calls. With a fitting surface the
+  // model must keep EVERY tool — never denied a capability it might need.
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_BUDGET_TOKENS: undefined }, async () => {
+    const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
+    const sel = await selectToolsForTurn({ userInput: 'pull 10 market leader accounts I have not touched', tools: TOOLS, rankFn: zero });
+    assert.equal(sel.reduced, false, 'a fitting toolset is never pruned');
+    assert.equal(sel.exposed.size, TOOLS.length, 'every tool stays available to the model');
+    assert.equal(sel.reason, 'within-budget');
+  });
+});
+
+test('NEVER STARVE: pruning still engages for a genuinely large surface that exceeds the token budget', async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '200' }, async () => {
+    const big: JitTool[] = CORE_SAMPLE.map((name) => ({ name, description: `core ${name}` }));
+    for (let i = 0; i < 60; i++) big.push({ name: `cx_tool_${i}`, description: `Composio tool number ${i} that does something specific with a moderately long description.` });
+    const ranker: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, t.name === 'cx_tool_7' ? 0.9 : 0.1]));
+    const sel = await selectToolsForTurn({ userInput: 'use composio tool 7', tools: big, rankFn: ranker });
+    assert.equal(sel.reduced, true, 'an over-budget surface IS pruned to bound context cost');
+    for (const c of CORE_SAMPLE) assert.ok(sel.exposed.has(c), `core ${c} survives the prune`);
+    assert.ok(sel.exposed.has('cx_tool_7'), 'the most relevant tool is retrieved');
   });
 });

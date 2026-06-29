@@ -192,6 +192,25 @@ function minScore(): number {
   return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : DEFAULT_MIN_SCORE;
 }
 
+// NEVER STARVE A MODEL OF THE TOOLS IT NEEDS. JIT exists to keep tool DEFINITIONS
+// from crowding the context — NOT to deny capability. So pruning engages ONLY when
+// the full tool surface would actually exceed this token budget; a normal-sized
+// toolset keeps EVERY tool. Generous on purpose (tool defs are prompt-cached, so a
+// large stable surface is nearly free after the first turn): the 2026-06-29 incident
+// was a Salesforce turn pruned to core-only that thrashed 27 shell calls and
+// destabilized the model. Only genuinely huge multi-MCP installs get pruned.
+const DEFAULT_JIT_BUDGET_TOKENS = 24_000;
+function toolJitBudgetTokens(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_TOOL_JIT_BUDGET_TOKENS', '') || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_JIT_BUDGET_TOKENS;
+}
+/** Cheap, conservative token estimate (chars/4) of a toolset's definitions. */
+function estimateToolsetTokens(tools: JitTool[]): number {
+  let chars = 0;
+  for (const t of tools) chars += t.name.length + 1 + (t.description ?? '').length;
+  return Math.ceil(chars / 4);
+}
+
 export interface JitTool {
   name: string;
   description?: string | null;
@@ -289,6 +308,14 @@ export async function selectToolsForTurn(opts: {
     : [];
   const candidates = opts.tools.filter((t) => !TOOL_JIT_CORE.has(t.name));
   if (candidates.length === 0) return exposeAll('no-jit-candidates');
+
+  // NEVER STARVE: only prune when the full tool surface would actually crowd the
+  // context budget. A normal-sized toolset keeps EVERY tool, so the model is never
+  // denied a capability it might need (the 2026-06-29 Salesforce turn got pruned to
+  // core-only and thrashed 27 shell calls). Pruning engages only for genuinely large
+  // multi-MCP surfaces — and this short-circuits the embedding ranker below when
+  // there's nothing to gain.
+  if (estimateToolsetTokens(opts.tools) <= toolJitBudgetTokens()) return exposeAll('within-budget');
 
   const ranker = opts.rankFn ?? ((q, t) => semanticRank(q, t, opts.now ?? Date.now()));
   const scores = await ranker(query, candidates);

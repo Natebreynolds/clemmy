@@ -86,8 +86,12 @@ function salvageCommittedResult(sessionId: string): ClaudeAgentSdkRunResult | nu
   const targets = [...new Set(writes.flatMap((w) => (w.targets ?? []).filter((t): t is string => typeof t === 'string')))];
   const allEmail = writes.every((w) => /SEND_EMAIL|SEND_MAIL/i.test(w.shapeKey ?? ''));
   const noun = allEmail ? (writes.length === 1 ? 'email' : 'emails') : (writes.length === 1 ? 'action' : 'actions');
-  const targetList = targets.length > 0 ? ` to ${targets.slice(0, 8).join(', ')}` : '';
-  const text = `✅ Done — ${writes.length} ${noun}${targetList} completed successfully. (I hit a hiccup writing the final summary, but the work above went through and nothing was duplicated.)`;
+  const targetList = targets.length > 0 ? ` (${targets.slice(0, 8).join(', ')})` : '';
+  // HONEST salvage: we know N writes LANDED, but NOT whether the task was fully
+  // complete (the model errored before confirming). Do not over-claim "Done" — say
+  // what ran, that nothing was duplicated, and ask the user to verify / offer to
+  // finish. Reporting partial completion as success would be its own bug.
+  const text = `⚠️ The model errored before it could confirm completion, but ${writes.length} ${noun} already went through${targetList} — nothing was duplicated. Please check these are what you intended; if anything's still missing, tell me and I'll finish it.`;
   return { text, toolUses: writes.map((w) => w.toolName ?? 'tool'), limitHit: false, sessionId };
 }
 

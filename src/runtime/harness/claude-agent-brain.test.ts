@@ -674,7 +674,10 @@ test('salvage A: a parse error AFTER work committed returns a SUCCESS confirmati
   assert.equal(res.stoppedReason, 'success');
   assert.match(res.text, /3 emails/);
   assert.match(res.text, /a@x\.com/);
-  assert.doesNotMatch(res.text, /could not be parsed|went wrong/i);
+  // HONEST: it must NOT over-claim "Done" — it reports what ran and asks to verify.
+  assert.match(res.text, /nothing was duplicated/i);
+  assert.match(res.text, /check|verify|missing/i);
+  assert.doesNotMatch(res.text, /could not be parsed|went wrong|✅ Done/i);
 });
 
 test('salvage B: a parse error with NOTHING committed retries once and succeeds', async () => {
