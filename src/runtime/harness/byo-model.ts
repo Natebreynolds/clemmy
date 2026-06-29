@@ -31,7 +31,7 @@ import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import type { Model } from '@openai/agents-core';
 import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
-import { repairToParseableJson, isParseableJson } from './json-repair.js';
+import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
 import { withResilience } from './resilient-model.js';
 import { resolveModelCapability, modelParityEnabled, restoreLegacyInstructionOrder } from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
@@ -75,7 +75,16 @@ function dropResponseFormatWithToolsEnabled(): boolean {
  *  "reply: expected string, received …" failure → repair/re-ask/degraded turn)
  *  AND adds latency to every decision. This mirrors the Claude
  *  `withThinkingDisabled` fix on the verify/judge path. Free-form turns (no
- *  structured contract) keep effort-driven thinking, where it actually helps. */
+ *  structured contract) keep effort-driven thinking, where it actually helps.
+ *
+ *  W2 (decision-quality parity) note: keeping thinking OFF here IS the chosen
+ *  reconciliation — the plan's "guarantee a clean structured decision" option,
+ *  not "reverse it to allow reasoning." The decision envelope is the FINAL
+ *  summary of a turn whose reasoning already happened (during tool/free-form
+ *  work); thinking on the envelope corrupts the JSON without improving the
+ *  decision. Decision RELIABILITY across brains is instead raised at the
+ *  response side (schema-shape validate + targeted re-ask), which is brain-
+ *  AGNOSTIC and applies to every compat backend — not just GLM. */
 export function applyGlmThinking(body: Record<string, unknown>, effort: string | undefined): void {
   const modelId = typeof body.model === 'string' ? body.model : '';
   if (!/glm/i.test(modelId)) return;
@@ -97,6 +106,13 @@ export function applyGlmThinking(body: Record<string, unknown>, effort: string |
 // request. WeakSet membership is not a wire field, so the body stays
 // byte-identical on the network; it's GC'd with the body.
 const downgradedBodies = new WeakSet<object>();
+
+// The ORIGINAL JSON Schema for each downgraded body, so the response side can
+// validate the (no-longer-wire-enforced) shape and re-ask if it's wrong — not
+// just check parseability. Keyed by the relaxed body; GC'd with it. Brain-
+// agnostic: every OpenAI-compatible structured call (decision, judge, reflection)
+// records its schema here.
+const downgradedSchemas = new WeakMap<object, unknown>();
 
 /** Relax a Chat-Completions request body for a generic OpenAI-compatible
  *  backend: strip OpenAI-only fields and downgrade strict json_schema to
@@ -168,6 +184,10 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
     }
     next.messages = messages;
     downgradedBodies.add(next);
+    // Remember the schema so the response side can validate the SHAPE (the
+    // downgrade drops wire-enforcement) and re-ask on a wrong-shape-but-parseable
+    // reply, not just an unparseable one.
+    if (schema && typeof schema === 'object') downgradedSchemas.set(next, schema);
     // Strict backends can't do response_format + tools at once. When tools are in
     // scope, DROP response_format entirely so the model can emit real tool_calls
     // OR a final JSON envelope — the schema is already folded into the system
@@ -227,11 +247,19 @@ function isToolOrEmpty(msg: CompatMessage | undefined): boolean {
 }
 
 /** One-shot re-ask with a terse JSON-only instruction (always non-streaming).
- *  Reuses the relaxed body (schema already folded into the system message). */
-async function reAskForJson(original: CreateFn, relaxed: Record<string, unknown>, options: unknown): Promise<string | null> {
+ *  Reuses the relaxed body (schema already folded into the system message). The
+ *  instruction defaults to the generic JSON-only nudge but can be SHAPE-AWARE
+ *  (naming the exact violations) for a parseable-but-wrong-shape reply. */
+const RE_ASK_JSON_ONLY = 'Return ONLY the JSON value — no markdown fences, no prose, no explanation.';
+async function reAskForJson(
+  original: CreateFn,
+  relaxed: Record<string, unknown>,
+  options: unknown,
+  instruction: string = RE_ASK_JSON_ONLY,
+): Promise<string | null> {
   try {
     const messages = Array.isArray(relaxed.messages) ? [...(relaxed.messages as unknown[])] : [];
-    messages.push({ role: 'system', content: 'Return ONLY the JSON value — no markdown fences, no prose, no explanation.' });
+    messages.push({ role: 'system', content: instruction });
     const c = (await original({ ...relaxed, stream: false, stream_options: undefined, messages }, options)) as CompatCompletion;
     return c?.choices?.[0]?.message?.content ?? null;
   } catch {
@@ -272,22 +300,52 @@ export function liftReasoning(completion: CompatCompletion): void {
 }
 
 /** Repair a structured (downgraded json_object) response's content into
- *  parseable JSON, re-asking once if needed. Mutates the completion. */
-async function repairStructuredContent(original: CreateFn, relaxed: Record<string, unknown>, options: unknown, completion: CompatCompletion): Promise<void> {
+ *  parseable — and, when the schema is known, schema-CONFORMING — JSON,
+ *  re-asking AT MOST once. Mutates the completion.
+ *
+ *  Two failure modes, one bounded re-ask budget:
+ *   • UNPARSEABLE → generic JSON-only re-ask (the long-standing behavior).
+ *   • PARSEABLE BUT WRONG SHAPE → a compat backend returned clean JSON that
+ *     doesn't match the (no-longer-wire-enforced) schema. Without this it would
+ *     pass here and fail the SDK's downstream Zod validation, forcing a full,
+ *     expensive orchestrator re-turn ("churning"). Instead do ONE shape-aware
+ *     re-ask naming the exact violations, and ADOPT the result only if it's
+ *     strictly better (parseable AND conforming). Monotonic — a healthy reply
+ *     is never re-asked, and good-enough JSON is never replaced with worse. */
+async function repairStructuredContent(original: CreateFn, relaxed: Record<string, unknown>, options: unknown, completion: CompatCompletion, schema?: unknown): Promise<void> {
   const msg = completion?.choices?.[0]?.message;
   if (!msg || typeof msg.content !== 'string') return;
   let { text, repaired } = repairToParseableJson(msg.content);
   let reAsked = false;
+  let reason: 'parse' | 'shape' | undefined;
   if (!isParseableJson(text)) {
+    reason = 'parse';
     const reText = await reAskForJson(original, relaxed, options);
     reAsked = true;
     if (reText != null) {
       const r2 = repairToParseableJson(reText);
       if (isParseableJson(r2.text)) { text = r2.text; repaired = true; }
     }
+  } else if (schema) {
+    const check = conformsToJsonSchemaShape(JSON.parse(text), schema);
+    if (!check.ok) {
+      reason = 'shape';
+      const instruction =
+        `Your previous JSON was the wrong shape (${check.violations.slice(0, 6).join('; ')}). `
+        + 'Return ONLY a single JSON object that strictly matches the schema in the system prompt — no markdown fences, no prose, no explanation.';
+      const reText = await reAskForJson(original, relaxed, options, instruction);
+      reAsked = true;
+      if (reText != null) {
+        const r2 = repairToParseableJson(reText);
+        if (isParseableJson(r2.text) && conformsToJsonSchemaShape(JSON.parse(r2.text), schema).ok) {
+          text = r2.text;
+          repaired = true;
+        }
+      }
+    }
   }
   if (repaired) msg.content = text;
-  logger.debug({ repaired, reAsked, kind: 'structured' }, 'byo json repair');
+  logger.debug({ repaired, reAsked, reason, kind: 'structured' }, 'byo json repair');
 }
 
 /** Repair malformed tool-call ARGUMENTS in place (strip fences / extract the
@@ -390,7 +448,7 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
         repairToolCallArguments(completion);
         return synthFaithfulStream(completion);
       }
-      if (structured) await repairStructuredContent(original, relaxed, options, completion);
+      if (structured) await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
       return synthContentStream(completion);
     }
 
@@ -401,7 +459,7 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
     if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {
       repairToolCallArguments(completion);
     } else if (structured && !isToolOrEmpty(msg)) {
-      await repairStructuredContent(original, relaxed, options, completion);
+      await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
     }
     return completion;
   };

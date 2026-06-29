@@ -367,3 +367,69 @@ test('wrap: a tool-call turn with malformed args is repaired (non-stream)', asyn
   const tc = ((res.choices as AnyObj[])[0].message as AnyObj).tool_calls as AnyObj[];
   assert.deepEqual(JSON.parse((tc[0].function as AnyObj).arguments as string), { q: 'acme' });
 });
+
+// --- W2: brain-agnostic shape-aware structured re-ask -----------------------
+// A schema with REQUIRED fields, so a parseable-but-wrong-shape reply (the
+// failure a compat backend produces once json_schema is no longer wire-enforced)
+// can be detected and re-asked. Applies to EVERY OpenAI-compatible backend.
+const decisionParams = (overrides: AnyObj = {}): AnyObj => ({
+  model: 'm',
+  messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'go' }],
+  response_format: {
+    type: 'json_schema',
+    json_schema: {
+      name: 'Decision', strict: true,
+      schema: {
+        type: 'object',
+        properties: { summary: { type: 'string' }, done: { type: 'boolean' }, nextAction: { type: 'string', enum: ['completed', 'abandoned'] } },
+        required: ['summary', 'done', 'nextAction'],
+      },
+    },
+  },
+  ...overrides,
+});
+
+test('wrap(W2): parseable-but-wrong-shape JSON triggers ONE shape-aware re-ask, adopts the conforming result', async () => {
+  const fake = makeFake([
+    () => completionWith('{"answer":"Paris"}'), // parseable, wrong shape
+    () => completionWith('{"summary":"answered the question","done":true,"nextAction":"completed"}'),
+  ]);
+  const res = (await wrapCompletionsCreate(fake.fn)(decisionParams())) as AnyObj;
+  assert.equal(fake.calls.length, 2, 'one initial + exactly one shape-aware re-ask');
+  // The re-ask instruction is SHAPE-aware (names the missing fields).
+  const reAskMsgs = (fake.calls[1].messages as AnyObj[]);
+  const lastSys = reAskMsgs[reAskMsgs.length - 1].content as string;
+  assert.ok(/wrong shape/i.test(lastSys) && /summary|done|nextAction/.test(lastSys), 'shape-aware re-ask names the violation');
+  assert.deepEqual(JSON.parse(((res.choices as AnyObj[])[0].message as AnyObj).content as string), {
+    summary: 'answered the question', done: true, nextAction: 'completed',
+  });
+});
+
+test('wrap(W2): wrong-shape then STILL wrong-shape keeps the original (monotonic, one re-ask only)', async () => {
+  const fake = makeFake([
+    () => completionWith('{"answer":"Paris"}'),
+    () => completionWith('{"still":"wrong"}'),
+  ]);
+  const res = (await wrapCompletionsCreate(fake.fn)(decisionParams())) as AnyObj;
+  assert.equal(fake.calls.length, 2, 'initial + one re-ask only (never replaces good-enough with worse)');
+  assert.deepEqual(JSON.parse(((res.choices as AnyObj[])[0].message as AnyObj).content as string), { answer: 'Paris' });
+});
+
+test('wrap(W2): a fully-conforming reply is NEVER re-asked (no spurious cost on healthy output)', async () => {
+  const fake = makeFake([() => completionWith('{"summary":"replied directly","done":true,"nextAction":"completed"}')]);
+  const res = (await wrapCompletionsCreate(fake.fn)(decisionParams())) as AnyObj;
+  assert.equal(fake.calls.length, 1, 'conforming JSON → zero re-asks');
+  assert.deepEqual(JSON.parse(((res.choices as AnyObj[])[0].message as AnyObj).content as string), {
+    summary: 'replied directly', done: true, nextAction: 'completed',
+  });
+});
+
+test('wrap(W2): UNPARSEABLE still uses the generic JSON-only re-ask (shape path does not double-fire)', async () => {
+  const fake = makeFake([() => completionWith('total garbage'), () => completionWith('{"summary":"x and y","done":true,"nextAction":"completed"}')]);
+  const res = (await wrapCompletionsCreate(fake.fn)(decisionParams())) as AnyObj;
+  assert.equal(fake.calls.length, 2, 'one parse re-ask only');
+  const reAskMsgs = (fake.calls[1].messages as AnyObj[]);
+  const lastSys = reAskMsgs[reAskMsgs.length - 1].content as string;
+  assert.ok(/Return ONLY the JSON value/.test(lastSys), 'unparseable path uses the generic nudge');
+  assert.equal(JSON.parse(((res.choices as AnyObj[])[0].message as AnyObj).content as string).done, true);
+});

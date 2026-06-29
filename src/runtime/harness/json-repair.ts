@@ -108,3 +108,77 @@ export function repairToParseableJson(raw: string): { text: string; repaired: bo
   if (cand === raw) return { text: raw, repaired: false };
   return { text: cand, repaired: true };
 }
+
+/**
+ * Conservative top-level shape check for a structured response whose JSON Schema
+ * was downgraded (json_schema → json_object, or dropped entirely when tools are
+ * in scope) for an OpenAI-compatible backend — where the schema is no longer
+ * WIRE-enforced. A compat backend (Together / DeepSeek / MiniMax / OpenRouter /
+ * GLM / …) can then return clean, *parseable* JSON of the WRONG shape, which
+ * passes the parse-only repair but fails the SDK's downstream Zod validation —
+ * forcing an expensive full re-turn. This catches the common cases at the model-
+ * call layer so a single cheap re-ask can fix them.
+ *
+ * NOT a full JSON-Schema validator. It only performs the false-positive-free
+ * checks: required top-level keys present, top-level enum membership, and clearly
+ * wrong primitive top-level types. Anything it can't be SURE about — no schema,
+ * non-object schema, nested/object/array/union/nullable property types, present-
+ * but-null values, additional properties — PASSES. So a HEALTHY response is
+ * never flagged (no spurious re-asks, no regression). Pure + unit-testable.
+ *
+ * Returns `{ ok, violations }`; `violations` is a short human-readable list to
+ * feed a targeted re-ask. Brain-agnostic: applies to every backend, every
+ * structured call site.
+ */
+export function conformsToJsonSchemaShape(
+  value: unknown,
+  schema: unknown,
+): { ok: boolean; violations: string[] } {
+  const s = schema as { type?: unknown; properties?: unknown; required?: unknown } | null | undefined;
+  // Only validate object schemas; bail (pass) on anything else.
+  const props = (s && typeof s === 'object' ? s.properties : undefined) as
+    | Record<string, { type?: unknown; enum?: unknown }>
+    | undefined;
+  const declaresObject = s?.type === 'object' || (props != null && typeof props === 'object');
+  if (!declaresObject) return { ok: true, violations: [] };
+
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, violations: ['expected a JSON object'] };
+  }
+  const obj = value as Record<string, unknown>;
+  const violations: string[] = [];
+
+  const required = Array.isArray(s?.required) ? (s!.required as unknown[]) : [];
+  for (const key of required) {
+    if (typeof key === 'string' && !(key in obj)) {
+      violations.push(`missing required field "${key}"`);
+    }
+  }
+
+  const PRIMITIVE = new Set(['string', 'boolean', 'number', 'integer']);
+  for (const [key, propSchema] of Object.entries(props ?? {})) {
+    if (!(key in obj)) continue; // absence handled by `required` above
+    const v = obj[key];
+    if (v === null || v === undefined) continue; // present-but-null: too risky to flag (nullable is common)
+    const enumVals = Array.isArray(propSchema?.enum) ? propSchema.enum : undefined;
+    if (enumVals && enumVals.length > 0) {
+      if (!enumVals.includes(v)) {
+        violations.push(`field "${key}" must be one of ${JSON.stringify(enumVals)}`);
+      }
+      continue;
+    }
+    const rawType = propSchema?.type;
+    const types = Array.isArray(rawType) ? rawType : typeof rawType === 'string' ? [rawType] : [];
+    // Only type-check when EVERY declared type is a primitive we understand;
+    // a union with object/array/null is skipped (can't cheaply validate).
+    if (types.length === 0 || !types.every((t) => typeof t === 'string' && PRIMITIVE.has(t))) continue;
+    const matches = types.some((t) => {
+      if (t === 'string') return typeof v === 'string';
+      if (t === 'boolean') return typeof v === 'boolean';
+      return typeof v === 'number'; // number | integer
+    });
+    if (!matches) violations.push(`field "${key}" should be ${types.join('|')}`);
+  }
+
+  return { ok: violations.length === 0, violations };
+}

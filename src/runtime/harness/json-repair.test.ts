@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractJsonCandidate, repairToParseableJson, isParseableJson } from './json-repair.js';
+import { extractJsonCandidate, repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
 
 test('repair: ```json fenced object is unwrapped and parses', () => {
   const { text, repaired } = repairToParseableJson('```json\n{"done": true}\n```');
@@ -86,4 +86,84 @@ test('extractJsonCandidate: returns null when nothing recoverable', () => {
 test('isParseableJson basic', () => {
   assert.equal(isParseableJson('{"a":1}'), true);
   assert.equal(isParseableJson('{a:1}'), false);
+});
+
+// --- conformsToJsonSchemaShape (W2: brain-agnostic decision-shape guard) ----
+
+// FAITHFUL to the real wire schema: normalizeZodForCodexStrict forces every
+// field into `required`, and nullable/nullish fields (reply, reason) serialize
+// as `anyOf` with NO top-level `type` (so the validator must skip type-checking
+// them — the key guard against false positives on healthy decisions).
+const DECISION_SCHEMA = {
+  type: 'object',
+  properties: {
+    reply: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    summary: { type: 'string' },
+    done: { type: 'boolean' },
+    nextAction: { type: 'string', enum: ['awaiting_user_input', 'awaiting_approval', 'awaiting_handoff_result', 'completed', 'abandoned'] },
+    reason: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+  },
+  required: ['reply', 'summary', 'done', 'nextAction', 'reason'],
+};
+
+test('shape: a fully-conforming decision passes (no false positive)', () => {
+  const r = conformsToJsonSchemaShape(
+    { reply: 'hi', summary: 'replied to greeting', done: true, nextAction: 'completed', reason: null },
+    DECISION_SCHEMA,
+  );
+  assert.deepEqual(r, { ok: true, violations: [] });
+});
+
+test('shape: missing required field is flagged', () => {
+  const r = conformsToJsonSchemaShape({ summary: 'did a thing', nextAction: 'completed', reason: null }, DECISION_SCHEMA);
+  assert.equal(r.ok, false);
+  assert.ok(r.violations.some((v) => v.includes('done')), 'flags missing done');
+});
+
+test('shape: wrong primitive type is flagged', () => {
+  const r = conformsToJsonSchemaShape(
+    { summary: 'x', done: 'yes', nextAction: 'completed', reason: null }, DECISION_SCHEMA,
+  );
+  assert.equal(r.ok, false);
+  assert.ok(r.violations.some((v) => v.includes('done')), 'flags done not boolean');
+});
+
+test('shape: invalid enum value is flagged', () => {
+  const r = conformsToJsonSchemaShape(
+    { summary: 'x', done: false, nextAction: 'keep_going', reason: null }, DECISION_SCHEMA,
+  );
+  assert.equal(r.ok, false);
+  assert.ok(r.violations.some((v) => v.includes('nextAction')), 'flags bad enum');
+});
+
+test('shape: a completely different object (wrong shape) is flagged', () => {
+  const r = conformsToJsonSchemaShape({ answer: 'the capital is Paris' }, DECISION_SCHEMA);
+  assert.equal(r.ok, false);
+  assert.ok(r.violations.length >= 3, 'flags the missing required fields');
+});
+
+test('shape: present-but-null nullable field is NOT flagged (conservative)', () => {
+  const r = conformsToJsonSchemaShape(
+    { reply: null, summary: 'x', done: true, nextAction: 'completed', reason: null }, DECISION_SCHEMA,
+  );
+  assert.equal(r.ok, true);
+});
+
+test('shape: no schema / non-object schema → always passes (never false-positive)', () => {
+  assert.equal(conformsToJsonSchemaShape({ anything: 1 }, undefined).ok, true);
+  assert.equal(conformsToJsonSchemaShape('not even an object', { type: 'string' }).ok, true);
+});
+
+test('shape: nested object/array property types are skipped (only top-level primitives checked)', () => {
+  const schema = { type: 'object', properties: { items: { type: 'array' }, meta: { type: 'object' } }, required: ['items'] };
+  // items present (wrong-ish but array/object types are not cheaply validated) → passes
+  assert.equal(conformsToJsonSchemaShape({ items: [1, 2], meta: { a: 1 } }, schema).ok, true);
+  // items missing → required catches it
+  assert.equal(conformsToJsonSchemaShape({ meta: {} }, schema).ok, false);
+});
+
+test('shape: a non-object value against an object schema is flagged', () => {
+  const r = conformsToJsonSchemaShape(['not', 'an', 'object'], DECISION_SCHEMA);
+  assert.equal(r.ok, false);
+  assert.ok(r.violations.includes('expected a JSON object'));
 });
