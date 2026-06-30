@@ -19,7 +19,31 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 const { HarnessSession } = await import('./session.js');
 const { listEvents } = await import('./eventlog.js');
-const { reportInterruptedChatRuns } = await import('./restart-recovery.js');
+const { reportInterruptedChatRuns, markRunInFlight } = await import('./restart-recovery.js');
+
+test('exported markRunInFlight: arms + clears a CHAT session, skips non-chat, respects the kill-switch', () => {
+  const chat = HarnessSession.create({ kind: 'chat', title: 'c' });
+  markRunInFlight(chat.id, true);
+  assert.notEqual(HarnessSession.load(chat.id)?.runInFlightSince(), null, 'chat session is armed');
+  markRunInFlight(chat.id, false);
+  assert.equal(HarnessSession.load(chat.id)?.runInFlightSince(), null, 'chat session is cleared');
+
+  // Non-chat sessions are never marked (workflow/agent have their own resume).
+  const wf = HarnessSession.create({ kind: 'workflow', title: 'w' });
+  markRunInFlight(wf.id, true);
+  assert.equal(HarnessSession.load(wf.id)?.runInFlightSince(), null, 'non-chat session is never armed');
+
+  // Kill-switch fully disables it.
+  const prev = process.env.CLEMMY_CHAT_RESTART_RECOVERY;
+  process.env.CLEMMY_CHAT_RESTART_RECOVERY = 'off';
+  try {
+    const c2 = HarnessSession.create({ kind: 'chat', title: 'c2' });
+    markRunInFlight(c2.id, true);
+    assert.equal(HarnessSession.load(c2.id)?.runInFlightSince(), null, 'kill-switch off → never armed');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CHAT_RESTART_RECOVERY; else process.env.CLEMMY_CHAT_RESTART_RECOVERY = prev;
+  }
+});
 
 test.after(() => {
   try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ }

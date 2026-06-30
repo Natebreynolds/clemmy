@@ -25,6 +25,7 @@ import { codexModelsAvailable, claudeModelsAvailable } from './model-role-option
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { maybeWrapWithFaultInjection } from './fault-inject.js';
 import { getActiveAuthMode, getByoBackendConfig, getClaudeBrainModel, getModelRoutingMode, getRuntimeEnv, MODELS } from '../../config.js';
+import { withModelRouteMetrics, type ModelRouteDecisionSource } from '../model-route-metrics.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.router-model' });
@@ -55,16 +56,32 @@ export class RouterModelProvider implements ModelProvider {
     // forced to prove cross-brain fallover. The lazily-built fallover targets in
     // buildBrainChain are different providers → not wrapped → they recover.
     primary.model = maybeWrapWithFaultInjection(primary.model, primary.provider);
-    if (!brainFalloverEnabled()) return primary.model;
-    // Wrap in a cross-provider fallover chain (primary -> other connected brains)
-    // so an overloaded/rate-limited/HUNG provider switches brains instead of
-    // dead-ending. falloverOn429: a 429 on one provider is irrelevant to the
-    // next, so switch. firstByteTimeoutMs: a silent provider falls over before
-    // the loop's stall watchdog fires.
-    const chain = this.buildBrainChain(primary);
-    return withModelFallback(chain, {
-      falloverOn429: true,
-      firstByteTimeoutMs: brainFalloverFirstByteMs(),
+    let resolved: Model;
+    if (!brainFalloverEnabled()) {
+      resolved = primary.model;
+    } else {
+      // Wrap in a cross-provider fallover chain (primary -> other connected brains)
+      // so an overloaded/rate-limited/HUNG provider switches brains instead of
+      // dead-ending. falloverOn429: a 429 on one provider is irrelevant to the
+      // next, so switch. firstByteTimeoutMs: a silent provider falls over before
+      // the loop's stall watchdog fires.
+      const chain = this.buildBrainChain(primary);
+      resolved = withModelFallback(chain, {
+        falloverOn429: true,
+        firstByteTimeoutMs: brainFalloverFirstByteMs(),
+      });
+    }
+    const requested = typeof modelName === 'string' && modelName.trim().length > 0 ? modelName.trim() : MODELS.primary;
+    return withModelRouteMetrics(resolved, {
+      role: 'brain',
+      requestedModel: requested,
+      resolvedModel: primary.label,
+      provider: primary.provider,
+      source: routeSourceForModelName(modelName),
+      reason: {
+        routingMode: getModelRoutingMode(),
+        falloverEnabled: brainFalloverEnabled(),
+      },
     });
   }
 
@@ -129,4 +146,8 @@ export class RouterModelProvider implements ModelProvider {
     }
     return chain;
   }
+}
+
+function routeSourceForModelName(modelName?: string): ModelRouteDecisionSource {
+  return typeof modelName === 'string' && modelName.trim().length > 0 ? 'explicit' : 'default';
 }

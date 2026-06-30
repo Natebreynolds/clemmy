@@ -13,9 +13,11 @@ const {
   claudeAgentSdkBrainMode,
   claudeAgentSdkBrainEnabled,
   renderClaudeAgentBrainSystemAppend,
+  renderClaudeAgentBrainTurnContext,
   respondViaClaudeAgentSdkBrain,
   setClaudeAgentSdkBrainRunForTest,
   setClaudeAgentSdkBrainJudgeForTest,
+  setClaudeAgentSdkBrainSearchFactsHybridForTest,
   looksLikeToolNarration,
   looksLikeStreamingNarration,
   looksLikeReasoningLeak,
@@ -28,6 +30,7 @@ beforeEach(() => {
   resetEventLog();
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
+  setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS;
@@ -35,13 +38,143 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
   delete process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY;
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
+  delete process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS;
   process.env.AUTH_MODE = 'api_key';
 });
 
 after(() => {
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
+  setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('JIT monotonic floor: the per-session advertised tool set only GROWS (cache-stable), never shrinks', () => {
+  const { bumpSessionToolFloor } = brain as { bumpSessionToolFloor: (s: string, e: Iterable<string>) => Set<string> };
+  const sid = 'jit-mono-test';
+  assert.deepEqual([...bumpSessionToolFloor(sid, ['a', 'b'])].sort(), ['a', 'b']);
+  // Turn 2 needs only 'c' — but the floor must GROW, not shrink to just 'c'.
+  assert.deepEqual([...bumpSessionToolFloor(sid, ['c'])].sort(), ['a', 'b', 'c']);
+  // Turn 3 needs only 'a' — floor stays stable (converged → the tools block is now
+  // identical turn-to-turn → the prompt cache holds).
+  assert.deepEqual([...bumpSessionToolFloor(sid, ['a'])].sort(), ['a', 'b', 'c']);
+  // A different session has its own independent floor.
+  assert.deepEqual([...bumpSessionToolFloor('other-session', ['x'])].sort(), ['x']);
+});
+
+test('JIT monotonic floor: the EMITTED allowlist string is byte-identical once converged (the actual prompt-cache precondition)', () => {
+  const { bumpSessionToolFloor } = brain as { bumpSessionToolFloor: (s: string, e: Iterable<string>) => Set<string> };
+  const sid = 'jit-mono-emit';
+  // fullAllowed is the stable per-turn ordering the brain filters against; the
+  // advertised allowlist = fullAllowed.filter(in floor).join(',') — what the SDK
+  // hashes for the tools-block cache key. Order must come from fullAllowed (stable),
+  // NOT floor insertion order, so a converged set always serializes identically.
+  const fullAllowed = ['alpha', 'bravo', 'charlie', 'delta', 'echo'];
+  const emit = (floor: Set<string>): string => fullAllowed.filter((n) => floor.has(n)).join(',');
+
+  // Turn 1: intent surfaces charlie+alpha. Turn 2: bravo (grows — one cache bust).
+  emit(bumpSessionToolFloor(sid, ['charlie', 'alpha']));
+  const t2 = emit(bumpSessionToolFloor(sid, ['bravo']));
+  // Turns 3..5 reselect already-floored tools in different orders → converged.
+  const t3 = emit(bumpSessionToolFloor(sid, ['alpha']));
+  const t4 = emit(bumpSessionToolFloor(sid, ['bravo', 'charlie']));
+  const t5 = emit(bumpSessionToolFloor(sid, ['charlie']));
+  // Byte-identical across the converged turns → the prefix cache-hits.
+  assert.equal(t3, t2);
+  assert.equal(t4, t2);
+  assert.equal(t5, t2);
+  // And the serialization follows fullAllowed order, not selection/insertion order.
+  assert.equal(t2, 'alpha,bravo,charlie');
+});
+
+test('Move 1: the SDK brain ARMS the in-flight marker during the run and CLEARS it on completion', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  const { HarnessSession } = await import('./session.js');
+  createSession({ id: 'brain-marker', kind: 'chat', title: 'm' });
+  let armedDuringRun: string | null | undefined;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    // Captured INSIDE the run: a daemon crash here must be reportable → armed.
+    armedDuringRun = HarnessSession.load('brain-marker')?.runInFlightSince() ?? null;
+    return { text: 'done', sessionId: 'sdk', model: 'm', toolUses: [] };
+  });
+  await respondViaClaudeAgentSdkBrain('home', { message: 'hello', sessionId: 'brain-marker' });
+  assert.notEqual(armedDuringRun, null, 'marker was ARMED during the run');
+  assert.equal(HarnessSession.load('brain-marker')?.runInFlightSince(), null, 'marker CLEARED after completion');
+});
+
+test('Move 4: a judge-failed-open completion is TAGGED verification.failedOpen (no silent green check)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  createSession({ id: 'brain-verif-failopen', kind: 'chat', title: 'v' });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Done — sent the 3 emails.', sessionId: 'sdk', model: 'm',
+    toolUses: ['mcp__clementine-local__composio_execute_tool'],
+  }));
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'judge timed out — accepting completion', failedOpen: true }));
+  await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-verif-failopen' });
+  const completed = listEvents('brain-verif-failopen').filter((e) => e.type === 'conversation_completed').at(-1);
+  assert.ok(completed, 'a completion event was emitted');
+  assert.equal((completed!.data as { verification?: { failedOpen?: boolean } }).verification?.failedOpen, true, 'fail-open is surfaced on the completion');
+});
+
+test('Move 4: a thrown completion judge is TAGGED verification.failedOpen', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  createSession({ id: 'brain-verif-throw', kind: 'chat', title: 'v' });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Done — sent the 3 emails.', sessionId: 'sdk', model: 'm',
+    toolUses: ['mcp__clementine-local__composio_execute_tool'],
+  }));
+  setClaudeAgentSdkBrainJudgeForTest(async () => { throw new Error('judge unavailable'); });
+  await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-verif-throw' });
+  const completed = listEvents('brain-verif-throw').filter((e) => e.type === 'conversation_completed').at(-1);
+  assert.ok(completed, 'a completion event was emitted');
+  assert.equal((completed!.data as { verification?: { failedOpen?: boolean } }).verification?.failedOpen, true);
+});
+
+test('Move 4: a clean cross-family done verdict leaves NO verification tag (full confidence)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  createSession({ id: 'brain-verif-clean', kind: 'chat', title: 'v' });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Done — sent the 3 emails.', sessionId: 'sdk', model: 'm',
+    toolUses: ['mcp__clementine-local__composio_execute_tool'],
+  }));
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'all three sent with links' }));
+  await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-verif-clean' });
+  const completed = listEvents('brain-verif-clean').filter((e) => e.type === 'conversation_completed').at(-1);
+  assert.equal((completed!.data as { verification?: unknown }).verification, undefined, 'a clean verdict adds no tag');
+});
+
+test('Move 1: the marker is CLEARED even when the run throws (finally)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  const { HarnessSession } = await import('./session.js');
+  createSession({ id: 'brain-marker-throw', kind: 'chat', title: 'm' });
+  setClaudeAgentSdkBrainRunForTest(async () => { throw new Error('boom'); });
+  await assert.rejects(respondViaClaudeAgentSdkBrain('home', { message: 'hi', sessionId: 'brain-marker-throw' }));
+  assert.equal(HarnessSession.load('brain-marker-throw')?.runInFlightSince(), null, 'marker cleared on throw');
+});
+
+test('Move 1: the marker stays armed when final delivery fails before terminal report-back', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  const { HarnessSession } = await import('./session.js');
+  createSession({ id: 'brain-marker-delivery-throw', kind: 'chat', title: 'm' });
+  setClaudeAgentSdkBrainRunForTest(async () => ({ text: 'done', sessionId: 'sdk', model: 'm', toolUses: [] }));
+  await assert.rejects(
+    respondViaClaudeAgentSdkBrain('home', {
+      message: 'hi',
+      sessionId: 'brain-marker-delivery-throw',
+      onChunk: async () => { throw new Error('client disconnected'); },
+    }),
+  );
+  assert.notEqual(
+    HarnessSession.load('brain-marker-delivery-throw')?.runInFlightSince(),
+    null,
+    'marker remains armed so restart recovery can report the missing terminal delivery',
+  );
 });
 
 test('claudeAgentSdkBrainEnabled requires Claude auth, opt-in flag, and a chat surface', () => {
@@ -84,6 +217,15 @@ test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/mode
   assert.match(prompt, /set_model_role/);
   assert.match(prompt, /usesSkill/);
   assert.doesNotMatch(prompt, /READ-ONLY\/local-context/);
+});
+
+test('renderClaudeAgentBrainTurnContext bounds slow hybrid recall and falls back open', async () => {
+  process.env.CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS = '5';
+  setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => await new Promise(() => { /* intentionally stalled */ }));
+  const start = Date.now();
+  const ctx = await renderClaudeAgentBrainTurnContext({ message: 'market leader accounts', sessionId: 'brain-recall-timeout' });
+  assert.ok(Date.now() - start < 500, 'slow recall must not stall turn-context assembly');
+  assert.doesNotMatch(ctx, /Relevant To Your Request\n- /, 'timed-out recall block is omitted');
 });
 
 test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors excludes, creates a session, and streams final text', async () => {

@@ -1641,6 +1641,26 @@ test('objective judge: gates premature completion and continues (action intent)'
   assert.equal(judgeCalls.length, 2);
 });
 
+test('objective judge: fail-open accepted completions are tagged in conversation_completed', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'done', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build me a research report on solar adoption',
+    judgeCompletion: true,
+    judgeFn: async () => ({ done: true, reason: 'judge timed out — accepting completion', failedOpen: true }),
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.delivered, true);
+  assert.equal((completed.data.verification as { failedOpen?: boolean } | undefined)?.failedOpen, true);
+});
+
 test('objective judge: does NOT fire for a non-action (lookup) intent', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
@@ -1702,6 +1722,25 @@ test('honest-completion: a promise-shaped final reply is judged before banking c
   const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
   assert.equal(completed.data.delivered, false);
   assert.match(String(completed.data.blockedReason), /no artifact produced/i);
+});
+
+test('honest-completion: promise-shaped fail-open acceptance is tagged, not silently green', async () => {
+  const sess = HarnessSession.create({ kind: 'workflow' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'promised', reply: "I'll prep those contacts and get them over next.", done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'prep the contacts',
+    judgeFn: async () => ({ done: true, reason: 'judge timed out — accepting completion', failedOpen: true }),
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.delivered, true);
+  assert.equal((completed.data.verification as { failedOpen?: boolean } | undefined)?.failedOpen, true);
 });
 
 test('done-invariant: done:true + nextAction:awaiting_user_input does NOT bank completed', async () => {
@@ -1945,25 +1984,34 @@ test('objective judge: off by default for non-promise answer (no judgeCompletion
 });
 
 test('objective judge: continuation budget caps retries, then delivery verifier blocks a remaining promise', async () => {
-  const sess = HarnessSession.create({ kind: 'chat' });
-  const premature = { finalOutput: { summary: 'promised again', reply: 'I will do it.', done: true, nextAction: 'completed', reason: null } };
-  const runner = scriptedRunner([premature, premature, premature, premature, premature]);
-  let judgeCalls = 0;
-  const result = await runConversation({
-    agent: makeAgentStub(),
-    sessionId: sess.id,
-    input: 'build me a research report on solar adoption',
-    judgeCompletion: true,
-    judgeFn: async () => { judgeCalls++; return { done: false, reason: 'still nothing produced' }; },
-    makeRunner: makeRunnerStub,
-    runRunner: runner,
-  });
-  assert.equal(result.status, 'awaiting_user_input');
-  assert.equal(judgeCalls, 4, '3 judge-forced continuations + 1 final delivery verification');
-  assert.equal(result.steps, 4, '3 judge-forced continuations + the final not-delivered boundary');
-  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
-  assert.equal(completed.data.delivered, false);
-  assert.match(String(completed.data.blockedReason), /still nothing produced/i);
+  // Pin the budget explicitly (default dropped 3→2 for token thrift, Phase 3) so
+  // this is hermetic against the live .env and documents the knob.
+  const prevMax = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+  process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '2';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const premature = { finalOutput: { summary: 'promised again', reply: 'I will do it.', done: true, nextAction: 'completed', reason: null } };
+    const runner = scriptedRunner([premature, premature, premature, premature, premature]);
+    let judgeCalls = 0;
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'build me a research report on solar adoption',
+      judgeCompletion: true,
+      judgeFn: async () => { judgeCalls++; return { done: false, reason: 'still nothing produced' }; },
+      makeRunner: makeRunnerStub,
+      runRunner: runner,
+    });
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(judgeCalls, 3, '2 judge-forced continuations + 1 final delivery verification');
+    assert.equal(result.steps, 3, '2 judge-forced continuations + the final not-delivered boundary');
+    const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(completed.data.delivered, false);
+    assert.match(String(completed.data.blockedReason), /still nothing produced/i);
+  } finally {
+    if (prevMax === undefined) delete process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
+    else process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = prevMax;
+  }
 });
 
 test('runConversation: recurses through done=false steps until done=true', async () => {

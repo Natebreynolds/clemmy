@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
 
 /**
  * SKILL.md skill store.
@@ -354,6 +354,30 @@ export function formatSkillLine(
   return `${base} — ${bits.join('; ')}`;
 }
 
+// Persistent-context skills index cap (roadmap #9, bound the context block). The
+// index is injected EVERY turn; an install with dozens of skills makes it an
+// unbounded token sink. Cap the listed lines and append a discovery pointer —
+// every omitted skill stays reachable via the always-available skill_list() tool,
+// so nothing is hidden, only deferred. CLEMMY_SKILLS_INDEX_MAX tunes it; 0 ⇒
+// uncapped. A normal install (< the cap) is byte-identical to the prior output.
+const SKILLS_INDEX_DEFAULT_MAX = 40;
+function skillsIndexMax(): number {
+  const raw = (getRuntimeEnv('CLEMMY_SKILLS_INDEX_MAX', String(SKILLS_INDEX_DEFAULT_MAX)) ?? '').trim();
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return SKILLS_INDEX_DEFAULT_MAX;
+  return n; // 0 ⇒ uncapped
+}
+
+/** Cap a list of rendered skill lines to `max`, appending a pointer to the
+ *  remainder when truncated so the omitted skills stay reachable via skill_list().
+ *  max <= 0 (or list within the cap) ⇒ the list is returned unchanged. */
+export function capSkillLines(lines: string[], max: number, kind: string): string[] {
+  if (max <= 0 || lines.length <= max) return lines;
+  const kept = lines.slice(0, max);
+  kept.push(`  - …and ${lines.length - max} more ${kind} — call skill_list() to see the full set.`);
+  return kept;
+}
+
 export function renderSkillsIndex(): string {
   const skills = listSkills();
   if (skills.length === 0) return '';
@@ -366,15 +390,16 @@ export function renderSkillsIndex(): string {
     s.frontmatter.description || '(no description)',
     s.frontmatter.applicability as { toolFamilies?: string[]; entitySlots?: string[] } | undefined,
   );
+  const max = skillsIndexMax();
   const out: string[] = [];
   if (approved.length > 0) {
     out.push('Installed skills (call `skill_read("<name>")` to load the full instructions when relevant):');
-    out.push(...approved.map(line));
+    out.push(...capSkillLines(approved.map(line), max, 'installed skills'));
   }
   if (drafts.length > 0) {
     out.push('');
     out.push('Draft skills (self-distilled from past successful runs — usable, but verify outputs; their tool slugs/args were PROVEN, the procedure text is unreviewed):');
-    out.push(...drafts.map(line));
+    out.push(...capSkillLines(drafts.map(line), max, 'draft skills'));
   }
   out.push(`Skills live on disk under ${SKILLS_DIR}/<name>/. Skills that bundle scripts/, src/, or references/ can be executed via run_shell_command with cwd set to the skill directory.`);
   return out.join('\n');

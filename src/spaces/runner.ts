@@ -19,6 +19,7 @@ import { resolveInSpace, runnerFilenameError, spaceStore, type SpaceDataSource, 
 import { readData, writeData, appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
 import { executeComposioTool } from '../integrations/composio/client.js';
 import { augmentPath } from '../runtime/spawn-env.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript,
 } from '../runtime/sandboxed-script.js';
@@ -119,11 +120,33 @@ export interface RefreshResult {
   write?: WriteDataResult | WriteDataError;
 }
 
+const refreshQueues = new Map<string, Promise<void>>();
+
+function enqueueSpaceRefresh<T>(slug: string, fn: () => Promise<T>): Promise<T> {
+  const previous = refreshQueues.get(slug) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(fn);
+  const tail = run.then(() => undefined, () => undefined);
+  refreshQueues.set(slug, tail);
+  tail.finally(() => {
+    if (refreshQueues.get(slug) === tail) refreshQueues.delete(slug);
+  }).catch(() => undefined);
+  return run;
+}
+
+/** Test-only: clear pending queue metadata after a fixture run. */
+export function _resetSpaceRefreshQueuesForTest(): void {
+  refreshQueues.clear();
+}
+
 /**
  * Refresh one data source (or the first, if sourceId omitted) and persist into
  * data.json under the source id, with a _meta entry. Returns per-source status.
  */
 export async function refreshSpaceData(slug: string, sourceId?: string): Promise<RefreshResult[]> {
+  return enqueueSpaceRefresh(slug, () => refreshSpaceDataLocked(slug, sourceId));
+}
+
+async function refreshSpaceDataLocked(slug: string, sourceId?: string): Promise<RefreshResult[]> {
   const rec = spaceStore.get(slug);
   if (!rec) return [{ ok: false, sourceId: sourceId ?? '(none)', error: `no workspace "${slug}"` }];
   if (rec.manifestErrors && rec.manifestErrors.length > 0) {
@@ -150,6 +173,8 @@ export async function refreshSpaceData(slug: string, sourceId?: string): Promise
   const meta = (current._meta && typeof current._meta === 'object') ? { ...(current._meta as Record<string, unknown>) } : {};
   const results: RefreshResult[] = [];
 
+  // Phase A observability: the workspace data-refresh lifecycle on the operator view.
+  recordOperationalEvent({ source: 'workspace', type: 'workspace_data_refresh_started', workspaceId: slug, actor: 'space-runner', payload: { sourceCount: sources.length, sourceId } });
   for (const source of sources) {
     const run = await runSpaceDataSource(slug, source);
     if (run.ok) {
@@ -167,5 +192,14 @@ export async function refreshSpaceData(slug: string, sourceId?: string): Promise
   const write = writeData(slug, current);
   if (write.ok) spaceStore.update(slug, { lastRefreshedAt: new Date().toISOString() });
   for (const r of results) r.write = write;
+  const failedCount = results.filter((r) => !r.ok).length;
+  recordOperationalEvent({
+    source: 'workspace',
+    type: failedCount > 0 ? 'workspace_data_refresh_failed' : 'workspace_data_refresh_completed',
+    severity: failedCount > 0 ? 'error' : 'info',
+    workspaceId: slug,
+    actor: 'space-runner',
+    payload: { okCount: results.length - failedCount, failedCount, total: results.length, writeOk: write.ok },
+  });
   return results;
 }

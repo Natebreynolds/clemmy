@@ -4,6 +4,7 @@ import type { NotificationRecord } from './notifications.js';
 import type { PendingApproval } from '../types.js';
 import type { EventRow, HarnessSessionSignal } from './harness/eventlog.js';
 import type { BoundaryError } from './boundary-error.js';
+import type { OperationalEventEnvelope } from './operational-telemetry.js';
 
 // Fan-out bus for "the daemon just did a thing" events. Listeners are
 // in-process only (the SSE handler in console-routes.ts subscribes
@@ -31,6 +32,10 @@ export type ActionEvent =
   | {
       kind: 'notification.created';
       notification: NotificationRecord;
+    }
+  | {
+      kind: 'operational.event';
+      event: OperationalEventEnvelope;
     }
   | {
       kind: 'execution.transitioned';

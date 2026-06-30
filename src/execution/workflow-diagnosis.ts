@@ -97,6 +97,24 @@ function coerceArray(raw: unknown): unknown[] | null {
 // "Blocked").
 const PROSE_BLOCK_RE = /^\s*(?:blocked\b|the (?:workflow )?step (?:is|was) blocked|step blocked\b)/i;
 
+// A step can produce a partial human report while explicitly saying a tool or
+// runtime dependency failed ("goal_list/goal_get errored out"). That is not a
+// clean success: the deliverable may be useful, but the run should surface as
+// needs-attention. Keep this narrow to tooling/runtime nouns so normal business
+// prose like "three campaigns failed" does not trip it.
+const PROSE_TOOL_FAILURE_RES = [
+  /\b(?:tool|tools|mcp|connector|connection|api|composio|goal_(?:list|get)|task_(?:list|get)|workflow runtime)\b.{0,120}\b(?:errored out|failed|failure|unavailable|not exposed|not available|unable to retrieve)\b/i,
+  /\b(?:errored out|failed|failure|unavailable|unable to retrieve)\b.{0,120}\b(?:tool|tools|mcp|connector|connection|api|composio|goal_(?:list|get)|task_(?:list|get)|workflow runtime)\b/i,
+];
+
+export function detectProseSelfReportedFailure(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const match = PROSE_TOOL_FAILURE_RES.map((re) => trimmed.match(re)).find(Boolean);
+  if (!match) return null;
+  return `reported tool/runtime failure: ${match[0].replace(/\s+/g, ' ').slice(0, 240)}`;
+}
+
 // A step can fail "politely" — returning a normal JSON object that
 // DESCRIBES its own failure without the literal `blocked:true`. The engine
 // then reports the run as a clean "completed" success despite the step's
@@ -154,12 +172,11 @@ export function detectSelfReportedFailure(obj: Record<string, unknown>): string 
  * `{records:{ok:false,error:"Unable to retrieve tool …"}}` — which the top-level
  * check + the output contract both wave through.
  *
- * Deliberately NOT wired into the canonical detectBlockedSteps (the runtime
- * completion path): a healthy real run can legitimately carry a nested
- * degraded-but-complete marker (e.g. one sub-source `ok:false` among real data),
- * and failing those would regress "degraded ≠ failed". It is used ONLY by the
- * creation-test trust gate, where a false flag merely leaves the draft DISABLED
- * with an explainable reason + "enable anyway" (informs, never traps).
+ * Used by creation tests AND the runtime completion path. At runtime this is
+ * still only a soft needs-attention signal (`self_reported_failure`), never a
+ * hard step failure or auto-heal trigger. That preserves the delivered output
+ * while preventing a nested "blocked"/"ok:false"/tool error envelope from being
+ * reported as a clean workflow success.
  */
 export function deepSelfReportedFailure(value: unknown, depth = 0): string | null {
   if (value == null || depth > 4) return null;
@@ -172,6 +189,9 @@ export function deepSelfReportedFailure(value: unknown, depth = 0): string | nul
   }
   if (typeof value === 'object') {
     const obj = value as Record<string, unknown>;
+    if (obj.blocked === true) {
+      return `nested blocked=true${typeof obj.reason === 'string' && obj.reason.trim() ? ` — ${obj.reason.trim().slice(0, 200)}` : ''}`;
+    }
     const here = detectSelfReportedFailure(obj);
     if (here) return here;
     for (const v of Object.values(obj)) {
@@ -220,7 +240,7 @@ function inspectArrayForFailures(arr: unknown[], stepId: string): BlockedStep | 
       blockedCount += 1;
       if (!firstReason) firstReason = String(obj.reason ?? 'blocked').slice(0, 200);
     } else {
-      const r = detectSelfReportedFailure(obj);
+      const r = detectSelfReportedFailure(obj) ?? deepSelfReportedFailure(obj);
       if (r) {
         failedCount += 1;
         if (!firstReason) firstReason = r;
@@ -265,9 +285,16 @@ export function detectBlockedSteps(
       // not a hard abort. Tagged 'self_reported_failure' so the runner
       // surfaces it as needs-attention but does NOT route it into the
       // prompt-rewrite Doctor (the failure is an outcome, not a bad prompt).
-      const reason = detectSelfReportedFailure(obj);
+      const reason = detectSelfReportedFailure(obj) ?? deepSelfReportedFailure(obj);
       if (reason) blocked.push({ stepId, reason: `step "${stepId}" ${reason}`.slice(0, 600), kind: 'self_reported_failure' });
     } else {
+      if (typeof raw === 'string') {
+        const reason = detectProseSelfReportedFailure(raw);
+        if (reason) {
+          blocked.push({ stepId, reason: `step "${stepId}" ${reason}`.slice(0, 600), kind: 'self_reported_failure' });
+          continue;
+        }
+      }
       // Not a blocked object, prose block, or healthy object — it may be a
       // forEach aggregate (array / JSON-array string). Surface per-item
       // polite blocks/failures that would otherwise read as a clean success.

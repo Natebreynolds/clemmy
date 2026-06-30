@@ -1,9 +1,9 @@
 /**
  * Run: npx tsx --test src/tools/workflow-schedule-tools.test.ts
  *
- * Proves workflow_schedule is no longer a back door around the author-time
- * guards: an ENABLED workflow that fails validation (ungated send) is refused,
- * while drafting (enabled=false) is allowed.
+ * Proves workflow_schedule respects the same send/publish safety policy as
+ * workflow_create: autonomous sends are allowed by default, but strict mode
+ * requires an approval gate and disabled drafts can still be saved.
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -58,6 +58,46 @@ test('enabled ungated-send workflow is ALLOWED (default allowSends=true)', async
   const text = resultText(result);
   assert.ok(/Created workflow/.test(text), `expected creation, got: ${text}`);
   assert.ok(readWorkflow('midday-sender'), 'workflow must be written');
+});
+
+test('strict send mode refuses a send-looking schedule without an approval gate', async () => {
+  const result = await scheduleTool()({
+    name: 'instagram-weekly-strict',
+    description: 'Draft and post a weekly Instagram update for the firm.',
+    cron: '0 10 * * 1',
+    instructions: 'Draft and post the weekly Instagram content for the firm.',
+    allowSends: false,
+    requiresApproval: false,
+    enabled: true,
+    toolCall: null,
+    timezone: null,
+  });
+  const text = resultText(result);
+  assert.match(text, /NOT scheduled/);
+  assert.match(text, /allowSends: false/);
+  assert.equal(readWorkflow('instagram-weekly-strict'), null, 'invalid enabled strict workflow must not be written');
+});
+
+test('strict scheduled social workflow can be saved with a declarative approval gate', async () => {
+  const result = await scheduleTool()({
+    name: 'instagram-weekly-approved',
+    description: 'Draft and post a weekly Instagram update for the firm.',
+    cron: '0 10 * * 1',
+    instructions: 'Draft and post the weekly Instagram content for the firm.',
+    allowSends: false,
+    requiresApproval: true,
+    approvalPreview: 'Review the Instagram caption and creative before posting.',
+    enabled: true,
+    toolCall: null,
+    timezone: null,
+  });
+  const text = resultText(result);
+  assert.match(text, /Created workflow "instagram-weekly-approved"/);
+  const written = readWorkflow('instagram-weekly-approved')?.data;
+  assert.ok(written, 'workflow must be written');
+  assert.equal(written.allowSends, false);
+  assert.equal(written.steps[0].requiresApproval, true);
+  assert.equal(written.steps[0].approvalPreview, 'Review the Instagram caption and creative before posting.');
 });
 
 test('workflow_schedule does NOT clobber an existing MULTI-step workflow — P1-8', async () => {

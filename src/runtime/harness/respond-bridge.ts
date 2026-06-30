@@ -51,7 +51,7 @@ import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
 import type { AssistantRequest, AssistantResponse, ToolActivity } from '../../types.js';
 
-export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow';
+export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow' | 'discord' | 'slack';
 
 /** Surfaces that are STAGED, not yet validated live: default OFF (legacy stays
  *  byte-identical) so a new conversion lands reversibly and Nathan flips the
@@ -94,7 +94,7 @@ const REUSE_USER_INPUT_TERMINALS = new Set<string>([
   'approval_requested',
 ]);
 
-function hasReusableRecordedUserInput(sessionId: string, text: string): boolean {
+export function hasReusableRecordedUserInput(sessionId: string, text: string): boolean {
   try {
     const expected = text.trim();
     if (!expected) return false;
@@ -135,6 +135,9 @@ const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judge
   // Interactive console home chat: full chat parity with desktop/Discord, so
   // the objective-completion judge is ON (same as the cli/webhook lanes).
   home: { kind: 'chat', judgeCompletion: true },
+  // Interactive chat transports share the same bridge/fallover spine as home.
+  discord: { kind: 'chat', judgeCompletion: true },
+  slack: { kind: 'chat', judgeCompletion: true },
 };
 
 export function harnessSurfaceEnabled(surface: HarnessSurface): boolean {
@@ -292,8 +295,8 @@ export async function respondViaHarness(
       // tool, so they keep the full surface. Still default-off via CLEMMY_TOOL_JIT.
       allowToolJit: config.kind === 'chat',
     });
-    // W1a — chat step-boundary brain fallover (shared with the Discord/Slack
-    // runner). On a CHAT surface, hand runConversation the ordered next-brain
+    // W1a — chat step-boundary brain fallover. On a CHAT surface, hand
+    // runConversation the ordered next-brain
     // model ids + a rebuild factory so a transient model/codex error mid-turn
     // re-dispatches to the next brain instead of immediately asking. Best-effort
     // + gated by CLEMMY_BRAIN_FALLOVER; absence = today's ask behavior.
@@ -438,8 +441,8 @@ function chatBrainFalloverEnabled(): boolean {
 }
 
 /**
- * UNIFIED chat-brain fallover decision, shared by respondPreferHarness AND the
- * surfaces that call the Claude SDK brain DIRECTLY (desktop dock, Discord, Slack).
+ * UNIFIED chat-brain fallover decision, shared by all chat surfaces through
+ * respondPreferHarness.
  * On a FALLOVER-ELIGIBLE terminal Claude failure where nothing harmful committed,
  * re-run the WHOLE turn on the standard harness brain (Codex→GLM, which has its own
  * first-byte fallover) — ONE model switch instead of a dead turn or 6 same-model

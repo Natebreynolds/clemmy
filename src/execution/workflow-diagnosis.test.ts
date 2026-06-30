@@ -32,6 +32,7 @@ const {
   listFixBackups,
   detectSelfReportedFailure,
   deepSelfReportedFailure,
+  detectProseSelfReportedFailure,
   diagnoseWorkflowBlock,
 } = mod;
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
@@ -46,6 +47,7 @@ test('deepSelfReportedFailure: finds a failure nested below the top level; null 
   );
   // Nested error string deeper down.
   assert.match(deepSelfReportedFailure({ a: { b: { error: 'boom' } } }) ?? '', /error="boom"/);
+  assert.match(deepSelfReportedFailure({ result: { blocked: true, reason: 'tool surface missing' } }) ?? '', /blocked=true/);
   // Healthy data — no false positive (a normal records payload).
   assert.equal(deepSelfReportedFailure({ records: [{ id: 1, name: 'x' }], count: 1 }), null);
   assert.equal(deepSelfReportedFailure('just a string'), null);
@@ -67,6 +69,18 @@ test('detectBlockedSteps finds blocked results (object + JSON string), skips syn
   assert.equal(blocked.find((b) => b.stepId === 'b')?.reason, 'missing sheet id');
 });
 
+test('detectBlockedSteps: nested blocked/failure envelopes mark real runs needs-attention', () => {
+  const blocked = detectBlockedSteps({
+    find_official_page: { output: { blocked: true, reason: 'workflow runtime did not expose composio_execute_tool' } },
+    scrape_and_analyze: { result: { ok: false, error: 'Unable to retrieve tool APIFY_RUN_ACTOR' } },
+    healthy: { output: { rows: [{ id: 1 }] } },
+  }, ['find_official_page', 'scrape_and_analyze', 'healthy']);
+  assert.deepEqual(blocked.map((b) => b.stepId), ['find_official_page', 'scrape_and_analyze']);
+  assert.equal(blocked[0].kind, 'self_reported_failure');
+  assert.match(blocked[0].reason, /blocked=true|composio_execute_tool/);
+  assert.match(blocked[1].reason, /ok=false/);
+});
+
 test('detectBlockedSteps catches PROSE blocks (root no longer missed)', () => {
   const blocked = detectBlockedSteps({
     a: 'Blocked the workflow step because the Google Drive connection is expired.',
@@ -76,6 +90,24 @@ test('detectBlockedSteps catches PROSE blocks (root no longer missed)', () => {
   const ids = blocked.map((x) => x.stepId);
   assert.deepEqual(ids, ['a']);
   assert.match(blocked[0].reason, /Drive connection is expired/);
+});
+
+test('detectBlockedSteps: prose tool/runtime failures are partial success, not clean success', () => {
+  assert.match(
+    detectProseSelfReportedFailure('Briefing generated, but goal_list/goal_get errored out while fetching active goals.') ?? '',
+    /goal_list\/goal_get errored out/,
+  );
+  assert.equal(
+    detectProseSelfReportedFailure('Three campaigns failed to produce qualified leads this week.'),
+    null,
+    'ordinary business failure prose is not a runtime/tool failure',
+  );
+  const blocked = detectBlockedSteps({
+    morning_briefing: 'The briefing is ready. Note: the goal tools errored out, so goals may be incomplete.',
+  });
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0].kind, 'self_reported_failure');
+  assert.match(blocked[0].reason, /tools errored out/);
 });
 
 test('detectBlockedSteps orders by stepOrder so the ROOT (earliest) is first', () => {

@@ -3,6 +3,7 @@ import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
 import { cosine, embedQuery, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { getRecallStats } from './recall.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 
 /**
  * Floor for the Stanford recall candidate pool. The pool is pre-filtered by
@@ -276,7 +277,9 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
            dfSession, dfCall, dfTool, trust, extractedAt, importance, input.sourceApp ?? null, autoPin, existing.id);
     const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
       .get(existing.id) as ConsolidatedFactRow;
-    return rowToFact(refreshed);
+    const updatedFact = rowToFact(refreshed);
+    emitSemanticFactUpserted(updatedFact, 'update');
+    return updatedFact;
   }
 
   const derivationDepth = Math.max(0, Math.min(2, input.derivationDepth ?? 0));
@@ -299,7 +302,22 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
 
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;
-  return rowToFact(inserted);
+  const insertedFact = rowToFact(inserted);
+  emitSemanticFactUpserted(insertedFact, 'insert');
+  return insertedFact;
+}
+
+/** Phase A observability: every semantic-memory write surfaces as one operational
+ *  event so the operator view shows what the agent is learning. Fail-open. */
+function emitSemanticFactUpserted(fact: ConsolidatedFact, mutation: 'insert' | 'update'): void {
+  recordOperationalEvent({
+    source: 'memory',
+    type: 'semantic_fact_upserted',
+    severity: 'info',
+    sessionId: fact.derivedFrom?.sessionId ?? undefined,
+    actor: 'facts.rememberFact',
+    payload: { id: fact.id, kind: fact.kind, mutation, importance: fact.importance, pinned: fact.pinned },
+  });
 }
 
 /**
@@ -629,6 +647,31 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
   } catch {
     return [];
   }
+}
+
+/**
+ * Union recall for the persistent-context "Relevant To Your Request" block
+ * (Phase 4 — close the Claude lane's knowledge starvation). FTS keyword hits go
+ * FIRST (precision), then semantic hits fill the remaining slots — so a
+ * paraphrased request that shares NO tokens with the stored fact ("market leader"
+ * vs "Market_Leader__c is true") still recalls it. Deduped by id, FTS-ranked
+ * first; strictly ADDITIVE to the FTS-only path (never drops a keyword hit).
+ * Falls back to pure FTS when embeddings are unavailable. Never throws.
+ */
+export async function searchFactsHybrid(query: string, limit = 5): Promise<ConsolidatedFact[]> {
+  const cap = Math.max(1, limit);
+  const fts = searchFactsByText(query, cap);
+  let semantic: ConsolidatedFact[] = [];
+  try { semantic = await findSimilarFacts(query, { topK: cap }); } catch { semantic = []; }
+  const seen = new Set<number>();
+  const out: ConsolidatedFact[] = [];
+  for (const f of [...fts, ...semantic]) {
+    if (seen.has(f.id)) continue;
+    seen.add(f.id);
+    out.push(f);
+    if (out.length >= cap) break;
+  }
+  return out;
 }
 
 /**

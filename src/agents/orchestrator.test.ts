@@ -464,6 +464,12 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
     assert.equal(routed.length, 1);
     assert.equal((routed[0].data as { modelId?: string }).modelId, 'minimax-01');
     assert.equal((routed[0].data as { seam?: string }).seam, 'chat');
+    const results = listEvents(session.id, { types: ['worker_result'] });
+    assert.equal(results.length, 1);
+    assert.equal((results[0].data as { item?: string }).item, 'landing page hero');
+    assert.equal((results[0].data as { ok?: boolean }).ok, true);
+    assert.equal((results[0].data as { model?: string }).model, 'minimax-01');
+    assert.equal((results[0].data as { toolCallId?: string }).toolCallId, 'call_worker_design');
   } finally {
     for (const [key, value] of Object.entries(prev)) {
       if (value === undefined) delete process.env[key];
@@ -525,6 +531,12 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
     const sdkEvent = routed.find((event) => (event.data as { transport?: string }).transport === 'claude_agent_sdk_worker');
     assert.ok(sdkEvent, 'expected SDK worker telemetry event');
     assert.deepEqual((sdkEvent.data as { toolUses?: string[] }).toolUses, ['mcp__clementine-local__skill_read']);
+    const results = listEvents(session.id, { types: ['worker_result'] });
+    assert.equal(results.length, 1);
+    assert.equal((results[0].data as { item?: string }).item, 'report hero');
+    assert.equal((results[0].data as { ok?: boolean }).ok, true);
+    assert.equal((results[0].data as { model?: string }).model, 'claude-sonnet-4-6');
+    assert.deepEqual((results[0].data as { toolUses?: string[] }).toolUses, ['mcp__clementine-local__skill_read']);
   } finally {
     setClaudeAgentSdkWorkerRunForTest(null);
     for (const [key, value] of Object.entries(prev)) {
@@ -532,6 +544,47 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
       else process.env[key] = value;
     }
   }
+});
+
+test('run_worker emits worker_result ok=false when an already-capped item is refused before respawn', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat', title: 'capped worker result' });
+  appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'system',
+    type: 'worker_capped',
+    data: { callId: 'call_old', item: 'Firm A - firma.com' },
+  });
+  const agent = await buildOrchestratorAgent();
+  const runWorker = (agent.tools ?? []).find((t) => (t as { name?: string }).name === 'run_worker') as {
+    invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
+  } | undefined;
+  assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+
+  const packet = {
+    objective: 'Research one firm.',
+    item: 'Firm A - firma.com',
+    resolvedTools: 'none needed',
+    context: 'Prior worker capped.',
+    instructions: 'Do not retry capped work.',
+    expectedOutput: 'One sentence or ERROR: <reason>.',
+    intent: 'research',
+  };
+  const input = JSON.stringify(packet);
+  const result = await runWorker.invoke(
+    new RunContext({ sessionId: session.id }),
+    input,
+    { toolCall: { name: 'run_worker', callId: 'call_worker_capped', arguments: input } },
+  );
+
+  assert.match(String(result), /^ERROR:/);
+  const results = listEvents(session.id, { types: ['worker_result'] });
+  assert.equal(results.length, 1);
+  assert.equal((results[0].data as { item?: string }).item, 'Firm A - firma.com');
+  assert.equal((results[0].data as { ok?: boolean }).ok, false);
+  assert.equal((results[0].data as { toolCallId?: string }).toolCallId, 'call_worker_capped');
+  assert.match(String((results[0].data as { reason?: string }).reason), /already exhausted/i);
 });
 
 test('Orchestrator has NO handoffs in Phase 3 (single-agent architecture)', async () => {

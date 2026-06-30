@@ -20,6 +20,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-runner-te
 
 const runner = await import('./runner.js');
 const store = await import('./store.js');
+const dataStore = await import('./data-store.js');
 
 function writeRunner(slug: string, file: string, body: string, exec = false): void {
   const dir = store.resolveInSpace(slug, 'data');
@@ -132,6 +133,40 @@ test('refreshSpaceData refuses malformed hand-written manifest JSON before runni
   assert.equal(res[0].ok, false);
   assert.match(res[0].error ?? '', /workspace manifest is invalid/);
   assert.match(res[0].error ?? '', /composio_args_json is not valid JSON/);
+});
+
+test('refreshSpaceData serializes same-space refreshes so concurrent sources do not clobber data.json', async () => {
+  const slug = 'refresh-serial';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Refresh Serial',
+    dataSources: [
+      { id: 'alpha', runner: 'alpha.mjs' },
+      { id: 'beta', runner: 'beta.mjs' },
+    ],
+  });
+  writeRunner(slug, 'alpha.mjs', `
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    process.stdout.write(JSON.stringify({rows:[{id:"alpha"}]}));
+  `);
+  writeRunner(slug, 'beta.mjs', `
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    process.stdout.write(JSON.stringify({rows:[{id:"beta"}]}));
+  `);
+
+  const [alpha, beta] = await Promise.all([
+    runner.refreshSpaceData(slug, 'alpha'),
+    runner.refreshSpaceData(slug, 'beta'),
+  ]);
+
+  assert.equal(alpha[0].ok, true, alpha[0].error ?? '');
+  assert.equal(beta[0].ok, true, beta[0].error ?? '');
+  const data = dataStore.readData(slug) as Record<string, unknown>;
+  assert.deepEqual(data.alpha, { rows: [{ id: 'alpha' }] });
+  assert.deepEqual(data.beta, { rows: [{ id: 'beta' }] });
+  assert.equal((data._meta as Record<string, { ok?: boolean }>).alpha.ok, true);
+  assert.equal((data._meta as Record<string, { ok?: boolean }>).beta.ok, true);
+  runner._resetSpaceRefreshQueuesForTest();
 });
 
 test('runner that prints nothing (exit 0) → "produced no output"', async () => {

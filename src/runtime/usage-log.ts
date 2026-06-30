@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import { recordOperationalEvent } from './operational-telemetry.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -128,7 +129,7 @@ export function recordModelUsage(args: {
   promptComponents?: Record<string, number>;
 }): void {
   const source = args.sessionId || 'unknown';
-  recordUsage({
+  const event = {
     at: new Date().toISOString(),
     source,
     kind: classifyUsageKind(source, args.channel),
@@ -144,6 +145,33 @@ export function recordModelUsage(args: {
     // Join keys for the State layer — derived, so every workflow lane gets them
     // for free (no per-model-lane call-site change). Absent for non-workflow calls.
     ...parseWorkflowSource(source),
+  };
+  recordUsage(event);
+  recordOperationalEvent({
+    source: 'model',
+    type: 'model_call_completed',
+    severity: 'info',
+    sessionId: source,
+    workflowRunId: event.runId,
+    modelCallId: args.responseId,
+    actor: 'usage-log',
+    now: new Date(event.at),
+    payload: {
+      channel: args.channel,
+      usageKind: event.kind,
+      model: event.model,
+      inputTokens: event.inputTokens,
+      cachedInputTokens: event.cachedInputTokens,
+      outputTokens: event.outputTokens,
+      reasoningTokens: event.reasoningTokens,
+      totalTokens: event.totalTokens,
+      durationMs: event.durationMs,
+      responseId: event.responseId,
+      runId: event.runId,
+      stepId: event.stepId,
+      itemKey: event.itemKey,
+      promptComponents: event.promptComponents,
+    },
   });
 }
 

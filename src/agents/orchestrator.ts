@@ -778,6 +778,38 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // Routing telemetry should never block worker fan-out.
         }
       };
+      // Move 5: durable per-worker completion record — restart-surviving coverage
+      // + spend for a long 100-subagent run (the in-memory fanout ledger is lost
+      // on a daemon restart). Best-effort; never blocks fan-out.
+      const appendWorkerResult = (data: { item: string; ok: boolean; model?: string | null; toolUses?: string[]; tokens?: number; reason?: string }): void => {
+        if (!sessionId) return;
+        try {
+          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...data, toolCallId } });
+        } catch { /* durable trace is best-effort */ }
+      };
+      const workerResultReason = (value: unknown): string => {
+        const raw = value instanceof Error ? value.message : typeof value === 'string' ? value : String(value ?? '');
+        return raw.split('\n')[0].slice(0, 400);
+      };
+      const appendWorkerResultFromOutput = (
+        output: unknown,
+        data: { model?: string | null; toolUses?: string[]; tokens?: number } = {},
+      ): void => {
+        const text = typeof output === 'string' ? output : String(output ?? '');
+        const ok = !/^\s*ERROR:/i.test(text);
+        appendWorkerResult({
+          item: input.item,
+          ok,
+          ...data,
+          ...(ok ? {} : { reason: workerResultReason(text) }),
+        });
+      };
+      const workerResultTokens = (usage: unknown): number => {
+        const u = usage as Record<string, unknown> | undefined;
+        if (!u || typeof u !== 'object') return 0;
+        const n = (k: string): number => (typeof u[k] === 'number' ? (u[k] as number) : 0);
+        return n('input_tokens') + n('output_tokens') + n('cache_read_input_tokens') + n('cache_creation_input_tokens');
+      };
       // HARD respawn guard (covers BOTH worker lanes — placed before the route
       // branch). If THIS item already hit its turn cap (worker_capped) earlier in
       // this run, refuse to re-spawn it: a re-run with the same packet just caps
@@ -789,7 +821,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // would self-fire a spurious worker_capped. Gated under the existing thrash
       // guard; workerItemAlreadyCapped is fail-open so it can never block fan-out.
       if (workerThrashGuardEnabled() && sessionId && workerItemAlreadyCapped(sessionId, input.item)) {
-        return `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
+        const message = `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
+        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message) });
+        return message;
       }
       if (claudeAgentSdkWorkerEnabled(workerModel)) {
         // Pass the PARENT chat session so the Claude SDK worker's gates +
@@ -814,6 +848,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             sdkModel: sdkResult.model ?? null,
             toolUses: sdkResult.toolUses,
           });
+          // Derive ok from the result, NOT hard-coded — a capped/blocked/empty
+          // worker returns an "ERROR:" envelope NORMALLY (the same signal the
+          // in-memory honest-partial ledger reads), so the durable coverage map
+          // must agree or it would over-report success after a restart.
+          const workerOk = !/^\s*ERROR:/i.test(sdkResult.text ?? '');
+          appendWorkerResult({
+            item: input.item,
+            ok: workerOk,
+            reason: workerOk ? undefined : (sdkResult.text ?? '').split('\n')[0]?.slice(0, 200),
+            model: sdkResult.model ?? workerModel,
+            toolUses: sdkResult.toolUses,
+            tokens: workerResultTokens(sdkResult.usage),
+          });
           return sdkResult.text;
         } catch (err) {
           // Claude SDK worker overloaded BEFORE committing anything (no tool ran,
@@ -824,7 +871,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           const next = (workerBrainFalloverEnabled() && err instanceof ClaudeSdkProviderOverloadError && !err.committed)
             ? falloverBrainModelIds('claude')[0]
             : undefined;
-          if (!next) throw err;
+          if (!next) {
+            appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });
+            throw err;
+          }
           appendWorkerRoute({
             seam: 'chat', item: input.item, attemptedIntent: input.intent ?? null,
             modelId: next.modelId, provider: next.provider,
@@ -834,7 +884,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             ? { ...runWorkerAsToolOptions, runOptions: { maxTurns: resolveWorkerMaxTurns(input.intent, workerMaxTurns) } }
             : runWorkerAsToolOptions;
           if (!runContext) throw new Error('run_worker requires an SDK run context');
-          return worker.clone({ model: next.modelId }).asTool(fbOptions).invoke(runContext, JSON.stringify(input), details);
+          try {
+            const output = await worker.clone({ model: next.modelId }).asTool(fbOptions).invoke(runContext, JSON.stringify(input), details);
+            appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
+            return output;
+          } catch (fallbackErr) {
+            appendWorkerResult({ item: input.item, ok: false, model: next.modelId, toolUses: [], reason: workerResultReason(fallbackErr) });
+            throw fallbackErr;
+          }
         }
       }
       if (route.trace) appendWorkerRoute(route.trace);
@@ -847,7 +904,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         : runWorkerAsToolOptions;
       const nestedWorkerTool = workerForCall.asTool(nestedAsToolOptions);
       if (!runContext) throw new Error('run_worker requires an SDK run context');
-      return nestedWorkerTool.invoke(runContext, JSON.stringify(input), details);
+      try {
+        const output = await nestedWorkerTool.invoke(runContext, JSON.stringify(input), details);
+        appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
+        return output;
+      } catch (err) {
+        appendWorkerResult({ item: input.item, ok: false, model: route.model ?? workerModel, toolUses: [], reason: workerResultReason(err) });
+        throw err;
+      }
     },
   }) as Tool<RuntimeContextValue>;
 

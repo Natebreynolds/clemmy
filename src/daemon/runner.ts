@@ -19,6 +19,7 @@ import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRu
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -377,10 +378,16 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
   if (state.lastRecursiveReflectionDay === day) return;
   state.lastRecursiveReflectionDay = day;
   saveState(state);
+  // Phase A observability: the episodic→semantic distillation tick is the
+  // mandate's "background consolidation". Bracket it so the operator view shows
+  // when memory consolidates and what it produced. Fail-open.
+  recordOperationalEvent({ source: 'memory', type: 'memory_consolidation_started', actor: 'recursive-reflection', payload: { day } });
   try {
     const result = await runRecursiveReflection();
     logger.info({ result }, 'Brain recursive reflection completed');
+    recordOperationalEvent({ source: 'memory', type: 'memory_consolidation_completed', actor: 'recursive-reflection', payload: { day, ...result } });
   } catch (err) {
+    recordOperationalEvent({ source: 'memory', type: 'memory_consolidation_completed', severity: 'error', actor: 'recursive-reflection', payload: { day, error: err instanceof Error ? err.message : String(err) } });
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
       'Brain recursive reflection failed (will retry tomorrow)',

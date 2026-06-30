@@ -29,6 +29,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { deleteWorkspaceIndex, indexWorkspaceRecord, reindexWorkspaceRecords } from './workspace-db.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
 
@@ -433,6 +434,11 @@ export class SpaceStore {
       recipe: input.recipe ?? existing?.recipe,
     };
     atomicWrite(manifestPath(input.id), JSON.stringify(persistableRecord(record), null, 2));
+    indexWorkspaceRecord(record, {
+      eventType: existing ? 'workspace_file_changed' : 'workspace_created',
+      actor: 'space-store',
+      payload: { mutation: existing ? 'save:update' : 'save:create' },
+    });
     return record;
   }
 
@@ -456,6 +462,11 @@ export class SpaceStore {
     };
     delete record.manifestErrors;
     atomicWrite(manifestPath(slug), JSON.stringify(persistableRecord(record), null, 2));
+    indexWorkspaceRecord(record, {
+      eventType: 'workspace_file_changed',
+      actor: 'space-store',
+      payload: { mutation: 'update' },
+    });
     return record;
   }
 
@@ -491,7 +502,13 @@ export class SpaceStore {
         obj.revisions = [...existing.revisions, revision].slice(-50);
         obj.updatedAt = new Date().toISOString();
         atomicWrite(file, JSON.stringify(obj, null, 2));
-        return readManifest(slug) ?? existing;
+        const updated = readManifest(slug) ?? existing;
+        indexWorkspaceRecord(updated, {
+          eventType: 'workspace_file_changed',
+          actor: 'space-store',
+          payload: { mutation: 'recordRevision' },
+        });
+        return updated;
       } catch {
         return existing;
       }
@@ -514,7 +531,15 @@ export class SpaceStore {
         obj.status = 'archived';
         obj.updatedAt = new Date().toISOString();
         atomicWrite(file, JSON.stringify(obj, null, 2));
-        return readManifest(slug);
+        const updated = readManifest(slug);
+        if (updated) {
+          indexWorkspaceRecord(updated, {
+            eventType: 'workspace_file_changed',
+            actor: 'space-store',
+            payload: { mutation: 'archive' },
+          });
+        }
+        return updated;
       } catch {
         return undefined;
       }
@@ -528,7 +553,16 @@ export class SpaceStore {
     const dir = resolveSpaceDir(slug);
     if (!existsSync(dir)) return false;
     rmSync(dir, { recursive: true, force: true });
+    deleteWorkspaceIndex(slug, { actor: 'space-store' });
     return true;
+  }
+
+  /** Rebuild the queryable DB index from manifest files. Manifests remain source of truth. */
+  reindex(includeArchived = true): number {
+    return reindexWorkspaceRecords(this.list(includeArchived), {
+      actor: 'space-store',
+      payload: { mutation: 'reindex' },
+    });
   }
 }
 

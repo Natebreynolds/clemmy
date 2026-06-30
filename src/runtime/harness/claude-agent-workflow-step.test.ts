@@ -236,6 +236,34 @@ test('runClaudeAgentSdkWorkflowStep converts missing tool surface into a blocked
   assert.equal(result.structured, true);
 });
 
+test('runClaudeAgentSdkWorkflowStep RE-THROWS (transient, self-heal) when the MCP surface never initialized (0 baseline tools)', async () => {
+  // The per-step MCP child advertised an EMPTY surface (no baseline read tools) —
+  // i.e. it had not finished initializing. This is the 2026-06-30 facebook-scrape
+  // failure mode: every step blocked on composio not being advertised. It must NOT
+  // hard-block (that kills the workflow's real work); it must throw a TRANSIENT
+  // error so the runner retries with a fresh MCP child.
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+    throw new ClaudeAgentSdkToolSurfaceError(['composio_execute_tool', 'composio_search_tools'], []);
+  });
+  const { isTransientStepError } = await import('../../execution/transient-error.js');
+
+  await assert.rejects(
+    () => runClaudeAgentSdkWorkflowStep({
+      step: { id: 'scrape_and_analyze', prompt: 'Use composio_execute_tool to scrape.', sideEffect: 'read' as const, allowedTools: ['composio_execute_tool'] },
+      workflowName: 'scorpion-facebook-trends',
+      prompt: 'Use composio_execute_tool to scrape.',
+      modelId: 'claude-opus-4-8',
+      sessionId: 'workflow:run-fb:scrape_and_analyze',
+      fullLane: true,
+    }),
+    (err: unknown) => {
+      assert.match((err as Error).message, /temporarily unavailable/);
+      assert.equal(isTransientStepError(err), true, 'must be classified retryable so the runner self-heals');
+      return true;
+    },
+  );
+});
+
 test('runClaudeAgentSdkWorkflowStep converts SDK turn limits into a blocked workflow result', async () => {
   setClaudeAgentSdkWorkflowStepRunForTest(async () => ({
     text: 'I reached the turn budget. Say "continue" to keep going.',

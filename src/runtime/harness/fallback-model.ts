@@ -28,6 +28,7 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
+import { recordOperationalEvent } from '../operational-telemetry.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.fallback-model' });
@@ -187,14 +188,26 @@ export class FallbackModel implements Model {
   }
 
   private logFallover(i: number, err: unknown): void {
+    const reason = err instanceof FirstByteTimeoutError ? 'first-byte-timeout' : (err instanceof BoundaryError ? err.kind : classifyModelError(err).kind);
     logger.warn(
       {
         from: this.chain[i].label,
         to: this.chain[i + 1].label,
-        reason: err instanceof FirstByteTimeoutError ? 'first-byte-timeout' : (err instanceof BoundaryError ? err.kind : classifyModelError(err).kind),
+        reason,
       },
       'brain unavailable — falling over to the next brain',
     );
+    recordOperationalEvent({
+      source: 'model',
+      type: 'model_fallover',
+      severity: 'warn',
+      actor: 'fallback-model',
+      payload: {
+        from: this.chain[i].label,
+        to: this.chain[i + 1].label,
+        reason,
+      },
+    });
   }
 
   /** Race a model call's first result against the first-byte timeout (only for a

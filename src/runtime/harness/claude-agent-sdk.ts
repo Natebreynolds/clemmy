@@ -19,6 +19,7 @@ import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from 
 import { buildGatedToolPermission } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
+import { recordOperationalEvent } from '../operational-telemetry.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -138,31 +139,45 @@ function sdkWallClockMs(): number {
 /** Mutable per-turn bookkeeping shared between the ceiling `canUseTool` wrapper
  *  and the run loop, so a self-imposed stop surfaces as a graceful limitHit
  *  (partial answer + "say continue") instead of a raw error. */
-interface ToolCeilingState { total: number; mutating: number; stopped: string | null }
+// pausedMs accumulates time spent INSIDE the base canUseTool — for a gated tool
+// that is dominated by the HUMAN approval wait (canUseTool does no model/tool
+// work, only the permission decision). It is subtracted from the wall clock so a
+// long confirm-first approval can't self-abort the turn the moment the user
+// approves — honoring "approve once, then run to completion".
+interface ToolCeilingState { total: number; mutating: number; stopped: string | null; pausedMs: number }
 
-/** Wrap a base `canUseTool` with a session-scoped call ceiling. Mutating
- *  (non-fast-allow) calls get a LOW ceiling; reads a HIGH one. Crossing either
- *  bound denies WITH `interrupt:true` (stops the turn) and latches `stopped` so
- *  every subsequent call keeps denying — belt-and-suspenders if the SDK doesn't
- *  honor the interrupt immediately. */
-function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: ToolCeilingState): CanUseTool {
+/** Wrap a base `canUseTool` to (1) ALWAYS meter approval-wait time into
+ *  state.pausedMs (so the wall clock excludes it), and (2) when `countCeiling`,
+ *  enforce a session-scoped call ceiling: mutating (non-fast-allow) calls get a
+ *  LOW ceiling, reads a HIGH one. Crossing either bound denies WITH
+ *  `interrupt:true` (stops the turn) and latches `stopped` so every subsequent
+ *  call keeps denying — belt-and-suspenders if the SDK doesn't honor the
+ *  interrupt immediately. */
+function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: ToolCeilingState, opts: { countCeiling: boolean }): CanUseTool {
   const fastAllow = new Set(fastAllowTools.map(normalizeToolName).filter(Boolean));
   const mutCeiling = sdkMutatingCallCeiling();
   const totalCeiling = sdkTotalCallCeiling();
   return (async (toolName, input, options) => {
-    if (state.stopped !== null) {
-      return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+    if (opts.countCeiling) {
+      if (state.stopped !== null) {
+        return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+      }
+      const tail = toolName.split('__').at(-1) ?? toolName;
+      const isRead = fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(tail));
+      state.total += 1;
+      if (!isRead) state.mutating += 1;
+      if (state.mutating > mutCeiling || state.total > totalCeiling) {
+        const why = state.mutating > mutCeiling ? `${state.mutating} actions` : `${state.total} tool calls`;
+        state.stopped = `I stopped myself after ${why} without finishing — that looked like a loop, so I held off rather than keep going and risk repeating an action. Tell me how you'd like to proceed and I'll pick it back up.`;
+        return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+      }
     }
-    const tail = toolName.split('__').at(-1) ?? toolName;
-    const isRead = fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(tail));
-    state.total += 1;
-    if (!isRead) state.mutating += 1;
-    if (state.mutating > mutCeiling || state.total > totalCeiling) {
-      const why = state.mutating > mutCeiling ? `${state.mutating} actions` : `${state.total} tool calls`;
-      state.stopped = `I stopped myself after ${why} without finishing — that looked like a loop, so I held off rather than keep going and risk repeating an action. Tell me how you'd like to proceed and I'll pick it back up.`;
-      return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+    const t0 = Date.now();
+    try {
+      return await base(toolName, input, options);
+    } finally {
+      state.pausedMs += Date.now() - t0;
     }
-    return base(toolName, input, options);
   }) as CanUseTool;
 }
 
@@ -383,6 +398,32 @@ export function buildAllowOnlyToolsPermission(allowedTools: string[]): CanUseToo
   };
 }
 
+/** Emit a canonical operational tool-call event for the Claude SDK lane (chat +
+ *  workflow step). Derives the workflow run/node from a "workflow:<runId>:<stepId>"
+ *  session id so workflow-step tool calls link to their run. Fail-open. */
+function emitSdkToolCallEvent(
+  sessionId: string | undefined,
+  type: 'tool_call_started' | 'tool_call_completed' | 'tool_call_failed',
+  callId: string,
+  toolName: string | undefined,
+  extra: Record<string, unknown> = {},
+): void {
+  try {
+    const wf = sessionId && sessionId.startsWith('workflow:') ? sessionId.split(':') : null;
+    recordOperationalEvent({
+      source: 'tool',
+      type,
+      severity: type === 'tool_call_failed' ? 'error' : 'info',
+      sessionId,
+      workflowRunId: wf ? wf[1] : undefined,
+      workflowNodeRunId: wf && wf.length > 2 ? wf.slice(2).join(':') : undefined,
+      toolCallId: callId,
+      actor: 'claude-agent-sdk',
+      payload: { tool: toolName ? mcpToolTail(toolName) : undefined, ...extra },
+    });
+  } catch { /* observability must never break the SDK run */ }
+}
+
 function mcpToolTail(toolName: string): string {
   return toolName.split('__').at(-1) ?? toolName;
 }
@@ -555,15 +596,15 @@ function normalizeToolResultContent(content: unknown): string {
 /** Pull tool_result blocks (callId + flattened text) from a user message — the
  *  Agent SDK feeds MCP tool results back as a user turn carrying
  *  `{ type: 'tool_result', tool_use_id, content }` blocks. */
-function extractToolResults(message: SDKMessage): Array<{ callId: string; output: string }> {
+function extractToolResults(message: SDKMessage): Array<{ callId: string; output: string; isError: boolean }> {
   if (message.type !== 'user') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
   if (!Array.isArray(content)) return [];
-  const out: Array<{ callId: string; output: string }> = [];
+  const out: Array<{ callId: string; output: string; isError: boolean }> = [];
   for (const block of content) {
-    const b = block as { type?: unknown; tool_use_id?: unknown; content?: unknown };
+    const b = block as { type?: unknown; tool_use_id?: unknown; content?: unknown; is_error?: unknown };
     if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
-      out.push({ callId: b.tool_use_id, output: normalizeToolResultContent(b.content) });
+      out.push({ callId: b.tool_use_id, output: normalizeToolResultContent(b.content), isError: b.is_error === true });
     }
   }
   return out;
@@ -706,16 +747,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const pathToClaudeCodeExecutable = resolveClaudeCliPath() ?? undefined;
   // Anti-thrash bounding (Phase 2): a per-turn call ceiling that INTERRUPTS the
   // SDK turn, shared with the run loop so a self-stop reads as a graceful limit.
-  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null };
+  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, pausedMs: 0 };
   // Agentic: the async approval gate (read/local fast-allow, everything else
   // → decideToolApproval → register/surface/await). permissionMode 'default'
   // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.
   const baseCanUseTool = agentic
     ? buildGatedToolPermission(options.sessionId as string, allowed)
     : buildAllowOnlyToolsPermission(allowed);
-  const canUseTool = sdkToolCeilingEnabled()
-    ? withToolCeiling(baseCanUseTool, allowed, ceilingState)
-    : baseCanUseTool;
+  // ALWAYS wrap (even with the ceiling off) so approval-wait time is metered into
+  // pausedMs for the wall-clock; the ceiling COUNTING is what the flag gates.
+  const canUseTool = withToolCeiling(baseCanUseTool, allowed, ceilingState, { countCeiling: sdkToolCeilingEnabled() });
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
   const sdkOptions: ClaudeAgentOptions = {
     env,
@@ -814,14 +855,17 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ceilingState.total = 0;
     ceilingState.mutating = 0;
     ceilingState.stopped = null;
+    ceilingState.pausedMs = 0;
     const startedAt = Date.now();
     const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
     try {
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       for await (const message of stream) {
-        // Wall-clock backstop: a genuinely stuck stream never hangs the turn.
-        if (wallClockMs > 0 && ceilingState.stopped === null && Date.now() - startedAt > wallClockMs) {
+        // Wall-clock backstop: a genuinely stuck stream never hangs the turn. EXCLUDE
+        // approval-wait (pausedMs) so a long confirm-first approval — the user may
+        // take many minutes — never self-aborts the turn the instant they approve.
+        if (wallClockMs > 0 && ceilingState.stopped === null && Date.now() - startedAt - ceilingState.pausedMs > wallClockMs) {
           ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
           try { await stream?.interrupt?.(); } catch { /* best-effort; finally closes */ }
           break;
@@ -841,12 +885,23 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         }
         const atext = extractAssistantText(message);
         if (atext) lastAssistantText = atext;
-        if (reflectLearning) for (const use of extractToolUseIds(message)) toolById.set(use.id, { name: use.name, input: use.input });
+        // Tool-call OBSERVABILITY (ungated from reflection): the Claude SDK runs
+        // its tool loop OUTSIDE the harness gate chain, so local/authoring tools
+        // (goal_create, task_add, memory_remember, …) called on this lane never
+        // produced a tool event — a real action (e.g. goal_create writing a goal)
+        // was INVISIBLE in the operator view, indistinguishable from a fabricated
+        // claim (observed 2026-06-30). Emit a canonical operational event for every
+        // tool use/result so the Observability panel shows what Clem actually does,
+        // on BOTH lanes (chat brain + workflow step share this runner). Fail-open.
+        for (const use of extractToolUseIds(message)) {
+          toolById.set(use.id, { name: use.name, input: use.input });
+          emitSdkToolCallEvent(options.sessionId, 'tool_call_started', use.id, use.name);
+        }
         toolUses.push(...extractAssistantToolUses(message));
-        if (reflectLearning) {
-          for (const tr of extractToolResults(message)) {
-            if (!tr.output) continue;
-            const source = toolById.get(tr.callId);
+        for (const tr of extractToolResults(message)) {
+          const source = toolById.get(tr.callId);
+          emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name);
+          if (reflectLearning && tr.output) {
             const tool = source ? reflectionToolName(source.name, source.input) : null;
             reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
           }

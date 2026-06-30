@@ -167,6 +167,7 @@ export function _resetEmbeddingHealthForTest(): void {
   lastSuccessAtMs = 0;
   lastErrorClass = null;
   lastErrorAtMs = 0;
+  embedQueryInflight.clear();
 }
 /** Test-only: drive the breaker without a real API call. */
 export function _driveEmbedFailureForTest(err: unknown): void { recordFailure(err); }
@@ -306,6 +307,7 @@ export function isEmbeddingsEnabled(): boolean {
 /** Test-only: inject (or clear with `null`) a deterministic provider. */
 export function _setEmbeddingProviderForTest(p: EmbeddingProvider | null | undefined): void {
   injectedProvider = p;
+  embedQueryInflight.clear();
 }
 /** Test-only: reset the lazily-probed local provider. */
 export function _resetLocalProviderForTest(): void {
@@ -411,9 +413,26 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
  * rerank path. Returns null if embeddings are disabled or the call fails
  * — recall falls back to FTS-only ordering.
  */
-export async function embedQuery(query: string): Promise<Float32Array | null> {
-  const provider = await getEmbeddingProvider();
-  if (!provider) return null;
+// Short-TTL in-FLIGHT cache (Phase 3): the same query is embedded twice in one
+// turn — the per-turn vault-hybrid recall AND the fact-recall vector prime both
+// embed `options.input`, concurrently (Promise.all). Caching the PROMISE (not just
+// the resolved value) dedupes the concurrent pair into ONE provider call, and a
+// short TTL also absorbs sequential repeats. Bounded so it never grows unbounded;
+// failures (null) are evicted so a transient miss never sticks. Kill-switch
+// CLEMMY_EMBED_QUERY_CACHE=off → byte-identical uncached behavior.
+const EMBED_QUERY_CACHE_TTL_MS = 60_000;
+const EMBED_QUERY_CACHE_MAX = 256;
+const embedQueryInflight = new Map<string, { at: number; p: Promise<Float32Array | null> }>();
+
+function embedQueryCacheEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_EMBED_QUERY_CACHE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+function embeddingProviderCacheKey(provider: EmbeddingProvider): string {
+  return `${provider.name ?? 'unknown'}:${provider.model ?? 'unknown'}:${provider.dim}`;
+}
+
+async function embedQueryWithProvider(provider: EmbeddingProvider, query: string): Promise<Float32Array | null> {
   if (inCooldown()) return null;
   try {
     const [vector] = await provider.embed([query]);
@@ -424,6 +443,32 @@ export async function embedQuery(query: string): Promise<Float32Array | null> {
     logger.warn({ err }, 'embedQuery failed; falling back to FTS-only');
     return null;
   }
+}
+
+async function embedQueryUncached(query: string): Promise<Float32Array | null> {
+  const provider = await getEmbeddingProvider();
+  if (!provider) return null;
+  return embedQueryWithProvider(provider, query);
+}
+
+export async function embedQuery(query: string): Promise<Float32Array | null> {
+  if (!embedQueryCacheEnabled()) return embedQueryUncached(query);
+  const provider = await getEmbeddingProvider();
+  if (!provider) return null;
+  const now = Date.now();
+  const key = `${embeddingProviderCacheKey(provider)}\n${query}`;
+  const hit = embedQueryInflight.get(key);
+  if (hit && now - hit.at < EMBED_QUERY_CACHE_TTL_MS) return hit.p;
+  const p = embedQueryWithProvider(provider, query);
+  embedQueryInflight.set(key, { at: now, p });
+  // Evict a null/failed result so a transient miss is never served from cache.
+  p.then((v) => { if (v == null) embedQueryInflight.delete(key); }).catch(() => embedQueryInflight.delete(key));
+  // Bound: drop the oldest entry (Map preserves insertion order) past the cap.
+  if (embedQueryInflight.size > EMBED_QUERY_CACHE_MAX) {
+    const oldest = embedQueryInflight.keys().next().value;
+    if (oldest !== undefined) embedQueryInflight.delete(oldest);
+  }
+  return p;
 }
 
 /**

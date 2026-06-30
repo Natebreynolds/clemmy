@@ -48,6 +48,8 @@ beforeEach(() => {
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
   delete process.env.CLEMMY_HARNESS_HOME;
   delete process.env.CLEMMY_HARNESS_WORKFLOW;
+  delete process.env.CLEMMY_HARNESS_DISCORD;
+  delete process.env.CLEMMY_HARNESS_SLACK;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   process.env.AUTH_MODE = 'api_key';
 });
@@ -74,6 +76,8 @@ test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); k
   assert.equal(harnessSurfaceEnabled('home'), true, 'home default ON');
   assert.equal(harnessSurfaceEnabled('workflow'), true, 'workflow default ON');
   assert.equal(harnessSurfaceEnabled('cli'), true, 'validated surface ON by default');
+  assert.equal(harnessSurfaceEnabled('discord'), true, 'discord default ON');
+  assert.equal(harnessSurfaceEnabled('slack'), true, 'slack default ON');
   process.env.CLEMMY_HARNESS_DASHBOARD = 'off';
   assert.equal(harnessSurfaceEnabled('dashboard'), false, 'kill-switch reverts to legacy');
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
@@ -201,6 +205,28 @@ test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through C
   assert.equal(res.text, 'claude sdk brain');
   assert.equal(legacyCalled, 0);
   assert.equal(runConversationCalled, 0, 'Claude SDK brain is a distinct route from the OpenAI SDK runner');
+});
+
+test('respondPreferHarness: Discord and Slack are first-class chat bridge surfaces', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const seenSurfaces: string[] = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: fakeRun({ status: 'completed' }),
+    claudeAgentBrain: (async (surface, req) => {
+      seenSurfaces.push(surface);
+      return { text: `claude:${surface}`, sessionId: req.sessionId, stoppedReason: 'success' };
+    }) as never,
+  });
+
+  const discord = await respondPreferHarness('discord', { message: 'hi', sessionId: 'discord-bridge' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+  const slack = await respondPreferHarness('slack', { message: 'hi', sessionId: 'slack-bridge' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+
+  assert.equal(discord.text, 'claude:discord');
+  assert.equal(slack.text, 'claude:slack');
+  assert.deepEqual(seenSurfaces, ['discord', 'slack']);
 });
 
 test('respondPreferHarness: Claude SDK brain relays harness tool/progress events to legacy callbacks', async () => {

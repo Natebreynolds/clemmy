@@ -219,6 +219,34 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     });
   } catch (err) {
     if (err instanceof ClaudeAgentSdkToolSurfaceError) {
+      // A tool-surface miss has TWO causes that must be handled differently:
+      //   (1) the per-step MCP child had not finished registering its tools when
+      //       the SDK init was checked — TRANSIENT. Each workflow step spawns a
+      //       FRESH stdio MCP child; a slow/racey startup advertises an empty (or
+      //       partial) surface, and the step then "blocks" on tools that ARE in
+      //       its profile. Observed 2026-06-30: an entire facebook-scrape workflow
+      //       blocked EVERY step on composio_execute_tool not being advertised,
+      //       while sibling workflows the same hour used composio fine. A fresh
+      //       child on retry recovers — so re-throw a transient error and let the
+      //       runner's bounded step-retry re-run with a new server (self-heal).
+      //   (2) the surface initialized fine but the required tool genuinely is not
+      //       in this step's profile — a real config error. Hard-blocking is right
+      //       there (no thrash on an unfixable miss).
+      // Tell them apart by whether the surface came back initialized at all: the
+      // MCP server ALWAYS registers the baseline read tools (ping/memory_search/
+      // workspace_roots/list_files/read_file) regardless of gated-mutations, so
+      // their ABSENCE means the child never finished initializing.
+      const tail = (t: string): string => t.split('__').at(-1) ?? t;
+      const BASELINE = new Set(['ping', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file']);
+      const surfaceInitialized = err.availableTools.some((t) => BASELINE.has(tail(t)));
+      if (!surfaceInitialized) {
+        // Transient phrasing so isTransientStepError() classifies it retryable
+        // (TRANSIENT_RE matches "temporarily unavailable"); NON_RETRYABLE_RE does
+        // not match this string, so the runner WILL retry with a fresh MCP child.
+        throw new Error(
+          `Workflow-step local MCP tool surface temporarily unavailable: the per-step MCP server advertised ${err.availableTools.length} tools and none of the always-registered baseline tools, so it had not finished initializing. A fresh-server retry should recover. Needed: ${err.missingTools.join(', ')}.`,
+        );
+      }
       return {
         output: {
           blocked: true,

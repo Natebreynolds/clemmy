@@ -87,6 +87,19 @@ const scheduleParams = {
     })
     .nullable()
     .describe('Direct tool invocation. Use this when the work is "call X with these exact args" (e.g. "post this Instagram caption with this image_url"). Mutually exclusive with `instructions`.'),
+  allowSends: z
+    .boolean()
+    .nullable()
+    .describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send/publish-looking step must carry requiresApproval=true or the save is refused.'),
+  requiresApproval: z
+    .boolean()
+    .nullable()
+    .describe('Set true to pause this scheduled step for user approval before it executes. Recommended for first-run social/legal/regulated publishes unless the user explicitly wants auto-publishing.'),
+  approvalPreview: z
+    .string()
+    .max(240)
+    .nullable()
+    .describe('Short preview shown on the approval card when requiresApproval=true, e.g. "Review the Instagram caption and image before posting."'),
   enabled: z
     .boolean()
     .nullable()
@@ -109,7 +122,7 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       'Returns the saved workflow path and the next scheduled run time. Idempotent — passing an existing `name` UPDATES that workflow.',
     ].join('\n'),
     scheduleParams,
-    async ({ name, description, cron, instructions, toolCall, enabled, timezone }) => {
+    async ({ name, description, cron, instructions, toolCall, allowSends, requiresApproval, approvalPreview, enabled, timezone }) => {
       if (!isValidSlug(name)) {
         return textResult(`Error: workflow name "${name}" is not a valid slug. Use lowercase kebab-case: "instagram-friday-post", "daily-briefing".`);
       }
@@ -154,19 +167,27 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
             + `To set ONLY its schedule, use workflow_update("${name}", trigger_schedule: "${cron}"). To redefine what it does, edit it with workflow_update.`,
         );
       }
+      const priorStep = prevSteps[0];
+      const stepRequiresApproval = requiresApproval ?? priorStep?.requiresApproval;
+      const stepApprovalPreview = approvalPreview ?? priorStep?.approvalPreview;
+      const resolvedAllowSends = allowSends ?? existing?.data.allowSends;
       const def: WorkflowDefinition = {
         name,
         description,
         enabled: enabled !== false,
         trigger: { schedule: cron, ...(resolvedTz ? { timezone: resolvedTz } : {}) },
         allowedTools,
+        ...(resolvedAllowSends !== undefined ? { allowSends: resolvedAllowSends } : {}),
         steps: [
           {
             // Preserve the single step's id + output contract on a reschedule;
             // only the prompt is (re)set from the caller's instructions/toolCall.
-            id: prevSteps[0]?.id ?? 'main',
+            id: priorStep?.id ?? 'main',
             prompt: stepPrompt,
-            ...(prevSteps[0]?.output ? { output: prevSteps[0].output } : {}),
+            ...(priorStep?.output ? { output: priorStep.output } : {}),
+            ...(stepRequiresApproval
+              ? { requiresApproval: true, approvalPreview: stepApprovalPreview || 'Review this scheduled action before it runs.' }
+              : {}),
           },
         ],
         // Preserve user-edited free-form body + declared inputs on an existing
@@ -290,4 +311,3 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
 function nextFireDescription(cron: string): string {
   return describeCron(cron);
 }
-

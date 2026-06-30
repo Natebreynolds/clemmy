@@ -76,6 +76,7 @@ import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { verifyStepOutput, isEmptyValue } from './step-output-verify.js';
+import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
@@ -87,6 +88,8 @@ import {
   recordSuccessfulWorkflowPattern,
   renderWorkflowPatternHint,
 } from '../memory/workflow-pattern-store.js';
+import { compileWorkflowStepsToGraph } from './workflow-graph.js';
+import { persistWorkflowGraphSnapshot } from './workflow-graph-store.js';
 import {
   claudeAgentSdkWorkflowStepEnabled,
   runClaudeAgentSdkWorkflowStep,
@@ -917,7 +920,7 @@ function applyWorkflowPatternHint(ctx: Pick<StepExecutionContext, 'learnedPatter
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip';
+  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output';
   note: string;
 }
 
@@ -929,6 +932,10 @@ export function workflowAdvisoryRequiresAttention(
     case 'foreach_overflow':
     case 'skill_not_executed':
     case 'idempotent_skip':
+    case 'ungrounded_output':
+      // A figure that contradicts the run's own captured tool results is the
+      // trust-killer ("plausible fluff") — it must surface for review, never pass
+      // as clean success.
       return true;
     case 'goal_validation_unavailable':
       // A dead judge is not proof the deliverable is bad. It is still delivered
@@ -1151,6 +1158,11 @@ interface HarnessStepResult {
   /** The real harness session id the step ran in — used by the per-step
    *  skill-execution judge to read this step's tool-call evidence. */
   sessionId: string;
+  /** Which lane actually ran. 'claude_sdk' = the Claude Agent SDK workflow-step
+   *  lane (whose pure-text synthesis output bypasses the runConversation content
+   *  grounding the Codex/harness lane gets); used to scope Move 3's per-item
+   *  grounding advisory so it never double-applies. */
+  lane?: 'claude_sdk' | 'harness';
 }
 
 function workflowHarnessMetadataMatches(
@@ -1354,6 +1366,7 @@ async function runStepViaHarness(
         approvalIds: [],
         usedStructuredResult: sdkResult.structured,
         sessionId: realSessionId,
+        lane: 'claude_sdk',
       };
     }
     if (modelRoute.trace) appendWorkerRoute(modelRoute.trace);
@@ -2366,6 +2379,7 @@ export async function executeStep(
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_skipped',
         stepId: step.id,
+        output: [],
         meta: { reason: 'forEach-empty', source: step.forEach },
       });
       return [];
@@ -2474,6 +2488,7 @@ export async function executeStep(
             );
             let output: unknown;
             let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
+            let itemLane: HarnessStepResult['lane'];
             // W1b — run the item, retrying a TRANSIENT failure for THIS item only
             // (read items freely; write/send items NEVER re-run once they recorded
             // an external_write — the same double-act guard as crash-resume). Budget
@@ -2491,6 +2506,7 @@ export async function executeStep(
                 );
                 output = r.output;
                 itemSessionId = r.sessionId;
+                itemLane = r.lane;
               } else {
                 // FORK collapse (staged): forEach item through the gated harness loop
                 // (default-OFF `workflow` surface → byte-identical to legacy until
@@ -2538,6 +2554,9 @@ export async function executeStep(
             // advisory is not counted as clean success. Fail-open; no-op for items
             // without usesSkill.
             await noteStepSkillAdvisory(step, itemSessionId, output, itemIntent, ctx, key);
+            // Move 3: the Claude SDK lane's pure-text output skips runConversation's
+            // content grounding — verify its figures per item (detection-only).
+            if (itemLane === 'claude_sdk') await noteStepOutputGroundingAdvisory(step, itemSessionId, output, ctx, key);
             appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
               kind: 'item_completed',
               stepId: step.id,
@@ -2737,6 +2756,47 @@ async function noteStepSkillAdvisory(
     }
   } catch {
     /* advisory is best-effort — a judge hiccup must never affect the step */
+  }
+}
+
+/**
+ * Move 3 — per-item CONTENT grounding for the Claude SDK fan-out lane. That lane's
+ * pure-text synthesis output (no external write → no brackets-boundary numeric
+ * gate) is the one place a FABRICATED figure can feed the aggregate of a
+ * 100-subagent run. Run the SAME numeric-grounding the write boundary uses, but
+ * DETECTION-ONLY (deferCommit → never bounces/escalates) + fail-open: the item
+ * still completes; a contradicted figure only records a needsAttention advisory so
+ * "plausible fluff" is visible instead of trusted. No-op unless the output is text
+ * and the global grounding gate is on. Only called for lane==='claude_sdk'.
+ */
+async function noteStepOutputGroundingAdvisory(
+  step: WorkflowStepInput,
+  sessionId: string,
+  output: unknown,
+  ctx: StepExecutionContext,
+  itemKey?: string,
+): Promise<void> {
+  if (!isOutputGroundingGateEnabled()) return;
+  const text = typeof output === 'string' ? output : '';
+  if (text.trim().length < 8) return; // structured outputs are gated at the write boundary
+  try {
+    const verdict = await evaluateOutputGrounding(sessionId, text, { kind: 'write', deferCommit: true });
+    if (verdict.action === 'bounce') {
+      const figs = verdict.figures.slice(0, 4).join(', ') || 'a figure';
+      ctx.qualityAdvisories.push({
+        stepId: step.id,
+        itemKey,
+        kind: 'ungrounded_output',
+        note: `step "${step.id}"${itemKey ? ` · item ${itemKey}` : ''} (Claude lane): ${figs} in the output contradicts this item's own captured tool results — ${verdict.reason}`,
+      });
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_advisory',
+        stepId: step.id,
+        meta: { reason: 'ungrounded_output', note: verdict.reason, figures: verdict.figures.slice(0, 8), itemKey },
+      });
+    }
+  } catch {
+    /* advisory is best-effort — a grounding hiccup must never affect the step */
   }
 }
 
@@ -2982,7 +3042,7 @@ function itemSendAlreadyFired(runId: string, stepId: string, itemKey: string): b
  *  session from turn 0 → re-issued the send (the double-send class the codebase
  *  was hardened against — integrity audit #2.2). Same deterministic session id
  *  as the plain step (`workflow:<runId>:<stepId>`, no itemKey). Fail-open. */
-export function stepSendAlreadyFired(runId: string, stepId: string): boolean {
+export function stepExternalWriteAlreadyClaimed(runId: string, stepId: string): boolean {
   try {
     const sid = `workflow:${runId}:${stepId}`;
     const writes = listHarnessEvents(sid, { types: ['external_write'] }).length;
@@ -2991,6 +3051,10 @@ export function stepSendAlreadyFired(runId: string, stepId: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function stepSendAlreadyFired(runId: string, stepId: string): boolean {
+  return stepExternalWriteAlreadyClaimed(runId, stepId);
 }
 
 function downstreamOfStep(steps: WorkflowStepInput[], rootStepId: string): Set<string> {
@@ -3115,6 +3179,7 @@ export function shouldHaltResumeForSideEffect(
   workflow: WorkflowDefinition,
   resume: { inFlightStepId?: string; completedSteps: Map<string, unknown>; failedSteps?: Set<string> },
   targetStepId?: string,
+  evidence?: { claimedExternalWrite?: boolean; harnessEnabled?: boolean },
 ): { stepId: string; cls: 'write' | 'send'; declared: boolean } | null {
   if (targetStepId) return null;
   const id = resume.inFlightStepId;
@@ -3126,7 +3191,14 @@ export function shouldHaltResumeForSideEffect(
   // guess — the halt message uses it to teach the one-line fix when the
   // class was only inferred (inferred read-only steps parking on crash was
   // the scorpion-facebook-trends failure mode, 2026-06-11).
-  return cls === 'read' ? null : { stepId: id, cls, declared: crashed.sideEffect === cls };
+  if (cls === 'read') return null;
+  // Current harness paths record external_write BEFORE dispatch. If an
+  // interrupted write/send step has a trustworthy harness session and the net
+  // external-write ledger is empty, there is no duplicated side effect to avoid:
+  // resume it instead of parking forever. Legacy/non-harness paths stay
+  // conservative because they may have acted without the shared ledger.
+  if (evidence?.harnessEnabled === true && evidence.claimedExternalWrite === false) return null;
+  return { stepId: id, cls, declared: crashed.sideEffect === cls };
 }
 
 async function executeWorkflow(
@@ -3149,7 +3221,20 @@ async function executeWorkflow(
   // Halt + throw, which routes to the error path → needsAttention (Wave 1), so
   // a human confirms before any re-run. (See shouldHaltResumeForSideEffect for
   // the exemptions: approval-gated steps and the targeted single-step re-run.)
-  const resumeHalt = shouldHaltResumeForSideEffect(workflow, resume, targetStepId);
+  const inFlightStep = resume.inFlightStepId
+    ? workflow.steps.find((step) => step.id === resume.inFlightStepId)
+    : undefined;
+  const claimedExternalWrite = inFlightStep
+    ? stepExternalWriteAlreadyClaimed(runId, inFlightStep.id)
+    : undefined;
+  const resumeHalt = shouldHaltResumeForSideEffect(
+    workflow,
+    resume,
+    targetStepId,
+    inFlightStep
+      ? { claimedExternalWrite, harnessEnabled: workflowHarnessEnabled(inFlightStep) }
+      : undefined,
+  );
   if (resumeHalt) {
     throw new Error(
       `Step "${resumeHalt.stepId}" was interrupted mid-run on a prior attempt and may have already ` +
@@ -3160,6 +3245,25 @@ async function executeWorkflow(
       `If the step is actually read-only (scrape/fetch/query — safe to repeat), declare \`sideEffect: read\` on it ` +
       `in the workflow definition and it will auto-resume after interruptions instead of parking here.`,
     );
+  }
+  if (
+    inFlightStep
+    && !targetStepId
+    && stepSideEffectClass(inFlightStep) !== 'read'
+    && workflowHarnessEnabled(inFlightStep)
+    && claimedExternalWrite === false
+    && !resume.completedSteps.has(inFlightStep.id)
+    && !resume.failedSteps?.has(inFlightStep.id)
+  ) {
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'step_advisory',
+      stepId: inFlightStep.id,
+      meta: {
+        reason: 'resume_after_interrupted_write_without_external_write',
+        sideEffect: stepSideEffectClass(inFlightStep),
+        note: 'Prior attempt was interrupted, but the workflow harness recorded no net external write before the interruption, so this step is safe to resume automatically.',
+      },
+    });
   }
 
   const learnedPatternMatches = targetStepId
@@ -4247,6 +4351,44 @@ async function processOneRunFile(
       kind: isResume ? 'run_resumed' : 'run_started',
       meta: { inputs, source: run.source, targetStepId: run.targetStepId ?? null },
     });
+    if (!isResume) {
+      try {
+        const graph = compileWorkflowStepsToGraph(workflow.data.steps, {
+          id: `${workflow.name}:${run.id}`,
+          name: workflow.data.name,
+          metadata: { workflowSlug: workflow.name, runId: run.id },
+        });
+        persistWorkflowGraphSnapshot({
+          workflowName: workflow.name,
+          runId: run.id,
+          graph,
+        });
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'workflow_graph_created',
+          meta: {
+            graph: {
+              name: graph.name,
+              entryNodeIds: graph.entryNodeIds,
+              nodes: graph.nodes.map((node) => ({
+                id: node.id,
+                type: node.type,
+                stepId: node.stepId,
+                model: node.model,
+                intent: node.intent,
+                forEach: node.forEach,
+                sideEffect: node.sideEffect,
+                usesSkill: node.usesSkill,
+                requiresApproval: node.requiresApproval,
+                deterministic: Boolean(node.deterministic),
+              })),
+              edges: graph.edges,
+            },
+          },
+        });
+      } catch {
+        // Best-effort telemetry only; graph snapshot failure must never block a run.
+      }
+    }
     // Reports-back: surface this workflow run in the unified Activity feed
     // (run-events / listRuns) so it shows alongside chat + background tasks,
     // not only on the Workflows page. startRun upserts (id = run.id), so any

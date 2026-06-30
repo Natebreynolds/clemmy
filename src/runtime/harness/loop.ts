@@ -1,6 +1,7 @@
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import { HarnessSession } from './session.js';
+import { markRunInFlight } from './restart-recovery.js';
 import {
   appendEvent,
   clearKill,
@@ -39,7 +40,7 @@ import {
 } from './budget.js';
 import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, composeJudgedObjective, type ObjectiveJudgeFn } from './objective-judge.js';
-import { verifyDelivered, verifyDeliveredEnabled } from './verify-delivered.js';
+import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -1355,21 +1356,6 @@ export function shouldElevateOnStepProgress(opts: {
   return opts.stepIndex >= opts.maxSteps; // about to exit on the step cap
 }
 
-// Restart-recovery: set/clear the in-flight marker on CHAT sessions only.
-// Best-effort — a marker write must never affect the run. Flag-gated so it can
-// be fully disabled. See restart-recovery.ts for the boot-time scan.
-function markRunInFlight(sessionId: string, on: boolean): void {
-  if ((process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() === 'off') return;
-  try {
-    const sess = HarnessSession.load(sessionId);
-    if (!sess || sess.kind !== 'chat') return;
-    if (on) sess.setRunInFlight();
-    else sess.clearRunInFlight();
-  } catch {
-    /* best-effort — the recovery marker must never break a run */
-  }
-}
-
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
@@ -1443,11 +1429,18 @@ async function runConversationCore(
   const objectiveJudgeOptIn = options.judgeCompletion === true;
   const objectiveJudgeActionIntent = classifyMessageIntent(options.input).intent === 'action';
   const objective = options.input;
-  const MAX_OBJECTIVE_JUDGE_CONTINUATIONS = 3;
+  // Each NOT-DONE continuation is a full brain re-run (expensive). 3 was wasteful
+  // for the common case; default to 2 (still room for a genuine multi-step finish)
+  // and make it tunable — CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS (Phase 3 token).
+  const MAX_OBJECTIVE_JUDGE_CONTINUATIONS = (() => {
+    const raw = Number.parseInt(getRuntimeEnv('CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS', '2') ?? '2', 10);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+  })();
   // A turn that fired this many tool calls did real multi-step work, regardless
   // of how the request was phrased.
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
+  let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
   // Inc A code trigger: fire the "offer to move this to the background" nudge at
   // most ONCE per run (a foreground chat grinding through a long action task).
@@ -2152,6 +2145,9 @@ async function runConversationCore(
           judgedObjective = composeJudgedObjective(objective, priorInputs);
         } catch { /* fail-open: judge the raw input */ }
         const verdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
+        if (verdict.done && (verdict.failedOpen || verdict.selfJudge)) {
+          completionVerification = { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge };
+        }
         // DETERMINISTIC skill-execution FLOOR. The LLM judge above can't be
         // trusted for the binary "did the skill's bundled script run" — on the
         // 2026-06-15 lunar-audit it HAD the evidence (no generate-html.js in the
@@ -2277,9 +2273,10 @@ async function runConversationCore(
       // A goal contract validated 'satisfied' this turn is the AUTHORITATIVE artifact
       // verification — skip the gate so its weaker promise-shaped heuristic can't
       // override a contract-verified completion into awaiting_user_input.
-      const delivery = verifyDeliveredEnabled() && !goalSatisfiedThisTurn && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn)
+      const delivery: DeliveryVerdict = verifyDeliveredEnabled() && !goalSatisfiedThisTurn && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn)
         ? await verifyDelivered(objective, userVisibleSummary, { judgeFn: objectiveJudge })
         : { delivered: true as const, status: 'completed' as const };
+      if (delivery.verification) completionVerification = delivery.verification;
       if (!delivery.delivered) {
         safeAppend({
           sessionId: options.sessionId,
@@ -2294,6 +2291,7 @@ async function runConversationCore(
             missingReply: isCompletedAction && !hasReply ? true : undefined,
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary).slice(0, 400),
+            ...(completionVerification ? { verification: completionVerification } : {}),
           },
         });
         const goalForBlocked = safeActiveGoal(options.sessionId);
@@ -2321,6 +2319,7 @@ async function runConversationCore(
           reply: decision.reply ?? null,
           missingReply: isCompletedAction && !hasReply ? true : undefined,
           delivered: true,
+          ...(completionVerification ? { verification: completionVerification } : {}),
         },
       });
       return {
@@ -4248,7 +4247,7 @@ async function runConversationFromResumeCore(opts: {
       // promise-shaped final reply converts to the honest awaiting_user_input.
       const deliveryObjective = composeResumeDeliveryObjective(opts.sessionId);
       const objectiveJudge = opts.judgeFn ?? judgeObjectiveComplete;
-      const delivery = verifyDeliveredEnabled()
+      const delivery: DeliveryVerdict = verifyDeliveredEnabled()
         ? await verifyDelivered(deliveryObjective, userVisibleSummary ?? '', { judgeFn: objectiveJudge })
         : { delivered: true as const, status: 'completed' as const };
       if (!delivery.delivered) {
@@ -4265,6 +4264,7 @@ async function runConversationFromResumeCore(opts: {
             missingReply: isCompletedAction && !hasReply ? true : undefined,
             delivered: false,
             blockedReason: (delivery.reason ?? userVisibleSummary ?? '').slice(0, 400),
+            ...(delivery.verification ? { verification: delivery.verification } : {}),
           },
         });
         const goalForBlocked = safeActiveGoal(opts.sessionId);
@@ -4290,6 +4290,7 @@ async function runConversationFromResumeCore(opts: {
           reply: decision?.reply ?? null,
           missingReply: isCompletedAction && !hasReply ? true : undefined,
           delivered: true,
+          ...(delivery.verification ? { verification: delivery.verification } : {}),
         },
       });
       return {

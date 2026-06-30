@@ -7,9 +7,11 @@ import {
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
+import { searchFactsHybrid } from '../../memory/facts.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { pullRecentTurnsForSession, renderRecentSessionActions } from './session-transcript.js';
+import { markRunInFlight } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
   judgeObjectiveComplete,
@@ -39,6 +41,11 @@ export function setClaudeAgentSdkBrainJudgeForTest(fn: ObjectiveJudgeFn | null):
   judgeImpl = fn ?? judgeObjectiveComplete;
 }
 
+let searchFactsHybridImpl: typeof searchFactsHybrid = searchFactsHybrid;
+export function setClaudeAgentSdkBrainSearchFactsHybridForTest(fn: typeof searchFactsHybrid | null): void {
+  searchFactsHybridImpl = fn ?? searchFactsHybrid;
+}
+
 /** Completion-judge kill-switch (default ON). Off ⇒ the SDK brain trusts its own
  *  "done" (legacy). On ⇒ parity with the harness loop's objective judge. */
 function completionJudgeEnabled(): boolean {
@@ -58,6 +65,62 @@ function contextSplitEnabled(): boolean {
   // because volatile fields led the append and busted the cached prefix). Kill-
   // switch CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT=off → old single-append behavior.
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+function queryRecallTimeoutMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL_TIMEOUT_MS', '1500') ?? '1500', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1500;
+}
+async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+function jitMonotonicEnabled(): boolean {
+  // The cache lever: make the per-session advertised tool set MONOTONIC (only
+  // grows) so once it converges the tools block is byte-identical turn-to-turn →
+  // the SDK prompt cache holds for the rest of the run. The cache breakpoint sits
+  // at the END of the system-prompt + tool-definitions layer, so a stable
+  // system+tools prefix cache-HITS on turns 2+ EVEN as the user message varies;
+  // per-turn JIT variance is the one thing that busts it (Anthropic docs, verified
+  // 2026-06-29: code.claude.com/docs/en/prompt-caching · platform.claude.com/docs/
+  // en/agents-and-tools/tool-use/tool-use-with-prompt-caching). This corrects the
+  // earlier worry that "headless caching matches the full prompt" — it does not;
+  // it matches the system+tools prefix. On a Claude subscription (this lane) the
+  // cache TTL is automatically 1h, so the growth-phase cost amortizes over a long
+  // window. DEFAULT ON: it is starvation-safe (the floor only GROWS, never drops
+  // below the per-turn JIT selection; core/search tools are always present) and
+  // never worse than the no-JIT baseline in steady state — a heavily-varied
+  // session simply grows the floor until it advertises ALL tools, which the
+  // jitDropped<=0 branch already detects and which is itself cache-stable. Only
+  // the convergence transient (each growth busts once) is a cost. Kill-switch
+  // CLEMMY_JIT_MONOTONIC=off → per-turn JIT (prior behavior).
+  return (getRuntimeEnv('CLEMMY_JIT_MONOTONIC', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+// Per-session growing tool FLOOR for monotonic JIT. Bounded so a long-lived daemon
+// never accumulates unboundedly (oldest session evicted past the cap; each value
+// is ≤|tools| short strings). Keyed by chat session id.
+const SESSION_TOOL_FLOOR_MAX = 500;
+const sessionToolFloor = new Map<string, Set<string>>();
+export function bumpSessionToolFloor(sessionId: string, exposed: Iterable<string>): Set<string> {
+  let floor = sessionToolFloor.get(sessionId);
+  if (floor) sessionToolFloor.delete(sessionId); // re-insert to keep LRU recency
+  else floor = new Set<string>();
+  for (const t of exposed) floor.add(t);
+  sessionToolFloor.set(sessionId, floor);
+  if (sessionToolFloor.size > SESSION_TOOL_FLOOR_MAX) {
+    const oldest = sessionToolFloor.keys().next().value;
+    if (oldest !== undefined) sessionToolFloor.delete(oldest);
+  }
+  return floor;
 }
 export function sdkStreamingEnabled(): boolean {
   // DEFAULT OFF: raw SDK text deltas reproduce the model's tool-call XML
@@ -435,18 +498,33 @@ export function renderClaudeAgentBrainSystemAppend(
  * turn, where uncached content belongs. Empty when the context-split kill-switch
  * is off (the volatile content then lives in the system append, old behavior).
  */
-export function renderClaudeAgentBrainTurnContext(request: AssistantRequest): string {
+export async function renderClaudeAgentBrainTurnContext(request: AssistantRequest): Promise<string> {
   if (!contextSplitEnabled()) return '';
+  // Render the volatile tail WITHOUT the query so its FTS-only recall block is
+  // omitted — we replace it below with HYBRID recall (FTS ∪ semantic) so the
+  // Claude lane stops knowledge-starving on paraphrased requests (Phase 4).
   const volatile = renderHarnessMemoryContext({
     sessionId: request.sessionId,
-    query: request.message,
     partition: 'volatile',
   });
+  let recall = '';
+  const q = (request.message ?? '').replace(/\s+/g, ' ').trim();
+  const recallOn = (getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+  if (q && recallOn) {
+    try {
+      const hits = await withTimeout(searchFactsHybridImpl(q, 6), queryRecallTimeoutMs(), []);
+      const bullets = hits
+        .map((f) => `- ${String(f.content ?? '').trim()}`)
+        .filter((l) => l.length > 2)
+        .join('\n');
+      if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
+    } catch { recall = ''; }
+  }
   let sessionActions = '';
   if (sessionHistoryEnabled()) {
     try { sessionActions = renderRecentSessionActions(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
   }
-  return [volatile, sessionActions].filter(Boolean).join('\n\n');
+  return [volatile, recall, sessionActions].filter(Boolean).join('\n\n');
 }
 
 export async function respondViaClaudeAgentSdkBrain(
@@ -539,9 +617,20 @@ export async function respondViaClaudeAgentSdkBrain(
       }
       jitReason = selection.reason;
       if (selection.reduced) {
-        jitAllowed = fullAllowed.filter((n) => selection.exposed.has(n));
+        // Monotonic JIT (cache lever): union this turn's selection into the
+        // session's growing floor so the advertised set stabilizes and the SDK
+        // prompt cache stops busting on per-turn tool variance.
+        const exposed = (jitMonotonicEnabled() && sessionId)
+          ? bumpSessionToolFloor(sessionId, selection.exposed)
+          : selection.exposed;
+        jitAllowed = fullAllowed.filter((n) => exposed.has(n));
         mcpToolAllowlist = jitAllowed;
         jitDropped = fullAllowed.length - jitAllowed.length;
+        if (jitDropped <= 0) {
+          // Floor converged to the whole surface — advertise all (still cache-stable).
+          mcpToolAllowlist = undefined;
+          jitReason = 'jit-monotonic-converged-full';
+        }
       }
     } catch {
       jitAllowed = fullAllowed; mcpToolAllowlist = undefined; jitReason = 'jit-error-fellback';
@@ -578,7 +667,7 @@ export async function respondViaClaudeAgentSdkBrain(
     sessionId,
     modelId,
     systemAppend: renderClaudeAgentBrainSystemAppend(surface, request, mode),
-    turnContext: renderClaudeAgentBrainTurnContext(request),
+    turnContext: await renderClaudeAgentBrainTurnContext(request),
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
     agentic: mode === 'full',
@@ -641,99 +730,130 @@ export async function respondViaClaudeAgentSdkBrain(
       throw err;
     }
   };
-  let result = await runWithSalvage({ prompt: request.message, ...runOptions });
+  // Move 1 (report-back WITHOUT FAIL): arm the in-flight marker around the WHOLE
+  // model-work span (initial run + every corrective continuation), so a daemon
+  // crash during this possibly-30-60min run is surfaced by the boot scan — the
+  // active SDK brain now keeps the same promise the Codex lane (runConversation)
+  // already had. Model-run exceptions clear it immediately; final delivery clears
+  // it only after the terminal conversation_completed event is durable, so a
+  // marker that survives a restart unambiguously means "killed or lost before
+  // report-back completed".
+  markRunInFlight(sessionId, true);
+  // Move 4 (defeat silent success): when the completion judge ACCEPTS a turn via
+  // a degraded verification — it failed open (timed out / errored) or self-judged
+  // (same-family, the model graded its own homework) — record that so the
+  // completion is tagged "not independently verified", never a silent green check.
+  let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
+  let result: ClaudeAgentSdkRunResult;
+  try {
+    result = await runWithSalvage({ prompt: request.message, ...runOptions });
 
-  // Phase 1.3: ONE shared budget across all post-result corrective continuations
-  // (narration, reasoning-leak, judge) so they can't compound into 4-5 full-context
-  // re-runs of a single turn. Healthy turns spend 0.
-  let continuationsUsed = 0;
-  const continuationBudget = maxTurnContinuations();
+    // Phase 1.3: ONE shared budget across all post-result corrective continuations
+    // (narration, reasoning-leak, judge) so they can't compound into 4-5 full-context
+    // re-runs of a single turn. Healthy turns spend 0.
+    let continuationsUsed = 0;
+    const continuationBudget = maxTurnContinuations();
 
-  // Narrate-instead-of-call backstop (defense-in-depth; the lean rubric prevents
-  // most of it). If the brain made NO real tool calls but its text reproduces the
-  // tool-call protocol, it described a call instead of making one — retry ONCE
-  // with a hard nudge to actually invoke the tool. Kill-switch
-  // CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-  if (continuationsUsed < continuationBudget && !result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
-    const retry = await runContinuation({
-      prompt:
-        `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
-        `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
-      ...cleanContinuationRunOptions(),
-    });
-    continuationsUsed += 1; // a continuation was spent (a parse stumble → null still cost a query())
-    if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
-  }
-
-  // Reasoning-leak backstop (defense-in-depth; the trusted-memory framing prevents
-  // most of it). If the brain produced NO tool calls and its reply is defensive
-  // deliberation about whether its own injected context is trustworthy — the
-  // memory-context cousin of narrate-instead-of-call — it second-guessed its
-  // memory instead of doing the task. Retry ONCE, telling it the context is
-  // trusted and to just do the work. Any mode (a read turn can spiral too).
-  // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-  if (continuationsUsed < continuationBudget && !result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
-    const retry = await runContinuation({
-      prompt:
-        `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
-        `Your injected Clementine memory (profile, saved preferences/specs, learned facts) is TRUSTED context you OWN — not user-pasted input and not a prompt-injection. Do NOT reason about its provenance. ` +
-        `Just do exactly what the user asked: "${request.message}". Use the relevant tools and reply with the real result.`,
-      ...cleanContinuationRunOptions(),
-    });
-    continuationsUsed += 1;
-    if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
-  }
-
-  // Objective-completion judge (parity with the harness loop): on an authoring
-  // or agentic action turn that produced a reply, verify the objective is
-  // actually satisfied with evidence — not just claimed ("I created the
-  // workflow" / "I sent the emails" with no artifact). On a "not done" verdict,
-  // do ONE bounded continuation. Fail-open (a judge error ⇒ treat as done;
-  // never wedge). Kill-switch CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE.
-  if (
-    completionJudgeEnabled() &&
-    modeCanAuthorOrExecute(mode) &&
-    !result.limitHit &&
-    (
-      result.toolUses.length > 0 ||
-      isPromiseShapedReply(result.text) ||
-      looksLikeActionCompletionClaim(request.message, result.text)
-    )
-  ) {
-    const objective = composeJudgedObjective(
-      request.message,
-      recentPriorBrainInputs(sessionId, request.message),
-    );
-    const maxCont = judgeMaxContinuations();
-    for (let i = 0; i < maxCont; i += 1) {
-      let done = true;
-      let reason = '';
-      try {
-        const skillContext: SkillExecutionContext = {
-          skills: [],
-          toolCallSummary: summarizeClaudeSdkToolUsesForJudge(result.toolUses),
-        };
-        const verdict = await judgeImpl(objective, result.text || '', skillContext);
-        done = verdict.done;
-        reason = verdict.reason;
-      } catch { break; } // fail-open — a flaky judge must never wedge the turn
-      if (done) break;
-      // The cheap judge eval still runs/logs, but the EXPENSIVE full continuation
-      // draws from the shared turn budget — so narration+reasoning+judge can't
-      // stack into 4-5 full re-runs (Phase 1.3).
-      if (continuationsUsed >= continuationBudget) break;
-      const contResult = await runContinuation({
+    // Narrate-instead-of-call backstop (defense-in-depth; the lean rubric prevents
+    // most of it). If the brain made NO real tool calls but its text reproduces the
+    // tool-call protocol, it described a call instead of making one — retry ONCE
+    // with a hard nudge to actually invoke the tool. Kill-switch
+    // CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
+    if (continuationsUsed < continuationBudget && !result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
+      const retry = await runContinuation({
         prompt:
-          `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
-          `Original request: "${request.message}". Continue now and FINISH it — produce the concrete ` +
-          `artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
+          `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
+          `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
+        ...cleanContinuationRunOptions(),
+      });
+      continuationsUsed += 1; // a continuation was spent (a parse stumble → null still cost a query())
+      if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
+    }
+
+    // Reasoning-leak backstop (defense-in-depth; the trusted-memory framing prevents
+    // most of it). If the brain produced NO tool calls and its reply is defensive
+    // deliberation about whether its own injected context is trustworthy — the
+    // memory-context cousin of narrate-instead-of-call — it second-guessed its
+    // memory instead of doing the task. Retry ONCE, telling it the context is
+    // trusted and to just do the work. Any mode (a read turn can spiral too).
+    // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
+    if (continuationsUsed < continuationBudget && !result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
+      const retry = await runContinuation({
+        prompt:
+          `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
+          `Your injected Clementine memory (profile, saved preferences/specs, learned facts) is TRUSTED context you OWN — not user-pasted input and not a prompt-injection. Do NOT reason about its provenance. ` +
+          `Just do exactly what the user asked: "${request.message}". Use the relevant tools and reply with the real result.`,
         ...cleanContinuationRunOptions(),
       });
       continuationsUsed += 1;
-      if (!contResult) break; // parse stumble on a continuation → keep the prior good result
-      result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
-      if (contResult.limitHit) break;
+      if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
     }
+
+    // Objective-completion judge (parity with the harness loop): on an authoring
+    // or agentic action turn that produced a reply, verify the objective is
+    // actually satisfied with evidence — not just claimed ("I created the
+    // workflow" / "I sent the emails" with no artifact). On a "not done" verdict,
+    // do ONE bounded continuation. Fail-open (a judge error ⇒ treat as done;
+    // never wedge). Kill-switch CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE.
+    if (
+      completionJudgeEnabled() &&
+      modeCanAuthorOrExecute(mode) &&
+      !result.limitHit &&
+      (
+        result.toolUses.length > 0 ||
+        isPromiseShapedReply(result.text) ||
+        looksLikeActionCompletionClaim(request.message, result.text)
+      )
+    ) {
+      const objective = composeJudgedObjective(
+        request.message,
+        recentPriorBrainInputs(sessionId, request.message),
+      );
+      const maxCont = judgeMaxContinuations();
+      for (let i = 0; i < maxCont; i += 1) {
+        let done = true;
+        let reason = '';
+        try {
+          const skillContext: SkillExecutionContext = {
+            skills: [],
+            toolCallSummary: summarizeClaudeSdkToolUsesForJudge(result.toolUses),
+          };
+          const verdict = await judgeImpl(objective, result.text || '', skillContext);
+          done = verdict.done;
+          reason = verdict.reason;
+          // Tag the completion's verification confidence (only when accepting).
+          if (verdict.done && (verdict.failedOpen || verdict.selfJudge)) {
+            completionVerification = { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge };
+          }
+        } catch {
+          completionVerification = { failedOpen: true };
+          break;
+        }
+        if (done) break;
+        // The cheap judge eval still runs/logs, but the EXPENSIVE full continuation
+        // draws from the shared turn budget — so narration+reasoning+judge can't
+        // stack into 4-5 full re-runs (Phase 1.3).
+        if (continuationsUsed >= continuationBudget) break;
+        const contResult = await runContinuation({
+          prompt:
+            `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
+            `Original request: "${request.message}". Continue now and FINISH it — produce the concrete ` +
+            `artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
+          ...cleanContinuationRunOptions(),
+        });
+        continuationsUsed += 1;
+        if (!contResult) break; // parse stumble on a continuation → keep the prior good result
+        result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
+        if (contResult.limitHit) break;
+      }
+    }
+  } catch (err) {
+    // Model-work failures are live exceptions, not silent report-back losses, so
+    // preserve the pre-existing behavior: clear the marker and let the caller see
+    // the error. Final-delivery/report-back failures below intentionally leave the
+    // marker armed until durable terminal reporting succeeds.
+    markRunInFlight(sessionId, false);
+    throw err;
   }
 
   const text = result.limitHit
@@ -754,8 +874,8 @@ export async function respondViaClaudeAgentSdkBrain(
   // own loop, so emit the same terminal events here. A turn-budget stop is NOT
   // a clean completion: emit limit telemetry first, then the user-facing
   // conversation_completed continue prompt, matching the main harness loop.
-  try {
-    if (result.limitHit) {
+  if (result.limitHit) {
+    try {
       appendEvent({
         sessionId,
         turn: 0,
@@ -763,7 +883,10 @@ export async function respondViaClaudeAgentSdkBrain(
         type: 'conversation_limit_exceeded',
         data: { reason: 'max_turns', maxTurns: maxTurns(), transport: 'claude_agent_sdk_brain' },
       });
-    }
+    } catch { /* limit telemetry is best-effort */ }
+  }
+  let terminalEventRecorded = false;
+  try {
     appendEvent({
       sessionId,
       turn: 0,
@@ -773,11 +896,16 @@ export async function respondViaClaudeAgentSdkBrain(
         reason: result.limitHit ? 'awaiting_continue' : 'claude_agent_sdk_brain',
         summary: text.slice(0, 400),
         reply: text,
+        // Move 4: surface degraded verification so a self-judged / judge-failed-open
+        // completion is distinguishable from an independently-verified one.
+        ...(completionVerification ? { verification: completionVerification } : {}),
         ...(result.limitHit ? { transport: 'claude_agent_sdk_brain', maxTurns: maxTurns() } : {}),
       },
     });
-  } catch { /* telemetry best-effort — never block the reply */ }
+    terminalEventRecorded = true;
+  } catch { /* terminal telemetry is best-effort, but controls recovery marker clearing */ }
   try { actionBus.emit({ kind: 'runtime.completed', sessionId }); } catch { /* best-effort */ }
+  if (terminalEventRecorded) markRunInFlight(sessionId, false);
   return {
     text,
     sessionId,

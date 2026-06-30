@@ -110,6 +110,14 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   'execution_create', 'execution_list', 'execution_get', 'execution_update_step', 'execution_complete', 'execution_mark_blocked',
   // PLAN coherence — create/list/update + the planner preview tools.
   'create_plan', 'list_plans', 'update_plan_step', 'draft_plan', 'share_plan', 'surface_plan',
+  // GOALS — first-class long-running outcomes (the /goal spine + self-drive). A goal
+  // create/update/check can land on ANY turn and is NOT evident from the message
+  // keywords (same rationale as focus_*/plan_*). They were JIT-prunable, so on a
+  // large multi-MCP surface the ranker dropped them and the brain reported "the
+  // goals tool isn't available" (observed 2026-06-30: 47 tools dropped, 0 goal
+  // tools surfaced). CORE is the reliable fix. (Absent goal_* are a no-op — JIT
+  // only keeps tools already in the surface.)
+  'goal_create', 'goal_update', 'goal_get', 'goal_list', 'goal_stale',
   // PRE-WRITE ritual + self-correcting memory.
   'memory_review_instructions', 'memory_forget',
   // MEMORY recall + write (the ever-learning core).

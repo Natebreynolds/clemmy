@@ -58,6 +58,7 @@ const {
   stepSideEffectClass,
   finalizeStepOutput,
   sendAlreadyClaimed,
+  stepExternalWriteAlreadyClaimed,
   stepSendAlreadyFired,
   seedFailedItemRetryRun,
   detectEmptyDeliverableReads,
@@ -210,6 +211,66 @@ test('pre-start missing-input workflow failure is recorded in Activity runs', as
   assert.equal(activityRun?.events.at(-1)?.type, 'failed');
 });
 
+test('fresh workflow run records a sanitized graph snapshot event', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const slug = 'graph-snapshot-runner';
+  const workflowName = 'Graph Snapshot Runner';
+  const runId = `graph-snapshot-${Date.now()}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Records the workflow graph shape when a run starts.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'pull',
+        prompt: 'Pull the source records.',
+        deterministic: { runner: 'emit.mjs' },
+        sideEffect: 'read',
+      },
+      {
+        id: 'summarize',
+        prompt: 'Summarize the source records.',
+        dependsOn: ['pull'],
+        deterministic: { runner: 'emit.mjs' },
+        sideEffect: 'read',
+      },
+    ],
+  });
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'emit.mjs'),
+    'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
+    'utf-8',
+  );
+
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(filePath, JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'queued',
+    inputs: {},
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  await processWorkflowRuns({} as never);
+
+  const events = readWorkflowEvents(slug, runId);
+  const graphEvent = events.find((event) => event.kind === 'workflow_graph_created');
+  assert.ok(graphEvent, `expected workflow_graph_created, got ${events.map((event) => event.kind).join(', ')}`);
+  const graph = graphEvent.meta?.graph as {
+    nodes?: Array<Record<string, unknown>>;
+    edges?: Array<{ source: string; target: string; type: string }>;
+    entryNodeIds?: string[];
+  } | undefined;
+  assert.deepEqual(graph?.entryNodeIds, ['pull']);
+  assert.deepEqual(graph?.nodes?.map((node) => node.id), ['pull', 'summarize']);
+  assert.equal(graph?.nodes?.some((node) => Object.hasOwn(node, 'prompt')), false);
+  assert.ok(graph?.edges?.some((edge) => edge.source === 'pull' && edge.target === 'summarize' && edge.type === 'dependency'));
+});
+
 test('reapResolvedParkedRuns re-admits on a rejected approval too (run fails loudly, never stuck)', () => {
   process.env.WORKFLOW_APPROVAL_PARKING = 'on';
   const sid2 = 'workflow-gate:park-test-2:send_step';
@@ -302,6 +363,9 @@ test('workflowAdvisoryRequiresAttention: confident quality misses are not clean 
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'foreach_overflow' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'skill_not_executed' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'idempotent_skip' }), true);
+  // Move 3: a Claude-lane figure that contradicts the run's own tool results is
+  // the trust-killer — it must surface for review, never pass as clean success.
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'ungrounded_output' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unavailable' }), false);
 });
 
@@ -1701,6 +1765,52 @@ test('P0-3 halts crash-resume of an autonomous write/send step', () => {
   assert.deepEqual(shouldHaltResumeForSideEffect(wf, resumeState('send', ['pull', 'save'])), { stepId: 'send', cls: 'send', declared: true });
 });
 
+test('P0-3 ledger-aware resume: harness write with no recorded external_write auto-resumes', () => {
+  const wf = wfWith([
+    { id: 'pull', prompt: 'Read leads.', sideEffect: 'read' },
+    { id: 'save', prompt: 'Write to the sheet.', sideEffect: 'write', dependsOn: ['pull'] },
+  ]);
+  assert.equal(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState('save', ['pull']),
+      undefined,
+      { harnessEnabled: true, claimedExternalWrite: false },
+    ),
+    null,
+  );
+});
+
+test('P0-3 ledger-aware resume: claimed external_write still halts', () => {
+  const wf = wfWith([
+    { id: 'save', prompt: 'Write to the sheet.', sideEffect: 'write' },
+  ]);
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState('save'),
+      undefined,
+      { harnessEnabled: true, claimedExternalWrite: true },
+    ),
+    { stepId: 'save', cls: 'write', declared: true },
+  );
+});
+
+test('P0-3 ledger-aware resume stays conservative for legacy/non-harness steps', () => {
+  const wf = wfWith([
+    { id: 'save', prompt: 'Write to the sheet.', sideEffect: 'write' },
+  ]);
+  assert.deepEqual(
+    shouldHaltResumeForSideEffect(
+      wf,
+      resumeState('save'),
+      undefined,
+      { harnessEnabled: false, claimedExternalWrite: false },
+    ),
+    { stepId: 'save', cls: 'write', declared: true },
+  );
+});
+
 test('P0-3 halt reports declared=false when the class was only inferred from prose', () => {
   // The scorpion-facebook-trends failure mode: no declared sideEffect, prose
   // heuristic guesses write → halt. The message uses declared=false to teach
@@ -1761,6 +1871,7 @@ test('Lane B (bug #8 / audit #2.2): stepSendAlreadyFired — a PLAIN step whose 
   HarnessSession.create({ id: sid, kind: 'workflow', channel: 'workflow', title: runId, metadata: { source: 'workflow' } });
   appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'GMAIL_SEND', targets: ['x@y.com'] } });
   assert.equal(stepSendAlreadyFired(runId, stepId), true, 'a fired send suppresses the transient retry (no double-send)');
+  assert.equal(stepExternalWriteAlreadyClaimed(runId, stepId), true, 'generic write ledger helper sees the same claim');
   // A failure compensation nets it back out → the send did NOT claim → retry ok.
   appendEvent({ sessionId: sid, turn: 0, role: 'tool', type: 'external_write_failed', data: { shapeKey: 'GMAIL_SEND', targets: ['x@y.com'] } });
   assert.equal(stepSendAlreadyFired(runId, stepId), false, 'a netted failure means the send did not claim → retry allowed');

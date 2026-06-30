@@ -151,6 +151,15 @@ export const EVENT_TYPES = [
   // role registry) — records the attempted intent, whether it matched, and the
   // resolved model/provider, so a trace can show "ran on Opus because 'design'".
   'worker_model_routed',
+  // A fan-out worker COMPLETED — durable record of {item, ok, model, toolUses,
+  // tokens} (Move 5). The honest N-of-M coverage map was in-memory only, so a
+  // mid-run daemon restart lost it; this makes the swarm's coverage + per-worker
+  // spend restart-surviving and queryable for a 30-60min 100-subagent run.
+  'worker_result',
+  // Move 2: deterministic pre-execution coherence critique of a surfaced plan
+  // (uncovered success criteria, unverifiable steps) — surfaced before approval so
+  // a walk-away user never green-lights a structurally weak 100-subagent plan.
+  'plan_critiqued',
   // Turn-start swarm governance decision: the context packet detected a
   // multi-item request and either offered fanout, constrained it, or kept the
   // work centralized under the current coordination policy. Pure telemetry.

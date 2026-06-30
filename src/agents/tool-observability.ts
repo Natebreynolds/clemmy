@@ -28,6 +28,7 @@
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import { recordOperationalEvent, type ToolOperationalEventType } from '../runtime/operational-telemetry.js';
 import { redactSensitiveValue } from '../runtime/security.js';
 import { summarizeToolArgs } from './plan-scope.js';
 import type { ToolKind } from './tool-taxonomy.js';
@@ -98,6 +99,7 @@ export function recordToolEvent(event: ToolLifecycleEvent): void {
   } catch {
     // We never let observability bring down a real tool call.
   }
+  recordOperationalToolEvent(tagged);
 }
 
 /**
@@ -175,4 +177,43 @@ export function recordPendingApproval(input: {
     argsSummary: summarizeToolArgs(input.toolName, input.args).slice(0, 200),
     mcp: input.mcp,
   });
+}
+
+function recordOperationalToolEvent(event: ToolLifecycleEvent): void {
+  const type = operationalTypeForToolPhase(event);
+  if (!type) return;
+  const when = parseEventDate(event.at);
+  recordOperationalEvent({
+    source: 'tool',
+    type,
+    severity: type === 'tool_call_failed' ? 'error' : type === 'tool_approval_pending' ? 'warn' : 'info',
+    sessionId: event.sessionId,
+    toolCallId: event.phase === 'pending-approval' ? event.approvalReason : undefined,
+    actor: 'tool-observability',
+    now: when,
+    payload: {
+      toolName: event.toolName,
+      kind: event.kind,
+      phase: event.phase,
+      durationMs: event.durationMs,
+      approvalReason: event.approvalReason,
+      argsSummary: event.argsSummary,
+      outcome: event.outcome,
+      errorMessage: event.errorMessage,
+      mcp: event.mcp,
+    },
+  });
+}
+
+function operationalTypeForToolPhase(event: ToolLifecycleEvent): ToolOperationalEventType | null {
+  if (event.phase === 'start') return 'tool_call_started';
+  if (event.phase === 'pending-approval') return 'tool_approval_pending';
+  if (event.phase === 'error' || event.outcome === 'error') return 'tool_call_failed';
+  if (event.phase === 'end') return 'tool_call_completed';
+  return null;
+}
+
+function parseEventDate(value: string): Date | undefined {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }

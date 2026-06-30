@@ -27,6 +27,27 @@ function enabled(): boolean {
   return (process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() !== 'off';
 }
 
+/**
+ * Set/clear the in-flight marker on a CHAT session. Set BEFORE a run and cleared
+ * in a finally on ANY exit (return or throw); only a hard process death between
+ * leaves it set — exactly the "killed mid-run" case the boot scan surfaces so a
+ * long chat run never dies silently. Chat-only + best-effort + flag-gated: a
+ * marker write must never affect the run. Shared by EVERY chat lane — the Codex
+ * orchestrator (runConversation) AND the active Claude Agent SDK brain — so
+ * "reports back without fail" holds on whichever brain is live.
+ */
+export function markRunInFlight(sessionId: string, on: boolean): void {
+  if (!enabled()) return;
+  try {
+    const sess = HarnessSession.load(sessionId);
+    if (!sess || sess.kind !== 'chat') return;
+    if (on) sess.setRunInFlight();
+    else sess.clearRunInFlight();
+  } catch {
+    /* best-effort — the recovery marker must never break a run */
+  }
+}
+
 const INTERRUPTED_REPLY =
   'This run was interrupted by a restart before it finished. Reply `continue` to pick up where it left off.';
 const MAX_NOTIFICATIONS = 10;

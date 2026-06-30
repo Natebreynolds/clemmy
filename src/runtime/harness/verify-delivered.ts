@@ -131,6 +131,8 @@ export interface DeliveryVerdict {
   reason?: string;
   /** The KIND of blocker, for routing/triage (only set when delivered:false). */
   blockerType?: BlockerType;
+  /** Present when a completion was accepted through degraded verification. */
+  verification?: { failedOpen?: boolean; selfJudge?: boolean };
 }
 
 export interface VerifyDeliveredOpts {
@@ -183,7 +185,11 @@ export async function verifyDelivered(
 
   const judge = opts.judgeFn ?? judgeObjectiveComplete;
   const verdict = await judge(objective, text); // itself fail-open on error
-  if (verdict.done) return DELIVERED;
+  if (verdict.done) {
+    return verdict.failedOpen || verdict.selfJudge
+      ? { ...DELIVERED, verification: { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge } }
+      : DELIVERED;
+  }
   const reason = verdict.reason || 'Replied with a promise of work but no verifiable artifact.';
   return {
     delivered: false,

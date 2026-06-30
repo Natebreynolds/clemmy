@@ -621,6 +621,51 @@ test('Phase 3: turnContext rides the USER turn (not the cached system append) so
   assert.doesNotMatch(capture.call.options.systemPrompt.append, /Current State|## Now/);
 });
 
+test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confirm-first approval does NOT self-abort the turn', async () => {
+  const prevPoll = process.env.CLEMMY_APPROVAL_POLL_MS;
+  process.env.CLEMMY_APPROVAL_POLL_MS = '10'; // fast poll so the test resolves quickly
+  const approvalRegistry = await import('./approval-registry.js');
+  const { createSession, getSession } = await import('./eventlog.js');
+  const sid = 'sdk-approval-wallclock';
+  try {
+    if (!getSession(sid)) createSession({ id: sid, kind: 'chat', title: 'approval wallclock' });
+    setClaudeAgentSdkQueryForTest(((p: any) => {
+      const canUse = p.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+      return stubsFor((async function* () {
+        yield initOnlyMessage();
+        // run_shell_command is NOT in the allowlist below → the gate registers an
+        // approval and AWAITS a human. Resolve it ~150ms later (a "slow human").
+        // That 150ms is spent INSIDE canUseTool → pausedMs, so it must NOT count
+        // toward the 40ms wall clock.
+        const callP = canUse('mcp__clementine-local__run_shell_command', { command: 'echo hi' }, { signal: new AbortController().signal });
+        setTimeout(() => {
+          for (const row of approvalRegistry.listPending({ sessionId: sid })) {
+            approvalRegistry.resolve(row.approvalId, 'approved', 'test');
+          }
+        }, 150);
+        await callP;
+        yield successResultMessage('finished after the slow approval');
+      })());
+    }) as any);
+
+    const r = await runClaudeAgentSdk({
+      prompt: 'do the gated thing',
+      sessionId: sid,
+      modelId: 'claude-sonnet-4-6',
+      agentic: true,
+      maxWallClockMs: 40, // far below the ~150ms approval wait
+      allowedLocalMcpTools: ['read_file', 'memory_search'],
+    });
+
+    // WITHOUT the pausedMs exclusion this would limitHit (150ms > 40ms). WITH it,
+    // wall - pausedMs ≈ 0 < 40ms → the turn completes normally after the approval.
+    assert.notEqual(r.limitHit, true, 'a long approval wait must not trip the wall clock');
+    assert.match(r.text, /finished after the slow approval/);
+  } finally {
+    if (prevPoll === undefined) delete process.env.CLEMMY_APPROVAL_POLL_MS; else process.env.CLEMMY_APPROVAL_POLL_MS = prevPoll;
+  }
+});
+
 function slowThenMoreQuery(): Query {
   return stubsFor((async function* () {
     yield initOnlyMessage();

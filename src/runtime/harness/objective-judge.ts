@@ -54,6 +54,18 @@ export const JUDGE_SYSTEM_PROMPT = [
 export interface ObjectiveJudgeVerdict {
   done: boolean;
   reason: string;
+  /**
+   * Verification PROVENANCE (Move 4 — defeat silent success). Callers surface
+   * these so a "done" the user trusts is distinguishable from an ASSUMED done:
+   * - failedOpen: the judge timed out / errored / didn't parse, so completion was
+   *   ACCEPTED WITHOUT a real verdict (the silent-success risk made visible).
+   * - selfJudge: graded by the SAME model family as the brain (no cross-family
+   *   judge logged in) — a real verdict, but lower-confidence (model graded its
+   *   own homework).
+   * Absent ⇒ a clean cross-family verdict (full confidence).
+   */
+  failedOpen?: boolean;
+  selfJudge?: boolean;
 }
 
 export interface ObjectiveJudgeGateInput {
@@ -379,17 +391,17 @@ export async function judgeObjectiveComplete(
     );
     if (!result) {
       record('timeout');
-      return { done: true, reason: 'judge timed out — accepting completion' };
+      return { done: true, reason: 'judge timed out — accepting completion', failedOpen: true };
     }
     const parsed = VerdictSchema.safeParse(result.finalOutput);
     if (!parsed.success) {
       record('invalid');
-      return { done: true, reason: 'judge output did not parse — accepting completion' };
+      return { done: true, reason: 'judge output did not parse — accepting completion', failedOpen: true };
     }
     record(parsed.data.done ? 'passed' : 'blocked');
-    return { done: parsed.data.done, reason: parsed.data.reason };
+    return { done: parsed.data.done, reason: parsed.data.reason, selfJudge: routing?.selfJudge === true };
   } catch {
     if (!recorded) record('error');
-    return { done: true, reason: 'judge unavailable — accepting completion' };
+    return { done: true, reason: 'judge unavailable — accepting completion', failedOpen: true };
   }
 }

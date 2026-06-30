@@ -9,6 +9,47 @@ import { surfaceGoalDraftFromNotes, type GoalDraftRecord } from '../agents/goal-
 import { surfacePlan } from '../agents/plan-proposals.js';
 import { PlanSchema, type Plan } from '../agents/planner.js';
 import { textResult } from './shared.js';
+import { getRuntimeEnv } from '../config.js';
+
+function planCritiqueEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_PLAN_CRITIQUE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+/**
+ * Move 2 — pre-execution PLAN critique. When a 100-subagent plan is surfaced for
+ * approval and the user has WALKED AWAY, the human eyeballing the card is the only
+ * quality look the decomposition gets. These DETERMINISTIC coherence checks (no
+ * LLM, fail-safe) catch a structurally weak plan BEFORE it burns wall-clock and a
+ * swarm's worth of tokens. Advisory only — never blocks approval.
+ */
+export function critiquePlan(plan: Plan): string[] {
+  const issues: string[] = [];
+  try {
+    const norm = (s: string): string => s.trim().toLowerCase().replace(/\s+/g, ' ');
+    // The schema's own invariant: when stages exist, every successCriterion should
+    // appear in EXACTLY ONE stage (verbatim). An uncovered criterion = a goal the
+    // plan never checks; a duplicated one = ambiguous validation.
+    if (plan.stages && plan.stages.length > 0) {
+      const stageCriteria = plan.stages.flatMap((s) => s.criteria.map(norm));
+      for (const c of plan.successCriteria) {
+        const hits = stageCriteria.filter((sc) => sc === norm(c)).length;
+        if (hits === 0) issues.push(`Success criterion is in NO stage (so the plan never checks it): "${c.slice(0, 90)}"`);
+        else if (hits > 1) issues.push(`Success criterion appears ${hits} times across stages (should be in exactly one): "${c.slice(0, 90)}"`);
+      }
+    }
+    // On a big plan, steps with no verification can't be confirmed during an
+    // unattended run — exactly the "did it actually work?" gap the dream can't have.
+    if (plan.estimatedComplexity === 'significant' || plan.estimatedComplexity === 'large') {
+      const unverifiable = plan.steps.filter((s) => !s.verification || !s.verification.trim()).length;
+      if (unverifiable > 0) {
+        issues.push(`${unverifiable} of ${plan.steps.length} step(s) declare NO verification — a long unattended run can't confirm they worked.`);
+      }
+    }
+  } catch {
+    return []; // fail-safe — a critique hiccup never affects surfacing
+  }
+  return issues;
+}
 
 /**
  * Autonomy-only action tools. These are the things v1 used to express
@@ -339,11 +380,22 @@ export function registerAutonomyActionTools(server: McpServer): void {
         const sendsLine = sends.length > 0
           ? `Irreversible sends the user is blessing by approving: ${sends.map((s) => `${s.count ? `${s.count}× ` : ''}${s.summary} [${s.slug}]`).join('; ')}.`
           : 'No irreversible external sends in this plan.';
+        // Move 2: deterministic plan-coherence critique surfaced WITH the plan so a
+        // walk-away approver sees structural weaknesses before they burn a swarm.
+        const planIssues = planCritiqueEnabled() ? critiquePlan(planResult.data) : [];
+        if (planIssues.length > 0 && sessionId) {
+          try {
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'plan_critiqued', data: { proposalId: proposal.id, issues: planIssues } });
+          } catch { /* durable critique trace is best-effort */ }
+        }
         return textResult([
           `Plan surfaced: ${proposal.id}.`,
           `Objective: ${proposal.plan.objective}`,
           `Complexity: ${proposal.plan.estimatedComplexity}; ${proposal.plan.steps.length} step(s); recommends tracked execution: ${proposal.plan.recommendsTrackedExecution}.`,
           sendsLine,
+          ...(planIssues.length > 0
+            ? ['', '⚠ Plan-coherence heads-up (tell the user before they approve):', ...planIssues.map((i) => `- ${i}`)]
+            : []),
           `The user has been notified — they can review and approve in the dashboard or by replying.`,
           sends.length > 0
             ? `Tell the user, in plain language: what you'll do, and EXACTLY what will be sent (${sends.map((s) => `${s.count ? `${s.count} ` : ''}${s.summary}`).join('; ')}) — then ask them to approve. On approval those sends run without further prompts; anything else still pauses.`

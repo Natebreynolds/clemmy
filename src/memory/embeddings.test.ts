@@ -13,13 +13,96 @@ import {
   classifyEmbedError,
   cosine,
   EMBEDDING_DIM,
+  embedQuery,
   getEmbeddingHealth,
   isEmbeddingsEnabled,
   vectorToBuffer,
   _resetEmbeddingHealthForTest,
   _driveEmbedFailureForTest,
   _driveEmbedSuccessForTest,
+  _setEmbeddingProviderForTest,
 } from './embeddings.js';
+
+test('embedQuery in-flight cache: two CONCURRENT identical embeds make ONE provider call (the per-turn double-embed)', async () => {
+  _resetEmbeddingHealthForTest();
+  let calls = 0;
+  _setEmbeddingProviderForTest({
+    id: 'test-counter',
+    dim: EMBEDDING_DIM,
+    embed: async (texts: string[]) => {
+      calls += 1;
+      return texts.map(() => new Float32Array(EMBEDDING_DIM));
+    },
+  } as any);
+  try {
+    // The hot path: buildTurnMemoryPrimer + primeTurnRecallVector both embed
+    // options.input concurrently. Caching the promise collapses them to one call.
+    const [a, b] = await Promise.all([embedQuery('pull my market leaders'), embedQuery('pull my market leaders')]);
+    assert.ok(a && b);
+    assert.equal(calls, 1, 'concurrent identical embeds deduped to a single provider call');
+    // A DIFFERENT query is a distinct call.
+    await embedQuery('something else entirely');
+    assert.equal(calls, 2);
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
+    _resetEmbeddingHealthForTest();
+  }
+});
+
+test('embedQuery in-flight cache: kill-switch off ⇒ every call hits the provider', async () => {
+  _resetEmbeddingHealthForTest();
+  const prev = process.env.CLEMMY_EMBED_QUERY_CACHE;
+  process.env.CLEMMY_EMBED_QUERY_CACHE = 'off';
+  let calls = 0;
+  _setEmbeddingProviderForTest({
+    id: 'test-counter', dim: EMBEDDING_DIM,
+    embed: async (texts: string[]) => { calls += 1; return texts.map(() => new Float32Array(EMBEDDING_DIM)); },
+  } as any);
+  try {
+    await Promise.all([embedQuery('same query'), embedQuery('same query')]);
+    assert.equal(calls, 2, 'cache disabled → no dedup');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_EMBED_QUERY_CACHE; else process.env.CLEMMY_EMBED_QUERY_CACHE = prev;
+    _setEmbeddingProviderForTest(undefined);
+    _resetEmbeddingHealthForTest();
+  }
+});
+
+test('embedQuery cache is cleared when the embedding provider changes', async () => {
+  _resetEmbeddingHealthForTest();
+  let callsA = 0;
+  let callsB = 0;
+  _setEmbeddingProviderForTest({
+    name: 'test-a',
+    model: 'a',
+    dim: EMBEDDING_DIM,
+    embed: async (texts: string[]) => {
+      callsA += 1;
+      return texts.map(() => Float32Array.from({ length: EMBEDDING_DIM }, () => 1));
+    },
+  });
+  try {
+    const a = await embedQuery('same query after provider swap');
+    assert.ok(a);
+    assert.equal(callsA, 1);
+    _setEmbeddingProviderForTest({
+      name: 'test-b',
+      model: 'b',
+      dim: EMBEDDING_DIM,
+      embed: async (texts: string[]) => {
+        callsB += 1;
+        return texts.map(() => Float32Array.from({ length: EMBEDDING_DIM }, () => 2));
+      },
+    });
+    const b = await embedQuery('same query after provider swap');
+    assert.ok(b);
+    assert.equal(callsB, 1, 'provider swap must not reuse the previous provider vector');
+    assert.equal(b[0], 2);
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
+    _resetEmbeddingHealthForTest();
+  }
+});
 
 test('vectorToBuffer + bufferToVector roundtrip preserves vectors', () => {
   const v = new Float32Array(EMBEDDING_DIM);
