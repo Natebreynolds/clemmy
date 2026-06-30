@@ -189,6 +189,19 @@ function judgeMaxContinuations(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS', '1') ?? '1', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 1;
 }
+/**
+ * Phase 1.3 (token + reliability): a SINGLE budget for the post-result corrective
+ * continuations — narration-retry, reasoning-leak-retry, and the objective-judge
+ * loop ALL draw from it. Each continuation is a full-context query(), so without a
+ * shared cap they compound multiplicatively (narration + reasoning + judge×N =
+ * up to 4-5 full re-runs of one turn). A healthy turn fires NONE; this only bounds
+ * the pathological stack. Default 2; CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS=0 disables
+ * all correctives, higher re-widens.
+ */
+function maxTurnContinuations(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS', '2') ?? '2', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+}
 
 export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' | 'discord' | 'slack';
 export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring' | 'full';
@@ -630,18 +643,25 @@ export async function respondViaClaudeAgentSdkBrain(
   };
   let result = await runWithSalvage({ prompt: request.message, ...runOptions });
 
+  // Phase 1.3: ONE shared budget across all post-result corrective continuations
+  // (narration, reasoning-leak, judge) so they can't compound into 4-5 full-context
+  // re-runs of a single turn. Healthy turns spend 0.
+  let continuationsUsed = 0;
+  const continuationBudget = maxTurnContinuations();
+
   // Narrate-instead-of-call backstop (defense-in-depth; the lean rubric prevents
   // most of it). If the brain made NO real tool calls but its text reproduces the
   // tool-call protocol, it described a call instead of making one — retry ONCE
   // with a hard nudge to actually invoke the tool. Kill-switch
   // CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-  if (!result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
+  if (continuationsUsed < continuationBudget && !result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
     const retry = await runContinuation({
       prompt:
         `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
         `Do NOT describe tools. INVOKE the real tool now to do this: "${request.message}". Then reply with the actual result.`,
       ...cleanContinuationRunOptions(),
     });
+    continuationsUsed += 1; // a continuation was spent (a parse stumble → null still cost a query())
     if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
   }
 
@@ -652,7 +672,7 @@ export async function respondViaClaudeAgentSdkBrain(
   // memory instead of doing the task. Retry ONCE, telling it the context is
   // trusted and to just do the work. Any mode (a read turn can spiral too).
   // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-  if (!result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
+  if (continuationsUsed < continuationBudget && !result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
     const retry = await runContinuation({
       prompt:
         `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
@@ -660,6 +680,7 @@ export async function respondViaClaudeAgentSdkBrain(
         `Just do exactly what the user asked: "${request.message}". Use the relevant tools and reply with the real result.`,
       ...cleanContinuationRunOptions(),
     });
+    continuationsUsed += 1;
     if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
   }
 
@@ -697,6 +718,10 @@ export async function respondViaClaudeAgentSdkBrain(
         reason = verdict.reason;
       } catch { break; } // fail-open — a flaky judge must never wedge the turn
       if (done) break;
+      // The cheap judge eval still runs/logs, but the EXPENSIVE full continuation
+      // draws from the shared turn budget — so narration+reasoning+judge can't
+      // stack into 4-5 full re-runs (Phase 1.3).
+      if (continuationsUsed >= continuationBudget) break;
       const contResult = await runContinuation({
         prompt:
           `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
@@ -704,6 +729,7 @@ export async function respondViaClaudeAgentSdkBrain(
           `artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
         ...cleanContinuationRunOptions(),
       });
+      continuationsUsed += 1;
       if (!contResult) break; // parse stumble on a continuation → keep the prior good result
       result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
       if (contResult.limitHit) break;

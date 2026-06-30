@@ -171,6 +171,41 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   assert.match(res.text, /Sent all 3 emails/);
 });
 
+test('Phase 1.3: a SHARED continuation budget caps narration + judge so corrective re-runs cannot stack', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const prevBudget = process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS;
+  process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS = '1';
+  try {
+    const prompts: string[] = [];
+    setClaudeAgentSdkBrainRunForTest(async (options) => {
+      prompts.push(options.prompt);
+      // 1st attempt narrates a tool call instead of invoking it (no real toolUses).
+      if (prompts.length === 1) {
+        return { text: 'Tool call: composio_execute_tool { "to": "x" }', sessionId: 'sdk', model: 'm', toolUses: [] };
+      }
+      // The narration retry "succeeds" with a promise-shaped reply + a real tool
+      // use, so the completion judge WOULD want another continuation.
+      return { text: "I'll send the emails next.", sessionId: 'sdk', model: 'm', toolUses: ['mcp__clementine-local__composio_execute_tool'] };
+    });
+    let judged = 0;
+    setClaudeAgentSdkBrainJudgeForTest(async () => { judged += 1; return { done: false, reason: 'no evidence shown' }; });
+
+    const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-cont-budget' });
+
+    // initial + ONE narration continuation = 2 full-context runs. The narration
+    // retry spent the only budgeted continuation, so the judge's not-done verdict
+    // does NOT fire a 3rd full re-run (budget exhausted).
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1], /INVOKE the real tool now/); // the narration retry prompt, not the judge's
+    assert.ok(judged >= 1, 'the cheap judge still evaluated — only its expensive continuation is budget-gated');
+    assert.ok(res.text.length > 0);
+  } finally {
+    if (prevBudget === undefined) delete process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS;
+    else process.env.CLEMMY_CLAUDE_SDK_MAX_CONTINUATIONS = prevBudget;
+  }
+});
+
 test('full mode: completion judge receives prior user context and SDK tool evidence', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
