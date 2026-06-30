@@ -531,6 +531,92 @@ test('thrown max-turns prefers later streamed text over an older assistant snaps
   assert.deepEqual(chunks, ['Later streamed checkpoint with more detail.']);
 });
 
+// -------- Phase 2: anti-thrash bounding (tool-call ceiling + wall-clock) --------
+function initOnlyMessage(): any {
+  return { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6', session_id: 's', uuid: 'i', apiKeySource: 'none', claude_code_version: '2', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'default', slash_commands: [], output_style: 'default', skills: [], plugins: [] };
+}
+function successResultMessage(text: string): any {
+  return { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: text, duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] };
+}
+// A query that HAMMERS a mutating tool through the host `canUseTool` (simulating
+// the SDK's pre-tool gate) until the ceiling interrupts, then ends. The SDK
+// aborts the turn on an interrupting deny, modeled here as a thrown stream error.
+function hammerToolQuery(p: any, cap: number): Query {
+  const canUse = p.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+  return stubsFor((async function* () {
+    yield initOnlyMessage();
+    for (let i = 0; i < cap; i++) {
+      const res = await canUse('mcp__clementine-local__run_shell_command', { command: `echo ${i}` }, {});
+      if (res?.behavior === 'deny' && res?.interrupt === true) {
+        throw new Error('Claude Code returned an error result: turn interrupted by host');
+      }
+    }
+    yield successResultMessage('done without tripping the ceiling');
+  })());
+}
+
+test('Phase 2: a mutating thrash trips the SDK tool-call ceiling and stops the turn (interrupt)', async () => {
+  const prev = process.env.CLEMMY_SDK_MUTATING_CALL_CEILING;
+  process.env.CLEMMY_SDK_MUTATING_CALL_CEILING = '3';
+  try {
+    setClaudeAgentSdkQueryForTest(((p: any) => hammerToolQuery(p, 50)) as any);
+    const r = await runClaudeAgentSdk({
+      prompt: 'do a thing',
+      sessionId: 'sdk-ceiling-trip',
+      modelId: 'claude-sonnet-4-6',
+      // read-only allowlist → run_shell_command is NOT fast-allow → counts as mutating
+      allowedLocalMcpTools: ['read_file', 'memory_search'],
+    });
+    assert.equal(r.limitHit, true);
+    assert.match(r.text, /stopped myself/i);
+    assert.match(r.text, /4 actions/); // trips on the 4th call (> ceiling of 3)
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_SDK_MUTATING_CALL_CEILING;
+    else process.env.CLEMMY_SDK_MUTATING_CALL_CEILING = prev;
+  }
+});
+
+test('Phase 2: the ceiling kill-switch (CLEMMY_SDK_TOOL_CEILING=off) leaves the run unbounded', async () => {
+  const prevSwitch = process.env.CLEMMY_SDK_TOOL_CEILING;
+  const prevCeil = process.env.CLEMMY_SDK_MUTATING_CALL_CEILING;
+  process.env.CLEMMY_SDK_TOOL_CEILING = 'off';
+  process.env.CLEMMY_SDK_MUTATING_CALL_CEILING = '3';
+  try {
+    setClaudeAgentSdkQueryForTest(((p: any) => hammerToolQuery(p, 10)) as any);
+    const r = await runClaudeAgentSdk({
+      prompt: 'do a thing',
+      sessionId: 'sdk-ceiling-off',
+      modelId: 'claude-sonnet-4-6',
+      allowedLocalMcpTools: ['read_file', 'memory_search'],
+    });
+    assert.notEqual(r.limitHit, true);
+    assert.equal(r.text, 'done without tripping the ceiling');
+  } finally {
+    if (prevSwitch === undefined) delete process.env.CLEMMY_SDK_TOOL_CEILING; else process.env.CLEMMY_SDK_TOOL_CEILING = prevSwitch;
+    if (prevCeil === undefined) delete process.env.CLEMMY_SDK_MUTATING_CALL_CEILING; else process.env.CLEMMY_SDK_MUTATING_CALL_CEILING = prevCeil;
+  }
+});
+
+function slowThenMoreQuery(): Query {
+  return stubsFor((async function* () {
+    yield initOnlyMessage();
+    await new Promise((r) => setTimeout(r, 12));
+    yield successResultMessage('should not be reached past the wall clock');
+  })());
+}
+
+test('Phase 2: the wall-clock backstop ends a stuck turn as a graceful limit, not a hang', async () => {
+  setClaudeAgentSdkQueryForTest(((_p: any) => slowThenMoreQuery()) as any);
+  const r = await runClaudeAgentSdk({
+    prompt: 'stuck turn',
+    sessionId: 'sdk-wallclock',
+    modelId: 'claude-sonnet-4-6',
+    maxWallClockMs: 1,
+  });
+  assert.equal(r.limitHit, true);
+  assert.match(r.text, /time budget/i);
+});
+
 test('successful SDK run falls back to streamed deltas when final result text is blank', async () => {
   const chunks: string[] = [];
   setClaudeAgentSdkQueryForTest(((_p: any) => streamedDeltasThenBlankSuccessQuery()) as any);

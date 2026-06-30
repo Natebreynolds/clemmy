@@ -5,6 +5,7 @@ import type {
   CanUseTool,
   McpServerConfig,
   Options as ClaudeAgentOptions,
+  PermissionResult,
   Query,
   SDKMessage,
   SDKResultMessage,
@@ -102,6 +103,68 @@ function overloadBackoffMs(attempt: number): number {
   return Math.min(15_000, base) + Math.floor(Math.random() * 500);
 }
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// -------- Phase 2: bound the SDK lane (anti-thrash) --------
+// The Claude Agent SDK chat lane has NO per-turn tool-call ceiling — its MCP-side
+// ToolCallsCounter is reconstructed at 1000 every call (gated-mutating-tools.ts)
+// so it never accumulates — and NO wall-clock backstop; only maxTurns. A runaway
+// (the 33-shell-call thrash that looked frozen and DOUBLE-SENT 3 emails,
+// 2026-06-29) therefore ran unbounded. The ceiling below counts calls in the
+// host-side `canUseTool` (which the SDK awaits before EVERY tool and which
+// persists across the whole turn) and, once a thrash crosses the bound, returns
+// `interrupt:true` to actually STOP the turn — the one place that can. All bounds
+// are kill-switchable and default generous (a backstop, never a limiter on real
+// deep work).
+function sdkToolCeilingEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_SDK_TOOL_CEILING', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+function sdkMutatingCallCeiling(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_SDK_MUTATING_CALL_CEILING', '50') || '50', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 50;
+}
+function sdkTotalCallCeiling(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_SDK_TOTAL_CALL_CEILING', '300') || '300', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 300;
+}
+/** 0 / "off" disables. Default 15 min: well beyond any normal turn — a backstop
+ *  against a genuinely stuck stream, not a limiter on legitimate long work. */
+function sdkWallClockMs(): number {
+  const raw = (getRuntimeEnv('CLEMMY_SDK_WALL_CLOCK_MS', '') ?? '').trim().toLowerCase();
+  if (raw === 'off' || raw === '0') return 0;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 15 * 60 * 1000;
+}
+
+/** Mutable per-turn bookkeeping shared between the ceiling `canUseTool` wrapper
+ *  and the run loop, so a self-imposed stop surfaces as a graceful limitHit
+ *  (partial answer + "say continue") instead of a raw error. */
+interface ToolCeilingState { total: number; mutating: number; stopped: string | null }
+
+/** Wrap a base `canUseTool` with a session-scoped call ceiling. Mutating
+ *  (non-fast-allow) calls get a LOW ceiling; reads a HIGH one. Crossing either
+ *  bound denies WITH `interrupt:true` (stops the turn) and latches `stopped` so
+ *  every subsequent call keeps denying — belt-and-suspenders if the SDK doesn't
+ *  honor the interrupt immediately. */
+function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: ToolCeilingState): CanUseTool {
+  const fastAllow = new Set(fastAllowTools.map(normalizeToolName).filter(Boolean));
+  const mutCeiling = sdkMutatingCallCeiling();
+  const totalCeiling = sdkTotalCallCeiling();
+  return (async (toolName, input, options) => {
+    if (state.stopped !== null) {
+      return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+    }
+    const tail = toolName.split('__').at(-1) ?? toolName;
+    const isRead = fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(tail));
+    state.total += 1;
+    if (!isRead) state.mutating += 1;
+    if (state.mutating > mutCeiling || state.total > totalCeiling) {
+      const why = state.mutating > mutCeiling ? `${state.mutating} actions` : `${state.total} tool calls`;
+      state.stopped = `I stopped myself after ${why} without finishing — that looked like a loop, so I held off rather than keep going and risk repeating an action. Tell me how you'd like to proceed and I'll pick it back up.`;
+      return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
+    }
+    return base(toolName, input, options);
+  }) as CanUseTool;
+}
 
 export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'ping',
@@ -397,6 +460,13 @@ export interface ClaudeAgentSdkRunOptions {
    * callers omit it → no partial messages, byte-identical result assembly.
    */
   onDelta?: (text: string) => void | Promise<void>;
+  /**
+   * Wall-clock backstop (ms) for the whole turn. The stream loop breaks if the
+   * turn outruns it, returning the graceful `limitHit` shape (partial answer +
+   * "say continue") rather than hanging. Absent → the lane default
+   * (sdkWallClockMs, 15 min, kill-switchable); 0 disables.
+   */
+  maxWallClockMs?: number;
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -627,6 +697,19 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // auto-updating `claude` here removes that dependency entirely (and the SDK
   // spawns it the same way it would the bundled native binary).
   const pathToClaudeCodeExecutable = resolveClaudeCliPath() ?? undefined;
+  // Anti-thrash bounding (Phase 2): a per-turn call ceiling that INTERRUPTS the
+  // SDK turn, shared with the run loop so a self-stop reads as a graceful limit.
+  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null };
+  // Agentic: the async approval gate (read/local fast-allow, everything else
+  // → decideToolApproval → register/surface/await). permissionMode 'default'
+  // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.
+  const baseCanUseTool = agentic
+    ? buildGatedToolPermission(options.sessionId as string, allowed)
+    : buildAllowOnlyToolsPermission(allowed);
+  const canUseTool = sdkToolCeilingEnabled()
+    ? withToolCeiling(baseCanUseTool, allowed, ceilingState)
+    : baseCanUseTool;
+  const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
   const sdkOptions: ClaudeAgentOptions = {
     env,
     ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
@@ -638,12 +721,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     tools: [],
     mcpServers: buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
     allowedTools: sdkToolNamesForLocalMcp(allowed),
-    // Agentic: the async approval gate (read/local fast-allow, everything else
-    // → decideToolApproval → register/surface/await). permissionMode 'default'
-    // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.
-    canUseTool: agentic
-      ? buildGatedToolPermission(options.sessionId as string, allowed)
-      : buildAllowOnlyToolsPermission(allowed),
+    canUseTool,
     permissionMode: agentic ? 'default' : 'dontAsk',
     maxTurns: options.maxTurns ?? 3,
     // Flip ON only when a delta sink is provided (chat surfaces). Worker/workflow
@@ -709,11 +787,23 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     streamedText = '';
     streamedAny = false;
     threwTurnLimit = false;
+    // Fresh per attempt: an overload retry re-runs the turn from scratch (and only
+    // happens pre-commit, so these are ~0 anyway), but reset for correctness.
+    ceilingState.total = 0;
+    ceilingState.mutating = 0;
+    ceilingState.stopped = null;
+    const startedAt = Date.now();
     const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
     try {
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       for await (const message of stream) {
+        // Wall-clock backstop: a genuinely stuck stream never hangs the turn.
+        if (wallClockMs > 0 && ceilingState.stopped === null && Date.now() - startedAt > wallClockMs) {
+          ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
+          try { await stream?.interrupt?.(); } catch { /* best-effort; finally closes */ }
+          break;
+        }
         const nextInit = extractInit(message);
         if (nextInit && !init) {
           init = nextInit;
@@ -743,7 +833,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && result?.subtype !== 'success') {
+      // Our OWN interrupt (tool ceiling / wall-clock) may surface as a thrown
+      // stream error rather than a clean result — it's a graceful self-stop, not
+      // a crash. Route it to the limitHit path below (handled after finally).
+      if (ceilingState.stopped !== null) {
+        threwTurnLimit = true;
+      } else if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && result?.subtype !== 'success') {
         threwTurnLimit = true;
       } else if (isProviderOverloadMessage(msg)) {
         const committed = toolUses.length > 0 || streamedAny;
@@ -762,9 +857,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     } finally {
       try { stream?.close?.(); } catch { /* ignore */ }
     }
-    break; // success (or a turn-limit stop) → leave the retry loop
+    // A self-imposed stop (ceiling/wall-clock) that ended the stream WITHOUT a
+    // throw (e.g. the SDK honored the interrupt cleanly) still routes to limitHit.
+    if (ceilingState.stopped !== null) threwTurnLimit = true;
+    break; // success (or a turn-limit / self stop) → leave the retry loop
   }
-  const partialLimitText = (): string => bestLimitHitText(lastAssistantText, streamedText);
+  // Prefer the self-stop reason (ceiling/wall-clock) over the generic turn-budget
+  // copy so the user sees WHY Clem held off.
+  const partialLimitText = (): string => ceilingState.stopped ?? bestLimitHitText(lastAssistantText, streamedText);
 
   if (!init && (options.requiredLocalMcpTools?.length ?? 0) > 0) {
     throw new ClaudeAgentSdkToolSurfaceError(options.requiredLocalMcpTools ?? [], []);
