@@ -454,6 +454,13 @@ export interface ClaudeAgentSdkRunOptions {
    */
   priorTurns?: Array<{ who: 'user' | 'assistant'; text: string }>;
   /**
+   * CHAT-only VOLATILE per-turn context (current time, query recall, live
+   * focus/goals, this-session actions). Injected into the USER turn — NOT the
+   * system append — so the stable system prefix stays cacheable across turns
+   * (Phase 3 #1). Absent → nothing added (worker/workflow + split-off path).
+   */
+  turnContext?: string;
+  /**
    * CHAT-only streaming. When set, assistant text deltas are forwarded as they
    * arrive (this also flips includePartialMessages on). ONLY text_delta is
    * forwarded — thinking/tool-arg deltas are filtered out. Worker/workflow
@@ -740,9 +747,24 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // CHAT multi-turn history: prepend the prior session turns as an authoritative
   // transcript so the stateless SDK lane (persistSession:false) has context. Empty
   // / absent priorTurns → byte-identical bare prompt (worker/workflow path).
-  const effectivePrompt = (options.priorTurns && options.priorTurns.length > 0)
-    ? `[CONVERSATION SO FAR — prior turns in THIS session; treat as authoritative, do NOT re-ask decisions already made]\n${renderTranscriptTurns(options.priorTurns)}\n\n[Latest message]\n${options.prompt}`
-    : options.prompt;
+  // Volatile per-turn context (Phase 3 #1) rides the USER turn so the stable
+  // system append stays cacheable. With neither priorTurns nor turnContext the
+  // prompt is byte-identical to the bare worker/workflow path.
+  const turnCtx = options.turnContext?.trim();
+  let effectivePrompt: string;
+  if ((options.priorTurns?.length ?? 0) === 0 && !turnCtx) {
+    effectivePrompt = options.prompt;
+  } else {
+    const parts: string[] = [];
+    if (options.priorTurns && options.priorTurns.length > 0) {
+      parts.push(`[CONVERSATION SO FAR — prior turns in THIS session; treat as authoritative, do NOT re-ask decisions already made]\n${renderTranscriptTurns(options.priorTurns)}`);
+    }
+    if (turnCtx) {
+      parts.push(`[CURRENT STATE — refreshed THIS turn from your memory and this session's actions; authoritative and newer than anything above]\n${turnCtx}`);
+    }
+    parts.push(`[Latest message]\n${options.prompt}`);
+    effectivePrompt = parts.join('\n\n');
+  }
 
   let result: SDKResultMessage | null = null;
   let init: SDKSystemMessage | null = null;

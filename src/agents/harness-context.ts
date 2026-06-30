@@ -260,7 +260,24 @@ function queryRecallEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: string }): string {
+/**
+ * The blocks that change turn-to-turn within a single conversation — the current
+ * time, the per-message query recall, the live focus/goals/held/working-memory.
+ * Splitting these out (partition:'stable' vs 'volatile') lets a caller put the
+ * STABLE memory in a cacheable system prefix and the VOLATILE tail in the
+ * (never-cached) user turn, so the big stable context stops re-billing every turn
+ * on the Claude lanes (Phase 3 #1, the largest token sink).
+ */
+const VOLATILE_CONTEXT_TITLES = new Set<string>([
+  'Now',
+  'Relevant To Your Request',
+  'Working Memory',
+  'Active Goals',
+  'Held For Later',
+  'Current Focus',
+]);
+
+export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: string; partition?: 'all' | 'stable' | 'volatile' }): string {
   let memContext;
   try {
     memContext = loadMemoryContext();
@@ -337,31 +354,52 @@ export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: 
     } catch { requestRecall = ''; }
   }
 
-  const blocks = [
+  // Title each block so a caller can request only the STABLE half (cacheable
+  // system prefix) or only the VOLATILE tail (sent in the user turn). Order is
+  // preserved exactly, so partition:'all' is byte-identical to the prior output.
+  const tagged: Array<{ title: string; text: string }> = [
     // Current date/time goes FIRST so the model reads it before any
     // other context. Without this the model defaults to its training
     // cutoff for date math, which is months stale.
-    section('Now', nowLine),
-    section('Autonomy', renderAutonomy()),
-    section('Standing Constraints', constraints),
-    section('Relevant To Your Request', requestRecall),
-    section('User Preferences', profile),
-    section('Persistent Facts', facts),
-    recentlyLearned,
-    section('Data Landscape', dataLandscape),
-    toolChoices,
-    establishedDestinations,
-    section('Working Memory', memContext.workingMemory),
-    section('Identity', memContext.identity),
-    section('Core Personality', memContext.soul),
-    section('Long-Term Memory', memContext.memory),
-    section('Active Goals', goals),
-    section('Held For Later', heldTasks),
-    section('Current Focus', focus),
-    section('Available Skills', skills),
-  ].filter(Boolean);
+    { title: 'Now', text: section('Now', nowLine) },
+    { title: 'Autonomy', text: section('Autonomy', renderAutonomy()) },
+    { title: 'Standing Constraints', text: section('Standing Constraints', constraints) },
+    { title: 'Relevant To Your Request', text: section('Relevant To Your Request', requestRecall) },
+    { title: 'User Preferences', text: section('User Preferences', profile) },
+    { title: 'Persistent Facts', text: section('Persistent Facts', facts) },
+    { title: 'Recently Learned', text: recentlyLearned },
+    { title: 'Data Landscape', text: section('Data Landscape', dataLandscape) },
+    { title: 'Remembered Tool Choices', text: toolChoices },
+    { title: 'Established Destinations', text: establishedDestinations },
+    { title: 'Working Memory', text: section('Working Memory', memContext.workingMemory) },
+    { title: 'Identity', text: section('Identity', memContext.identity) },
+    { title: 'Core Personality', text: section('Core Personality', memContext.soul) },
+    { title: 'Long-Term Memory', text: section('Long-Term Memory', memContext.memory) },
+    { title: 'Active Goals', text: section('Active Goals', goals) },
+    { title: 'Held For Later', text: section('Held For Later', heldTasks) },
+    { title: 'Current Focus', text: section('Current Focus', focus) },
+    { title: 'Available Skills', text: section('Available Skills', skills) },
+  ];
+
+  const partition = opts?.partition ?? 'all';
+  const blocks = tagged
+    .filter((b) => Boolean(b.text))
+    .filter((b) =>
+      partition === 'all' ? true
+      : partition === 'volatile' ? VOLATILE_CONTEXT_TITLES.has(b.title)
+      : !VOLATILE_CONTEXT_TITLES.has(b.title))
+    .map((b) => b.text);
 
   if (blocks.length === 0) return '';
+  // The volatile tail rides in the user turn (uncached by design), so it gets a
+  // lighter header that frames it as the time-sensitive refresh; stable/all keep
+  // the canonical persistent-context header (byte-identical for 'all').
+  if (partition === 'volatile') {
+    return [
+      '# Current State (refreshed this turn)',
+      ...blocks,
+    ].join('\n\n');
+  }
   return [
     '# Persistent Context',
     'This block is loaded fresh each turn from the user\'s vault and memory stores. Treat it as ground truth about who the user is and what they\'re working on — it is the same persistent memory the chat dock and voice surfaces use, so what you learn here carries across every Clementine channel.',

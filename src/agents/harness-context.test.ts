@@ -108,6 +108,38 @@ test('stale focus is not rendered as active persistent context', () => {
   }
 });
 
+test('partition: default ("all") is byte-identical to no partition (regression guard for the cache split)', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts.' });
+  const q = 'pull my market leader accounts';
+  assert.equal(
+    renderHarnessMemoryContext({ sessionId: 's', query: q, partition: 'all' }),
+    renderHarnessMemoryContext({ sessionId: 's', query: q }),
+  );
+});
+
+test('partition: stable EXCLUDES the volatile tail (Now / query recall / Current Focus); volatile holds ONLY those', () => {
+  resetMemoryDb();
+  rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts in Salesforce.' });
+  const q = 'market leader accounts';
+
+  const stable = renderHarnessMemoryContext({ sessionId: 's', query: q, partition: 'stable' });
+  // The big stable memory stays (cacheable); the per-turn-volatile blocks are gone.
+  assert.match(stable, /## Persistent Facts/);
+  assert.doesNotMatch(stable, /## Now/);
+  assert.doesNotMatch(stable, /## Relevant To Your Request/);
+  assert.doesNotMatch(stable, /## Current Focus/);
+
+  const volatile = renderHarnessMemoryContext({ sessionId: 's', query: q, partition: 'volatile' });
+  // The volatile tail carries the time-sensitive bits and its own light header…
+  assert.match(volatile, /# Current State \(refreshed this turn\)/);
+  assert.match(volatile, /## Now/);
+  assert.match(volatile, /## Relevant To Your Request/);
+  // …and NOT the stable memory (so it doesn't duplicate the cached prefix).
+  assert.doesNotMatch(volatile, /## Persistent Facts/);
+  assert.doesNotMatch(volatile, /# Persistent Context/);
+});
+
 process.on('exit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });

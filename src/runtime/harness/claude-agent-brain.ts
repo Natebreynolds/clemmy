@@ -50,6 +50,15 @@ function sessionHistoryEnabled(): boolean {
   // CLEMMY_CLAUDE_SDK_SESSION_HISTORY=off → byte-identical bare-message prompt.
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_SESSION_HISTORY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
+function contextSplitEnabled(): boolean {
+  // Phase 3 #1 (token): keep the STABLE memory in the cacheable system append and
+  // move the VOLATILE tail (Now / query-recall / focus / goals / held / working-
+  // memory / this-session actions) into the user turn, so the big stable context
+  // stops re-billing every turn (the Claude SDK lane re-billed ~5-15K tok/turn
+  // because volatile fields led the append and busted the cached prefix). Kill-
+  // switch CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT=off → old single-append behavior.
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
 export function sdkStreamingEnabled(): boolean {
   // DEFAULT OFF: raw SDK text deltas reproduce the model's tool-call XML
   // narration, which dumped into the dock bubble (live 2026-06-23). Clean live
@@ -362,15 +371,25 @@ export function renderClaudeAgentBrainSystemAppend(
   request: AssistantRequest,
   mode: ClaudeAgentBrainMode = claudeAgentSdkBrainMode() ?? 'read_only',
 ): string {
-  const persistentContext = renderHarnessMemoryContext({ sessionId: request.sessionId, query: request.message });
+  const split = contextSplitEnabled();
+  // Split ON: the system append carries ONLY the STABLE memory (cacheable across
+  // turns); the volatile tail + this-session actions move to the user turn (see
+  // renderClaudeAgentBrainTurnContext). Split OFF: the old single-append behavior
+  // (full context + query recall + sessionActions here) — byte-identical.
+  const persistentContext = renderHarnessMemoryContext({
+    sessionId: request.sessionId,
+    query: split ? undefined : request.message,
+    partition: split ? 'stable' : 'all',
+  });
   const spaceSlug = workspaceSlugFromSessionId(request.sessionId);
   const workspacePrimer = spaceSlug ? buildWorkspaceContextPrimer(spaceSlug) : null;
   // Visibility into THIS session's completed irreversible actions. The text
   // transcript doesn't carry tool results, so without this the brain is blind to
   // its own prior sends and can re-run them (the 2026-06-29 double-send). Gated by
-  // the same session-history kill-switch.
+  // the same session-history kill-switch. Split ON → this rides the user turn
+  // instead (it grows each action, so it's volatile and must not bust the cache).
   let sessionActions = '';
-  if (sessionHistoryEnabled()) {
+  if (!split && sessionHistoryEnabled()) {
     try { sessionActions = renderRecentSessionActions(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
   }
   return [
@@ -393,6 +412,28 @@ export function renderClaudeAgentBrainSystemAppend(
     'How you operate here:',
     CLAUDE_BRAIN_RUBRIC,
   ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * The VOLATILE per-turn context for the Claude SDK brain — the bits that change
+ * turn-to-turn (current time, query recall, live focus/goals/held/working-memory)
+ * plus THIS session's completed irreversible actions. Returned separately from
+ * the (stable, cacheable) system append so the caller can inject it into the user
+ * turn, where uncached content belongs. Empty when the context-split kill-switch
+ * is off (the volatile content then lives in the system append, old behavior).
+ */
+export function renderClaudeAgentBrainTurnContext(request: AssistantRequest): string {
+  if (!contextSplitEnabled()) return '';
+  const volatile = renderHarnessMemoryContext({
+    sessionId: request.sessionId,
+    query: request.message,
+    partition: 'volatile',
+  });
+  let sessionActions = '';
+  if (sessionHistoryEnabled()) {
+    try { sessionActions = renderRecentSessionActions(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
+  }
+  return [volatile, sessionActions].filter(Boolean).join('\n\n');
 }
 
 export async function respondViaClaudeAgentSdkBrain(
@@ -524,6 +565,7 @@ export async function respondViaClaudeAgentSdkBrain(
     sessionId,
     modelId,
     systemAppend: renderClaudeAgentBrainSystemAppend(surface, request, mode),
+    turnContext: renderClaudeAgentBrainTurnContext(request),
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
     agentic: mode === 'full',

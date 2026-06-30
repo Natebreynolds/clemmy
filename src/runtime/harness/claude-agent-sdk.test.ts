@@ -597,6 +597,30 @@ test('Phase 2: the ceiling kill-switch (CLEMMY_SDK_TOOL_CEILING=off) leaves the 
   }
 });
 
+test('Phase 3: turnContext rides the USER turn (not the cached system append) so the stable prefix can cache', async () => {
+  const capture: { call?: any } = {};
+  setClaudeAgentSdkQueryForTest(((params: any) => { capture.call = params; return successQuery('done'); }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'pull my market leaders',
+    sessionId: 'sdk-turn-context',
+    modelId: 'claude-sonnet-4-6',
+    systemAppend: 'STABLE-SYSTEM-IDENTITY-AND-FACTS',
+    turnContext: '# Current State (refreshed this turn)\n\n## Now\nMonday',
+    priorTurns: [{ who: 'user', text: 'hi' }, { who: 'assistant', text: 'hello' }],
+  });
+
+  // Volatile context is in the user turn, clearly framed and BELOW the prior turns.
+  assert.match(capture.call.prompt, /\[CURRENT STATE — refreshed THIS turn/);
+  assert.match(capture.call.prompt, /## Now\nMonday/);
+  assert.match(capture.call.prompt, /\[Latest message\]\npull my market leaders/);
+  assert.ok(capture.call.prompt.indexOf('CONVERSATION SO FAR') < capture.call.prompt.indexOf('CURRENT STATE'));
+  // The stable system append is untouched — it must NOT carry the volatile tail
+  // (that's the whole point: a stable prefix the API can cache across turns).
+  assert.equal(capture.call.options.systemPrompt.append, 'STABLE-SYSTEM-IDENTITY-AND-FACTS');
+  assert.doesNotMatch(capture.call.options.systemPrompt.append, /Current State|## Now/);
+});
+
 function slowThenMoreQuery(): Query {
   return stubsFor((async function* () {
     yield initOnlyMessage();
