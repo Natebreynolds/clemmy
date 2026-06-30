@@ -2,6 +2,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSyn
 import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import type { WorkflowStepInput } from '../memory/workflow-store.js';
+import { isOperationalEventType, recordOperationalEvent, type OperationalEventSeverity, type OperationalEventSource, type OperationalEventType } from '../runtime/operational-telemetry.js';
 
 /**
  * Append-only event log per workflow run — the durability layer.
@@ -50,6 +52,21 @@ export type WorkflowEventKind =
   | 'attempt_record'      // STATE: a comparable per-attempt record (what was tried, what changed, what it cost)
   | 'step_advisory'       // step completed but a non-failing quality check flagged it (skill-execution miss)
   | 'step_skipped'        // step was a no-op (forEach over empty list, condition)
+  | 'workflow_graph_created'         // graph snapshot compiled/created for the run
+  | 'workflow_node_ready'            // graph node dependencies satisfied
+  | 'workflow_node_started'          // graph node execution started
+  | 'workflow_node_completed'        // graph node execution completed
+  | 'workflow_node_failed'           // graph node execution failed
+  | 'workflow_branch_evaluated'      // condition node chose branch edge(s)
+  | 'workflow_graph_patch_proposed'  // model/system proposed graph mutation
+  | 'workflow_graph_patch_applied'   // graph mutation validated and applied
+  | 'workflow_graph_patch_rejected'  // graph mutation failed validation
+  | 'workflow_checkpoint_created'    // durable checkpoint before risky work
+  | 'workflow_rollback_started'      // compensating/rollback path started
+  | 'workflow_rollback_completed'    // compensating/rollback path completed
+  | 'workflow_trigger_fired'         // manual/schedule/webhook/system trigger fired
+  | 'workflow_trigger_deduped'       // trigger was ignored due to dedupe
+  | 'workflow_resume_replayed'       // run replayed events after restart
   | 'item_started'        // one iteration of a forEach step started
   | 'item_completed'      // one iteration of a forEach step done
   | 'item_retry'          // one iteration failed TRANSIENTLY; retrying that item after backoff (W1b)
@@ -169,7 +186,67 @@ export function appendWorkflowEvent(
     // mirror to stderr so the daemon's supervisor.log captures the
     // event when the per-run log is unwritable.
   }
+  mirrorWorkflowOperationalEvent(workflowName, runId, full);
   return full;
+}
+
+// The live runner emits LEGACY lifecycle kinds (step_*/item_*/approval_*/tool_*);
+// the operational taxonomy names them workflow_node_*/approval_*/tool_call_*. Map
+// them here so the existing emit points light up telemetry with NO runner edits.
+// A kind that is ALREADY an operational type (the graph layer's workflow_node_*,
+// workflow_graph_*, etc.) passes straight through. A given emit is exactly one
+// kind, so this never double-counts.
+const LEGACY_WORKFLOW_OPERATIONAL: Readonly<Record<string, { type: OperationalEventType; source: OperationalEventSource }>> = {
+  step_started: { type: 'workflow_node_started', source: 'workflow' },
+  step_completed: { type: 'workflow_node_completed', source: 'workflow' },
+  step_failed: { type: 'workflow_node_failed', source: 'workflow' },
+  item_started: { type: 'workflow_node_started', source: 'workflow' },
+  item_completed: { type: 'workflow_node_completed', source: 'workflow' },
+  item_failed: { type: 'workflow_node_failed', source: 'workflow' },
+  approval_requested: { type: 'approval_required', source: 'safety' },
+  approval_granted: { type: 'approval_resolved', source: 'safety' },
+  approval_rejected: { type: 'approval_resolved', source: 'safety' },
+  tool_called: { type: 'tool_call_started', source: 'tool' },
+  tool_result: { type: 'tool_call_completed', source: 'tool' },
+};
+
+function mirrorWorkflowOperationalEvent(workflowName: string, runId: string, event: WorkflowEvent): void {
+  const mapped = LEGACY_WORKFLOW_OPERATIONAL[event.kind];
+  const type: OperationalEventType | null = mapped?.type
+    ?? (isOperationalEventType(event.kind) ? event.kind : null);
+  if (!type) return;
+  recordOperationalEvent({
+    source: mapped?.source ?? 'workflow',
+    type,
+    severity: severityForWorkflowEvent(event),
+    workflowRunId: runId,
+    workflowNodeRunId: stringFromMeta(event.meta, 'workflowNodeRunId')
+      ?? stringFromMeta(event.meta, 'nodeRunId')
+      ?? event.stepId,
+    sessionId: stringFromMeta(event.meta, 'sessionId'),
+    actor: 'workflow-runner',
+    now: new Date(event.t),
+    payload: {
+      workflowName,
+      stepId: event.stepId,
+      itemKey: event.itemKey,
+      output: event.output,
+      error: event.error,
+      meta: event.meta,
+      attempt: event.attempt,
+    },
+  });
+}
+
+function severityForWorkflowEvent(event: WorkflowEvent): OperationalEventSeverity {
+  if (event.error || event.kind.endsWith('_failed')) return 'error';
+  if (event.kind.endsWith('_rejected') || event.kind.endsWith('_deduped')) return 'warn';
+  return 'info';
+}
+
+function stringFromMeta(meta: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = meta?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 /**
@@ -311,8 +388,11 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
     if (ev.kind === 'step_failed' && ev.stepId) {
       failedSteps.add(ev.stepId);
     }
-    if (ev.kind === 'step_completed' && ev.stepId) {
-      completedSteps.set(ev.stepId, ev.output);
+    if ((ev.kind === 'step_completed' || ev.kind === 'step_skipped') && ev.stepId) {
+      const output = ev.kind === 'step_skipped' && ev.output === undefined && ev.meta?.reason === 'forEach-empty'
+        ? []
+        : ev.output;
+      completedSteps.set(ev.stepId, output);
       failedSteps.delete(ev.stepId);
       if (inFlightStepId === ev.stepId) inFlightStepId = undefined;
     }
@@ -324,6 +404,114 @@ export function computeResumeState(workflowName: string, runId: string): ResumeS
   }
 
   return { completedSteps, completedItems, failedSteps, inFlightStepId, lastEventAt, terminal };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Queue visibility — reconstruct a run's SUB-TASK QUEUE from the durable
+// event log so each queued unit ("check followers", "draft post 3") is a
+// first-class, restart-surviving item the Tasks board can show, instead of one
+// opaque "campaign running" card. Pure read; no behaviour change.
+// ─────────────────────────────────────────────────────────────────
+
+export type RunQueueStepStatus = 'done' | 'running' | 'failed' | 'queued' | 'blocked';
+
+export interface RunQueueStep {
+  stepId: string;
+  /** Short human label (first line of the step prompt, else the id). */
+  title: string;
+  kind: 'step' | 'forEach';
+  status: RunQueueStepStatus;
+  /** The next ready-to-run step (the head of the queue) — what Clem does next. */
+  isNext: boolean;
+  /** forEach progress (present only for forEach steps that have started). */
+  itemsDone?: number;
+  itemsTotal?: number;
+  itemsFailed?: number;
+}
+
+export interface RunQueue {
+  runId: string;
+  steps: RunQueueStep[];
+  doneCount: number;
+  totalCount: number;
+  /** The step that will run next (null when none are ready — running/blocked/done). */
+  nextStepId: string | null;
+}
+
+function stepLabel(step: WorkflowStepInput): string {
+  const firstLine = (step.prompt ?? '').split('\n').map((l) => l.trim()).find((l) => l.length > 0);
+  const label = (firstLine ?? step.id).trim();
+  return label.length > 90 ? `${label.slice(0, 87)}…` : label;
+}
+
+/**
+ * Reconstruct the ordered sub-task queue for a workflow run from its durable
+ * events + the workflow's declared steps. Every step gets a status (done /
+ * running / failed / queued / blocked); the first ready step is flagged `isNext`.
+ * forEach steps carry item progress from the log. Survives restarts (it reads the
+ * same events.jsonl the crash-resume does). Never throws — returns an empty queue
+ * on any read error so the board degrades gracefully.
+ */
+export function reconstructWorkflowRunQueue(
+  workflowName: string,
+  runId: string,
+  steps: WorkflowStepInput[],
+): RunQueue {
+  try {
+    const state = computeResumeState(workflowName, runId);
+    const failedItemsByStep = new Map<string, number>();
+    for (const item of listFinalFailedItems(workflowName, runId)) {
+      failedItemsByStep.set(item.stepId, (failedItemsByStep.get(item.stepId) ?? 0) + 1);
+    }
+    // Per-forEach item progress: distinct keys started vs completed, from events.
+    const perStepItems = new Map<string, { started: Set<string>; done: Set<string> }>();
+    for (const ev of readWorkflowEvents(workflowName, runId)) {
+      if (!ev.stepId || !ev.itemKey) continue;
+      let s = perStepItems.get(ev.stepId);
+      if (!s) { s = { started: new Set(), done: new Set() }; perStepItems.set(ev.stepId, s); }
+      s.started.add(ev.itemKey);
+      if (ev.kind === 'item_completed') s.done.add(ev.itemKey);
+    }
+
+    let nextStepId: string | null = null;
+    const out: RunQueueStep[] = steps.map((step) => {
+      const deps = step.dependsOn ?? [];
+      const failedItemCount = failedItemsByStep.get(step.id) ?? 0;
+      let status: RunQueueStepStatus;
+      if (state.failedSteps.has(step.id) || failedItemCount > 0) status = 'failed';
+      else if (state.completedSteps.has(step.id)) status = 'done';
+      else if (state.inFlightStepId === step.id) status = 'running';
+      else if (deps.every((d) => state.completedSteps.has(d))) status = 'queued';
+      else status = 'blocked';
+
+      // The head of the queue: the FIRST ready step (in declared order).
+      const isNext = status === 'queued' && nextStepId === null;
+      if (isNext) nextStepId = step.id;
+
+      const items = perStepItems.get(step.id);
+      return {
+        stepId: step.id,
+        title: stepLabel(step),
+        kind: step.forEach ? 'forEach' : 'step',
+        status,
+        isNext,
+        ...(step.forEach && items && items.started.size > 0
+          ? { itemsDone: items.done.size, itemsTotal: items.started.size }
+          : {}),
+        ...(step.forEach && failedItemCount > 0 ? { itemsFailed: failedItemCount } : {}),
+      };
+    });
+
+    return {
+      runId,
+      steps: out,
+      doneCount: out.filter((s) => s.status === 'done').length,
+      totalCount: out.length,
+      nextStepId,
+    };
+  } catch {
+    return { runId, steps: [], doneCount: 0, totalCount: 0, nextStepId: null };
+  }
 }
 
 /**

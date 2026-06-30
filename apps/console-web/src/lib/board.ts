@@ -27,6 +27,13 @@ export interface BoardFailureSummary {
   reason: string;
 }
 
+/** The draft body + image of a CONTENT approval (a post/email), so it's reviewed
+ *  in place in the Approvals card instead of a one-line summary. */
+export interface ApprovalContentPreview {
+  body?: string;
+  imageUrl?: string;
+}
+
 export interface BoardCard {
   id: string;
   sourceKind: BoardSourceKind;
@@ -43,6 +50,7 @@ export interface BoardCard {
   continueMode?: BoardContinueMode;
   approvalId?: string;
   nextSafeAction?: string;
+  contentPreview?: ApprovalContentPreview;
   artifactSummary?: BoardArtifactSummary;
   failureSummary?: BoardFailureSummary;
   /** A finished/parked background task idle past the stale threshold (>7d). */
@@ -74,6 +82,41 @@ export const COLUMNS: { id: BoardColumnId; label: string }[] = [
 ];
 
 export const listBoard = () => apiGet<{ cards: BoardCard[]; generatedAt: string }>('/api/console/board');
+
+// Queue visibility: the sub-task queue of one workflow run (each step/forEach
+// unit with status + what runs next), reconstructed server-side from the durable
+// event log so it survives restarts. Lets a campaign card expand into its queue.
+export type RunQueueStepStatus = 'done' | 'running' | 'failed' | 'queued' | 'blocked';
+export interface RunQueueStep {
+  stepId: string;
+  title: string;
+  kind: 'step' | 'forEach';
+  status: RunQueueStepStatus;
+  isNext: boolean;
+  itemsDone?: number;
+  itemsTotal?: number;
+  itemsFailed?: number;
+}
+export interface RunQueue {
+  runId: string;
+  steps: RunQueueStep[];
+  doneCount: number;
+  totalCount: number;
+  nextStepId: string | null;
+}
+
+export const getRunQueue = (slug: string, runId: string) =>
+  apiGet<RunQueue>(`/api/console/board/run/${encodeURIComponent(slug)}/${encodeURIComponent(runId)}/queue`);
+
+/** The workflow slug + runId a card's queue lives under, or null if the card
+ *  isn't a workflow run (background/execution/approval have no step queue). */
+export function runQueueRef(card: BoardCard): { slug: string; runId: string } | null {
+  if (card.sourceKind !== 'run' && card.sourceKind !== 'workflow') return null;
+  const slug = card.raw.workflowSlug ?? card.raw.workflowName;
+  const runId = card.raw.runId ?? card.id;
+  if (!slug || !runId) return null;
+  return { slug, runId };
+}
 
 /**
  * The action a drop onto `target` would trigger, or null if the move isn't

@@ -149,6 +149,87 @@ function trim(input: string, max: number): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Approval CONTENT preview (Slice 2) — when an approval publishes content
+// (an IG/social post, an email), pull the draft BODY + IMAGE out of the tool
+// args so the user reviews the actual post in the Approvals card, not a one-line
+// "approve INSTAGRAM_CREATE_POST" summary. Best-effort + heuristic across tool
+// arg shapes (incl. composio's nested `arguments`); returns undefined when there's
+// no reviewable content. Never throws.
+// ─────────────────────────────────────────────────────────────────
+
+const CONTENT_BODY_KEYS = ['caption', 'body', 'text', 'message', 'content', 'post', 'html', 'description', 'status'];
+const CONTENT_IMAGE_KEYS = [
+  'image_url', 'imageUrl', 'media_url', 'mediaUrl', 'image', 'media', 'media_urls',
+  'photo', 'thumbnail', 'thumbnail_url', 'attachment_url', 'picture', 'cover_url',
+];
+
+export interface ApprovalContentPreview {
+  body?: string;
+  imageUrl?: string;
+}
+
+function looksLikeImageUrl(s: string): boolean {
+  const t = s.trim();
+  if (/^data:image\//i.test(t)) return true;
+  if (/^https?:\/\//i.test(t)) {
+    return /\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)(\?|#|$)/i.test(t)
+      || /(image|img|photo|media|cdn|imgur|cloudinary|unsplash|instagram|fbcdn|googleusercontent)/i.test(t);
+  }
+  return /^\/?[\w./-]+\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(t); // local path
+}
+
+function pickLongestString(record: Record<string, unknown>, keys: string[]): string {
+  let best = '';
+  for (const key of keys) {
+    const v = record[key];
+    if (typeof v === 'string' && v.trim().length > best.length) best = v;
+  }
+  return best.trim();
+}
+
+function pickImageUrl(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const v = record[key];
+    if (typeof v === 'string' && looksLikeImageUrl(v)) return v.trim();
+    if (Array.isArray(v)) {
+      const first = v.find((x) => typeof x === 'string' && looksLikeImageUrl(x));
+      if (typeof first === 'string') return first.trim();
+    }
+  }
+  return '';
+}
+
+export function extractApprovalContentPreview(
+  _tool: string | null,
+  args: Record<string, unknown> | null | undefined,
+): ApprovalContentPreview | undefined {
+  try {
+    if (!args || typeof args !== 'object') return undefined;
+    // composio_execute_tool nests the real fields under `arguments` (string|object).
+    let inner: Record<string, unknown> = args;
+    const nested = (args as Record<string, unknown>).arguments;
+    if (typeof nested === 'string') {
+      try { const p = JSON.parse(nested); if (p && typeof p === 'object') inner = p as Record<string, unknown>; } catch { /* keep args */ }
+    } else if (nested && typeof nested === 'object') {
+      inner = nested as Record<string, unknown>;
+    }
+    const rawBody = pickLongestString(inner, CONTENT_BODY_KEYS);
+    const imageUrl = pickImageUrl(inner, CONTENT_IMAGE_KEYS);
+    if (!rawBody && !imageUrl) return undefined;
+    const out: ApprovalContentPreview = {};
+    if (rawBody) {
+      // Preserve line structure (a post body has it); just cap length.
+      const clean = rawBody.replace(/\r\n/g, '\n').replace(/[ \t]+\n/g, '\n').trim();
+      out.body = clean.length > 1500 ? `${clean.slice(0, 1499)}…` : clean;
+    }
+    if (imageUrl) out.imageUrl = imageUrl;
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Short human-readable preview of a live tool_called event for the
  * status line (chat dock + Discord progress). Capped tight (~70 chars)

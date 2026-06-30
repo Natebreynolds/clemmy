@@ -353,6 +353,125 @@ test('GET /api/console/workflows exposes needs-attention last-run status', async
   }
 });
 
+test('GET /api/console/board/run/:slug/:runId/queue returns the workflow sub-task queue', async () => {
+  const workflowSlug = 'board-queue-flow';
+  const workflowName = 'Board Queue Flow';
+  const runId = 'run-queue-visible';
+  writeWorkflow(workflowSlug, {
+    name: workflowName,
+    description: 'queue visibility test',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Pull campaign inputs.' },
+      { id: 'draft', prompt: 'Draft each post.', dependsOn: ['pull'], forEach: 'pull' },
+      { id: 'summary', prompt: 'Summarize the campaign.', dependsOn: ['draft'] },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'running',
+    createdAt: '2026-06-24T14:00:00.000Z',
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'pull' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_completed', stepId: 'pull', output: ['a', 'b'] });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'draft' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'item_started', stepId: 'draft', itemKey: 'a' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'item_started', stepId: 'draft', itemKey: 'b' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'item_completed', stepId: 'draft', itemKey: 'a', output: 'done-a' });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board/run/${encodeURIComponent(workflowSlug)}/${runId}/queue`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      runId: string;
+      steps: Array<{ stepId: string; status: string; itemsDone?: number; itemsTotal?: number; isNext: boolean }>;
+      nextStepId: string | null;
+    };
+    assert.equal(body.runId, runId);
+    assert.equal(body.nextStepId, null);
+    const by = Object.fromEntries(body.steps.map((step) => [step.stepId, step]));
+    assert.equal(by.pull.status, 'done');
+    assert.equal(by.draft.status, 'running');
+    assert.equal(by.draft.itemsDone, 1);
+    assert.equal(by.draft.itemsTotal, 2);
+    assert.equal(by.summary.status, 'blocked');
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/board/run/:slug/:runId/queue rejects missing or mismatched run records', async () => {
+  const workflowSlug = 'board-queue-mismatch';
+  const workflowName = 'Board Queue Mismatch';
+  writeWorkflow(workflowSlug, {
+    name: workflowName,
+    description: 'queue mismatch test',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'one', prompt: 'Run one step.' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'run-other-workflow.json'), JSON.stringify({
+    id: 'run-other-workflow',
+    workflow: 'Different Workflow',
+    status: 'running',
+    createdAt: '2026-06-24T14:10:00.000Z',
+  }, null, 2), 'utf-8');
+
+  const h = await boot();
+  try {
+    const missing = await fetch(`${h.url}/api/console/board/run/${encodeURIComponent(workflowSlug)}/does-not-exist/queue`);
+    assert.equal(missing.status, 404);
+    const mismatch = await fetch(`${h.url}/api/console/board/run/${encodeURIComponent(workflowSlug)}/run-other-workflow/queue`);
+    assert.equal(mismatch.status, 404);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/board/run/:slug/:runId/queue narrows TRY runs to the target step', async () => {
+  const workflowSlug = 'board-queue-target-step';
+  const workflowName = 'Board Queue Target Step';
+  const runId = 'run-target-step';
+  writeWorkflow(workflowSlug, {
+    name: workflowName,
+    description: 'target-step queue test',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'first', prompt: 'First step.' },
+      { id: 'only_this', prompt: 'Try only this step.', dependsOn: ['first'] },
+      { id: 'last', prompt: 'Last step.', dependsOn: ['only_this'] },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'running',
+    targetStepId: 'only_this',
+    createdAt: '2026-06-24T14:20:00.000Z',
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'only_this' });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board/run/${encodeURIComponent(workflowSlug)}/${runId}/queue`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { steps: Array<{ stepId: string; status: string }> };
+    assert.deepEqual(body.steps.map((step) => step.stepId), ['only_this']);
+    assert.equal(body.steps[0]?.status, 'running');
+  } finally {
+    await h.close();
+  }
+});
+
 test('workflow failed-item recovery endpoints list and requeue only final failed forEach items', async () => {
   const workflowName = 'Failed Item Recovery';
   const workflowSlug = 'failed-item-recovery';

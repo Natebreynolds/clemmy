@@ -12,6 +12,7 @@ import { BudgetsForm } from './advanced/BudgetsForm';
 import { AutonomyForm } from './advanced/AutonomyForm';
 import { DiagnosticsView } from './advanced/DiagnosticsView';
 import { EvolutionView } from './advanced/EvolutionView';
+import { ObservabilityView } from './advanced/ObservabilityView';
 import { DeveloperFlags } from './advanced/DeveloperFlags';
 
 function Usage() {
@@ -110,6 +111,7 @@ export function Advanced() {
     case 'usage': return <Usage />;
     case 'tools': return <Tools />;
     case 'diagnostics': return <DiagnosticsView />;
+    case 'observability': return <ObservabilityView />;
     case 'budgets': return <BudgetsForm />;
     case 'autonomy': return <AutonomyForm />;
     case 'evolution': return <EvolutionView />;

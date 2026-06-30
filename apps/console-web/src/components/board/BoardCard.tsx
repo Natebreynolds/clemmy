@@ -11,7 +11,8 @@ import { cn } from '@/lib/cn';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { relativeTime } from '@/lib/inbox';
-import { cardTone, sourceLabel, type BoardButtonIntent, type BoardCard as BoardCardT } from '@/lib/board';
+import { cardTone, sourceLabel, runQueueRef, type BoardButtonIntent, type BoardCard as BoardCardT } from '@/lib/board';
+import { RunQueue } from './RunQueue';
 
 const dragActions = new Set(['cancel', 'resume', 'promote']);
 
@@ -93,6 +94,30 @@ export function BoardCard({
       {card.nextSafeAction && (
         <p className="mt-2 line-clamp-2 text-caption text-faint">{card.nextSafeAction}</p>
       )}
+
+      {card.contentPreview && (card.contentPreview.body || card.contentPreview.imageUrl) && (
+        <div className="mt-2 overflow-hidden rounded-md border border-border bg-subtle">
+          {card.contentPreview.imageUrl && (
+            <img
+              src={card.contentPreview.imageUrl}
+              alt="Draft post image"
+              className="max-h-44 w-full object-cover"
+              loading="lazy"
+              onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+            />
+          )}
+          {card.contentPreview.body && (
+            <p className="whitespace-pre-wrap px-2.5 py-2 text-caption text-fg line-clamp-[8]">
+              {card.contentPreview.body}
+            </p>
+          )}
+        </div>
+      )}
+
+      {(() => {
+        const ref = runQueueRef(card);
+        return ref ? <RunQueue slug={ref.slug} runId={ref.runId} /> : null;
+      })()}
 
       <div className="mt-2.5 flex items-center justify-between gap-2">
         <StatusPill tone={tone.tone}>

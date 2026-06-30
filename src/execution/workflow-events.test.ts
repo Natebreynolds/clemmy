@@ -28,8 +28,10 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-events-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listFinalFailedItems, listPendingRuns, reapRunEventDir } =
+const { appendWorkflowEvent, readWorkflowEvents, computeResumeState, listFinalFailedItems, listPendingRuns, reapRunEventDir, reconstructWorkflowRunQueue } =
   await import('./workflow-events.js');
+type TestStep = { id: string; prompt: string; forEach?: string; dependsOn?: string[] };
+const asSteps = (s: TestStep[]): Parameters<typeof reconstructWorkflowRunQueue>[2] => s as unknown as Parameters<typeof reconstructWorkflowRunQueue>[2];
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 
@@ -39,12 +41,143 @@ function cleanup(): void {
 
 test.after(() => cleanup());
 
+test('reconstructWorkflowRunQueue: done/running/blocked + forEach progress from the durable log (queue visibility)', () => {
+  const wf = 'queue-vis'; const run = 'q1';
+  const steps = asSteps([
+    { id: 's1', prompt: 'check Instagram for followers' },
+    { id: 's2', prompt: 'draft posts', forEach: 'items', dependsOn: ['s1'] },
+    { id: 's3', prompt: 'compile report', dependsOn: ['s2'] },
+  ]);
+  appendWorkflowEvent(wf, run, { kind: 'run_started' });
+  appendWorkflowEvent(wf, run, { kind: 'step_started', stepId: 's1' });
+  appendWorkflowEvent(wf, run, { kind: 'step_completed', stepId: 's1' });
+  appendWorkflowEvent(wf, run, { kind: 'step_started', stepId: 's2' });
+  for (const k of ['a', 'b', 'c']) appendWorkflowEvent(wf, run, { kind: 'item_started', stepId: 's2', itemKey: k });
+  appendWorkflowEvent(wf, run, { kind: 'item_completed', stepId: 's2', itemKey: 'a' });
+  appendWorkflowEvent(wf, run, { kind: 'item_completed', stepId: 's2', itemKey: 'b' });
+
+  const q = reconstructWorkflowRunQueue(wf, run, steps);
+  assert.equal(q.totalCount, 3);
+  assert.equal(q.doneCount, 1);
+  const by = Object.fromEntries(q.steps.map((s) => [s.stepId, s]));
+  assert.equal(by.s1.status, 'done');
+  assert.equal(by.s1.title, 'check Instagram for followers');   // human label from prompt
+  assert.equal(by.s2.status, 'running');
+  assert.equal(by.s2.kind, 'forEach');
+  assert.equal(by.s2.itemsDone, 2);   // a, b completed
+  assert.equal(by.s2.itemsTotal, 3);  // a, b, c started
+  assert.equal(by.s3.status, 'blocked'); // s2 not done yet
+  assert.equal(q.nextStepId, null); // s2 running, s3 blocked → nothing READY
+});
+
+test('operational telemetry bridge: legacy step_*/approval_* kinds mirror into operational events (Phase A observability)', async () => {
+  const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
+  const wf = 'otel-bridge'; const run = 'otel-run-1';
+  appendWorkflowEvent(wf, run, { kind: 'step_started', stepId: 'a' });
+  appendWorkflowEvent(wf, run, { kind: 'step_completed', stepId: 'a' });
+  appendWorkflowEvent(wf, run, { kind: 'step_failed', stepId: 'b', error: 'boom' });
+  appendWorkflowEvent(wf, run, { kind: 'approval_requested', stepId: 'c' });
+  appendWorkflowEvent(wf, run, { kind: 'transcript_chunk', stepId: 'd' }); // streaming UI noise — must NOT mirror
+
+  const events = listOperationalEvents({ workflowRunId: run, limit: 100 });
+  const types = new Set(events.map((e) => e.type));
+  // legacy lifecycle → operational taxonomy
+  assert.ok(types.has('workflow_node_started'), 'step_started → workflow_node_started');
+  assert.ok(types.has('workflow_node_completed'), 'step_completed → workflow_node_completed');
+  assert.ok(types.has('workflow_node_failed'), 'step_failed → workflow_node_failed');
+  assert.ok(types.has('approval_required'), 'approval_requested → approval_required');
+  // transcript_chunk is neither mapped nor an operational type → dropped
+  assert.ok(!events.some((e) => (e.payload as { stepId?: string } | undefined)?.stepId === 'd'));
+  // source + severity mapping
+  assert.equal(events.find((e) => e.type === 'approval_required')?.source, 'safety');
+  const failed = events.find((e) => e.type === 'workflow_node_failed');
+  assert.equal(failed?.source, 'workflow');
+  assert.equal(failed?.severity, 'error');
+});
+
+test('reconstructWorkflowRunQueue: the next ready step is flagged isNext (what Clem does next)', () => {
+  const wf = 'queue-next'; const run = 'n1';
+  const steps = asSteps([
+    { id: 'a', prompt: 'scrape competitors' },
+    { id: 'b', prompt: 'draft the post', dependsOn: ['a'] },
+  ]);
+  appendWorkflowEvent(wf, run, { kind: 'step_started', stepId: 'a' });
+  appendWorkflowEvent(wf, run, { kind: 'step_completed', stepId: 'a' });
+  const q = reconstructWorkflowRunQueue(wf, run, steps);
+  const by = Object.fromEntries(q.steps.map((s) => [s.stepId, s]));
+  assert.equal(by.a.status, 'done');
+  assert.equal(by.b.status, 'queued');
+  assert.equal(by.b.isNext, true);
+  assert.equal(q.nextStepId, 'b');
+});
+
+test('reconstructWorkflowRunQueue: skipped no-op steps satisfy downstream dependencies', () => {
+  const wf = 'queue-skipped'; const run = 'skip1';
+  const steps = asSteps([
+    { id: 'empty_fanout', prompt: 'process any new rows', forEach: 'rows' },
+    { id: 'summarize', prompt: 'summarize the run', dependsOn: ['empty_fanout'] },
+  ]);
+  appendWorkflowEvent(wf, run, { kind: 'step_started', stepId: 'empty_fanout' });
+  appendWorkflowEvent(wf, run, { kind: 'step_skipped', stepId: 'empty_fanout', meta: { reason: 'forEach-empty' } });
+
+  const state = computeResumeState(wf, run);
+  assert.equal(state.completedSteps.has('empty_fanout'), true, 'resume replay treats skipped as complete');
+  assert.deepEqual(state.completedSteps.get('empty_fanout'), [], 'older empty forEach skip logs replay as []');
+  const q = reconstructWorkflowRunQueue(wf, run, steps);
+  const by = Object.fromEntries(q.steps.map((s) => [s.stepId, s]));
+  assert.equal(by.empty_fanout.status, 'done');
+  assert.equal(by.summarize.status, 'queued');
+  assert.equal(q.nextStepId, 'summarize');
+});
+
+test('reconstructWorkflowRunQueue: completed forEach steps with final failed items stay failed', () => {
+  const wf = 'queue-failed-items'; const run = 'fail1';
+  const steps = asSteps([
+    { id: 'pull', prompt: 'pull rows' },
+    { id: 'send', prompt: 'send each row', forEach: 'pull', dependsOn: ['pull'] },
+    { id: 'report', prompt: 'report results', dependsOn: ['send'] },
+  ]);
+  appendWorkflowEvent(wf, run, { kind: 'step_started', stepId: 'pull' });
+  appendWorkflowEvent(wf, run, { kind: 'step_completed', stepId: 'pull', output: ['a', 'b'] });
+  appendWorkflowEvent(wf, run, { kind: 'step_started', stepId: 'send' });
+  appendWorkflowEvent(wf, run, { kind: 'item_started', stepId: 'send', itemKey: 'a' });
+  appendWorkflowEvent(wf, run, { kind: 'item_completed', stepId: 'send', itemKey: 'a', output: 'ok-a' });
+  appendWorkflowEvent(wf, run, { kind: 'item_started', stepId: 'send', itemKey: 'b' });
+  appendWorkflowEvent(wf, run, { kind: 'item_failed', stepId: 'send', itemKey: 'b', error: 'still failed' });
+  appendWorkflowEvent(wf, run, { kind: 'step_completed', stepId: 'send', output: [{ itemKey: 'a', output: 'ok-a' }] });
+
+  const q = reconstructWorkflowRunQueue(wf, run, steps);
+  const by = Object.fromEntries(q.steps.map((s) => [s.stepId, s]));
+  assert.equal(by.send.status, 'failed');
+  assert.equal(by.send.itemsDone, 1);
+  assert.equal(by.send.itemsTotal, 2);
+  assert.equal(by.send.itemsFailed, 1);
+  assert.equal(by.report.status, 'queued', 'completed step output still satisfies downstream dependencies');
+  assert.equal(q.doneCount, 1);
+});
+
 test('append + read round-trips one event', () => {
   appendWorkflowEvent('round-trip', 'r1', { kind: 'run_started' });
   const events = readWorkflowEvents('round-trip', 'r1');
   assert.equal(events.length, 1);
   assert.equal(events[0].kind, 'run_started');
   assert.ok(events[0].t.match(/^\d{4}-\d{2}-\d{2}T/), 'has ISO timestamp');
+});
+
+test('append + read round-trips workflow graph telemetry events', () => {
+  appendWorkflowEvent('graph-round-trip', 'r1', {
+    kind: 'workflow_branch_evaluated',
+    stepId: 'decide',
+    meta: {
+      graphId: 'graph-1',
+      nodeId: 'decide',
+      selectedEdgeIds: ['condition:decide->send'],
+    },
+  });
+  const events = readWorkflowEvents('graph-round-trip', 'r1');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, 'workflow_branch_evaluated');
+  assert.deepEqual(events[0].meta?.selectedEdgeIds, ['condition:decide->send']);
 });
 
 test('append preserves event order across many writes', () => {

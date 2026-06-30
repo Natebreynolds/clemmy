@@ -55,7 +55,7 @@ import {
 } from '../memory/workflow-store.js';
 import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
 import { extractArchitectDiff } from './architect-diff.js';
-import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents } from '../execution/workflow-events.js';
+import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents, reconstructWorkflowRunQueue } from '../execution/workflow-events.js';
 import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
@@ -215,7 +215,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
-import { respondPreferHarness, recoverChatBrainFailure } from '../runtime/harness/respond-bridge.js';
+import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from '../runtime/harness/claude-agent-brain.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
@@ -244,7 +244,13 @@ import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
 import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJudgeAvailable, readRecentDebateTraces } from '../runtime/harness/debate-model.js';
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
-import { summarizeApprovalAction } from '../runtime/approval-summary.js';
+import { summarizeApprovalAction, extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
+import {
+  listOperationalEvents,
+  isOperationalEventType,
+  type ListOperationalEventsOptions,
+  type OperationalEventSource,
+} from '../runtime/operational-telemetry.js';
 import {
   appendRecallTranscriptSegment,
   buildAnalyzerPrompt,
@@ -967,6 +973,13 @@ function readWorkflowRunRecords(): WorkflowRunRecordSummary[] {
   return records;
 }
 
+function readWorkflowRunRecord(runId: string): WorkflowRunRecordSummary | null {
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  return normalizeWorkflowRunRecord(raw);
+}
+
 function expandCronField(field: string, min: number, max: number): number[] | null {
   const values = new Set<number>();
   const addRange = (start: number, end: number, step = 1): boolean => {
@@ -1203,6 +1216,9 @@ interface BoardCard {
   continueMode?: BoardContinueMode;
   approvalId?: string;
   nextSafeAction?: string;
+  /** Slice 2: the draft body + image of a CONTENT approval (a post/email), so it
+   *  is reviewed in place in the Approvals card instead of a one-line summary. */
+  contentPreview?: ApprovalContentPreview;
   artifactSummary?: BoardArtifactSummary;
   failureSummary?: BoardFailureSummary;
   /** A finished/parked task idle past the stale threshold (background only) — the
@@ -5908,6 +5924,7 @@ export function registerConsoleRoutes(
           summary: approvalSummaryFromArgs(r.args ?? undefined, r.subject),
           reason: approvalReasonFromArgs(r.args ?? undefined),
           preview,
+          contentPreview: extractApprovalContentPreview(r.tool, r.args ?? undefined),
           sourceTitle: undefined as string | undefined,
           sourceKind: undefined as string | undefined,
           tool: r.tool,
@@ -5989,6 +6006,37 @@ export function registerConsoleRoutes(
    * runs. Each card carries an `actions` allowlist the frontend uses to gate
    * drag-and-drop (a drop is a REQUEST for an action, never a status write).
    */
+  // Queue visibility: the SUB-TASK QUEUE of one workflow run — each step/forEach
+  // unit ("check followers", "draft post 3") with its status (done/running/
+  // failed/queued/blocked) + what runs next, reconstructed from the durable event
+  // log. Lets the Tasks board expand a campaign card into its real queue instead
+  // of one opaque "running" pill. Read-only; survives restarts.
+  app.get('/api/console/board/run/:slug/:runId/queue', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const slug = String(req.params.slug ?? '');
+      const runId = String(req.params.runId ?? '');
+      const entry = listWorkflows().find((e) => e.name === slug || e.data.name === slug);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+      const run = readWorkflowRunRecord(runId);
+      if (!run) { res.status(404).json({ error: 'workflow run not found' }); return; }
+      if (run.workflow !== entry.data.name && run.workflow !== entry.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      const steps = run.targetStepId
+        ? (entry.data.steps ?? []).filter((step) => step.id === run.targetStepId)
+        : (entry.data.steps ?? []);
+      if (run.targetStepId && steps.length === 0) {
+        res.status(404).json({ error: 'workflow run target step not found' });
+        return;
+      }
+      res.json(reconstructWorkflowRunQueue(entry.name, runId, steps));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/board', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -6202,6 +6250,7 @@ export function registerConsoleRoutes(
           nextSafeAction: isWorkflowApproval
             ? 'Approve or reject; the workflow runner resumes the parked step.'
             : 'Approve or reject; Clementine resumes the paused run.',
+          contentPreview: extractApprovalContentPreview(row.tool, row.args ?? undefined),
           raw: {
             approvalKind: 'harness',
             tool: row.tool,
@@ -6237,6 +6286,7 @@ export function registerConsoleRoutes(
           continueMode: 'approval',
           approvalId: approval.id,
           nextSafeAction: 'Approve or reject; Clementine resumes the paused runtime approval.',
+          contentPreview: extractApprovalContentPreview(approval.toolName, args),
           raw: { approvalKind: 'runtime', tool: approval.toolName, reason: approvalReasonFromArgs(args) },
         });
       }
@@ -7602,6 +7652,86 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * Operational telemetry query — the 100%-observability read API (Phase A).
+   * Returns the canonical operational_events (workflow/model/workspace/memory/
+   * safety/tool) filtered by source/type/workspace/run/session/since. Read-only;
+   * fail-open store. The dashboard observability panel + audits query this.
+   */
+  const OPERATIONAL_SOURCES: ReadonlySet<string> = new Set<OperationalEventSource>([
+    'workflow', 'model', 'workspace', 'memory', 'safety', 'tool', 'harness', 'scheduler',
+  ]);
+  app.get('/api/console/telemetry', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const q = req.query as Record<string, string | undefined>;
+      const opts: ListOperationalEventsOptions = {};
+      if (q.source && OPERATIONAL_SOURCES.has(q.source)) opts.source = q.source as OperationalEventSource;
+      if (q.type && isOperationalEventType(q.type)) opts.type = q.type;
+      if (q.workspaceId) opts.workspaceId = q.workspaceId;
+      if (q.workflowRunId) opts.workflowRunId = q.workflowRunId;
+      if (q.sessionId) opts.sessionId = q.sessionId;
+      if (q.since) opts.since = q.since;
+      const limitRaw = q.limit ? Number(q.limit) : NaN;
+      if (Number.isFinite(limitRaw)) opts.limit = Math.max(1, Math.min(limitRaw, 1000));
+      res.json({ events: listOperationalEvents(opts) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Operational telemetry live stream (SSE). Replays the most recent operational
+   * events on connect, then forwards every new `operational.event` from the
+   * action bus — the real-time operator view of tool calls, workflow node
+   * transitions, model routing, memory consolidation, and safety guards.
+   */
+  app.get('/api/console/telemetry/stream', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    let closed = false;
+    const writeEvent = (eventName: string, payload: unknown): void => {
+      if (closed || res.destroyed) return;
+      res.write(`event: ${eventName}\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    try {
+      const sourceFilter = typeof req.query.source === 'string' && OPERATIONAL_SOURCES.has(req.query.source)
+        ? (req.query.source as OperationalEventSource) : undefined;
+      // Replay oldest→newest so the client renders a forward-ordered timeline.
+      const replay = listOperationalEvents({ source: sourceFilter, limit: 50 }).reverse();
+      writeEvent('replay', replay);
+    } catch {
+      writeEvent('replay', []);
+    }
+
+    const unsubscribe = actionBus.subscribe((event) => {
+      if (event.kind !== 'operational.event') return;
+      writeEvent('operational.event', event);
+    });
+
+    const heartbeat = setInterval(() => {
+      if (closed || res.destroyed) return;
+      res.write(`: ping\n\n`);
+    }, 15_000);
+
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+  });
+
+  /**
    * Per-session harness event stream.
    *
    * Used by the desktop chat and the Discord bot to watch a long-
@@ -8548,24 +8678,18 @@ export function registerConsoleRoutes(
             onChunk: emitToken,
           };
           try {
-            await respondViaClaudeAgentSdkBrain('home', brainReq);
+            await respondPreferHarness('home', brainReq, (req) => respondViaClaudeAgentSdkBrain('home', req));
           } catch (err) {
-            // Unify the dock with the harness path: a terminal Claude failure
-            // (overload / unparseable tool call) with nothing harmful committed
-            // falls the turn over to the Codex/GLM brain instead of "Didn't finish".
-            const recovered = await recoverChatBrainFailure('home', brainReq, err).catch(() => null);
-            if (!recovered) {
-              appendHarnessEvent({
-                sessionId,
-                turn: 0,
-                role: 'system',
-                type: 'run_failed',
-                data: {
-                  error: err instanceof Error ? err.message : String(err),
-                  stage: 'claude_agent_sdk_brain',
-                },
-              });
-            }
+            appendHarnessEvent({
+              sessionId,
+              turn: 0,
+              role: 'system',
+              type: 'run_failed',
+              data: {
+                error: err instanceof Error ? err.message : String(err),
+                stage: 'respond_bridge',
+              },
+            });
           }
           return;
         }
