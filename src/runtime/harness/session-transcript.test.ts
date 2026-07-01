@@ -306,6 +306,29 @@ test('renderTranscriptTurns formats USER:/YOU: lines and trims long turns to 800
   assert.ok(!block.includes('x'.repeat(801)), 'trimmed to 800 chars + ellipsis');
 });
 
+test('renderTranscriptTurns NEUTRALIZES a tool-call-shaped ASSISTANT turn (kills the narration-replay loop)', () => {
+  // ROOT CAUSE (2026-07-01): a prior narrated reply must NOT replay as a YOU: exemplar the
+  // model then mimics. Both the within-session history and the cross-session prefix go through
+  // this one function, so this single filter covers every replay path.
+  const block = renderTranscriptTurns([
+    { who: 'user', text: 'whats on my calendar' },
+    { who: 'assistant', text: '{"tool_call":{"name":"composio_search_tools","arguments":{"query":"outlook calendar"}}}' },
+    { who: 'user', text: 'and tomorrow?' },
+    { who: 'assistant', text: '[Tool: OUTLOOK_OUTLOOK_GET_CALENDAR_VIEW]' },
+  ]);
+  // The raw tool-call syntax must be gone — replaced with a neutral marker.
+  assert.ok(!block.includes('tool_call'), 'the {"tool_call":…} JSON is not replayed');
+  assert.ok(!block.includes('[Tool:'), 'the [Tool: …] reference is not replayed');
+  assert.match(block, / {2}YOU: \(took a tool action\)/);
+  // A USER turn that merely mentions the words is untouched (only assistant turns are sanitized).
+  assert.match(block, / {2}USER: whats on my calendar$/m);
+  // A normal assistant turn is preserved verbatim.
+  assert.match(
+    renderTranscriptTurns([{ who: 'assistant', text: 'Your calendar today: 9am standup, 2pm client call.' }]),
+    / {2}YOU: Your calendar today: 9am standup, 2pm client call\.$/m,
+  );
+});
+
 test('empty session → no turns → empty block (brain no-history path is byte-identical)', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;

@@ -19,6 +19,7 @@ import {
 import { gatherSessionSkills } from './skill-execution.js';
 import { renderSkillsIndex } from '../../memory/skill-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine } from './context-packet.js';
+import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
 import { markRunInFlight } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
@@ -203,59 +204,17 @@ function finalChunkDelta(text: string, streamedText: string, streamedAny: boolea
  *  Detect the CLASS, not one format. Headers are line-anchored so a mid-sentence
  *  "…what each tool call does…" never trips it. */
 export function looksLikeToolNarration(text: string, toolUses: string[]): boolean {
+  // A REAL tool fired ⇒ this text is a legitimate reply, not narration.
   if (toolUses.length > 0) return false;
-  const t = (text || '').trim();
-  if (!t) return false;
-  return (
-    // "Tool: x", "Tool call: x", "**Tool call: x**", "Tool_call: x" at line start —
-    // ALSO when wrapped in a leading pseudo-tag the model hallucinates, e.g.
-    // "<system>Tool call: composio_search_tools — {…}</system>" (2026-06-30 live: a
-    // Workspace build + composio search + offer_background all narrated in this shape;
-    // the `<system>` prefix defeated the old line-anchored header). The optional
-    // `<tag>`/`</tag>` prefix keeps it line-anchored so mid-sentence prose never trips.
-    /(^|\n)\s*(?:<\/?[a-z][a-z0-9_-]*>\s*)?\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
-    // Bracketed tool reference the model prints as its answer: "[Tool: OUTLOOK_GET_…]",
-    // "[Calling tool X]", "[Using composio_execute_tool]" (2026-07-01 live: a Scorpion
-    // calendar turn on the Sonnet-5 brain answered with "[Tool: OUTLOOK_OUTLOOK_GET_CALENDAR_VIEW]").
-    /(^|\n)\s*\[\s*(?:tool|calling|using|invoking|call)\b[^\]]*\]/i.test(t) ||
-    // Tagged markers some models emit: "<tool_call>", "[tool_call]".
-    /(^|\n)\s*[<\[]\s*tool[\s_-]*call\b/i.test(t) ||
-    /(^|\n)\s*function\s*\n?\s*\{/.test(t) ||
-    /System:\s*tool result/i.test(t) ||
-    // A bare tool-call-shaped JSON payload (command / tool_slug / tool_name / arguments).
-    /(^|\n)\s*\{\s*"(command|tool_slug|tool_name|arguments)"\s*:/i.test(t) ||
-    // OpenAI/function-calling JSON the model PRINTS instead of invoking:
-    // `{"tool_call":{"name":"composio_search_tools","arguments":{…}}}` and the bare
-    // `{"name":"x","arguments":{…}}` / `"function":{"name":…}` shapes (2026-07-01 live:
-    // a Scorpion calendar turn on the Claude brain printed exactly this + fired no tool).
-    /"tool_call"\s*:\s*\{/i.test(t) ||
-    /"name"\s*:\s*"[a-z0-9_.-]+"\s*,\s*"arguments"\s*:/i.test(t) ||
-    /"function"\s*:\s*\{\s*"name"\s*:/i.test(t) ||
-    /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t)
-  );
+  return looksLikeToolCallShape(text);
 }
 
-/** Streaming-time guard: detect the UNAMBIGUOUS tool-call-protocol / native XML
- *  markers in the live text accumulated SO FAR, so the dock stops streaming the
- *  moment a delta starts reproducing tool-call XML (the noise that made raw
- *  streaming default-off). Unlike looksLikeToolNarration this takes no toolUses
- *  arg — mid-stream we don't yet know the final tool-call count — so it checks
- *  only the high-precision markers that are never legitimate prose, never the
- *  ambiguous bare-JSON shape. The authoritative final reply still delivers once. */
+/** Streaming-time guard: detect the tool-call-protocol markers in the live text
+ *  accumulated SO FAR, so the dock stops streaming the moment a delta starts reproducing
+ *  tool-call syntax. No toolUses arg (mid-stream the final count is unknown), so it uses the
+ *  streaming-safe subset of the shared shapes. The authoritative final reply still delivers. */
 export function looksLikeStreamingNarration(text: string): boolean {
-  const t = text || '';
-  if (!t) return false;
-  return (
-    /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t) ||
-    // Header form, incl. a leading hallucinated `<system>`/`<assistant>` wrapper tag
-    // (2026-06-30 live: "<system>Tool call: composio_search_tools — {…}</system>").
-    /(^|\n)\s*(?:<\/?[a-z][a-z0-9_-]*>\s*)?\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
-    /(^|\n)\s*[<[]\s*tool[\s_-]*call\b/i.test(t) ||
-    // Function-calling JSON printed as text (see looksLikeToolNarration) — suppress the
-    // stream so the raw `{"tool_call":{…}}` never reaches the bubble.
-    /"tool_call"\s*:\s*\{/i.test(t) ||
-    /"function"\s*:\s*\{\s*"name"\s*:/i.test(t)
-  );
+  return looksLikeToolCallShapeStreaming(text);
 }
 
 /** Detect the "reasoning-leak" failure: the brain verbalized its instruction-
@@ -1127,9 +1086,19 @@ export async function respondViaClaudeAgentSdkBrain(
     throw err;
   }
 
-  const text = result.limitHit
+  let text = result.limitHit
     ? renderLimitHitReply(result.text)
     : (result.text.trim() || '(no reply produced)');
+  // ROOT-CAUSE guard (2026-07-01 Scorpion-calendar): if the FINAL reply is itself SHAPED like
+  // a printed tool call — the model narrated instead of invoking, and the retry corrective
+  // didn't fix it (or `limitHit` short-circuited it) — do NOT show the user raw
+  // `{"tool_call":…}`/`[Tool: X]` and, critically, do NOT persist it as the durable reply
+  // (which would replay next turn as a `YOU:` exemplar and TEACH the model to keep narrating —
+  // the self-reinforcing loop). Replace with a neutral, honest fallback. Only when no real tool
+  // fired (a legitimate summary that mentions a tool is fine).
+  if (!result.limitHit && result.toolUses.length === 0 && looksLikeToolCallShape(text)) {
+    text = 'I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.';
+  }
   // Deliver only the missing final chunk. If the exact final already streamed,
   // avoid a double-render. If a judge/retry replaced the answer, append the
   // authoritative final reply so direct callers are not left with stale partial

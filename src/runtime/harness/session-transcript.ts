@@ -8,6 +8,7 @@
  * the brain's own prior turns with no schema change.
  */
 import { SessionStore } from '../../memory/session-store.js';
+import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import {
   getSession as getHarnessSession,
   listSessions as listHarnessSessions,
@@ -235,7 +236,15 @@ export function renderTranscriptTurns(turns: Array<{ who: 'user' | 'assistant'; 
   return turns
     .map((t) => {
       const label = t.who === 'user' ? 'USER' : 'YOU';
-      const trimmed = t.text.length > TURN_TRIM ? `${t.text.slice(0, TURN_TRIM)}…` : t.text;
+      // ROOT-CAUSE guard (2026-07-01): NEVER replay a prior ASSISTANT turn that is shaped like a
+      // printed tool call (`{"tool_call":…}`, `[Tool: X]`, `Tool call: …`). If narration ever
+      // slipped into a stored reply, echoing it here as a `YOU:` exemplar teaches the model to
+      // mimic the format — the self-reinforcing loop. Neutralize it (both this within-session
+      // path and the cross-session prefix go through here, so ONE filter covers every replay).
+      const safeText = t.who === 'assistant' && looksLikeToolCallShape(t.text)
+        ? '(took a tool action)'
+        : t.text;
+      const trimmed = safeText.length > TURN_TRIM ? `${safeText.slice(0, TURN_TRIM)}…` : safeText;
       return `  ${label}: ${trimmed}`;
     })
     .join('\n');
