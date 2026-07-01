@@ -119,20 +119,64 @@ test('gateway routes parked background question replies before any model run', a
     },
   } as never);
 
-  const response = await gateway.handleMessage({
+  // Step 1: the gateway does NOT silently apply the message — it CONFIRMS first, surfacing
+  // the parked task + its question, without running the model.
+  const ask = await gateway.handleMessage({
     message: 'healthcare only',
     sessionId: session.id,
     channel: 'mobile',
     source: 'mobile',
   });
+  assert.equal(respondCalled, false, 'no model run — the parked task is surfaced first');
+  assert.equal(ask.handledControl, true);
+  assert.match(ask.text, /background task "Segment prospects" is paused/);
+  assert.match(ask.text, /Which segment\?/, 'the parked question is shown');
+  assert.match(ask.text, /Reply \*\*yes\*\* to apply/);
+  // NOT applied yet — still awaiting the user's confirmation.
+  assert.equal(getBackgroundTask(task.id)?.status, 'awaiting_input');
+  assert.equal(getBackgroundTask(task.id)?.inputResolution, undefined);
 
+  // Step 2: the user confirms → the ORIGINAL message is applied as the answer.
+  const applied = await gateway.handleMessage({
+    message: 'yes',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+  });
   assert.equal(respondCalled, false);
-  assert.equal(response.handledControl, true);
-  assert.equal(response.queuedTaskId, task.id);
-  assert.match(response.text, /passed that to your background task "Segment prospects"/);
+  assert.equal(applied.handledControl, true);
+  assert.equal(applied.queuedTaskId, task.id);
+  assert.match(applied.text, /sent "healthcare only" to your background task/);
   const stored = getBackgroundTask(task.id);
   assert.equal(stored?.status, 'pending');
   assert.equal(stored?.inputResolution?.answer, 'healthcare only');
+});
+
+test('gateway parked reply: declining leaves the task paused and does NOT re-nag on the next message', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Decline path' });
+  const task = createBackgroundTask({
+    title: 'Segment prospects', prompt: 'finish segmenting', originSessionId: session.id, channel: 'mobile', source: 'mobile',
+  });
+  markBackgroundTaskAwaitingInput(task.id, 'q-decline', 'Which segment?');
+
+  let respondCalls = 0;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => { respondCalls += 1; return { text: 'foreground', sessionId: req.sessionId }; },
+  } as never);
+  const opts = { sessionId: session.id, channel: 'mobile' as const, source: 'mobile' as const };
+
+  // First unrelated message → asks to confirm.
+  const ask = await gateway.handleMessage({ message: 'what is the weather', ...opts });
+  assert.match(ask.text, /paused waiting on you/);
+  // Decline (a non-yes reply) → the task stays paused, the message is handled normally.
+  const declined = await gateway.handleMessage({ message: 'no, something else', ...opts });
+  assert.equal(declined.handledControl ?? false, false, 'decline falls through to the model');
+  assert.equal(respondCalls, 1, 'the declined message reached the foreground model');
+  assert.equal(getBackgroundTask(task.id)?.status, 'awaiting_input', 'task still parked');
+  // A FURTHER message must NOT re-nag about the same parked question.
+  const next = await gateway.handleMessage({ message: 'tell me a joke', ...opts });
+  assert.equal(next.handledControl ?? false, false, 'no re-ask for the already-declined question');
+  assert.equal(respondCalls, 2);
 });
 
 test('gateway bare continue prioritizes a parked background continuation', async () => {

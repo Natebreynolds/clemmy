@@ -210,16 +210,75 @@ function recordGatewayRoute(
   return route;
 }
 
+// A pending "apply your last message to the parked task?" confirmation, keyed by origin
+// session. In-memory + short TTL — a transient one-question handshake, safe to lose on
+// restart. We CONFIRM before routing a freeform message to a parked background task instead
+// of silently consuming it (the message the user typed might be unrelated to the task's
+// question). Cleared on answer/decline.
+interface PendingParkedApply {
+  questionId: string;
+  taskId: string;
+  taskTitle: string;
+  candidate: string;
+  at: number;
+}
+const pendingParkedApply = new Map<string, PendingParkedApply>();
+// Once the user declines to answer a specific parked question via chat, don't re-nag them
+// for THAT question on every subsequent message — only re-offer when the question changes.
+const declinedParkedQuestion = new Map<string, string>();
+const PARKED_CONFIRM_TTL_MS = 30 * 60_000;
+const PARKED_AFFIRM_RE = /^\/?(y|yes|yep|yeah|yup|sure|ok|okay|apply|apply it|send it|use (?:that|it)|do it|confirm|go ahead|please do)\b/i;
+
 function routeParkedBackgroundReply(request: GatewayRequest): GatewayResponse | null {
   const answer = request.message.trim();
+
+  // ── Step 2: a confirmation is already pending for this session ──────────────
+  const pending = pendingParkedApply.get(request.sessionId);
+  if (pending) {
+    const fresh = Date.now() - pending.at <= PARKED_CONFIRM_TTL_MS;
+    pendingParkedApply.delete(request.sessionId);
+    if (fresh && PARKED_AFFIRM_RE.test(answer)) {
+      // Confirmed → apply the ORIGINAL message (the candidate), not the "yes".
+      const stillParked = findSoleAwaitingInputTaskForOrigin(request.sessionId);
+      if (stillParked?.pendingQuestionId === pending.questionId) {
+        const queued = queueBackgroundTaskInputResolution(pending.questionId, pending.candidate);
+        declinedParkedQuestion.delete(request.sessionId);
+        return {
+          sessionId: request.sessionId,
+          handledControl: true,
+          queuedTaskId: queued?.id ?? pending.taskId,
+          text: `Done — I sent "${pending.candidate}" to your background task "${pending.taskTitle}". It's resuming and will report back here when it's finished.`,
+        };
+      }
+      // The task moved on between the ask and the confirm — fall through to normal handling.
+    } else if (fresh) {
+      // Not a confirmation → the user meant something else. Leave the task parked, remember
+      // they declined THIS question (so we don't re-ask every message), and handle their
+      // message normally (return null → the brain answers it).
+      declinedParkedQuestion.set(request.sessionId, pending.questionId);
+      return null;
+    }
+  }
+
+  // ── Step 1: a sole task is parked awaiting input → ASK before applying ───────
   const parkedTask = findSoleAwaitingInputTaskForOrigin(request.sessionId);
-  if (parkedTask?.pendingQuestionId) {
-    const queued = queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, answer);
+  if (
+    parkedTask?.pendingQuestionId
+    && declinedParkedQuestion.get(request.sessionId) !== parkedTask.pendingQuestionId
+  ) {
+    pendingParkedApply.set(request.sessionId, {
+      questionId: parkedTask.pendingQuestionId,
+      taskId: parkedTask.id,
+      taskTitle: parkedTask.title,
+      candidate: answer,
+      at: Date.now(),
+    });
+    const asked = parkedTask.pendingQuestion ? ` It asked: "${parkedTask.pendingQuestion}"` : '';
     return {
       sessionId: request.sessionId,
       handledControl: true,
-      queuedTaskId: queued?.id ?? parkedTask.id,
-      text: `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`,
+      queuedTaskId: parkedTask.id,
+      text: `Heads up — your background task "${parkedTask.title}" is paused waiting on you.${asked}\n\nWant me to send your message — "${answer}" — as the answer? Reply **yes** to apply it, or just tell me what you meant and I'll handle that instead (the task stays paused).`,
     };
   }
 
