@@ -361,6 +361,33 @@ test('listPendingRuns excludes runs with terminal queue-record status', () => {
   assert.ok(!flights.includes('queue-cancelled/r1'), 'cancelled queue record is not pending');
 });
 
+test('listPendingRuns excludes a FINISHED creation_test — the 2026-06-19 clem-smoke-flow zombies', () => {
+  // A creation_test is a one-shot workflow-shape validation that finishes immediately.
+  // It was NOT in the terminal set, so 9 of them (Jun 19) painted QUEUED / RUNNING=0
+  // and were re-"resumed" on every boot forever. A finished one must now be terminal.
+  appendWorkflowEvent('clem-smoke-zombie', 'ct1', { kind: 'run_started' });
+  appendWorkflowEvent('clem-smoke-zombie', 'ct1', { kind: 'step_started', stepId: 'echo_hello' });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, 'ct1.json'),
+    JSON.stringify({ id: 'ct1', workflow: 'clem-smoke-zombie', status: 'creation_test', finishedAt: '2026-06-19T07:06:36.601Z', output: 'creation test passed' }),
+    'utf-8',
+  );
+  // A FRESH creation_test (no finishedAt) is still resumable/pending — it only
+  // becomes terminal once it has finished, so the drain can still run a live one.
+  appendWorkflowEvent('clem-smoke-fresh', 'ct2', { kind: 'run_started' });
+  appendWorkflowEvent('clem-smoke-fresh', 'ct2', { kind: 'step_started', stepId: 'echo_hello' });
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, 'ct2.json'),
+    JSON.stringify({ id: 'ct2', workflow: 'clem-smoke-fresh', status: 'creation_test' }),
+    'utf-8',
+  );
+
+  const flights = listPendingRuns().map((p) => `${p.workflowName}/${p.runId}`);
+  assert.ok(!flights.includes('clem-smoke-zombie/ct1'), 'a finished creation_test is terminal, not pending');
+  assert.ok(flights.includes('clem-smoke-fresh/ct2'), 'a fresh (unfinished) creation_test still drains');
+});
+
 test('listPendingRuns returns empty when WORKFLOWS_DIR is empty', () => {
   // We don't reset the dir mid-suite, so this test exists mostly to
   // prove the function doesn't throw when called against a vault

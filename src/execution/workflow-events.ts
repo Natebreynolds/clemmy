@@ -541,8 +541,16 @@ function terminalRunRecordStatus(runId: string): boolean {
   // `return false`, which made every reaped run look permanently pending.
   if (!existsSync(file)) return true;
   try {
-    const raw = JSON.parse(readFileSync(file, 'utf-8')) as { status?: unknown };
-    return typeof raw.status === 'string' && TERMINAL_RUN_RECORD_STATUSES.has(raw.status);
+    const raw = JSON.parse(readFileSync(file, 'utf-8')) as { status?: unknown; finishedAt?: unknown };
+    if (typeof raw.status !== 'string') return false;
+    if (TERMINAL_RUN_RECORD_STATUSES.has(raw.status)) return true;
+    // A creation_test (workflow-shape validation) is a one-shot check, not a
+    // resumable run. Once it has FINISHED it must not resurface as pending/in-flight
+    // on the board or in the boot "Resuming N in-flight" loop — the 2026-06-19
+    // clem-smoke-flow zombies (9 finished creation_tests painted QUEUED / RUNNING=0,
+    // re-"resumed" every boot, never reaped because they aren't a terminal status).
+    if (raw.status === 'creation_test' && typeof raw.finishedAt === 'string') return true;
+    return false;
   } catch {
     return false;
   }

@@ -387,7 +387,10 @@ function enqueueScheduledRun(workflowName: string): void {
  * touched.
  */
 const RUN_RETENTION_DAYS = 7;
-const TERMINAL_STATUSES: ReadonlySet<string> = new Set(['completed', 'error', 'cancelled']);
+// creation_test / dry_run are one-shot validation runs — terminal once written, so
+// they age out on the same retention window instead of lingering forever (the
+// 2026-06-19 clem-smoke-flow creation_tests that piled up on the board).
+const TERMINAL_STATUSES: ReadonlySet<string> = new Set(['completed', 'error', 'cancelled', 'creation_test', 'dry_run']);
 
 export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return { scanned: 0, deleted: 0 };
