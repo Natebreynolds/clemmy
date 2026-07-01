@@ -11,6 +11,7 @@ import {
   listConnectedToolkits,
   listAllToolkits,
 } from '../integrations/composio/client.js';
+import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled } from '../integrations/composio/async-job.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier } from '../memory/tool-choice-store.js';
@@ -643,6 +644,16 @@ async function runComposioExecute(
         });
       } catch {
         // Outcome recording failure must never break tool execution
+      }
+
+      // ASYNC job-receipt awareness: a call can SUCCEED but only return a QUEUED
+      // RECEIPT (a DataForSEO task id, an Apify run handle) — NOT the result. Make
+      // that explicit with an id-bearing poll directive so the model fetches the
+      // real result instead of mistaking the receipt for the answer. Shape-detected;
+      // inert on a normal result. Kill-switch CLEMMY_COMPOSIO_ASYNC_RESOLVE.
+      if (!failure.failed && composioAsyncResolveEnabled()) {
+        const receipt = detectJobReceipt(toolSlug, result);
+        if (receipt) output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
       }
 
       // Only count/advise on SUCCESS — a failed call isn't "an item processed".
