@@ -36,6 +36,7 @@ import {
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
   ClaudeSdkProviderOverloadError,
+  ClaudeSdkContextOverflowError,
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
@@ -329,6 +330,17 @@ function maxTurns(): number {
   return Number.isFinite(raw) && raw >= 1 ? raw : 24;
 }
 
+/** A2 reduced-context retry: drop the query-recall block from a turn context.
+ *  Recall is re-derivable (the model can search memory); constraints, session
+ *  actions (the double-send guard) and continuation context are NOT — keep them. */
+function stripRecallFromTurnContext(turnContext: string | undefined): string | undefined {
+  if (!turnContext) return turnContext;
+  return turnContext
+    .split('\n\n')
+    .filter((block) => !block.startsWith('## Relevant To Your Request'))
+    .join('\n\n');
+}
+
 function toolProfileForMode(mode: ClaudeAgentBrainMode): ClaudeAgentSdkToolProfile {
   if (mode === 'full') return 'full';
   if (mode === 'local_authoring') return 'local_authoring';
@@ -556,7 +568,9 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
     try {
       const hits = await withTimeout(searchFactsHybridImpl(q, 6), queryRecallTimeoutMs(), []);
       const bullets = hits
-        .map((f) => `- ${String(f.content ?? '').trim()}`)
+        // 500-char per-bullet bound: recall content is injected every turn
+        // and was one of the last unbounded context inputs on this lane.
+        .map((f) => `- ${String(f.content ?? '').trim().slice(0, 500)}`)
         .filter((l) => l.length > 2)
         .join('\n');
       if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
@@ -895,6 +909,27 @@ export async function respondViaClaudeAgentSdkBrain(
         }
         throw err; // committed but no external write to salvage — surface for the caller
       }
+      // A2: context-window overflow (typed by the SDK wrapper). Committed ⇒
+      // salvage an honest partial exactly like the overload branch (NEVER
+      // re-run — would double-act). Uncommitted ⇒ ONE retry with reduced
+      // context: recall dropped, prior turns halved to the last 2 — but the
+      // session-actions block KEPT (it is the double-send guard).
+      if (claudeSdkSalvageEnabled() && err instanceof ClaudeSdkContextOverflowError) {
+        if (err.committed) {
+          const salvagedOverflow = salvageCommittedResult(sessionId);
+          if (salvagedOverflow) {
+            try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_salvaged', reason: 'context_overflow_after_commit' } }); } catch { /* best-effort */ }
+            return salvagedOverflow;
+          }
+          throw err;
+        }
+        try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_overflow_retry', reason: 'context_overflow_reduced_retry' } }); } catch { /* best-effort */ }
+        return await runClaudeAgentSdkImpl({
+          ...opts,
+          priorTurns: opts.priorTurns?.slice(-2),
+          turnContext: stripRecallFromTurnContext(opts.turnContext),
+        });
+      }
       if (!claudeSdkSalvageEnabled() || !isClaudeSdkUnparseableToolCall(err)) throw err;
       const salvaged = salvageCommittedResult(sessionId);
       if (salvaged) {
@@ -1067,6 +1102,23 @@ export async function respondViaClaudeAgentSdkBrain(
           return `\n\nThese are the skill procedure(s) you loaded earlier this run (their content is not in this fresh context) — FOLLOW them for the remaining work; you do NOT need to skill_read again:\n${bodies}\n`;
         } catch { return ''; }
       })();
+      // A3 recall ledger: continuations run in FRESH context (tool RESULTS from
+      // earlier segments are lost) — hand the model each earlier call's id so it
+      // can tool_output_query(callId) the stored result instead of re-fetching.
+      // Lossless-recall parity with the Codex lane's clip stubs.
+      let continuationLedger = [...(result.toolCallLedger ?? [])];
+      const renderLedger = (): string => {
+        if (continuationLedger.length === 0) return '';
+        const lines: string[] = [];
+        let bytes = 0;
+        for (const entry of continuationLedger) {
+          const line = `- ${entry.name} [${entry.callId}] ${entry.argsPreview}`;
+          bytes += line.length + 1;
+          if (bytes > 4000) { lines.push(`- …(+${continuationLedger.length - lines.length} more calls)`); break; }
+          lines.push(line);
+        }
+        return `\n\nTool calls you already made this run (their FULL results are stored — pull any of them with tool_output_query("<call id>") instead of re-running the tool):\n${lines.join('\n')}\n`;
+      };
       while (
         result.limitHit
         && result.toolUses.length > 0
@@ -1076,13 +1128,14 @@ export async function respondViaClaudeAgentSdkBrain(
         const progress = (result.text || '').trim().slice(0, 1500);
         const cont = await runContinuation({
           prompt:
-            `You hit the per-turn tool budget but the task is NOT finished. Your progress so far:\n${progress}${reinjectedSkills}\n\n`
+            `You hit the per-turn tool budget but the task is NOT finished. Your progress so far:\n${progress}${reinjectedSkills}${renderLedger()}\n\n`
             + `Continue from where you left off and FINISH ALL remaining items from the original request: "${request.message}". `
             + `Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.`,
           ...cleanContinuationRunOptions(),
         });
         autoContinues += 1;
         if (!cont) break; // a parse stumble on a continuation → keep the prior partial
+        continuationLedger = [...continuationLedger, ...(cont.toolCallLedger ?? [])];
         result = { ...cont, toolUses: [...result.toolUses, ...cont.toolUses] };
         try {
           appendEvent({ sessionId, turn: 0, role: 'system', type: 'sdk_auto_continue', data: { attempt: autoContinues, stillLimited: Boolean(cont.limitHit) } });

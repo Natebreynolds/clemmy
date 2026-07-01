@@ -161,6 +161,13 @@ export function renderFocusForInstructions(): string {
 }
 
 const CONSTRAINTS_SHOWN = 20;
+// Per-line bound for injected memory content (recall bullets, constraint
+// bodies). A single runaway fact must not blow the volatile context tail.
+const CONTEXT_LINE_MAX_CHARS = 500;
+function clipContextLine(text: string): string {
+  const t = text.trim();
+  return t.length <= CONTEXT_LINE_MAX_CHARS ? t : `${t.slice(0, CONTEXT_LINE_MAX_CHARS - 1)}…`;
+}
 function renderActiveConstraints(): string {
   try {
     // listConstraints() (no arg) returns ALL active constraints — the same set
@@ -171,7 +178,7 @@ function renderActiveConstraints(): string {
     const all = listConstraints();
     if (all.length === 0) return '';
     const shown = all.slice(0, CONSTRAINTS_SHOWN);
-    let out = shown.map((c) => `- ${c.content}`).join('\n');
+    let out = shown.map((c) => `- ${clipContextLine(String(c.content ?? ''))}`).join('\n');
     if (all.length > shown.length) {
       out += `\n_(+${all.length - shown.length} more standing constraints are ACTIVE and ENFORCED on tool dispatch, not all shown here.)_`;
     }
@@ -372,7 +379,7 @@ export function renderHarnessMemoryContext(opts?: {
   if (recallQuery && queryRecallEnabled()) {
     try {
       const hits = searchFactsByText(recallQuery, QUERY_RECALL_LIMIT);
-      if (hits.length > 0) requestRecall = hits.map((f) => `- ${String(f.content ?? '').trim()}`).filter((l) => l.length > 2).join('\n');
+      if (hits.length > 0) requestRecall = hits.map((f) => `- ${clipContextLine(String(f.content ?? ''))}`).filter((l) => l.length > 2).join('\n');
     } catch { requestRecall = ''; }
   }
 

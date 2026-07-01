@@ -23,6 +23,7 @@ import { buildGatedToolPermission } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
+import { appendEvent } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 
@@ -67,6 +68,26 @@ export class ClaudeSdkProviderOverloadError extends Error {
     super(message);
     this.name = 'ClaudeSdkProviderOverloadError';
   }
+}
+
+/** The SDK child ran out of context window (prompt-too-long / context-length
+ *  error). No distinct SDK subtype exists — it arrives as a generic
+ *  error_during_execution result or a thrown stream error, which previously hit
+ *  the raw `throw` and killed the run unsalvaged. `committed` mirrors
+ *  ClaudeSdkProviderOverloadError: true ⇒ side effects landed, callers must
+ *  salvage (never re-run); false ⇒ one reduced-context retry is safe. */
+export class ClaudeSdkContextOverflowError extends Error {
+  readonly contextOverflow = true;
+  constructor(message: string, readonly committed: boolean) {
+    super(message);
+    this.name = 'ClaudeSdkContextOverflowError';
+  }
+}
+
+const CONTEXT_OVERFLOW_RE = /prompt is too long|context (window|length|limit)|input.{0,40}exceeds|exceeds.{0,40}context|too many total (text )?bytes/i;
+
+export function isContextOverflowMessage(msg: string): boolean {
+  return CONTEXT_OVERFLOW_RE.test(msg);
 }
 
 export class ClaudeAgentSdkToolSurfaceError extends Error {
@@ -501,6 +522,63 @@ function emitSdkToolCallEvent(
   } catch { /* observability must never break the SDK run */ }
 }
 
+/** Context-compaction signals the SDK's child process relays as stream messages.
+ *  The wrapper previously dropped these — a long run could compact (or fail to)
+ *  with ZERO harness-visible trace, so "is context holding the model back?" was
+ *  unanswerable. Shape per @anthropic-ai/claude-agent-sdk: SDKCompactBoundaryMessage
+ *  (subtype 'compact_boundary') and SDKStatusMessage (subtype 'status',
+ *  compact_result/'compact_error' on completion). */
+function extractCompactionSignal(message: unknown):
+  | { kind: 'boundary'; trigger: string; preTokens: number; postTokens: number | null; durationMs: number | null }
+  | { kind: 'failed'; error: string }
+  | null {
+  const m = message as { type?: string; subtype?: string; compact_metadata?: Record<string, unknown>; compact_result?: string; compact_error?: string };
+  if (m?.type !== 'system') return null;
+  if (m.subtype === 'compact_boundary') {
+    const meta = m.compact_metadata ?? {};
+    return {
+      kind: 'boundary',
+      trigger: typeof meta.trigger === 'string' ? meta.trigger : 'auto',
+      preTokens: numeric(meta.pre_tokens),
+      postTokens: meta.post_tokens === undefined ? null : numeric(meta.post_tokens),
+      durationMs: meta.duration_ms === undefined ? null : numeric(meta.duration_ms),
+    };
+  }
+  if (m.subtype === 'status' && m.compact_result === 'failed') {
+    return { kind: 'failed', error: m.compact_error ?? 'unknown' };
+  }
+  return null;
+}
+
+/** Log a compaction signal to the session eventlog (mirror of the Codex lane's
+ *  condenser_applied) so the operator view can see the SDK managed its context. */
+function emitSdkCompactionEvent(sessionId: string | undefined, signal: NonNullable<ReturnType<typeof extractCompactionSignal>>): void {
+  if (!sessionId) return;
+  try {
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'system',
+      type: signal.kind === 'boundary' ? 'sdk_compact_boundary' : 'sdk_compact_failed',
+      data: signal.kind === 'boundary'
+        ? { trigger: signal.trigger, preTokens: signal.preTokens, postTokens: signal.postTokens, durationMs: signal.durationMs, transport: 'claude_agent_sdk' }
+        : { error: signal.error, transport: 'claude_agent_sdk' },
+    });
+  } catch { /* observability must never break the SDK run */ }
+}
+
+/** Largest advertised context window across the models this result used —
+ *  utilization against it is the "how close to the cliff" health signal. */
+function contextWindowFromResult(result: SDKResultMessage | null): number | null {
+  const modelUsage = (result as { modelUsage?: Record<string, unknown> } | null)?.modelUsage;
+  if (!modelUsage || typeof modelUsage !== 'object') return null;
+  let max = 0;
+  for (const raw of Object.values(modelUsage)) {
+    max = Math.max(max, numeric((raw as Record<string, unknown>).contextWindow));
+  }
+  return max > 0 ? max : null;
+}
+
 function mcpToolTail(toolName: string): string {
   return toolName.split('__').at(-1) ?? toolName;
 }
@@ -617,6 +695,10 @@ export interface ClaudeAgentSdkRunResult {
   limitHit?: boolean;
   /** Typed stop reason for non-successful-but-non-error terminal states. */
   stoppedReason?: RunStoppedReason;
+  /** A3 recall ledger: every tool call this run with its callId, so an
+   *  auto-continue (fresh context — tool RESULTS are lost) can pull earlier
+   *  results via tool_output_query(callId) instead of re-fetching. */
+  toolCallLedger?: Array<{ callId: string; name: string; argsPreview: string }>;
 }
 
 function extractAssistantToolUses(message: SDKMessage): string[] {
@@ -831,6 +913,7 @@ function recordClaudeAgentSdkUsage(
     const totals = usageTotalsFromResult(result);
     if (!totals) return;
     const responseId = (result as { uuid?: unknown } | null)?.uuid;
+    const contextWindowTokens = contextWindowFromResult(result);
     recordModelUsage({
       sessionId: options.sessionId?.trim() || result?.session_id || init?.session_id || 'unknown',
       model: init?.model || options.modelId || 'claude-agent-sdk',
@@ -840,6 +923,12 @@ function recordClaudeAgentSdkUsage(
       totalTokens: totals.totalTokens,
       durationMs: numeric((result as { duration_ms?: unknown } | null)?.duration_ms),
       responseId: typeof responseId === 'string' ? responseId : undefined,
+      ...(contextWindowTokens
+        ? {
+            contextWindowTokens,
+            windowUtilization: Math.round((totals.inputTokens / contextWindowTokens) * 1000) / 1000,
+          }
+        : {}),
     });
   } catch { /* observability must never break the SDK lane */ }
 }
@@ -921,6 +1010,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       excludeDynamicSections: true,
     },
     ...(options.outputSchema ? { outputFormat: { type: 'json_schema', schema: options.outputSchema } } : {}),
+    // With settingSources:[] no user/project settings load, so auto-compaction
+    // was default-dependent. Pin it ON explicitly: long agentic runs must
+    // compact rather than die at the context cliff. (managedSettings is the
+    // policy tier — nothing else is set, so this is a single-knob override.)
+    managedSettings: { autoCompactEnabled: true },
   };
 
   // CHAT multi-turn history: prepend the prior session turns as an authoritative
@@ -948,6 +1042,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   let result: SDKResultMessage | null = null;
   let init: SDKSystemMessage | null = null;
   let toolUses: string[] = [];
+  const toolCallLedger: Array<{ callId: string; name: string; argsPreview: string }> = [];
   // Learning OUT (brain continuity). The Agent SDK runs its tool loop OUTSIDE
   // the @openai/agents RunHooks, so the onToolEnd → scheduleReflection path the
   // Codex loop uses (hooks.ts) never fires here. Without this, a Claude
@@ -990,6 +1085,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     result = null;
     init = null;
     toolUses = [];
+    toolCallLedger.length = 0;
     lastAssistantText = '';
     streamedText = '';
     streamedAny = false;
@@ -1038,6 +1134,8 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         }
         const atext = extractAssistantText(message);
         if (atext) lastAssistantText = atext;
+        const compaction = extractCompactionSignal(message);
+        if (compaction) emitSdkCompactionEvent(options.sessionId, compaction);
         // Tool-call OBSERVABILITY (ungated from reflection): the Claude SDK runs
         // its tool loop OUTSIDE the harness gate chain, so local/authoring tools
         // (goal_create, task_add, memory_remember, …) called on this lane never
@@ -1048,6 +1146,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // on BOTH lanes (chat brain + workflow step share this runner). Fail-open.
         for (const use of extractToolUseIds(message)) {
           toolById.set(use.id, { name: use.name, input: use.input });
+          try {
+            toolCallLedger.push({
+              callId: use.id,
+              name: mcpToolTail(use.name),
+              argsPreview: JSON.stringify(use.input ?? {}).slice(0, 120),
+            });
+          } catch { /* ledger is best-effort */ }
           emitSdkToolCallEvent(options.sessionId, 'tool_call_started', use.id, use.name);
         }
         toolUses.push(...extractAssistantToolUses(message));
@@ -1089,6 +1194,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // Give up — surface a TYPED error so a caller that can switch providers
         // re-dispatches when it's safe (committed=false), else surfaces it.
         throw new ClaudeSdkProviderOverloadError(msg, committed);
+      } else if (isContextOverflowMessage(msg)) {
+        // Context-window overflow surfaced as a thrown stream error. TYPED so the
+        // brain can salvage (committed) or retry once with reduced context.
+        throw new ClaudeSdkContextOverflowError(msg, toolUses.length > 0 || streamedAny);
       } else {
         throw err;
       }
@@ -1115,6 +1224,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       sessionId: result?.session_id ?? init?.session_id,
       model: init?.model,
       toolUses,
+      toolCallLedger,
       usage: result?.usage,
       modelUsage: result?.modelUsage,
       limitHit: false,
@@ -1129,6 +1239,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       sessionId: result?.session_id ?? init?.session_id,
       model: init?.model,
       toolUses,
+      toolCallLedger,
       usage: result?.usage,
       modelUsage: result?.modelUsage,
       limitHit: true,
@@ -1148,13 +1259,21 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         sessionId: result.session_id,
         model: init?.model,
         toolUses,
+        toolCallLedger,
         usage: result.usage,
         modelUsage: result.modelUsage,
         limitHit: true,
       };
     }
     recordClaudeAgentSdkUsage(options, result, init);
-    throw new Error(`Claude Agent SDK failed: ${JSON.stringify(result).slice(0, 800)}`);
+    const resultText = JSON.stringify(result);
+    if (isContextOverflowMessage(resultText)) {
+      // Overflow arrives as a generic error_during_execution result (no distinct
+      // SDK subtype) — previously this hit the raw throw below and the run died
+      // with no salvage. TYPED so the brain's salvage/reduced-retry path runs.
+      throw new ClaudeSdkContextOverflowError(resultText.slice(0, 800), toolUses.length > 0 || streamedAny);
+    }
+    throw new Error(`Claude Agent SDK failed: ${resultText.slice(0, 800)}`);
   }
   recordClaudeAgentSdkUsage(options, result, init);
   return {
@@ -1163,6 +1282,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     sessionId: result.session_id,
     model: init?.model,
     toolUses,
+    toolCallLedger,
     usage: result.usage,
     modelUsage: result.modelUsage,
   };

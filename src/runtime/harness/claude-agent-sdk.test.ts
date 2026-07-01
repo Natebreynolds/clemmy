@@ -885,3 +885,51 @@ test('buildScopedNativeMcpServers: an SEO turn attaches the native dataforseo MC
     invalidateMcpServerDiscoveryCache();
   }
 });
+
+test('runClaudeAgentSdk surfaces SDK compaction signals + context-window health (A1)', async () => {
+  const eventlog = await import('./eventlog.js');
+  const session = eventlog.createSession({ kind: 'chat' });
+  const sessionId = session.id;
+  setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages([
+    {
+      type: 'system', subtype: 'init', model: 'claude-opus-4-8', session_id: 'sdk-compact-1', uuid: 'u1',
+      apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(), tools: [], mcp_servers: [],
+      permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [],
+    } as any,
+    // The child process compacted its own context mid-run — previously dropped.
+    {
+      type: 'system', subtype: 'compact_boundary', session_id: 'sdk-compact-1', uuid: 'cb1',
+      compact_metadata: { trigger: 'auto', pre_tokens: 150_000, post_tokens: 40_000, duration_ms: 900 },
+    } as any,
+    // A FAILED compaction must be visible too (it predicts a context-cliff death).
+    {
+      type: 'system', subtype: 'status', session_id: 'sdk-compact-1', uuid: 'st1',
+      status: null, compact_result: 'failed', compact_error: 'summarizer unavailable',
+    } as any,
+    {
+      type: 'result', subtype: 'success', session_id: 'sdk-compact-1', uuid: 'compact-result-1',
+      result: 'ok', duration_ms: 20, duration_api_ms: 12, is_error: false, num_turns: 1,
+      stop_reason: 'end_turn', total_cost_usd: 0,
+      usage: { input_tokens: 100_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 50 },
+      modelUsage: { 'claude-opus-4-8': { inputTokens: 100_000, outputTokens: 50, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0, contextWindow: 200_000, maxOutputTokens: 32_000 } },
+      permission_denials: [],
+    } as any,
+  ], {})) as any);
+
+  await runClaudeAgentSdk({ prompt: 'long analysis', sessionId, modelId: 'claude-opus-4-8' });
+
+  const events = eventlog.listEvents(sessionId, {});
+  const boundary = events.find((e) => e.type === 'sdk_compact_boundary');
+  assert.ok(boundary, 'sdk_compact_boundary event appended');
+  assert.equal((boundary!.data as any).preTokens, 150_000);
+  assert.equal((boundary!.data as any).postTokens, 40_000);
+  assert.equal((boundary!.data as any).trigger, 'auto');
+  const failed = events.find((e) => e.type === 'sdk_compact_failed');
+  assert.ok(failed, 'sdk_compact_failed event appended');
+  assert.equal((failed!.data as any).error, 'summarizer unavailable');
+
+  const usage = usageLog.readUsageEventsForDate().filter((e) => e.source === sessionId);
+  assert.equal(usage.length, 1);
+  assert.equal((usage[0] as any).contextWindowTokens, 200_000);
+  assert.equal((usage[0] as any).windowUtilization, 0.5);
+});

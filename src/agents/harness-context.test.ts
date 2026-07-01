@@ -205,3 +205,28 @@ test('partition: stable EXCLUDES the volatile tail (Now / query recall / Current
 process.on('exit', () => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });
+
+test('recall + constraint lines are bounded: a runaway fact cannot blow the volatile context', () => {
+  resetMemoryDb();
+  const runaway = `Salesforce market leader schema notes: ${'z'.repeat(5_000)}`;
+  rememberFact({ kind: 'project', content: runaway });
+  rememberFact({ kind: 'constraint', content: `Always send from the approved sender. ${'c'.repeat(5_000)}` });
+  const ctx = renderHarnessMemoryContext({ query: 'salesforce market leader schema notes' });
+  // Only the sections A4 bounds per-line: query recall + standing constraints.
+  // (The Persistent Facts primer has its own TOTAL bound and allows longer lines.)
+  for (const section of ctx.split(/\n(?=## )/)) {
+    const title = section.split('\n', 1)[0] ?? '';
+    if (!/Relevant To Your Request|Standing Constraints/.test(title)) continue;
+    for (const line of section.split('\n').filter((l) => l.startsWith('- '))) {
+      assert.ok(line.length <= 520, `injected line bounded (got ${line.length} chars in "${title}")`);
+    }
+  }
+});
+
+test('recall + constraint lines under the bound are byte-identical (no clipping side effects)', () => {
+  resetMemoryDb();
+  const content = 'The daily-prospect-outreach workflow targets Salesforce Accounts owned by Nathan Reynolds.';
+  rememberFact({ kind: 'project', content });
+  const ctx = renderHarnessMemoryContext({ query: 'daily prospect outreach workflow salesforce' });
+  assert.ok(ctx.includes(`- ${content}`), 'short fact renders unmodified');
+});

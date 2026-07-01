@@ -228,6 +228,10 @@ function normalizeTranscriptText(text: string): string {
 }
 
 const TURN_TRIM = 800;
+// Cross-session continuation prefixes ride into EVERY turn's context on the
+// Claude SDK lane — bound them (they were the last unbounded context input).
+const CROSS_SESSION_PREFIX_MAX_CHARS = 2000;
+const CROSS_SESSION_PREFIXES_TOTAL_MAX_CHARS = 6000;
 const ASYNC_OUTCOME_REPORT_BACK_RE = /^\[(?:background task|workflow run) [^\]\n]+ (?:completed|failed|blocked|needs input|needs attention)\]/i;
 
 /** Render prior turns as USER:/YOU: lines (per-turn 800-char trim). The caller
@@ -289,12 +293,14 @@ export function renderCrossSessionPrefixesForModel(
     const texts = rows.map((row) => {
       try {
         const data = JSON.parse(row.data_json) as { text?: unknown };
-        return typeof data.text === 'string' ? data.text.trim() : '';
+        // Per-prefix bound: a single runaway continuation blob must not blow
+        // the turn context (these texts were previously unbounded).
+        return typeof data.text === 'string' ? clipHistory(data.text.trim(), CROSS_SESSION_PREFIX_MAX_CHARS) : '';
       } catch {
         return '';
       }
     }).filter(Boolean);
-    return texts.join('\n\n');
+    return clipHistory(texts.join('\n\n'), CROSS_SESSION_PREFIXES_TOTAL_MAX_CHARS);
   } catch {
     return '';
   }

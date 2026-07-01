@@ -127,6 +127,10 @@ export function recordModelUsage(args: {
   durationMs?: number;
   responseId?: string;
   promptComponents?: Record<string, number>;
+  /** Context-window health (Claude SDK lane): how close this call ran to the
+   *  model's window. utilization = inputTokens / contextWindowTokens. */
+  contextWindowTokens?: number;
+  windowUtilization?: number;
 }): void {
   const source = args.sessionId || 'unknown';
   const event = {
@@ -142,6 +146,8 @@ export function recordModelUsage(args: {
     durationMs: args.durationMs,
     responseId: args.responseId,
     promptComponents: args.promptComponents,
+    contextWindowTokens: args.contextWindowTokens,
+    windowUtilization: args.windowUtilization,
     // Join keys for the State layer — derived, so every workflow lane gets them
     // for free (no per-model-lane call-site change). Absent for non-workflow calls.
     ...parseWorkflowSource(source),

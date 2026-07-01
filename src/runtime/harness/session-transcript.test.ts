@@ -345,3 +345,30 @@ test('caps to the most recent 2*maxTurns events', () => {
   assert.ok(turns.length <= 6, `capped to <=2*maxTurns, got ${turns.length}`);
   assert.equal(turns[turns.length - 1].text, 'a9', 'keeps the NEWEST turns');
 });
+
+test('renderCrossSessionPrefixesForModel is byte-identical for prefixes under the bound', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  const text = '[CONTINUATION CONTEXT]\n  USER: short prefix.\n  YOU: noted.';
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'cross_session_prefix', data: { text } });
+  const rendered = renderCrossSessionPrefixesForModel(openEventLog(), sid, 4);
+  assert.equal(rendered, text, 'under-bound prefixes must pass through unclipped');
+});
+
+test('renderCrossSessionPrefixesForModel clips a runaway prefix (per-prefix and total bounds)', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  // Four 10k-char blobs: previously 40k chars rode into EVERY turn's context.
+  for (let i = 0; i < 4; i++) {
+    appendEvent({
+      sessionId: sid,
+      turn: 0,
+      role: 'system',
+      type: 'cross_session_prefix',
+      data: { text: `[BLOB ${i}] ${'x'.repeat(10_000)}` },
+    });
+  }
+  const rendered = renderCrossSessionPrefixesForModel(openEventLog(), sid, 4);
+  assert.ok(rendered.length <= 6_100, `total bound holds (got ${rendered.length} chars)`);
+  assert.match(rendered, /\[session history truncated\]/);
+});

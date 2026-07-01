@@ -25,7 +25,7 @@ const {
   sdkStreamingEnabled,
 } = brain;
 const { appendEvent, createSession, getSession, listEvents, resetEventLog, writeToolOutput } = await import('./eventlog.js');
-const { ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
+const { ClaudeSdkProviderOverloadError, ClaudeSdkContextOverflowError } = await import('./claude-agent-sdk.js');
 
 beforeEach(() => {
   resetEventLog();
@@ -1157,4 +1157,70 @@ test('salvage: kill-switch off ⇒ the parse error propagates (byte-identical to
     /could not be parsed/,
   );
   delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
+});
+
+test('overflow A2: a COMMITTED context overflow salvages an honest partial (never re-runs)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE; // default on
+  createSession({ id: 'overflow-committed', kind: 'chat', title: 'overflow salvage' });
+  appendEvent({ sessionId: 'overflow-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: ['a@x.com'] } });
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; throw new ClaudeSdkContextOverflowError('prompt is too long: 214000 tokens > 200000 maximum', true); });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'sent' }));
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send that email', sessionId: 'overflow-committed' });
+  assert.equal(calls, 1, 'must NOT re-run after a committed overflow (no double-send)');
+  assert.doesNotMatch(res.text, /prompt is too long|went wrong/i);
+});
+
+test('overflow A2: an UNCOMMITTED context overflow retries ONCE with reduced context (recall dropped, session actions kept)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
+  createSession({ id: 'overflow-uncommitted', kind: 'chat', title: 'overflow retry' });
+  const seen: Array<{ priorTurns?: unknown[]; turnContext?: string }> = [];
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (opts: any) => {
+    calls += 1;
+    seen.push({ priorTurns: opts.priorTurns, turnContext: opts.turnContext });
+    if (calls === 1) throw new ClaudeSdkContextOverflowError('context length exceeded', false);
+    return { text: 'finished after reduced retry', toolUses: [] };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'finish the report', sessionId: 'overflow-uncommitted' });
+  assert.equal(calls, 2, 'exactly one reduced-context retry');
+  assert.match(res.text, /finished after reduced retry/);
+  const retry = seen[1];
+  assert.ok((retry.priorTurns?.length ?? 0) <= 2, 'prior turns halved to the last 2');
+  assert.ok(!(retry.turnContext ?? '').includes('## Relevant To Your Request'), 'recall section dropped on the retry');
+});
+
+test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds for tool_output_query)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  let calls = 0;
+  const prompts: string[] = [];
+  setClaudeAgentSdkBrainRunForTest(async (opts: any) => {
+    calls += 1;
+    prompts.push(String(opts.prompt ?? ''));
+    if (calls === 1) {
+      return {
+        text: 'Scraped 60 of 100 leads so far.',
+        sessionId: 's',
+        toolUses: ['mcp__clementine-local__composio_execute_tool'],
+        toolCallLedger: [
+          { callId: 'toolu_abc123', name: 'composio_execute_tool', argsPreview: '{"tool_slug":"APIFY_GET_DATASET_ITEMS"}' },
+        ],
+        limitHit: true,
+      };
+    }
+    return { text: 'All 100 leads done.', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false };
+  });
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'scrape 100 leads', sessionId: 'brain-ledger' });
+  assert.equal(calls, 2);
+  assert.match(res.text, /All 100 leads done/);
+  const contPrompt = prompts[1];
+  assert.match(contPrompt, /tool_output_query/, 'ledger instruction present');
+  assert.match(contPrompt, /toolu_abc123/, 'earlier callId handed to the continuation');
+  assert.match(contPrompt, /APIFY_GET_DATASET_ITEMS/, 'args preview present');
 });
