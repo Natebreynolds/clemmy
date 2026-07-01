@@ -20,6 +20,7 @@ import { gatherSessionSkills } from './skill-execution.js';
 import { renderSkillsIndex } from '../../memory/skill-store.js';
 import { detectMultiItemIntent, fanoutDirectiveLine } from './context-packet.js';
 import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
+import { createReplyStreamExtractor } from './reply-stream.js';
 import { markRunInFlight } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
@@ -134,13 +135,13 @@ export function bumpSessionToolFloor(sessionId: string, exposed: Iterable<string
   return floor;
 }
 export function sdkStreamingEnabled(): boolean {
-  // DEFAULT OFF: raw SDK text deltas reproduce the model's tool-call XML
-  // narration, which dumped into the dock bubble (live 2026-06-23). Clean live
-  // progress now comes from tool_called events (parity with the Codex lane); the
-  // full reply still delivers once via the final onChunk. Opt back into raw token
-  // streaming with CLEMMY_CLAUDE_SDK_STREAMING=on.
-  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_SDK_STREAMING', 'off') ?? 'off').trim().toLowerCase();
-  return raw === 'on' || raw === 'true' || raw === '1';
+  // DEFAULT ON (2026-07-01): the two reasons it was off are both fixed — tool-call narration
+  // is now suppressed mid-stream (looksLikeStreamingNarration) AND the {"reply":"…"} envelope
+  // is unwrapped by the reply-stream extractor, so the dock streams CLEAN prose token-by-token
+  // (parity with the Codex lane) instead of raw JSON/tool-call syntax. Kill-switch =off reverts
+  // to progress-chips-only (the final reply still delivers once via the guarded final onChunk).
+  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_SDK_STREAMING', 'on') ?? 'on').trim().toLowerCase();
+  return raw !== 'off' && raw !== 'false' && raw !== '0';
 }
 function narrationRetryEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NARRATION_RETRY', 'on') ?? 'on').trim().toLowerCase() !== 'off';
@@ -823,6 +824,10 @@ export async function respondViaClaudeAgentSdkBrain(
   // what was ACTUALLY shown, so a turn that ONLY narrated still streams its clean
   // narration-retry answer and the final reply delivers authoritatively.
   let narrationStream = false;
+  // Raw SDK deltas so far (for the narration check); the CLEAN reply text goes to the dock via
+  // the reply-envelope extractor so the user sees prose, not `{"reply":"…"}` JSON.
+  let rawStreamText = '';
+  const replyExtractor = createReplyStreamExtractor();
   const turnContext = await renderClaudeAgentBrainTurnContext(request);
   emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext);
   const runOptions = {
@@ -844,11 +849,18 @@ export async function respondViaClaudeAgentSdkBrain(
     onDelta: (request.onChunk && sdkStreamingEnabled())
       ? async (d: string): Promise<void> => {
         if (narrationStream) return;
-        const candidate = streamedText + d;
-        if (looksLikeStreamingNarration(candidate)) { narrationStream = true; return; }
-        streamedText = candidate;
+        rawStreamText += d;
+        // Narration guard on the RAW stream: if the model starts printing tool-call syntax,
+        // stop forwarding for the rest of the turn (the final reply still delivers).
+        if (looksLikeStreamingNarration(rawStreamText)) { narrationStream = true; return; }
+        // Emit only the CLEAN reply text (extracted from the {"reply":"…"} envelope), so the
+        // dock streams prose, not JSON. streamedText tracks what was ACTUALLY shown (clean) so
+        // the final-chunk dedup below doesn't re-render the answer.
+        const cleanDelta = replyExtractor(d);
+        if (!cleanDelta) return;
+        streamedText += cleanDelta;
         streamedAny = true;
-        await request.onChunk?.(d);
+        await request.onChunk?.(cleanDelta);
       }
       : undefined,
   };

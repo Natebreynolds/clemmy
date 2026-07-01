@@ -816,8 +816,10 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('', []), false);
 });
 
-test('sdkStreamingEnabled defaults OFF (clean dock — opt back in with =on)', () => {
+test('sdkStreamingEnabled defaults ON (clean streaming — narration suppressed + reply unwrapped); =off reverts', () => {
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
+  assert.equal(sdkStreamingEnabled(), true);
+  process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'off';
   assert.equal(sdkStreamingEnabled(), false);
   process.env.CLEMMY_CLAUDE_SDK_STREAMING = 'on';
   assert.equal(sdkStreamingEnabled(), true);
