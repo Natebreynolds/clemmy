@@ -20,6 +20,7 @@ import { buildGatedToolPermission } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
+import { AgentRuntimeCancelledError } from '../provider.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -307,6 +308,11 @@ export const CLAUDE_AGENT_SDK_FULL_TOOLS = [
   'execution_update_step',
   'execution_mark_blocked',
   'execution_complete',
+  // Fan-out primitive — BRAIN ONLY (deliberately NOT in AGENTIC_EXECUTION_TOOLS, so a
+  // WORKER never gets run_worker → no worker-spawns-worker recursion). Lets a Claude
+  // brain parallelize N independent items instead of processing them sequentially and
+  // blowing its per-query turn budget.
+  'run_worker',
 ] as const;
 
 /** Scoped agentic surface for a Claude WORKER (one parent-planned item). The
@@ -519,6 +525,8 @@ export interface ClaudeAgentSdkRunOptions {
    * (sdkWallClockMs, 15 min, kill-switchable); 0 disables.
    */
   maxWallClockMs?: number;
+  /** Caller-driven cancellation hook (background task cancel/deadline). */
+  shouldCancel?: () => boolean | Promise<boolean>;
 }
 
 export interface ClaudeAgentSdkRunResult {
@@ -566,6 +574,24 @@ function extractToolUseIds(message: SDKMessage): Array<{ id: string; name: strin
 
 function bareMcpToolName(rawName: string): string {
   return rawName.split('__').at(-1) ?? rawName;
+}
+
+const TERMINAL_AFTER_TOOL_NAMES = new Set(['dispatch_background_task']);
+
+function isTerminalAfterTool(rawName: string | null | undefined): boolean {
+  return typeof rawName === 'string' && TERMINAL_AFTER_TOOL_NAMES.has(bareMcpToolName(rawName));
+}
+
+function renderTerminalToolReply(rawName: string, input: unknown, output: string): string {
+  const bare = bareMcpToolName(rawName);
+  if (bare === 'dispatch_background_task') {
+    const match = output.match(/Dispatched "([^"]+)" to the background \(task ([^)]+)\)/i);
+    const inputObjective = (input as { objective?: unknown } | null | undefined)?.objective;
+    const title = match?.[1] || (typeof inputObjective === 'string' && inputObjective.trim() ? inputObjective.trim() : 'the task');
+    const taskId = match?.[2];
+    return `On it - I started "${title}" as a background task${taskId ? ` (${taskId})` : ''}. It will keep running in the daemon and report back here when it finishes or gets stuck.`;
+  }
+  return output.trim() || `${bare} completed.`;
 }
 
 function reflectionToolName(rawName: string | null, input: unknown): string | null {
@@ -840,6 +866,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // That bypasses the clean-result grace below, so a workflow step hard-failed.
   // Catch it here and fall through to the same limitHit handling.
   let threwTurnLimit = false;
+  // Some tools are explicit handoffs. Once Claude has queued background work,
+  // continuing the same foreground turn can duplicate the task or answer from
+  // an empty foreground context. Stop at the tool boundary and let the outcome
+  // report-back re-enter the origin conversation when the daemon finishes.
+  let terminalToolReply: string | null = null;
   // FIRST-BYTE-SAFE overload retry: re-run the whole query on an Anthropic
   // overload/5xx ONLY while nothing has been committed yet (no tool executed,
   // nothing streamed to the user) — so a retry can't double-act or duplicate
@@ -854,6 +885,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     streamedText = '';
     streamedAny = false;
     threwTurnLimit = false;
+    terminalToolReply = null;
     // Fresh per attempt: an overload retry re-runs the turn from scratch (and only
     // happens pre-commit, so these are ~0 anyway), but reset for correctness.
     ceilingState.total = 0;
@@ -864,8 +896,15 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const toolById = new Map<string, { name: string; input: unknown }>();
     let stream: Query | undefined;
     try {
+      if (options.shouldCancel && await options.shouldCancel()) {
+        throw new AgentRuntimeCancelledError('Run cancelled by caller.');
+      }
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       for await (const message of stream) {
+        if (options.shouldCancel && await options.shouldCancel()) {
+          try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+          throw new AgentRuntimeCancelledError('Run cancelled by caller.');
+        }
         // Wall-clock backstop: a genuinely stuck stream never hangs the turn. EXCLUDE
         // approval-wait (pausedMs) so a long confirm-first approval — the user may
         // take many minutes — never self-aborts the turn the instant they approve.
@@ -909,7 +948,13 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             const tool = source ? reflectionToolName(source.name, source.input) : null;
             reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
           }
+          if (!tr.isError && source && isTerminalAfterTool(source.name)) {
+            terminalToolReply = renderTerminalToolReply(source.name, source.input, tr.output);
+            try { await stream?.interrupt?.(); } catch { /* best-effort */ }
+            break;
+          }
         }
+        if (terminalToolReply) break;
         result = extractResult(message) ?? result;
       }
     } catch (err) {
@@ -949,6 +994,19 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
 
   if (!init && (options.requiredLocalMcpTools?.length ?? 0) > 0) {
     throw new ClaudeAgentSdkToolSurfaceError(options.requiredLocalMcpTools ?? [], []);
+  }
+
+  if (terminalToolReply) {
+    recordClaudeAgentSdkUsage(options, result, init);
+    return {
+      text: terminalToolReply,
+      sessionId: result?.session_id ?? init?.session_id,
+      model: init?.model,
+      toolUses,
+      usage: result?.usage,
+      modelUsage: result?.modelUsage,
+      limitHit: false,
+    };
   }
 
   if (threwTurnLimit) {
