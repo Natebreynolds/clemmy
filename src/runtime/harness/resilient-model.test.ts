@@ -57,6 +57,21 @@ test('classifyModelError: 429/529/5xx/401/transport classified; random not retry
   assert.equal(classifyModelError(new Error('bad input')).retryable, false);
 });
 
+test('classifyModelError: usage/plan quota exhausted → rate_limited (fallover), NOT auth, regardless of status', () => {
+  // The live failure: Codex prolite "The usage limit has been reached" arriving as 403.
+  assert.deepEqual(pick(classifyModelError({ status: 403, message: 'The usage limit has been reached. Reset at 2026-07-01T10:49:18.000Z.' })),
+    { retryable: true, kind: 'model.rate_limited', isAuth: false });
+  // Marker only in the body (400) — still a fallover-eligible rate-limit, not auth/terminal.
+  assert.deepEqual(pick(classifyModelError({ status: 400, message: 'Bad Request', bodyText: '{"error":{"type":"usage_limit_reached"}}' })),
+    { retryable: true, kind: 'model.rate_limited', isAuth: false });
+  // As a 429 it was already rate_limited — stays rate_limited (no regression).
+  assert.deepEqual(pick(classifyModelError({ status: 429, message: 'usage_limit_reached' })),
+    { retryable: true, kind: 'model.rate_limited', isAuth: false });
+  // A genuine 403 auth error (no quota marker) still classifies as auth_expired.
+  assert.deepEqual(pick(classifyModelError({ status: 403, message: 'invalid api key' })),
+    { retryable: true, kind: 'model.auth_expired', isAuth: true });
+});
+
 test('classifyModelError: honors Retry-After header (seconds)', () => {
   const c = classifyModelError({ statusCode: 429, responseHeaders: { 'retry-after': '2' } });
   assert.equal(c.retryAfterMs, 2000);

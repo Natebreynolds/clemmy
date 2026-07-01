@@ -45,11 +45,14 @@ const {
   STALE_TASK_AGE_MS,
   registerBackgroundDrainKick,
   requestBackgroundDrain,
+  markBackgroundTaskRunning,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../runtime/harness/fanout-ledger.js');
+const { createSession, appendEvent, getSession } = await import('../runtime/harness/eventlog.js');
+const { listNotifications } = await import('../runtime/notifications.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -171,6 +174,122 @@ test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-ap
   assert.ok(scope, 'a plan scope should exist for the run session');
   assert.deepEqual(scope!.allowedTools, ['*'], 'background run scope covers all non-read tools');
   assert.equal(scope!.planProposalId, `background-task:${task.id}`);
+});
+
+test('processBackgroundTasks embeds origin transcript and action ledger in the worker prompt', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Origin chat' });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use the approved Revill prospect list and do not email Casey twice.' } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'email_send', targets: ['casey@example.com'] } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Sent Casey the first email and saved the draft follow-up.' } });
+  const task = createBackgroundTask({ title: 'Finish follow-up', prompt: 'finish the follow-up sequence', originSessionId: origin.id, model: 'claude-sonnet-5' });
+
+  let workerPromptSeen = '';
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { message: string; sessionId: string }) {
+      workerPromptSeen = request.message;
+      return { text: 'Done — follow-up sequence completed and verified.', sessionId: request.sessionId, stoppedReason: 'success' as const };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.match(workerPromptSeen, /## Origin Session Lineage/);
+  assert.match(workerPromptSeen, /session_history/);
+  assert.match(workerPromptSeen, /USER: Use the approved Revill prospect list/);
+  assert.match(workerPromptSeen, /YOU: Sent Casey the first email/);
+  assert.match(workerPromptSeen, /ALREADY DONE/);
+  assert.match(workerPromptSeen, /email_send/);
+  assert.match(workerPromptSeen, /casey@example\.com/);
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'done');
+  assert.equal(updated?.requestedModel, 'claude-sonnet-5');
+  assert.equal(updated?.effectiveModel, 'claude-sonnet-5');
+  assert.equal(updated?.modelProvider, 'claude');
+  assert.equal(updated?.modelRouteKind, 'legacy');
+  assert.equal(updated?.modelTransport, 'legacy_assistant');
+});
+
+test('processBackgroundTasks carries origin lineage into automatic continuation prompts', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Origin chat' });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Only use the approved Denver shortlist.' } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Casey has already been emailed once.' } });
+  const task = createBackgroundTask({ title: 'Long follow-up', prompt: 'finish the follow-up sequence', originSessionId: origin.id });
+  const messages: string[] = [];
+
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { message: string; sessionId: string }) {
+      messages.push(request.message);
+      if (messages.length === 1) {
+        return {
+          text: 'Partial pass finished; more work remains.',
+          sessionId: request.sessionId,
+          stoppedReason: 'max-turns-with-grace' as const,
+        };
+      }
+      return {
+        text: 'Done — follow-up sequence completed without resending Casey.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.equal(messages.length, 2);
+  assert.match(messages[1], /Continue background task/);
+  assert.match(messages[1], /## Origin Session Lineage/);
+  assert.match(messages[1], /USER: Only use the approved Denver shortlist/);
+  assert.match(messages[1], /ALREADY DONE/);
+  assert.match(messages[1], /OUTLOOK_SEND_EMAIL/);
+  assert.match(messages[1], /casey@example\.com/);
+});
+
+test('processBackgroundTasks carries origin lineage into question-answer resume prompts', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Origin chat' });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use my approved healthcare segment and avoid duplicate sends.' } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'crm_update', targets: ['record:acct-42'] } });
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Updated acct-42 and asked which segment to finish.' } });
+  const task = createBackgroundTask({ title: 'Resume after answer', prompt: 'finish the enrichment', originSessionId: origin.id });
+  markBackgroundTaskAwaitingInput(task.id, 'q-origin-resume', 'Which segment should I use?');
+  queueBackgroundTaskInputResolution('q-origin-resume', 'healthcare only');
+  let workerPromptSeen = '';
+
+  const stubAssistant = {
+    getRuntime() {
+      return {} as never;
+    },
+    async respond(request: { message: string; sessionId: string }) {
+      workerPromptSeen = request.message;
+      return {
+        text: 'Done — healthcare segment enriched and acct-42 was not repeated.',
+        sessionId: request.sessionId,
+        stoppedReason: 'success' as const,
+      };
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const processed = await processBackgroundTasks(stubAssistant as any, 1);
+  assert.equal(processed, 1);
+  assert.match(workerPromptSeen, /healthcare only/);
+  assert.match(workerPromptSeen, /## Origin Session Lineage/);
+  assert.match(workerPromptSeen, /USER: Use my approved healthcare segment/);
+  assert.match(workerPromptSeen, /ALREADY DONE/);
+  assert.match(workerPromptSeen, /crm_update/);
+  assert.match(workerPromptSeen, /record:acct-42/);
 });
 
 test('processBackgroundTasks auto-continues a max-turn pause before marking the task done', async () => {
@@ -389,6 +508,74 @@ test('markBackgroundTaskFailed with status=interrupted does NOT report back (aut
   assert.equal(reported.length, 0, 'interrupted (auto-resumed) must not spam the session with a failure');
 });
 
+test('markBackgroundTaskDone still reports after an earlier needs-input report-back', () => {
+  const sessionId = 'sess-reportback-after-input';
+  const task = createBackgroundTask({ title: 'Finish outreach', prompt: 'do it', originSessionId: sessionId });
+  markBackgroundTaskAwaitingInput(task.id, 'q-reportback-after-input', 'Which segment should I use?');
+  markBackgroundTaskDone(task.id, 'Finished the healthcare segment.');
+
+  const turns = new SessionStore().get(sessionId).turns
+    .filter((t) => typeof t.text === 'string' && t.text.startsWith(`[background task ${task.id} `));
+  assert.equal(turns.length, 2, 'parked question and final completion both reach the chat');
+  assert.match(turns[0].text, /NEEDS INPUT/);
+  assert.match(turns[1].text, /completed/);
+  assert.match(turns[1].text, /healthcare segment/);
+});
+
+test('markBackgroundTaskAwaitingInput reports distinct follow-up questions for the same task', () => {
+  const sessionId = 'sess-reportback-two-inputs';
+  const task = createBackgroundTask({ title: 'Finish outreach', prompt: 'do it', originSessionId: sessionId });
+  markBackgroundTaskAwaitingInput(task.id, 'q-reportback-first-input', 'Which segment should I use?');
+  // A crash/retry of the same parked question must stay idempotent.
+  markBackgroundTaskAwaitingInput(task.id, 'q-reportback-first-input-retry', 'Which segment should I use?');
+  markBackgroundTaskAwaitingInput(task.id, 'q-reportback-second-input', 'Which region should I prioritize?');
+
+  const turns = new SessionStore().get(sessionId).turns
+    .filter((t) => typeof t.text === 'string' && t.text.startsWith(`[background task ${task.id} `));
+  assert.equal(turns.length, 2, 'distinct parked questions both reach the origin chat');
+  assert.match(turns[0].text, /Which segment/);
+  assert.match(turns[1].text, /Which region/);
+});
+
+test('markBackgroundTaskDone still reports after an earlier continue-needed report-back', () => {
+  const sessionId = 'sess-reportback-after-continue';
+  const task = createBackgroundTask({ title: 'Long build', prompt: 'do it', originSessionId: sessionId });
+  markBackgroundTaskAwaitingContinue(task.id, 'hit turn budget', 'partial notes');
+  markBackgroundTaskDone(task.id, 'Finished after continuing.');
+
+  const turns = new SessionStore().get(sessionId).turns
+    .filter((t) => typeof t.text === 'string' && t.text.startsWith(`[background task ${task.id} `));
+  assert.equal(turns.length, 2, 'continue-needed and final completion both reach the chat');
+  assert.match(turns[0].text, /NEEDS INPUT/);
+  assert.match(turns[1].text, /completed/);
+  assert.match(turns[1].text, /Finished after continuing/);
+});
+
+test('terminal background states clear stale parked input and continue metadata', () => {
+  const inputTask = createBackgroundTask({ title: 'Finish after answer', prompt: 'do it', originSessionId: 'sess-terminal-cleanup-input' });
+  markBackgroundTaskAwaitingInput(inputTask.id, 'q-terminal-cleanup', 'Which segment?');
+  queueBackgroundTaskInputResolution('q-terminal-cleanup', 'healthcare');
+  markBackgroundTaskDone(inputTask.id, 'Finished after the answer.');
+
+  const inputDone = getBackgroundTask(inputTask.id);
+  assert.equal(inputDone?.status, 'done');
+  assert.equal(inputDone?.pendingQuestionId, undefined);
+  assert.equal(inputDone?.pendingQuestion, undefined);
+  assert.equal(inputDone?.inputResolution, undefined);
+  assert.equal(getBackgroundTaskByQuestionId('q-terminal-cleanup'), null);
+
+  const continueTask = createBackgroundTask({ title: 'Fail after continue', prompt: 'do it', originSessionId: 'sess-terminal-cleanup-continue' });
+  markBackgroundTaskAwaitingContinue(continueTask.id, 'hit turn budget', 'partial notes');
+  queueBackgroundTaskContinue(continueTask.id);
+  markBackgroundTaskFailed(continueTask.id, 'provider failed after resume', 'failed');
+
+  const continueFailed = getBackgroundTask(continueTask.id);
+  assert.equal(continueFailed?.status, 'failed');
+  assert.equal(continueFailed?.continueResolution, undefined);
+  assert.equal(continueFailed?.pendingQuestionId, undefined);
+  assert.equal(continueFailed?.pendingApprovalId, undefined);
+});
+
 // ─── P0-C: a runtime-error abort must NOT be reported as a completed task ─────
 
 test('classifyBackgroundTaskOutcome: stoppedReason "error" → blocked (not a hollow done)', () => {
@@ -417,6 +604,15 @@ test('classifyBackgroundTaskOutcome: the wall-clock error text alone (no stopped
     "I hit a runtime error and couldn't finish the reply: ...exceeded the wall-clock budget of 120000ms...",
   );
   assert.equal(outcome.outcome, 'blocked', 'the runtime-error text patterns catch it even without stoppedReason');
+});
+
+test('classifyBackgroundTaskOutcome: self-declared no-result text → blocked', () => {
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-no-result-text' },
+    "I'm stopping this run without a number because no command executed and no tool result was available. Nothing satisfies the success criterion; no verified integer was produced.",
+  );
+  assert.equal(outcome.outcome, 'blocked', 'a clean stop with no verified deliverable is not a completed background task');
+  assert.match(outcome.reason ?? '', /without a number/i);
 });
 
 test('classifyBackgroundTaskOutcome: a genuinely-complete run still reports done', () => {
@@ -524,6 +720,36 @@ test('markBackgroundTaskAwaitingInput parks the task with the question', () => {
   assert.equal(parked?.status, 'awaiting_input');
   assert.equal(parked?.pendingQuestionId, 'q-1');
   assert.match(parked?.pendingQuestion ?? '', /market-leaders/);
+});
+
+test('awaiting-input notifications preserve originating Discord and Slack channel metadata', () => {
+  const discordTask = createBackgroundTask({
+    title: 'Discord follow-up',
+    prompt: 'ask in Discord',
+    originSessionId: 'discord:origin',
+    source: 'discord',
+    userId: 'discord-user-1',
+    channel: 'discord:discord-channel-1',
+  });
+  markBackgroundTaskAwaitingInput(discordTask.id, 'q-discord-routing', 'Which Discord segment?');
+  const discordNote = listNotifications(200)
+    .find((item) => item.metadata?.backgroundTaskId === discordTask.id);
+  assert.equal(discordNote?.metadata?.discordUserId, 'discord-user-1');
+  assert.equal(discordNote?.metadata?.discordChannelId, 'discord-channel-1');
+
+  const slackTask = createBackgroundTask({
+    title: 'Slack follow-up',
+    prompt: 'ask in Slack',
+    originSessionId: 'slack:C123:1700000000.000100',
+    source: 'slack',
+    userId: 'U123',
+    channel: 'slack:C123:1700000000.000100',
+  });
+  markBackgroundTaskAwaitingInput(slackTask.id, 'q-slack-routing', 'Which Slack segment?');
+  const slackNote = listNotifications(200)
+    .find((item) => item.metadata?.backgroundTaskId === slackTask.id);
+  assert.equal(slackNote?.metadata?.slackChannelId, 'C123');
+  assert.equal(slackNote?.metadata?.slackThreadTs, '1700000000.000100');
 });
 
 test('queueBackgroundTaskInputResolution re-queues with the freeform answer', () => {
@@ -676,4 +902,14 @@ test('findStaleBackgroundTasks: returns finished + parked, excludes active + arc
   assert.equal(stale.find((s) => s.task.id === parked.id)?.kind, 'parked');
   assert.equal(ids.has(active.id), false, 'pending is active, not stale — even when old');
   assert.equal(ids.has(archivedTask.id), false, 'archived is already cleared, never stale');
+});
+
+test('markBackgroundTaskRunning pre-registers the background:<id> trace session (no SSE 404 window)', () => {
+  const task = createBackgroundTask({ title: 'Deep SEO on 3 firms', prompt: 'do the work' });
+  assert.equal(getSession(task.runSessionId), null, 'no trace session before it runs');
+  const running = markBackgroundTaskRunning(task.id);
+  assert.equal(running?.status, 'running');
+  const sess = getSession(task.runSessionId);
+  assert.ok(sess, 'the background:<id> harness session exists the instant it flips to RUNNING → trace SSE finds it, no 404');
+  assert.equal(sess?.kind, 'execution');
 });

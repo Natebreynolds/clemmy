@@ -24,6 +24,9 @@ import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/ha
 import { BLOCKED_TEXT_PATTERNS, classifyBlocker, verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
+import { getSession as getHarnessSessionRow, createSession as createHarnessSession } from '../runtime/harness/eventlog.js';
+import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -72,7 +75,15 @@ export interface BackgroundTaskRecord {
   runSessionId: string;
   userId?: string;
   channel?: string;
+  /** Requested model at enqueue/drain time. `model` is the legacy requested slot;
+   *  these explicit fields make fallback/fallover diagnostics legible. */
+  requestedModel?: string;
   model?: string;
+  effectiveModel?: string;
+  modelProvider?: string;
+  modelRouteKind?: string;
+  modelTransport?: string;
+  modelRouteFalloverFrom?: string;
   maxMinutes: number;
   source: 'discord' | 'slack' | 'webhook' | 'cli' | 'gateway' | 'daemon' | 'mobile' | 'workflow' | 'desktop';
   createdAt: string;
@@ -227,9 +238,26 @@ function loadTaskFile(filePath: string): BackgroundTaskRecord | null {
   }
 }
 
+function parseTaskChannelForNotification(channel?: string): {
+  discordChannelId?: string;
+  slackChannelId?: string;
+  slackThreadTs?: string;
+} {
+  const parts = channel?.split(':') ?? [];
+  if (parts[0] === 'discord') {
+    return { discordChannelId: parts.length >= 2 ? parts[parts.length - 1] : undefined };
+  }
+  if (parts[0] === 'slack') {
+    return {
+      slackChannelId: parts[1],
+      slackThreadTs: parts.length >= 3 ? parts.slice(2).join(':') : undefined,
+    };
+  }
+  return {};
+}
+
 function taskNotificationMetadata(task: BackgroundTaskRecord, extra: Record<string, unknown> = {}): Record<string, unknown> {
-  const channelParts = task.channel?.startsWith('discord:') ? task.channel.split(':') : [];
-  const discordChannelId = channelParts.length >= 3 ? channelParts[channelParts.length - 1] : undefined;
+  const channel = parseTaskChannelForNotification(task.channel);
   const allowDiscordCheckIns = loadProactivityPolicy().allowDiscordCheckIns;
   return {
     backgroundTaskId: task.id,
@@ -238,7 +266,9 @@ function taskNotificationMetadata(task: BackgroundTaskRecord, extra: Record<stri
     userId: task.userId,
     channel: task.channel,
     discordUserId: allowDiscordCheckIns && task.channel?.startsWith('discord:') ? task.userId : undefined,
-    discordChannelId: allowDiscordCheckIns ? discordChannelId : undefined,
+    discordChannelId: allowDiscordCheckIns ? channel.discordChannelId : undefined,
+    slackChannelId: channel.slackChannelId,
+    slackThreadTs: channel.slackThreadTs,
     ...extra,
   };
 }
@@ -288,6 +318,18 @@ function writeFullResultFile(task: BackgroundTaskRecord, result: string): string
   return filePath;
 }
 
+function renderOriginLineageBlock(originSessionId: string | undefined): string {
+  if (!originSessionId) return '';
+  let history = '';
+  try { history = renderSessionHistoryForModel(originSessionId, 8, 6_000); } catch { history = ''; }
+  return [
+    '## Origin Session Lineage',
+    `This task was spawned from session "${originSessionId}". Treat the origin history as authoritative for user decisions, constraints, resource ids, and already-completed external actions.`,
+    'Do not redo completed external writes unless the user explicitly asked to do them again. If you need more than the bounded history below, call session_history with the origin session id before acting.',
+    history,
+  ].filter(Boolean).join('\n');
+}
+
 function buildWorkerPrompt(task: BackgroundTaskRecord): string {
   const policy = loadProactivityPolicy();
   // Carry the spawning chat session's parked GOAL into this delegated worker
@@ -315,6 +357,8 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
     task.originSessionId ? `Origin session: ${task.originSessionId}` : '',
     `Soft max runtime: ${task.maxMinutes} minutes`,
     '',
+    renderOriginLineageBlock(task.originSessionId),
+    '',
     pinned
       ? `## Pinned Constraint (from the session that started this task — act on EXACTLY this target; do NOT re-discover or substitute a different list)\n${pinned}\n`
       : '',
@@ -328,11 +372,56 @@ function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: st
     `Continue background task ${task.id}.`,
     'The previous worker turn hit an internal run/turn budget before the objective was complete.',
     'Pick up from the prior session state and finish the original request. Do not restart from scratch unless the prior state is unusable.',
+    renderOriginLineageBlock(task.originSessionId),
     previousText ? `Previous partial result / continuation note:\n${previousText.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
     '',
     'Original request:',
     task.prompt,
   ].filter(Boolean).join('\n');
+}
+
+function buildWorkerInputResumePrompt(task: BackgroundTaskRecord, answer: string): string {
+  return [
+    `The user answered your question: "${answer}". Continue the task with this answer.`,
+    'Use the prior run session state, but preserve the origin session facts below if the continuation is picked up by a different model/backend.',
+    renderOriginLineageBlock(task.originSessionId),
+    '',
+    'Original request:',
+    task.prompt,
+  ].filter(Boolean).join('\n');
+}
+
+function recordBackgroundTaskRoute(
+  task: BackgroundTaskRecord,
+  runId: string | undefined,
+  response: AssistantResponse,
+  requestedModel: string,
+): BackgroundTaskRecord {
+  const route = routeDiagnosticsFromResponse(response);
+  const patch: Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>> = {
+    requestedModel: route?.requestedModel ?? requestedModel,
+    effectiveModel: route?.effectiveModel,
+    modelProvider: route?.provider,
+    modelRouteKind: route?.routeKind,
+    modelTransport: route?.transport,
+    modelRouteFalloverFrom: route?.falloverFrom,
+  };
+  const updated = updateBackgroundTask(task.id, patch) ?? task;
+  if (route) {
+    addRunEvent(runId, {
+      type: 'status',
+      message: `Model route: ${route.routeKind}${route.provider ? `/${route.provider}` : ''}${route.effectiveModel ? ` ${route.effectiveModel}` : ''}.`,
+      data: {
+        routeKind: route.routeKind,
+        requestedModel: route.requestedModel ?? requestedModel,
+        effectiveModel: route.effectiveModel,
+        provider: route.provider,
+        transport: route.transport,
+        falloverFrom: route.falloverFrom,
+      },
+    });
+  }
+  return updated;
 }
 
 export function createBackgroundTask(input: CreateBackgroundTaskInput): BackgroundTaskRecord {
@@ -347,6 +436,7 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     runSessionId: `background:${id}`,
     userId: input.userId,
     channel: input.channel,
+    requestedModel: input.model,
     model: input.model,
     maxMinutes: Math.max(1, Math.min(240, Math.floor(input.maxMinutes ?? 60))),
     source: input.source ?? 'gateway',
@@ -487,10 +577,21 @@ export function updateBackgroundTask(id: string, patch: Partial<Omit<BackgroundT
   return updated;
 }
 
+function clearParkedBackgroundState(): Partial<Omit<BackgroundTaskRecord, 'id' | 'createdAt'>> {
+  return {
+    pendingApprovalId: undefined,
+    approvalResolution: undefined,
+    pendingQuestionId: undefined,
+    pendingQuestion: undefined,
+    inputResolution: undefined,
+    continueResolution: undefined,
+  };
+}
+
 export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task || task.status !== 'pending') return null;
-  return updateBackgroundTask(id, {
+  const updated = updateBackgroundTask(id, {
     status: 'running',
     startedAt: nowIso(),
     error: undefined,
@@ -499,7 +600,21 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     // reads inputResolution to resume with the answer (mirrors how
     // approvalResolution survives markBackgroundTaskRunning).
     pendingQuestionId: undefined,
+    pendingQuestion: undefined,
   });
+  // Pre-register the trace session the instant the card flips to RUNNING, so the board's
+  // live-trace SSE (GET /api/sessions/background:<id>/events) never 404s during the startup
+  // window. The worker otherwise creates background:<id> lazily on its FIRST
+  // respondPreferHarness call — after markRunning/startRun/buildWorkerPrompt — and the
+  // browser's EventSource does not recover from that 404. Both harness lanes use
+  // get-or-create (if (!getSession) createSession), so this is safe; they see it and skip.
+  try {
+    const runSessionId = updated?.runSessionId ?? `background:${id}`;
+    if (!getHarnessSessionRow(runSessionId)) {
+      createHarnessSession({ id: runSessionId, kind: 'execution', title: updated?.title ?? task.title ?? 'Background task' });
+    }
+  } catch { /* trace pre-registration is best-effort; the worker creates it anyway */ }
+  return updated;
 }
 
 /**
@@ -552,13 +667,12 @@ export function markBackgroundTaskDone(id: string, result: string): BackgroundTa
   if (!task) return null;
   const resultPath = writeFullResultFile(task, result);
   const updated = updateBackgroundTask(id, {
+    ...clearParkedBackgroundState(),
     status: 'done',
     completedAt: nowIso(),
     result: resultPath ? `${result.slice(0, RESULT_TRUNCATE_CHARS)}\n...[full result saved to ${resultPath}]` : result,
     resultPath,
     error: undefined,
-    pendingApprovalId: undefined,
-    approvalResolution: undefined,
   });
   if (updated) {
     addNotification({
@@ -587,10 +701,10 @@ export function markBackgroundTaskDone(id: string, result: string): BackgroundTa
  */
 export function markBackgroundTaskAwaitingInput(id: string, questionId: string, question: string): BackgroundTaskRecord | null {
   const updated = updateBackgroundTask(id, {
+    ...clearParkedBackgroundState(),
     status: 'awaiting_input',
     pendingQuestionId: questionId,
     pendingQuestion: question.slice(0, RESULT_TRUNCATE_CHARS),
-    inputResolution: undefined,
     result: question.slice(0, RESULT_TRUNCATE_CHARS),
   });
   if (updated) {
@@ -616,9 +730,9 @@ export function markBackgroundTaskAwaitingInput(id: string, questionId: string, 
 
 export function markBackgroundTaskAwaitingApproval(id: string, approvalId: string, resultText: string): BackgroundTaskRecord | null {
   const updated = updateBackgroundTask(id, {
+    ...clearParkedBackgroundState(),
     status: 'awaiting_approval',
     pendingApprovalId: approvalId,
-    approvalResolution: undefined,
     result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
   });
   if (updated) {
@@ -641,13 +755,11 @@ export function markBackgroundTaskAwaitingApproval(id: string, approvalId: strin
 export function markBackgroundTaskAwaitingContinue(id: string, reason: string, resultText: string): BackgroundTaskRecord | null {
   const reasonText = clean(reason || 'The task reached its internal run budget before finishing.', 1000);
   const updated = updateBackgroundTask(id, {
+    ...clearParkedBackgroundState(),
     status: 'awaiting_continue',
     completedAt: undefined,
     error: reasonText,
     result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
-    pendingApprovalId: undefined,
-    approvalResolution: undefined,
-    continueResolution: undefined,
   });
   if (updated) {
     addNotification({
@@ -685,12 +797,11 @@ export function markBackgroundTaskAwaitingContinue(id: string, reason: string, r
  */
 export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string): BackgroundTaskRecord | null {
   const updated = updateBackgroundTask(id, {
+    ...clearParkedBackgroundState(),
     status: 'blocked',
     completedAt: nowIso(),
     error: clean(reason, 1000),
     result: resultText.slice(0, RESULT_TRUNCATE_CHARS),
-    pendingApprovalId: undefined,
-    approvalResolution: undefined,
   });
   if (updated) {
     // Tag the blocker by KIND (deterministic, zero-token) so the dashboard /
@@ -720,10 +831,10 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
 
 export function markBackgroundTaskFailed(id: string, error: string, status: Extract<BackgroundTaskStatus, 'failed' | 'aborted' | 'interrupted'> = 'failed'): BackgroundTaskRecord | null {
   const updated = updateBackgroundTask(id, {
+    ...clearParkedBackgroundState(),
     status,
     completedAt: nowIso(),
     error: clean(error, 1000),
-    approvalResolution: undefined,
   });
   if (updated) {
     addNotification({
@@ -1314,7 +1425,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      const resume = task.inputResolution;
 	      const continuation = task.continueResolution;
 	      let workerMessage = resume
-	        ? `The user answered your question: "${resume.answer}". Continue the task with this answer.`
+	        ? buildWorkerInputResumePrompt(task, resume.answer)
 	        : continuation
 	          ? buildWorkerContinuePrompt(task, task.result ?? continuation.reason)
 	          : buildWorkerPrompt(task);
@@ -1334,11 +1445,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        // kill switch and re-throws AgentRuntimeCancelledError on caller-driven
 	        // aborts. Kill-switch CLEMMY_HARNESS_BACKGROUND=off.
 	        const remainingWallMs = Math.max(1, wallClockDeadlineMs - Date.now());
+	        const requestedModel = task.model ?? MODELS.deep;
 	        response = await respondPreferHarness('background', {
 	          sessionId: task.runSessionId,
 	          channel: task.channel ?? 'background',
 	          userId: task.userId,
-	          model: task.model ?? MODELS.deep,
+	          model: requestedModel,
 	          // P0-B — give a heavy worker turn real headroom, but never more than
 	          // half the task's soft cap so one overlong call aborts-and-recovers
 	          // (P0-A) well before the whole-task deadline cancels everything.
@@ -1390,6 +1502,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	            });
 	          },
 	        }, (req) => assistant.respond(req));
+	        task = recordBackgroundTaskRoute(task, run.id, response, requestedModel);
 
 	        if (response.stoppedReason !== 'max-turns-with-grace') break;
 	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) break;
@@ -1458,6 +1571,9 @@ export function renderBackgroundTask(task: BackgroundTaskRecord): string {
     `Task ${task.id}`,
     `Status: ${task.status}`,
     `Title: ${task.title}`,
+	    task.effectiveModel || task.modelProvider || task.modelRouteKind
+	      ? `Model route: ${task.modelRouteKind ?? 'unknown'}${task.modelProvider ? `/${task.modelProvider}` : ''}${task.effectiveModel ? ` ${task.effectiveModel}` : ''}${task.modelRouteFalloverFrom ? ` (fallover from ${task.modelRouteFalloverFrom})` : ''}`
+	      : '',
 	    task.pendingApprovalId ? `Approval: ${task.pendingApprovalId}` : '',
 	    task.startedAt ? `Started: ${task.startedAt}` : '',
 	    task.lastCheckInAt ? `Last check-in: ${task.lastCheckInAt}` : '',

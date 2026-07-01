@@ -67,6 +67,13 @@ interface ErrorClass {
 }
 
 const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefused|fetch failed|socket hang up|network|und_err|aborted|timeout/i;
+// A plan/usage QUOTA is exhausted (e.g. Codex/ChatGPT "usage_limit_reached", "The usage
+// limit has been reached", plan_limit). Providers return this as 429 OR 403 OR a 400 with
+// the marker only in the body — the bare status classifier mis-tags the 403/400 variants as
+// auth_expired → terminal run_failed with NO fallover. Detect it by message REGARDLESS of
+// status so it routes like a rate-limit: fallover to another brain, else a clean recoverable
+// "quota reached" ask — never a hard fail. (Retrying the same exhausted provider is futile.)
+const USAGE_LIMIT_RE = /usage[_ ]?limit|plan[_ ]?limit|usage_limit_reached|quota (?:exceeded|reached)|exceeded your current quota/i;
 
 /** Classify a thrown model error into a retry decision. Duck-types the AI SDK's
  *  APICallError (statusCode / responseHeaders / isRetryable) without importing
@@ -77,6 +84,14 @@ export function classifyModelError(err: unknown): ErrorClass {
     : typeof e?.status === 'number' ? e.status
     : undefined;
   const retryAfterMs = parseRetryAfter(e?.responseHeaders);
+
+  // Usage/plan quota exhausted — check FIRST (before the status branches), because the
+  // 403/400 variants would otherwise mis-classify as auth_expired → terminal. Body text
+  // (CodexRuntimeError.bodyText) carries the marker even when the message doesn't.
+  const quotaText = `${typeof e?.message === 'string' ? e.message : ''} ${typeof (e as { bodyText?: unknown })?.bodyText === 'string' ? (e as { bodyText?: string }).bodyText : ''}`;
+  if (USAGE_LIMIT_RE.test(quotaText)) {
+    return { retryable: true, kind: 'model.rate_limited', status, isAuth: false, retryAfterMs };
+  }
 
   if (status === 401 || status === 403) {
     return { retryable: true, kind: 'model.auth_expired', status, isAuth: true, retryAfterMs };

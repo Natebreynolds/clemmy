@@ -952,6 +952,15 @@ function isTransientCodexStatus(status?: number): boolean {
   return status === 408 || status === 409 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
+// A usage/plan QUOTA is exhausted (often surfaced as a 429). Retrying the SAME provider is
+// futile — it burns the retry budget and delays the brain fallover. Detect it so the retry
+// loop skips straight to throwing (→ classifyModelError tags it rate_limited → fallover).
+function isCodexUsageLimitError(error: unknown): boolean {
+  if (!(error instanceof CodexRuntimeError)) return false;
+  const text = `${error.message ?? ''} ${(error as { bodyText?: string }).bodyText ?? ''}`;
+  return /usage[_ ]?limit|plan[_ ]?limit|usage_limit_reached|quota (?:exceeded|reached)/i.test(text);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1020,6 +1029,7 @@ export class CodexNativeRuntime implements AgentRuntime {
         if (
           error instanceof CodexRuntimeError &&
           isTransientCodexStatus(error.status) &&
+          !isCodexUsageLimitError(error) &&
           transientAttempts < 3
         ) {
           const delayMs = 750 * 2 ** transientAttempts;
