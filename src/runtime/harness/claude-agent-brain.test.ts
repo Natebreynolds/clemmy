@@ -209,12 +209,13 @@ test('Move 1: the marker stays armed when final delivery fails before terminal r
   );
 });
 
-test('claudeAgentSdkBrainEnabled requires Claude auth, opt-in flag, and a chat surface', () => {
+test('claudeAgentSdkBrainEnabled requires Claude auth, opt-in flag, and a supported surface', () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   assert.equal(claudeAgentSdkBrainEnabled('home'), true);
   assert.equal(claudeAgentSdkBrainMode(), 'local_authoring');
   assert.equal(claudeAgentSdkBrainEnabled('dashboard'), true);
+  assert.equal(claudeAgentSdkBrainEnabled('background'), true, 'background tasks need the SDK lane so Claude can call Clementine tools');
   assert.equal(claudeAgentSdkBrainEnabled('workflow'), false, 'execution surfaces stay on the guarded harness');
 
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
@@ -604,6 +605,52 @@ test('turn-budget stop surfaces as max-turns-with-grace and writes user_input + 
   const completed = events.find((e) => (e as { type?: string }).type === 'conversation_completed') as { data?: Record<string, unknown> } | undefined;
   assert.equal(completed?.data?.reason, 'awaiting_continue');
   assert.match(String(completed?.data?.reply ?? ''), /Say "continue"/);
+});
+
+test('F1: a limit-hit WITH tool progress AUTO-CONTINUES and finishes (no park)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    // Turn 1: made tool progress (2 firms) but hit the per-query turn budget.
+    if (calls === 1) return { text: 'Did firms 1-2. Continuing with the remaining 3.', sessionId: 's', model: 'claude-sonnet-5', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: true };
+    // Continuation: finishes the rest.
+    return { text: 'Done — deep SEO for all 5 firms.', sessionId: 's', model: 'claude-sonnet-5', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false };
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'get deep SEO for 5 firms', sessionId: 'brain-autocont' });
+
+  assert.equal(calls, 2, 'auto-continued exactly once past the turn budget');
+  assert.equal(res.stoppedReason, 'success', 'finished, not parked');
+  assert.doesNotMatch(res.text, /Say "continue"/, 'no park prompt — it finished');
+  assert.match(res.text, /all 5 firms/);
+  assert.ok(listEvents('brain-autocont').some((e) => (e as { type?: string }).type === 'sdk_auto_continue'), 'auto-continue telemetry emitted');
+});
+
+test('F1: no forward progress (0 tool calls) does NOT auto-continue — still parks', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; return { text: 'stuck', sessionId: 's', toolUses: [], limitHit: true }; });
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'x', sessionId: 'brain-autocont-noprog' });
+  assert.equal(calls, 1, 'a limit-hit with NO tool progress must not auto-continue (anti-loop)');
+  assert.match(res.text, /Say "continue"/);
+});
+
+test('F1: kill-switch CLEMMY_CLAUDE_SDK_AUTO_CONTINUE=off ⇒ parks on limit (prior behavior)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE = 'off';
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; return { text: 'partial', sessionId: 's', toolUses: ['x'], limitHit: true }; });
+  try {
+    const res = await respondViaClaudeAgentSdkBrain('home', { message: 'long task', sessionId: 'brain-autocont-off' });
+    assert.equal(calls, 1, 'no auto-continue when the kill-switch is off');
+    assert.match(res.text, /Say "continue"/);
+  } finally {
+    delete process.env.CLEMMY_CLAUDE_SDK_AUTO_CONTINUE;
+  }
 });
 
 test('streaming max-turn stop appends the missing continue guidance instead of suppressing it', async () => {

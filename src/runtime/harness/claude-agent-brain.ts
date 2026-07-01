@@ -275,7 +275,29 @@ function maxTurnContinuations(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : 2;
 }
 
-export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' | 'discord' | 'slack';
+/** DEFAULT ON. When the SDK brain hits its per-query turn budget (maxTurns) on a run
+ *  that is STILL making forward progress, auto-continue instead of PARKING on "say
+ *  continue" — a per-query turn cap must not stop an autonomous multi-item run (the
+ *  2026-07-01 Sonnet 5 stress: 5-firm SEO parked at 2/5 on maxTurns=24). Mirrors the
+ *  main loop's auto-continue-on-limit ratchet. Off (CLEMMY_CLAUDE_SDK_AUTO_CONTINUE=off)
+ *  ⇒ the prior park-on-limit behavior. */
+function sdkAutoContinueEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_AUTO_CONTINUE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+/** Max auto-continues per run (each re-runs with a fresh turn budget). The per-query
+ *  tool-ceiling + wall-clock remain the hard backstops. */
+function maxSdkAutoContinues(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_AUTO_CONTINUE_MAX', '8') ?? '8', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 8;
+}
+/** Total wall-clock budget across all auto-continues (a hard stop against a run that
+ *  keeps making token progress without ever finishing). Default 30 min. */
+function sdkAutoContinueWallMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_AUTO_CONTINUE_WALL_MS', '1800000') ?? '1800000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1_800_000;
+}
+
+export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' | 'discord' | 'slack' | 'background';
 export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring' | 'full';
 
 function configuredMode(): ClaudeAgentBrainMode | null {
@@ -304,7 +326,7 @@ export function claudeAgentSdkBrainMode(): ClaudeAgentBrainMode | null {
 }
 
 export function isClaudeAgentBrainSurface(surface: string): surface is ClaudeAgentBrainSurface {
-  return surface === 'webhook' || surface === 'cli' || surface === 'dashboard' || surface === 'home' || surface === 'discord' || surface === 'slack';
+  return surface === 'webhook' || surface === 'cli' || surface === 'dashboard' || surface === 'home' || surface === 'discord' || surface === 'slack' || surface === 'background';
 }
 
 export function claudeAgentSdkBrainEnabled(surface: string): surface is ClaudeAgentBrainSurface {
@@ -776,6 +798,8 @@ export async function respondViaClaudeAgentSdkBrain(
     mcpToolAllowlist,
     agentic: mode === 'full',
     maxTurns: maxTurns(),
+    maxWallClockMs: request.maxWallClockMs,
+    shouldCancel: request.shouldCancel,
     priorTurns,
     onDelta: (request.onChunk && sdkStreamingEnabled())
       ? async (d: string): Promise<void> => {
@@ -963,6 +987,39 @@ export async function respondViaClaudeAgentSdkBrain(
         if (!contResult) break; // parse stumble on a continuation → keep the prior good result
         result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
         if (contResult.limitHit) break;
+      }
+    }
+
+    // F1 — auto-continue past a MAX-TURNS budget stop instead of PARKING on "say
+    // continue". A per-query turn cap must not stop an autonomous run that is STILL
+    // making forward progress (toolUses > 0). Each continuation re-runs with the
+    // progress-so-far in the prompt + a fresh turn budget; the stateless SDK lane
+    // (persistSession:false) tracks progress in its own reply, so we hand that back
+    // and tell it to finish the REST without redoing. Bounded by count + total
+    // wall-clock; the per-query tool-ceiling/wall-clock stay the hard backstops.
+    if (result.limitHit && sdkAutoContinueEnabled()) {
+      const autoStart = Date.now();
+      let autoContinues = 0;
+      while (
+        result.limitHit
+        && result.toolUses.length > 0
+        && autoContinues < maxSdkAutoContinues()
+        && (Date.now() - autoStart) < sdkAutoContinueWallMs()
+      ) {
+        const progress = (result.text || '').trim().slice(0, 1500);
+        const cont = await runContinuation({
+          prompt:
+            `You hit the per-turn tool budget but the task is NOT finished. Your progress so far:\n${progress}\n\n`
+            + `Continue from where you left off and FINISH ALL remaining items from the original request: "${request.message}". `
+            + `Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.`,
+          ...cleanContinuationRunOptions(),
+        });
+        autoContinues += 1;
+        if (!cont) break; // a parse stumble on a continuation → keep the prior partial
+        result = { ...cont, toolUses: [...result.toolUses, ...cont.toolUses] };
+        try {
+          appendEvent({ sessionId, turn: 0, role: 'system', type: 'sdk_auto_continue', data: { attempt: autoContinues, stillLimited: Boolean(cont.limitHit) } });
+        } catch { /* telemetry best-effort */ }
       }
     }
   } catch (err) {

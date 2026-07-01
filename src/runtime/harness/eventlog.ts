@@ -94,6 +94,9 @@ export const EVENT_TYPES = [
   // conversation. Carries the from/to caps so the dashboard can show
   // why the budget changed mid-run.
   'budget_elevated',
+  // SDK brain auto-continued past a per-query max-turns budget instead of parking
+  // on "say continue" (F1). Carries the attempt # and whether it's still limited.
+  'sdk_auto_continue',
   // Tool-injection scoping: emitted at agent construction so traces can
   // explain why a run saw a small external MCP surface instead of every
   // configured server tool.
