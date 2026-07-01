@@ -179,6 +179,23 @@ function formatFallbackSuggestions(intent: string, failedTool: string, failureTy
  *  GMAIL_SEND_EMAIL → "gmail send email". Without this the callers passed no intent,
  *  it defaulted to a placeholder, and the whole "here are your alternatives (incl. a
  *  native MCP / CLI for the same capability)" path was inert. */
+/** Best-effort count of items in an auto-resolved async dataset (Apify GET_DATASET_ITEMS
+ *  and friends), for the requested-vs-returned partial-scrape check. null when unknown. */
+export function asyncResultItemCount(result: unknown): number | null {
+  const seen: unknown[] = [result];
+  for (let i = 0; i < seen.length && i < 6; i += 1) {
+    const v = seen[i];
+    if (Array.isArray(v)) return v.length;
+    if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      for (const key of ['items', 'data', 'results', 'records']) {
+        if (key in o) seen.push(o[key]);
+      }
+    }
+  }
+  return null;
+}
+
 function intentSeedFromSlug(toolSlug?: string): string | undefined {
   if (!toolSlug) return undefined;
   const seed = toolSlug.replace(/[_\-]+/g, ' ').trim().toLowerCase();
@@ -676,8 +693,24 @@ async function runComposioExecute(
           // know it was async. Any other family / a poll overrun falls back to the
           // id-bearing corrective (never worse than model-driven). Bounded latency.
           const poll = await autoPollJob(receipt, (slug, a) => executeComposioTool(slug, a, effectiveConnectionId));
+          const reason = poll.reason ?? '';
           if (poll.resolved) {
-            output = `${formatComposioExecuteOutput(poll.result, { ...options, toolSlug })}\n\n[auto-resolved] Polled the queued ${receipt.family} job (${poll.polls} check${poll.polls === 1 ? '' : 's'}) and fetched the real result — this IS the final output.`;
+            const n = asyncResultItemCount(poll.result);
+            // Requested-vs-returned nudge: a "SUCCEEDED but only 40 of the 100 you wanted"
+            // partial scrape must NOT silently read as complete. We can't know the requested
+            // count generically, so surface the returned count + tell her to verify it.
+            const countNote = n !== null
+              ? ` It returned ${n} item${n === 1 ? '' : 's'} — VERIFY this matches how many you asked for; if it's short, the run under-delivered (partial scrape) — do not treat a partial as complete.`
+              : '';
+            output = `${formatComposioExecuteOutput(poll.result, { ...options, toolSlug })}\n\n[auto-resolved] Polled the ${receipt.family} job (${poll.polls} check${poll.polls === 1 ? '' : 's'}) and fetched the real result — this IS the final output.${countNote}`;
+          } else if (/^run\s+(FAILED|ABORTED|TIMED)/i.test(reason)) {
+            // The run TERMINALLY FAILED — do NOT steer her to keep polling a dead run.
+            output = `⚠️ The ${receipt.family} run ${receipt.jobId} ${reason.replace(/^run\s+/i, '')} — it did NOT produce results. Do NOT poll it again. Start a FRESH run (re-invoke the actor, optionally with a smaller scope) or report the failure (with the run id) to the user.\n\n${output}`;
+          } else if (reason === 'budget-exceeded') {
+            // Still RUNNING after the (now 4-min) auto-poll window → a genuinely long job.
+            // Steer to backgrounding (which polls + reports back) rather than grinding manual
+            // polls in-chat with no wait primitive (burns the turn budget / risks giving up).
+            output = `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (offer_background / dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
           } else {
             output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
           }

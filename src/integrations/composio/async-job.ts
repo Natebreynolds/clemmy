@@ -147,8 +147,12 @@ export function composioAutoPollEnabled(): boolean {
 }
 
 function autoPollBudgetMs(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_COMPOSIO_AUTO_POLL_MS', '60000') ?? '60000', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+  // 240s (was 60s): a real 100-lead area scrape (Google-Maps/Apollo-style Apify actor)
+  // routinely runs 1-4 minutes, so a 60s budget almost always overran → degraded to the
+  // fragile model-driven manual-poll path. 240s brings the common case back inside the
+  // harness's own resolve while staying under the 300s externalApi tool-timeout bucket.
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_COMPOSIO_AUTO_POLL_MS', '240000') ?? '240000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 240_000;
 }
 
 /** Unwrap `{data,…}` then look for a run/list payload. */

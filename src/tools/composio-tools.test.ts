@@ -12,7 +12,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { formatComposioToolOutput, formatComposioExecuteOutput, detectComposioFailure, composioThrownErrorOutput } = await import('./composio-tools.js');
+const { formatComposioToolOutput, formatComposioExecuteOutput, detectComposioFailure, composioThrownErrorOutput, asyncResultItemCount } = await import('./composio-tools.js');
 const {
   closeEventLog,
   resetEventLog,
@@ -544,4 +544,12 @@ test('formatComposioExecuteOutput: an invalid-offset error redirects to recall, 
   assert.match(out, /FAILED/);
   assert.match(out, /recall_tool_result/);
   assert.match(out, /do NOT pass a guessed offset/i);
+});
+
+test('asyncResultItemCount: counts items in an Apify dataset (partial-scrape check)', () => {
+  assert.equal(asyncResultItemCount({ data: { items: new Array(40).fill({ lead: 'x' }) } }), 40, 'nested items → count');
+  assert.equal(asyncResultItemCount(new Array(100).fill({ lead: 'x' })), 100, 'bare array → length');
+  assert.equal(asyncResultItemCount({ data: new Array(7).fill(1) }), 7, 'data array → length');
+  assert.equal(asyncResultItemCount({ results: new Array(3).fill(1) }), 3);
+  assert.equal(asyncResultItemCount({ status: 'SUCCEEDED' }), null, 'no item list → null (no false count)');
 });
