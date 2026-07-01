@@ -27,6 +27,7 @@ import pino from 'pino';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKSPACE_DOCK_TOOLS } from '../spaces/workspace-context.js';
+import { matchToolChoicesForStep } from '../memory/tool-choice-store.js';
 
 const logger = pino({ name: 'clementine-next.tool-jit' });
 
@@ -287,6 +288,11 @@ export async function selectToolsForTurn(opts: {
   tools: JitTool[];
   rankFn?: JitRankFn;
   now?: number;
+  /** Built-in tool names memory says are PROVEN for this prompt (from the tool-choice
+   *  store) — pinned like the intent set so a remembered-good tool survives pruning
+   *  even if its semantic score falls below the floor. Mirrors the MCP-side
+   *  resolveMcpToolScopeWithRecall. Only names present in `tools` are pinned. */
+  recallPinned?: string[];
 }): Promise<ToolJitSelection> {
   const all = new Set(opts.tools.map((t) => t.name));
   const exposeAll = (reason: string): ToolJitSelection => ({ exposed: all, reduced: false, reason, droppedCount: 0 });
@@ -302,6 +308,10 @@ export async function selectToolsForTurn(opts: {
   const present = opts.tools.filter((t) => TOOL_JIT_CORE.has(t.name)).map((t) => t.name);
   const intentPinned = looksLikeWorkspaceAuthoringIntent(query)
     ? opts.tools.filter((t) => WORKSPACE_INTENT_TOOLS.has(t.name)).map((t) => t.name)
+    : [];
+  const recallSet = new Set(opts.recallPinned ?? []);
+  const recallPinned = recallSet.size > 0
+    ? opts.tools.filter((t) => recallSet.has(t.name) && !TOOL_JIT_CORE.has(t.name)).map((t) => t.name)
     : [];
   const candidates = opts.tools.filter((t) => !TOOL_JIT_CORE.has(t.name));
   if (candidates.length === 0) return exposeAll('no-jit-candidates');
@@ -327,14 +337,46 @@ export async function selectToolsForTurn(opts: {
     .slice(0, k)
     .map((r) => r.name);
 
-  const exposed = new Set<string>([...present, ...intentPinned, ...selected]);
+  const exposed = new Set<string>([...present, ...intentPinned, ...recallPinned, ...selected]);
   const droppedCount = all.size - exposed.size;
   return {
     exposed,
     reduced: droppedCount > 0,
-    reason: `jit top${k}@${floor} (${present.length} core + ${intentPinned.length} intent + ${selected.length} retrieved)`,
+    reason: `jit top${k}@${floor} (${present.length} core + ${intentPinned.length} intent + ${recallPinned.length} recall + ${selected.length} retrieved)`,
     droppedCount,
   };
+}
+
+/** DEFAULT ON — recall-driven pin of built-in tools. Off (CLEMMY_JIT_RECALL_PIN=off)
+ *  ⇒ no recall pinning (byte-identical to intent+semantic only). */
+function jitRecallPinEnabled(): boolean {
+  const v = (getRuntimeEnv('CLEMMY_JIT_RECALL_PIN', 'on') ?? 'on').toLowerCase();
+  return v !== 'off' && v !== '0' && v !== 'false' && v !== 'no';
+}
+
+/**
+ * Built-in tool names that MEMORY proves were the right tool for a prompt like this,
+ * from the tool-choice store (the same store resolveMcpToolScopeWithRecall reads on
+ * the MCP side). Pass the result to selectToolsForTurn({ recallPinned }) so a
+ * remembered-good built-in survives JIT pruning even when its semantic score is low —
+ * the "find the right tool using memory" half on the built-in surface. Strictly
+ * additive (only ever widens the exposed set); best-effort (never throws). Filtering
+ * to the turn's actual tool names happens inside selectToolsForTurn.
+ */
+export function recallPinnedBuiltinTools(userInput?: string | null): string[] {
+  if (!jitRecallPinEnabled()) return [];
+  const query = (userInput ?? '').trim();
+  if (!query) return [];
+  try {
+    const matches = matchToolChoicesForStep(query, { limit: 5 });
+    const names = new Set<string>();
+    for (const m of matches) {
+      for (const fam of m.family) names.add(fam);
+    }
+    return [...names];
+  } catch {
+    return [];
+  }
 }
 
 /** Test-only: clear the in-memory caches. */

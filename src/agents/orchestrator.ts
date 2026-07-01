@@ -28,7 +28,7 @@ import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
-import { resolveToolJitDecision, selectToolsForTurn } from './tool-jit.js';
+import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
@@ -1212,6 +1212,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           name: (t as { name?: string }).name ?? '',
           description: (t as { description?: string }).description ?? '',
         })),
+        recallPinned: recallPinnedBuiltinTools(jitQuery),
       });
       jitReason = selection.reason;
       if (selection.reduced) {

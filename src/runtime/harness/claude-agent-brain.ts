@@ -1,6 +1,6 @@
 import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
-import { resolveToolJitDecision, selectToolsForTurn } from '../../agents/tool-jit.js';
+import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
 import {
   buildWorkspaceContextPrimer, workspaceSlugFromSessionId, WORKSPACE_DOCK_TOOLS,
 } from '../../spaces/workspace-context.js';
@@ -710,6 +710,7 @@ export async function respondViaClaudeAgentSdkBrain(
       const selection = await selectToolsForTurn({
         userInput: jitQuery,
         tools: fullAllowed.map((name) => ({ name, description: descByName.get(name) ?? '' })),
+        recallPinned: recallPinnedBuiltinTools(jitQuery),
       });
       // H1c: a dock chat IS editing a Workspace — pin the space tools so the JIT
       // never drops them (else the model can't persist the edit and sandboxes it).

@@ -149,6 +149,27 @@ test('workspace authoring intents pin the space tools even under a worst-case JI
   });
 });
 
+test('recall-pinned built-in tools survive JIT pruning even below the semantic floor', async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
+    const droppable = ['workflow_get', 'git_status', 'task_add'];
+    const tools: JitTool[] = [...CORE_SAMPLE, ...droppable].map((name) => ({ name, description: name }));
+    const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0])); // everything below floor
+
+    const sel = await selectToolsForTurn({
+      userInput: 'do the thing',
+      tools,
+      rankFn: zero,
+      recallPinned: ['workflow_get', 'not_present_this_turn'],
+    });
+
+    assert.equal(sel.reduced, true, 'JIT still reduced the surface');
+    assert.ok(sel.exposed.has('workflow_get'), 'a memory-proven built-in is pinned despite a 0 score');
+    assert.ok(!sel.exposed.has('git_status'), 'an un-recalled droppable tool still drops');
+    assert.ok(!sel.exposed.has('not_present_this_turn'), 'a recall name absent this turn is ignored, not injected');
+    assert.match(sel.reason, /recall/, 'reason surfaces the recall-pin count');
+  });
+});
+
 test('workspace intent pinning also catches natural dashboard requests that omit the word workspace', async () => {
   await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const tools: JitTool[] = [...CORE_SAMPLE, 'space_save', 'space_refresh', 'workflow_create']
