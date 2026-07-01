@@ -27,7 +27,7 @@ const {
   judgeChoice,
   MODELS,
 } = await import('../../config.js');
-const { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled, judgeDefaultModel } = await import('./model-roles.js');
+const { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled, judgeDefaultModel, codexSafeFast } = await import('./model-roles.js');
 const { resolveProvider } = await import('./model-wire-registry.js');
 
 /** Set env keys for a permutation, run fn, restore. */
@@ -322,5 +322,42 @@ test('codex_oauth brain: a healthy gpt primary is unchanged (byte-identical, not
 test('the guard ONLY fires for codex_oauth — an api_key brain still reports its BYO primary', () => {
   withEnv({ AUTH_MODE: 'api_key', OPENAI_MODEL_PRIMARY: 'glm-5.2', MODEL_ROUTING_MODE: 'off' }, () => {
     assert.equal(defaultForRole('brain'), 'glm-5.2', 'api_key brain is untouched by the Codex guard');
+  });
+});
+
+// ── P1: brain-safe fast fail-open (stop the GLM/BYO judge + warmup storm) ──
+// The boundary judges and boot warmup fail open to MODELS.fast. When OPENAI_MODEL_FAST
+// is repurposed to a BYO/GLM id, those (parallel) lanes stormed the BYO endpoint even
+// though the user picked Codex for the brain — the observed 429 burst. codexSafeFast()
+// keeps the fail-open on the brain's own family.
+test('codexSafeFast: codex brain + a repurposed GLM fast slot NEVER fails open to BYO', () => {
+  withEnv({ AUTH_MODE: 'codex_oauth', OPENAI_MODEL_PRIMARY: 'gpt-5.5', OPENAI_MODEL_FAST: 'glm-5.2', MODEL_ROUTING_MODE: 'off', BYO_MODEL_BASE_URL: undefined, BYO_MODEL_API_KEY: undefined }, () => {
+    assert.equal(resolveProvider(MODELS.fast), 'byo', 'precondition: the fast slot holds a GLM/BYO id');
+    const fast = codexSafeFast();
+    assert.equal(resolveProvider(fast), 'codex', 'the judge/warmup fail-open stays on the Codex family, never BYO');
+    assert.equal(fast, 'gpt-5.4-mini', 'uses the cheap code-level Codex judge id');
+  });
+});
+
+test('codexSafeFast: a healthy codex fast slot is byte-identical (no rewrite)', () => {
+  withEnv({ AUTH_MODE: 'codex_oauth', OPENAI_MODEL_PRIMARY: 'gpt-5.5', OPENAI_MODEL_FAST: 'gpt-5.4-mini', MODEL_ROUTING_MODE: 'off' }, () => {
+    assert.equal(codexSafeFast(), 'gpt-5.4-mini', 'a codex fast slot is untouched');
+  });
+});
+
+test('codexSafeFast: claude brain + GLM fast slot fails open to the cheap Claude judge, not BYO', () => {
+  withEnv({ AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8', OPENAI_MODEL_FAST: 'glm-5.2', MODEL_ROUTING_MODE: 'off' }, () => {
+    const fast = codexSafeFast();
+    assert.equal(resolveProvider(fast), 'claude', 'a Claude brain fails open on the Claude family, never BYO');
+  });
+});
+
+test('codexSafeFast: a genuine all_in BYO brain KEEPS the BYO fast slot (intended, not a storm)', () => {
+  withEnv({
+    AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.example.test', BYO_MODEL_API_KEY: 'k', BYO_MODEL_ID: 'glm-5.2',
+    OPENAI_MODEL_FAST: 'glm-5.2',
+  }, () => {
+    assert.equal(codexSafeFast(), 'glm-5.2', 'when the user really is on BYO, the fast slot is what they intend');
   });
 });

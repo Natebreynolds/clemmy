@@ -300,10 +300,9 @@ export function buildOutputGroundingPrompt(claims: NumericClaim[], sources: Grou
 }
 
 async function runOutputGroundingJudge(claims: NumericClaim[], sources: GroundingSource[]): Promise<OutputGroundingVerdict> {
-  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
+  const [{ Agent, Runner }, { z }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('zod'),
-    import('../../config.js'),
     import('../schema-normalizer.js'),
     import('./debate-model.js'),
     import('./judge-family.js'),
@@ -321,7 +320,7 @@ async function runOutputGroundingJudge(claims: NumericClaim[], sources: Groundin
   const agent = new Agent({
     name: 'OutputGroundingJudge',
     instructions: "Verify a deliverable's numeric claims against the session's own captured tool results. Accept derived/rounded/aggregated figures. Output only the structured verdict.",
-    model: routing.model ?? MODELS.fast,
+    model: routing.model ?? routing.modelId,
     modelSettings: { reasoning: { effort: 'low' } },
     outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],

@@ -193,10 +193,9 @@ export function _setGroundingJudgeForTests(fn: GroundingJudgeFn | null): void { 
  *  (caller converts to fail-open). Dynamic imports keep brackets.ts free of
  *  an SDK dependency at module load. */
 async function runGroundingJudge(payload: string, sources: GroundingSource[]): Promise<GroundingVerdict> {
-  const [{ Agent, Runner }, { z }, { MODELS }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
+  const [{ Agent, Runner }, { z }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('zod'),
-    import('../../config.js'),
     import('../schema-normalizer.js'),
     import('./debate-model.js'),
     import('./judge-family.js'),
@@ -210,8 +209,9 @@ async function runGroundingJudge(payload: string, sources: GroundingSource[]): P
     name: 'GroundingJudge',
     instructions: 'Verify outgoing external-write payloads against the session\'s own source artifacts. Output only the structured verdict.',
     // Cross-family boundary judge (a Codex/GLM brain is not graded by its own
-    // family); falls open to MODELS.fast when no different family is available.
-    model: routing.model ?? MODELS.fast,
+    // family); falls open to the brain-family-safe cheap id (routing.modelId, never
+    // a repurposed BYO fast slot) when no different family is available.
+    model: routing.model ?? routing.modelId,
     modelSettings: { reasoning: { effort: 'low' } },
     outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],

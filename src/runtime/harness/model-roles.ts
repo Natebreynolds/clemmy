@@ -37,7 +37,13 @@ import {
 import { validateRoleModelBinding } from './model-role-options.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
-import { chooseBoundaryJudgeFamily, judgeCrossFamilyEnabled, debateBrainsAvailable } from './judge-family.js';
+import {
+  chooseBoundaryJudgeFamily,
+  judgeCrossFamilyEnabled,
+  debateBrainsAvailable,
+  boundaryClaudeJudgeModel,
+  boundaryCodexJudgeModel,
+} from './judge-family.js';
 
 /** Fixed internal role seam. brain = the active orchestrator model; worker =
  *  delegated run_worker/grunt labor; judge = the fusion verify checker / debate
@@ -144,6 +150,33 @@ function codexSafePrimary(): string {
     return DEFAULT_CODEX_MODEL;
   }
   return MODELS.primary;
+}
+
+/** The brain's provider family — the family the wire will ACTUALLY dispatch the
+ *  brain to. Reuses defaultForRole('brain') so all_in→byo, claude_oauth→claude,
+ *  codex_oauth→codex (guarded) are all classified correctly, and a repurposed
+ *  OPENAI_MODEL_* slot can't mislabel a Codex brain as 'byo'. */
+function activeBrainFamily(): ModelProviderClass {
+  return resolveProvider(defaultForRole('brain'));
+}
+
+/** MODELS.fast, guarded against a repurposed OPENAI_MODEL_FAST slot that holds a
+ *  BYO id (e.g. glm-5.2). MODELS.fast is the JUDGE/warmup fail-open across the
+ *  boundary gates; when that slot routes to a BYO endpoint the (parallel) judge
+ *  lanes and the boot warmup storm the BYO provider even though the user never
+ *  picked BYO for the brain — the observed 429 burst ("set the brain to Codex but
+ *  everything still ran on GLM"). When the fast slot would route to BYO but the
+ *  brain is NOT byo, fall back to the brain family's cheap, code-level judge id so
+ *  the fail-open stays on the brain's own family (an already-tagged self-judge)
+ *  instead of an unintended BYO storm. A fast slot that already matches the brain
+ *  family, or a genuine BYO brain, is unaffected (byte-identical). Mirrors
+ *  codexSafePrimary(). */
+export function codexSafeFast(): string {
+  const fast = MODELS.fast;
+  if (resolveProvider(fast) !== 'byo') return fast;
+  const brainFamily = activeBrainFamily();
+  if (brainFamily === 'byo') return fast; // the user really is on BYO — intended
+  return brainFamily === 'claude' ? boundaryClaudeJudgeModel() : boundaryCodexJudgeModel();
 }
 
 export function defaultForRole(role: ModelRole): string {

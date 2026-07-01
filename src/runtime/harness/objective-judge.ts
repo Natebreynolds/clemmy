@@ -1,6 +1,7 @@
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import { MODELS } from '../../config.js';
+import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
 import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
@@ -224,8 +225,9 @@ function buildJudgeAgent(routing?: BoundaryJudgeRouting): Agent<RuntimeContextVa
     name: 'ObjectiveCompletionJudge',
     instructions: JUDGE_SYSTEM_PROMPT,
     // Cross-family boundary judge (avoids the brain self-grading); falls open to
-    // the cheap default model when no different family is available.
-    model: routing?.model ?? MODELS.fast,
+    // the brain-family-safe cheap id when no different family is available (never a
+    // repurposed BYO fast slot that would storm an unintended provider).
+    model: routing?.model ?? routing?.modelId ?? codexSafeFast(),
     // A binary done/not-done verdict against an explicit rubric does not need
     // deep chain-of-thought — low reasoning effort cuts the largest chunk of
     // per-call latency on this hot path (the judge runs on most action turns).

@@ -42,7 +42,7 @@ import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
 import { resolveByoProviderForModel } from './byo-providers.js';
 import { classifyTurnIntent } from './turn-intent.js';
-import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
+import { resolveRoleModel, codexSafeFast, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
 import {
   claudeAvailable,
@@ -918,7 +918,7 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
   const brain = resolveRoleModel('brain');
   const brainFamily = brain.provider;
   if (!judgeCrossFamilyEnabled()) {
-    return { model: null, modelId: MODELS.fast, judgeFamily: brainFamily, brainFamily, selfJudge: true };
+    return { model: null, modelId: codexSafeFast(), judgeFamily: brainFamily, brainFamily, selfJudge: true };
   }
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
@@ -933,8 +933,9 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
       selfJudge: checker.provider === brain.provider,
     };
   }
-  // Fail-open: no usable resolved judge → keep MODELS.fast (current behavior), tagged.
-  return { model: null, modelId: MODELS.fast, judgeFamily: brainFamily, brainFamily, selfJudge: true };
+  // Fail-open: no usable resolved judge → the brain-family-safe cheap id (never a
+  // repurposed BYO fast slot that would storm an unintended provider), tagged.
+  return { model: null, modelId: codexSafeFast(), judgeFamily: brainFamily, brainFamily, selfJudge: true };
 }
 
 export function resolveDebateBrains(passthrough: ModelProvider, modelName?: string): DebateBrains | null {

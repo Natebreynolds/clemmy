@@ -12,6 +12,7 @@ import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
 import { MODELS, getRuntimeEnv } from '../config.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
@@ -1173,7 +1174,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
             { sessionId: warmupSessionId, counter: new ToolCallsCounter(8) },
             () => assistant.getRuntime().run({
               instructions: 'Reply with the single word: ok',
-              model: MODELS.fast,
+              // Warm the BRAIN's actual model, not MODELS.fast: the provider prompt
+              // cache is keyed per-model, so priming the fast slot never helped the
+              // first real (brain) turn — and a repurposed BYO fast slot (e.g.
+              // glm-5.2) turned this boot ping into an unintended BYO call. The brain
+              // model is what the first turn will actually use.
+              model: resolveRoleModel('brain').modelId,
               prompt: 'ok',
               sessionId: warmupSessionId,
             }),
