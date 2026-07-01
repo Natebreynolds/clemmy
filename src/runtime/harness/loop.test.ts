@@ -246,6 +246,181 @@ test('W1a: a transient error AFTER an external_write does NOT switch brains (no 
   assert.equal(listEventsForConv(sess.id, { types: ['brain_fallover'] }).length, 0, 'no fallover advisory');
 });
 
+test('runTurn replays eventlog transcript when a Claude-only session has no SDK snapshot', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Draft the Acme renewal update and ask me before sending.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      reason: 'claude_agent_sdk_brain',
+      reply: 'I drafted the Acme renewal update and am waiting for your approval before sending.',
+    },
+  });
+
+  let seenItems: AgentInputItem[] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    seenItems = items;
+    return {
+      history: [...items, { role: 'assistant', content: 'Continuing from the Acme draft.' } as AgentInputItem],
+      lastResponseId: undefined,
+      finalOutput: 'Continuing from the Acme draft.',
+    };
+  };
+
+  const result = await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'pick this back up',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const replay = seenItems.find((item) => {
+    const record = item as { role?: unknown; content?: unknown };
+    return record.role === 'system' &&
+      typeof record.content === 'string' &&
+      record.content.includes('[SESSION REPLAY]');
+  }) as { content?: string } | undefined;
+  assert.ok(replay?.content, 'standard harness lane injects the canonical eventlog replay');
+  assert.match(replay.content, /USER: Draft the Acme renewal update/);
+  assert.match(replay.content, /YOU: I drafted the Acme renewal update/);
+  assert.doesNotMatch(replay.content, /USER: pick this back up/, 'current input is not duplicated into prior history');
+});
+
+test('runTurn replays only newer Claude turns missing from an older OpenAI snapshot', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Summarize the Atlas kickoff notes.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'openai_agents_harness', reply: 'Atlas kickoff summary is saved.' },
+  });
+  sess.recordTurnResult({
+    history: [
+      { role: 'user', content: 'Summarize the Atlas kickoff notes.' } as AgentInputItem,
+      { role: 'assistant', content: 'Atlas kickoff summary is saved.' } as AgentInputItem,
+    ],
+    lastResponseId: undefined,
+    turn: 1,
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Now draft the renewal email from that summary.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      reason: 'claude_agent_sdk_brain',
+      reply: 'I drafted the renewal email but did not send it.',
+    },
+  });
+
+  let seenItems: AgentInputItem[] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    seenItems = items;
+    return {
+      history: [...items, { role: 'assistant', content: 'Continuing with the unsent renewal draft.' } as AgentInputItem],
+      lastResponseId: undefined,
+      finalOutput: 'Continuing with the unsent renewal draft.',
+    };
+  };
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'pick up the renewal draft',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const replay = seenItems.find((item) => {
+    const record = item as { role?: unknown; content?: unknown };
+    return record.role === 'system' &&
+      typeof record.content === 'string' &&
+      record.content.includes('[SESSION REPLAY]');
+  }) as { content?: string } | undefined;
+  assert.ok(replay?.content, 'newer Claude turn missing from the snapshot is replayed');
+  assert.match(replay.content, /USER: Now draft the renewal email/);
+  assert.match(replay.content, /YOU: I drafted the renewal email but did not send it/);
+  assert.doesNotMatch(replay.content, /Summarize the Atlas kickoff notes/, 'older snapshot-backed user turn is not duplicated');
+  assert.doesNotMatch(replay.content, /Atlas kickoff summary is saved/, 'older snapshot-backed assistant turn is not duplicated');
+  assert.doesNotMatch(replay.content, /USER: pick up the renewal draft/, 'current input is not duplicated into prior history');
+});
+
+test('runTurn replays an unpaired awaiting_user_input question into a later brain turn', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Deploy the staging build.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Which target should I deploy: staging or production?' },
+  });
+
+  let seenItems: AgentInputItem[] = [];
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    seenItems = items;
+    return {
+      history: [...items, { role: 'assistant', content: 'Continuing after deployment target answer.' } as AgentInputItem],
+      lastResponseId: undefined,
+      finalOutput: 'Continuing after deployment target answer.',
+    };
+  };
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'use staging',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  const replay = seenItems.find((item) => {
+    const record = item as { role?: unknown; content?: unknown };
+    return record.role === 'system' &&
+      typeof record.content === 'string' &&
+      record.content.includes('[SESSION REPLAY]');
+  }) as { content?: string } | undefined;
+  assert.ok(replay?.content, 'the prior pause question is replayed');
+  assert.match(replay.content, /USER: Deploy the staging build/);
+  assert.match(replay.content, /YOU: Which target should I deploy/);
+  assert.doesNotMatch(replay.content, /USER: use staging/, 'current answer is not duplicated into prior history');
+});
+
 test('normalizeError: a non-Error object never renders as "[object Object]" (the run_failed crash)', () => {
   // The exact class that produced "Something went wrong: [object Object]": a raw
   // provider error envelope thrown late in a model stream.
@@ -1163,6 +1338,24 @@ test('generic run error emits run_failed and marks the session failed', async ()
   assert.match(String(failed[0].data.error), /unexpected null/);
   const reloaded = HarnessSession.load(sess.id);
   assert.equal(reloaded!.sessionRow.status, 'failed');
+});
+
+test('A2#3: an UNHANDLED model HTTP status (422) becomes a recoverable ask + brain-switch, not a dead session', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async () => {
+    // A model-backend HTTP error the classifier doesn't specifically handle (not
+    // 401/403/429/5xx). Previously → terminal run_failed (a dead turn). Now → recoverable
+    // model.unknown → retry/switch/stop ask (fallover-eligible), session stays ACTIVE.
+    throw { statusCode: 422, message: 'Unprocessable request' };
+  };
+  const result = await runTurn({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'do thing',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'recoverable — not a dead session');
+  const reloaded = HarnessSession.load(sess.id);
+  assert.notEqual(reloaded!.sessionRow.status, 'failed', 'session is NOT marked failed');
 });
 
 test('a NON-Error transient throw (the [object Object] class) becomes a retry prompt, not a crash', async () => {

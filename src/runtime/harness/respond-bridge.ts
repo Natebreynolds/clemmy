@@ -46,10 +46,11 @@ import { getRuntimeEnv } from '../../config.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
+import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
 import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
-import type { AssistantRequest, AssistantResponse, ToolActivity } from '../../types.js';
+import type { AssistantRequest, AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../../types.js';
 
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow' | 'discord' | 'slack';
 
@@ -144,6 +145,59 @@ export function harnessSurfaceEnabled(surface: HarnessSurface): boolean {
   const dflt = STAGING_SURFACES.has(surface) ? 'off' : 'on';
   const raw = (getRuntimeEnv(`CLEMMY_HARNESS_${surface.toUpperCase()}`, dflt) ?? dflt).trim().toLowerCase();
   return !(raw === 'off' || raw === '0' || raw === 'false' || raw === 'no');
+}
+
+function providerFor(modelId: string | undefined): string | undefined {
+  if (!modelId) return undefined;
+  try { return resolveProvider(modelId); } catch { return undefined; }
+}
+
+function readRawString(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const got = (value as Record<string, unknown>)[key];
+  return typeof got === 'string' && got.trim() ? got.trim() : undefined;
+}
+
+function routeForLegacyFallback(surface: HarnessSurface, request: AssistantRequest): AssistantRouteDiagnostics {
+  return {
+    routeKind: 'legacy',
+    surface,
+    requestedModel: request.model,
+    effectiveModel: request.model,
+    provider: providerFor(request.model),
+    transport: 'legacy_assistant',
+  };
+}
+
+function routeForHarness(surface: HarnessSurface, request: AssistantRequest): AssistantRouteDiagnostics {
+  const config = SURFACE_CONFIG[surface];
+  const effectiveModel = config.honorModel && request.model
+    ? request.model
+    : resolveRoleModel('brain').modelId;
+  return {
+    routeKind: 'harness',
+    surface,
+    requestedModel: request.model,
+    effectiveModel,
+    provider: providerFor(effectiveModel),
+    transport: 'openai_agents_harness',
+  };
+}
+
+function routeForClaudeSdkBrain(surface: HarnessSurface, request: AssistantRequest, response: AssistantResponse): AssistantRouteDiagnostics {
+  const rawModel = readRawString(response.raw, 'model');
+  const effectiveModel = rawModel
+    ?? (request.model?.startsWith('claude-') ? request.model : undefined)
+    ?? resolveRoleModel('brain').modelId;
+  return {
+    routeKind: 'claude_agent_sdk_brain',
+    surface,
+    requestedModel: request.model,
+    effectiveModel,
+    provider: 'claude',
+    transport: readRawString(response.raw, 'transport') ?? 'claude_agent_sdk_brain',
+    mode: readRawString(response.raw, 'mode'),
+  };
 }
 
 // Test seams — same pattern as the grounding judge's _setGroundingJudgeForTests.
@@ -329,12 +383,12 @@ export async function respondViaHarness(
 
     switch (result.status) {
       case 'completed':
-        return {
+        return withRouteDiagnostics({
           text: replyText || '(no reply produced)',
           sessionId,
           stoppedReason: 'success',
           turnsUsed: result.lastTurn,
-        };
+        }, routeForHarness(surface, request));
       case 'awaiting_user_input':
         // The run asked the user a clarifying question (ask_user_question). It is
         // NOT done — surface a DISTINCT stop reason so a BACKGROUND run parks for
@@ -342,16 +396,16 @@ export async function respondViaHarness(
         // (the root cause of "tasks get lost" + "she can't pause for validation").
         // Foreground/chat callers treat any non-success reason as a normal reply,
         // so this is forward-only for them — only the background drain branches on it.
-        return {
+        return withRouteDiagnostics({
           text: replyText || '(no reply produced)',
           sessionId,
           stoppedReason: 'awaiting-input',
           turnsUsed: result.lastTurn,
-        };
+        }, routeForHarness(surface, request));
       case 'awaiting_approval': {
         const pending = listPending({ sessionId, status: 'pending' });
         const first = pending[0];
-        return {
+        return withRouteDiagnostics({
           text: replyText
             || (first
               ? `Paused for approval \`${first.approvalId}\`: ${first.subject}. Approve or reject it and I'll continue.`
@@ -360,25 +414,25 @@ export async function respondViaHarness(
           pendingApprovalId: first?.approvalId,
           stoppedReason: 'pending-approval',
           turnsUsed: result.lastTurn,
-        };
+        }, routeForHarness(surface, request));
       }
       case 'limit_exceeded':
-        return {
+        return withRouteDiagnostics({
           text: replyText || 'I hit the run budget before finishing — say "continue" to keep going.',
           sessionId,
           stoppedReason: 'max-turns-with-grace',
           turnsUsed: result.lastTurn,
-        };
+        }, routeForHarness(surface, request));
       case 'killed':
         // Preserve the legacy cancellation contract: callers (background
         // tasks) classify aborts via this error type.
         if (cancelledByCaller) throw new AgentRuntimeCancelledError('Run cancelled by caller.');
-        return {
+        return withRouteDiagnostics({
           text: replyText || 'Run was cancelled.',
           sessionId,
           stoppedReason: 'cancelled',
           turnsUsed: result.lastTurn,
-        };
+        }, routeForHarness(surface, request));
       case 'failed':
       default:
         throw new Error(result.error || `harness run ${result.status}`);
@@ -400,19 +454,25 @@ export async function respondPreferHarness(
   request: AssistantRequest,
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
 ): Promise<AssistantResponse> {
-  if (!harnessSurfaceEnabled(surface)) return legacyRespond(request);
+  if (!harnessSurfaceEnabled(surface)) {
+    return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+  }
   // Per-call tool-exclusion: route through the harness ONLY when it can ENFORCE
   // every excluded name (harness-surface tool). A non-filterable exclude (an
   // external MCP tool) falls back to legacy so we never silently widen the
   // caller's tool surface. buildOrchestratorAgent does the actual filtering.
-  if (!harnessCanEnforceExcludes(request.excludeToolNames)) return legacyRespond(request);
+  if (!harnessCanEnforceExcludes(request.excludeToolNames)) {
+    return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+  }
   let auth: { ok: boolean };
   try {
     auth = await configureImpl();
   } catch {
     auth = { ok: false };
   }
-  if (!auth.ok) return legacyRespond(request);
+  if (!auth.ok) {
+    return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+  }
   if (claudeAgentSdkBrainEnabled(surface)) {
     const detachProgressRelay = attachLegacyProgressRelay(request);
     let detached = false;
@@ -422,7 +482,8 @@ export async function respondPreferHarness(
       detachProgressRelay();
     };
     try {
-      return await claudeAgentBrainImpl(surface, request);
+      const response = await claudeAgentBrainImpl(surface, request);
+      return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
     } catch (err) {
       const recovered = await recoverChatBrainFailure(surface, request, err, detach);
       if (recovered) return recovered;
@@ -459,10 +520,23 @@ function chatBrainFalloverEnabled(): boolean {
  */
 export function isChatBrainFalloverEligible(err: unknown): boolean {
   if (!chatBrainFalloverEnabled()) return false;
-  return (
-    (err instanceof ClaudeSdkProviderOverloadError && !err.committed) ||
-    isClaudeSdkUnparseableToolCall(err)
-  );
+  // NEVER fall over an INTENTIONAL stop (user cancel / kill / abort) — that's not a brain
+  // failure, and re-running it on another brain would ignore the user's stop.
+  if (err instanceof AgentRuntimeCancelledError) return false;
+  const name = err instanceof Error ? err.name : '';
+  if (/cancel|kill|abort/i.test(name)) return false;
+  // A COMMITTED provider overload is already handled by the SDK lane's salvage (it returns a
+  // success), so a propagated overload here is the uncommitted one.
+  if (err instanceof ClaudeSdkProviderOverloadError) return !err.committed;
+  // Unparseable tool call — a flaky stumble a DIFFERENT brain usually doesn't reproduce.
+  if (isClaudeSdkUnparseableToolCall(err)) return true;
+  // GENERIC terminal Claude-brain failure (non-overload 4xx/5xx, usage-limit, tool-surface
+  // error, SDK internal throw, runtime.unknown): a DIFFERENT brain often succeeds where this
+  // one dead-ended. Safe to re-run the whole turn — the duplicate-send HARD WALL blocks any
+  // re-send of an already-committed external write on the re-run, so switching brains can't
+  // double-act. Broadened 2026-07-01 (brain-switching-when-needed): previously every
+  // non-overload / non-parse Claude-brain error HARD-FAILED the turn with no fallover.
+  return err instanceof Error;
 }
 
 export async function recoverChatBrainFailure(
@@ -472,12 +546,25 @@ export async function recoverChatBrainFailure(
   detach?: () => void,
 ): Promise<AssistantResponse | null> {
   if (!isChatBrainFalloverEligible(err)) return null;
-  bridgeLogger.warn({ surface, kind: err instanceof ClaudeSdkProviderOverloadError ? 'overload' : 'parse_failure' },
-    'Claude brain terminal failure with nothing harmful committed — falling the turn over to the harness brain (Codex→GLM)');
+  const kind = err instanceof ClaudeSdkProviderOverloadError ? 'overload'
+    : isClaudeSdkUnparseableToolCall(err) ? 'parse_failure'
+    : 'terminal_error';
+  bridgeLogger.warn({ surface, kind, err: err instanceof Error ? err.message : String(err) },
+    'Claude brain terminal failure — switching the turn over to the harness brain (Codex→GLM); the duplicate-send wall protects any committed write');
   detach?.();
-  return respondViaHarness(surface, request, {
-    reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
-  });
+  try {
+    const recovered = await respondViaHarness(surface, request, {
+      reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
+    });
+    const route = routeDiagnosticsFromResponse(recovered);
+    return route ? withRouteDiagnostics(recovered, { ...route, falloverFrom: 'claude_agent_sdk_brain' }) : recovered;
+  } catch (falloverErr) {
+    // The fallover brain ALSO failed terminally — no worse than not falling over. Return
+    // null so the caller surfaces the original error (best-effort switch).
+    bridgeLogger.warn({ surface, err: falloverErr instanceof Error ? falloverErr.message : String(falloverErr) },
+      'brain fallover to the harness brain also failed — surfacing the original error');
+    return null;
+  }
 }
 
 type BuiltAgent = Awaited<ReturnType<typeof buildOrchestratorAgent>>;

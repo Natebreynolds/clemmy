@@ -97,6 +97,8 @@ function titleForKind(kind: BoundaryErrorKind): string {
       return 'Model auth expired';
     case 'model.http_5xx':
       return 'Model backend is having trouble';
+    case 'model.unknown':
+      return 'Model backend hit an unexpected error';
     case 'mcp.server_unavailable':
       return 'Tool server is unavailable';
     case 'mcp.tool_call_failed':
@@ -185,6 +187,7 @@ function severityForKind(kind: BoundaryErrorKind): 'warn' | 'error' | 'critical'
     case 'model.transport_timeout':
     case 'model.empty_completion':
     case 'model.http_5xx':
+    case 'model.unknown':
     case 'mcp.server_unavailable':
     case 'notification.delivery_failed':
     case 'notification.partial_chunk':

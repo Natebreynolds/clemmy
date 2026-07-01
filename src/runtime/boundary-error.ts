@@ -42,6 +42,9 @@ export type BoundaryErrorKind =
   | 'model.empty_completion'
   | 'model.auth_expired'
   | 'model.http_5xx'
+  // An unclassified/non-transient model-or-runtime failure that would otherwise dead-end
+  // at a terminal run_failed. Recoverable: brain-switch first, else a retry/switch/stop ask.
+  | 'model.unknown'
   // MCP fleet
   | 'mcp.server_unavailable'
   | 'mcp.tool_call_failed'

@@ -18,6 +18,7 @@ const {
   respondPreferHarness,
   respondViaHarness,
   harnessSurfaceEnabled,
+  isChatBrainFalloverEligible,
   _setBridgeImplsForTests,
 } = await import('./respond-bridge.js');
 // eslint-disable-next-line import/first
@@ -273,10 +274,10 @@ test('respondPreferHarness: Claude SDK brain relays harness tool/progress events
   assert.ok(seenReasoning.some((text) => /planning the next step/i.test(text)));
 });
 
-test('respondPreferHarness: Claude SDK brain opt-in does not route execution surfaces', async () => {
+test('respondPreferHarness: Claude SDK brain opt-in routes background, while workflow stays on its dedicated path', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
-  let claudeBrainCalled = 0;
+  const claudeBrainSurfaces: string[] = [];
   let runConversationCalled = 0;
   _setBridgeImplsForTests({
     configure: okConfigure,
@@ -285,20 +286,25 @@ test('respondPreferHarness: Claude SDK brain opt-in does not route execution sur
       runConversationCalled += 1;
       return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, lastDecision: { reply: 'harness', summary: 's', done: true, nextAction: 'completed' } };
     }) as never,
-    claudeAgentBrain: (async (_surface, req) => {
-      claudeBrainCalled += 1;
+    claudeAgentBrain: (async (surface, req) => {
+      claudeBrainSurfaces.push(surface);
       return { text: 'claude', sessionId: req.sessionId };
     }) as never,
   });
 
-  const res = await respondPreferHarness('workflow', { message: 'step', sessionId: 'claude-brain-workflow' }, async (req) => ({
+  const background = await respondPreferHarness('background', { message: 'count files', sessionId: 'claude-brain-background' }, async (req) => ({
+    text: 'legacy',
+    sessionId: req.sessionId,
+  }));
+  const workflow = await respondPreferHarness('workflow', { message: 'step', sessionId: 'claude-brain-workflow' }, async (req) => ({
     text: 'legacy',
     sessionId: req.sessionId,
   }));
 
-  assert.equal(res.text, 'harness');
+  assert.equal(background.text, 'claude');
+  assert.equal(workflow.text, 'harness');
   assert.equal(runConversationCalled, 1);
-  assert.equal(claudeBrainCalled, 0, 'workflow stays on the guarded harness until mutation parity is ported');
+  assert.deepEqual(claudeBrainSurfaces, ['background']);
 });
 
 test('Claude SDK brain overload (uncommitted) falls the turn over to the harness brain (Codex→GLM)', async () => {
@@ -319,6 +325,9 @@ test('Claude SDK brain overload (uncommitted) falls the turn over to the harness
   const res = await respondPreferHarness('home', { message: 'hi', sessionId: 'fallover-ok' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
   assert.equal(res.text, 'harness-fallover', 'turn ran on the harness brain after Claude overloaded');
   assert.equal(runConversationCalled, 1);
+  assert.equal(res.route?.routeKind, 'harness');
+  assert.equal(res.route?.falloverFrom, 'claude_agent_sdk_brain');
+  assert.equal(res.route?.surface, 'home');
 });
 
 test('Claude SDK brain UNPARSEABLE-TOOL-CALL (parse failure) also falls the turn over to the harness brain', async () => {
@@ -449,6 +458,10 @@ test('respondViaHarness: completed maps to AssistantResponse with reply preferre
   assert.equal(res.text, 'hello user');
   assert.equal(res.stoppedReason, 'success');
   assert.equal(res.turnsUsed, 3);
+  assert.equal(res.route?.routeKind, 'harness');
+  assert.equal(res.route?.surface, 'webhook');
+  assert.equal(res.route?.transport, 'openai_agents_harness');
+  assert.ok(res.route?.effectiveModel, 'effective model is recorded for diagnostics');
   const session = getSession('bridge-t5');
   assert.ok(session, 'harness session created');
   assert.equal(session?.kind, 'chat', 'webhook surface creates a chat-kind session');
@@ -583,4 +596,27 @@ test('respondViaHarness: caller-driven cancel throws AgentRuntimeCancelledError 
     }),
     (err: unknown) => err instanceof AgentRuntimeCancelledError,
   );
+});
+
+test('isChatBrainFalloverEligible: ANY genuine Claude-brain failure switches brains; intentional stops do NOT', () => {
+  const prev = process.env.CLEMMY_BRAIN_FALLOVER;
+  try {
+    process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+    // Broadened: a generic terminal error (SDK internal throw, tool-surface, unknown 4xx)
+    // is now fallover-eligible — a DIFFERENT brain often succeeds. (Was a dead turn.)
+    assert.equal(isChatBrainFalloverEligible(new Error('SDK internal failure: something broke')), true);
+    assert.equal(isChatBrainFalloverEligible(new Error('The usage limit has been reached')), true);
+    // Uncommitted overload still eligible; committed overload is handled by salvage (not here).
+    assert.equal(isChatBrainFalloverEligible(new ClaudeSdkProviderOverloadError('529 Overloaded', false)), true);
+    assert.equal(isChatBrainFalloverEligible(new ClaudeSdkProviderOverloadError('529 Overloaded', true)), false);
+    // Intentional stops are NOT brain failures — never switch/re-run them.
+    assert.equal(isChatBrainFalloverEligible(new AgentRuntimeCancelledError('Run cancelled by caller.')), false);
+    const killErr = new Error('stopped'); killErr.name = 'KillRequested';
+    assert.equal(isChatBrainFalloverEligible(killErr), false);
+    // Kill-switch off ⇒ never fall over (prior behavior preserved).
+    process.env.CLEMMY_BRAIN_FALLOVER = 'off';
+    assert.equal(isChatBrainFalloverEligible(new Error('SDK internal failure')), false);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_BRAIN_FALLOVER; else process.env.CLEMMY_BRAIN_FALLOVER = prev;
+  }
 });

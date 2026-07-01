@@ -28,6 +28,11 @@ import {
   harnessToolBracketsEnabled,
 } from './brackets.js';
 import { compactSessionIfNeeded, checkpointGoalStage } from './compaction.js';
+import {
+  pullRecentTurnsForHarnessHistory,
+  renderRecentActionsForHarnessHistory,
+  renderTranscriptTurns,
+} from './session-transcript.js';
 import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
 import { buildAgentContextPacket } from './context-packet.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
@@ -100,6 +105,77 @@ function safeMaybeAutoFocus(sessionId: string, summaryHint?: unknown): void {
   } catch (err) {
     // Focus is a context aid, not a reason to fail the user's turn.
     console.warn('[harness] auto-focus failed', err instanceof Error ? err.message : err);
+  }
+}
+
+function itemText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value.map((entry) => {
+      if (typeof entry === 'string') return entry;
+      if (entry && typeof entry === 'object') {
+        const record = entry as Record<string, unknown>;
+        if (typeof record.text === 'string') return record.text;
+        if (typeof record.content === 'string') return record.content;
+      }
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  return '';
+}
+
+function normalizeReplaySearchText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function snapshotSearchText(items: AgentInputItem[]): string {
+  return normalizeReplaySearchText(items.map((item) => {
+    const record = item as { content?: unknown };
+    const content = itemText(record.content);
+    if (content.trim()) return content;
+    try { return JSON.stringify(item); } catch { return ''; }
+  }).filter(Boolean).join('\n'));
+}
+
+function snapshotIncludesTurn(snapshotText: string, turnText: string): boolean {
+  const needle = normalizeReplaySearchText(turnText);
+  if (!needle) return true;
+  if (snapshotText.includes(needle)) return true;
+  // Long assistant replies may be represented inside structured JSON or compacted
+  // with suffixes stripped. A strong prefix match is enough to avoid duplicate
+  // replay while still recovering genuinely missing Claude SDK turns.
+  if (needle.length > 240 && snapshotText.includes(needle.slice(0, 240))) return true;
+  return false;
+}
+
+function clipReplayFallback(text: string, maxChars: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, Math.max(0, maxChars - 30))}\n...[session history truncated]`;
+}
+
+function renderEventlogReplayFallback(sessionId: string, currentInput: string, snapshotItems: AgentInputItem[]): string {
+  try {
+    const db = openEventLog();
+    const snapshotText = snapshotSearchText(snapshotItems);
+    const actions = renderRecentActionsForHarnessHistory(db, sessionId);
+    const turns = pullRecentTurnsForHarnessHistory(sessionId, 8);
+    const current = currentInput.trim();
+    const priorTurns = turns.length > 0 &&
+      turns[turns.length - 1]?.who === 'user' &&
+      turns[turns.length - 1]?.text.trim() === current
+      ? turns.slice(0, -1)
+      : turns;
+    const missingTurns = priorTurns.filter((turn) => !snapshotIncludesTurn(snapshotText, turn.text));
+    const parts = [
+      actions,
+      missingTurns.length > 0
+        ? `Recent transcript missing from the persisted SDK snapshot for ${sessionId}:\n${renderTranscriptTurns(missingTurns)}`
+        : '',
+    ].filter(Boolean);
+    return parts.length > 0 ? clipReplayFallback(parts.join('\n\n'), 8_000) : '';
+  } catch {
+    return '';
   }
 }
 
@@ -3102,6 +3178,24 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     });
   }
 
+  // Cross-brain replay fallback: the Claude SDK brain writes canonical
+  // user_input_received/conversation_completed rows, but it does not populate the
+  // OpenAI SDK conversation snapshot. If a later turn for the same session falls
+  // over to this standard harness lane, replay only the eventlog turns/actions
+  // missing from the snapshot. That covers both a fully empty snapshot and a mixed
+  // session with an older OpenAI snapshot plus newer Claude turns, without
+  // duplicating normal harness history.
+  const replay = renderEventlogReplayFallback(options.sessionId, options.input, compactedItems);
+  if (replay) {
+    compactedItems = [
+      {
+        role: 'system',
+        content: `[SESSION REPLAY]\n${replay}`,
+      } as AgentInputItem,
+      ...compactedItems,
+    ];
+  }
+
   // Cross-session prefix injection. The seed function in discord-harness
   // writes a cross_session_prefix event when a fresh session opens with
   // prior same-channel context. Without injecting it into items here,
@@ -4596,6 +4690,9 @@ export function isCodexAuthRevoked(err: unknown, message: string): boolean {
 const TRANSIENT_FALLOVER_KINDS = new Set<string>([
   'model.overloaded', 'model.rate_limited', 'model.http_5xx', 'model.transport_timeout',
   'codex.http_5xx', 'codex.sse_truncated', 'codex.wall_clock', 'codex.transport_timeout',
+  // An unclassified terminal failure: try SWITCHING brains before dead-ending — a different
+  // brain often succeeds where this one hit an unexpected error (brain-switching-when-needed).
+  'model.unknown',
 ]);
 
 /**
@@ -4821,6 +4918,21 @@ function handleRunError(
           retryable: true,
           userMessage: `The model backend hit a transient error (${cls.kind.replace('model.', '')}).`,
         });
+      } else if (typeof cls.status === 'number' && !cls.isAuth && !isCodexAuthRevoked(err, message)) {
+        // A2#3 — an unhandled MODEL-BACKEND HTTP error (a non-401/403/429/5xx status the
+        // classifier didn't recognize, e.g. a 4xx quota/policy code) would otherwise dead-end
+        // at the terminal run_failed below (a hard crash the user can't recover from without
+        // re-typing). Wrap it as recoverable model.unknown so the SAME path fires: on a
+        // fallover-capable surface the brain is SWITCHED first (model.unknown is in
+        // TRANSIENT_FALLOVER_KINDS), and if every brain is exhausted the user gets the
+        // "retry / switch / stop" ask with the session left ACTIVE. Scoped to errors that
+        // carry an HTTP status (genuine backend failures) so a non-model code bug still
+        // fails honestly. NOT auth — that keeps its own re-auth path below.
+        err = BoundaryError.from(err, {
+          kind: 'model.unknown',
+          retryable: true,
+          userMessage: 'The model backend hit an unexpected error.',
+        });
       }
     } catch { /* classification is best-effort — fall through to normal handling */ }
   }
@@ -4845,6 +4957,9 @@ function handleRunError(
       'model.rate_limited',
       'model.http_5xx',
       'model.transport_timeout',
+      // Unclassified terminal failure — recoverable ask (retry/switch/stop) instead of a
+      // dead session; brain-switch is tried first via the deferInfraAsk path below.
+      'model.unknown',
     ]);
     const askUserEnabled =
       (getRuntimeEnv('HARNESS_INFRA_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
