@@ -26,6 +26,7 @@ import {
   type ClaudeAgentSdkToolProfile,
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
+  ClaudeSdkProviderOverloadError,
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
@@ -803,6 +804,20 @@ export async function respondViaClaudeAgentSdkBrain(
     try {
       return await runClaudeAgentSdkImpl(opts);
     } catch (err) {
+      // P4: a COMMITTED provider overload (the model hit 429/529 AFTER side effects
+      // landed, 21-min-in) used to dead-end as a raw "overloaded" error. If writes
+      // committed, salvage an HONEST partial from the ledger instead of the raw error
+      // — the user gets "N actions went through, nothing duplicated, I hit capacity"
+      // rather than a bare failure. NEVER re-runs (would double-act). An UNCOMMITTED
+      // overload still propagates so the existing transplant to another brain runs.
+      if (claudeSdkSalvageEnabled() && err instanceof ClaudeSdkProviderOverloadError && err.committed) {
+        const salvagedOverload = salvageCommittedResult(sessionId);
+        if (salvagedOverload) {
+          try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_salvaged', reason: 'provider_overload_after_commit' } }); } catch { /* best-effort */ }
+          return salvagedOverload;
+        }
+        throw err; // committed but no external write to salvage — surface for the caller
+      }
       if (!claudeSdkSalvageEnabled() || !isClaudeSdkUnparseableToolCall(err)) throw err;
       const salvaged = salvageCommittedResult(sessionId);
       if (salvaged) {

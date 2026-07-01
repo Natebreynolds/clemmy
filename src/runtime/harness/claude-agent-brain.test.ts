@@ -25,6 +25,7 @@ const {
   sdkStreamingEnabled,
 } = brain;
 const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('./eventlog.js');
+const { ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
 
 beforeEach(() => {
   resetEventLog();
@@ -902,6 +903,40 @@ test('salvage A: a parse error AFTER work committed returns a SUCCESS confirmati
   assert.match(res.text, /nothing was duplicated/i);
   assert.match(res.text, /check|verify|missing/i);
   assert.doesNotMatch(res.text, /could not be parsed|went wrong|✅ Done/i);
+});
+
+test('salvage A2: a COMMITTED provider overload returns an honest partial (never re-runs, no double-send)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE; // default on
+  createSession({ id: 'overload-committed', kind: 'chat', title: 'overload salvage' });
+  // 2 emails already sent this turn when the provider 529'd mid-run (21-min-in case).
+  for (const t of ['a@x.com', 'b@y.com']) {
+    appendEvent({ sessionId: 'overload-committed', turn: 0, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_OUTLOOK_SEND_EMAIL', toolName: 'composio_execute_tool', targets: [t] } });
+  }
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => { calls += 1; throw new ClaudeSdkProviderOverloadError('API Error: 529 overloaded_error', true); });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'sent' }));
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send those 2 emails', sessionId: 'overload-committed' });
+  assert.equal(calls, 1, 'must NOT re-run after a committed overload (no double-send)');
+  assert.match(res.text, /2 emails/);
+  assert.match(res.text, /nothing was duplicated/i);
+  // The user gets an honest recoverable message, NOT a bare "overloaded" error.
+  assert.doesNotMatch(res.text, /overloaded_error|529|went wrong/i);
+});
+
+test('salvage A2b: an UNCOMMITTED overload still propagates (so the transplant to another brain runs)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
+  createSession({ id: 'overload-uncommitted', kind: 'chat', title: 'overload uncommitted' });
+  // No external_write events → nothing to salvage.
+  setClaudeAgentSdkBrainRunForTest(async () => { throw new ClaudeSdkProviderOverloadError('API Error: 529 overloaded_error', true); });
+  await assert.rejects(
+    respondViaClaudeAgentSdkBrain('home', { message: 'do a thing', sessionId: 'overload-uncommitted' }),
+    /overloaded_error|529/i,
+    'a committed overload with no writes to salvage propagates for the caller to handle',
+  );
 });
 
 test('salvage B: a parse error with NOTHING committed retries once and succeeds', async () => {
