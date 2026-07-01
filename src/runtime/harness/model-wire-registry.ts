@@ -203,9 +203,12 @@ const REGISTRY: RegistryRow[] = [
     },
   },
   {
-    idMatch: /claude-fable-5|claude-sonnet-4-6|claude-sonnet-4\.6/i,
+    // Sonnet 5 is a 4.6+ generation Sonnet (effort + adaptive thinking, NOT the
+    // legacy budget_tokens path) — it MUST match here and not fall through to the
+    // claude-sonnet-legacy row below, which would 400 on effort/budget_tokens.
+    idMatch: /claude-fable-5|claude-sonnet-5|claude-sonnet-4-6|claude-sonnet-4\.6/i,
     cap: {
-      family: 'fable-5/sonnet-4.6', apiShape: 'anthropic_messages',
+      family: 'fable-5/sonnet-5/sonnet-4.6', apiShape: 'anthropic_messages',
       contextWindow: 200_000, maxOutput: 64_000, supportsEffort: true,
       effortMap: ANTHROPIC_EFFORT_MAP, thinkingMode: 'effort',
       supportsPromptCache: true, cacheMinTokens: 2048, retryClass: 'anthropic',

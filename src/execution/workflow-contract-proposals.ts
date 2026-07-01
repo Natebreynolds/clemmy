@@ -31,6 +31,11 @@ export interface WorkflowContractProposal {
   notes: string[];
 }
 
+export interface AppliedWorkflowContractUpgrades {
+  def: WorkflowDefinition;
+  changes: string[];
+}
+
 const INPUT_TOKEN_RE = /\{\{\s*input\.([A-Za-z0-9_-]+)\s*\}\}/g;
 const LEGACY_COMMON_INPUT_RE = /\{\{\s*([A-Za-z][A-Za-z0-9_-]*)\s*\}\}/g;
 
@@ -39,18 +44,20 @@ const PRODUCE_RE =
 const READ_DATA_RE =
   /\b(?:fetch|find|search|query|pull|list|retrieve|collect|extract|scrape|crawl|get|read|load|monitor)\b/i;
 const DELIVERABLE_RE =
-  /\b(?:report|brief|audit|file|document|url|link|html|sheet|spreadsheet|pdf|csv|deck|slides?|deploy(?:ed|ment)?|publish(?:ed)?|draft(?:ed)?|records?|rows?|list|items?|leads?|prospects?|meetings?|accounts?|contacts?|results?|page|website|saved to|written to|upload(?:ed)?)\b/i;
+  /\b(?:report|brief|audit|summary|summaries|file|document|url|link|html|sheet|spreadsheet|pdf|csv|deck|slides?|deploy(?:ed|ment)?|publish(?:ed)?|draft(?:ed)?|records?|rows?|list|items?|leads|prospects|meetings|accounts|contacts|results?|page|website|saved to|written to|upload(?:ed)?)\b/i;
 const URL_DELIVERABLE_RE =
   /\b(?:url|link|deploy(?:ed|ment)?|publish(?:ed)?|website|page|live\s+site|netlify|vercel|google\s+sheets?|spreadsheet|sheet)\b/i;
 const FILE_DELIVERABLE_RE =
   /\b(?:file|html|pdf|csv|deck|slides?|screenshot|preview|saved to|written to|export|render)\b/i;
 const LIST_DELIVERABLE_RE =
-  /\b(?:list|rows?|records?|items?|leads?|prospects?|meetings?|accounts?|contacts?|results?)\b/i;
+  /\b(?:list|rows?|records?|items?|leads|prospects|meetings|accounts|contacts|results?)\b/i;
+const SUMMARY_DELIVERABLE_RE =
+  /\b(?:summary|summaries)\b/i;
 
 const LIST_KEY_HINTS: Array<[string, RegExp]> = [
   ['meetings', /\bmeetings?\b/i],
-  ['leads', /\bleads?\b/i],
-  ['prospects', /\bprospects?\b/i],
+  ['leads', /\bleads\b/i],
+  ['prospects', /\bprospects\b/i],
   ['accounts', /\baccounts?\b/i],
   ['contacts', /\bcontacts?\b/i],
   ['records', /\brecords?\b/i],
@@ -172,6 +179,11 @@ function proposeStepOutput(step: WorkflowStepInput): WorkflowContractStepOutputP
     verify.path_exists = ['path'];
     reasons.push('prompt asks for a file/render/export-style deliverable');
   }
+  if (SUMMARY_DELIVERABLE_RE.test(prompt)) {
+    required.add('summary');
+    nonEmpty.add('summary');
+    reasons.push('prompt asks for a summary deliverable');
+  }
   if (LIST_DELIVERABLE_RE.test(prompt)) {
     const key = listOutputKey(prompt);
     required.add(key);
@@ -232,9 +244,17 @@ function fallbackObjective(workflow: WorkflowDefinition, stepOutputs: WorkflowCo
     workflow.description_body,
     workflow.synthesis?.prompt,
     stepOutputs[stepOutputs.length - 1]?.promptSnippet,
-  ].find((part) => typeof part === 'string' && part.trim().length > 0);
+  ].find((part) => meaningfulObjective(part));
   if (base) return snippet(base, 1200);
   return `Complete workflow "${workflow.name}" and produce its expected deliverable.`;
+}
+
+function meaningfulObjective(text: string | undefined): string | undefined {
+  const trimmed = text?.replace(/\s+/g, ' ').trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length < 4) return undefined;
+  if (/^(?:x|test|todo|tbd|n\/a|na)$/i.test(trimmed)) return undefined;
+  return trimmed;
 }
 
 function proposeGoal(
@@ -243,13 +263,17 @@ function proposeGoal(
 ): WorkflowGoal | undefined {
   if (hasPinnedGoal(workflow)) return undefined;
   const legacyGoal = deriveLegacyWorkflowRunGoal(workflow, sampleInputsFromDefaults(workflow));
+  const legacyObjective = meaningfulObjective(legacyGoal?.objective);
+  const legacyCriteria = legacyGoal?.successCriteria ?? [];
   const criteria = [
-    ...(legacyGoal?.successCriteria ?? []),
+    ...(stepOutputs.length > 0
+      ? legacyCriteria.filter((criterion) => !/^Step ".+" output (?:includes|has)\b/.test(criterion))
+      : legacyCriteria),
     ...stepOutputs.flatMap(criteriaFromStepProposal),
   ];
   if (criteria.length === 0 && stepOutputs.length === 0 && !workflow.synthesis?.prompt) return undefined;
   return {
-    objective: legacyGoal?.objective || fallbackObjective(workflow, stepOutputs),
+    objective: legacyObjective || fallbackObjective(workflow, stepOutputs),
     successCriteria: [...new Set(criteria)].slice(0, 10),
     maxAttempts: 2,
   };
@@ -276,6 +300,51 @@ export function proposeWorkflowContractUpgrades(workflow: WorkflowDefinition): W
     proposedGoal,
     proposedStepOutputs,
     notes,
+  };
+}
+
+export function applyWorkflowContractUpgrades(
+  workflow: WorkflowDefinition,
+  proposal: WorkflowContractProposal = proposeWorkflowContractUpgrades(workflow),
+): AppliedWorkflowContractUpgrades {
+  const changes: string[] = [];
+  const nextInputs: Record<string, WorkflowInputDef> = { ...(workflow.inputs ?? {}) };
+  let inputsChanged = false;
+  for (const input of proposal.proposedInputs) {
+    if (input.key in nextInputs) continue;
+    nextInputs[input.key] = input.input;
+    inputsChanged = true;
+    changes.push(`Declared workflow input "${input.key}".`);
+  }
+
+  const outputByStep = new Map(proposal.proposedStepOutputs.map((p) => [p.stepId, p]));
+  let stepsChanged = false;
+  const steps = workflow.steps.map((step) => {
+    if (step.output && Object.keys(step.output).length > 0) return step;
+    const output = outputByStep.get(step.id);
+    if (!output) return step;
+    stepsChanged = true;
+    changes.push(`Added output contract to step "${step.id}".`);
+    return { ...step, output: output.output };
+  });
+
+  let goalChanged = false;
+  let goal = workflow.goal;
+  if (!hasPinnedGoal(workflow) && proposal.proposedGoal) {
+    goal = proposal.proposedGoal;
+    goalChanged = true;
+    changes.push('Pinned workflow goal.');
+  }
+
+  if (!inputsChanged && !stepsChanged && !goalChanged) return { def: workflow, changes };
+  return {
+    def: {
+      ...workflow,
+      ...(inputsChanged ? { inputs: nextInputs } : {}),
+      ...(stepsChanged ? { steps } : {}),
+      ...(goalChanged ? { goal } : {}),
+    },
+    changes,
   };
 }
 

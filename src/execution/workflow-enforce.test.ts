@@ -164,6 +164,19 @@ test('autoRepair: forEach over a non-dependency wires the dependsOn', () => {
   assert.equal(checkWorkflowForWrite(repaired).ok, true);
 });
 
+test('autoRepair: forEach output path over a non-dependency wires the dependsOn', () => {
+  const def = wf({
+    steps: [
+      { id: 'list', prompt: 'produce a list of leads' },
+      { id: 'each', prompt: 'process {{item}}', forEach: '{{steps.list.output.items}}' },
+    ],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[1].dependsOn, ['list']);
+  assert.match(repairs.join(' '), /forEach/);
+  assert.equal(checkWorkflowForWrite(repaired).ok, true);
+});
+
 test('autoRepair: undeclared {{input.X}} gets declared so the engine binds it', () => {
   const def = wf({
     steps: [{ id: 'a', prompt: 'audit {{input.segment}}' }],
@@ -209,12 +222,75 @@ test('autoRepair P0-3: never overrides an author-declared sideEffect', () => {
   assert.equal(repaired.steps[0].sideEffect, 'read'); // declared value preserved
 });
 
+test('checkWorkflowForWrite: validator sees declared sideEffect from typed definitions', () => {
+  const result = checkWorkflowForWrite(wf({
+    steps: [{ id: 'send', prompt: 'Send the email summary to Nate.', sideEffect: 'read' }],
+  }));
+  assert.equal(result.ok, true);
+  assert.ok(
+    result.warnings.some((w) => /declares sideEffect: read/.test(w) && /SEND/.test(w)),
+    result.warnings.join('\n'),
+  );
+});
+
 test('autoRepair: declares COMMON input keys so callers/UI can supply them', () => {
   const def = wf({ steps: [{ id: 'a', prompt: 'audit {{input.url}}' }] });
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
   assert.ok(repaired.inputs?.url);
   assert.match(repairs.join(' '), /url/);
   assert.equal(checkWorkflowForWrite(repaired).ok, true);
+});
+
+test('autoRepair: adds inferred output contracts and a pinned goal for deliverable workflows', () => {
+  const def = wf({
+    description: 'Audit a website and produce a report URL with rows of findings.',
+    steps: [
+      {
+        id: 'deliver',
+        prompt: 'Create a report URL and return rows of findings for the audit.',
+      },
+    ],
+  });
+  const before = checkWorkflowForWrite(def);
+  assert.ok(before.warnings.some((w) => /output contract/.test(w)));
+  assert.ok(before.warnings.some((w) => /no pinned `goal`/.test(w)));
+
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+
+  assert.deepEqual(repaired.steps[0].output?.required_keys?.sort(), ['rows', 'url']);
+  assert.deepEqual(repaired.steps[0].output?.verify?.url_present, ['url']);
+  assert.deepEqual(repaired.steps[0].output?.non_empty, ['rows']);
+  assert.equal(repaired.steps[0].output?.min_items?.rows, 1);
+  assert.ok(repaired.goal?.objective);
+  assert.ok(repaired.goal?.successCriteria?.some((criterion) => criterion.includes('deliver')));
+  assert.ok(repairs.some((repair) => /Added output contract/.test(repair)));
+  assert.ok(repairs.some((repair) => /Pinned a workflow goal/.test(repair)));
+
+  const after = checkWorkflowForWrite(repaired);
+  assert.equal(after.ok, true);
+  assert.equal(after.warnings.some((w) => /output contract/.test(w)), false);
+  assert.equal(after.warnings.some((w) => /no pinned `goal`/.test(w)), false);
+});
+
+test('autoRepair: never overrides explicit output contracts or pinned goals', () => {
+  const explicitOutput = { type: 'object' as const, required_keys: ['custom'] };
+  const explicitGoal = { objective: 'Use the custom success definition.', successCriteria: ['custom must exist'], maxAttempts: 1 };
+  const def = wf({
+    goal: explicitGoal,
+    steps: [
+      {
+        id: 'deliver',
+        prompt: 'Create a report URL and return rows of findings.',
+        output: explicitOutput,
+      },
+    ],
+  });
+
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+
+  assert.equal(repaired.steps[0].output, explicitOutput);
+  assert.equal(repaired.goal, explicitGoal);
+  assert.equal(repairs.some((repair) => /Added output contract|Pinned a workflow goal/.test(repair)), false);
 });
 
 test('checkWorkflowForWrite: synthesis participates in validation', () => {

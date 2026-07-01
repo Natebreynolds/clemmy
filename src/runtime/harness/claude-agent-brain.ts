@@ -7,6 +7,7 @@ import {
 import { getCoreToolsAsync } from '../../tools/registry.js';
 import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
+import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
@@ -527,6 +528,72 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   return [volatile, recall, sessionActions].filter(Boolean).join('\n\n');
 }
 
+function emitClaudeAgentSdkBrainContextTelemetry(
+  sessionId: string,
+  request: AssistantRequest,
+  turnContext: string,
+): void {
+  const query = (request.message ?? '').replace(/\s+/g, ' ').trim();
+  const injectedBytes = Buffer.byteLength(turnContext, 'utf-8');
+  const injected = injectedBytes > 0;
+  try {
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'system',
+      type: 'turn_memory_primer',
+      data: {
+        enabled: true,
+        queryPreview: query.slice(0, 160),
+        hitCount: null,
+        injected,
+        injectedBytes,
+        source: 'claude_agent_sdk_brain_context',
+        skippedReason: injected ? null : 'empty_context',
+      },
+    });
+  } catch { /* telemetry must never block the turn */ }
+  try {
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'system',
+      type: 'agent_context_packet',
+      data: {
+        inputPreview: query.slice(0, 160),
+        complexity: 'provider_managed',
+        memory: {
+          enabled: true,
+          injected,
+          source: 'claude_agent_sdk_brain_context',
+        },
+        skills: { detected: false },
+        workflows: { detected: false },
+        toolScope: { lane: 'claude_agent_sdk_brain' },
+        mcp: { lane: 'claude_agent_sdk_brain' },
+        healthWarnings: [],
+        agentSystem: { lane: 'claude_agent_sdk_brain' },
+        multiItem: { detected: false },
+        injectedBytes,
+      },
+    });
+  } catch { /* telemetry must never block the turn */ }
+  try {
+    appendEvent({
+      sessionId,
+      turn: 1,
+      role: 'system',
+      type: 'reasoning_effort',
+      data: {
+        effort: 'provider_default',
+        reason: 'claude_agent_sdk_brain_provider_managed',
+        kind: 'chat',
+        transport: 'claude_agent_sdk_brain',
+      },
+    });
+  } catch { /* telemetry must never block the turn */ }
+}
+
 export async function respondViaClaudeAgentSdkBrain(
   surface: ClaudeAgentBrainSurface,
   request: AssistantRequest,
@@ -571,6 +638,32 @@ export async function respondViaClaudeAgentSdkBrain(
     // didn't). role:'system' → no spurious agent label.
     appendEvent({ sessionId, turn: 1, role: 'system', type: 'turn_started', data: {} });
   } catch { /* best effort — never block the turn */ }
+
+  // Memory writeback parity with the main harness loop. The Claude Agent SDK
+  // brain can truthfully answer a "remember this" turn without calling
+  // memory_remember, so run the same deterministic auto-capture fallback here
+  // for real chat turns. Errors are swallowed: memory capture must not block the
+  // model turn, but the trace records candidate signals when it does engage.
+  try {
+    const session = getSession(sessionId);
+    const shouldCapture = session?.kind === 'chat';
+    const captured = shouldCapture
+      ? captureInteractionSignals({ message: request.message, sessionId })
+      : { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
+    if (captured.candidates.length > 0 || captured.profilePatch) {
+      appendEvent({
+        sessionId,
+        turn: 1,
+        role: 'system',
+        type: 'memory_signals_captured',
+        data: {
+          factCount: captured.candidates.length,
+          profilePatch: captured.profilePatch ?? null,
+          reasons: captured.candidates.map((candidate) => candidate.reason),
+        },
+      });
+    }
+  } catch { /* auto-capture is opportunistic and must never block a turn */ }
 
   if (request.shouldCancel && await request.shouldCancel()) {
     return {
@@ -663,11 +756,13 @@ export async function respondViaClaudeAgentSdkBrain(
   // what was ACTUALLY shown, so a turn that ONLY narrated still streams its clean
   // narration-retry answer and the final reply delivers authoritatively.
   let narrationStream = false;
+  const turnContext = await renderClaudeAgentBrainTurnContext(request);
+  emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext);
   const runOptions = {
     sessionId,
     modelId,
     systemAppend: renderClaudeAgentBrainSystemAppend(surface, request, mode),
-    turnContext: await renderClaudeAgentBrainTurnContext(request),
+    turnContext,
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
     agentic: mode === 'full',

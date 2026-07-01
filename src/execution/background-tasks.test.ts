@@ -219,6 +219,50 @@ test('processBackgroundTasks clears per-turn fanout coverage before automatic co
   assert.match(updated?.result ?? '', /recovered Acme/);
 });
 
+test('processBackgroundTasks lets a verified final deliverable override partial worker coverage', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({ title: 'Write comparison doc', prompt: 'Research 10 tools and save comparison.md' });
+  clearLedger(task.runSessionId);
+  let judgeCalls = 0;
+
+  _setBackgroundDeliveryJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: true, reason: 'comparison.md exists and covers all requested tools' };
+  });
+
+  try {
+    const stubAssistant = {
+      getRuntime() {
+        return {} as never;
+      },
+      async respond(request: { sessionId: string }) {
+        recordWorkerResult({
+          sessionId: task.runSessionId,
+          callId: 'worker-asana-failed',
+          item: 'Asana',
+          ok: false,
+          reason: 'ERROR: worker failed after parent recovered the data',
+        });
+        return {
+          text: 'Done. Deliverable: comparison.md. Verified all 10 tools and all required sections.',
+          sessionId: request.sessionId,
+          stoppedReason: 'success' as const,
+        };
+      },
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const processed = await processBackgroundTasks(stubAssistant as any, 1);
+    assert.equal(processed, 1);
+    assert.equal(judgeCalls, 0, 'concrete artifact text is accepted by the cheap verifier without a judge call');
+    const updated = getBackgroundTask(task.id);
+    assert.equal(updated?.status, 'done');
+    assert.match(updated?.result ?? '', /Verified all 10 tools/);
+  } finally {
+    _setBackgroundDeliveryJudgeForTests(null);
+  }
+});
+
 test('processBackgroundTasks parks turn-budget exhaustion before terminal fanout coverage', async () => {
   const task = createBackgroundTask({ title: 'Exhausted fanout run', prompt: 'process a very large list' });
   clearLedger(task.runSessionId);

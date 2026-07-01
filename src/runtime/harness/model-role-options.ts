@@ -233,7 +233,19 @@ export function brainOptions(): BrainOption[] {
   } else {
     opts.push({ id: 'codex_oauth', value: 'codex_oauth', label: 'Codex — GPT-5.x', available: false });
   }
-  opts.push({ id: 'claude_oauth', value: 'claude_oauth', label: 'Claude — Opus', available: claudeModelsAvailable() });
+  // Claude brain: offer each connected Claude model (like the Codex picker) so the
+  // brain can be pinned to Sonnet 5 vs Opus 4.8 vs Fable 5 — not just "Claude".
+  // value `claude_oauth:<id>` so the active-brain route persists the exact model
+  // (→ CLAUDE_MODEL). Falls back to the generic unavailable row when Claude isn't
+  // connected so the row still renders.
+  const claudeGroup = connectedModelGroups().find((g) => g.provider === 'claude');
+  if (claudeGroup && claudeGroup.models.length > 0) {
+    for (const m of claudeGroup.models) {
+      opts.push({ id: 'claude_oauth', value: `claude_oauth:${m.id}`, modelId: m.id, label: `Claude — ${m.label.replace(/^Claude\s+/, '')}`, available: true });
+    }
+  } else {
+    opts.push({ id: 'claude_oauth', value: 'claude_oauth', label: 'Claude — Opus', available: false });
+  }
   const seen = new Set<string>();
   for (const provider of getByoProviders()) {
     if (!providerToBackendConfig(provider).configured) continue;
@@ -269,7 +281,10 @@ export function effectiveBrainValue(): string {
   // 'api_key' nor a BYO model that isn't actually orchestrating.
   const brainModelId = defaultForRole('brain');
   const provider = resolveProvider(brainModelId);
-  if (provider === 'claude') return 'claude_oauth';
+  // claude → the SPECIFIC model value so the picker highlights the right Claude
+  // row (brainOptions lists every connected Claude model; the resolved id is
+  // getClaudeBrainModel(), always one of CLAUDE_MODEL_PRESETS or the default).
+  if (provider === 'claude') return `claude_oauth:${brainModelId}`;
   // codex → the SPECIFIC model value so the picker highlights the right gpt-5.x row
   // (brainOptions lists every connected Codex model; the resolved id is always one
   // of them — MODEL_PRESETS includes the DEFAULT_CODEX_MODEL fallback).

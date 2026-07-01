@@ -2,6 +2,8 @@ import type { WorkflowDefinition, WorkflowInputDef } from '../memory/workflow-st
 import { validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
+import { proposeWorkflowContractUpgrades } from './workflow-contract-proposals.js';
+import { textMentionsDeliverable } from './workflow-deliverable-hints.js';
 
 /**
  * Author/enable-time enforcement (typed-workflow-contract).
@@ -40,6 +42,7 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       usesSkill: s.usesSkill,
       allowedTools: s.allowedTools,
       requiresApproval: s.requiresApproval,
+      sideEffect: s.sideEffect,
       inputs: s.inputs as Record<string, unknown> | undefined,
       output: s.output as Record<string, unknown> | undefined,
     })),
@@ -383,6 +386,16 @@ export interface WorkflowAutoRepair {
   repairs: string[];
 }
 
+function forEachSourceStepId(expr: string | undefined): string | null {
+  const raw = (expr ?? '').trim();
+  if (!raw) return null;
+  const templated = /^\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/.exec(raw);
+  if (templated) return templated[1];
+  const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
+  if (directPath) return directPath[1];
+  return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
+}
+
 export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowAutoRepair {
   const repairs: string[] = [];
   const steps = def.steps.map((s) => ({
@@ -454,8 +467,8 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
     }
     // 2. forEach over a real step.
     if (typeof step.forEach === 'string' && step.forEach.trim().length > 0) {
-      const src = step.forEach.trim();
-      if (ids.has(src)) addDep(step, src, `forEach source`);
+      const src = forEachSourceStepId(step.forEach);
+      if (src && ids.has(src)) addDep(step, src, `forEach source`);
     }
   }
 
@@ -482,11 +495,44 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
   }
   declareReferencedInputs(def.synthesis?.prompt, 'synthesis prompt');
 
-  if (repairs.length === 0 && !sideEffectChanged) return { def, repairs };
+  // Contract hardening: authoring already proposes pinned goals/output contracts
+  // for legacy workflows. Apply the same conservative proposals during repair so
+  // newly-created workflows start self-verifying instead of relying on prose.
+  let contractChanged = false;
+  let goalChanged = false;
+  let repairedGoal = def.goal;
+  const proposalBase: WorkflowDefinition = {
+    ...def,
+    steps,
+    ...(declaredChanged ? { inputs: declared } : {}),
+  };
+  const contractProposal = proposeWorkflowContractUpgrades(proposalBase);
+  const outputByStep = new Map(contractProposal.proposedStepOutputs.map((proposal) => [proposal.stepId, proposal]));
+  for (const step of steps) {
+    if (step.output && Object.keys(step.output).length > 0) continue;
+    const proposal = outputByStep.get(step.id);
+    if (!proposal) continue;
+    step.output = proposal.output;
+    contractChanged = true;
+    repairs.push(`Added output contract to step "${step.id}" (${proposal.reasons.join('; ')}).`);
+  }
+  const synthesisLooksDeliverable = textMentionsDeliverable(def.synthesis?.prompt ?? '');
+  if (
+    !repairedGoal?.objective
+    && contractProposal.proposedGoal
+    && (contractProposal.proposedStepOutputs.length > 0 || synthesisLooksDeliverable)
+  ) {
+    repairedGoal = contractProposal.proposedGoal;
+    goalChanged = true;
+    repairs.push('Pinned a workflow goal so completed runs are judged against concrete success criteria.');
+  }
+
+  if (repairs.length === 0 && !sideEffectChanged && !contractChanged && !goalChanged) return { def, repairs };
   const repaired: WorkflowDefinition = {
     ...def,
     steps,
     ...(declaredChanged ? { inputs: declared } : {}),
+    ...(goalChanged ? { goal: repairedGoal } : {}),
   };
   return { def: repaired, repairs };
 }

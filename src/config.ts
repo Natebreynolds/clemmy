@@ -183,8 +183,16 @@ export function judgeChoice(): 'claude' | 'codex' {
 }
 
 export const CLAUDE_MODEL_PRESETS = [
+  // Newest Anthropic tiers, all wired through model-wire-registry + budget.ts so
+  // they dispatch with the correct anthropic_messages/effort shape. Defaults stay
+  // on Opus 4.8 (getClaudeBrainModel) — switching the default is a cost decision.
+  // Fable 5: most capable widely released model ($10/$50 per MTok).
+  // Sonnet 5 (launched 2026-06): best speed/intelligence, $3/$15 ($2/$10 intro
+  // through 2026-08-31) — a 4.6+ generation Sonnet (effort + adaptive thinking).
+  { id: 'claude-fable-5', label: 'Claude Fable 5 (most capable)' },
   { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 (flagship)' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
+  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 (fast + smart)' },
+  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (legacy)' },
   { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5' },
 ];
 export const CODEX_AUTH_SOURCE_FILE = getEnv('CODEX_AUTH_SOURCE_FILE', path.join(os.homedir(), '.codex', 'auth.json'));

@@ -126,6 +126,45 @@ test('requiredLocalMcpToolsForWorkflowStep detects Salesforce CLI and notificati
   assert.deepEqual(requiredLocalMcpToolsForWorkflowStep(salesforceStep, false), []);
 });
 
+test('requiredLocalMcpToolsForWorkflowStep does not promote every allowed tool to a hard requirement', () => {
+  const discoveryStep = {
+    id: 'find_official_page',
+    sideEffect: 'read' as const,
+    allowedTools: ['composio_execute_tool', 'composio_search_tools'],
+    prompt: 'Find the official public Facebook page. Expected official page: https://www.facebook.com/scorpion.co unless evidence shows otherwise.',
+  };
+  assert.deepEqual(
+    requiredLocalMcpToolsForWorkflowStep(discoveryStep, true),
+    [],
+    'allowedTools are permissions; optional discovery tools must not block a step before it can use deterministic evidence',
+  );
+});
+
+test('requiredLocalMcpToolsForWorkflowStep still requires explicit Composio execution/search paths', () => {
+  const scrapeStep = {
+    id: 'scrape_and_analyze',
+    sideEffect: 'read' as const,
+    prompt: 'Use Composio tool APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS with actorId apify/facebook-posts-scraper.',
+  };
+  assert.deepEqual(requiredLocalMcpToolsForWorkflowStep(scrapeStep, true), ['composio_execute_tool']);
+
+  const discoverStep = {
+    id: 'discover_tool',
+    sideEffect: 'read' as const,
+    prompt: 'Use composio_search_tools to discover the right Google Sheets action.',
+  };
+  assert.deepEqual(requiredLocalMcpToolsForWorkflowStep(discoverStep, true), ['composio_search_tools']);
+});
+
+test('requiredLocalMcpToolsForWorkflowStep does not equate every send step with notify_user', () => {
+  const emailStep = {
+    id: 'send_daily_email',
+    sideEffect: 'send' as const,
+    prompt: 'Use Composio tool GMAIL_SEND_EMAIL to send the daily standup email.',
+  };
+  assert.deepEqual(requiredLocalMcpToolsForWorkflowStep(emailStep, true), ['composio_execute_tool']);
+});
+
 test('runClaudeAgentSdkWorkflowStep full lane runs the tool-capable gated profile on the workflow session', async () => {
   let captured: any;
   setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {

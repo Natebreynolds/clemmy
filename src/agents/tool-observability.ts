@@ -26,6 +26,7 @@
  * and never throws. If the log is unwritable, we drop the event.
  */
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent, type ToolOperationalEventType } from '../runtime/operational-telemetry.js';
@@ -33,12 +34,16 @@ import { redactSensitiveValue } from '../runtime/security.js';
 import { summarizeToolArgs } from './plan-scope.js';
 import type { ToolKind } from './tool-taxonomy.js';
 
-const EVENT_DIR = path.join(BASE_DIR, 'state', 'tool-events');
+function eventDir(): string {
+  const baseDir = process.env.CLEMENTINE_HOME || BASE_DIR || path.join(os.homedir(), '.clementine-next');
+  return path.join(baseDir, 'state', 'tool-events');
+}
 
 function ensureDir(): void {
-  if (!existsSync(EVENT_DIR)) {
+  const dir = eventDir();
+  if (!existsSync(dir)) {
     try {
-      mkdirSync(EVENT_DIR, { recursive: true });
+      mkdirSync(dir, { recursive: true });
     } catch {
       // Best-effort. If we can't make the dir, write() will swallow.
     }
@@ -47,7 +52,7 @@ function ensureDir(): void {
 
 function currentLogFile(): string {
   const dateKey = new Date().toISOString().slice(0, 10);
-  return path.join(EVENT_DIR, `${dateKey}.ndjson`);
+  return path.join(eventDir(), `${dateKey}.ndjson`);
 }
 
 export interface ToolLifecycleEvent {

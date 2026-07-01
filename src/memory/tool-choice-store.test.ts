@@ -79,6 +79,23 @@ test('rememberToolChoice strips a pinned connection id before persisting', () =>
   assert.doesNotMatch(rec.choice.invocationTemplate ?? '', /connected_account_id|ca_STALE123/);
 });
 
+test('rememberToolChoice rejects placeholder identifiers instead of poisoning active choice recall', () => {
+  const intent = 'placeholder.choice.poison';
+  rememberToolChoice({
+    intent,
+    description: 'bad remembered path',
+    choice: { kind: 'mcp', identifier: 'null', invocationTemplate: 'null' },
+  });
+  const rec = recallToolChoice(intent);
+  assert.ok(rec, 'record is kept so fallbacks/history can survive');
+  assert.equal(rec!.choice, null, 'placeholder is not an active proven choice');
+  assert.deepEqual(
+    matchToolChoicesForStep('List Airtable records for prospects.', { choices: [rec!] }),
+    [],
+    'inactive placeholder choices cannot match workflow authoring',
+  );
+});
+
 test('rememberToolChoice + recallToolChoice round-trip by exact slug', () => {
   const intent = 'salesforce.accounts.list_stale';
   rememberToolChoice({

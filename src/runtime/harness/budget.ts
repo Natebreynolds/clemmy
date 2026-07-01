@@ -138,6 +138,19 @@ const MODEL_CONTEXT_LIMITS: ReadonlyMap<string, number> = new Map([
   // codex-mini / codex-medium — Codex-flavored variants
   ['codex-mini', 200_000],
   ['codex-medium', 200_000],
+  // Claude subscription/API models exposed through the Claude Agent SDK.
+  // Keep this conservative at the standard 200K Claude context window; users
+  // can override future larger SKUs via CLEMMY_MODEL_CONTEXT_LIMIT_<id>.
+  ['claude-opus-4-8', 200_000],
+  ['claude-opus-4.8', 200_000],
+  ['claude-opus-4-7', 200_000],
+  ['claude-opus-4.7', 200_000],
+  ['claude-opus-4', 200_000],
+  ['claude-sonnet-5', 200_000],
+  ['claude-sonnet-4-6', 200_000],
+  ['claude-sonnet-4.6', 200_000],
+  ['claude-sonnet-4', 200_000],
+  ['claude-fable-5', 200_000],
   // Legacy fallbacks for older configs that may still appear
   ['gpt-4.1', 128_000],
   ['gpt-4.1-mini', 128_000],
@@ -171,14 +184,20 @@ const DEFAULT_CONTEXT_LIMIT = 128_000;
  * over both — see `getEffectiveContextLimit`.
  */
 export function modelContextLimit(modelId: string): number {
-  const direct = MODEL_CONTEXT_LIMITS.get(modelId);
+  const normalizedId = modelId.trim();
+  // Some preflight callers intentionally do not know the final concrete model
+  // yet (for example before role routing resolves). Use the conservative
+  // default silently for an absent id; it is not an unknown configured model and
+  // should not create noisy daemon warnings.
+  if (!normalizedId) return DEFAULT_CONTEXT_LIMIT;
+  const direct = MODEL_CONTEXT_LIMITS.get(normalizedId);
   if (direct !== undefined) return direct;
   // Try a prefix match for model variants we haven't enumerated
   // (e.g. "gpt-5.4-mini-2026-05" → "gpt-5.4-mini"). Pick the longest
   // matching known prefix to avoid e.g. "gpt-5.4" eating "gpt-5.4-mini".
   let bestKey: string | null = null;
   for (const key of MODEL_CONTEXT_LIMITS.keys()) {
-    if (modelId.startsWith(key) && (!bestKey || key.length > bestKey.length)) {
+    if (normalizedId.startsWith(key) && (!bestKey || key.length > bestKey.length)) {
       bestKey = key;
     }
   }
@@ -186,7 +205,7 @@ export function modelContextLimit(modelId: string): number {
     return MODEL_CONTEXT_LIMITS.get(bestKey)!;
   }
   logger.warn(
-    { modelId, fallback: DEFAULT_CONTEXT_LIMIT },
+    { modelId: normalizedId, fallback: DEFAULT_CONTEXT_LIMIT },
     'modelContextLimit: unknown model id, falling back to conservative default. Add it to MODEL_CONTEXT_LIMITS or set CLEMMY_MODEL_CONTEXT_LIMIT_<id> env.',
   );
   return DEFAULT_CONTEXT_LIMIT;

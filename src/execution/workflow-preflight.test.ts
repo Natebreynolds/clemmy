@@ -91,6 +91,25 @@ test('workflowEditAdvisories: ignores routine non-edit warnings', () => {
   assert.deepEqual(out, ['Step "build" looks like it produces a deliverable but declares no output contract.']);
 });
 
+test('workflowEditAdvisories: includes sideEffect safety mismatches', () => {
+  const out = workflowEditAdvisories([
+    'Step "send" declares sideEffect: read, but its prompt looks like a SEND step.',
+  ]);
+  assert.deepEqual(out, ['Step "send" declares sideEffect: read, but its prompt looks like a SEND step.']);
+});
+
+test('workflowEditAdvisories: includes unattended reliability drift warnings', () => {
+  const out = workflowEditAdvisories([
+    'Step "draft" looks like multi-item work but has no forEach — it will run serially in one context.',
+    'Step "pull" looks like it should use your proven cli `sf data query --json`, but its prompt doesn\'t embed it and its tools still include composio — at runtime the step may re-decide and drift onto a stale path.',
+    'Workflow is currently disabled — scheduled triggers will not fire.',
+  ]);
+  assert.deepEqual(out, [
+    'Step "draft" looks like multi-item work but has no forEach — it will run serially in one context.',
+    'Step "pull" looks like it should use your proven cli `sf data query --json`, but its prompt doesn\'t embed it and its tools still include composio — at runtime the step may re-decide and drift onto a stale path.',
+  ]);
+});
+
 test('preflight: flags workflow steps whose required local MCP tool is excluded from the worker profile', () => {
   withEnv({ CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS: 'ping,notify_user' }, () => {
     const r = preflightWorkflow(wf({

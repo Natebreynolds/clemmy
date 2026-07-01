@@ -37,28 +37,9 @@ function maxTurns(step: WorkflowStepInput, fullLane: boolean): number {
   return Number.isFinite(raw) && raw >= 1 ? raw : (fullLane ? 24 : 6);
 }
 
-function addIfKnown(out: Set<string>, tool: string): void {
-  const trimmed = tool.trim();
-  if (!trimmed || trimmed === '*') return;
-  const tail = trimmed.split('__').at(-1) ?? trimmed;
-  if (tail === 'run_shell_command') out.add('run_shell_command');
-  else if (tail === 'write_file') out.add('write_file');
-  else if (tail === 'notify_user') out.add('notify_user');
-  else if (tail === 'local_cli_list') out.add('local_cli_list');
-  else if (tail === 'local_cli_probe') out.add('local_cli_probe');
-  else if (tail === 'composio_execute_tool') out.add('composio_execute_tool');
-  else if (tail === 'composio_search_tools') out.add('composio_search_tools');
-  else if (tail === 'composio_list_tools') out.add('composio_list_tools');
-  else if (tail === 'composio_*') {
-    out.add('composio_search_tools');
-    out.add('composio_execute_tool');
-  }
-}
-
 export function requiredLocalMcpToolsForWorkflowStep(step: WorkflowStepInput, fullLane: boolean): string[] {
   if (!fullLane) return [];
   const out = new Set<string>();
-  for (const tool of step.allowedTools ?? []) addIfKnown(out, tool);
 
   const text = `${step.prompt ?? ''}\n${step.intent ?? ''}`.toLowerCase();
   if (
@@ -72,10 +53,18 @@ export function requiredLocalMcpToolsForWorkflowStep(step: WorkflowStepInput, fu
   if (text.includes('write_file') || /\bwrite\s+(?:a\s+)?file\b/.test(text)) out.add('write_file');
   if (text.includes('local_cli_list')) out.add('local_cli_list');
   if (text.includes('local_cli_probe')) out.add('local_cli_probe');
-  if (text.includes('composio_execute_tool')) out.add('composio_execute_tool');
-  if (text.includes('composio_search_tools')) out.add('composio_search_tools');
+  if (
+    text.includes('composio_execute_tool')
+    || /\bcomposio\s+(?:tool|action)\b/.test(text)
+    || /\b(?:AIRTABLE|APIFY|DATAFORSEO|FIRECRAWL|GMAIL|GOOGLE(?:DOCS|DRIVE|SHEETS)?|HUBSPOT|NOTION|OUTLOOK|SALESFORCE|SLACK)_[A-Z0-9_]{3,}\b/.test(`${step.prompt ?? ''}\n${step.intent ?? ''}`)
+  ) {
+    out.add('composio_execute_tool');
+  }
+  if (text.includes('composio_search_tools') || /\bcomposio\s+(?:search|discover|lookup|look up|find)\b/.test(text)) {
+    out.add('composio_search_tools');
+  }
   if (text.includes('composio_list_tools')) out.add('composio_list_tools');
-  if (/\bnotify\b|\bdm\b|\bsend nate\b|\bsend (?:the )?(?:summary|notification|message)\b/.test(text) || step.sideEffect === 'send') {
+  if (/\bnotify\b|\bdm\b|\bsend nate\b|\bsend (?:the )?(?:summary|notification|message)\b/.test(text)) {
     out.add('notify_user');
   }
 

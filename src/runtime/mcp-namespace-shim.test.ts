@@ -12,16 +12,25 @@
  *   4) Lifecycle — connect() reaches every server, close() reaches
  *      every server, and one server failing does not break the rest.
  */
-import { test } from 'node:test';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { MCPServer } from '@openai/agents';
-import {
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mcp-shim-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-mcp-shim-test\n', 'utf-8');
+
+const {
   createMcpNamespaceShim,
   namespaceToolName,
   parseNamespacedTool,
   slugifyServerName,
   listMcpServerHealth,
-} from './mcp-namespace-shim.js';
+} = await import('./mcp-namespace-shim.js');
 
 /**
  * Minimal MCPServer-shaped fake. We don't extend the SDK's classes
@@ -148,6 +157,29 @@ test('shim: callTool routes to the right server with the original tool name', as
   await shim.callTool('beta__get_thing', { q: 'pinecone' });
   assert.deepEqual(a._calls, []);
   assert.deepEqual(b._calls, [{ tool: 'get_thing', args: { q: 'pinecone' } }]);
+});
+
+test('shim: native MCP lifecycle telemetry is scoped to the harness session', async () => {
+  const b = makeFakeServer({ name: 'obs', tools: [{ name: 'get_observability_probe' }] });
+  const shim = createMcpNamespaceShim({ servers: [b], cacheToolsList: false });
+  const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
+  await shim.listTools();
+
+  await withHarnessRunContext(
+    { sessionId: 'mcp-observability-sess', counter: new ToolCallsCounter() },
+    () => shim.callTool('obs__get_observability_probe', { q: 'session-scope' }),
+  );
+
+  const today = new Date().toISOString().slice(0, 10);
+  const logPath = path.join(TMP_HOME, 'state', 'tool-events', `${today}.ndjson`);
+  assert.equal(existsSync(logPath), true, 'MCP lifecycle telemetry should be written into the test home');
+  const events = readFileSync(logPath, 'utf-8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { sessionId?: string; toolName?: string; phase?: string });
+  const scoped = events.filter((event) => event.toolName === 'obs__get_observability_probe');
+  assert.deepEqual(scoped.map((event) => event.phase), ['start', 'end']);
+  assert.ok(scoped.every((event) => event.sessionId === 'mcp-observability-sess'), 'MCP lifecycle records must carry the active harness session');
 });
 
 test('shim: callTool throws a clear error for an unknown tool name', async () => {
@@ -441,16 +473,8 @@ test('shim: a native MCP call credits its proven-path memo (closes the 0% MCP co
   // Native MCP bypasses wrapToolForHarness, so this shim is the ONLY place an MCP
   // outcome can reach procedural memory. Prove a successful native call scores the
   // matching memo end-to-end (it sat permanently at the 0.5 prior before).
-  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
-  const pathMod = (await import('node:path')).default;
-  const osMod = (await import('node:os')).default;
-  const home = mkdtempSync(pathMod.join(osMod.tmpdir(), 'clemmy-mcp-credit-'));
-  const prevHome = process.env.CLEMENTINE_HOME;
   const prevOutcomes = process.env.CLEMMY_PROCEDURAL_OUTCOMES;
-  process.env.CLEMENTINE_HOME = home;
   process.env.CLEMMY_PROCEDURAL_OUTCOMES = 'on';
-  mkdirSync(pathMod.join(home, 'state'), { recursive: true });
-  writeFileSync(pathMod.join(home, 'state', 'machine-id'), 'machine-mcp-credit\n');
   const { resetMachineIdCacheForTests } = await import('./machine-id.js');
   resetMachineIdCacheForTests?.();
   const { rememberToolChoice, peekToolChoice } = await import('../memory/tool-choice-store.js');
@@ -474,8 +498,11 @@ test('shim: a native MCP call credits its proven-path memo (closes the 0% MCP co
   );
   assert.equal(peekToolChoice(INTENT)!.choice!.successCount ?? 0, before + 1, 'the native MCP call scored the memo (was bypassing the credit boundary entirely)');
   } finally {
-    if (prevHome === undefined) delete process.env.CLEMENTINE_HOME; else process.env.CLEMENTINE_HOME = prevHome;
     if (prevOutcomes === undefined) delete process.env.CLEMMY_PROCEDURAL_OUTCOMES; else process.env.CLEMMY_PROCEDURAL_OUTCOMES = prevOutcomes;
     resetMachineIdCacheForTests?.();
   }
+});
+
+after(() => {
+  try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });

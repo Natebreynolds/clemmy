@@ -101,6 +101,13 @@ test('modelContextLimit: gpt-5.5 dated snapshot variant matches via prefix', () 
   assert.equal(modelContextLimit('gpt-5.5-codex-2026-05'), 400_000);
 });
 
+test('modelContextLimit: known Claude Agent SDK models do not warn/fall back as unknown', () => {
+  assert.equal(modelContextLimit('claude-opus-4-8'), 200_000);
+  assert.equal(modelContextLimit('claude-opus-4-8-2026-06'), 200_000);
+  assert.equal(modelContextLimit('claude-sonnet-4-6'), 200_000);
+  assert.equal(modelContextLimit('claude-fable-5'), 200_000);
+});
+
 test('modelContextLimit: prefix match for variants (longest-prefix wins)', () => {
   // gpt-5.4-mini-2026-05 should match the gpt-5.4-mini prefix, not gpt-5.4
   assert.equal(modelContextLimit('gpt-5.4-mini-2026-05'), 128_000);
@@ -120,6 +127,11 @@ test('modelContextLimit: BYO providers (MiniMax / DeepSeek / GLM) resolve, longe
 
 test('modelContextLimit: unknown model falls back to conservative default', () => {
   assert.equal(modelContextLimit('totally-made-up-model-xyz'), 128_000);
+});
+
+test('modelContextLimit: absent model id falls back silently to conservative default', () => {
+  assert.equal(modelContextLimit(''), 128_000);
+  assert.equal(modelContextLimit('   '), 128_000);
 });
 
 // ─── getEffectiveContextLimit (env override) ──────────────────────

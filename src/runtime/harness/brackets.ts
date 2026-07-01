@@ -1356,12 +1356,17 @@ export function wrapToolForHarness<T extends WrappableTool>(
           ? (parsedInput as { command: string }).command
           : '';
         if (command) {
+          const publishShape = classifyShellCommand(command);
           // PROVENANCE (2026-06-15 clobber): a publish to an EXPLICIT target that
           // was NOT created or named THIS session may be an unrelated live site
           // (a coffee-shop build deployed onto a law-firm site via a site id
           // reused from `netlify status` after `sites:create` failed). Hard-block.
           // Chat only, so recurring workflows reusing a stable site id are exempt.
-          const sessionRow = getSession(ctx.sessionId);
+          // Build provenance only for commands that can use it; that scan walks the
+          // session transcript and must stay off ordinary shell-command hot paths.
+          const sessionRow = publishShape.isPublish && publishShape.hasExplicitDestination
+            ? getSession(ctx.sessionId)
+            : null;
           if (sessionRow?.kind === 'chat') {
             // Project key = the command's working dir, so provenance is scoped to
             // THIS project (a destination established for one project can't

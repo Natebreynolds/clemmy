@@ -204,6 +204,31 @@ test('workflow_contract_proposals reports upgrades without mutating workflow fil
   assert.deepEqual(after.steps[0].output, before.steps[0].output);
 });
 
+test('workflow_contract_proposals apply=true persists safe metadata-only upgrades', async () => {
+  writeWorkflow('legacy-apply-wf', {
+    name: 'legacy-apply-wf',
+    description: 'Audit {{input.url}} and publish a report.',
+    enabled: false,
+    trigger: { manual: true },
+    synthesis: { prompt: 'Return the live report URL.' },
+    steps: [
+      { id: 'deploy', prompt: 'Deploy the audit page and return the URL for {{input.url}}.' },
+    ],
+  });
+
+  const result = await workflowContractProposals()({ name: 'legacy apply', apply: true });
+  const text = resultText(result);
+
+  assert.match(text, /Applied workflow contract upgrades/);
+  assert.match(text, /legacy-apply-wf/);
+
+  const after = readWorkflow('legacy-apply-wf')!.data;
+  assert.ok(after.inputs?.url);
+  assert.ok(after.goal?.objective);
+  assert.deepEqual(after.steps[0].output?.required_keys, ['url']);
+  assert.deepEqual(after.steps[0].output?.verify?.url_present, ['url']);
+});
+
 test('workflow_create persists step intent for intent-routed worker models', async () => {
   const result = await workflowCreate()({
     name: 'intent-wf',
@@ -281,25 +306,33 @@ test('workflow_create simple mode generates a design step intent when the descri
   });
 });
 
-test('workflow_create without an output contract leaves step.output undefined (no-regression)', async () => {
-  await workflowCreate()({
+test('workflow_create auto-repairs a missing summary output contract and pinned goal', async () => {
+  const result = await workflowCreate()({
     name: 'plain-wf',
     description: 'x',
-    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+    steps: [{ id: 's', prompt: 'Fetch the prospect site and return a summary.' }],
   });
-  assert.equal(readWorkflow('plain-wf')!.data.steps[0].output, undefined);
+  const text = resultText(result);
+  assert.match(text, /Created workflow "plain-wf"/);
+  assert.match(text, /Added output contract/);
+  assert.match(text, /Pinned a workflow goal/);
+
+  const saved = readWorkflow('plain-wf')!.data;
+  assert.deepEqual(saved.steps[0].output?.required_keys, ['summary']);
+  assert.deepEqual(saved.steps[0].output?.non_empty, ['summary']);
+  assert.equal(saved.goal?.objective, 'Fetch the prospect site and return a summary.');
 });
 
 test('workflow_update can add an output contract to an existing step', async () => {
   await workflowCreate()({
     name: 'upc-wf',
     description: 'x',
-    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+    steps: [{ id: 's', prompt: 'Fetch the prospect site and return a summary.' }],
   });
   const contract = { type: 'object' as const, required_keys: ['summary'] };
   await workflowUpdate()({
     name: 'upc-wf',
-    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.', output: contract }],
+    steps: [{ id: 's', prompt: 'Fetch the prospect site and return a summary.', output: contract }],
   });
   assert.deepEqual(readWorkflow('upc-wf')!.data.steps[0].output, contract);
 });
@@ -366,7 +399,7 @@ test('workflow_create rejects malformed inputs schema JSON without creating', as
   const result = await workflowCreate()({
     name: 'bad-wf',
     description: 'x',
-    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+    steps: [{ id: 's', prompt: 'Fetch the prospect site and return a summary.' }],
     inputs: '{url: not json}',
   });
   assert.match(resultText(result), /invalid workflow inputs schema json/i);
@@ -377,7 +410,7 @@ test('workflow_update accepts an inputs SCHEMA JSON string and updates def.input
   await workflowCreate()({
     name: 'up-wf',
     description: 'x',
-    steps: [{ id: 's', prompt: 'Fetch and summarize the prospect site.' }],
+    steps: [{ id: 's', prompt: 'Fetch the prospect site and return a summary.' }],
   });
   const result = await workflowUpdate()({
     name: 'up-wf',

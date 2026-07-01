@@ -83,6 +83,31 @@ test('deriveLegacyWorkflowRunGoal: derives provisional goal from intent, inputs,
   assert.ok(goal!.successCriteria.some((c) => /at least 1 item/.test(c)));
 });
 
+test('deriveLegacyWorkflowRunGoal: infers provisional criteria from deliverable prompts when contracts are missing', () => {
+  const goal = deriveLegacyWorkflowRunGoal(
+    wf({
+      description_body: 'Create an audit artifact.',
+      steps: [
+        {
+          id: 'build_and_deploy',
+          prompt: 'Build the audit HTML file, deploy it to Netlify, and return the live URL and saved preview path.',
+        },
+        {
+          id: 'pull_rows',
+          prompt: 'Generate the list of overdue Salesforce meetings and output the rows.',
+        },
+      ],
+    }),
+    {},
+  );
+  assert.ok(goal);
+  assert.ok(goal!.successCriteria.some((c) => /required keys: url, path/.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /http\(s\) URL at "url"/.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /existing local file path at "path"/.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /required keys: items/.test(c)));
+  assert.ok(goal!.successCriteria.some((c) => /at least 1 item/.test(c)));
+});
+
 test('deriveLegacyWorkflowRunGoal: null when a legacy workflow has no objective source', () => {
   const goal = deriveLegacyWorkflowRunGoal(
     { name: 'x', description: '', steps: [] } as Parameters<typeof deriveLegacyWorkflowRunGoal>[0],
@@ -149,8 +174,35 @@ test('judgeWorkflowTarget: includes provisional legacy success criteria in the j
   });
   assert.equal(v.reached, true);
   assert.match(seenObjective, /Produce a live audit page/);
-  assert.match(seenObjective, /Success criteria inferred from the workflow contract/);
+  assert.match(seenObjective, /Success criteria inferred from the workflow contract and deliverable hints/);
   assert.match(seenObjective, /A real URL is present/);
+});
+
+test('judgeWorkflowTarget: accepts structured send evidence without asking the model judge', async () => {
+  const j = judgeReturning({ done: false, reason: 'no verifiable evidence the email was sent at 8am' });
+  const v = await judgeWorkflowTarget({
+    workflow: wf({ description: 'Emails Nate a daily standup brief at 8am.' }),
+    inputs: {},
+    finalOutput: '## main\n{"sent":true,"to":"nathan.reynolds@scorpion.co","subject":"Daily Standup","logId":"log_123"}',
+    judgeFn: j.fn,
+  });
+  assert.equal(v.reached, true);
+  assert.equal(v.judged, false);
+  assert.equal(j.calls(), 0, 'deterministic dispatch proof should bypass a wording-only target miss');
+  assert.match(v.gap, /structured dispatch evidence/);
+});
+
+test('judgeWorkflowTarget: does not accept negative send evidence', async () => {
+  const j = judgeReturning({ done: false, reason: 'the email was not sent' });
+  const v = await judgeWorkflowTarget({
+    workflow: wf({ description: 'Emails Nate a daily standup brief at 8am.' }),
+    inputs: {},
+    finalOutput: '{"sent":false,"to":"nathan.reynolds@scorpion.co","logId":"log_123"}',
+    judgeFn: j.fn,
+  });
+  assert.equal(v.reached, false);
+  assert.equal(v.judged, true);
+  assert.equal(j.calls(), 1);
 });
 
 test('judgeWorkflowTarget: NOT reached when the judge names a specific miss', async () => {

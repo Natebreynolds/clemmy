@@ -122,6 +122,29 @@ function extractToolArgs(approval: PendingApproval): Record<string, unknown> | u
   return undefined;
 }
 
+/**
+ * Legibility for a workflow APPROVAL GATE (and, in unattended/yolo mode, the audit
+ * stream). At gate time the step has not run, so there are no tool args to render —
+ * but the step DEFINITION is the resolved action. Show what the step will DO (side
+ * effect + tools + its instruction) so the approver sees the real action instead of
+ * an opaque "approve step <id>". Same legibility, whether shown for a human to
+ * approve (gated) or recorded as Clem acts (yolo). Reuses `trim`.
+ */
+export function describeWorkflowStepAction(step: {
+  id: string;
+  prompt?: string;
+  intent?: string;
+  sideEffect?: 'read' | 'write' | 'send';
+  allowedTools?: string[];
+}): string {
+  const effect = step.sideEffect === 'send' ? 'SEND' : step.sideEffect === 'write' ? 'WRITE' : 'READ';
+  const tools = (step.allowedTools ?? []).filter((t) => typeof t === 'string' && t.trim().length > 0);
+  const toolsPart = tools.length > 0 ? ` via ${tools.slice(0, 6).join(', ')}${tools.length > 6 ? ', …' : ''}` : '';
+  const instruction = (step.prompt ?? step.intent ?? '').replace(/\s+/g, ' ').trim();
+  const instrPart = instruction ? ` — ${trim(instruction, 240)}` : '';
+  return `${effect}${toolsPart}${instrPart}`;
+}
+
 function pickString(record: Record<string, unknown>, keys: string[]): string {
   for (const key of keys) {
     const value = record[key];

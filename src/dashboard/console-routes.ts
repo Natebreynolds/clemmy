@@ -290,6 +290,10 @@ import {
   deleteUnifiedSession,
 } from './sessions-api.js';
 
+function toolEventsDir(): string {
+  return path.join(process.env.CLEMENTINE_HOME || BASE_DIR, 'state', 'tool-events');
+}
+
 /**
  * Mounts the Clementine Console dashboard at /console.
  *
@@ -4169,7 +4173,7 @@ export function registerConsoleRoutes(
   app.get('/api/console/tool-events/recent', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const limit = Math.max(1, Math.min(50, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '6', 10) || 6));
-    const eventsDir = path.join(os.homedir(), '.clementine-next', 'state', 'tool-events');
+    const eventsDir = toolEventsDir();
     try {
       if (!fs.existsSync(eventsDir)) {
         res.json({ events: [] });
@@ -5822,12 +5826,9 @@ export function registerConsoleRoutes(
       try {
         const { openEventLog } = await import('../runtime/harness/eventlog.js');
         const hdb = openEventLog();
-        // We emitted reflection lifecycle via recordToolEvent — those
-        // land in ~/.clementine-next/state/tool-events/<date>.ndjson,
-        // not harness.db. Reading those files directly here.
-        const path = await import('node:path');
-        const fs = await import('node:fs');
-        const dir = path.join(require('node:os').homedir(), '.clementine-next', 'state', 'tool-events');
+        // We emitted reflection lifecycle via recordToolEvent, not harness.db.
+        // Read the same configured tool-events home the writer uses.
+        const dir = toolEventsDir();
         const today = new Date().toISOString().slice(0, 10);
         const file = path.join(dir, today + '.ndjson');
         if (fs.existsSync(file)) {
@@ -8056,6 +8057,21 @@ export function registerConsoleRoutes(
       }
 
       if (brain === 'claude_oauth') {
+        // A Claude brain orchestrates with a specific Claude model. Honor an
+        // explicit pick from the brain dropdown (value `claude_oauth:<id>` →
+        // brainModelId, e.g. claude-sonnet-5) by persisting CLAUDE_MODEL, which
+        // getClaudeBrainModel() reads. Validate it's a real Claude model so a
+        // stale/unknown id can't be written; an empty/non-Claude id leaves the
+        // current CLAUDE_MODEL (default Opus) untouched.
+        if (brainModelId && resolveProvider(brainModelId) === 'claude') {
+          const eligible = brainOptions().some((o) => o.id === 'claude_oauth' && o.modelId === brainModelId);
+          if (!eligible) {
+            res.status(400).json({ error: `Model "${brainModelId}" is not a connected Claude model.` });
+            return;
+          }
+          updateEnvKey('CLAUDE_MODEL', brainModelId);
+          process.env.CLAUDE_MODEL = brainModelId;
+        }
         // Preflight BEFORE persisting; refresh a near-expiry vault token so the
         // harness' own sync check at configure-time also passes next turn.
         try {

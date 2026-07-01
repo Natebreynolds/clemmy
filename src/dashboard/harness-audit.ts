@@ -7,6 +7,7 @@ import { loadTeamAgents } from '../tools/shared.js';
 import { listWorkflowPatterns } from '../memory/workflow-pattern-store.js';
 import { listRuns } from '../runtime/run-events.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { statSync } from 'node:fs';
 
 export type HarnessAuditStatus = 'pass' | 'warn' | 'fail';
 
@@ -105,13 +106,18 @@ function buildToolChecks(): HarnessAuditCheck[] {
 
 function buildWorkflowChecks(): HarnessAuditCheck[] {
   const workflows = listWorkflows();
-  const invalid = workflows
-    .map((workflow) => ({ workflow, validation: validateWorkflowDefinition(workflow.data as unknown as WorkflowFrontmatter) }))
-    .filter((item) => !item.validation.ok);
-  const warnCount = workflows
-    .map((workflow) => validateWorkflowDefinition(workflow.data as unknown as WorkflowFrontmatter).warnings.length)
-    .reduce((sum, count) => sum + count, 0);
+  const validations = workflows
+    .map((workflow) => ({ workflow, validation: validateWorkflowDefinition(workflow.data as unknown as WorkflowFrontmatter) }));
   const enabled = workflows.filter((workflow) => workflow.data.enabled !== false);
+  const enabledValidations = validations.filter((item) => item.workflow.data.enabled !== false);
+  const invalid = enabledValidations.filter((item) => !item.validation.ok);
+  const warnCount = enabledValidations
+    .map((item) => item.validation.warnings.length)
+    .reduce((sum, count) => sum + count, 0);
+  const disabledWarnCount = validations
+    .filter((item) => item.workflow.data.enabled === false)
+    .map((item) => item.validation.warnings.length)
+    .reduce((sum, count) => sum + count, 0);
   const scheduledWithoutTimezone = enabled.filter((workflow) => workflow.data.trigger?.schedule && !workflow.data.trigger.timezone);
   const riskyUndeclared = workflows.flatMap((workflow) =>
     workflow.data.steps
@@ -134,7 +140,7 @@ function buildWorkflowChecks(): HarnessAuditCheck[] {
       invalid.length > 0
         ? `${invalid.length} workflow(s) have blocking validation errors.`
         : warnCount > 0
-          ? `${warnCount} workflow validator warning(s) across the catalog.`
+          ? `${warnCount} workflow validator warning(s) across enabled workflows${disabledWarnCount > 0 ? ` (${disabledWarnCount} warning(s) on disabled drafts ignored).` : '.'}`
           : 'All workflows pass structural validation cleanly.',
       invalid.length > 0 ? 'high' : 'medium',
     ),
@@ -228,7 +234,36 @@ function buildAgentChecks(): HarnessAuditCheck[] {
   const agents = loadTeamAgents();
   const known = new Set(['clementine', ...agents.map((agent) => agent.slug)]);
   const danglingMessages = agents.flatMap((agent) => agent.canMessage.filter((slug) => !known.has(slug)).map((slug) => `${agent.slug}->${slug}`));
-  const blockedRuns = listRuns(80).filter((run) => run.status === 'failed' || run.needsAttention);
+  const recentCutoff = Date.now() - 7 * 24 * 60 * 60_000;
+  const workflowEditedAt = new Map<string, number>();
+  for (const workflow of listWorkflows()) {
+    try {
+      const editedMs = statSync(workflow.filePath).mtimeMs;
+      workflowEditedAt.set(workflow.name, editedMs);
+      workflowEditedAt.set(workflow.data.name, editedMs);
+    } catch {
+      // Missing stat should not hide a failed run.
+    }
+  }
+  const latestRunsByWorkstream = new Map<string, ReturnType<typeof listRuns>[number]>();
+  for (const run of listRuns(80)) {
+    const updatedMs = Date.parse(run.updatedAt || run.createdAt);
+    if (Number.isFinite(updatedMs) && updatedMs < recentCutoff) continue;
+    const key = `${run.source}:${run.title || run.id}`;
+    const current = latestRunsByWorkstream.get(key);
+    const currentMs = current ? Date.parse(current.updatedAt || current.createdAt) : 0;
+    if (!current || updatedMs >= currentMs) latestRunsByWorkstream.set(key, run);
+  }
+  const blockedCandidates = Array.from(latestRunsByWorkstream.values()).filter((run) => run.status === 'failed' || run.needsAttention);
+  const stalePreEditRuns = blockedCandidates.filter((run) => {
+    if (run.source !== 'workflow') return false;
+    const workflowName = (run.title || '').replace(/^Workflow:\s*/, '').trim();
+    const editedAt = workflowEditedAt.get(workflowName);
+    if (!editedAt) return false;
+    const runUpdated = Date.parse(run.updatedAt || run.createdAt);
+    return Number.isFinite(runUpdated) && editedAt > runUpdated + 1000;
+  });
+  const blockedRuns = blockedCandidates.filter((run) => !stalePreEditRuns.includes(run));
   const proactiveWithoutTools = agents.filter((agent) => agent.autonomyEnabled && (agent.allowedTools ?? []).length === 0);
   return [
     check(
@@ -261,8 +296,10 @@ function buildAgentChecks(): HarnessAuditCheck[] {
       'Recent run health',
       blockedRuns.length > 0 ? 'warn' : 'pass',
       blockedRuns.length > 0
-        ? `${blockedRuns.length} recent run(s) failed or need attention.`
-        : 'No failed/needs-attention runs in the recent activity window.',
+        ? `${blockedRuns.length} current workstream(s) have a failed or needs-attention latest run in the last 7 days${stalePreEditRuns.length > 0 ? ` (${stalePreEditRuns.length} stale pre-edit workflow run(s) ignored).` : '.'}`
+        : stalePreEditRuns.length > 0
+          ? `No current workstreams have failed/needs-attention latest runs in the last 7 days (${stalePreEditRuns.length} stale pre-edit workflow run(s) ignored).`
+          : 'No current workstreams have failed/needs-attention latest runs in the last 7 days.',
       'medium',
     ),
   ];
@@ -270,15 +307,28 @@ function buildAgentChecks(): HarnessAuditCheck[] {
 
 function buildLearningChecks(): HarnessAuditCheck[] {
   const patterns = listWorkflowPatterns();
-  const recentCleanRuns = listRuns(80).filter((run) => run.source === 'workflow' && run.status === 'completed' && !run.needsAttention);
+  const latestWorkflowRuns = new Map<string, ReturnType<typeof listRuns>[number]>();
+  for (const run of listRuns(80).filter((item) => item.source === 'workflow')) {
+    const key = run.title?.replace(/^Workflow:\s*/, '') || run.id;
+    const current = latestWorkflowRuns.get(key);
+    const runMs = Date.parse(run.updatedAt || run.createdAt);
+    const currentMs = current ? Date.parse(current.updatedAt || current.createdAt) : 0;
+    if (!current || runMs >= currentMs) latestWorkflowRuns.set(key, run);
+  }
+  const currentCleanWorkflowCount = Array.from(latestWorkflowRuns.values())
+    .filter((run) => run.status === 'completed' && !run.needsAttention)
+    .length;
+  const patternCoverageWarn = patterns.length === 0
+    ? currentCleanWorkflowCount > 0
+    : currentCleanWorkflowCount > patterns.length;
   return [
     check(
       'workflow-patterns',
       'Workflow pattern memory',
-      patterns.length === 0 && recentCleanRuns.length > 0 ? 'warn' : 'pass',
+      patterns.length === 0 && currentCleanWorkflowCount > 0 ? 'warn' : 'pass',
       patterns.length === 0
-        ? recentCleanRuns.length > 0
-          ? 'Clean workflow runs exist, but no workflow patterns have been recorded yet.'
+        ? currentCleanWorkflowCount > 0
+          ? 'Current clean workflow streams exist, but no workflow patterns have been recorded yet.'
           : 'No workflow pattern memory yet; it will fill after clean workflow runs.'
         : `${patterns.length} learned workflow pattern(s) available for procedural recall.`,
       'medium',
@@ -286,10 +336,10 @@ function buildLearningChecks(): HarnessAuditCheck[] {
     check(
       'pattern-coverage',
       'Pattern coverage',
-      patterns.length > 0 && recentCleanRuns.length > patterns.length * 4 ? 'warn' : 'pass',
+      patternCoverageWarn ? 'warn' : 'pass',
       patterns.length > 0
-        ? `${patterns.length} pattern(s) cover ${recentCleanRuns.length} recent clean workflow activity record(s).`
-        : 'Pattern coverage starts after the first clean workflow completion.',
+        ? `${patterns.length} pattern(s) cover ${currentCleanWorkflowCount} current clean workflow stream(s).`
+        : 'Pattern coverage starts after the first current clean workflow completion.',
       'low',
     ),
   ];

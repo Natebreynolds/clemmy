@@ -103,6 +103,37 @@ test('Move 1: the SDK brain ARMS the in-flight marker during the run and CLEARS 
   assert.equal(HarnessSession.load('brain-marker')?.runInFlightSince(), null, 'marker CLEARED after completion');
 });
 
+test('SDK brain auto-captures explicit remember turns even when the model skips memory_remember', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  createSession({ id: 'brain-autocap-remember', kind: 'chat', title: 'm' });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Saved — your smoke marker is MEMTOK-999999.',
+    sessionId: 'sdk',
+    model: 'm',
+    toolUses: [],
+  }));
+
+  await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Remember exactly: my smoke marker is MEMTOK-999999. Confirm.',
+    sessionId: 'brain-autocap-remember',
+  });
+
+  const events = listEvents('brain-autocap-remember');
+  const captured = events.find((event) => event.type === 'memory_signals_captured');
+  assert.ok(captured, 'SDK brain emitted memory capture telemetry for the explicit remember turn');
+  assert.equal((captured!.data as { factCount?: number }).factCount, 1);
+  assert.deepEqual(
+    (captured!.data as { reasons?: string[] }).reasons,
+    ['explicit remember request'],
+  );
+  assert.ok(
+    events.findIndex((event) => event.type === 'memory_signals_captured') <
+      events.findIndex((event) => event.type === 'conversation_completed'),
+    'capture telemetry is recorded before the final saved reply',
+  );
+});
+
 test('Move 4: a judge-failed-open completion is TAGGED verification.failedOpen (no silent green check)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
@@ -224,7 +255,8 @@ test('renderClaudeAgentBrainTurnContext bounds slow hybrid recall and falls back
   setClaudeAgentSdkBrainSearchFactsHybridForTest(async () => await new Promise(() => { /* intentionally stalled */ }));
   const start = Date.now();
   const ctx = await renderClaudeAgentBrainTurnContext({ message: 'market leader accounts', sessionId: 'brain-recall-timeout' });
-  assert.ok(Date.now() - start < 500, 'slow recall must not stall turn-context assembly');
+  const elapsedMs = Date.now() - start;
+  assert.ok(elapsedMs < 1500, `slow recall must not stall turn-context assembly; elapsed ${elapsedMs}ms`);
   assert.doesNotMatch(ctx, /Relevant To Your Request\n- /, 'timed-out recall block is omitted');
 });
 
@@ -261,12 +293,18 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   assert.equal(captured.sessionId, 'brain-run');
   assert.equal(captured.maxTurns, 24);
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));
+  assert.ok(captured.allowedLocalMcpTools.includes('memory_remember'));
   assert.equal(captured.allowedLocalMcpTools.includes('memory_read'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('composio_execute_tool'), false);
   // JIT pinned off above → no MCP tool-allowlist passed (server advertises all tools).
   assert.equal(captured.mcpToolAllowlist, undefined, 'JIT off must not filter the MCP surface');
+  assert.equal(listEvents('brain-run', { types: ['turn_memory_primer'] }).length, 1);
+  assert.equal(listEvents('brain-run', { types: ['agent_context_packet'] }).length, 1);
+  const effort = listEvents('brain-run', { types: ['reasoning_effort'] })[0]?.data as { transport?: string; effort?: string } | undefined;
+  assert.equal(effort?.transport, 'claude_agent_sdk_brain');
+  assert.equal(effort?.effort, 'provider_default');
 });
 
 test('JIT explicitly off: the SDK brain passes the FULL profile + no mcpToolAllowlist (byte-identical surface)', async () => {

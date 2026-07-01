@@ -250,6 +250,77 @@ test('multi-item step without forEach → parallelism warning', () => {
   );
 });
 
+test('parallelism hint: top-N summaries and row bookkeeping are not fanout advisories', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow with ordinary summary/setup work',
+    steps: [
+      {
+        id: 'brief',
+        prompt: 'Summarize the top 1-3 active goals and their next actions, then write a concise morning briefing.',
+      },
+      {
+        id: 'tracker',
+        prompt: 'Read only the header row, then read existing data rows in small batches. For each returned data row, compute and preserve its actual Google Sheet row number.',
+      },
+    ],
+  });
+
+  assert.ok(
+    !result.warnings.some((warning) => warning.includes('has no forEach')),
+    `expected no forEach warning, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('parallelism hint: aggregate draft artifacts are not fanout advisories', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that drafts a batch artifact',
+    steps: [
+      {
+        id: 'draft_outreach',
+        prompt: 'Draft prospect outreach for each selected account and return a single artifact path and URL for review.',
+        output: {
+          type: 'object',
+          required_keys: ['url', 'path'],
+          verify: { url_present: ['url'], path_exists: ['path'] },
+        },
+      },
+    ],
+  });
+
+  assert.ok(
+    !result.warnings.some((warning) => warning.includes('has no forEach')),
+    `expected no forEach warning, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('parallelism hint: shared tracker batch writes with aggregate outputs are not fanout advisories', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow that updates the shared tracker in one batch',
+    steps: [
+      {
+        id: 'write_drafts_to_sheet',
+        prompt: 'Write each draft back into that account\'s existing tracker row. If test_mode is true, return a preview of the exact row updates that would be made.',
+        output: {
+          type: 'object',
+          required_keys: ['url', 'path', 'accounts'],
+          non_empty: ['accounts'],
+          min_items: { accounts: 1 },
+          verify: { url_present: ['url'], path_exists: ['path'] },
+        },
+        sideEffect: 'write',
+      },
+    ],
+  });
+
+  assert.ok(
+    !result.warnings.some((warning) => warning.includes('has no forEach')),
+    `expected no forEach warning, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
 test('parallelism hint gives the mechanical forEach rewrite + steers away from run_worker (Gap D)', () => {
   const result = validateWorkflowDefinition({
     name: 'wf',
@@ -347,6 +418,7 @@ test('deploy deliverable without output contract suggests URL and file verificat
   assert.ok(warning, `expected output-contract advisory, got: ${JSON.stringify(result.warnings)}`);
   assert.match(warning!, /url_present/);
   assert.match(warning!, /path_exists/);
+  assert.equal((warning!.match(/\bverify:/g) ?? []).length, 1, 'suggestion should merge URL and path checks into one verify block');
 });
 
 test('list-producing deliverable without output contract suggests non-empty data contract', () => {
@@ -374,6 +446,21 @@ test('deliverable workflow without a pinned goal gets a goal-loop advisory', () 
   assert.ok(
     result.warnings.some((w) => /no pinned `goal`/.test(w)),
     `expected pinned goal advisory, got: ${JSON.stringify(result.warnings)}`,
+  );
+});
+
+test('synthesis-only deliverable workflow without a pinned goal still gets a goal-loop advisory', () => {
+  const result = validateWorkflowDefinition({
+    name: 'wf',
+    description: 'Workflow with a synthesis deliverable',
+    synthesis: { prompt: 'Return the final report URL and saved HTML path.' },
+    steps: [
+      { id: 'prepare', prompt: 'Analyze the source material.' },
+    ],
+  });
+  assert.ok(
+    result.warnings.some((w) => /no pinned `goal`/.test(w)),
+    `expected pinned goal advisory from synthesis deliverable, got: ${JSON.stringify(result.warnings)}`,
   );
 });
 
@@ -668,6 +755,139 @@ test('binding warning: no remembered choices → no binding warning (byte-identi
   assert.ok(!result.warnings.some((w) => /proven/.test(w)));
 });
 
+test('binding warning: placeholder remembered choices never render Bake `null` guidance', () => {
+  const wf: WorkflowFrontmatter = {
+    name: 'airtable-flow',
+    description: 'List Airtable records for prospects.',
+    enabled: true,
+    steps: [{ id: 'list', prompt: 'List Airtable records for the prospects table.', allowedTools: ['composio_execute_tool'] }],
+  };
+  const placeholder: ToolChoiceRecord = {
+    intent: 'airtable.records.list',
+    description: 'List Airtable records for a table',
+    choice: { kind: 'mcp', identifier: 'null', invocationTemplate: 'null', testedAt: '2026-06-01T00:00:00Z' },
+    fallbacks: [],
+    body: '',
+    filePath: '/tmp/null-choice.md',
+  };
+  const result = validateWorkflowDefinition(wf, { rememberedToolChoices: [placeholder] });
+  assert.equal(result.ok, true);
+  assert.ok(!result.warnings.some((w) => /Bake `null`|proven mcp `null`/.test(w)), result.warnings.join('\n'));
+});
+
+test('binding warning: mixed Composio step may keep native MCP when family is already scoped and named', () => {
+  const wf: WorkflowFrontmatter = {
+    name: 'seo-airtable-flow',
+    description: 'Enrich prospect and update Airtable.',
+    enabled: true,
+    steps: [{
+      id: 'enrich',
+      prompt: 'Use DataForSEO for ranked keywords, then update the Airtable record with the findings.',
+      allowedTools: ['composio_execute_tool', 'dataforseo__dataforseo_labs_google_ranked_keywords'],
+    }],
+  };
+  const mcpChoice: ToolChoiceRecord = {
+    intent: 'dataforseo ranked keywords domain',
+    description: 'Use native DataForSEO ranked keywords.',
+    choice: { kind: 'mcp', identifier: 'dataforseo__dataforseo_labs_google_ranked_keywords', testedAt: '2026-06-01T00:00:00Z' },
+    fallbacks: [],
+    body: '',
+    filePath: '/tmp/dataforseo.md',
+  };
+  const result = validateWorkflowDefinition(wf, { rememberedToolChoices: [mcpChoice] });
+  assert.equal(result.ok, true);
+  assert.ok(!result.warnings.some((w) => /drift onto a stale path/.test(w)), result.warnings.join('\n'));
+});
+
+test('sideEffect coherence: warns when declared class is weaker than the prompt', () => {
+  const readDeclaredSend = validateWorkflowDefinition({
+    name: 'side-effect-read-send',
+    description: 'Bad side effect declaration.',
+    enabled: true,
+    steps: [{ id: 'send', prompt: 'Send the email summary to Nate.', sideEffect: 'read' }],
+  });
+  assert.ok(readDeclaredSend.warnings.some((w) => /declares sideEffect: read/.test(w) && /SEND/.test(w)), readDeclaredSend.warnings.join('\n'));
+
+  const writeDeclaredSendSnake = validateWorkflowDefinition({
+    name: 'side-effect-write-send',
+    description: 'Snake case side effect declaration.',
+    enabled: true,
+    steps: [{ id: 'post', prompt: 'Publish the Instagram post for the firm.', side_effect: 'write' }],
+  });
+  assert.ok(writeDeclaredSendSnake.warnings.some((w) => /declares sideEffect: write/.test(w) && /SEND/.test(w)), writeDeclaredSendSnake.warnings.join('\n'));
+});
+
+test('sideEffect coherence: read-only social post analysis is not mistaken for publishing', () => {
+  const result = validateWorkflowDefinition({
+    name: 'post-analysis',
+    description: 'Analyze public social posts.',
+    enabled: true,
+    steps: [{
+      id: 'analyze',
+      prompt: 'Scrape recent public posts from the Scorpion Facebook page and analyze the post themes.',
+      sideEffect: 'read',
+    }],
+  });
+  assert.ok(!result.warnings.some((w) => /declares sideEffect/.test(w)), result.warnings.join('\n'));
+  assert.ok(!result.warnings.some((w) => /has no forEach/.test(w)), result.warnings.join('\n'));
+});
+
+test('sideEffect coherence: explicit do-not-send boundaries are not treated as SEND actions', () => {
+  const result = validateWorkflowDefinition({
+    name: 'draft-only-digest',
+    description: 'Draft a digest without sending.',
+    enabled: true,
+    steps: [{
+      id: 'draft_summary',
+      prompt: 'Compose a digest draft. This is a DRAFT only — do NOT send, post, email, or call any external tool. Output the digest text only.',
+      sideEffect: 'read',
+    }],
+  });
+  assert.ok(!result.warnings.some((w) => /declares sideEffect/.test(w)), result.warnings.join('\n'));
+});
+
+test('sideEffect coherence: email/contact data fields are not mistaken for SEND actions', () => {
+  const result = validateWorkflowDefinition({
+    name: 'contact-selection',
+    description: 'Select outreach candidates.',
+    enabled: true,
+    steps: [{
+      id: 'select_candidates',
+      prompt: 'Select accounts eligible to email today. Return accountId, bestContactEmail, Last Email Sent At, Email Status, and skip reasons. If no rows qualify, there is nothing to send.',
+      sideEffect: 'read',
+    }],
+  });
+  assert.ok(!result.warnings.some((w) => /declares sideEffect/.test(w)), result.warnings.join('\n'));
+});
+
+test('sideEffect coherence: downstream send/write planning language is not the current step action', () => {
+  const result = validateWorkflowDefinition({
+    name: 'tracker-read',
+    description: 'Read state and mark downstream mode.',
+    enabled: true,
+    steps: [{
+      id: 'read_tracker',
+      prompt: 'Read the tracker rows and return current state. If input.test_mode is true, explicitly mark all downstream write/send/draft steps as preview-only unless the user separately approves live writes.',
+      sideEffect: 'read',
+    }],
+  });
+  assert.ok(!result.warnings.some((w) => /declares sideEffect/.test(w)), result.warnings.join('\n'));
+});
+
+test('sideEffect coherence: risk-class planning labels do not make a READ planning step look mutating', () => {
+  const result = validateWorkflowDefinition({
+    name: 'objective-planner',
+    description: 'Plan work safely.',
+    enabled: true,
+    steps: [{
+      id: 'operating_plan',
+      prompt: 'Classify each item: risk_class "read" for research. risk_class "write" for internal drafts, files, records, or task updates. risk_class "send" for externally visible messaging. Return JSON only with work_items.',
+      sideEffect: 'read',
+    }],
+  });
+  assert.ok(!result.warnings.some((w) => /declares sideEffect/.test(w)), result.warnings.join('\n'));
+});
+
 // ── forEach target validation (2026-06-03: silent zero-work fan-out) ──
 
 test('forEach pointing at an unknown step → error', () => {
@@ -704,6 +924,19 @@ test('forEach over a declared dependency → ok', () => {
     ],
   });
   assert.ok(!result.errors.some((e) => /forEach|fans out/.test(e)));
+});
+
+test('forEach over a declared dependency output path → ok', () => {
+  const result = validateWorkflowDefinition({
+    name: 'fe-path-ok',
+    description: 'Fan out over a dependency output path.',
+    enabled: true,
+    steps: [
+      { id: 'pull', prompt: 'Pull the list of prospects.' },
+      { id: 'enrich', prompt: 'Enrich each item.', dependsOn: ['pull'], forEach: '{{steps.pull.output.prospects}}' },
+    ],
+  });
+  assert.ok(!result.errors.some((e) => /forEach|fans out/.test(e)), result.errors.join('\n'));
 });
 
 // ── {{steps.X.output}} must reference a dependency ───────────────────

@@ -1,6 +1,7 @@
 import { judgeObjectiveComplete, JUDGE_RESPONSE_MAX_CHARS, type ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { withJudgeTimeout } from '../runtime/harness/judge-family.js';
 import type { WorkflowDefinition, WorkflowStepOutputContract } from '../memory/workflow-store.js';
+import { inferOutputContractFromPrompt } from './workflow-deliverable-hints.js';
 
 /**
  * Workflow-level "did we reach the target?" judge.
@@ -46,6 +47,10 @@ const MAX_DELIVERABLE_CHARS = 12000;
 // genuine miss names a missing TARGET element. Suppressed when we windowed.
 const TRUNCATION_SHAPED_GAP = /truncat|cut ?off|incomplete (response|text|json|output|deliverable|data)|no complete verifiable|not fully (visible|shown|present)|appears? (to be )?(cut|incomplete)|omitted/i;
 const MAX_INPUT_SCALAR_CHARS = 200;
+const SEND_TARGET_RE = /\b(?:send|sent|emails?|e-?mails?|emailing|notify|notifies|notification|message|dm)\b/i;
+const SEND_EVIDENCE_RE = /(?:"(?:sent|notified|delivered)"\s*:\s*true\b|(?:^|[\s,{])(?:sent|notified|delivered)\s*[:=]\s*true\b)/i;
+const SEND_PROOF_RE = /"?(?:logId|messageId|notificationId|emailId|sentAt|sent_at|to|recipient|recipients|from|subject|summary)"?\s*[:=]/i;
+const SEND_NEGATIVE_RE = /(?:"blocked"\s*:\s*true\b|status["']?\s*:\s*["']?blocked\b|not\s+sent|failed\s+to\s+send|could\s+not\s+send)/i;
 
 type WorkflowTargetFields = Pick<
   WorkflowDefinition,
@@ -54,6 +59,7 @@ type WorkflowTargetFields = Pick<
 
 type LegacyGoalStep = {
   id?: string;
+  prompt?: string;
   output?: WorkflowStepOutputContract;
 };
 
@@ -100,7 +106,9 @@ export function buildWorkflowObjective(
 
 function appendContractCriteria(out: string[], step: LegacyGoalStep): void {
   const id = step.id || 'unnamed';
-  const c = step.output;
+  const c = step.output && Object.keys(step.output).length > 0
+    ? step.output
+    : inferOutputContractFromPrompt(step.prompt ?? '');
   if (!c || Object.keys(c).length === 0) return;
   if (c.required_keys?.length) {
     out.push(`Step "${id}" output includes required keys: ${c.required_keys.join(', ')}.`);
@@ -155,6 +163,14 @@ export function renderDeliverableForJudge(finalOutput: unknown, fallbackBody?: s
   return `${text.slice(0, MAX_DELIVERABLE_CHARS)}\n\n…[deliverable truncated to ${MAX_DELIVERABLE_CHARS} chars for judging — the run's full output is longer and complete]…`;
 }
 
+function deterministicSendEvidence(objective: string, deliverable: string): string | null {
+  if (!SEND_TARGET_RE.test(objective)) return null;
+  if (SEND_NEGATIVE_RE.test(deliverable)) return null;
+  if (!SEND_EVIDENCE_RE.test(deliverable)) return null;
+  if (!SEND_PROOF_RE.test(deliverable)) return null;
+  return 'structured dispatch evidence present in the workflow output';
+}
+
 export interface JudgeWorkflowTargetInput {
   workflow: WorkflowTargetFields & { steps?: unknown };
   inputs: Record<string, unknown>;
@@ -192,6 +208,10 @@ export async function judgeWorkflowTarget(
       gap: 'no target or deliverable to judge — accepting completion',
     };
   }
+  const sendEvidence = deterministicSendEvidence(objective, deliverable);
+  if (sendEvidence) {
+    return { reached: true, judged: false, gap: sendEvidence };
+  }
   const judge = opts.judgeFn ?? judgeObjectiveComplete;
   // True when the deliverable is long enough that the judge sees only a
   // head+tail window of it (the slice happens inside buildObjectiveJudgePrompt
@@ -203,7 +223,7 @@ export async function judgeWorkflowTarget(
     ...((opts.goal?.successCriteria?.length ?? 0) > 0
       ? [
           '',
-          'Success criteria inferred from the workflow contract:',
+          'Success criteria inferred from the workflow contract and deliverable hints:',
           ...opts.goal!.successCriteria.map((c, i) => `${i + 1}. ${c}`),
         ]
       : []),

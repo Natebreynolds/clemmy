@@ -23,7 +23,7 @@ import { validateCronExpression, getNextRun } from '../shared/cron.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
-import { proposeWorkflowContractUpgrades, renderWorkflowContractProposalReport } from '../execution/workflow-contract-proposals.js';
+import { applyWorkflowContractUpgrades, proposeWorkflowContractUpgrades, renderWorkflowContractProposalReport } from '../execution/workflow-contract-proposals.js';
 import { listCachedToolkits } from '../integrations/composio/client.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
@@ -696,12 +696,13 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_contract_proposals',
-    'Scan one workflow or all installed workflows and propose pinned goal, input, and step output-contract upgrades. Read-only: it never edits workflow files. Use before enabling old workflows or tagging a release.',
+    'Scan one workflow or all installed workflows and propose pinned goal, input, and step output-contract upgrades. Read-only by default; pass apply=true to persist safe metadata-only upgrades. Use before enabling old workflows or tagging a release.',
     {
       name: z.string().optional().describe('Optional workflow name. Omit to scan every installed workflow. Fuzzy names are resolved the same way workflow_get resolves them.'),
       include_clean: z.boolean().optional().describe('When true, include workflows with no proposed changes. Default false.'),
+      apply: z.boolean().optional().describe('When true, apply safe metadata-only upgrades (declared inputs, pinned goals, output contracts). Default false.'),
     },
-    async ({ name, include_clean }) => {
+    async ({ name, include_clean, apply }) => {
       const all = listWorkflowFiles();
       if (all.length === 0) return textResult('No workflows found.');
       let targets = all;
@@ -729,7 +730,31 @@ export function registerOrchestrationTools(server: McpServer): void {
       const proposals = targets
         .map((entry) => proposeWorkflowContractUpgrades(entry.data))
         .filter((proposal) => include_clean === true || proposal.needsUpgrade);
-      return textResult(renderWorkflowContractProposalReport(proposals), { maxChars: 40_000 });
+      const report = renderWorkflowContractProposalReport(proposals);
+      if (apply !== true) return textResult(report, { maxChars: 40_000 });
+
+      const byName = new Map(targets.map((entry) => [entry.data.name, entry]));
+      const appliedLines: string[] = [];
+      for (const proposal of proposals) {
+        const entry = byName.get(proposal.workflowName);
+        if (!entry) continue;
+        const applied = applyWorkflowContractUpgrades(entry.data, proposal);
+        if (applied.changes.length === 0) {
+          appliedLines.push(`- ${proposal.workflowName}: no metadata changes needed.`);
+          continue;
+        }
+        const prep = prepareWorkflowForWrite(applied.def);
+        if (!prep.ok) {
+          appliedLines.push(`- ${proposal.workflowName}: NOT applied — repaired definition still has blocking issue(s): ${prep.errors.join('; ')}`);
+          continue;
+        }
+        writeWorkflow(path.basename(entry.dir), prep.def);
+        appliedLines.push(`- ${proposal.workflowName}: ${[...applied.changes, ...prep.repairs].join(' ')}`);
+      }
+      return textResult(
+        `${report}\n\nApplied workflow contract upgrades:\n${appliedLines.length ? appliedLines.join('\n') : '- No matching upgrades to apply.'}`,
+        { maxChars: 40_000 },
+      );
     },
   );
 

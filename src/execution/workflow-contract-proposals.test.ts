@@ -88,6 +88,22 @@ test('flags legacy raw common inputs as declarations plus prompt rewrites', () =
   assert.match(proposal.notes.join('\n'), /rewrite/);
 });
 
+test('infers a summary contract without treating prospect site as a list', () => {
+  const proposal = proposeWorkflowContractUpgrades(wf({
+    description: 'x',
+    steps: [
+      { id: 'summary', prompt: 'Fetch the prospect site and return a summary.' },
+    ],
+  }));
+
+  assert.equal(proposal.proposedGoal?.objective, 'Fetch the prospect site and return a summary.');
+  assert.equal(proposal.proposedGoal?.successCriteria?.filter((c) => /Step "summary"/.test(c)).length, 2);
+  assert.equal(proposal.proposedStepOutputs.length, 1);
+  assert.deepEqual(proposal.proposedStepOutputs[0].output.required_keys, ['summary']);
+  assert.deepEqual(proposal.proposedStepOutputs[0].output.non_empty, ['summary']);
+  assert.equal(proposal.proposedStepOutputs[0].output.min_items, undefined);
+});
+
 test('renders a reviewable non-mutating proposal report', () => {
   const proposal = proposeWorkflowContractUpgrades(wf({
     synthesis: { prompt: 'Return the live audit URL.' },

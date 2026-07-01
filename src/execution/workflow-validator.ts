@@ -24,6 +24,11 @@
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
 import { validateCronExpression } from '../shared/cron.js';
+import {
+  outputContractSuggestionFromPrompt,
+  promptLooksDeliverable,
+  textMentionsDeliverable,
+} from './workflow-deliverable-hints.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -45,6 +50,8 @@ export interface WorkflowStepShape {
   allowedTools?: string[];
   requiresApproval?: boolean;
   requires_approval?: boolean;
+  sideEffect?: 'read' | 'write' | 'send';
+  side_effect?: 'read' | 'write' | 'send';
   /** Typed step contract (P0). Keys = declared input names. */
   inputs?: Record<string, unknown>;
   output?: Record<string, unknown>;
@@ -194,6 +201,65 @@ function checkApprovalCoherence(
   }
 
   return { errors, warnings };
+}
+
+const SIDE_EFFECT_SEND_RE =
+  /\b(?:send|sends|sending|deliver|delivers|delivering|dispatch|dispatches|dispatching)\b[\s\S]{0,80}\b(?:e-?mails?|messages?|sms|texts?|invites?|dms?|notifications?|newsletters?|nate|user|client|customer|prospect|recipient|inbox|mailbox)\b|\bnotify(?:ing|ies)?\b[\s\S]{0,80}\b(?:nate|user|client|customer|prospect|recipient|inbox|mailbox|about|with|that)\b|\b(?:email|e-mail|message|dm)\s+(?:nate|the\s+user|a\s+user|users?|clients?|customers?|prospects?|recipients?)\b/i;
+const SIDE_EFFECT_PUBLISH_RE =
+  /\b(?:publish|publishes|publishing)\b[\s\S]{0,60}\b(?:tweet|tweets|linkedin|slack|twitter|\bx\b|facebook|instagram|blog\s*post|social\s+post|post)\b|\b(?:post|posts|posting)\b[\s\S]{0,30}\b(?:to|on|onto)\s+(?:linkedin|slack|twitter|\bx\b|facebook|instagram|the\s+blog|a\s+blog)\b/i;
+const SIDE_EFFECT_WRITE_RE =
+  /\b(?:create|creates|creating|add|adds|adding|insert|inserts|upsert|upserts|update|updates|updating|write|writes|writing|save|saves|saving|delete|deletes|remove|removes|append|appends|draft|drafts|upload|uploads)\b[\s\S]{0,60}\b(?:record|records|row|rows|sheet|spreadsheet|table|crm|airtable|salesforce|hubspot|database|file|files|document|docs?|event|calendar|invite|message|ticket|issue|page|notion|post|url)\b/i;
+
+function sideEffectSignalText(prompt: string): string {
+  return prompt
+    // "do NOT send/post/email" is a safety boundary, not an instruction to act.
+    .replace(/\b(?:do\s+not|don't|never)\s+(?:send|post|publish|email|e-mail|notify|message|dm|call|execute|create|update|write|save|delete|upload)\b[^\n.!?]*/gi, ' ')
+    // "nothing to send" / "no email was sent" / "downstream send steps" are
+    // status or planning language, not an instruction for this step to send.
+    .replace(/\b(?:nothing|no\s+(?:email|message|notification|dm|post|content))\s+(?:is\s+|was\s+|to\s+)?(?:send|sent|post|posted|publish|published|email|e-mail|notify|message|dm)\b[^\n.!?]*/gi, ' ')
+    .replace(/\bdownstream\s+[a-z0-9_/ -]{0,50}\bsteps?\b/gi, ' ')
+    // Planning prompts often describe risk classes named read/write/send; those
+    // labels are not themselves side effects for the current step.
+    .replace(/\brisk[_ -]?class\s*["']?(?:read|write|send)["']?\s+for\b[^\n]*/gi, ' ')
+    .replace(/\brisk[_ -]?class\s*[:=]\s*["']?(?:read|write|send)["']?/gi, ' ')
+    .replace(/\bread\|write\|send\b/gi, ' ');
+}
+
+function declaredSideEffect(step: WorkflowStepShape): 'read' | 'write' | 'send' | null {
+  const raw = step.sideEffect ?? step.side_effect;
+  return raw === 'read' || raw === 'write' || raw === 'send' ? raw : null;
+}
+
+function promptSideEffectClass(prompt: string): 'read' | 'write' | 'send' {
+  const signal = sideEffectSignalText(prompt);
+  if (SIDE_EFFECT_SEND_RE.test(signal) || SIDE_EFFECT_PUBLISH_RE.test(signal)) return 'send';
+  if (SIDE_EFFECT_WRITE_RE.test(signal)) return 'write';
+  return 'read';
+}
+
+function sideEffectRank(cls: 'read' | 'write' | 'send'): number {
+  return cls === 'read' ? 0 : cls === 'write' ? 1 : 2;
+}
+
+function checkSideEffectCoherence(step: WorkflowStepShape): string | null {
+  const declared = declaredSideEffect(step);
+  if (!declared) return null;
+  const inferred = promptSideEffectClass(step.prompt ?? '');
+  if (sideEffectRank(declared) >= sideEffectRank(inferred)) return null;
+  return (
+    `Step "${step.id}" declares sideEffect: ${declared}, but its prompt looks like a ${inferred.toUpperCase()} step. `
+    + 'Set the stronger sideEffect or rewrite the prompt; otherwise crash-resume, retry, and phantom-completion guards can treat the step as safer than it is.'
+  );
+}
+
+function forEachSourceStepId(expr: string | undefined): string | null {
+  const raw = (expr ?? '').trim();
+  if (!raw) return null;
+  const templated = /^\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/.exec(raw);
+  if (templated) return templated[1];
+  const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
+  if (directPath) return directPath[1];
+  return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
 }
 
 // ─── Step output reference resolution ────────────────────────────────
@@ -401,11 +467,44 @@ export interface ValidateOptions {
   rememberedToolChoices?: ToolChoiceRecord[];
 }
 
-const MULTI_ITEM_PROMPT_RE = /\b(?:for each|each one|each account|each site|each firm|for every|all \d+|top \d+|\d+\s+(?:accounts?|sites?|firms?|leads?|contacts?|emails?|rows?))\b/i;
+const MULTI_ITEM_NOUN = '(?:accounts?|sites?|firms?|leads?|contacts?|emails?|drafts?|rows?|prospects?|messages?|posts?)';
+const MULTI_ITEM_PROMPT_RE = new RegExp(
+  String.raw`\b(?:for each(?:\s+of\s+the)?(?:\s+\d+)?\s+(?:[\w\`'"-]+\s+){0,3}${MULTI_ITEM_NOUN}|each\s+${MULTI_ITEM_NOUN}|for every\s+${MULTI_ITEM_NOUN}|all\s+\d+\s+${MULTI_ITEM_NOUN}|top\s+\d+\s+${MULTI_ITEM_NOUN}|\d+\s+${MULTI_ITEM_NOUN})\b`,
+  'i',
+);
+const ROW_BOOKKEEPING_RE = /\b(?:for each returned data row|compute and preserve (?:its )?actual .*row number|read only the header row|data rows in small batches|build existingrows)\b/i;
+const EXPLICIT_PER_ITEM_RE = /\b(?:for each|each|for every|per)\b/i;
+const SOCIAL_POST_BATCH_RE = /\b(?:scrape|analy[sz]e|summari[sz]e|review)\b[\s\S]{0,160}\b(?:public\s+|social\s+|recent\s+)?posts?\b|\bposts_reviewed_count\b|\bpost themes?\b/i;
+const AGGREGATE_BATCH_RE = /\b(?:batch|bulk|tracker|sheet|spreadsheet|preview|summary|artifact|file|path|url|exact row updates|existing tracker row|existing .* row|update these fields|return (?:a |an )?(?:preview|list|summary|artifact|file|url|path))\b/i;
 const SERIAL_WORK_RE = /\b(?:scrape|crawl|research|enrich|audit|draft|create|write|send|update)\b/i;
+
+function outputLooksAggregate(output: WorkflowStepShape['output'] | undefined): boolean {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return false;
+  const required = Array.isArray(output.required_keys) ? output.required_keys.map((key) => key.toLowerCase()) : [];
+  const hasArtifactHandle = required.some((key) => key === 'url' || key === 'path');
+  const hasCollectionHandle = required.some((key) => /\b(?:accounts|rows|drafts|items|posts|prospects|leads|contacts)\b/i.test(key));
+  const verify = output.verify as { path_exists?: unknown; url_present?: unknown } | undefined;
+  const verifiesHandle = Boolean(
+    verify
+    && (
+      (Array.isArray(verify.path_exists) && verify.path_exists.length > 0)
+      || (Array.isArray(verify.url_present) && verify.url_present.length > 0)
+    ),
+  );
+  return output.type === 'object' && (hasArtifactHandle || hasCollectionHandle || verifiesHandle);
+}
+
+function stepLooksIntentionalAggregateBatch(step: WorkflowStepShape): boolean {
+  if (!outputLooksAggregate(step.output)) return false;
+  if (!AGGREGATE_BATCH_RE.test(step.prompt ?? '')) return false;
+  return true;
+}
 
 function checkParallelismHint(step: WorkflowStepShape): string | null {
   if (step.forEach) return null;
+  if (ROW_BOOKKEEPING_RE.test(step.prompt)) return null;
+  if (!EXPLICIT_PER_ITEM_RE.test(step.prompt) && SOCIAL_POST_BATCH_RE.test(step.prompt)) return null;
+  if (stepLooksIntentionalAggregateBatch(step)) return null;
   if (!MULTI_ITEM_PROMPT_RE.test(step.prompt) || !SERIAL_WORK_RE.test(step.prompt)) return null;
   return `Step "${step.id}" looks like multi-item work but has no forEach — it will run serially in one context. To parallelize safely, have the upstream step emit an ARRAY and add \`forEach: <upstreamStepId>\` to this step; the runner then fans out per item with bounded concurrency and keeps each item's context lean. (run_worker is not the path — it's unavailable inside a workflow step; forEach is the fan-out primitive.)`;
 }
@@ -423,47 +522,17 @@ function checkDeterministicRunner(step: WorkflowStepShape): string | null {
 // A step that produces a concrete artifact (file / URL / report / record)
 // should declare an `output` contract — that's what engages BOTH the
 // deterministic per-step verifier (verifyStepOutput) AND the end-of-run target
-// judge. Without it, a step that claims success without actually producing the
-// deliverable passes silently. Advisory only (regex can't be certain), and
-// skipped when the step already declares output / is a forEach fan-out wrapper
-// (its items carry the shape) / is purely deterministic config.
-const DELIVERABLE_RE = /\b(report|brief|audit|file|document|url|link|html|sheet|spreadsheet|pdf|csv|deck|slides?|deploy(?:ed|ment)?|publish(?:ed)?|draft(?:ed)?|records?|rows?|list|items?|leads?|prospects?|meetings?|accounts?|contacts?|results?|page|website|saved to|written to|upload(?:ed)?)\b/i;
-const PRODUCE_RE = /\b(produce|generate|create|build|write|draft|deploy|publish|save|export|render|compile|assemble|deliver|output)\b/i;
-const URL_DELIVERABLE_RE = /\b(url|link|deploy(?:ed|ment)?|publish(?:ed)?|website|page|live\s+site|netlify|vercel)\b/i;
-const FILE_DELIVERABLE_RE = /\b(file|html|pdf|csv|deck|slides?|document|screenshot|preview|saved to|written to|export|render)\b/i;
-const LIST_DELIVERABLE_RE = /\b(list|rows?|records?|items?|leads?|prospects?|meetings?|accounts?|contacts?|results?)\b/i;
-
+// judge. Without it, runtime can only infer a soft needs-attention advisory
+// when concrete deliverable evidence is missing. Advisory only (regex can't be
+// certain), and skipped when the step already declares output / is a forEach
+// fan-out wrapper (its items carry the shape) / is purely deterministic config.
 function stepLooksDeliverable(step: WorkflowStepShape): boolean {
-  const prompt = step.prompt ?? '';
-  return DELIVERABLE_RE.test(prompt) && PRODUCE_RE.test(prompt);
+  return promptLooksDeliverable(step.prompt ?? '');
 }
 
 function workflowHasGoal(data: WorkflowFrontmatter): boolean {
   const objective = data.goal?.objective;
   return typeof objective === 'string' && objective.trim().length >= 4;
-}
-
-function outputContractSuggestion(prompt: string): string {
-  const checks: string[] = [];
-  const required = new Set<string>();
-  if (URL_DELIVERABLE_RE.test(prompt)) {
-    required.add('url');
-    checks.push('verify: { url_present: ["url"] }');
-  }
-  if (FILE_DELIVERABLE_RE.test(prompt)) {
-    required.add('path');
-    checks.push('verify: { path_exists: ["path"] }');
-  }
-  if (LIST_DELIVERABLE_RE.test(prompt)) {
-    required.add('items');
-    checks.push('non_empty: ["items"]');
-    checks.push('min_items: { items: 1 }');
-  }
-  if (required.size === 0) {
-    required.add('result');
-    checks.push('non_empty: ["result"]');
-  }
-  return `Suggested shape: output: { type: "object", required_keys: [${[...required].map((k) => `"${k}"`).join(', ')}], ${checks.join(', ')} }.`;
 }
 
 function checkOutputContractHint(step: WorkflowStepShape): string | null {
@@ -472,14 +541,14 @@ function checkOutputContractHint(step: WorkflowStepShape): string | null {
   if (step.deterministic) return null; // deterministic steps are handled by checkDeterministicRunner
   const prompt = step.prompt ?? '';
   if (!stepLooksDeliverable(step)) return null;
-  return `Step "${step.id}" looks like it produces a deliverable but declares no output contract. Add an "output" block so the engine can confirm the deliverable actually exists and the end-of-run target check can verify it — otherwise a step that claims success without producing the artifact passes silently. ${outputContractSuggestion(prompt)}`;
+  return `Step "${step.id}" looks like it produces a deliverable but declares no output contract. Add an "output" block so the engine can hard-verify the deliverable and the end-of-run target check can use concrete evidence; without it, the runner can only infer a best-effort needs-attention advisory when artifact evidence is missing. ${outputContractSuggestionFromPrompt(prompt)}`;
 }
 
 function checkWorkflowGoalHint(data: WorkflowFrontmatter, steps: WorkflowStepShape[]): string | null {
   if (workflowHasGoal(data)) return null;
   const hasDeliverableStep = steps.some((step) => !step.forEach && !step.deterministic && stepLooksDeliverable(step));
   const synthesisPrompt = data.synthesis?.prompt ?? '';
-  const hasDeliverableSynthesis = synthesisPrompt.length > 0 && DELIVERABLE_RE.test(synthesisPrompt);
+  const hasDeliverableSynthesis = textMentionsDeliverable(synthesisPrompt);
   if (!hasDeliverableStep && !hasDeliverableSynthesis) return null;
   return 'Workflow appears to produce a deliverable but has no pinned `goal`. Add a goal objective and success criteria so completion is judged against external evidence, not just the model saying it is done.';
 }
@@ -502,13 +571,24 @@ function checkRememberedToolChoiceBinding(
   } catch {
     return null;
   }
-  const m = matches.find((x) => (x.kind === 'cli' || x.kind === 'mcp') && !x.alreadyBound);
+  const m = matches.find((x) =>
+    (x.kind === 'cli' || x.kind === 'mcp')
+    && !x.alreadyBound
+    && !/^(?:null|undefined|none|n\/a|na|unknown)?$/i.test((x.command ?? '').trim()));
   if (!m) return null;
   const allowed = step.allowedTools;
   // Drift is possible when the step can still reach composio: an explicit
   // composio_* entry, OR no allowedTools at all (default = full surface).
   const canReachComposio =
     !allowed || allowed.length === 0 || allowed.some((t) => typeof t === 'string' && t.startsWith('composio'));
+  const familyReachable = !!allowed && m.family.every((f) =>
+    allowed.some((t) => t === f || (t.endsWith('*') && f.startsWith(t.slice(0, -1)))));
+  if (familyReachable && m.kind === 'mcp') {
+    const namespace = m.identifier.split('__')[0]?.toLowerCase() ?? '';
+    if (namespace && new RegExp(`\\b${namespace.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(step.prompt ?? '')) {
+      return null;
+    }
+  }
   if (!canReachComposio) return null;
   return (
     `Step "${step.id}" looks like it should use your proven ${m.kind} \`${m.command}\`, but its prompt doesn't `
@@ -636,10 +716,15 @@ export function validateWorkflowDefinition(
     // items and SILENTLY skips the step (reason: forEach-empty) — a fan-out that
     // looks authored but does zero work. Catch it at author time.
     if (typeof step.forEach === 'string' && step.forEach.trim().length > 0) {
-      const src = step.forEach.trim();
-      if (!ids.has(src)) {
+      const raw = step.forEach.trim();
+      const src = forEachSourceStepId(raw);
+      if (!src) {
         errors.push(
-          `Step "${step.id}" has forEach: "${src}" but no such step exists — the fan-out would iterate over nothing and the step is silently skipped at run time.`,
+          `Step "${step.id}" has unsupported forEach source "${raw}". Use an upstream step id or {{steps.<stepId>.output[.<path>]}}.`,
+        );
+      } else if (!ids.has(src)) {
+        errors.push(
+          `Step "${step.id}" has forEach: "${raw}" but no such step "${src}" exists — the fan-out would iterate over nothing and the step is silently skipped at run time.`,
         );
       } else if (src === step.id) {
         errors.push(`Step "${step.id}" has forEach pointing at itself.`);
@@ -680,6 +765,9 @@ export function validateWorkflowDefinition(
     );
     for (const issue of approval.errors) errors.push(issue);
     for (const issue of approval.warnings) warnings.push(issue);
+
+    const sideEffectIssue = checkSideEffectCoherence(step);
+    if (sideEffectIssue) warnings.push(sideEffectIssue);
 
     // Step output references → errors. Data flows only from declared
     // dependencies, so a {{steps.X.output}} where X isn't an upstream

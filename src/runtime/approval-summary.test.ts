@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractApprovalContentPreview } from './approval-summary.js';
+import { extractApprovalContentPreview, describeWorkflowStepAction } from './approval-summary.js';
 
 test('extractApprovalContentPreview: pulls caption + image from a social-post tool call', () => {
   const p = extractApprovalContentPreview('composio_execute_tool', {
@@ -44,4 +44,18 @@ test('extractApprovalContentPreview: picks the LONGEST content string (the real 
     content: 'This is the actual long-form post content that should win as the body.',
   });
   assert.match(p!.body!, /actual long-form/);
+});
+
+test('describeWorkflowStepAction renders the resolved action for an approval gate (legibility #1)', () => {
+  const desc = describeWorkflowStepAction({
+    id: 'gated_notify',
+    sideEffect: 'send',
+    allowedTools: ['notify_user'],
+    prompt: 'Call notify_user exactly once with the message: "Clem approval-gate test — if you see this exactly once, the gate works."',
+  });
+  assert.match(desc, /^SEND via notify_user — /);
+  assert.match(desc, /approval-gate test/);
+  // read step with no tools still legible
+  const r = describeWorkflowStepAction({ id: 's', sideEffect: 'read', prompt: 'fetch the page' });
+  assert.match(r, /^READ — fetch the page/);
 });

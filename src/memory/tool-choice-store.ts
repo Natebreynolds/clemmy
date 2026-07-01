@@ -124,16 +124,33 @@ function parseRecord(filePath: string): ToolChoiceRecord | null {
   return { intent, description, choice, fallbacks, body: parsed.content ?? '', filePath };
 }
 
+function placeholderChoiceString(value: unknown): boolean {
+  if (typeof value !== 'string') return true;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length === 0
+    || normalized === 'null'
+    || normalized === 'undefined'
+    || normalized === 'none'
+    || normalized === 'n/a'
+    || normalized === 'na'
+    || normalized === 'unknown';
+}
+
+function cleanInvocationTemplate(value: unknown): string | undefined {
+  if (placeholderChoiceString(value)) return undefined;
+  return stripBakedConnectionId(value as string);
+}
+
 function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
   const kind = r.kind;
   const identifier = r.identifier ?? r.command ?? r.slug ?? r.name;
   if (kind !== 'cli' && kind !== 'composio' && kind !== 'mcp') return null;
-  if (typeof identifier !== 'string' || identifier.length === 0) return null;
+  if (placeholderChoiceString(identifier)) return null;
   return {
     kind,
-    identifier,
+    identifier: (identifier as string).trim(),
     // Strip any baked `connected_account_id` on READ too (not just on write):
     // 50+ legacy choices on disk still carry a hardcoded ca_… that, if the model
     // copied the template verbatim into composio_execute_tool, would override the
@@ -141,7 +158,7 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
     // (the 2026-06-01 Airtable INVALID_PERMISSIONS class). Stripping at the single
     // read source means every consumer — context injection, recall, the authoring
     // matcher — sees a connection-less template and always falls to live resolve.
-    invocationTemplate: typeof r.invocationTemplate === 'string' ? stripBakedConnectionId(r.invocationTemplate) : undefined,
+    invocationTemplate: cleanInvocationTemplate(r.invocationTemplate),
     testedAt: typeof r.testedAt === 'string' ? r.testedAt : new Date().toISOString(),
     testEvidence: typeof r.testEvidence === 'string' ? r.testEvidence : undefined,
     // Outcome counters — only present once measured, so legacy files round-trip
@@ -360,6 +377,18 @@ export function evidenceLooksFailedOrBlocked(text: string | undefined): boolean 
 export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRecord {
   const existing = parseRecord(filePathFor(input.intent));
   const now = new Date().toISOString();
+  if (placeholderChoiceString(input.choice.identifier)) {
+    const saved = writeRecord({
+      intent: input.intent,
+      description: input.description ?? existing?.description,
+      choice: existing?.choice ?? null,
+      fallbacks: existing?.fallbacks ?? [],
+      body: input.body ?? existing?.body ?? defaultBodyFor(input.intent, input.description ?? existing?.description),
+      filePath: existing?.filePath,
+    });
+    emitToolChoiceEvent('remember_rejected_failed', input.intent, 'placeholder');
+    return saved;
+  }
   // Write-back guard (2026-06-21 poisoned-memo class): if the model's OWN
   // evidence/description says this attempt was BLOCKED by a gate or FAILED, never
   // promote it to the active proven choice. Record it as a fallback (preserving
@@ -395,8 +424,8 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
   const samePath = prev && prev.kind === input.choice.kind && prev.identifier === input.choice.identifier;
   const choice: ToolChoiceRecordChoice = {
     kind: input.choice.kind,
-    identifier: input.choice.identifier,
-    invocationTemplate: stripBakedConnectionId(input.choice.invocationTemplate),
+    identifier: input.choice.identifier.trim(),
+    invocationTemplate: cleanInvocationTemplate(input.choice.invocationTemplate),
     testedAt: input.choice.testedAt ?? now,
     testEvidence: input.choice.testEvidence,
     ...(samePath ? {
@@ -589,6 +618,19 @@ const STEP_MATCH_GENERIC_TOKENS = new Set<string>([
   'query', 'get', 'list', 'fetch', 'read', 'write', 'create', 'update', 'delete',
   'run', 'call', 'data', 'records', 'record', 'find', 'search', 'pull', 'fetching',
 ]);
+const STEP_MATCH_WEAK_IDENTITY_TOKENS = new Set<string>([
+  ...STEP_MATCH_GENERIC_TOKENS,
+  // Common deliverable/prose nouns that show up in old auto-remembered
+  // objectives. They can raise score, but must not be the only tool identity
+  // anchor ("draft a summary" is not a DataForSEO backlinks-summary bind).
+  'summary', 'summarize', 'digest', 'report', 'brief', 'audit', 'email', 'emails',
+  'draft', 'drafts', 'message', 'messages', 'file', 'files', 'path', 'page',
+  'content', 'parsing', 'native', 'server',
+]);
+const SHORT_TOOL_ALIASES: Record<string, string[]> = {
+  sf: ['salesforce'],
+  gh: ['github'],
+};
 
 /** Word-tokenize free text (a step prompt) into a lowercase set, dropping
  *  punctuation and very short tokens. (recall's `tokenize` only splits slugs
@@ -611,11 +653,141 @@ function wordTokens(text: string): Set<string> {
  *  days" → the Salesforce SOQL choice). Non-CLI identifiers (composio/mcp) are
  *  bare identity slugs already, so they're used whole. */
 function cliCommandHead(command: string): string {
-  const flagIdx = command.search(/\s-{1,2}\w/); // first " -x" / " --x"
-  const quoteIdx = command.search(/["'=]/);     // first quoted / `=` argument
-  const cuts = [flagIdx, quoteIdx].filter((i) => i >= 0);
-  const cut = cuts.length ? Math.min(...cuts) : command.length;
-  return command.slice(0, cut);
+  const parts = command.trim().split(/\s+/);
+  const keep: string[] = [];
+  for (const raw of parts) {
+    const token = raw.trim();
+    if (!token) continue;
+    if (/^(?:&&|\|\||\||;)$/.test(token)) break;
+    if (/^-/.test(token)) break;
+    if (/^["'`]/.test(token) || token.includes('=') || token.includes('{{') || token.includes('$(')) break;
+    if (/^(?:\/|\.\/|\.\.\/)/.test(token)) break;
+    keep.push(token);
+  }
+  return keep.join(' ');
+}
+
+function addExpandedToken(out: Set<string>, token: string): void {
+  if (!token) return;
+  out.add(token);
+  for (const alias of SHORT_TOOL_ALIASES[token] ?? []) out.add(alias);
+}
+
+function validCallableMcpIdentifier(identifier: string): boolean {
+  // Native MCP tools are callable names like `dataforseo__on_page_content_parsing`.
+  // A few old memories accidentally stored prose/action sequences as kind:mcp
+  // (`write_file(path=...) then browser_harness_run(...)`). Those are not valid
+  // allowedTools entries and must never drive workflow binding/advisories.
+  return /^[A-Za-z][A-Za-z0-9_-]*__[A-Za-z0-9][A-Za-z0-9_-]*$/.test(identifier.trim());
+}
+
+function mcpNamespaceTokens(identifier: string): Set<string> {
+  const namespace = identifier.trim().split('__')[0] ?? '';
+  return wordTokens(namespace);
+}
+
+function choiceIdentityText(rec: ToolChoiceRecord): string {
+  const choice = rec.choice;
+  if (!choice) return '';
+  if (choice.kind === 'cli') {
+    const template = choice.invocationTemplate && !placeholderChoiceString(choice.invocationTemplate)
+      ? choice.invocationTemplate
+      : choice.identifier;
+    return `${choice.identifier} ${cliCommandHead(template)}`;
+  }
+  return choice.identifier;
+}
+
+function cliHeadTokens(rec: ToolChoiceRecord): string[] {
+  if (rec.choice?.kind !== 'cli') return [];
+  const template = rec.choice.invocationTemplate && !placeholderChoiceString(rec.choice.invocationTemplate)
+    ? rec.choice.invocationTemplate
+    : rec.choice.identifier;
+  return [...wordTokens(cliCommandHead(template))];
+}
+
+function cliProgramTokens(rec: ToolChoiceRecord): Set<string> {
+  const [program] = cliHeadTokens(rec);
+  const out = new Set<string>();
+  if (program) addExpandedToken(out, program);
+  return out;
+}
+
+const CLI_IGNORED_OPERATION_TOKENS = new Set<string>(['data']);
+const CLI_OPERATION_SYNONYMS: Record<string, string[]> = {
+  query: ['query', 'queries', 'pull', 'pulls', 'fetch', 'fetches', 'list', 'lists', 'find', 'finds', 'search', 'searches', 'get', 'gets', 'retrieve', 'retrieves', 'lookup', 'lookups'],
+  create: ['create', 'creates', 'add', 'adds', 'insert', 'inserts', 'upsert', 'upserts'],
+  update: ['update', 'updates', 'upsert', 'upserts', 'patch', 'patches', 'set', 'sets'],
+  deploy: ['deploy', 'deploys', 'publish', 'publishes', 'release', 'releases'],
+  read: ['read', 'reads', 'inspect', 'inspects', 'check', 'checks', 'get', 'gets'],
+  display: ['display', 'displays', 'show', 'shows', 'get', 'gets', 'read', 'reads'],
+};
+
+function cliOperationTokens(rec: ToolChoiceRecord): Set<string> {
+  const tokens = cliHeadTokens(rec).slice(1);
+  const out = new Set<string>();
+  for (const t of tokens) {
+    if (t.length < 3 || STEP_MATCH_STOPWORDS.has(t) || CLI_IGNORED_OPERATION_TOKENS.has(t)) continue;
+    out.add(t);
+  }
+  return out;
+}
+
+function promptMatchesCliOperation(prompt: Set<string>, promptText: string, rec: ToolChoiceRecord): boolean {
+  const ops = cliOperationTokens(rec);
+  if (ops.size === 0) return true;
+  for (const op of ops) {
+    if (op === 'query') {
+      if (cliChoiceLooksCountQuery(rec) && promptLooksCountQuery(promptText)) return true;
+      if (prompt.has('query') || prompt.has('queries') || prompt.has('soql')) return true;
+      // Broad words like "find" and "list" are common in planning prose. Accept
+      // them for a query command only when the step also explicitly scopes the
+      // action to a CLI, e.g. "using the Salesforce CLI, fetch...".
+      if (prompt.has('cli')) {
+        for (const synonym of CLI_OPERATION_SYNONYMS.query ?? []) {
+          if (synonym !== 'query' && synonym !== 'queries' && prompt.has(synonym)) return true;
+        }
+      }
+      continue;
+    }
+    if (prompt.has(op)) return true;
+    for (const synonym of CLI_OPERATION_SYNONYMS[op] ?? []) {
+      if (prompt.has(synonym)) return true;
+    }
+  }
+  return false;
+}
+
+function cliChoiceLooksCountQuery(rec: ToolChoiceRecord): boolean {
+  if (rec.choice?.kind !== 'cli') return false;
+  const text = `${rec.intent}\n${rec.choice.invocationTemplate ?? ''}`;
+  return /\bcount(?:_|\b)|\bcount\s*\(/i.test(text);
+}
+
+function promptLooksCountQuery(promptText: string): boolean {
+  const text = promptText.toLowerCase();
+  return (
+    /\b(?:count|total)\s+(?:the\s+)?(?:salesforce\s+)?(?:accounts?|records?|prospects?|contacts?|opportunities?)\b/.test(text)
+    || /\bhow many\s+(?:salesforce\s+)?(?:accounts?|records?|prospects?|contacts?|opportunities?)\b/.test(text)
+    || /\bselect\s+count\s*\(/.test(text)
+  );
+}
+
+function identityChoiceTokens(rec: ToolChoiceRecord): Set<string> {
+  const raw = wordTokens(choiceIdentityText(rec));
+  const out = new Set<string>();
+  for (const t of raw) {
+    if (t.length < 2 || STEP_MATCH_STOPWORDS.has(t)) continue;
+    if (t.length >= 3 || SHORT_TOOL_ALIASES[t]) addExpandedToken(out, t);
+  }
+  return out;
+}
+
+function intentChoiceTokens(rec: ToolChoiceRecord): Set<string> {
+  const raw = tokenize(slugifyIntent(rec.intent));
+  const out = new Set<string>();
+  for (const t of raw) if (t.length >= 3 && !STEP_MATCH_STOPWORDS.has(t)) out.add(t);
+  return out;
 }
 
 /** CORE identity tokens of a choice: its intent slug + the command-HEAD of its
@@ -624,15 +796,10 @@ function cliCommandHead(command: string): string {
  *  words. A match needs ≥2 of these (service + operation), so a lone service
  *  mention — or an incidental shared argument-value word — can't bind. */
 function coreChoiceTokens(rec: ToolChoiceRecord): Set<string> {
-  const identifier = rec.choice?.identifier ?? '';
-  const identityText = rec.choice?.kind === 'cli' ? cliCommandHead(identifier) : identifier;
-  const raw = new Set<string>([
-    ...tokenize(slugifyIntent(rec.intent)),
-    ...wordTokens(identityText),
+  return new Set<string>([
+    ...intentChoiceTokens(rec),
+    ...identityChoiceTokens(rec),
   ]);
-  const out = new Set<string>();
-  for (const t of raw) if (t.length >= 3 && !STEP_MATCH_STOPWORDS.has(t)) out.add(t);
-  return out;
 }
 
 /** CONTEXT tokens of a choice: its description words, minus generics. Used to
@@ -724,17 +891,35 @@ export function matchToolChoicesForStep(
   const out: StepToolChoiceMatch[] = [];
   for (const rec of records) {
     if (!rec.choice) continue; // inactive (invalidated, not yet rediscovered)
+    if (placeholderChoiceString(rec.choice.identifier)) continue;
+    if (rec.choice.kind === 'mcp' && !validCallableMcpIdentifier(rec.choice.identifier)) continue;
+    const identity = identityChoiceTokens(rec);
+    if (identity.size === 0) continue;
     const core = coreChoiceTokens(rec);
     if (core.size === 0) continue;
+    const matchedIdentity = [...identity].filter((t) => prompt.has(t));
+    const hasStrongIdentity = matchedIdentity.some((t) => !STEP_MATCH_WEAK_IDENTITY_TOKENS.has(t));
+    const matchedMcpNamespace = rec.choice.kind === 'mcp'
+      ? [...mcpNamespaceTokens(rec.choice.identifier)].filter((t) => prompt.has(t))
+      : [];
     const matchedCore = [...core].filter((t) => prompt.has(t));
     const alreadyBound = promptAlreadyBinds(promptText, rec.choice);
 
     // Precision: an embedded command is the strongest possible signal → always a
     // match (the consumer skips it as already-bound). Otherwise require at least
     // TWO CORE identity tokens (typically service + operation, e.g. "salesforce"
-    // AND "query") with a real anchor — so a lone service mention or an
-    // incidental shared description word can never trigger a bind.
+    // AND "query") and a concrete tool-identity anchor — so broad old objective
+    // prose ("email audit", "summary") cannot bind unrelated tools.
     if (!alreadyBound) {
+      if (matchedIdentity.length === 0) continue;
+      if (!hasStrongIdentity) continue;
+      if (rec.choice.kind === 'mcp' && matchedMcpNamespace.length === 0) continue;
+      if (rec.choice.kind === 'cli') {
+        const matchedProgram = [...cliProgramTokens(rec)].some((t) => prompt.has(t));
+        if (!matchedProgram) continue;
+        if (!promptMatchesCliOperation(prompt, promptText, rec)) continue;
+        if (cliChoiceLooksCountQuery(rec) && !promptLooksCountQuery(promptText)) continue;
+      }
       if (matchedCore.length < 2) continue;
       if (!matchedCore.some((t) => t.length >= 4)) continue;
     }
@@ -786,10 +971,13 @@ export function toolFamilyForChoice(choice: ToolChoiceRecordChoice): string[] {
 
 /** The concrete, human-readable command/tool to bake into a bound step prompt. */
 export function boundCommandForChoice(choice: ToolChoiceRecordChoice): string {
-  if (choice.invocationTemplate && choice.invocationTemplate.trim().length > 0) {
+  if (choice.kind === 'mcp') {
+    return placeholderChoiceString(choice.identifier) ? '' : choice.identifier;
+  }
+  if (choice.invocationTemplate && !placeholderChoiceString(choice.invocationTemplate)) {
     return choice.invocationTemplate.trim();
   }
-  return choice.identifier;
+  return placeholderChoiceString(choice.identifier) ? '' : choice.identifier;
 }
 
 // ─────────────────────────────────────────────────────────────────

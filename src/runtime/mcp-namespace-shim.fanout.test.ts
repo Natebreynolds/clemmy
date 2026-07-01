@@ -9,11 +9,21 @@
  * underlying server — no app, no daemon, no API. This is the "different way"
  * to prove the wiring before the release.
  */
-import { test } from 'node:test';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { MCPServer } from '@openai/agents';
-import { createMcpNamespaceShim, namespaceToolName, slugifyServerName } from './mcp-namespace-shim.js';
-import { withHarnessRunContext, ToolCallsCounter, type HarnessRunContext } from './harness/brackets.js';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mcp-fanout-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-mcp-fanout-test\n', 'utf-8');
+
+const { createMcpNamespaceShim, namespaceToolName, slugifyServerName } = await import('./mcp-namespace-shim.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
+type HarnessRunContext = import('./harness/brackets.js').HarnessRunContext;
 
 // Fake underlying server that returns the REAL CallToolResultContent shape
 // (a content-block ARRAY), so appendMcpFanoutAdvisory's Array.isArray gate and
@@ -93,4 +103,8 @@ test('MCP shim leaves results untouched when there is no harness session context
     last = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-xxxxxx.com` }));
   }
   assert.ok(!/FAN-OUT NOW/.test(last), 'no advisory without a session context (cannot key the bucket)');
+});
+
+after(() => {
+  try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });

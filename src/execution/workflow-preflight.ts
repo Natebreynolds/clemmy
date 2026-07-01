@@ -43,7 +43,7 @@ export interface PreflightResult {
 
 export function workflowEditAdvisories(warnings: string[]): string[] {
   return warnings.filter((w) =>
-    /no pinned `goal`|output contract|common input \{\{input\.|Synthesis prompt references common input/i.test(w));
+    /no pinned `goal`|output contract|common input \{\{input\.|Synthesis prompt references common input|sideEffect|multi-item work but has no forEach|should use your proven .*drift onto a stale path/i.test(w));
 }
 
 export function preflightWorkflow(

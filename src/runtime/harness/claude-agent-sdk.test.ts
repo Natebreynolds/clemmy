@@ -58,6 +58,7 @@ test('defaultClaudeAgentSdkAllowedLocalTools is conservative unless explicitly o
     delete process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS;
     const defaults = defaultClaudeAgentSdkAllowedLocalTools();
     assert.ok(defaults.includes('memory_search'));
+    assert.ok(defaults.includes('memory_remember'));
     assert.ok(defaults.includes('read_file'));
     assert.equal(defaults.includes('run_shell_command'), false);
     assert.equal(defaults.includes('write_file'), false);

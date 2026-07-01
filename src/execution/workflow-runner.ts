@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, openSync, writeSy
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
+import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
 } from '../runtime/sandboxed-script.js';
@@ -13,7 +14,7 @@ import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harne
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { runBoundedPool } from './bounded-pool.js';
-import { bindStepInputs } from './step-binding.js';
+import { bindStepInputs, resolveFrom } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
 import { addRunEvent, startRun, finishRun } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
@@ -78,6 +79,7 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow
 import { verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
+import { inferOutputContractFromPrompt } from './workflow-deliverable-hints.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
 import { deliverOutcome } from '../runtime/outcome.js';
@@ -829,6 +831,26 @@ function coerceToArray(value: unknown): unknown[] | null {
   return null;
 }
 
+function forEachSourceStepId(expr: string | undefined): string | null {
+  const raw = (expr ?? '').trim();
+  if (!raw) return null;
+  const templated = /^\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}$/.exec(raw);
+  if (templated) return templated[1];
+  const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
+  if (directPath) return directPath[1];
+  return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
+}
+
+function resolveForEachSource(expr: string, stepOutputs: Record<string, unknown>): { sourceId: string | null; value: unknown } {
+  const raw = expr.trim();
+  const sourceId = forEachSourceStepId(raw);
+  if (!sourceId) return { sourceId: null, value: undefined };
+  const templated = /^\{\{\s*(steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?)\s*\}\}$/.exec(raw);
+  const directPath = /^(steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?)$/.exec(raw);
+  const from = templated?.[1] ?? directPath?.[1] ?? `steps.${sourceId}.output`;
+  return { sourceId, value: resolveFrom(from, {}, stepOutputs, undefined) };
+}
+
 function itemKey(item: unknown, index: number): string {
   if (item && typeof item === 'object') {
     const candidate = (item as Record<string, unknown>).id
@@ -920,7 +942,7 @@ function applyWorkflowPatternHint(ctx: Pick<StepExecutionContext, 'learnedPatter
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output';
+  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract';
   note: string;
 }
 
@@ -933,6 +955,7 @@ export function workflowAdvisoryRequiresAttention(
     case 'skill_not_executed':
     case 'idempotent_skip':
     case 'ungrounded_output':
+    case 'inferred_output_contract':
       // A figure that contradicts the run's own captured tool results is the
       // trust-killer ("plausible fluff") — it must surface for review, never pass
       // as clean success.
@@ -1360,8 +1383,18 @@ async function runStepViaHarness(
         toolUses: sdkResult.toolUses,
         structured: sdkResult.structured,
       });
+      // Phantom-completion guard (#2): a send/write step that called no real tool
+      // didn't actually act — surface it as blocked instead of a silent success.
+      let sdkOutput = sdkResult.output;
+      if (isPhantomStepCompletion(step, sdkResult.toolUses, sdkOutput)) {
+        const cls = stepSideEffectClass(step);
+        sdkOutput = {
+          blocked: true,
+          reason: `Step "${step.id}" is a ${cls} step but completed without calling any tool — the ${cls === 'send' ? 'send' : 'write'} was not actually performed (it returned output instead of acting). Re-run the step or fix it to call its tool.`,
+        };
+      }
       return {
-        output: sdkResult.output,
+        output: sdkOutput,
         hadApprovals: false,
         approvalIds: [],
         usedStructuredResult: sdkResult.structured,
@@ -1627,7 +1660,10 @@ async function awaitDeclarativeStepApproval(
   let row = pending[0];
   if (!row) {
     const subject = (step.approvalPreview && step.approvalPreview.trim())
-      || `Approve "${ctx.workflow.name}" step "${step.id}" before it runs`;
+      // Legibility (#1): show WHAT the step will do, not just its id — so the
+      // approver (gated) or the audit stream (unattended/yolo) sees the real
+      // action. Flows to the dashboard card, the notification, and Discord/Slack.
+      || `Approve "${ctx.workflow.name}" step "${step.id}": ${describeWorkflowStepAction(step)}`;
     // The approvals table has `session_id REFERENCES sessions(id)` with
     // foreign_keys=ON, so a gate approval can only be registered once a
     // sessions row exists for the gate id. The declarative gate uses its
@@ -2223,6 +2259,11 @@ export class WorkflowContractViolationError extends Error {
   }
 }
 
+function isBlockedStepOutput(output: unknown): boolean {
+  return output !== null && typeof output === 'object' && !Array.isArray(output) &&
+    (output as { blocked?: unknown }).blocked === true;
+}
+
 export function finalizeStepOutput(
   workflowSlug: string,
   runId: string,
@@ -2242,9 +2283,7 @@ export function finalizeStepOutput(
   // blocked output; it flows through as step_completed and the run reports the
   // real reason. (Live: add_to_airtable blocked "no prospects — Salesforce
   // expired" but the user saw "missing required output key created_records".)
-  const isBlockedOutput =
-    bound !== null && typeof bound === 'object' && !Array.isArray(bound) &&
-    (bound as { blocked?: unknown }).blocked === true;
+  const isBlockedOutput = isBlockedStepOutput(bound);
   if (step.output && !isBlockedOutput) {
     const result = verifyStepOutput(step.output, bound);
     if (!result.ok) {
@@ -2287,6 +2326,139 @@ export function finalizeStepOutput(
     ...(meta ? { meta } : {}),
   });
   return bound;
+}
+
+function collectStringLeaves(value: unknown, into: string[] = [], depth = 0): string[] {
+  if (into.length >= 64 || depth > 6) return into;
+  if (typeof value === 'string') {
+    into.push(value);
+    return into;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStringLeaves(item, into, depth + 1);
+    return into;
+  }
+  if (value && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>)) collectStringLeaves(item, into, depth + 1);
+  }
+  return into;
+}
+
+function hasHttpUrl(value: unknown): boolean {
+  const urls = new Set<string>();
+  collectHttpUrls(value, urls, 0);
+  return urls.size > 0;
+}
+
+function normalizePathCandidate(candidate: string): string {
+  return candidate
+    .trim()
+    .replace(/^["'`([{<]+/, '')
+    .replace(/["'`.,;:)\]}>]+$/, '');
+}
+
+function pathCandidateExists(candidate: string): boolean {
+  const cleaned = normalizePathCandidate(candidate);
+  if (!cleaned || /^https?:\/\//i.test(cleaned)) return false;
+  const candidates = path.isAbsolute(cleaned)
+    ? [cleaned]
+    : [cleaned, path.resolve(process.cwd(), cleaned)];
+  return candidates.some((p) => existsSync(p));
+}
+
+function hasExistingPath(value: unknown): boolean {
+  const pathLike =
+    /(?:\.{1,2}\/|\/|[A-Za-z0-9_.-]+\/)[^\s"'<>]+|[A-Za-z0-9_.-]+\.(?:html?|md|pdf|csv|tsx?|jsx?|json|txt|docx?|xlsx?|pptx?|png|jpe?g|webp|gif|zip)/gi;
+  for (const text of collectStringLeaves(value)) {
+    if (pathCandidateExists(text)) return true;
+    for (const match of text.matchAll(pathLike)) {
+      if (pathCandidateExists(match[0])) return true;
+    }
+  }
+  return false;
+}
+
+function hasNonEmptyArrayDeep(value: unknown, depth = 0): boolean {
+  if (depth > 6) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((item) => hasNonEmptyArrayDeep(item, depth + 1));
+  }
+  return false;
+}
+
+function hasTextList(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (!text) return false;
+  if (/^\s*(?:[-*]|\d+[.)])\s+\S+/m.test(text)) return true;
+  if (/^\s*\|.+\|\s*$/m.test(text)) return true;
+  return false;
+}
+
+function hasNonEmptyListEvidence(value: unknown): boolean {
+  return hasNonEmptyArrayDeep(value) || collectStringLeaves(value).some(hasTextList);
+}
+
+/**
+ * Legacy deliverable guard: workflows authored before explicit `output`
+ * contracts can still promise "produce a URL/file/list" in prose. Infer that
+ * concrete shape and surface a needs-attention advisory when the completed step
+ * output has no matching evidence. This is intentionally softer than declared
+ * contracts: it accepts legacy prose that contains a real URL, existing file
+ * path, or text list instead of requiring an object shape the prompt never saw.
+ */
+export function inferredOutputContractAdvisory(step: WorkflowStepInput, output: unknown): string | null {
+  if (step.output || step.deterministic || step.forEach) return null;
+  const contract = inferOutputContractFromPrompt(step.prompt ?? '');
+  if (!contract) return null;
+  const bound = coerceOutputForContract(output, contract);
+  if (isBlockedStepOutput(bound)) return null;
+  if (verifyStepOutput(contract, bound).ok) return null;
+
+  const problems: string[] = [];
+  const expectedUrl = (contract.verify?.url_present?.length ?? 0) > 0 || (contract.required_keys ?? []).includes('url');
+  const expectedPath = (contract.verify?.path_exists?.length ?? 0) > 0 || (contract.required_keys ?? []).includes('path');
+  const expectedItems =
+    Object.keys(contract.min_items ?? {}).length > 0 ||
+    (contract.non_empty ?? []).includes('items') ||
+    (contract.required_keys ?? []).includes('items');
+  const expectedResult = (contract.required_keys ?? []).includes('result');
+
+  if (expectedUrl && !hasHttpUrl(bound)) {
+    problems.push('expected a URL deliverable, but no http(s) URL was found');
+  }
+  if (expectedPath && !hasExistingPath(bound)) {
+    problems.push('expected a file deliverable, but no existing file path was found');
+  }
+  if (expectedItems && !hasNonEmptyListEvidence(bound)) {
+    problems.push('expected a non-empty list/rows deliverable, but no non-empty list was found');
+  }
+  if (expectedResult && isEmptyValue(bound)) {
+    problems.push('expected a non-empty deliverable result, but output was empty');
+  }
+  if (problems.length === 0) return null;
+
+  return `step "${step.id}" looked like it should produce a concrete deliverable, but output did not satisfy inferred checks: ${problems.join('; ')} — produced ${describeOutputShape(bound)}. Add an explicit output contract to make this hard-enforced, or adjust the step/output.`;
+}
+
+function noteInferredOutputContractAdvisory(
+  step: WorkflowStepInput,
+  output: unknown,
+  ctx: StepExecutionContext,
+): void {
+  const note = inferredOutputContractAdvisory(step, output);
+  if (!note) return;
+  ctx.qualityAdvisories.push({
+    stepId: step.id,
+    kind: 'inferred_output_contract',
+    note,
+  });
+  appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+    kind: 'step_advisory',
+    stepId: step.id,
+    meta: { reason: 'inferred_output_contract', note },
+  });
 }
 
 /**
@@ -2370,7 +2542,8 @@ export async function executeStep(
 
   // 2. forEach — iterate an upstream output with bounded concurrency.
   if (step.forEach) {
-    const upstream = ctx.stepOutputs[step.forEach];
+    const forEachSource = resolveForEachSource(step.forEach, ctx.stepOutputs);
+    const upstream = forEachSource.value;
     let items = coerceToArray(upstream);
     // Creation-test: fan out over only the first item (just confirm the per-item
     // work returns data; don't run the whole batch while authoring).
@@ -2380,7 +2553,7 @@ export async function executeStep(
         kind: 'step_skipped',
         stepId: step.id,
         output: [],
-        meta: { reason: 'forEach-empty', source: step.forEach },
+        meta: { reason: 'forEach-empty', source: step.forEach, sourceStepId: forEachSource.sourceId ?? undefined },
       });
       return [];
     }
@@ -2717,7 +2890,9 @@ export async function executeStep(
     }
   }
 
-  return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output);
+  const finalized = finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output);
+  noteInferredOutputContractAdvisory(step, finalized, ctx);
+  return finalized;
 }
 
 /**
@@ -2871,11 +3046,40 @@ export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' |
   return 'read';
 }
 
+/** Phantom-completion guard (#2): the trust-critical correctness check for
+ *  unattended/yolo autonomy. A SEND/WRITE step that "completes" while calling ZERO
+ *  real tools never performed its action — it emitted output instead of acting
+ *  (observed 2026-06-30: a notify step returned the message as output without
+ *  calling notify_user; same family as a workflow "completing" without scraping).
+ *  In yolo mode this is the killer: Clem reports done, you're away, nothing
+ *  happened. Re-classify it as a BLOCKED step so the existing diagnosis/needs-
+ *  attention path surfaces it honestly instead of a silent false success.
+ *  Signal is deliberately narrow (zero real tools) to avoid false-positives:
+ *  - deterministic runner steps don't call brain tools → excluded;
+ *  - StructuredOutput is schema emission, not an action → ignored;
+ *  - an already-{blocked} output is honest → left alone.
+ *  Kill-switch CLEMMY_WORKFLOW_PHANTOM_GUARD (default on). */
+const PHANTOM_GUARD_INERT_TOOLS: ReadonlySet<string> = new Set(['StructuredOutput']);
+function phantomGuardEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKFLOW_PHANTOM_GUARD', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+export function isPhantomStepCompletion(step: WorkflowStepInput, toolUses: string[] | undefined, output: unknown): boolean {
+  if (!phantomGuardEnabled()) return false;
+  if (step.deterministic) return false;
+  const cls = stepSideEffectClass(step);
+  if (cls !== 'send' && cls !== 'write') return false;
+  if (output && typeof output === 'object' && !Array.isArray(output) && (output as { blocked?: unknown }).blocked === true) return false;
+  const realTools = (toolUses ?? [])
+    .map((t) => (typeof t === 'string' ? (t.split('__').at(-1) ?? t) : ''))
+    .filter((t) => t.length > 0 && !PHANTOM_GUARD_INERT_TOOLS.has(t));
+  return realTools.length === 0;
+}
+
 /** Does `consumer` read `sourceId`'s output — via dependsOn, a forEach over it,
  *  or a {{steps.<sourceId>.output…}} reference in its prompt? Pure. */
 export function stepConsumesOutput(consumer: WorkflowStepInput, sourceId: string): boolean {
   if ((consumer.dependsOn ?? []).includes(sourceId)) return true;
-  if (consumer.forEach === sourceId) return true;
+  if (forEachSourceStepId(consumer.forEach) === sourceId) return true;
   const escaped = sourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`\\{\\{\\s*steps\\.${escaped}[.\\s}]`).test(consumer.prompt ?? '');
 }

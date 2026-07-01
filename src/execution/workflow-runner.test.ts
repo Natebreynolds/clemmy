@@ -56,7 +56,9 @@ const {
   creationTestVerdict,
   shouldHaltResumeForSideEffect,
   stepSideEffectClass,
+  isPhantomStepCompletion,
   finalizeStepOutput,
+  inferredOutputContractAdvisory,
   sendAlreadyClaimed,
   stepExternalWriteAlreadyClaimed,
   stepSendAlreadyFired,
@@ -358,6 +360,45 @@ test('describeOutputShape: names the actual produced shape (so a contract failur
   assert.equal(describeOutputShape(null), 'null');
 });
 
+test('inferredOutputContractAdvisory: accepts legacy prose with concrete URL evidence', () => {
+  const note = inferredOutputContractAdvisory(
+    { id: 'publish', prompt: 'Build and publish the website page URL.' } as never,
+    'Published at https://example.com/landing',
+  );
+  assert.equal(note, null);
+});
+
+test('inferredOutputContractAdvisory: accepts legacy prose with an existing file path', () => {
+  const filePath = path.join(tmp, 'legacy-report.md');
+  writeFileSync(filePath, '# Report\n', 'utf-8');
+  const note = inferredOutputContractAdvisory(
+    { id: 'report', prompt: 'Create an HTML file and output the file path.' } as never,
+    `Saved to ${filePath}.`,
+  );
+  assert.equal(note, null);
+});
+
+test('inferredOutputContractAdvisory: flags a legacy deliverable step with no list evidence', () => {
+  const note = inferredOutputContractAdvisory(
+    { id: 'leads', prompt: 'Generate a list of weekly leads.' } as never,
+    'No leads found.',
+  );
+  assert.match(note ?? '', /non-empty list/);
+  assert.match(note ?? '', /produced string/);
+});
+
+test('inferredOutputContractAdvisory: explicit output contracts own their own enforcement path', () => {
+  const note = inferredOutputContractAdvisory(
+    {
+      id: 'leads',
+      prompt: 'Generate a list of weekly leads.',
+      output: { type: 'object', required_keys: ['items'], non_empty: ['items'] },
+    } as never,
+    { items: [] },
+  );
+  assert.equal(note, null);
+});
+
 test('workflowAdvisoryRequiresAttention: confident quality misses are not clean success', () => {
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'target_missed' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'foreach_overflow' }), true);
@@ -366,6 +407,7 @@ test('workflowAdvisoryRequiresAttention: confident quality misses are not clean 
   // Move 3: a Claude-lane figure that contradicts the run's own tool results is
   // the trust-killer — it must surface for review, never pass as clean success.
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'ungrounded_output' }), true);
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'inferred_output_contract' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unavailable' }), false);
 });
 
@@ -976,6 +1018,42 @@ test('forEach batches an oversized fan-out and still attempts every item', async
   }
 });
 
+test('forEach resolves {{steps.x.output.path}} sources at runtime', async () => {
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  try {
+    const ctx = {
+      workflow: { name: 'Path ForEach Test', steps: [] },
+      workflowSlug: 'foreach-path-test',
+      runId: 'fp-1',
+      inputs: {},
+      stepOutputs: { pull: { created_records: [{ id: 'r1' }, { id: 'r2' }] } },
+      assistant: { respond: async () => ({ text: 'done' }) },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = {
+      id: 'enrich',
+      prompt: 'Process {{item.id}}.',
+      forEach: '{{steps.pull.output.created_records}}',
+    } as unknown as Parameters<typeof executeStep>[0];
+
+    const output = await executeStep(step, ctx) as Array<{ itemKey: string; output: unknown }>;
+
+    assert.deepEqual(output.map((item) => item.itemKey), ['r1', 'r2']);
+    const started = readWorkflowEvents('foreach-path-test', 'fp-1').filter((e) => e.kind === 'item_started');
+    assert.deepEqual(started.map((e) => e.itemKey), ['r1', 'r2']);
+  } finally {
+    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
+    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
+    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
+    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+  }
+});
+
 test('forEach batching resumes after already-completed items and drains remaining pending items', async () => {
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
@@ -1249,6 +1327,43 @@ test('workflow conversion: a plain step routes through the GATED harness loop wh
   }
 });
 
+test('executeStep: legacy plain deliverable step records inferred output-contract advisory', async () => {
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  try {
+    const qualityAdvisories: Array<{ kind: string; note: string }> = [];
+    const ctx = {
+      workflow: { name: 'Legacy Deliverable Advisory', steps: [] },
+      workflowSlug: 'legacy-deliverable-advisory',
+      runId: 'legacy-deliverable-1',
+      inputs: {},
+      stepOutputs: {},
+      assistant: { respond: async () => ({ text: 'No leads found.' }) },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories,
+    } as unknown as Parameters<typeof executeStep>[1];
+    const step = {
+      id: 'lead_list',
+      prompt: 'Generate a list of weekly leads.',
+      useHarness: false,
+    } as unknown as Parameters<typeof executeStep>[0];
+
+    const out = await executeStep(step, ctx);
+    assert.equal(out, 'No leads found.');
+    const advisory = qualityAdvisories.find((a) => a.kind === 'inferred_output_contract');
+    assert.match(advisory?.note ?? '', /non-empty list/);
+    const event = readWorkflowEvents('legacy-deliverable-advisory', 'legacy-deliverable-1')
+      .find((ev) => ev.kind === 'step_advisory' && ev.meta?.reason === 'inferred_output_contract');
+    assert.equal(event?.stepId, 'lead_list');
+  } finally {
+    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW; else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS; else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
+  }
+});
+
 test('findContractViolationStep: finds the most-recent output_contract failure with its problems', () => {
   const events = [
     { t: '1', kind: 'step_started', stepId: 'a' },
@@ -1329,6 +1444,7 @@ test('explainDeterministicSpawnError: an unrelated error passes through unchange
 test('stepConsumesOutput: dependsOn, forEach, and {{steps.x.output}} all count as consuming', () => {
   assert.equal(stepConsumesOutput({ id: 'b', prompt: 'x', dependsOn: ['a'] } as any, 'a'), true);
   assert.equal(stepConsumesOutput({ id: 'b', prompt: 'x', forEach: 'a' } as any, 'a'), true);
+  assert.equal(stepConsumesOutput({ id: 'b', prompt: 'x', forEach: '{{steps.a.output.items}}' } as any, 'a'), true);
   assert.equal(stepConsumesOutput({ id: 'b', prompt: 'use {{steps.a.output}} now' } as any, 'a'), true);
   assert.equal(stepConsumesOutput({ id: 'b', prompt: 'unrelated' } as any, 'a'), false);
   // a different step id that is a prefix must NOT match (steps.a vs steps.account)
@@ -1931,4 +2047,28 @@ test('P0-3 end-to-end: park → approve → crash mid-send HALTS (closes the dou
     { stepId: 'send', cls: 'send', declared: true },
     'post-approval mid-send crash halts',
   );
+});
+
+test('isPhantomStepCompletion: a send/write step that called no real tool is flagged (phantom completion #2)', () => {
+  // phantom: send step, zero tools → it never sent
+  assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send', prompt: 'call notify_user' }, [], {}), true);
+  // phantom: only StructuredOutput (schema emission, not an action)
+  assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, ['StructuredOutput'], {}), true);
+  // phantom: write step, zero tools
+  assert.equal(isPhantomStepCompletion({ id: 'w', sideEffect: 'write' }, [], 'done'), true);
+
+  // NOT phantom: it actually called the send tool
+  assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, ['mcp__clementine-local__notify_user'], {}), false);
+  // NOT phantom: read step (no action expected)
+  assert.equal(isPhantomStepCompletion({ id: 'r', sideEffect: 'read' }, [], {}), false);
+  // NOT phantom: deterministic runner doesn't call brain tools
+  assert.equal(isPhantomStepCompletion({ id: 'd', sideEffect: 'send', deterministic: { runner: 'x.mjs' } }, [], {}), false);
+  // NOT phantom: already-blocked output is honest, leave it
+  assert.equal(isPhantomStepCompletion({ id: 'b', sideEffect: 'send' }, [], { blocked: true, reason: 'no data' }), false);
+});
+
+test('isPhantomStepCompletion: kill-switch off → never flags', () => {
+  process.env.CLEMMY_WORKFLOW_PHANTOM_GUARD = 'off';
+  assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, [], {}), false);
+  delete process.env.CLEMMY_WORKFLOW_PHANTOM_GUARD;
 });

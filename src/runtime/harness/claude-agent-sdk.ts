@@ -188,6 +188,10 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'memory_recall',
   'memory_list_facts',
   'memory_search_facts',
+  // Local-only memory writes are safe in the "read-only" Claude brain profile:
+  // they do not touch external systems, but they preserve core chat semantics
+  // for explicit "remember this" requests across model backends.
+  'memory_remember',
   'task_list',
   'workspace_roots',
   'workspace_list',

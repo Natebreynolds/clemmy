@@ -25,11 +25,30 @@ async function boot(authorized = { v: true }) {
   registerConsoleRoutes(app, () => authorized.v, {} as never, { serveLegacyAtRoot: false });
   const server: Server = await new Promise((resolve) => {
     const s = createServer(app);
+    s.keepAliveTimeout = 30_000;
+    s.headersTimeout = 31_000;
     s.listen(0, '127.0.0.1', () => resolve(s));
   });
   const port = (server.address() as AddressInfo).port;
   return { url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => server.close(() => r())) };
 }
+
+const fetch: typeof globalThis.fetch = async (...args) => {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await globalThis.fetch(...args);
+    } catch (err) {
+      lastError = err;
+      const message = err instanceof Error ? err.message : String(err);
+      const code = (err as { cause?: { code?: unknown } }).cause?.code;
+      const transient = message.includes('fetch failed') || code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'UND_ERR_SOCKET';
+      if (!transient || attempt === 2) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+};
 
 interface GoalRow {
   id: string;

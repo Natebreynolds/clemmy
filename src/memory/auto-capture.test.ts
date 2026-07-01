@@ -70,6 +70,14 @@ test('extractAutoMemoryCandidates keeps explicit remember for personal facts', (
   assert.equal(candidates[0]?.kind, 'user');
 });
 
+test('extractAutoMemoryCandidates keeps explicit "remember exactly" smoke facts', () => {
+  const candidates = extractAutoMemoryCandidates('Remember exactly: my smoke marker is MEMTOK-123456. Confirm.');
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.kind, 'user');
+  assert.match(candidates[0]?.content, /MEMTOK-123456/);
+});
+
 test('extractProfilePatchFromMessage captures explicit communication preferences', () => {
   const patch = extractProfilePatchFromMessage('Call me Nate. Keep it concise and no preamble.');
 

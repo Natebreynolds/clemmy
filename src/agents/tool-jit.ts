@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { getRuntimeEnv } from '../config.js';
+import { WORKSPACE_DOCK_TOOLS } from '../spaces/workspace-context.js';
 
 const logger = pino({ name: 'clementine-next.tool-jit' });
 
@@ -161,19 +162,7 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
  */
 export const TOOL_JIT_CORE: ReadonlySet<string> = TOOL_JIT_MANDATED;
 
-const WORKSPACE_INTENT_TOOLS: ReadonlySet<string> = new Set<string>([
-  'space_get',
-  'space_get_view',
-  'space_get_runner',
-  'space_list',
-  'space_save',
-  'space_edit_view',
-  'space_edit_runner',
-  'space_revert_runner',
-  'space_refresh',
-  'space_try_runner',
-  'space_set_data',
-]);
+const WORKSPACE_INTENT_TOOLS: ReadonlySet<string> = new Set<string>(WORKSPACE_DOCK_TOOLS);
 
 function looksLikeWorkspaceAuthoringIntent(query: string): boolean {
   const q = query.toLowerCase();

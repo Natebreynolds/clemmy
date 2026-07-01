@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { selectToolsForTurn, toolJitEnabled, TOOL_JIT_CORE, TOOL_JIT_MANDATED, assignToolJitArm, resolveToolJitDecision, toolJitExperimentEnabled, type JitTool, type JitRankFn } from './tool-jit.js';
+import { WORKSPACE_DOCK_TOOLS } from '../spaces/workspace-context.js';
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => Promise<void> | void): Promise<void> | void {
   const prev: Record<string, string | undefined> = {};
@@ -130,19 +131,7 @@ test('TOOL_JIT_CORE includes the acquisition escape-hatch + execution lane', () 
 
 test('workspace authoring intents pin the space tools even under a worst-case JIT ranker', async () => {
   await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
-    const spaceTools = [
-      'space_get',
-      'space_get_view',
-      'space_get_runner',
-      'space_list',
-      'space_save',
-      'space_edit_view',
-      'space_edit_runner',
-      'space_revert_runner',
-      'space_refresh',
-      'space_try_runner',
-      'space_set_data',
-    ];
+    const spaceTools = [...WORKSPACE_DOCK_TOOLS];
     const otherDroppable = ['workflow_create', 'git_status', 'task_add'];
     const tools: JitTool[] = [...CORE_SAMPLE, ...spaceTools, ...otherDroppable]
       .map((name) => ({ name, description: name }));

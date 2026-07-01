@@ -157,12 +157,14 @@ export function ModelRolesCard({ embedded = false }: { embedded?: boolean } = {}
     } finally { setBusy(null); }
   };
 
-  // The option value is the unique selector: a BYO model is `api_key:<modelId>`
-  // (so any connected model can be the brain), Codex/Claude are their plain ids.
+  // The option value is the unique selector: a BYO model is `api_key:<modelId>`,
+  // Codex is `codex_oauth:<id>`, Claude is `claude_oauth:<id>` (so any connected
+  // model can be the brain). A bare value (no `:`) is the plain auth-mode.
   const onBrain = (value: string) => run('brain', () =>
     value.startsWith('api_key:') ? setActiveBrain('api_key', value.slice('api_key:'.length))
       : value.startsWith('codex_oauth:') ? setActiveBrain('codex_oauth', value.slice('codex_oauth:'.length))
-        : setActiveBrain(value as ActiveBrain));
+        : value.startsWith('claude_oauth:') ? setActiveBrain('claude_oauth', value.slice('claude_oauth:'.length))
+          : setActiveBrain(value as ActiveBrain));
   const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
 

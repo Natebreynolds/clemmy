@@ -893,7 +893,8 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // Blocks surface as soft tool errors the model recovers from. The
       // external_write ledger (emitted on success below) is SHARED with the
       // composio path so duplicate detection spans both surfaces.
-      const integritySessionId = harnessRunContextStorage.getStore()?.sessionId;
+      const activeRunContext = harnessRunContextStorage.getStore();
+      const integritySessionId = activeRunContext?.sessionId;
       // Gate as a send when the tool is send-kind (audit #1) OR its args describe
       // a network mutation (audit #6 — kernel exec_command/browser_curl etc.).
       const argMutation = detectMcpArgsNetworkMutation(args);
@@ -1001,6 +1002,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       }
 
       const finish = beginToolEvent({
+        sessionId: integritySessionId,
         toolName,
         kind: decision.kind,
         approvalReason: decision.reason,

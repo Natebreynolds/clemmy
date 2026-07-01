@@ -741,6 +741,7 @@ export function classifyBackgroundTaskOutcome(
   task: Pick<BackgroundTaskRecord, 'runSessionId'>,
   finalText: string,
   stoppedReason?: RunStoppedReason,
+  opts: { ignoreFanoutCoverage?: boolean } = {},
 ): { outcome: 'done' | 'blocked'; reason?: string } {
   // 1) Structured signal: did the worker explicitly mark an execution
   //    blocked in its own session? This is the strongest signal — it's
@@ -796,8 +797,10 @@ export function classifyBackgroundTaskOutcome(
   // 4) FIX 7 — fan-out coverage: if this run fanned out workers and any item
   //    FAILED (worker returned ERROR:), report partial coverage honestly
   //    instead of a hollow "done". Flag-gated (CLEMMY_FANOUT_LEDGER).
-  const coverageBlock = fanoutCoverageBlock(task.runSessionId);
-  if (coverageBlock) return coverageBlock;
+  if (!opts.ignoreFanoutCoverage) {
+    const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+    if (coverageBlock) return coverageBlock;
+  }
 
   return { outcome: 'done' };
 }
@@ -807,18 +810,20 @@ async function verifyBackgroundTaskDelivery(
   finalText: string,
   stoppedReason?: RunStoppedReason,
 ): Promise<{ outcome: 'done' | 'blocked'; reason?: string }> {
-  const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason);
+  const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
   if (classified.outcome === 'blocked') return classified;
 
+  const coverageBlock = fanoutCoverageBlock(task.runSessionId);
   try {
     const verdict = await verifyDelivered(task.prompt || task.title, finalText, {
       stoppedReason,
       ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
     });
     if (!verdict.delivered) {
-      return { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
+      return coverageBlock ?? { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
     }
   } catch {
+    if (coverageBlock) return coverageBlock;
     return { outcome: 'done' };
   }
 
@@ -1087,14 +1092,6 @@ async function finishWorkerRun(
       outputPreview: response.text,
     });
     logger.warn({ taskId: task.id, reason }, 'Background task paused awaiting continue (not done)');
-    return;
-  }
-  const coverageBlock = fanoutCoverageBlock(task.runSessionId);
-  if (coverageBlock) {
-    markBackgroundTaskBlocked(task.id, coverageBlock.reason, response.text);
-    finishRun(run.id, { status: 'failed', message: `Background task ${task.id} ${coverageBlock.reason}`, outputPreview: response.text });
-    clearLedger(task.runSessionId);
-    logger.warn({ taskId: task.id, reason: coverageBlock.reason }, 'Background task partial fan-out coverage (blocked, not done)');
     return;
   }
   const outcome = await verifyBackgroundTaskDelivery(task, response.text, response.stoppedReason);
