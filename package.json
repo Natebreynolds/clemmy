@@ -80,7 +80,12 @@
     "smoke:all": "bash scripts/smoke-all.sh",
     "eval:jobs": "tsx scripts/eval-jobs.ts",
     "job:capture": "tsx scripts/capture-job-fixture.ts",
-    "measure:judge-calibration": "tsx scripts/measure-judge-calibration.ts"
+    "measure:judge-calibration": "tsx scripts/measure-judge-calibration.ts",
+    "proof": "tsx scripts/proof/run-proof.ts",
+    "proof:claude": "tsx scripts/proof/run-proof.ts --brain claude",
+    "proof:codex": "tsx scripts/proof/run-proof.ts --brain codex",
+    "proof:glm": "tsx scripts/proof/run-proof.ts --brain glm",
+    "proof:selftest": "tsx --test scripts/proof/score.test.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.82",
