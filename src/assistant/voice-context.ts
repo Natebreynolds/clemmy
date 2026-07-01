@@ -4,6 +4,8 @@ import { listActiveGoalSummaries } from '../memory/goals-list.js';
 import { loadSessionBrief, renderSessionContinuity } from '../memory/session-briefs.js';
 import { loadMemoryContext } from '../memory/vault.js';
 import { loadWorkingMemoryForSession } from '../memory/working-memory.js';
+import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
+import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 
 function section(title: string, body?: string, maxChars = 1800): string {
@@ -22,10 +24,34 @@ function buildVoiceGoalsContext(): string {
   }).join('\n');
 }
 
+function buildVoiceSessionContinuity(sessionId: string): string {
+  const sessionBrief = loadSessionBrief(sessionId);
+  const briefText = sessionBrief ? renderSessionContinuity(sessionBrief) : '';
+  let harnessHistory = '';
+  try {
+    if (getHarnessSession(sessionId)) {
+      harnessHistory = renderSessionHistoryForModel(sessionId, 8, 1800);
+    }
+  } catch {
+    harnessHistory = '';
+  }
+  if (briefText || harnessHistory) {
+    return [
+      briefText,
+      harnessHistory ? `Canonical harness history:\n${harnessHistory}` : '',
+    ].filter(Boolean).join('\n\n');
+  }
+  try {
+    return renderSessionHistoryForModel(sessionId, 8, 1800);
+  } catch {
+    return '';
+  }
+}
+
 export function buildRealtimeVoiceInstructions(sessionId = 'console:home'): string {
   const owner = OWNER_NAME || 'the user';
   const baseContext = loadMemoryContext();
-  const sessionBrief = loadSessionBrief(sessionId);
+  const sessionContinuity = buildVoiceSessionContinuity(sessionId);
   const sessionWorkingMemory = loadWorkingMemoryForSession(sessionId) ?? baseContext.workingMemory;
   const profile = renderProfileForInstructions();
   const facts = renderFactsForInstructions(8);
@@ -44,7 +70,7 @@ export function buildRealtimeVoiceInstructions(sessionId = 'console:home'): stri
     'Do not claim local work has been completed unless send_to_clementine returns that result. If approval is required, tell the user to approve it in Clementine.',
     section('User Preferences', profile, 1600),
     section('Persistent Facts', facts, 1400),
-    section('Session Continuity', sessionBrief ? renderSessionContinuity(sessionBrief) : '', 1800),
+    section('Session Continuity', sessionContinuity, 1800),
     section('Working Memory', sessionWorkingMemory, 1800),
     section('Identity', baseContext.identity, 1400),
     section('Core Personality', baseContext.soul, 1600),

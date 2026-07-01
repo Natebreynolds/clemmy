@@ -1,0 +1,251 @@
+/**
+ * Run: npx tsx --test src/channels/discord-harness-background.test.ts
+ *
+ * Focused parity coverage for Discord/Slack background handoff replies. These
+ * tests keep their own CLEMENTINE_HOME so they never touch local daemon state.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-discord-bg-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+
+const { __test__ } = await import('./discord-harness.js');
+const {
+  createBackgroundTask,
+  getBackgroundTask,
+  markBackgroundTaskAwaitingContinue,
+  markBackgroundTaskAwaitingInput,
+} = await import('../execution/background-tasks.js');
+const { createSession } = await import('../runtime/harness/eventlog.js');
+
+test.after(() => {
+  rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+function transport() {
+  const sent: string[] = [];
+  return {
+    sent,
+    api: {
+      async sendInitial(content: string) {
+        sent.push(content);
+        return { async edit() { /* no-op */ } };
+      },
+      async sendError(content: string) {
+        sent.push(`error:${content}`);
+      },
+    },
+  };
+}
+
+test('Discord/Slack parked background question captures the next freeform reply', async () => {
+  const origin = createSession({ kind: 'chat', channel: 'discord' });
+  const task = createBackgroundTask({
+    title: 'Segment prospects',
+    prompt: 'finish the prospect segment',
+    originSessionId: origin.id,
+    channel: 'discord:chan-a',
+    source: 'discord',
+  });
+  markBackgroundTaskAwaitingInput(task.id, 'q-bg-discord', 'Which segment should I use?');
+
+  const tx = transport();
+  const handled = await __test__.maybeRouteParkedBackgroundReply({
+    sessionId: origin.id,
+    message: 'healthcare only',
+    transport: tx.api,
+  });
+
+  assert.equal(handled, true);
+  const stored = getBackgroundTask(task.id);
+  assert.equal(stored?.status, 'pending');
+  assert.equal(stored?.inputResolution?.answer, 'healthcare only');
+  assert.match(tx.sent[0], /passed that to your background task "Segment prospects"/);
+});
+
+test('Discord/Slack continue resumes one parked background continuation', async () => {
+  const origin = createSession({ kind: 'chat', channel: 'slack' });
+  const task = createBackgroundTask({
+    title: 'Long report',
+    prompt: 'continue the report',
+    originSessionId: origin.id,
+    channel: 'slack:chan-a',
+    source: 'slack',
+  });
+  markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial work');
+
+  const tx = transport();
+  const handled = await __test__.maybeRouteParkedBackgroundReply({
+    sessionId: origin.id,
+    message: 'continue',
+    transport: tx.api,
+  });
+
+  assert.equal(handled, true);
+  const stored = getBackgroundTask(task.id);
+  assert.equal(stored?.status, 'pending');
+  assert.ok(stored?.continueResolution, 'continue request should be queued');
+  assert.match(tx.sent[0], /Continuing background task "Long report"/);
+});
+
+test('stale Discord channel mapping still captures one parked background question by exact channel', async () => {
+  const origin = createSession({ kind: 'chat', channel: 'discord' });
+  const task = createBackgroundTask({
+    title: 'Stale channel question',
+    prompt: 'finish the stale channel task',
+    originSessionId: origin.id,
+    channel: 'discord:chan-stale-question',
+    source: 'discord',
+  });
+  markBackgroundTaskAwaitingInput(task.id, 'q-bg-stale-channel', 'Which market?');
+
+  const tx = transport();
+  const handled = await __test__.maybeRouteParkedBackgroundReply({
+    channelLabel: 'discord:chan-stale-question',
+    channelId: 'chan-stale-question',
+    channel: 'discord',
+    message: 'Birmingham',
+    transport: tx.api,
+  });
+
+  assert.equal(handled, true);
+  const stored = getBackgroundTask(task.id);
+  assert.equal(stored?.status, 'pending');
+  assert.equal(stored?.inputResolution?.answer, 'Birmingham');
+  assert.match(tx.sent[0], /passed that to your background task "Stale channel question"/);
+});
+
+test('stale Slack channel mapping still resumes one parked background continuation', async () => {
+  const origin = createSession({ kind: 'chat', channel: 'slack' });
+  const task = createBackgroundTask({
+    title: 'Stale Slack continue',
+    prompt: 'finish the Slack report',
+    originSessionId: origin.id,
+    channel: 'slack:chan-stale-continue',
+    source: 'slack',
+  });
+  markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial work');
+
+  const tx = transport();
+  const handled = await __test__.maybeRouteParkedBackgroundReply({
+    channelLabel: 'slack:chan-stale-continue',
+    channelId: 'chan-stale-continue',
+    channel: 'slack',
+    message: 'continue',
+    transport: tx.api,
+  });
+
+  assert.equal(handled, true);
+  const stored = getBackgroundTask(task.id);
+  assert.equal(stored?.status, 'pending');
+  assert.ok(stored?.continueResolution, 'continue request should be queued');
+  assert.match(tx.sent[0], /Continuing background task "Stale Slack continue"/);
+});
+
+test('stale channel fallback uses origin session metadata for tasks without stored channel', async () => {
+  const origin = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    metadata: { source: 'discord', channelId: 'chan-meta-fallback' },
+  });
+  const task = createBackgroundTask({
+    title: 'Metadata fallback question',
+    prompt: 'finish metadata fallback task',
+    originSessionId: origin.id,
+    source: 'desktop',
+  });
+  markBackgroundTaskAwaitingInput(task.id, 'q-bg-metadata-fallback', 'Which city?');
+
+  const tx = transport();
+  const handled = await __test__.maybeRouteParkedBackgroundReply({
+    channelLabel: 'discord:chan-meta-fallback',
+    channelId: 'chan-meta-fallback',
+    channel: 'discord',
+    message: 'Austin',
+    transport: tx.api,
+  });
+
+  assert.equal(handled, true);
+  const stored = getBackgroundTask(task.id);
+  assert.equal(stored?.status, 'pending');
+  assert.equal(stored?.inputResolution?.answer, 'Austin');
+  assert.match(tx.sent[0], /passed that to your background task "Metadata fallback question"/);
+});
+
+test('stale channel fallback does not cross-match discordChannelId across surfaces', async () => {
+  const origin = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    metadata: { source: 'discord', discordChannelId: 'shared-raw-id' },
+  });
+  const task = createBackgroundTask({
+    title: 'Discord-only question',
+    prompt: 'finish the Discord task',
+    originSessionId: origin.id,
+    source: 'desktop',
+  });
+  markBackgroundTaskAwaitingInput(task.id, 'q-bg-cross-surface', 'Which segment?');
+
+  const tx = transport();
+  const handled = await __test__.maybeRouteParkedBackgroundReply({
+    channelLabel: 'slack:shared-raw-id',
+    channelId: 'shared-raw-id',
+    channel: 'slack',
+    message: 'healthcare',
+    transport: tx.api,
+  });
+
+  assert.equal(handled, false);
+  assert.equal(tx.sent.length, 0);
+  assert.equal(getBackgroundTask(task.id)?.status, 'awaiting_input');
+});
+
+test('session rehydration does not cross-match discordChannelId across surfaces', async () => {
+  const discord = createSession({
+    kind: 'chat',
+    channel: 'discord',
+    metadata: { source: 'discord', discordChannelId: 'shared-session-id' },
+  });
+  assert.equal(__test__.findMostRecentChannelSession('shared-session-id', 'slack'), null);
+  assert.equal(__test__.findMostRecentChannelSession('shared-session-id', 'discord')?.sessionId, discord.id);
+});
+
+test('stale channel fallback refuses ambiguous parked background questions', async () => {
+  const first = createSession({ kind: 'chat', channel: 'discord' });
+  const second = createSession({ kind: 'chat', channel: 'discord' });
+  const taskA = createBackgroundTask({
+    title: 'Ambiguous A',
+    prompt: 'first ambiguous task',
+    originSessionId: first.id,
+    channel: 'discord:chan-ambiguous',
+    source: 'discord',
+  });
+  const taskB = createBackgroundTask({
+    title: 'Ambiguous B',
+    prompt: 'second ambiguous task',
+    originSessionId: second.id,
+    channel: 'discord:chan-ambiguous',
+    source: 'discord',
+  });
+  markBackgroundTaskAwaitingInput(taskA.id, 'q-bg-ambiguous-a', 'First question?');
+  markBackgroundTaskAwaitingInput(taskB.id, 'q-bg-ambiguous-b', 'Second question?');
+
+  const tx = transport();
+  const handled = await __test__.maybeRouteParkedBackgroundReply({
+    channelLabel: 'discord:chan-ambiguous',
+    channelId: 'chan-ambiguous',
+    channel: 'discord',
+    message: 'use healthcare',
+    transport: tx.api,
+  });
+
+  assert.equal(handled, false);
+  assert.equal(tx.sent.length, 0);
+  assert.equal(getBackgroundTask(taskA.id)?.status, 'awaiting_input');
+  assert.equal(getBackgroundTask(taskB.id)?.status, 'awaiting_input');
+});

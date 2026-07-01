@@ -5,6 +5,8 @@ import { BASE_DIR } from '../config.js';
 import { ExecutionStore, renderExecutionSummary } from '../execution/store.js';
 import { PlanStore } from '../planning/plan-store.js';
 import type { SessionAutoBrief, SessionBriefRecord, SessionManualHandoff, SessionRecord } from '../types.js';
+import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
+import { pullRecentTurnsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 
 const SESSION_BRIEFS_DIR = path.join(BASE_DIR, 'state', 'session-briefs');
 
@@ -134,6 +136,30 @@ function buildAutoBrief(session: SessionRecord, manual?: SessionManualHandoff): 
   };
 }
 
+function canonicalSessionForBrief(session: SessionRecord): SessionRecord {
+  try {
+    const row = getHarnessSession(session.id);
+    if (!row) return session;
+    const turns = pullRecentTurnsForHarnessHistory(session.id, 20).map((turn) => ({
+      role: turn.who === 'user' ? 'user' as const : 'assistant' as const,
+      text: turn.text,
+      createdAt: turn.at,
+    }));
+    if (turns.length === 0) return session;
+    return {
+      ...session,
+      userId: row.userId ?? session.userId,
+      channel: row.channel ?? session.channel,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      title: row.title ?? row.objective ?? session.title,
+      turns,
+    };
+  } catch {
+    return session;
+  }
+}
+
 export function loadSessionBrief(sessionId: string): SessionBriefRecord | null {
   ensureSessionBriefsDir();
   const filePath = briefPathForSession(sessionId);
@@ -152,14 +178,15 @@ function saveSessionBrief(brief: SessionBriefRecord): void {
 }
 
 export function refreshSessionBrief(session: SessionRecord): SessionBriefRecord {
+  const canonicalSession = canonicalSessionForBrief(session);
   const existing = loadSessionBrief(session.id);
   const brief: SessionBriefRecord = {
-    sessionId: session.id,
-    userId: session.userId,
-    channel: session.channel,
-    createdAt: existing?.createdAt ?? session.createdAt,
-    updatedAt: session.updatedAt,
-    auto: buildAutoBrief(session, existing?.manual),
+    sessionId: canonicalSession.id,
+    userId: canonicalSession.userId,
+    channel: canonicalSession.channel,
+    createdAt: existing?.createdAt ?? canonicalSession.createdAt,
+    updatedAt: canonicalSession.updatedAt,
+    auto: buildAutoBrief(canonicalSession, existing?.manual),
     manual: existing?.manual,
   };
   saveSessionBrief(brief);
@@ -183,13 +210,14 @@ export function saveSessionManualHandoff(input: {
     context: cleanText(input.context ?? '', 1200),
   };
 
+  const canonicalSession = canonicalSessionForBrief(input.session);
   const brief: SessionBriefRecord = {
-    sessionId: input.session.id,
-    userId: input.session.userId,
-    channel: input.session.channel,
-    createdAt: loadSessionBrief(input.session.id)?.createdAt ?? input.session.createdAt,
-    updatedAt: input.session.updatedAt,
-    auto: buildAutoBrief(input.session, manual),
+    sessionId: canonicalSession.id,
+    userId: canonicalSession.userId,
+    channel: canonicalSession.channel,
+    createdAt: loadSessionBrief(canonicalSession.id)?.createdAt ?? canonicalSession.createdAt,
+    updatedAt: canonicalSession.updatedAt,
+    auto: buildAutoBrief(canonicalSession, manual),
     manual,
   };
   saveSessionBrief(brief);

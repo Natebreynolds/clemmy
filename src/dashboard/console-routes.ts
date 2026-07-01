@@ -216,11 +216,13 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain } from '../runtime/harness/claude-agent-brain.js';
 import { runPlanFirstPreflight, shouldUsePlanFirst } from '../runtime/harness/plan-first.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
@@ -714,6 +716,27 @@ function isHarnessSessionCurrentlyWorking(session: HarnessSessionRow, activeWind
   const latest = listHarnessEvents(session.id, { limit: 1, desc: true })[0];
   if (!latest) return false;
   return !isHarnessTerminalEvent(latest.type);
+}
+
+const ACTIVE_WORK_SESSION_PAGE_SIZE = 500;
+
+function listVisibleActiveWorkHarnessSessions(pendingSessionIds: Set<string>): HarnessSessionRow[] {
+  const out: HarnessSessionRow[] = [];
+  for (let offset = 0; ; offset += ACTIVE_WORK_SESSION_PAGE_SIZE) {
+    const page = listHarnessSessions({
+      kind: ['workflow', 'execution', 'agent'],
+      status: ['active', 'paused'],
+      limit: ACTIVE_WORK_SESSION_PAGE_SIZE,
+      offset,
+    });
+    for (const session of page) {
+      if (!isIgnorableActiveWorkSession(session, { pendingSessionIds })) {
+        out.push(session);
+      }
+    }
+    if (page.length < ACTIVE_WORK_SESSION_PAGE_SIZE) break;
+  }
+  return out;
 }
 
 function actionEventTime(event: ActionEvent): string {
@@ -4101,12 +4124,9 @@ export function registerConsoleRoutes(
   app.get('/api/console/active-work', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const activeNonChatSessions = listHarnessSessions({
-        kind: ['workflow', 'execution', 'agent'],
-        status: ['active', 'paused'],
-        limit: 100,
-      });
       const pendingApprovals = approvalRegistry.listPending({ status: 'pending' });
+      const sessionsWithPendingApprovals = new Set(pendingApprovals.map((approval) => approval.sessionId));
+      const activeNonChatSessions = listVisibleActiveWorkHarnessSessions(sessionsWithPendingApprovals);
       const activeBackgroundTasks = listBackgroundTasks().filter(
         (task) => task.status === 'running' || task.status === 'pending' || task.status === 'awaiting_approval',
       );
@@ -6105,6 +6125,16 @@ export function registerConsoleRoutes(
             error: task.error,
             resultPreview: task.result?.slice(0, 600),
             source: task.source,
+            modelRoute: task.effectiveModel || task.modelProvider || task.modelRouteKind || task.modelTransport || task.modelRouteFalloverFrom
+              ? {
+                  requestedModel: task.requestedModel,
+                  effectiveModel: task.effectiveModel,
+                  provider: task.modelProvider,
+                  routeKind: task.modelRouteKind,
+                  transport: task.modelTransport,
+                  falloverFrom: task.modelRouteFalloverFrom,
+                }
+              : undefined,
           },
         });
       }
@@ -8796,6 +8826,7 @@ export function registerConsoleRoutes(
         shouldCancel: () => closed,
       };
       const response = await respondPreferHarness('home', streamReq, (req) => assistant.respond(req));
+      const route = routeDiagnosticsFromResponse(response);
       writeEvent({
         type: 'done',
         sessionId,
@@ -8805,6 +8836,7 @@ export function registerConsoleRoutes(
         // right affordance ([Continue] for max-turns-with-grace, etc.).
         stoppedReason: response.stoppedReason ?? 'success',
         turnsUsed: response.turnsUsed ?? null,
+        route: route ?? null,
       });
       res.end();
     } catch (err) {

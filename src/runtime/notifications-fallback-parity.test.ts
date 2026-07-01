@@ -48,3 +48,13 @@ test('an explicit Discord destination suppresses BOTH fallbacks (no duplicate Sl
   assert.ok(dests.some((d) => d.type === 'discord_channel'), 'derived Discord channel present');
   assert.ok(!ids.some((id) => id.startsWith('fallback-')), 'no fallback fires when a real destination routed it');
 });
+
+test('an explicit Slack thread destination preserves thread identity and suppresses fallbacks', () => {
+  const dests = getNotificationDestinationsForRecord(
+    record({ slackChannelId: 'C_SLACK', slackThreadTs: '1700000000.000100' }),
+  );
+  const slack = dests.find((d) => d.type === 'slack_channel');
+  assert.equal(slack?.channelId, 'C_SLACK');
+  assert.equal(slack?.threadTs, '1700000000.000100');
+  assert.ok(!dests.some((d) => d.id.startsWith('fallback-')), 'no fallback fires when the Slack thread routed it');
+});

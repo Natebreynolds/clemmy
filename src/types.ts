@@ -227,8 +227,22 @@ export interface AssistantResponse {
   stoppedReason?: RunStoppedReason;
   /** Number of model→tool→model turns the run actually used. */
   turnsUsed?: number;
+  /** Best-effort non-secret model route diagnostics for async/background
+   *  observability. This must never drive control flow. */
+  route?: AssistantRouteDiagnostics;
   /** Runtime-specific diagnostics for smoke tests and advanced callers. */
   raw?: unknown;
+}
+
+export interface AssistantRouteDiagnostics {
+  routeKind: 'harness' | 'claude_agent_sdk_brain' | 'claude_agent_sdk_workflow_step' | 'legacy';
+  surface?: string;
+  requestedModel?: string;
+  effectiveModel?: string;
+  provider?: string;
+  transport?: string;
+  mode?: string;
+  falloverFrom?: string;
 }
 
 export interface RuntimeContextValue {

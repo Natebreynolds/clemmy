@@ -18,7 +18,12 @@ process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
 const { ClementineGateway } = await import('./router.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { getRun } = await import('../runtime/run-events.js');
-const { getBackgroundTask } = await import('../execution/background-tasks.js');
+const {
+  createBackgroundTask,
+  getBackgroundTask,
+  markBackgroundTaskAwaitingContinue,
+  markBackgroundTaskAwaitingInput,
+} = await import('../execution/background-tasks.js');
 
 afterEach(() => {
   resetEventLog();
@@ -95,6 +100,87 @@ test('bare continue without a limit completion remains a normal user message', a
   assert.equal(capturedMessage, 'continue');
 });
 
+test('gateway routes parked background question replies before any model run', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Mobile background question' });
+  const task = createBackgroundTask({
+    title: 'Segment prospects',
+    prompt: 'finish segmenting prospects',
+    originSessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+  });
+  markBackgroundTaskAwaitingInput(task.id, 'q-gateway-bg', 'Which segment?');
+
+  let respondCalled = false;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => {
+      respondCalled = true;
+      return { text: 'foreground', sessionId: req.sessionId };
+    },
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'healthcare only',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+  });
+
+  assert.equal(respondCalled, false);
+  assert.equal(response.handledControl, true);
+  assert.equal(response.queuedTaskId, task.id);
+  assert.match(response.text, /passed that to your background task "Segment prospects"/);
+  const stored = getBackgroundTask(task.id);
+  assert.equal(stored?.status, 'pending');
+  assert.equal(stored?.inputResolution?.answer, 'healthcare only');
+});
+
+test('gateway bare continue prioritizes a parked background continuation', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Mobile background continue' });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      reason: 'awaiting_continue',
+      lastDecisionSummary: 'Harness foreground continuation should not win.',
+      reply: 'Reply `continue` to keep going.',
+    },
+  });
+  const task = createBackgroundTask({
+    title: 'Long report',
+    prompt: 'continue the report',
+    originSessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+  });
+  markBackgroundTaskAwaitingContinue(task.id, 'turn budget', 'partial work');
+
+  let respondCalled = false;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => {
+      respondCalled = true;
+      return { text: 'foreground', sessionId: req.sessionId };
+    },
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'continue',
+    sessionId: session.id,
+    channel: 'mobile',
+    source: 'mobile',
+  });
+
+  assert.equal(respondCalled, false);
+  assert.equal(response.handledControl, true);
+  assert.equal(response.queuedTaskId, task.id);
+  assert.match(response.text, /Continuing background task "Long report"/);
+  const stored = getBackgroundTask(task.id);
+  assert.equal(stored?.status, 'pending');
+  assert.ok(stored?.continueResolution, 'continue request should be queued on the background task');
+});
+
 test('gateway auto-promotes broad multi-system data pipelines to background', async () => {
   const session = createSession({ kind: 'chat', channel: 'mobile', title: 'CRM enrichment' });
   let respondCalled = false;
@@ -145,4 +231,31 @@ test('gateway records max-turns-with-grace as a non-completed run', async () => 
   const run = getRun('run-gateway-limit');
   assert.equal(run?.status, 'failed');
   assert.match(run?.error ?? '', /continue|budget/i);
+});
+
+test('gateway returns and records model route diagnostics', async () => {
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => ({
+      text: 'Done. Route diagnostic recorded.',
+      sessionId: req.sessionId,
+    }),
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'record the route diagnostic',
+    sessionId: 'sess-gateway-route',
+    channel: 'mobile',
+    source: 'mobile',
+    model: 'claude-sonnet-5',
+    runId: 'run-gateway-route',
+  });
+
+  assert.equal(response.route?.routeKind, 'legacy');
+  assert.equal(response.route?.surface, 'webhook');
+  assert.equal(response.route?.requestedModel, 'claude-sonnet-5');
+
+  const run = getRun('run-gateway-route');
+  const routeEvent = run?.events.find((event) => event.message.startsWith('Model route:'));
+  assert.equal(routeEvent?.data?.routeKind, 'legacy');
+  assert.equal(routeEvent?.data?.requestedModel, 'claude-sonnet-5');
 });

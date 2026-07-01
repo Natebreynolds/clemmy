@@ -106,6 +106,26 @@ test('Move 1: the SDK brain ARMS the in-flight marker during the run and CLEARS 
   assert.equal(HarnessSession.load('brain-marker')?.runInFlightSince(), null, 'marker CLEARED after completion');
 });
 
+test('Claude SDK brain creates background sessions as execution sessions, not chat sessions', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'background result',
+    sessionId: 'sdk',
+    model: 'm',
+    toolUses: [],
+  }));
+
+  await respondViaClaudeAgentSdkBrain('background', {
+    message: 'run this in the background',
+    sessionId: 'brain-background-kind',
+  });
+
+  const session = getSession('brain-background-kind');
+  assert.equal(session?.kind, 'execution');
+  assert.equal(session?.metadata.source, 'claude-agent-sdk-brain:background');
+});
+
 test('SDK brain auto-captures explicit remember turns even when the model skips memory_remember', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
@@ -275,6 +295,29 @@ test('Claude brain carries same-session external-write ledger in the volatile tu
   assert.match(ctx, /OUTLOOK_SEND_EMAIL/);
   assert.match(ctx, /casey@example\.com/);
   assert.equal(ctx.match(/ALREADY DONE in THIS conversation/g)?.length, 1);
+});
+
+test('Claude brain volatile turn context includes cross-session continuation prefix', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  createSession({ id: 'brain-prefix-split', kind: 'chat', channel: 'discord', title: 'fresh split' });
+  appendEvent({
+    sessionId: 'brain-prefix-split',
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: {
+      text: [
+        '[CONTINUATION CONTEXT]',
+        '  USER: Work from the approved client sheet.',
+        '  YOU: I found the correct sheet id.',
+      ].join('\n'),
+    },
+  });
+
+  const ctx = await renderClaudeAgentBrainTurnContext({ message: 'continue', sessionId: 'brain-prefix-split' });
+
+  assert.match(ctx, /\[CONTINUATION CONTEXT\]/);
+  assert.match(ctx, /approved client sheet/);
 });
 
 test('Claude brain carries same-session external-write ledger in system append when context split is off', () => {
@@ -948,6 +991,39 @@ test('frameTrustedMemory labels non-empty memory as trusted, passes empty throug
   // Empty / whitespace memory ⇒ no framing block (nothing to frame).
   assert.equal(frameTrustedMemory(''), '');
   assert.equal(frameTrustedMemory('   \n  '), '');
+});
+
+test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-input and skips continuations', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  let runCalls = 0;
+  let judgeCalls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    runCalls += 1;
+    return {
+      text: 'Which environment should I use?',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__ask_user_question'],
+      stoppedReason: 'awaiting-input',
+    };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judgeCalls += 1;
+    throw new Error('judge should not run while awaiting user input');
+  });
+
+  const res = await respondViaClaudeAgentSdkBrain('background', {
+    message: 'deploy it',
+    sessionId: 'brain-ask-awaiting',
+  });
+
+  assert.equal(runCalls, 1, 'must not run a corrective continuation after a real ask');
+  assert.equal(judgeCalls, 0, 'completion judge must not convert a pause into more work');
+  assert.equal(res.stoppedReason, 'awaiting-input');
+  assert.match(res.text, /Which environment/);
+  const completions = listEvents('brain-ask-awaiting', { types: ['conversation_completed'] });
+  assert.equal(completions.at(-1)?.data.reason, 'awaiting_user_input');
 });
 
 test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local authoring tools but not broad execution', async () => {

@@ -19,8 +19,11 @@ import assert from 'node:assert/strict';
 
 const {
   checkpointWorkingMemory,
+  refreshWorkingMemory,
   workingMemoryPathForSession,
 } = await import('./working-memory.js');
+const { SessionStore } = await import('./session-store.js');
+const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
 test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
 
@@ -54,6 +57,38 @@ test('checkpointWorkingMemory replaces the section (no duplication) and preserve
 test('checkpointWorkingMemory is best-effort and never throws', () => {
   assert.doesNotThrow(() => checkpointWorkingMemory('', {}));
   assert.doesNotThrow(() => checkpointWorkingMemory('sess-wm-3', { lastText: undefined, toolCallsTotal: undefined, turn: undefined }));
+});
+
+test('refreshWorkingMemory prefers canonical harness turns over same-id legacy ghost', () => {
+  resetEventLog();
+  const sessionId = 'sess-wm-harness-canonical';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Harness canonical working memory' });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Use working memory source WM-HARNESS-515.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reply: 'WM-HARNESS-515 is now the accepted source.' },
+  });
+  const ghost = new SessionStore().appendTurn(sessionId, {
+    role: 'user',
+    text: '[background task wm-ghost completed] synthetic report-back only',
+    createdAt: new Date().toISOString(),
+  }, 'user-wm', 'desktop');
+
+  refreshWorkingMemory(ghost);
+
+  const content = readFileSync(workingMemoryPathForSession(sessionId), 'utf-8');
+  assert.match(content, /WM-HARNESS-515/);
+  assert.match(content, /Use working memory source/);
+  assert.doesNotMatch(content, /wm-ghost/);
 });
 
 // (Active Task pin tests removed — the mechanism was deleted in goal-contract

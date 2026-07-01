@@ -7,6 +7,8 @@ import { loadSessionBrief } from './session-briefs.js';
 import type { SessionRecord } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { isUserFacingSession } from '../execution/scope.js';
+import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
+import { pullRecentTurnsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 
 const SESSION_WORKING_MEMORY_DIR = path.join(path.dirname(WORKING_MEMORY_FILE), 'state', 'working-memory');
 
@@ -30,6 +32,19 @@ export function loadWorkingMemoryForSession(sessionId: string, maxChars = 3000):
 }
 
 function buildSessionSummary(session: SessionRecord): string {
+  try {
+    if (getHarnessSession(session.id)) {
+      const turns = pullRecentTurnsForHarnessHistory(session.id, 3);
+      if (turns.length > 0) {
+        return turns
+          .slice(-6)
+          .map((turn) => `${turn.who === 'user' ? 'User' : 'Assistant'}: ${turn.text.replace(/\s+/g, ' ').slice(0, 180)}`)
+          .join('\n');
+      }
+    }
+  } catch {
+    // Fall back to the supplied legacy session below.
+  }
   const turns = session.turns.slice(-6);
   if (turns.length === 0) {
     return 'No recent conversation.';

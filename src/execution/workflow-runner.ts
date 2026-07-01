@@ -51,6 +51,7 @@ import {
   type RunConversationResult,
 } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { normalizeRouteDiagnostics, routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { countDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
@@ -96,6 +97,8 @@ import {
   claudeAgentSdkWorkflowStepEnabled,
   runClaudeAgentSdkWorkflowStep,
 } from '../runtime/harness/claude-agent-workflow-step.js';
+import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
+import type { AssistantRouteDiagnostics } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
@@ -344,6 +347,10 @@ interface QueuedRunRecord {
    * for ALL runs regardless).
    */
   originSessionId?: string;
+  /** Additional chats that asked for the same queued/running work via duplicate
+   *  queue detection. Report-backs fan out to each unique origin while execution
+   *  lineage remains anchored to the primary originSessionId. */
+  originSessionIds?: string[];
   stepOutputs?: Record<string, unknown>;
   output?: string;
   error?: string;
@@ -409,6 +416,27 @@ interface QueuedRunRecord {
    * the result never dies silently.
    */
   notifiedAt?: string;
+}
+
+function workflowRunOriginSessionIds(run: Pick<QueuedRunRecord, 'originSessionId' | 'originSessionIds'>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed && !seen.has(trimmed)) {
+        seen.add(trimmed);
+        out.push(trimmed);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) add(item);
+    }
+  };
+  add(run.originSessionId);
+  add(run.originSessionIds);
+  return out;
 }
 
 interface ParkedStepRef {
@@ -929,12 +957,35 @@ interface StepExecutionContext {
   // Procedural recall from prior clean workflow runs. Injected as a short
   // advisory into LLM steps only; deterministic helpers stay byte-identical.
   learnedPatternHint?: string;
+  // Chat/session that queued this workflow. When present, model-run steps receive
+  // a small authoritative lineage block so a different model/backend can preserve
+  // the user's decisions and avoid repeating prior external writes.
+  originSessionId?: string;
 }
 
 function applyWorkflowPatternHint(ctx: Pick<StepExecutionContext, 'learnedPatternHint'>, prompt: string): string {
   const hint = ctx.learnedPatternHint?.trim();
   if (!hint) return prompt;
   return `${prompt}\n\n${hint}`;
+}
+
+export function renderWorkflowOriginLineageBlock(originSessionId: string | undefined): string {
+  if (!originSessionId) return '';
+  let history = '';
+  try { history = renderSessionHistoryForModel(originSessionId, 6, 3_500); } catch { history = ''; }
+  return [
+    '=== ORIGIN SESSION LINEAGE (authoritative) ===',
+    `This workflow was started from session "${originSessionId}". Preserve the user's decisions, constraints, resource ids, and already-completed external actions from that session.`,
+    'Do not repeat completed external writes unless the user explicitly asked to do them again. If you need more context before acting, call session_history with the origin session id.',
+    history,
+    '=== END ORIGIN SESSION LINEAGE ===',
+  ].filter(Boolean).join('\n');
+}
+
+function applyWorkflowOriginLineage(ctx: Pick<StepExecutionContext, 'originSessionId'>, prompt: string): string {
+  const lineage = renderWorkflowOriginLineageBlock(ctx.originSessionId);
+  if (!lineage) return prompt;
+  return `${lineage}\n\n=== WORKFLOW STEP REQUEST ===\n${prompt}`;
 }
 
 /** A non-blocking quality heads-up attached to a COMPLETED run. The deliverable
@@ -1186,6 +1237,33 @@ interface HarnessStepResult {
    *  grounding the Codex/harness lane gets); used to scope Move 3's per-item
    *  grounding advisory so it never double-applies. */
   lane?: 'claude_sdk' | 'harness';
+  route?: AssistantRouteDiagnostics;
+}
+
+function workflowModelRouteMeta(route: AssistantRouteDiagnostics | undefined): Record<string, unknown> | undefined {
+  const normalized = normalizeRouteDiagnostics(route);
+  if (!normalized) return undefined;
+  return {
+    routeKind: normalized.routeKind,
+    requestedModel: normalized.requestedModel,
+    effectiveModel: normalized.effectiveModel,
+    provider: normalized.provider,
+    transport: normalized.transport,
+    mode: normalized.mode,
+    falloverFrom: normalized.falloverFrom,
+  };
+}
+
+function workflowHarnessRoute(step: WorkflowStepInput, stepModel: string | undefined): AssistantRouteDiagnostics {
+  const effectiveModel = stepModel ?? resolveRoleModel('brain').modelId;
+  return {
+    routeKind: 'harness',
+    surface: 'workflow',
+    requestedModel: step.model ?? stepModel,
+    effectiveModel,
+    provider: resolveProvider(effectiveModel),
+    transport: 'openai_agents_harness',
+  };
 }
 
 function workflowHarnessMetadataMatches(
@@ -1254,12 +1332,24 @@ function getWorkflowHarnessSession(
   });
 }
 
+function markWorkflowHarnessSessionTerminal(
+  session: HarnessSession,
+  status: Extract<import('../runtime/harness/eventlog.js').SessionStatus, 'completed' | 'failed'>,
+): void {
+  try {
+    if (!approvalRegistry.hasPending(session.id)) session.markStatus(status);
+  } catch {
+    // Session status is observability/recovery metadata; never mask step output.
+  }
+}
+
 export const workflowRunnerInternalsForTest = {
   findParkedWorkflowHarnessSession,
   getWorkflowHarnessSession,
   awaitDeclarativeStepApproval,
   bindStepContext,
   renderStepContextBlock,
+  renderWorkflowOriginLineageBlock,
   hasCompletedUpstreamMutation: (steps: WorkflowStepInput[], blockedStepId: string, completedStepIds: Set<string>) =>
     hasCompletedUpstreamMutation(steps, blockedStepId, completedStepIds),
   tryAutoHealAndRequeue,
@@ -1354,16 +1444,30 @@ async function runStepViaHarness(
     };
     if (stepModel && claudeAgentSdkWorkflowStepEnabled(stepModel) && workflowStepCanRunOnClaudeAgentSdk(step)) {
       const fullLane = workflowStepUsesFullClaudeLane(step);
-      const sdkResult = await runClaudeAgentSdkWorkflowStep({
-        step,
-        workflowName,
-        prompt: message,
-        modelId: stepModel,
-        // Run gated mutating tools on the step's REAL session so the workflow's
-        // plan-scope / auto-approval grants (opened by the runner) apply to the
-        // SDK lane's gated tools — required for unattended write/send steps.
-        sessionId: fullLane ? realSessionId : undefined,
-        fullLane,
+      let sdkResult;
+      try {
+        sdkResult = await runClaudeAgentSdkWorkflowStep({
+          step,
+          workflowName,
+          prompt: message,
+          modelId: stepModel,
+          // Run gated mutating tools on the step's REAL session so the workflow's
+          // plan-scope / auto-approval grants (opened by the runner) apply to the
+          // SDK lane's gated tools — required for unattended write/send steps.
+          sessionId: fullLane ? realSessionId : undefined,
+          fullLane,
+        });
+      } catch (err) {
+        markWorkflowHarnessSessionTerminal(session, 'failed');
+        throw err;
+      }
+      const route = normalizeRouteDiagnostics({
+        routeKind: 'claude_agent_sdk_workflow_step',
+        surface: 'workflow',
+        requestedModel: step.model ?? stepModel,
+        effectiveModel: sdkResult.model ?? stepModel,
+        provider: 'claude',
+        transport: 'claude_agent_sdk_workflow_step',
       });
       appendWorkerRoute({
         ...(modelRoute.trace ?? {
@@ -1382,6 +1486,7 @@ async function runStepViaHarness(
         sdkModel: sdkResult.model ?? null,
         toolUses: sdkResult.toolUses,
         structured: sdkResult.structured,
+        modelRoute: workflowModelRouteMeta(route),
       });
       // Phantom-completion guard (#2): a send/write step that called no real tool
       // didn't actually act — surface it as blocked instead of a silent success.
@@ -1393,6 +1498,7 @@ async function runStepViaHarness(
           reason: `Step "${step.id}" is a ${cls} step but completed without calling any tool — the ${cls === 'send' ? 'send' : 'write'} was not actually performed (it returned output instead of acting). Re-run the step or fix it to call its tool.`,
         };
       }
+      markWorkflowHarnessSessionTerminal(session, 'completed');
       return {
         output: sdkOutput,
         hadApprovals: false,
@@ -1400,9 +1506,11 @@ async function runStepViaHarness(
         usedStructuredResult: sdkResult.structured,
         sessionId: realSessionId,
         lane: 'claude_sdk',
+        route,
       };
     }
     if (modelRoute.trace) appendWorkerRoute(modelRoute.trace);
+    const route = workflowHarnessRoute(step, stepModel);
     const agent = useWorkflowStepAgent()
       ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools, model: stepModel })
       : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId, model: stepModel });
@@ -1561,14 +1669,14 @@ async function runStepViaHarness(
       );
     }
     if (captured.found) {
-      return { output: captured.value, hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId };
+      return { output: captured.value, hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
     }
     if (result.status !== 'completed') {
       throw new Error(
         `workflow step "${step.id}" did not complete (status: ${result.status}): ${describeStepNonCompletion(result.status, result.error)}`,
       );
     }
-    return { output: prose, hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId };
+    return { output: prose, hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
   } finally {
     // Belt + suspenders: clear the heartbeat gate in finally so a throw
     // mid-resume doesn't leave the heartbeat permanently suppressed
@@ -2655,13 +2763,17 @@ export async function executeStep(
             // when the step declares no `inputs`). `item` is in scope here.
             const itemContext = bindStepContext(step, ctx, item);
             const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
-            const prompt = applyWorkflowPatternHint(
+            const prompt = applyWorkflowOriginLineage(
               ctx,
-              applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent))),
+              applyWorkflowPatternHint(
+                ctx,
+                applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent))),
+              ),
             );
             let output: unknown;
             let itemSessionId = `workflow:${ctx.runId}:${step.id}:${key}`;
             let itemLane: HarnessStepResult['lane'];
+            let itemRoute: AssistantRouteDiagnostics | undefined;
             // W1b — run the item, retrying a TRANSIENT failure for THIS item only
             // (read items freely; write/send items NEVER re-run once they recorded
             // an external_write — the same double-act guard as crash-resume). Budget
@@ -2680,11 +2792,12 @@ export async function executeStep(
                 output = r.output;
                 itemSessionId = r.sessionId;
                 itemLane = r.lane;
+                itemRoute = r.route;
               } else {
                 // FORK collapse (staged): forEach item through the gated harness loop
                 // (default-OFF `workflow` surface → byte-identical to legacy until
                 // CLEMMY_HARNESS_WORKFLOW=on + a real workflow run validates chaining).
-                output = (await respondPreferHarness('workflow', {
+                const response = await respondPreferHarness('workflow', {
                   sessionId: `workflow:${ctx.runId}:${step.id}:${key}`,
                   channel: 'workflow',
                   message: `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\nItem: ${key}\n\n${prompt}`,
@@ -2695,7 +2808,9 @@ export async function executeStep(
                   // the codex-safe brain default.
                   model: resolveWorkflowStepModel(step).model ?? defaultForRole('brain'),
                   maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
-                }, (r) => ctx.assistant.respond(r))).text;
+                }, (r) => ctx.assistant.respond(r));
+                output = response.text;
+                itemRoute = routeDiagnosticsFromResponse(response);
               }
             };
             await runWithStepRetry(runItemOnce, {
@@ -2735,6 +2850,7 @@ export async function executeStep(
               stepId: step.id,
               itemKey: key,
               output,
+              meta: { modelRoute: workflowModelRouteMeta(itemRoute) },
             });
             bumpWorkflowRunItemProgress(ctx.runId, step.id, 'completed');
             return { itemKey: key, output, index: idx };
@@ -2812,9 +2928,10 @@ export async function executeStep(
     ctx,
     applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs))),
   );
-  const promptedWithPatterns = applyWorkflowPatternHint(ctx, prompt);
+  const promptedWithPatterns = applyWorkflowOriginLineage(ctx, applyWorkflowPatternHint(ctx, prompt));
   let output: unknown;
   let stepSessionId = `workflow:${ctx.runId}:${step.id}`;
+  let stepRoute: AssistantRouteDiagnostics | undefined;
   if (workflowHarnessEnabled(step)) {
     try {
       const result = await runStepViaHarness(
@@ -2829,6 +2946,7 @@ export async function executeStep(
       );
       output = result.output;
       stepSessionId = result.sessionId;
+      stepRoute = result.route;
       if (result.hadApprovals) {
         logger.info(
           { stepId: step.id, approvalIds: result.approvalIds, count: result.approvalIds.length },
@@ -2861,6 +2979,7 @@ export async function executeStep(
       maxWallClockMs: WORKFLOW_STEP_WALL_CLOCK_MS,
     }, (r) => ctx.assistant.respond(r));
     output = response.text;
+    stepRoute = routeDiagnosticsFromResponse(response);
   }
 
   // Skill-execution check (advisory, DETECTION-ONLY). Engages ONLY for
@@ -2890,7 +3009,9 @@ export async function executeStep(
     }
   }
 
-  const finalized = finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output);
+  const finalized = finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, output, {
+    modelRoute: workflowModelRouteMeta(stepRoute),
+  });
   noteInferredOutputContractAdvisory(step, finalized, ctx);
   return finalized;
 }
@@ -3413,6 +3534,7 @@ async function executeWorkflow(
   assistant: ClementineAssistant,
   targetStepId?: string,
   goalFeedback?: string,
+  originSessionId?: string,
 ): Promise<{ finalOutput: string; forEachFailures: Array<{ stepId: string; itemKey: string; error: string }>; qualityAdvisories: WorkflowQualityAdvisory[] }> {
   const resume = computeResumeState(workflowSlug, runId);
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
@@ -3513,7 +3635,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint,
+        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint, originSessionId,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -3534,7 +3656,7 @@ async function executeWorkflow(
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
         const output = await executeStepVerified(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint,
+          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint, originSessionId,
         });
         return { step, output };
       }));
@@ -3817,26 +3939,28 @@ export function enqueueWorkflowOutcomeTurn(
   // desktop/Discord/mobile surfaces render the SAME structure as every other
   // lane. Preserves the `[workflow run <id> …]` prefix + the "needs attention"
   // wording for a soft-blocked workflow (idempotency + tests depend on it).
-  deliverOutcome(
-    { status: outcome, detail },
-    {
-      originSessionId: run.originSessionId,
-      sourceLabel: 'workflow run',
-      sourceId: run.id,
-      title: workflowName,
-      statusHint: `workflow_run_status run_id="${run.id}"`,
-      headWord: { blocked: 'needs attention' },
-      // Was 1500 — the most aggressive cut of any report-back lane, and it
-      // carries the actual user-facing report on a CHAT-fired workflow. Aligned
-      // to the outcome default (4000) so this lane is no more starved than the
-      // background-task lane; the marker + statusHint still recover the rest.
-      maxDetailChars: 4000,
-      // Report-back v2: a chat-fired run's outcome is SPOKEN into the idle
-      // origin conversation (creation tests included — "verified, set to
-      // run: fire now or wait?"), not just staged for the user's next turn.
-      proactiveTurn: true,
-    },
-  );
+  for (const originSessionId of workflowRunOriginSessionIds(run)) {
+    deliverOutcome(
+      { status: outcome, detail },
+      {
+        originSessionId,
+        sourceLabel: 'workflow run',
+        sourceId: run.id,
+        title: workflowName,
+        statusHint: `workflow_run_status run_id="${run.id}"`,
+        headWord: { blocked: 'needs attention' },
+        // Was 1500 — the most aggressive cut of any report-back lane, and it
+        // carries the actual user-facing report on a CHAT-fired workflow. Aligned
+        // to the outcome default (4000) so this lane is no more starved than the
+        // background-task lane; the marker + statusHint still recover the rest.
+        maxDetailChars: 4000,
+        // Report-back v2: a chat-fired run's outcome is SPOKEN into the idle
+        // origin conversation (creation tests included — "verified, set to
+        // run: fire now or wait?"), not just staged for the user's next turn.
+        proactiveTurn: true,
+      },
+    );
+  }
 }
 
 // A daemon restart drains EVERY run file, so the cancelled-notify path must not
@@ -4022,7 +4146,7 @@ function tryAutoHealAndRequeue(args: {
   try {
     appendWorkflowEvent(workflowSlug, run.id, { kind: 'step_retry', stepId: fix.stepId, meta: { selfHeal: true, attempt } });
   } catch { /* heal log is best-effort */ }
-  const requeued = requeueWorkflowFromRun(run.id, { originSessionId: run.originSessionId, selfHealAttempt: attempt });
+  const requeued = requeueWorkflowFromRun(run.id, { originSessionIds: workflowRunOriginSessionIds(run), selfHealAttempt: attempt });
   if (requeued.status === 'not_found') {
     // Fix is applied but we couldn't re-queue — report it so it's never silent.
     logger.warn({ runId: run.id }, 'self-heal: applied fix but could not re-queue; surfacing for manual re-run');
@@ -4612,7 +4736,7 @@ async function processOneRunFile(
           itemKeys: run.retryFailedItemKeys,
         });
       }
-      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId, run.goalFeedback);
+      const { finalOutput, forEachFailures, qualityAdvisories } = await executeWorkflow(workflow.data, workflow.name, run.id, inputs, assistant, run.targetStepId, run.goalFeedback, run.originSessionId);
       throwIfWorkflowRunCancelled(run.id);
       const resume = computeResumeState(workflow.name, run.id);
       const rawStepOutputs = Object.fromEntries(resume.completedSteps);
@@ -4779,7 +4903,7 @@ async function processOneRunFile(
           let requeued: ReturnType<typeof requeueWorkflowFromRun> | null = null;
           try {
             requeued = requeueWorkflowFromRun(run.id, {
-              originSessionId: run.originSessionId,
+              originSessionIds: workflowRunOriginSessionIds(run),
               goalAttempt: (run.goalAttempt ?? 0) + 1,
               goalFeedback: goalFeedbackNext,
             });
@@ -5220,7 +5344,7 @@ async function processOneRunFile(
         // eventual COMPLETION turn must still land, so the park turn gets its
         // own sourceId (run id + gate) instead of sharing the run's. A run
         // that parks on several gates over its life gets one turn per gate.
-        if (run.originSessionId) {
+        for (const originSessionId of workflowRunOriginSessionIds(run)) {
           const gateKey = approvalIds[0] ?? error.parkedSteps[0]?.stepId ?? 'gate';
           deliverOutcome(
             {
@@ -5230,7 +5354,7 @@ async function processOneRunFile(
                 + `Reply \`approve ${approvalIds[0] ?? ''}\` or \`reject ${approvalIds[0] ?? ''}\` — it resumes automatically after you decide.`,
             },
             {
-              originSessionId: run.originSessionId,
+              originSessionId,
               sourceLabel: 'workflow run',
               sourceId: `${run.id}#parked-${gateKey}`,
               title: workflow.data.name,

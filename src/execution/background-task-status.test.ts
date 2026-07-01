@@ -11,7 +11,14 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-bgtask-status-test-'
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { createBackgroundTask, markBackgroundTaskAwaitingContinue, markBackgroundTaskDone } = await import('./background-tasks.js');
+const {
+  archiveBackgroundTask,
+  createBackgroundTask,
+  listBackgroundTasks,
+  markBackgroundTaskAwaitingContinue,
+  markBackgroundTaskAwaitingInput,
+  markBackgroundTaskDone,
+} = await import('./background-tasks.js');
 const { recordToolEvent } = await import('../agents/tool-observability.js');
 const {
   getBackgroundTaskStatus,
@@ -63,4 +70,19 @@ test('background task status summaries include awaiting_continue in active work'
 
   const active = listBackgroundTaskStatusSummaries({ status: 'active', limit: 20 });
   assert.ok(active.some((item) => item.task.id === task.id && item.task.status === 'awaiting_continue'));
+});
+
+test('background task status resolves an awaiting_input task by default', () => {
+  for (const existing of listBackgroundTasks()) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Needs a decision',
+    prompt: 'ask before continuing',
+    source: 'desktop',
+  });
+  markBackgroundTaskAwaitingInput(task.id, 'q-status-default', 'Which segment should I use?');
+
+  assert.equal(resolveBackgroundTask()?.id, task.id);
+  const details = getBackgroundTaskStatus();
+  assert.equal(details?.task.id, task.id);
+  assert.equal(details?.task.status, 'awaiting_input');
 });

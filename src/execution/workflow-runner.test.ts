@@ -486,6 +486,30 @@ test('applySkillToPrompt: empty usesSkill string is treated as unset', () => {
   assert.equal(out, 'do thing carefully');
 });
 
+test('renderWorkflowOriginLineageBlock includes harness transcript/action ledger and ignores legacy ghosts', () => {
+  resetEventLog();
+  const sid = 'workflow-origin-lineage';
+  HarnessSession.create({ id: sid, kind: 'chat', channel: 'desktop', title: 'Origin chat' });
+  appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use the approved Denver list only.' } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Sent Casey once and saved the follow-up brief.' } });
+  new RunnerSessionStore().appendTurn(sid, {
+    role: 'user',
+    text: '[workflow run wf-ghost completed] synthetic ghost only',
+    createdAt: new Date().toISOString(),
+  });
+
+  const out = workflowRunnerInternalsForTest.renderWorkflowOriginLineageBlock(sid);
+
+  assert.match(out, /ORIGIN SESSION LINEAGE/);
+  assert.match(out, /USER: Use the approved Denver list only/);
+  assert.match(out, /YOU: Sent Casey once/);
+  assert.match(out, /ALREADY DONE/);
+  assert.match(out, /OUTLOOK_SEND_EMAIL/);
+  assert.match(out, /casey@example\.com/);
+  assert.doesNotMatch(out, /wf-ghost/);
+});
+
 // ---------------------------------------------------------------------------
 // Gap A — a step that ends in any non-`completed` harness status must report
 // back honestly, never be captured as prose-success. The throw in
@@ -550,6 +574,25 @@ test('enqueueWorkflowOutcomeTurn: idempotent — a second call (drain retry / re
   enqueueWorkflowOutcomeTurn({ id: 'gapE-2', workflow: 'wf' as never, originSessionId: 'sessE2' }, 'My WF', 'done', 'r');
   const turns = new RunnerSessionStore().get('sessE2').turns;
   assert.equal(turns.filter((t: { text?: string }) => typeof t.text === 'string' && t.text.startsWith('[workflow run gapE-2 ')).length, 1);
+});
+
+test('enqueueWorkflowOutcomeTurn: duplicate observer origins each receive one report-back', () => {
+  const run = {
+    id: 'gapE-multi',
+    workflow: 'wf' as never,
+    originSessionId: 'sessE-multi-a',
+    originSessionIds: ['sessE-multi-a', 'sessE-multi-b', 'sessE-multi-b'],
+  };
+
+  enqueueWorkflowOutcomeTurn(run, 'My WF', 'done', 'the deliverable');
+  enqueueWorkflowOutcomeTurn(run, 'My WF', 'done', 'the deliverable');
+
+  for (const sessionId of ['sessE-multi-a', 'sessE-multi-b']) {
+    const turns = new RunnerSessionStore().get(sessionId).turns;
+    const mine = turns.filter((t: { text?: string }) => typeof t.text === 'string' && t.text.startsWith('[workflow run gapE-multi '));
+    assert.equal(mine.length, 1, `${sessionId} gets exactly one report-back`);
+    assert.match(mine[0].text, /the deliverable/);
+  }
 });
 
 // shouldNotifyCancelledRun — backlog-spam guard (review must-fix #1)
@@ -804,6 +847,97 @@ test('workflow Claude-routed read-only step uses Claude Agent SDK and returns st
     assert.equal(data.modelId, 'claude-sonnet-4-6');
     assert.equal(data.transport, 'claude_agent_sdk_workflow_step');
     assert.deepEqual(data.toolUses, ['mcp__clementine-local__skill_read']);
+    assert.deepEqual(data.modelRoute, {
+      routeKind: 'claude_agent_sdk_workflow_step',
+      requestedModel: 'claude-sonnet-4-6',
+      effectiveModel: 'claude-sonnet-4-6',
+      provider: 'claude',
+      transport: 'claude_agent_sdk_workflow_step',
+    });
+    assert.equal(
+      HarnessSession.load('workflow:wf-sdk-1:design_report')?.sessionRow.status,
+      'completed',
+      'Claude SDK workflow-step lane closes the harness step session',
+    );
+    const completed = readWorkflowEvents('claude-workflow-step-smoke', 'wf-sdk-1')
+      .filter((event) => event.kind === 'step_completed' && event.stepId === 'design_report');
+    assert.equal(completed.length, 1);
+    assert.deepEqual(completed[0].meta?.modelRoute, data.modelRoute);
+  } finally {
+    setClaudeAgentSdkWorkflowStepRunForTest(null);
+    resetHarnessRuntimeConfig();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('workflow Claude-routed step marks its harness session failed when the SDK throws', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const stateDir = path.join(tmp, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'auth.json'),
+    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-test-token', refreshToken: 'refresh' } }),
+    'utf-8',
+  );
+  writeFileSync(
+    path.join(stateDir, 'claude-auth.json'),
+    JSON.stringify({
+      accessToken: 'sk-ant-oat01-workflow-step-test-token',
+      refreshToken: 'refresh-token',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    }),
+    'utf-8',
+  );
+
+  const prev: Record<string, string | undefined> = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    CLEMMY_MODEL_ROLES_REGISTRY: process.env.CLEMMY_MODEL_ROLES_REGISTRY,
+    CLEMMY_WORKER_INTENT_ROUTING: process.env.CLEMMY_WORKER_INTENT_ROUTING,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+  };
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.CLEMMY_MODEL_ROLES_REGISTRY = 'on';
+    process.env.CLEMMY_WORKER_INTENT_ROUTING = 'on';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
+    delete process.env.WORKFLOW_USE_HARNESS;
+    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+      { role: 'worker', modelId: 'claude-sonnet-4-6', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
+    ]);
+    setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+      throw new Error('permanent sdk failure');
+    });
+
+    const step = {
+      id: 'design_fail',
+      prompt: 'Design the report section.',
+      intent: 'design',
+      sideEffect: 'read' as const,
+    };
+    const ctx = {
+      workflow: { name: 'Claude Workflow Step Failure', description: 'test', enabled: true, steps: [step], trigger: { manual: true } },
+      workflowSlug: 'claude-workflow-step-failure',
+      runId: 'wf-sdk-fail',
+      inputs: {},
+      stepOutputs: {},
+      assistant: { respond: async () => { throw new Error('legacy assistant should not be called'); } },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+
+    await assert.rejects(() => executeStep(step, ctx), /permanent sdk failure/);
+    assert.equal(
+      HarnessSession.load('workflow:wf-sdk-fail:design_fail')?.sessionRow.status,
+      'failed',
+      'thrown SDK workflow step closes the harness step session as failed',
+    );
   } finally {
     setClaudeAgentSdkWorkflowStepRunForTest(null);
     resetHarnessRuntimeConfig();

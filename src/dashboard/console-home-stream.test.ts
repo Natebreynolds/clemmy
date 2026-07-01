@@ -22,20 +22,23 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 
+type StubAssistantRequest = { sessionId: string; onReasoning?: (text: string) => void };
+type StreamEvent = { type?: string; text?: string; error?: string; route?: { routeKind?: string; surface?: string } | null };
+
 test.after(() => {
   delete process.env.CLEMMY_HARNESS_HOME;
   resetEventLog();
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-async function boot() {
+async function boot(respond?: (req: StubAssistantRequest) => Promise<{ text: string; sessionId: string }>) {
   const app = express();
   app.use(express.json());
   const assistant = {
-    respond: async (req: { sessionId: string; onReasoning?: (text: string) => void }) => {
+    respond: respond ?? (async (req: StubAssistantRequest) => {
       req.onReasoning?.('Clementine is recovering from a stalled step.');
       return { text: 'done', sessionId: req.sessionId };
-    },
+    }),
     getRuntime: () => ({
       listPendingApprovals: () => [],
     }),
@@ -54,6 +57,14 @@ async function boot() {
   return { url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => server.close(() => r())) };
 }
 
+function parseNdjson(text: string): StreamEvent[] {
+  return text
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as StreamEvent);
+}
+
 test('home chat stream forwards specific progress text', async () => {
   const h = await boot();
   try {
@@ -63,16 +74,36 @@ test('home chat stream forwards specific progress text', async () => {
       body: JSON.stringify({ message: 'hello', sessionId: 'console:test-stream' }),
     });
     assert.equal(res.status, 200);
-    const events = (await res.text())
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as { type?: string; text?: string });
+    const events = parseNdjson(await res.text());
 
     assert.ok(events.some((event) =>
       event.type === 'status' && event.text === 'Clementine is recovering from a stalled step.',
     ), 'stream preserves non-generic progress text');
-    assert.ok(events.some((event) => event.type === 'done' && event.text === 'done'), 'stream ends with done event');
+    const done = events.find((event) => event.type === 'done');
+    assert.equal(done?.text, 'done', 'stream ends with done event');
+    assert.equal(done?.route?.routeKind, 'legacy', 'terminal frame includes model route diagnostics');
+    assert.equal(done?.route?.surface, 'home');
+  } finally {
+    await h.close();
+  }
+});
+
+test('home chat stream emits terminal error event when assistant throws', async () => {
+  const h = await boot(async () => {
+    throw new Error('simulated stream failure');
+  });
+  try {
+    const res = await fetch(`${h.url}/api/console/home/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hello', sessionId: 'console:test-stream-error' }),
+    });
+    assert.equal(res.status, 200);
+    const events = parseNdjson(await res.text());
+
+    const error = events.find((event) => event.type === 'error');
+    assert.match(error?.error ?? '', /simulated stream failure/);
+    assert.equal(events.at(-1)?.type, 'error', 'stream closes after a terminal error event');
   } finally {
     await h.close();
   }

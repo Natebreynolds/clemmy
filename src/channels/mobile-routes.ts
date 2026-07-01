@@ -69,6 +69,7 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { processBackgroundTasks } from '../execution/background-tasks.js';
+import type { AssistantRouteDiagnostics } from '../types.js';
 
 export const MOBILE_SESSION_COOKIE = 'clem_mobile_session';
 const COOKIE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -81,6 +82,7 @@ interface ChatSendResponse {
   queuedTaskId?: string;
   stoppedReason?: string;
   turnsUsed?: number;
+  route?: AssistantRouteDiagnostics;
 }
 
 /**
@@ -943,6 +945,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         queuedTaskId: gatewayResponse.queuedTaskId,
         stoppedReason: gatewayResponse.stoppedReason,
         turnsUsed: gatewayResponse.turnsUsed,
+        route: gatewayResponse.route,
       };
       rememberIdempotent(scope, idempotencyKey, payload);
       res.json(payload);

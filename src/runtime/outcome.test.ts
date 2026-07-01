@@ -20,6 +20,9 @@ import assert from 'node:assert/strict';
 
 const { renderOutcomeText, deliverOutcome, outcomePrefix } = await import('./outcome.js');
 const { SessionStore } = await import('../memory/session-store.js');
+const { appendEvent, createSession, listEvents } = await import('./harness/eventlog.js');
+const { reconstructHarnessTranscript } = await import('./harness/transcript.js');
+const { renderSessionHistoryForModel } = await import('./harness/session-transcript.js');
 
 test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
 
@@ -82,6 +85,94 @@ test('deliverOutcome: idempotent — a second call does not double-post', () => 
   assert.equal(deliverOutcome({ status: 'failed', detail: 'r2' }, c), false, 'second (even different status) is a no-op');
   const turns = new SessionStore().get('sess-oc-2').turns.filter((t) => typeof t.text === 'string' && t.text.startsWith('[background task bg-d2 '));
   assert.equal(turns.length, 1, 'exactly one outcome turn for a single source id');
+});
+
+test('deliverOutcome: needs_input does not suppress the later terminal report', () => {
+  const c = ctx({ originSessionId: 'sess-oc-needs-then-done', sourceId: 'bg-needs-done' });
+  assert.equal(deliverOutcome({ status: 'needs_input', detail: 'Which segment?' }, c), true, 'question writes');
+  assert.equal(deliverOutcome({ status: 'done', detail: 'Finished after the answer.' }, c), true, 'terminal result still writes');
+  assert.equal(deliverOutcome({ status: 'failed', detail: 'late duplicate' }, c), false, 'terminal remains idempotent');
+
+  const turns = new SessionStore().get('sess-oc-needs-then-done').turns
+    .filter((t) => typeof t.text === 'string' && t.text.startsWith('[background task bg-needs-done '));
+  assert.equal(turns.length, 2);
+  assert.match(turns[0].text, /NEEDS INPUT/);
+  assert.match(turns[1].text, /completed/);
+});
+
+test('deliverOutcome: repeated needs_input dedupes exact replay but allows a later distinct question', () => {
+  const c = ctx({ originSessionId: 'sess-oc-two-questions', sourceId: 'bg-two-questions' });
+  assert.equal(deliverOutcome({ status: 'needs_input', detail: 'Which segment?' }, c), true, 'first question writes');
+  assert.equal(deliverOutcome({ status: 'needs_input', detail: 'Which segment?' }, c), false, 'exact replay dedupes');
+  assert.equal(deliverOutcome({ status: 'needs_input', detail: 'Which region?' }, c), true, 'distinct later question writes');
+
+  const turns = new SessionStore().get('sess-oc-two-questions').turns
+    .filter((t) => typeof t.text === 'string' && t.text.startsWith('[background task bg-two-questions '));
+  assert.equal(turns.length, 2);
+  assert.match(turns[0].text, /Which segment/);
+  assert.match(turns[1].text, /Which region/);
+});
+
+test('deliverOutcome: harness origins receive report-back in eventlog, not a desktop ghost', () => {
+  const sessionId = 'sess-oc-harness';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Harness chat' });
+
+  assert.equal(deliverOutcome(
+    { status: 'done', summary: 'counted 9 files' },
+    ctx({ originSessionId: sessionId, sourceId: 'bg-h1' }),
+  ), true);
+  assert.equal(new SessionStore().exists(sessionId), false, 'must not create a sessions.json ghost for a harness chat');
+
+  const reports = listEvents(sessionId, { types: ['user_input_received'] })
+    .filter((event) => typeof event.data?.text === 'string' && event.data.text.startsWith('[background task bg-h1 '));
+  assert.equal(reports.length, 1);
+  assert.match(String(reports[0].data.text), /completed]/);
+
+  const transcript = reconstructHarnessTranscript(sessionId).map((t) => t.text);
+  assert.ok(transcript.some((text) => text.startsWith('[background task bg-h1 completed]')));
+
+  assert.equal(deliverOutcome(
+    { status: 'done', summary: 'counted 9 files again' },
+    ctx({ originSessionId: sessionId, sourceId: 'bg-h1' }),
+  ), false, 'second report-back is idempotent');
+});
+
+test('incident replay: failed background report-back survives reopen/model-switch history without legacy ghost shadowing', () => {
+  const sessionId = 'sess-oc-incident-replay';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', userId: 'user-incident', title: 'Incident replay' });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Run the Sonnet background job using CLIENT-CONTEXT-991.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reply: 'Queued the background job for CLIENT-CONTEXT-991.' },
+  });
+
+  assert.equal(deliverOutcome(
+    { status: 'failed', detail: 'Sonnet 5 background worker failed before producing a verified result.' },
+    ctx({ originSessionId: sessionId, sourceId: 'bg-sonnet-failed', title: 'Sonnet background job' }),
+  ), true);
+  assert.equal(new SessionStore().exists(sessionId), false, 'failed report-back must not create a same-id desktop ghost');
+
+  new SessionStore().appendTurn(sessionId, {
+    role: 'user',
+    text: '[background task bg-sonnet-failed completed] stale desktop ghost GHOST-SUCCESS-991',
+    createdAt: new Date().toISOString(),
+  }, 'user-incident', 'desktop');
+
+  const history = renderSessionHistoryForModel(sessionId, 12, 12_000);
+
+  assert.match(history, /CLIENT-CONTEXT-991/);
+  assert.match(history, /FAILED/);
+  assert.match(history, /Sonnet 5 background worker failed/);
+  assert.doesNotMatch(history, /GHOST-SUCCESS-991/);
 });
 
 test('deliverOutcome: no origin session → false, no throw', () => {

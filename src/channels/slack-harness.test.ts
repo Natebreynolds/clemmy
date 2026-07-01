@@ -8,12 +8,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { toSlackMrkdwn, approvalBlocksForState, buildSlackHarnessTransport } from './slack-harness.js';
+import { toSlackMrkdwn, approvalBlocksForState, buildSlackHarnessTransport, slackHarnessConversationId } from './slack-harness.js';
 import type { DisplayState } from './discord-harness.js';
 
 function state(partial: Partial<DisplayState>): DisplayState {
   return { summary: '', status: 'thinking', done: false, toolsCalled: [], toolCount: 0, ...partial };
 }
+
+test('slackHarnessConversationId isolates threads inside the same Slack channel', () => {
+  assert.equal(slackHarnessConversationId('C123'), 'C123');
+  assert.equal(slackHarnessConversationId('C123', ''), 'C123');
+  assert.equal(slackHarnessConversationId('C123', '1717000000.000100'), 'C123:1717000000.000100');
+  assert.notEqual(
+    slackHarnessConversationId('C123', '1717000000.000100'),
+    slackHarnessConversationId('C123', '1717000000.000200'),
+  );
+});
 
 test('toSlackMrkdwn: converts bold, headings, links, and bullets', () => {
   assert.equal(toSlackMrkdwn('**bold**'), '*bold*');

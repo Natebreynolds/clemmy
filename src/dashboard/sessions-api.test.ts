@@ -45,8 +45,10 @@ appendEvent({ sessionId: discord.id, turn: 1, role: 'user', type: 'user_input_re
 appendEvent({ sessionId: discord.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'hello!' } });
 
 // Workflow run with two step-sessions sharing a runId → collapses to one row.
-createSession({ kind: 'workflow', channel: 'workflow', title: 'My Flow::step-1', metadata: { source: 'workflow', workflowName: 'My Flow', workflowRunId: 'run-xyz', stepId: 'step-1' } });
-createSession({ kind: 'workflow', channel: 'workflow', title: 'My Flow::step-2', metadata: { source: 'workflow', workflowName: 'My Flow', workflowRunId: 'run-xyz', stepId: 'step-2' } });
+const workflowStep1 = createSession({ kind: 'workflow', channel: 'workflow', title: 'My Flow::step-1', metadata: { source: 'workflow', workflowName: 'My Flow', workflowRunId: 'run-xyz', stepId: 'step-1' } });
+appendEvent({ sessionId: workflowStep1.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'step one gathered source notes' } });
+const workflowStep2 = createSession({ kind: 'workflow', channel: 'workflow', title: 'My Flow::step-2', metadata: { source: 'workflow', workflowName: 'My Flow', workflowRunId: 'run-xyz', stepId: 'step-2' } });
+appendEvent({ sessionId: workflowStep2.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'step two produced final brief' } });
 
 test('list merges both stores and collapses workflow steps', () => {
   const sessions = buildUnifiedSessionList();
@@ -64,6 +66,8 @@ test('list merges both stores and collapses workflow steps', () => {
   const workflow = byOrigin('workflow')[0];
   assert.equal(workflow.continuable, false, 'workflow runs are read-only');
   assert.equal(workflow.title, 'My Flow', 'titled by workflow name, not step');
+  assert.equal(workflow.preview, 'step two produced final brief');
+  assert.equal(workflow.turnCount, 2);
 });
 
 test('pinned sessions sort first', () => {
@@ -75,9 +79,11 @@ test('pinned sessions sort first', () => {
   patchUnifiedSession(`desktop:chat-desktop`, { pinned: false });
 });
 
-test('q filter matches title and desktop transcript; source filter narrows', () => {
+test('q filter matches title plus desktop and harness transcripts; source filter narrows', () => {
   assert.equal(buildUnifiedSessionList({ q: 'SEO audit' }).length, 1);
   assert.equal(buildUnifiedSessionList({ q: 'discord' }).length, 1);
+  assert.equal(buildUnifiedSessionList({ q: 'hi from discord' })[0]?.id, `harness:${discord.id}`);
+  assert.equal(buildUnifiedSessionList({ q: 'source notes' })[0]?.origin, 'workflow');
   assert.equal(buildUnifiedSessionList({ source: 'workflow' }).length, 1);
   assert.equal(buildUnifiedSessionList({ source: 'discord' })[0].origin, 'discord');
 });
@@ -106,6 +112,7 @@ test('detail returns turns and the right continueHint per store', () => {
   const wf = buildUnifiedSessionList({ source: 'workflow' })[0];
   const wfDetail = getUnifiedSessionDetail(wf.id);
   assert.ok(wfDetail);
+  assert.deepEqual(wfDetail!.turns.map((t) => t.text), ['step one gathered source notes', 'step two produced final brief']);
   assert.equal(wfDetail!.continueHint, null);
 });
 
@@ -113,6 +120,102 @@ test('detail returns null for unknown / malformed ids', () => {
   assert.equal(getUnifiedSessionDetail('desktop:nope'), null);
   assert.equal(getUnifiedSessionDetail('harness:nope'), null);
   assert.equal(getUnifiedSessionDetail('garbage'), null);
+});
+
+test('list prefers the harness session over a same-raw-id desktop report-back ghost', () => {
+  const rawId = 'same-raw-reportback';
+  createSession({ id: rawId, kind: 'chat', channel: 'desktop', title: 'Original harness chat' });
+  appendEvent({ sessionId: rawId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'original harness question' } });
+  appendEvent({ sessionId: rawId, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'original harness answer' } });
+  store.appendTurn(rawId, turn('user', '[background task bg-ghost completed] synthetic report-back only'));
+
+  const matches = buildUnifiedSessionList({ includeArchived: true, limit: 500 })
+    .filter((s) => s.id.endsWith(rawId));
+  assert.deepEqual(matches.map((s) => s.id), [`harness:${rawId}`]);
+
+  const detail = getUnifiedSessionDetail(`harness:${rawId}`);
+  assert.ok(detail);
+  assert.deepEqual(detail!.turns.map((t) => t.text), ['original harness question', 'original harness answer']);
+
+  const staleDetail = getUnifiedSessionDetail(`desktop:${rawId}`);
+  assert.ok(staleDetail);
+  assert.equal(staleDetail!.session.id, `harness:${rawId}`);
+  assert.deepEqual(staleDetail!.turns.map((t) => t.text), ['original harness question', 'original harness answer']);
+
+  const patched = patchUnifiedSession(`desktop:${rawId}`, { pinned: true, tags: ['canonical'] });
+  assert.equal(patched?.id, `harness:${rawId}`);
+  assert.equal(getSession(rawId)?.metadata.pinned, true);
+  assert.deepEqual(getSession(rawId)?.metadata.tags, ['canonical']);
+});
+
+test('list still prefers an older harness session when newer harness rows fill the first page', () => {
+  const rawId = 'same-raw-behind-harness-page';
+  createSession({ id: rawId, kind: 'chat', channel: 'desktop', title: 'Older canonical harness chat' });
+  appendEvent({ sessionId: rawId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'older canonical question' } });
+  appendEvent({ sessionId: rawId, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'older canonical answer' } });
+  store.appendTurn(rawId, turn('user', '[background task bg-page-ghost completed] ghost only'));
+
+  for (let i = 0; i < 305; i += 1) {
+    createSession({
+      id: `workflow:newer-page-fill:${i}:s1`,
+      kind: 'workflow',
+      channel: 'workflow',
+      title: `Page Fill ${i}::step`,
+      metadata: { source: 'workflow', workflowName: `Page Fill ${i}`, workflowRunId: `page-fill-${i}` },
+    });
+  }
+
+  const matches = buildUnifiedSessionList({ includeArchived: true, limit: 500 })
+    .filter((s) => s.id.endsWith(rawId));
+  assert.deepEqual(matches.map((s) => s.id), [`harness:${rawId}`]);
+
+  const detail = getUnifiedSessionDetail(`harness:${rawId}`);
+  assert.ok(detail);
+  assert.deepEqual(detail!.turns.map((t) => t.text), ['older canonical question', 'older canonical answer']);
+});
+
+test('list suppresses desktop ghosts for non-representative collapsed workflow steps', () => {
+  const runId = 'run-collapsed-step-ghost';
+  const stepA = createSession({
+    id: `workflow:${runId}:a`,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Collapsed Ghost Flow::a',
+    metadata: { source: 'workflow', workflowName: 'Collapsed Ghost Flow', workflowRunId: runId, stepId: 'a' },
+  });
+  appendEvent({ sessionId: stepA.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'hidden step canonical event' } });
+  const stepZ = createSession({
+    id: `workflow:${runId}:z`,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Collapsed Ghost Flow::z',
+    metadata: { source: 'workflow', workflowName: 'Collapsed Ghost Flow', workflowRunId: runId, stepId: 'z' },
+  });
+  appendEvent({ sessionId: stepZ.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'representative step canonical event' } });
+  store.appendTurn(stepA.id, turn('user', '[background task ghost-for-step-a completed] synthetic report-back only'));
+
+  const sessions = buildUnifiedSessionList({ includeArchived: true, limit: 500 });
+  assert.equal(sessions.some((s) => s.id === `desktop:${stepA.id}`), false);
+  const workflow = sessions.find((s) => s.title === 'Collapsed Ghost Flow');
+  assert.ok(workflow);
+  assert.equal(workflow.origin, 'workflow');
+  assert.deepEqual(getUnifiedSessionDetail(workflow.id)?.turns.map((t) => t.text), [
+    'hidden step canonical event',
+    'representative step canonical event',
+  ]);
+});
+
+test('delete via stale desktop id archives the canonical harness row', () => {
+  const rawId = 'same-raw-stale-delete';
+  createSession({ id: rawId, kind: 'chat', channel: 'desktop', title: 'Delete canonical harness chat' });
+  appendEvent({ sessionId: rawId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'canonical delete question' } });
+  store.appendTurn(rawId, turn('user', '[background task stale-delete completed] synthetic report-back only'));
+
+  const deleted = deleteUnifiedSession(`desktop:${rawId}`);
+  assert.deepEqual(deleted, { ok: true, mode: 'archived' });
+  assert.equal(getSession(rawId)?.metadata.archived, true);
+  assert.equal(new SessionStore().exists(rawId), true, 'legacy ghost is not hard-deleted through the stale route');
+  assert.equal(buildUnifiedSessionList({ includeArchived: true, limit: 500 }).some((s) => s.id === `desktop:${rawId}`), false);
 });
 
 test('patch dispatches to the right store', () => {
@@ -127,6 +230,85 @@ test('patch dispatches to the right store', () => {
   assert.equal(updated!.title, 'Renamed chat');
 });
 
+test('patch on a collapsed workflow run updates every step session', () => {
+  const stepA = createSession({ kind: 'workflow', channel: 'workflow', title: 'Patch Flow::a', metadata: { source: 'workflow', workflowName: 'Patch Flow', workflowRunId: 'run-patch-all', stepId: 'a' } });
+  const stepB = createSession({ kind: 'workflow', channel: 'workflow', title: 'Patch Flow::b', metadata: { source: 'workflow', workflowName: 'Patch Flow', workflowRunId: 'run-patch-all', stepId: 'b' } });
+  appendEvent({ sessionId: stepA.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'patch step a done' } });
+  appendEvent({ sessionId: stepB.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'patch step b done' } });
+
+  const updated = patchUnifiedSession(`harness:${stepB.id}`, {
+    title: 'Renamed Patch Flow',
+    pinned: true,
+    tags: ['review'],
+    archived: true,
+  });
+
+  assert.equal(updated?.title, 'Renamed Patch Flow');
+  assert.equal(updated?.pinned, true);
+  assert.deepEqual(updated?.tags, ['review']);
+  assert.equal(updated?.archived, true);
+  assert.equal(updated?.preview, 'patch step b done');
+  for (const step of [stepA, stepB]) {
+    const row = getSession(step.id);
+    assert.equal(row?.metadata.workflowName, 'Renamed Patch Flow');
+    assert.equal(row?.metadata.pinned, true);
+    assert.equal(row?.metadata.archived, true);
+    assert.deepEqual(row?.metadata.tags, ['review']);
+  }
+  assert.equal(buildUnifiedSessionList({ source: 'workflow' }).some((s) => s.title === 'Renamed Patch Flow'), false);
+  assert.equal(buildUnifiedSessionList({ source: 'workflow', includeArchived: true }).filter((s) => s.title === 'Renamed Patch Flow').length, 1);
+});
+
+test('collapsed workflow summary aggregates legacy metadata across step sessions', () => {
+  const runId = 'run-legacy-partial-metadata';
+  const stepA = createSession({
+    id: `workflow:${runId}:a`,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Legacy Partial Flow::a',
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Legacy Partial Flow',
+      workflowRunId: runId,
+      stepId: 'a',
+      pinned: true,
+      archived: true,
+      tags: ['legacy'],
+    },
+  });
+  appendEvent({ sessionId: stepA.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'legacy archived step' } });
+  const stepZ = createSession({
+    id: `workflow:${runId}:z`,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Legacy Partial Flow::z',
+    metadata: {
+      source: 'workflow',
+      workflowRunId: runId,
+      stepId: 'z',
+      tags: ['newer'],
+    },
+  });
+  appendEvent({ sessionId: stepZ.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'legacy newer step' } });
+
+  assert.equal(buildUnifiedSessionList({ source: 'workflow', limit: 500 }).some((s) => s.title === 'Legacy Partial Flow'), false);
+
+  const archived = buildUnifiedSessionList({ source: 'workflow', includeArchived: true, limit: 500 })
+    .find((s) => s.title === 'Legacy Partial Flow');
+  assert.ok(archived);
+  assert.equal(archived.archived, true);
+  assert.equal(archived.pinned, true);
+  assert.equal(archived.tags.includes('legacy'), true);
+  assert.equal(archived.tags.includes('newer'), true);
+
+  const detail = getUnifiedSessionDetail(archived.id);
+  assert.ok(detail);
+  assert.equal(detail.session.archived, true);
+  assert.equal(detail.session.pinned, true);
+  assert.equal(detail.session.tags.includes('legacy'), true);
+  assert.equal(detail.session.tags.includes('newer'), true);
+});
+
 test('delete = hard for desktop, archive for harness', () => {
   const harnessDel = deleteUnifiedSession(`harness:${discord.id}`);
   assert.deepEqual(harnessDel, { ok: true, mode: 'archived' });
@@ -136,4 +318,17 @@ test('delete = hard for desktop, archive for harness', () => {
   const desktopDel = deleteUnifiedSession('desktop:chat-to-delete');
   assert.deepEqual(desktopDel, { ok: true, mode: 'deleted' });
   assert.equal(new SessionStore().exists('chat-to-delete'), false);
+});
+
+test('delete on a collapsed workflow run archives every step session', () => {
+  const stepA = createSession({ kind: 'workflow', channel: 'workflow', title: 'Delete Flow::a', metadata: { source: 'workflow', workflowName: 'Delete Flow', workflowRunId: 'run-delete-all', stepId: 'a' } });
+  const stepB = createSession({ kind: 'workflow', channel: 'workflow', title: 'Delete Flow::b', metadata: { source: 'workflow', workflowName: 'Delete Flow', workflowRunId: 'run-delete-all', stepId: 'b' } });
+
+  const deleted = deleteUnifiedSession(`harness:${stepB.id}`);
+
+  assert.deepEqual(deleted, { ok: true, mode: 'archived' });
+  assert.equal(getSession(stepA.id)?.metadata.archived, true);
+  assert.equal(getSession(stepB.id)?.metadata.archived, true);
+  assert.equal(buildUnifiedSessionList({ source: 'workflow' }).some((s) => s.title === 'Delete Flow'), false);
+  assert.equal(buildUnifiedSessionList({ source: 'workflow', includeArchived: true }).filter((s) => s.title === 'Delete Flow').length, 1);
 });

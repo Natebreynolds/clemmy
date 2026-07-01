@@ -19,7 +19,7 @@
  * agent/execution sessions have their own resume paths and are never touched.
  * Entirely best-effort and flag-gated (CLEMMY_CHAT_RESTART_RECOVERY).
  */
-import { listSessions, appendEvent } from './eventlog.js';
+import { listSessions, appendEvent, type SessionRow } from './eventlog.js';
 import { HarnessSession } from './session.js';
 import { addNotification } from '../notifications.js';
 
@@ -51,6 +51,17 @@ export function markRunInFlight(sessionId: string, on: boolean): void {
 const INTERRUPTED_REPLY =
   'This run was interrupted by a restart before it finished. Reply `continue` to pick up where it left off.';
 const MAX_NOTIFICATIONS = 10;
+const CHAT_SCAN_PAGE_SIZE = 500;
+
+function listChatSessionsForRecovery(): SessionRow[] {
+  const rows: SessionRow[] = [];
+  for (let offset = 0; ; offset += CHAT_SCAN_PAGE_SIZE) {
+    const page = listSessions({ kind: 'chat', limit: CHAT_SCAN_PAGE_SIZE, offset });
+    rows.push(...page);
+    if (page.length < CHAT_SCAN_PAGE_SIZE) break;
+  }
+  return rows;
+}
 
 /**
  * Scan chat sessions for an in-flight marker left by a run that was killed
@@ -63,7 +74,7 @@ export function reportInterruptedChatRuns(now: () => number = Date.now): number 
 
   let rows;
   try {
-    rows = listSessions({ kind: 'chat' });
+    rows = listChatSessionsForRecovery();
   } catch {
     return 0;
   }

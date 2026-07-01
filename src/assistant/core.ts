@@ -15,6 +15,7 @@ import { AgentRuntimeCancelledError, ASSISTANT_PAUSED_PLACEHOLDER, type AgentRun
 import { addRunEvent } from '../runtime/run-events.js';
 import { isUserFacingSession, looksLikeInternalPrompt } from '../execution/scope.js';
 import { classifyMessageIntent } from './message-intent.js';
+import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 
 /**
  * v0.5.21 Phase 2 — default wall-clock budget for chat turns.
@@ -72,6 +73,16 @@ function defaultWallClockForChannel(channel?: string): number {
 function shouldUseExecutionTracking(request: AssistantRequest): boolean {
   return isUserFacingSession(request.sessionId, request.channel) &&
     !looksLikeInternalPrompt(request.message);
+}
+
+function recentTranscriptForPrompt(sessions: SessionStore, sessionId: string, maxTurns: number): string {
+  try {
+    const harnessHistory = renderSessionHistoryForModel(sessionId, maxTurns, 12_000).trim();
+    if (harnessHistory) return harnessHistory;
+  } catch {
+    // Fall back to the legacy session store below.
+  }
+  return sessions.recentTranscript(sessionId, maxTurns);
 }
 
 export class ClementineAssistant {
@@ -150,7 +161,7 @@ export class ClementineAssistant {
       : messageIntent.intent === 'meta_clarify'
         ? (hasInflight ? 6 : 3)
         : 12;
-    const transcriptBeforeReply = this.sessions.recentTranscript(request.sessionId, transcriptDepth);
+    const transcriptBeforeReply = recentTranscriptForPrompt(this.sessions, request.sessionId, transcriptDepth);
     // ExecutionIntent only matters when the user is asking for action
     // or continuing tracked work. Skip the keyword scoring entirely
     // for casual / lookup / meta turns — saves a scan and avoids

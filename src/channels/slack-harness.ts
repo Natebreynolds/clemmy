@@ -43,6 +43,12 @@ export function toSlackMrkdwn(text: string): string {
 // Slack section text hard-caps at 3000 chars; keep interim edits under it.
 const SECTION_MAX = 2900;
 
+export function slackHarnessConversationId(channelId: string, threadTs?: string): string {
+  const channel = channelId.trim();
+  const thread = threadTs?.trim();
+  return thread ? `${channel}:${thread}` : channel;
+}
+
 function sectionBlock(body: string): KnownBlock {
   const text = body.length > SECTION_MAX ? `${body.slice(0, SECTION_MAX - 1)}…` : body;
   return { type: 'section', text: { type: 'mrkdwn', text: text || '…' } };
@@ -362,14 +368,15 @@ export async function handleSlackHarnessMessage(opts: {
         threadTs: opts.threadTs,
       });
 
+  const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs);
   await runDiscordHarnessConversation({
     prompt: effectivePrompt,
     rawPrompt: opts.prompt,
-    channelId: opts.channelId,
+    channelId: conversationId,
     userId: opts.userId,
     guildId: opts.teamId ?? null,
     transport,
     channel: 'slack',
-    channelLabel: `slack:${opts.channelId}`,
+    channelLabel: `slack:${conversationId}`,
   });
 }

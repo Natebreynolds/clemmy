@@ -65,7 +65,7 @@ import {
 } from '../integrations/composio/client.js';
 import { computeAvailability, KNOWN_SERVICES, loadToolPreferences, saveToolPreferences, type ToolSource } from '../integrations/tool-preferences.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
-import { ClementineGateway } from '../gateway/router.js';
+import { ClementineGateway, type GatewayResponse } from '../gateway/router.js';
 import { addRunEvent, finishRun, getRun, listRuns, startRun } from '../runtime/run-events.js';
 import {
   friendlyEventMessage,
@@ -328,10 +328,33 @@ function workflowRunRecordAsActivityRun(
   };
 }
 
+function serializeMessageResponse(response: GatewayResponse): {
+  response: string;
+  session_id: string;
+  run_id?: string;
+  queued_task_id?: string;
+  pending_approval_id?: string;
+  stopped_reason?: string;
+  turns_used?: number;
+  route?: GatewayResponse['route'];
+} {
+  return {
+    response: response.text,
+    session_id: response.sessionId,
+    run_id: response.runId,
+    queued_task_id: response.queuedTaskId,
+    pending_approval_id: response.pendingApprovalId,
+    stopped_reason: response.stoppedReason,
+    turns_used: response.turnsUsed,
+    route: response.route,
+  };
+}
+
 export const __test__ = {
   completionOutputPreview,
   enrichActivityRun,
   enrichActivityRunDetail,
+  serializeMessageResponse,
   workflowRunRecordAsActivityRun,
 };
 
@@ -1662,13 +1685,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         source: 'webhook',
       });
 
-      res.json({
-        response: response.text,
-        session_id: response.sessionId,
-        run_id: response.runId,
-        queued_task_id: response.queuedTaskId,
-        pending_approval_id: response.pendingApprovalId,
-      });
+      res.json(serializeMessageResponse(response));
     } catch (err) {
       logger.error({ err }, 'Webhook /api/message failed');
       res.status(500).json({ error: 'Internal server error' });

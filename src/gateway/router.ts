@@ -3,8 +3,12 @@ import type { ClementineAssistant } from '../assistant/core.js';
 import { ExecutionStore, renderExecutionSummary } from '../execution/store.js';
 import {
   cancelBackgroundTask,
+  findSoleAwaitingContinueTaskForOrigin,
+  findSoleAwaitingInputTaskForOrigin,
   getBackgroundTask,
   listBackgroundTasks,
+  queueBackgroundTaskContinue,
+  queueBackgroundTaskInputResolution,
   renderBackgroundTask,
   renderBackgroundTaskList,
   resumeBackgroundTask,
@@ -15,9 +19,10 @@ import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFi
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { deriveTitle } from '../memory/derive-title.js';
-import type { ToolActivity } from '../types.js';
+import type { AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.gateway' });
 
@@ -54,6 +59,8 @@ export interface GatewayResponse {
   stoppedReason?: string;
   /** How many turns were consumed before stopping. */
   turnsUsed?: number;
+  /** Best-effort model route diagnostics for caller/debug parity. */
+  route?: AssistantRouteDiagnostics;
 }
 
 type GatewayCommand =
@@ -179,6 +186,57 @@ function renderTaskQueued(taskId: string): string {
     '',
     `Use \`status ${taskId}\` to check progress, \`stop ${taskId}\` to abort before it finishes, or \`tasks\` to list recent jobs.`,
   ].join('\n');
+}
+
+function recordGatewayRoute(
+  runId: string | undefined,
+  response: Pick<AssistantResponse, 'route' | 'raw'>,
+  requestedModel: string | undefined,
+): AssistantRouteDiagnostics | undefined {
+  const route = routeDiagnosticsFromResponse(response);
+  if (!route) return undefined;
+  addRunEvent(runId, {
+    type: 'status',
+    message: `Model route: ${route.routeKind}${route.provider ? `/${route.provider}` : ''}${route.effectiveModel ? ` ${route.effectiveModel}` : ''}.`,
+    data: {
+      routeKind: route.routeKind,
+      requestedModel: route.requestedModel ?? requestedModel,
+      effectiveModel: route.effectiveModel,
+      provider: route.provider,
+      transport: route.transport,
+      falloverFrom: route.falloverFrom,
+    },
+  });
+  return route;
+}
+
+function routeParkedBackgroundReply(request: GatewayRequest): GatewayResponse | null {
+  const answer = request.message.trim();
+  const parkedTask = findSoleAwaitingInputTaskForOrigin(request.sessionId);
+  if (parkedTask?.pendingQuestionId) {
+    const queued = queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, answer);
+    return {
+      sessionId: request.sessionId,
+      handledControl: true,
+      queuedTaskId: queued?.id ?? parkedTask.id,
+      text: `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`,
+    };
+  }
+
+  if (/^\/?(continue|resume|keep going)$/i.test(answer)) {
+    const continueTask = findSoleAwaitingContinueTaskForOrigin(request.sessionId);
+    if (continueTask) {
+      const queued = queueBackgroundTaskContinue(continueTask.id);
+      return {
+        sessionId: request.sessionId,
+        handledControl: true,
+        queuedTaskId: queued?.id ?? continueTask.id,
+        text: `Continuing background task "${continueTask.title}". It will report back here when it's done.`,
+      };
+    }
+  }
+
+  return null;
 }
 
 function renderRunList(runs: RunRecord[]): string {
@@ -460,6 +518,22 @@ export class ClementineGateway {
       return { ...response, runId: run.id };
     }
 
+    const parkedBackground = routeParkedBackgroundReply(request);
+    if (parkedBackground) {
+      addRunEvent(run.id, {
+        type: 'queued_background',
+        status: 'queued',
+        message: 'Reply routed to parked background task.',
+      });
+      finishRun(run.id, {
+        status: 'completed',
+        message: 'Reply routed to parked background task.',
+        queuedTaskId: parkedBackground.queuedTaskId,
+        outputPreview: parkedBackground.text,
+      });
+      return { ...parkedBackground, runId: run.id };
+    }
+
     const effectiveMessage = rewriteBareContinueForHarness(request.sessionId, request.message);
 
     if (shouldPromoteToDurable(request.message)) {
@@ -518,6 +592,7 @@ export class ClementineGateway {
         ? null
         : await verifyDelivered(request.message, response.text, { stoppedReason: response.stoppedReason });
       const runFailedNotDelivered = verdict ? !verdict.delivered : false;
+      const route = recordGatewayRoute(run.id, response, request.model);
       finishRun(run.id, {
         status: response.pendingApprovalId
           ? 'awaiting_approval'
@@ -540,6 +615,7 @@ export class ClementineGateway {
         runId: run.id,
         stoppedReason: response.stoppedReason,
         turnsUsed: response.turnsUsed,
+        route,
       };
     } catch (error) {
       finishRun(run.id, {

@@ -42,6 +42,14 @@ const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 
+async function renderAgentInstructions(agent: { instructions?: unknown }): Promise<string> {
+  const instr = agent.instructions;
+  if (typeof instr === 'function') {
+    return String(await (instr as (ctx: unknown, agent: unknown) => unknown)({ context: {} }, agent));
+  }
+  return String(instr ?? '');
+}
+
 test.after(() => {
   setClaudeAgentSdkWorkerRunForTest(null);
   try {
@@ -96,6 +104,28 @@ test('Orchestrator builds the Clem single-agent with structured outputType', asy
     reason: null,
   });
   assert.equal(parsed.success, true);
+});
+
+test('Orchestrator instructions stay dynamic and include same-session completed actions', async () => {
+  const session = createSession({ kind: 'chat', channel: 'test' });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'CRM_UPDATE', targets: ['record:acct-42'] },
+  });
+
+  const agent = await buildOrchestratorAgent({ sessionId: session.id });
+  assert.equal(typeof agent.instructions, 'function', 'instructions must remain a live renderer, not a stringified function');
+
+  const instructions = await renderAgentInstructions(agent);
+  assert.match(instructions, /# Persistent Context/);
+  assert.match(instructions, /## Completed Actions This Conversation/);
+  assert.match(instructions, /ALREADY DONE in THIS conversation/);
+  assert.match(instructions, /CRM_UPDATE/);
+  assert.match(instructions, /record:acct-42/);
+  assert.doesNotMatch(instructions, /function harnessInstructions|=> `?\$?\{?baseInstructions/);
 });
 
 test('Orchestrator is built with explicit modelSettings so the SDK honors per-turn reasoning effort', async () => {

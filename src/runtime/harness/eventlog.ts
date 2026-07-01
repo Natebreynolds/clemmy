@@ -287,6 +287,7 @@ export interface ListSessionsOptions {
   channel?: string | string[];
   updatedAfter?: string;
   limit?: number;
+  offset?: number;
 }
 
 let cached: Database.Database | null = null;
@@ -644,11 +645,14 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
   if (clauses.length > 0) {
     sql += ` WHERE ${clauses.join(' AND ')}`;
   }
-  sql += ' ORDER BY updated_at DESC';
+  sql += ' ORDER BY updated_at DESC, id DESC';
   const rawLimit = Math.trunc(options.limit ?? 100);
   const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, rawLimit)) : 100;
-  sql += ' LIMIT ?';
+  const rawOffset = Math.trunc(options.offset ?? 0);
+  const offset = Number.isFinite(rawOffset) ? Math.max(0, rawOffset) : 0;
+  sql += ' LIMIT ? OFFSET ?';
   params.push(limit);
+  params.push(offset);
   const rows = db.prepare(sql).all(...params) as RawSessionRow[];
   return rows.map(rowToSession);
 }

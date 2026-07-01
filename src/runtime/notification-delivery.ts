@@ -232,9 +232,13 @@ export async function deliverNotificationToDestination(
     if (!shouldDeliverSlackNotification(notification)) return;
     const blocks = buildSlackBlocksForNotification(notification);
     if (blocks && blocks.length > 0) {
-      await sendSlackChannelMessageWithBlocks(destination.channelId, buildSlackBotMessage(notification), blocks);
+      await sendSlackChannelMessageWithBlocks(destination.channelId, buildSlackBotMessage(notification), blocks, {
+        threadTs: destination.threadTs,
+      });
     } else {
-      await sendSlackChannelMessage(destination.channelId, buildSlackBotMessage(notification));
+      await sendSlackChannelMessage(destination.channelId, buildSlackBotMessage(notification), {
+        threadTs: destination.threadTs,
+      });
     }
     return;
   }

@@ -25,6 +25,7 @@ const {
   createBackgroundTask, markBackgroundTaskRunning, markBackgroundTaskDone,
   markBackgroundTaskAwaitingApproval, markBackgroundTaskAwaitingContinue, markBackgroundTaskBlocked, markBackgroundTaskFailed,
   getBackgroundTask,
+  updateBackgroundTask,
 } = await import('../execution/background-tasks.js');
 const { startRun, finishRun } = await import('../runtime/run-events.js');
 const { registerConsoleRoutes } = await import('./console-routes.js');
@@ -32,7 +33,7 @@ const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { CRON_TRIGGERS_DIR, WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
-const { createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
+const { appendEvent: appendHarnessEvent, createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -234,6 +235,116 @@ test('board archive is rejected for an ACTIVE task (its worker is still live)', 
     assert.equal(res.status, 409);
     assert.equal((await res.json() as { ok: boolean }).ok, false);
     assert.notEqual(getBackgroundTask(task.id)!.archived, true, 'running task left un-archived');
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/board exposes background model route diagnostics', async () => {
+  const task = createBackgroundTask({ title: 'routed task', prompt: 'p', model: 'claude-sonnet-5' });
+  updateBackgroundTask(task.id, {
+    effectiveModel: 'claude-sonnet-5',
+    modelProvider: 'claude',
+    modelRouteKind: 'claude_agent_sdk_brain',
+    modelTransport: 'sdk',
+    modelRouteFalloverFrom: 'harness',
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: BoardCard[] };
+    const card = body.cards.find((c) => c.id === task.id);
+    assert.ok(card, 'routed background task card is present');
+    assert.deepEqual(card!.raw?.modelRoute, {
+      requestedModel: 'claude-sonnet-5',
+      effectiveModel: 'claude-sonnet-5',
+      provider: 'claude',
+      routeKind: 'claude_agent_sdk_brain',
+      transport: 'sdk',
+      falloverFrom: 'harness',
+    });
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/active-work ignores stale terminal workflow sessions', async () => {
+  const stale = createHarnessSession({
+    id: 'workflow:terminal-stale:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'terminal stale step',
+  });
+  appendHarnessEvent({ sessionId: stale.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+  appendHarnessEvent({ sessionId: stale.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'done' } });
+
+  const live = createHarnessSession({
+    id: 'workflow:still-live:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'still live step',
+  });
+  appendHarnessEvent({ sessionId: live.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+
+  const emptyOrphan = createHarnessSession({
+    id: 'workflow:empty-orphan:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'empty orphan step',
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/active-work`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { items: Array<{ id: string; type: string }> };
+    const sessionIds = new Set(body.items.filter((item) => item.type === 'session').map((item) => item.id));
+    assert.equal(sessionIds.has(stale.id), false, 'terminal workflow session is not active work');
+    assert.equal(sessionIds.has(emptyOrphan.id), false, 'session-start-only orphan is not active work');
+    assert.equal(sessionIds.has(live.id), true, 'non-terminal workflow session remains active work');
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/active-work scans beyond filtered dormant session pages', async () => {
+  const live = createHarnessSession({
+    id: 'workflow:live-behind-dormant-page:s1',
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'live behind dormant page',
+  });
+  appendHarnessEvent({ sessionId: live.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  for (let i = 0; i < 505; i += 1) {
+    const dormant = createHarnessSession({
+      id: `workflow:dormant-page-filter:${i}:s1`,
+      kind: 'workflow',
+      channel: 'workflow',
+      title: `dormant filtered step ${i}`,
+    });
+    appendHarnessEvent({ sessionId: dormant.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+    appendHarnessEvent({
+      sessionId: dormant.id,
+      turn: 1,
+      role: 'system',
+      type: 'conversation_completed',
+      data: { reply: 'done' },
+    });
+  }
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/active-work`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { items: Array<{ id: string; type: string }> };
+    const sessionIds = new Set(body.items.filter((item) => item.type === 'session').map((item) => item.id));
+    assert.equal(sessionIds.has(live.id), true, 'live session is still found after newer dormant rows are filtered');
+    assert.equal(sessionIds.has('workflow:dormant-page-filter:0:s1'), false, 'terminal rows remain filtered');
   } finally {
     await h.close();
   }

@@ -19,8 +19,16 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { pullRecentTurnsForSession, renderTranscriptTurns, renderRecentSessionActions } = await import('./session-transcript.js');
+const {
+  pullRecentTurnsForSession,
+  renderRecentActionsForHarnessHistory,
+  renderCrossSessionPrefixesForModel,
+  renderSessionHistoryForModel,
+  renderTranscriptTurns,
+  renderRecentSessionActions,
+} = await import('./session-transcript.js');
 const { resetEventLog, createSession, appendEvent, openEventLog } = await import('./eventlog.js');
+const { SessionStore } = await import('../../memory/session-store.js');
 
 test('renderRecentSessionActions surfaces this session\'s completed sends so the brain knows it already did them', () => {
   resetEventLog();
@@ -40,11 +48,181 @@ test('renderRecentSessionActions surfaces this session\'s completed sends so the
   assert.equal((block2.match(/chris@macgilliswiemer\.com/g) ?? []).length, 1, 'deduped by (shape, target)');
 });
 
+test('renderRecentSessionActions does not call compensated failed writes already done', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sid, turn: 1, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write_failed', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+
+  const block = renderRecentSessionActions(openEventLog(), sid);
+
+  assert.equal(block, '', 'a demonstrably failed dispatch must not be presented to the brain as succeeded');
+});
+
+test('renderRecentSessionActions keeps a later successful retry after an earlier compensated failure', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sid, turn: 1, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'external_write_failed', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+  appendEvent({ sessionId: sid, turn: 2, role: 'tool', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+
+  const block = renderRecentSessionActions(openEventLog(), sid);
+
+  assert.match(block, /ALREADY DONE/);
+  assert.equal((block.match(/casey@example\.com/g) ?? []).length, 1);
+});
+
 test('renderRecentSessionActions is empty when nothing was sent (byte-identical no-op)', () => {
   resetEventLog();
   const sid = createSession({ kind: 'chat' }).id;
   appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'hi' } });
   assert.equal(renderRecentSessionActions(openEventLog(), sid), '');
+});
+
+test('renderSessionHistoryForModel keeps cross-session continuation context with current-session transcript', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat', channel: 'discord', title: 'fresh split' }).id;
+  appendEvent({
+    sessionId: sid,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: {
+      text: [
+        '[CONTINUATION CONTEXT]',
+        '  USER: Use the board-approved prospect list only.',
+        '  YOU: I queued the first 10 for review.',
+      ].join('\n'),
+    },
+  });
+  appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'go ahead with those' } });
+
+  const history = renderSessionHistoryForModel(sid, 10, 12_000);
+
+  assert.match(history, /\[CONTINUATION CONTEXT\]/);
+  assert.match(history, /board-approved prospect list only/);
+  assert.match(history, /USER: go ahead with those/);
+});
+
+test('renderSessionHistoryForModel aggregates sibling workflow-step sessions for cross-model parity', () => {
+  resetEventLog();
+  const step1 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Parity Flow::step-1',
+    metadata: { workflowRunId: 'wf-parity', workflowName: 'Parity Flow', stepId: 'step-1' },
+  });
+  appendEvent({ sessionId: step1.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Collect source notes for the brief.' } });
+  appendEvent({ sessionId: step1.id, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'DOC_UPDATE', targets: ['doc:brief-source'] } });
+  appendEvent({ sessionId: step1.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Step one gathered source notes.' } });
+  const step2 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Parity Flow::step-2',
+    metadata: { workflowRunId: 'wf-parity', workflowName: 'Parity Flow', stepId: 'step-2' },
+  });
+  appendEvent({ sessionId: step2.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Step two produced the final brief.' } });
+
+  const history = renderSessionHistoryForModel(step2.id, 10, 12_000);
+
+  assert.match(history, /ALREADY DONE in THIS workflow run/);
+  assert.match(history, /DOC_UPDATE/);
+  assert.match(history, /doc:brief-source/);
+  assert.match(history, /workflow run wf-parity/);
+  assert.match(history, /USER: Collect source notes/);
+  assert.match(history, /YOU: Step one gathered source notes/);
+  assert.match(history, /YOU: Step two produced the final brief/);
+});
+
+test('renderSessionHistoryForModel aggregates workflow sibling continuation prefixes for model switches', () => {
+  resetEventLog();
+  const step1 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Prefix Flow::step-1',
+    metadata: { workflowRunId: 'wf-prefix-parity', workflowName: 'Prefix Flow', stepId: 'step-1' },
+  });
+  appendEvent({
+    sessionId: step1.id,
+    turn: 0,
+    role: 'system',
+    type: 'cross_session_prefix',
+    data: {
+      text: [
+        '[CONTINUATION CONTEXT]',
+        '  USER: Use the approved Mattermost thread only.',
+        '  YOU: I confirmed the background run should continue from that thread.',
+      ].join('\n'),
+    },
+  });
+  const step2 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Prefix Flow::step-2',
+    metadata: { workflowRunId: 'wf-prefix-parity', workflowName: 'Prefix Flow', stepId: 'step-2' },
+  });
+  appendEvent({ sessionId: step2.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Step two kept working from the approved thread.' } });
+
+  const prefixes = renderCrossSessionPrefixesForModel(openEventLog(), step2.id, 4);
+  const history = renderSessionHistoryForModel(step2.id, 10, 12_000);
+
+  assert.match(prefixes, /approved Mattermost thread only/);
+  assert.match(history, /\[CONTINUATION CONTEXT\]/);
+  assert.match(history, /approved Mattermost thread only/);
+  assert.match(history, /YOU: Step two kept working from the approved thread/);
+});
+
+test('renderSessionHistoryForModel suppresses pure same-id legacy outcome ghosts for harness sessions', () => {
+  resetEventLog();
+  const sessionId = 'empty-harness-with-outcome-ghost';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Empty harness row' });
+  new SessionStore().appendTurn(sessionId, {
+    role: 'user',
+    text: '[background task bg-ghost completed] stale synthetic report-back only GHOST-SUCCESS-123',
+    createdAt: new Date().toISOString(),
+  }, 'user-ghost', 'desktop');
+
+  const history = renderSessionHistoryForModel(sessionId, 10, 12_000);
+
+  assert.equal(history, '');
+});
+
+test('renderSessionHistoryForModel still falls back to real legacy text for empty harness rows', () => {
+  resetEventLog();
+  const sessionId = 'empty-harness-with-real-legacy';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Migration row' });
+  new SessionStore().appendTurn(sessionId, {
+    role: 'user',
+    text: 'Please remember REAL-LEGACY-555 for this migrated chat.',
+    createdAt: new Date().toISOString(),
+  }, 'user-real', 'desktop');
+
+  const history = renderSessionHistoryForModel(sessionId, 10, 12_000);
+
+  assert.match(history, /REAL-LEGACY-555/);
+});
+
+test('renderRecentActionsForHarnessHistory aggregates sibling workflow-step action ledgers', () => {
+  resetEventLog();
+  const step1 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Action Flow::step-1',
+    metadata: { workflowRunId: 'wf-action-parity', workflowName: 'Action Flow', stepId: 'step-1' },
+  });
+  appendEvent({ sessionId: step1.id, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+  const step2 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Action Flow::step-2',
+    metadata: { workflowRunId: 'wf-action-parity', workflowName: 'Action Flow', stepId: 'step-2' },
+  });
+
+  const actions = renderRecentActionsForHarnessHistory(openEventLog(), step2.id);
+
+  assert.match(actions, /ALREADY DONE in THIS workflow run/);
+  assert.match(actions, /OUTLOOK_SEND_EMAIL/);
+  assert.match(actions, /casey@example\.com/);
 });
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
@@ -74,6 +252,47 @@ test('assistant text prefers reply, falls back to summary', () => {
   const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
   assert.equal(turns[0].text, 'summary-only field');
   assert.equal(turns[1].text, 'reply wins');
+});
+
+test('unpaired awaiting_user_input questions are assistant turns in replay', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  userMsg(sid, 'deploy the site');
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Which environment should I deploy to?' },
+  });
+
+  const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
+
+  assert.deepEqual(turns.map((t) => t.who), ['user', 'assistant']);
+  assert.equal(turns[1].text, 'Which environment should I deploy to?');
+});
+
+test('paired awaiting_user_input plus conversation_completed is not double-rendered', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Which account should I use?' },
+  });
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'awaiting_user_input', reply: 'Which account should I use?' },
+  });
+
+  const turns = pullRecentTurnsForSession(openEventLog(), sid, 6);
+
+  assert.deepEqual(turns.map((t) => t.text), ['Which account should I use?']);
 });
 
 test('renderTranscriptTurns formats USER:/YOU: lines and trims long turns to 800', () => {

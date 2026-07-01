@@ -34,6 +34,14 @@ import { runConversation, runConversationFromResume } from '../runtime/harness/l
 import { respondViaClaudeAgentSdkBrain, claudeAgentSdkBrainEnabled } from '../runtime/harness/claude-agent-brain.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
+import {
+  findSoleAwaitingContinueTaskForOrigin,
+  findSoleAwaitingInputTaskForOrigin,
+  listBackgroundTasks,
+  queueBackgroundTaskContinue,
+  queueBackgroundTaskInputResolution,
+  type BackgroundTaskRecord,
+} from '../execution/background-tasks.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { pullRecentTurnsForSession, renderTranscriptTurns } from '../runtime/harness/session-transcript.js';
@@ -168,12 +176,13 @@ function findMostRecentChannelSession(channelId: string, channel: string = 'disc
              (channel = ? AND json_extract(metadata_json, '$.channelId') = ?)
              OR json_extract(metadata_json, '$.source') = ?
                 AND json_extract(metadata_json, '$.channelId') = ?
-             OR json_extract(metadata_json, '$.discordChannelId') = ?
+             OR (channel = ? OR json_extract(metadata_json, '$.source') = ?)
+                AND json_extract(metadata_json, '$.discordChannelId') = ?
            )
            ORDER BY updated_at DESC
            LIMIT 1`,
       )
-      .get(channel, channelId, channel, channelId, channelId) as { id?: string; updated_at?: string } | undefined;
+      .get(channel, channelId, channel, channelId, channel, channel, channelId) as { id?: string; updated_at?: string } | undefined;
     if (!row?.id || !row.updated_at) return null;
     return { sessionId: row.id, updatedAt: new Date(row.updated_at).getTime() };
   } catch {
@@ -1068,8 +1077,10 @@ export const __test__ = {
   approvalComponentsForState,
   approvalPickerComponents,
   collectDiscordSessionOptions,
+  findMostRecentChannelSession,
   globalApprovalRowsForDm,
   isDiscordTokenExpired,
+  maybeRouteParkedBackgroundReply,
   renderSessionPickerText,
   sessionPickerComponents,
   /** Inject a fresh channel→session mapping (Step 5 typed-plan-approval tests). */
@@ -1284,6 +1295,108 @@ export interface DisplayState {
   // 42%]` footer so the user sees the context filling up before it
   // explodes. Only shown when > 30%.
   contextPct?: number;
+}
+
+async function sendParkedBackgroundAck(
+  transport: DiscordHarnessTransport,
+  message: string,
+  meta: { sessionId: string; taskId: string },
+): Promise<void> {
+  try {
+    await transport.sendInitial(message);
+  } catch (err) {
+    try { await transport.sendError(message); } catch { /* transport is best-effort */ }
+    logger.warn(
+      { err: err instanceof Error ? err.message : err, sessionId: meta.sessionId, taskId: meta.taskId },
+      'failed to acknowledge parked background reply',
+    );
+  }
+}
+
+function taskBelongsToChatChannel(
+  task: Pick<BackgroundTaskRecord, 'channel' | 'originSessionId'>,
+  input: { channelLabel: string; channelId: string; channel: string },
+): boolean {
+  if (task.channel === input.channelLabel) return true;
+  if (!task.originSessionId) return false;
+  try {
+    const origin = getHarnessSession(task.originSessionId);
+    const metadata = origin?.metadata ?? {};
+    if (origin?.channel === input.channel && metadata.channelId === input.channelId) return true;
+    if (metadata.source === input.channel && metadata.channelId === input.channelId) return true;
+    // Historical binding metadata kept the Discord-prefixed field name even
+    // when Slack reused this harness module. Keep it as a compatibility path.
+    const originMatchesChannel = origin?.channel === input.channel || metadata.source === input.channel;
+    if (originMatchesChannel && metadata.discordChannelId === input.channelId) return true;
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function findSoleAwaitingInputTaskForChannel(input: { channelLabel: string; channelId: string; channel: string }): BackgroundTaskRecord | null {
+  const parked = listBackgroundTasks({ status: 'awaiting_input' })
+    .filter((task) => taskBelongsToChatChannel(task, input));
+  return parked.length === 1 ? parked[0] : null;
+}
+
+function findSoleAwaitingContinueTaskForChannel(input: { channelLabel: string; channelId: string; channel: string }): BackgroundTaskRecord | null {
+  const parked = listBackgroundTasks({ status: 'awaiting_continue' })
+    .filter((task) => taskBelongsToChatChannel(task, input));
+  return parked.length === 1 ? parked[0] : null;
+}
+
+/**
+ * Route a user's reply back into a parked background task before any brain sees
+ * it as a fresh chat turn. This mirrors console-home behavior for Discord and
+ * Slack: one parked question captures the next freeform reply; one task awaiting
+ * continuation captures `continue` / `resume` / `keep going`.
+ */
+async function maybeRouteParkedBackgroundReply(input: {
+  sessionId?: string;
+  channelLabel?: string;
+  channelId?: string;
+  channel?: string;
+  message: string;
+  transport: DiscordHarnessTransport;
+}): Promise<boolean> {
+  const answer = input.message.trim();
+  const channelLookup = !input.sessionId && input.channelLabel && input.channelId && input.channel
+    ? { channelLabel: input.channelLabel, channelId: input.channelId, channel: input.channel }
+    : null;
+  const parkedTask = input.sessionId
+    ? findSoleAwaitingInputTaskForOrigin(input.sessionId)
+    : channelLookup
+      ? findSoleAwaitingInputTaskForChannel(channelLookup)
+      : null;
+  if (parkedTask?.pendingQuestionId) {
+    queueBackgroundTaskInputResolution(parkedTask.pendingQuestionId, answer);
+    await sendParkedBackgroundAck(
+      input.transport,
+      `Got it — I passed that to your background task "${parkedTask.title}". It's resuming now and will report back here when it's done.`,
+      { sessionId: parkedTask.originSessionId ?? input.sessionId ?? input.channelLabel ?? 'unknown', taskId: parkedTask.id },
+    );
+    return true;
+  }
+
+  if (/^\/?(continue|resume|keep going)$/i.test(answer)) {
+    const continueTask = input.sessionId
+      ? findSoleAwaitingContinueTaskForOrigin(input.sessionId)
+      : channelLookup
+        ? findSoleAwaitingContinueTaskForChannel(channelLookup)
+        : null;
+    if (continueTask) {
+      queueBackgroundTaskContinue(continueTask.id);
+      await sendParkedBackgroundAck(
+        input.transport,
+        `Continuing background task "${continueTask.title}". It will report back here when it's done.`,
+        { sessionId: continueTask.originSessionId ?? input.sessionId ?? input.channelLabel ?? 'unknown', taskId: continueTask.id },
+      );
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -1656,10 +1769,13 @@ export async function runDiscordHarnessConversation(opts: {
     // a regular user message.
     const entry = getOrHydrateChannelSession(channelId, channel);
     if (entry) {
+      if (await maybeRouteParkedBackgroundReply({ sessionId: entry.sessionId, message: prompt, transport })) return;
       const lastCompletion = readLastConversationCompletion(entry.sessionId);
       if (lastCompletion && isContinueCompletionReason(lastCompletion.reason)) {
         prompt = buildContinueInput(lastCompletion.lastDecisionSummary);
       }
+    } else if (await maybeRouteParkedBackgroundReply({ channelLabel, channelId, channel, message: prompt, transport })) {
+      return;
     }
   }
 
@@ -1680,6 +1796,14 @@ export async function runDiscordHarnessConversation(opts: {
       });
       return;
     }
+  }
+
+  const parkedEntry = getOrHydrateChannelSession(channelId, channel);
+  if (parkedEntry && await maybeRouteParkedBackgroundReply({ sessionId: parkedEntry.sessionId, message: prompt, transport })) {
+    return;
+  }
+  if (!parkedEntry && await maybeRouteParkedBackgroundReply({ channelLabel, channelId, channel, message: prompt, transport })) {
+    return;
   }
 
   // Typed consent into a surfaced plan (gate-unification Step 5). A PlanProposal

@@ -14,12 +14,14 @@
 import { SessionStore } from '../memory/session-store.js';
 import {
   getSession as getHarnessSession,
+  listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
   updateSession as updateHarnessSession,
+  type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js';
-import { reconstructHarnessTranscript, harnessPreview } from '../runtime/harness/transcript.js';
+import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import type {
   SessionRecord,
@@ -152,30 +154,190 @@ function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): Unifi
  * sessions (one session per step, titled `name::stepId`) into a single
  * row per workflow run so a multi-step workflow doesn't flood the list.
  */
-function collectHarnessSummaries(): UnifiedSessionSummary[] {
-  const rows = listHarnessSessions({ limit: 300, status: 'any' })
-    .filter((row) => isUserFacingSession(row.id, row.channel ?? undefined));
+const HARNESS_SESSION_PAGE_SIZE = 500;
+
+function listUserFacingHarnessRows(): HarnessSessionRow[] {
+  const out: HarnessSessionRow[] = [];
+  for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
+    const page = listHarnessSessions({ limit: HARNESS_SESSION_PAGE_SIZE, offset, status: 'any' });
+    out.push(...page.filter((row) => isUserFacingSession(row.id, row.channel ?? undefined)));
+    if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
+  }
+  return out;
+}
+
+function listHarnessRowsForWorkflowRun(workflowRunId: string): HarnessSessionRow[] {
+  if (!workflowRunId) return [];
+  const out: HarnessSessionRow[] = [];
+  for (let offset = 0; ; offset += HARNESS_SESSION_PAGE_SIZE) {
+    const page = listHarnessSessions({ limit: HARNESS_SESSION_PAGE_SIZE, offset, status: 'any' });
+    out.push(...page.filter((row) => row.metadata?.workflowRunId === workflowRunId));
+    if (page.length < HARNESS_SESSION_PAGE_SIZE) break;
+  }
+  return out;
+}
+
+function workflowRunIdFor(row: HarnessSessionRow): string {
+  return typeof row.metadata?.workflowRunId === 'string' ? row.metadata.workflowRunId : '';
+}
+
+function workflowNameFor(row: HarnessSessionRow): string {
+  return typeof row.metadata?.workflowName === 'string' ? row.metadata.workflowName : '';
+}
+
+function mergedWorkflowRunMetadata(
+  representative: HarnessSessionRow,
+  rows: HarnessSessionRow[],
+): Record<string, unknown> {
+  const relatedRows = rows.length > 0 ? rows : [representative];
+  const metadata: Record<string, unknown> = { ...representative.metadata };
+  const tags: string[] = [];
+  const seenTags = new Set<string>();
+  let workflowName = '';
+
+  for (const row of relatedRows) {
+    const rowName = workflowNameFor(row).trim();
+    if (!workflowName && rowName) workflowName = rowName.slice(0, 120);
+
+    for (const tag of metaTags(row.metadata)) {
+      const normalized = tag.trim().slice(0, 40);
+      if (!normalized || seenTags.has(normalized) || tags.length >= 20) continue;
+      seenTags.add(normalized);
+      tags.push(normalized);
+    }
+  }
+
+  metadata.pinned = relatedRows.some((row) => metaBool(row, 'pinned'));
+  metadata.archived = relatedRows.some((row) => metaBool(row, 'archived'));
+  metadata.tags = tags;
+  if (workflowName) metadata.workflowName = workflowName;
+  return metadata;
+}
+
+function mergedWorkflowRunRow(
+  representative: HarnessSessionRow,
+  rows: HarnessSessionRow[],
+): HarnessSessionRow {
+  return {
+    ...representative,
+    metadata: mergedWorkflowRunMetadata(representative, rows),
+  };
+}
+
+function relatedHarnessRowsForPatch(row: HarnessSessionRow): HarnessSessionRow[] {
+  const workflowRunId = workflowRunIdFor(row);
+  return workflowRunId ? listHarnessRowsForWorkflowRun(workflowRunId) : [row];
+}
+
+interface HarnessSummaryCollection {
+  summaries: UnifiedSessionSummary[];
+  rawIds: Set<string>;
+}
+
+function collectHarnessSummaries(): HarnessSummaryCollection {
+  const rows = listUserFacingHarnessRows();
   const out: UnifiedSessionSummary[] = [];
+  const rawIds = new Set(rows.map((row) => row.id));
+  const workflowRows = new Map<string, HarnessSessionRow[]>();
   const seenWorkflowRuns = new Set<string>();
+
   for (const row of rows) {
-    const runId = typeof row.metadata?.workflowRunId === 'string' ? row.metadata.workflowRunId : '';
+    const runId = workflowRunIdFor(row);
+    if (!runId) continue;
+    const grouped = workflowRows.get(runId);
+    if (grouped) grouped.push(row);
+    else workflowRows.set(runId, [row]);
+  }
+
+  for (const row of rows) {
+    const runId = workflowRunIdFor(row);
     if (runId) {
       // rows are updated_at DESC, so the first one we see per run is the
       // most recent step — keep it as the run's representative row.
       if (seenWorkflowRuns.has(runId)) continue;
       seenWorkflowRuns.add(runId);
-      const workflowName = typeof row.metadata?.workflowName === 'string' ? row.metadata.workflowName : '';
-      out.push(summarizeHarness(row, workflowName || undefined));
+      const aggregate = mergedWorkflowRunRow(row, workflowRows.get(runId) ?? [row]);
+      const workflowName = workflowNameFor(aggregate);
+      out.push(summarizeHarness(aggregate, workflowName || undefined));
       continue;
     }
     out.push(summarizeHarness(row));
   }
-  return out;
+  return { summaries: out, rawIds };
 }
 
 function desktopSearchText(record: SessionRecord): string {
   const tail = record.turns.slice(-20).map((t) => t.text).join(' ');
   return `${record.title ?? ''} ${tail}`.toLowerCase();
+}
+
+function harnessSearchText(summary: UnifiedSessionSummary): string {
+  const rawId = summary.id.slice(HARNESS_PREFIX.length);
+  const row = getHarnessSession(rawId);
+  const tail = (row ? reconstructHarnessDetailTurns(row, 40) : reconstructHarnessTranscript(rawId, 40))
+    .slice(-20)
+    .map((t) => t.text)
+    .join(' ');
+  return `${summary.title ?? ''} ${tail}`.toLowerCase();
+}
+
+function workflowEventTurn(event: HarnessEventRow): (UnifiedSessionTurn & { seq: number }) | null {
+  if (event.type === 'user_input_received') {
+    const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
+    return text ? { role: 'user', text, createdAt: event.createdAt, seq: event.seq } : null;
+  }
+  if (event.type === 'conversation_completed') {
+    const text = humanHarnessText(event.data.reply ?? event.data.summary, '');
+    return text ? { role: 'assistant', text, createdAt: event.createdAt, seq: event.seq } : null;
+  }
+  return null;
+}
+
+function reconstructWorkflowRunTranscript(workflowRunId: string, perSessionLimit = 1000): UnifiedSessionTurn[] {
+  const turns = listHarnessRowsForWorkflowRun(workflowRunId)
+    .flatMap((row) => listHarnessEvents(row.id, {
+      types: ['user_input_received', 'conversation_completed'],
+      limit: perSessionLimit,
+    }))
+    .map(workflowEventTurn)
+    .filter((turn): turn is UnifiedSessionTurn & { seq: number } => turn !== null);
+  turns.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.seq - right.seq);
+  return turns.map(({ seq: _seq, ...turn }) => turn);
+}
+
+function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit = 1000): UnifiedSessionTurn[] {
+  const workflowRunId = workflowRunIdFor(row);
+  return workflowRunId
+    ? reconstructWorkflowRunTranscript(workflowRunId, perSessionLimit)
+    : reconstructHarnessTranscript(row.id, perSessionLimit);
+}
+
+function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary): void {
+  const rawId = summary.id.slice(HARNESS_PREFIX.length);
+  const row = getHarnessSession(rawId);
+  if (!row) {
+    summary.preview = clip(harnessPreview(rawId), 140);
+    return;
+  }
+  const turns = reconstructHarnessDetailTurns(row, 1000);
+  summary.turnCount = turns.length;
+  summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
+}
+
+function canonicalHarnessRowForRawId(rawId: string): HarnessSessionRow | null {
+  const row = getHarnessSession(rawId);
+  return row && isUserFacingSession(row.id, row.channel ?? undefined) ? row : null;
+}
+
+function detailForHarnessRow(row: HarnessSessionRow): SessionDetail {
+  const runId = workflowRunIdFor(row);
+  const summaryRow = runId ? mergedWorkflowRunRow(row, listHarnessRowsForWorkflowRun(runId)) : row;
+  const workflowName = workflowNameFor(summaryRow);
+  const summary = summarizeHarness(summaryRow, runId && workflowName ? workflowName : undefined);
+  const turns = reconstructHarnessDetailTurns(row);
+  summary.turnCount = turns.length;
+  summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
+  return { session: summary, turns, continueHint: continueHintFor(summary, row.id) };
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────
@@ -187,17 +349,24 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
   const source = query.source?.trim() ?? '';
   const includeArchived = Boolean(query.includeArchived);
   const limit = Math.max(1, Math.min(500, Math.trunc(query.limit ?? 100)));
+  const harnessCollection = collectHarnessSummaries();
+  const harness = harnessCollection.summaries;
+  const harnessRawIds = harnessCollection.rawIds;
 
   // Desktop side — also keep the matching records for cheap search/preview.
   const desktopRecords = new Map<string, SessionRecord>();
   const desktop: UnifiedSessionSummary[] = [];
   for (const record of store.listAll()) {
     if (isInternalSessionId(record.id)) continue;
+    // If a raw id exists in both stores, the harness row is the canonical
+    // conversation. Desktop duplicates are report-back ghosts created by older
+    // outcome delivery and should not shadow the full harness transcript.
+    if (harnessRawIds.has(record.id)) continue;
     desktopRecords.set(record.id, record);
     desktop.push(summarizeDesktop(record));
   }
 
-  let all = [...desktop, ...collectHarnessSummaries()];
+  let all = [...desktop, ...harness];
 
   if (!includeArchived) all = all.filter((s) => !s.archived);
   if (source) all = all.filter((s) => s.origin === source);
@@ -208,6 +377,8 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
       if (s.store === 'desktop') {
         const rec = desktopRecords.get(s.id.slice(DESKTOP_PREFIX.length));
         if (rec && desktopSearchText(rec).includes(q)) return true;
+      } else if (harnessSearchText(s).includes(q)) {
+        return true;
       }
       return false;
     });
@@ -228,7 +399,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
       const last = rec?.turns[rec.turns.length - 1];
       summary.preview = last ? clip(last.text, 140) : '';
     } else {
-      summary.preview = clip(harnessPreview(summary.id.slice(HARNESS_PREFIX.length)), 140);
+      fillHarnessPreviewAndCount(summary);
     }
   }
   return page;
@@ -257,6 +428,9 @@ export function getUnifiedSessionDetail(id: string): SessionDetail | null {
   if (!parsed) return null;
 
   if (parsed.store === 'desktop') {
+    const canonicalHarnessRow = canonicalHarnessRowForRawId(parsed.rawId);
+    if (canonicalHarnessRow) return detailForHarnessRow(canonicalHarnessRow);
+
     const store = new SessionStore();
     if (!store.exists(parsed.rawId)) return null;
     const record = store.get(parsed.rawId);
@@ -273,13 +447,7 @@ export function getUnifiedSessionDetail(id: string): SessionDetail | null {
 
   const row = getHarnessSession(parsed.rawId);
   if (!row) return null;
-  const runId = typeof row.metadata?.workflowRunId === 'string' ? row.metadata.workflowRunId : '';
-  const workflowName = typeof row.metadata?.workflowName === 'string' ? row.metadata.workflowName : '';
-  const summary = summarizeHarness(row, runId && workflowName ? workflowName : undefined);
-  const turns = reconstructHarnessTranscript(parsed.rawId);
-  summary.turnCount = turns.length;
-  summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
-  return { session: summary, turns, continueHint: continueHintFor(summary, parsed.rawId) };
+  return detailForHarnessRow(row);
 }
 
 export function patchUnifiedSession(id: string, patch: SessionPatchInput): UnifiedSessionSummary | null {
@@ -287,6 +455,9 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
   if (!parsed) return null;
 
   if (parsed.store === 'desktop') {
+    const canonicalHarnessRow = canonicalHarnessRowForRawId(parsed.rawId);
+    if (canonicalHarnessRow) return patchUnifiedSession(`${HARNESS_PREFIX}${canonicalHarnessRow.id}`, patch);
+
     const store = new SessionStore();
     const updated = store.setMeta(parsed.rawId, patch);
     if (!updated) return null;
@@ -298,18 +469,26 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
 
   const row = getHarnessSession(parsed.rawId);
   if (!row) return null;
-  const meta = { ...row.metadata };
-  if (patch.pinned !== undefined) meta.pinned = patch.pinned;
-  if (patch.archived !== undefined) meta.archived = patch.archived;
-  if (patch.tags !== undefined) {
-    meta.tags = patch.tags.filter((t): t is string => typeof t === 'string').map((t) => t.trim().slice(0, 40)).filter(Boolean).slice(0, 20);
+  const relatedRows = relatedHarnessRowsForPatch(row);
+  const workflowRunId = workflowRunIdFor(row);
+  const patchTags = patch.tags !== undefined
+    ? patch.tags.filter((t): t is string => typeof t === 'string').map((t) => t.trim().slice(0, 40)).filter(Boolean).slice(0, 20)
+    : undefined;
+  let next = row;
+  for (const target of relatedRows) {
+    const meta = { ...target.metadata };
+    if (patch.pinned !== undefined) meta.pinned = patch.pinned;
+    if (patch.archived !== undefined) meta.archived = patch.archived;
+    if (patchTags !== undefined) meta.tags = patchTags;
+    if (workflowRunId && patch.title !== undefined) meta.workflowName = patch.title.trim().slice(0, 120);
+    const updated = updateHarnessSession(target.id, {
+      metadata: meta,
+      ...(!workflowRunId && patch.title !== undefined ? { title: patch.title.trim().slice(0, 120) } : {}),
+    });
+    if (target.id === parsed.rawId) next = updated;
   }
-  const next = updateHarnessSession(parsed.rawId, {
-    metadata: meta,
-    ...(patch.title !== undefined ? { title: patch.title.trim().slice(0, 120) } : {}),
-  });
-  const summary = summarizeHarness(next);
-  summary.preview = clip(harnessPreview(parsed.rawId), 140);
+  const summary = summarizeHarness(next, workflowRunId ? workflowNameFor(next) || undefined : undefined);
+  fillHarnessPreviewAndCount(summary);
   return summary;
 }
 
@@ -321,6 +500,9 @@ export function deleteUnifiedSession(
   if (!parsed) return null;
 
   if (parsed.store === 'desktop') {
+    const canonicalHarnessRow = canonicalHarnessRowForRawId(parsed.rawId);
+    if (canonicalHarnessRow) return deleteUnifiedSession(`${HARNESS_PREFIX}${canonicalHarnessRow.id}`, hard);
+
     const store = new SessionStore();
     return { ok: store.delete(parsed.rawId), mode: 'deleted' };
   }
@@ -332,6 +514,8 @@ export function deleteUnifiedSession(
     // Not supported for harness sessions (would lose audit history).
     return { ok: false, mode: 'archived' };
   }
-  updateHarnessSession(parsed.rawId, { metadata: { ...row.metadata, archived: true } });
+  for (const target of relatedHarnessRowsForPatch(row)) {
+    updateHarnessSession(target.id, { metadata: { ...target.metadata, archived: true } });
+  }
   return { ok: true, mode: 'archived' };
 }

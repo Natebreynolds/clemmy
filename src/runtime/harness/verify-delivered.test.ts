@@ -72,6 +72,19 @@ test('blocked-text in the final reply is blocked (no judge needed)', async () =>
   assert.equal(judge.calls(), 0);
 });
 
+test('a self-declared non-delivery is blocked even when the run stopped cleanly', async () => {
+  const judge = judgeStub(true);
+  const v = await verifyDelivered(
+    'count markdown files and return only the integer',
+    "I'm stopping this run without a number because no command executed and no tool result was available. Nothing satisfies the success criterion; no verified integer was produced.",
+    { stoppedReason: 'success', judgeFn: judge.fn },
+  );
+  assert.equal(v.delivered, false);
+  assert.equal(v.status, 'blocked');
+  assert.match(v.reason ?? '', /without a number/i);
+  assert.equal(judge.calls(), 0);
+});
+
 test('a PROMISE-shaped reply spends a judge call; judge=not-done => blocked', async () => {
   const judge = judgeStub(false);
   const v = await verifyDelivered("prep the contacts", "I'll prep those contacts and get them over to you next.", {
@@ -135,6 +148,8 @@ test('kill-switch off => always delivered (no behavior change, no judge call)', 
 test('matchesBlockedText: true on blocked shapes, false on a clean result', () => {
   assert.equal(matchesBlockedText('Approval required to send.'), true);
   assert.equal(matchesBlockedText('waiting on your confirmation'), true);
+  assert.equal(matchesBlockedText("I'm stopping this run without a number."), true);
+  assert.equal(matchesBlockedText('Nothing that satisfies the success criterion; no verified integer produced.'), true);
   assert.equal(matchesBlockedText('Added 5 rows to the sheet.'), false);
   assert.equal(matchesBlockedText(''), false);
   assert.equal(matchesBlockedText(undefined), false);

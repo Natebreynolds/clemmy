@@ -62,6 +62,45 @@ export function findDuplicateQueuedWorkflowRun(
   return null;
 }
 
+function normalizeOriginSessionIds(...values: unknown[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed && !seen.has(trimmed)) {
+        seen.add(trimmed);
+        out.push(trimmed);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) add(item);
+    }
+  };
+  for (const value of values) add(value);
+  return out;
+}
+
+function attachOriginSessionIdsToRun(runId: string, origins: string[]): void {
+  if (origins.length === 0) return;
+  const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
+  if (!existsSync(file)) return;
+  let rec: Record<string, unknown>;
+  try {
+    rec = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  const merged = normalizeOriginSessionIds(rec.originSessionId, rec.originSessionIds, origins);
+  if (merged.length === 0) return;
+  rec.originSessionId = merged[0];
+  if (merged.length > 1) rec.originSessionIds = merged;
+  else delete rec.originSessionIds;
+  writeFileSync(file, JSON.stringify(rec, null, 2), 'utf-8');
+}
+
 export interface QueueWorkflowRunResult {
   status: 'queued' | 'duplicate';
   id?: string;
@@ -79,6 +118,10 @@ export interface QueueWorkflowRunOptions {
    *  Written into the run record so the runner re-enters it on a terminal
    *  state. Omit for scheduled/cron/dashboard/webhook runs (notification-only). */
   originSessionId?: string;
+  /** Additional origin chats that requested/observed the same queued/running
+   *  work. Backwards-compatible with originSessionId; used only when duplicate
+   *  queue requests should also report back to the current chat. */
+  originSessionIds?: string[];
   /** Self-heal lineage: how many times this run has already been auto-healed +
    *  re-queued. Carried run→run so the runner can bound auto-heal attempts. */
   selfHealAttempt?: number;
@@ -109,7 +152,9 @@ export function queueWorkflowRun(
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
   const duplicate = findDuplicateQueuedWorkflowRun(name, normalizedInputs, opts?.excludeRunId);
+  const origins = normalizeOriginSessionIds(opts?.originSessionId, opts?.originSessionIds);
   if (duplicate) {
+    attachOriginSessionIdsToRun(duplicate.id, origins);
     return {
       status: 'duplicate',
       id: duplicate.id,
@@ -117,7 +162,7 @@ export function queueWorkflowRun(
     };
   }
   const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
-  const origin = opts?.originSessionId?.trim();
+  const origin = origins[0];
   const selfHealAttempt = typeof opts?.selfHealAttempt === 'number' && opts.selfHealAttempt > 0
     ? opts.selfHealAttempt
     : undefined;
@@ -146,6 +191,7 @@ export function queueWorkflowRun(
       // Only written when present → scheduled/dashboard/webhook records are
       // byte-identical to before (no origin → notification-only).
       ...(origin ? { originSessionId: origin } : {}),
+      ...(origins.length > 1 ? { originSessionIds: origins } : {}),
       ...(selfHealAttempt ? { selfHealAttempt } : {}),
       ...(goalAttempt ? { goalAttempt } : {}),
       ...(goalFeedback ? { goalFeedback } : {}),
@@ -258,9 +304,9 @@ export function requeueWorkflowFromRun(
   if (!existsSync(file)) {
     return { status: 'not_found', message: `Original run "${originalRunId}" not found; nothing to re-queue.` };
   }
-  let rec: { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
+  let rec: { workflow?: unknown; inputs?: unknown; originSessionId?: unknown; originSessionIds?: unknown };
   try {
-    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
+    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown; originSessionId?: unknown; originSessionIds?: unknown };
   } catch {
     return { status: 'not_found', message: 'Original run record unreadable; nothing to re-queue.' };
   }
@@ -273,10 +319,12 @@ export function requeueWorkflowFromRun(
   );
   // Carry the original run's chat-origin so the re-run reports back into the
   // SAME chat (closes the deferred report-back gap), unless the caller overrides.
-  const originSessionId = opts.originSessionId
-    ?? (typeof rec.originSessionId === 'string' ? rec.originSessionId : undefined);
+  const originSessionIds = opts.originSessionId || opts.originSessionIds
+    ? normalizeOriginSessionIds(opts.originSessionId, opts.originSessionIds)
+    : normalizeOriginSessionIds(rec.originSessionId, rec.originSessionIds);
   const queued = queueWorkflowRun(workflow, inputs, {
-    originSessionId,
+    originSessionId: originSessionIds[0],
+    originSessionIds,
     selfHealAttempt: opts.selfHealAttempt,
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,
@@ -294,9 +342,9 @@ export function requeueWorkflowFailedItemsFromRun(
   if (!existsSync(file)) {
     return { status: 'not_found', message: `Original run "${originalRunId}" not found; no failed items to re-queue.` };
   }
-  let rec: { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
+  let rec: { workflow?: unknown; inputs?: unknown; originSessionId?: unknown; originSessionIds?: unknown };
   try {
-    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown; originSessionId?: unknown };
+    rec = JSON.parse(readFileSync(file, 'utf-8')) as { workflow?: unknown; inputs?: unknown; originSessionId?: unknown; originSessionIds?: unknown };
   } catch {
     return { status: 'not_found', message: 'Original run record unreadable; no failed items to re-queue.' };
   }
@@ -332,10 +380,12 @@ export function requeueWorkflowFailedItemsFromRun(
       ? (rec.inputs as Record<string, string>)
       : {},
   );
-  const originSessionId = opts.originSessionId
-    ?? (typeof rec.originSessionId === 'string' ? rec.originSessionId : undefined);
+  const originSessionIds = opts.originSessionId || opts.originSessionIds
+    ? normalizeOriginSessionIds(opts.originSessionId, opts.originSessionIds)
+    : normalizeOriginSessionIds(rec.originSessionId, rec.originSessionIds);
   const queued = queueWorkflowRun(workflow, inputs, {
-    originSessionId,
+    originSessionId: originSessionIds[0],
+    originSessionIds,
     selfHealAttempt: opts.selfHealAttempt,
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,

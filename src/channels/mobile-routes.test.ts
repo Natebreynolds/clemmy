@@ -35,7 +35,7 @@ interface Harness {
 
 let harnessCounter = 0;
 
-async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean }): Promise<Harness> {
+async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean; assistant?: Parameters<typeof createMobileRouter>[0]['assistant'] }): Promise<Harness> {
   const stateDir = path.join(TMP_ROOT, `case-${++harnessCounter}`);
   const app = express();
   app.use(express.json());
@@ -46,6 +46,7 @@ async function startHarness(opts?: { admin?: boolean; cookieSecure?: boolean }):
       stateDir,
       cookieSecure: opts?.cookieSecure,
       isAdminAuthorized: () => admin,
+      assistant: opts?.assistant,
     }),
   );
   const server: Server = await new Promise((resolve) => {
@@ -363,6 +364,51 @@ test('chat/send returns 503 when no assistant is wired', async () => {
     const body = await res.json() as { error: string };
     assert.equal(body.error, 'CHAT_SEND_UNAVAILABLE');
   } finally { await h.close(); }
+});
+
+test('chat/send includes model route diagnostics and preserves them on idempotent replay', async () => {
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  const assistant = {
+    respond: async (req: { sessionId: string }) => ({
+      text: 'Done. Route passthrough recorded.',
+      sessionId: req.sessionId,
+    }),
+  } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    const cookie = extractCookie(login.headers.get('set-cookie'))!;
+
+    const first = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'route-replay-1' },
+      body: JSON.stringify({ message: 'record route diagnostics', sessionId: 'sess-mobile-route' }),
+    });
+    assert.equal(first.status, 200);
+    const firstBody = await first.json() as { route?: { routeKind?: string; surface?: string; transport?: string } };
+    assert.equal(firstBody.route?.routeKind, 'legacy');
+    assert.equal(firstBody.route?.surface, 'webhook');
+    assert.equal(firstBody.route?.transport, 'legacy_assistant');
+
+    const replay = await fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'route-replay-1' },
+      body: JSON.stringify({ message: 'record route diagnostics', sessionId: 'sess-mobile-route' }),
+    });
+    assert.equal(replay.headers.get('idempotent-replay'), '1');
+    const replayBody = await replay.json() as { route?: { routeKind?: string; surface?: string; transport?: string } };
+    assert.deepEqual(replayBody.route, firstBody.route);
+  } finally {
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    await h.close();
+  }
 });
 
 test('chat transcript preserves limit-exceeded reason metadata for mobile continue UX', async () => {

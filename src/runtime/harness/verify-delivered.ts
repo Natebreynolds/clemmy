@@ -47,6 +47,10 @@ export const BLOCKED_TEXT_PATTERNS: RegExp[] = [
   /\bwaiting (on|for) (your|user|the user)\b/i,
   /\bblocked (on|by)\b/i,
   /\bmissing (data|access|credentials|the required)\b/i,
+  /\bi('?m| am)\s+stopping\b[\s\S]{0,160}\bwithout\b[\s\S]{0,80}\b(number|result|deliverable|answer|verified)\b/i,
+  /\bnothing that satisfies (the )?success (criterion|criteria)\b/i,
+  /\bno verified (integer|number|result|deliverable|answer)\b/i,
+  /\bno command executed and no tool result\b/i,
   // Runtime-error stubs that respond() produces when the model backend throws
   // (a wall-clock abort that survived the in-loop retries, a 5xx burst, a
   // transport timeout). These are NOT completed deliverables.

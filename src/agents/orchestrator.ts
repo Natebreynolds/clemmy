@@ -1250,6 +1250,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
+  const baseInstructions = harnessInstructions(rubricChoice.instructions, { sessionId: options.sessionId ?? undefined });
+  const instructions = codeModeMandate
+    ? () => `${baseInstructions()}\n\n${codeModeMandate}`
+    : baseInstructions;
+
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'Clem',
     handoffDescription:
@@ -1258,7 +1263,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // (SOUL, MEMORY, IDENTITY, working memory, facts, goals) each
     // turn — vault edits and new facts surface immediately without
     // restarting the daemon.
-    instructions: harnessInstructions(rubricChoice.instructions, { sessionId: options.sessionId ?? undefined }) + (codeModeMandate ? `\n\n${codeModeMandate}` : ''),
+    instructions,
     // Per-call override (dormant — no caller passes it yet) so worker-model
     // routing survives a workflow-step conversion onto the harness loop.
     model: options.model ?? resolveRoleModel('brain').modelId,

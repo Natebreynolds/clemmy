@@ -252,6 +252,29 @@ test('listSessions filters recent sessions without loading events', () => {
   assert.deepEqual(new Set(activeRows.map((session) => session.id)), new Set([discord.id, workflow.id]));
 });
 
+test('listSessions has deterministic tie ordering for offset pagination', () => {
+  resetEventLog();
+  for (let i = 0; i < 5; i += 1) {
+    createSession({ id: `tie-page-${String(i).padStart(3, '0')}`, kind: 'chat' });
+  }
+
+  const sameUpdatedAt = '2026-07-01T00:00:00.000Z';
+  openEventLog().prepare('UPDATE sessions SET updated_at = ? WHERE id LIKE ?').run(sameUpdatedAt, 'tie-page-%');
+
+  assert.deepEqual(
+    listSessions({ limit: 2, offset: 0 }).map((session) => session.id),
+    ['tie-page-004', 'tie-page-003'],
+  );
+  assert.deepEqual(
+    listSessions({ limit: 2, offset: 2 }).map((session) => session.id),
+    ['tie-page-002', 'tie-page-001'],
+  );
+  assert.deepEqual(
+    listSessions({ limit: 2, offset: 4 }).map((session) => session.id),
+    ['tie-page-000'],
+  );
+});
+
 test('kill switch is sticky until cleared', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

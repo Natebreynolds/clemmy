@@ -62,7 +62,7 @@ export function resolveBackgroundTask(input?: string): BackgroundTaskRecord | nu
   }
 
   return listBackgroundTasks()
-    .find((task) => task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'awaiting_continue' || task.status === 'pending')
+    .find((task) => task.status === 'running' || task.status === 'awaiting_approval' || task.status === 'awaiting_input' || task.status === 'awaiting_continue' || task.status === 'pending')
     ?? listBackgroundTasks()[0]
     ?? null;
 }

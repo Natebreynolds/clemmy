@@ -7,7 +7,9 @@ import { loadSessionBrief, listSessionBriefs, refreshSessionBrief, renderSession
 import { PlanStore } from '../planning/plan-store.js';
 import { INBOX_DIR, TASKS_FILE, parseTasks, sessions, textResult } from './shared.js';
 import { listGoalRecords, type GoalRecord } from '../memory/goals-list.js';
-import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
+import { getSession as getHarnessSession, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
+import { pullRecentTurnsForHarnessHistory, renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
+import type { ConversationTurn, SessionRecord } from '../types.js';
 
 interface DiscoveredWorkItem {
   type: string;
@@ -163,6 +165,38 @@ function renderDiscoveredWork(items: DiscoveredWorkItem[], limit: number): strin
   ].join('\n');
 }
 
+function harnessSessionRecordForContinuity(sessionId: string): SessionRecord | null {
+  try {
+    const row = getHarnessSession(sessionId);
+    if (!row) return null;
+    const turns: ConversationTurn[] = pullRecentTurnsForHarnessHistory(sessionId, 20).map((turn) => ({
+      role: turn.who === 'user' ? 'user' : 'assistant',
+      text: turn.text,
+      createdAt: turn.at,
+    }));
+    return {
+      id: row.id,
+      userId: row.userId ?? undefined,
+      channel: row.channel ?? undefined,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      title: row.title ?? row.objective ?? undefined,
+      turns,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sessionRecordForContinuity(sessionId: string): { session: SessionRecord; source: 'legacy' | 'harness' } {
+  const harness = harnessSessionRecordForContinuity(sessionId);
+  if (harness && harness.turns.length > 0) return { session: harness, source: 'harness' };
+  const legacy = sessions.get(sessionId);
+  if (legacy.turns.length > 0) return { session: legacy, source: 'legacy' };
+  if (harness) return { session: harness, source: 'harness' };
+  return { session: legacy, source: 'legacy' };
+}
+
 export function registerSessionTools(server: McpServer): void {
   server.tool(
     'session_history',
@@ -172,7 +206,7 @@ export function registerSessionTools(server: McpServer): void {
       max_turns: z.number().int().min(1).max(40).optional(),
     },
     async ({ session_id, max_turns }) => {
-      const transcript = sessions.recentTranscript(session_id, max_turns ?? 12);
+      const transcript = renderSessionHistoryForModel(session_id, max_turns ?? 12, 12_000);
       if (transcript) return textResult(transcript);
 
       // Fallback: harness sessions (Discord, workflow chat) record their
@@ -209,7 +243,7 @@ export function registerSessionTools(server: McpServer): void {
       context: z.string().optional(),
     },
     async ({ session_id, completed, remaining, decisions, blockers, context }) => {
-      const session = sessions.get(session_id);
+      const { session } = sessionRecordForContinuity(session_id);
       const brief = saveSessionManualHandoff({
         session,
         completed,
@@ -237,13 +271,30 @@ export function registerSessionTools(server: McpServer): void {
       session_id: z.string().min(1),
     },
     async ({ session_id }) => {
-      const session = sessions.get(session_id);
+      const { session, source } = sessionRecordForContinuity(session_id);
+      const brief = loadSessionBrief(session_id);
+      if (source === 'harness') {
+        const harnessHistory = renderSessionHistoryForModel(session_id, 20, 16_000);
+        if (brief) {
+          return textResult([
+            renderSessionResume(session, brief),
+            harnessHistory ? `Canonical harness history:\n${harnessHistory}` : '',
+          ].filter(Boolean).join('\n\n'));
+        }
+        if (harnessHistory) {
+          return textResult([
+            `Harness session resume for ${session_id}.`,
+            harnessHistory,
+          ].join('\n\n'));
+        }
+      }
       if (session.turns.length === 0) {
+        if (brief) return textResult(renderSessionResume(session, brief));
         return textResult('No prior activity for that session.');
       }
 
-      const brief = loadSessionBrief(session_id) ?? refreshSessionBrief(session);
-      return textResult(renderSessionResume(session, brief));
+      const refreshed = brief ?? refreshSessionBrief(session);
+      return textResult(renderSessionResume(session, refreshed));
     },
   );
 

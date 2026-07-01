@@ -34,10 +34,13 @@ import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderEstablishedDestinationsForContext } from '../runtime/harness/published-destinations.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
 import { listActiveGoalSummaries } from '../memory/goals-list.js';
+import { loadWorkingMemoryForSession } from '../memory/working-memory.js';
 import { listHeldTasks } from './plan-proposals.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import { modelParityEnabled, CACHE_BREAK_SENTINEL } from '../runtime/harness/model-wire-registry.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
+import { renderRecentActionsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
@@ -271,13 +274,20 @@ function queryRecallEnabled(): boolean {
 const VOLATILE_CONTEXT_TITLES = new Set<string>([
   'Now',
   'Relevant To Your Request',
+  'Completed Actions This Conversation',
   'Working Memory',
   'Active Goals',
   'Held For Later',
   'Current Focus',
 ]);
 
-export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: string; partition?: 'all' | 'stable' | 'volatile' }): string {
+export function renderHarnessMemoryContext(opts?: {
+  sessionId?: string;
+  query?: string;
+  partition?: 'all' | 'stable' | 'volatile';
+  includeRememberedToolChoices?: boolean;
+  includeSessionActions?: boolean;
+}): string {
   let memContext;
   try {
     memContext = loadMemoryContext();
@@ -301,6 +311,7 @@ export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: 
   // learned tools/facts. Scoped to the active focus objective. Returns
   // SECTION-wrapped strings, placed below at their existing positions.
   const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(getActiveObjective());
+  const rememberedToolChoices = opts?.includeRememberedToolChoices === false ? '' : toolChoices;
 
   // Source-map / landscape memory — a pointer-first index of WHERE the user's
   // data lives, scoped to the active objective. Off (flag) → ''.
@@ -321,6 +332,17 @@ export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: 
   const goals = renderActiveGoals();
   const heldTasks = renderHeldTasks(opts?.sessionId);
   const nowLine = renderCurrentTimeForInstructions();
+  const workingMemory = opts?.sessionId
+    ? loadWorkingMemoryForSession(opts.sessionId) ?? memContext.workingMemory
+    : memContext.workingMemory;
+  let sessionActions = '';
+  if (opts?.sessionId && opts.includeSessionActions !== false) {
+    try {
+      sessionActions = renderRecentActionsForHarnessHistory(openEventLog(), opts.sessionId);
+    } catch {
+      sessionActions = '';
+    }
+  }
 
   let skills = '';
   try {
@@ -365,13 +387,14 @@ export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: 
     { title: 'Autonomy', text: section('Autonomy', renderAutonomy()) },
     { title: 'Standing Constraints', text: section('Standing Constraints', constraints) },
     { title: 'Relevant To Your Request', text: section('Relevant To Your Request', requestRecall) },
+    { title: 'Completed Actions This Conversation', text: section('Completed Actions This Conversation', sessionActions) },
     { title: 'User Preferences', text: section('User Preferences', profile) },
     { title: 'Persistent Facts', text: section('Persistent Facts', facts) },
     { title: 'Recently Learned', text: recentlyLearned },
     { title: 'Data Landscape', text: section('Data Landscape', dataLandscape) },
-    { title: 'Remembered Tool Choices', text: toolChoices },
+    { title: 'Remembered Tool Choices', text: rememberedToolChoices },
     { title: 'Established Destinations', text: establishedDestinations },
-    { title: 'Working Memory', text: section('Working Memory', memContext.workingMemory) },
+    { title: 'Working Memory', text: section('Working Memory', workingMemory) },
     { title: 'Identity', text: section('Identity', memContext.identity) },
     { title: 'Core Personality', text: section('Core Personality', memContext.soul) },
     { title: 'Long-Term Memory', text: section('Long-Term Memory', memContext.memory) },
@@ -414,9 +437,17 @@ export function renderHarnessMemoryContext(opts?: { sessionId?: string; query?: 
  * once per turn via getSystemPrompt, so vault edits surface
  * immediately on the next turn.
  */
-export function harnessInstructions(roleInstructions: string, opts?: { sessionId?: string }): () => string {
+export function harnessInstructions(roleInstructions: string, opts?: {
+  sessionId?: string;
+  includeRememberedToolChoices?: boolean;
+  includeSessionActions?: boolean;
+}): () => string {
   return () => {
-    const ctx = renderHarnessMemoryContext({ sessionId: opts?.sessionId });
+    const ctx = renderHarnessMemoryContext({
+      sessionId: opts?.sessionId,
+      includeRememberedToolChoices: opts?.includeRememberedToolChoices,
+      includeSessionActions: opts?.includeSessionActions,
+    });
     if (!ctx) return roleInstructions;
     // Parity (default): STABLE role instructions FIRST so the whole prefix
     // (identity + role + tools) can be prompt-cached; the per-turn DYNAMIC

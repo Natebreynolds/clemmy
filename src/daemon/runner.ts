@@ -24,6 +24,7 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
+import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processSpaceSchedules } from '../spaces/scheduler.js';
@@ -31,6 +32,7 @@ import { isSpacesEnabled } from '../spaces/store.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
 import { reportInterruptedChatRuns } from '../runtime/harness/restart-recovery.js';
+import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session-reconcile.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
@@ -72,6 +74,7 @@ import {
 } from '../runtime/notifications.js';
 import { deliverNotificationToDestination } from '../runtime/notification-delivery.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import type { AssistantResponse } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
 const STATE_FILE = path.join(path.dirname(CRON_RUNS_DIR), 'daemon-state.json');
@@ -120,6 +123,11 @@ const DELIVERY_MAX_AGE_MS = (() => {
 const DELIVERY_MAX_PER_TICK = (() => {
   const n = parseInt(getRuntimeEnv('NOTIFICATION_DELIVERY_MAX_PER_TICK') ?? '', 10);
   return Number.isFinite(n) && n > 0 ? n : 25;
+})();
+const NO_DESTINATION_RETRY_KEY = '__no_destinations__';
+const NO_DESTINATION_RETRY_MS = (() => {
+  const minutes = parseInt(getRuntimeEnv('NOTIFICATION_NO_DESTINATION_RETRY_MINUTES') ?? '', 10);
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 15) * 60_000;
 })();
 
 function sleep(ms: number): Promise<void> {
@@ -215,6 +223,19 @@ function appendRunLog(jobName: string, payload: Record<string, unknown>): void {
   writeFileSync(filePath, `${existing}${JSON.stringify(payload)}\n`, 'utf-8');
 }
 
+function cronRouteMetadata(response: Pick<AssistantResponse, 'route' | 'raw'>): Record<string, unknown> | undefined {
+  const route = routeDiagnosticsFromResponse(response);
+  if (!route) return undefined;
+  return {
+    routeKind: route.routeKind,
+    requestedModel: route.requestedModel,
+    effectiveModel: route.effectiveModel,
+    provider: route.provider,
+    transport: route.transport,
+    falloverFrom: route.falloverFrom,
+  };
+}
+
 // Per-cron wall-clock budget. Unleashed/background jobs are allowed
 // more headroom because they're often the ones doing real research
 // (proposal briefs, audits). job.max_hours is honored if set; otherwise
@@ -305,6 +326,7 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
     // promised / errored run. Fail-open + suspicious-only, so this only ever
     // converts a false "ok" into an honest "needs attention".
     const verdict = await verifyDelivered(prompt, response.text, { stoppedReason: response.stoppedReason });
+    const route = cronRouteMetadata(response);
 
     appendRunLog(job.name, {
       status: verdict.delivered ? 'ok' : 'blocked',
@@ -313,6 +335,7 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       durationMs: Date.now() - startMs,
       source,
       response: response.text,
+      ...(route ? { route } : {}),
       ...(verdict.delivered ? {} : { blockedReason: verdict.reason }),
     });
     addNotification({
@@ -328,9 +351,9 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
         : `⚠️ This run did not finish cleanly: ${verdict.reason ?? 'no verifiable result'}\n\n${response.text}`,
       createdAt: new Date().toISOString(),
       read: false,
-      metadata: { job: job.name, source, ...(verdict.delivered ? {} : { status: 'blocked' }) },
+      metadata: { job: job.name, source, ...(route ? { route } : {}), ...(verdict.delivered ? {} : { status: 'blocked' }) },
     });
-    logger.info({ job: job.name, source, delivered: verdict.delivered }, verdict.delivered ? 'Cron job completed' : 'Cron job blocked (not done)');
+    logger.info({ job: job.name, source, delivered: verdict.delivered, route }, verdict.delivered ? 'Cron job completed' : 'Cron job blocked (not done)');
   } catch (error) {
     appendRunLog(job.name, {
       status: 'error',
@@ -691,8 +714,15 @@ function emitNoDestinationsPromptIfNeeded(deferredCount: number): void {
     body: 'Clementine has produced notifications (cron jobs, workflows, executions) that have nowhere to go. Open Console → Settings → Notifications to add a Discord channel/DM or webhook. Deferred notifications will flush automatically once a destination is configured.',
     createdAt: new Date().toISOString(),
     read: false,
+    // Dashboard-only: this warning exists because there is no external route.
+    // Queueing it for delivery would create another unroutable queue item.
+    silent: true,
     metadata: { errorCategory: 'no_destinations', deferredCount },
   });
+}
+
+function isNoDestinationsSetupNotification(notification: NotificationRecord): boolean {
+  return notification.kind === 'system' && notification.metadata?.errorCategory === 'no_destinations';
 }
 
 function staleApprovalNotificationReason(
@@ -735,7 +765,7 @@ function staleApprovalNotificationReason(
   return 'approval_not_found';
 }
 
-async function processNotificationDeliveries(assistant: ClementineAssistant): Promise<void> {
+export async function processNotificationDeliveries(assistant: ClementineAssistant): Promise<void> {
   const queue = listQueuedNotificationDeliveries();
   if (queue.length === 0) return;
 
@@ -747,6 +777,17 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
   for (const job of queue) {
     const notification = getNotification(job.notificationId);
     if (!notification) {
+      continue;
+    }
+
+    if (isNoDestinationsSetupNotification(notification)) {
+      // Legacy queue hygiene: older builds created this setup warning as a
+      // normal push notification. It exists because there is no external route,
+      // so keep it in Activity but never deliver or retry it externally.
+      updateNotificationDeliveryStatus(notification.id, {
+        deliveredAt: notification.deliveredAt,
+        deliveryError: 'Skipped: no-destination setup notification is dashboard-only',
+      });
       continue;
     }
 
@@ -780,12 +821,30 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
 
     const destinations = getNotificationDestinationsForRecord(notification);
     if (destinations.length === 0) {
+      const nextNoDestinationAttempt = job.nextAttemptAtByDestination?.[NO_DESTINATION_RETRY_KEY];
+      if (nextNoDestinationAttempt) {
+        const nextAttemptMs = Date.parse(nextNoDestinationAttempt);
+        if (Number.isFinite(nextAttemptMs) && nextAttemptMs > nowMs) {
+          nextQueue.push(job);
+          continue;
+        }
+      }
+
       // No destinations resolved. Previously this dropped the job
       // permanently — the user could trigger hours of work and never
       // hear a peep. Now we keep the job alive in the queue (cheap;
-      // it's just a scan per tick) and emit a single daily prompt
-      // telling the user to configure a destination. As soon as one
-      // is added, the queued jobs flush on the next tick.
+      // it's just a scan per tick), but we back off the warning/prompt
+      // path so one unroutable job cannot spam logs every 15s. We still
+      // resolve destinations before honoring this backoff, so adding a
+      // destination lets queued jobs flush on the next tick.
+      job.nextAttemptAtByDestination = {
+        ...(job.nextAttemptAtByDestination ?? {}),
+        [NO_DESTINATION_RETRY_KEY]: new Date(nowMs + NO_DESTINATION_RETRY_MS).toISOString(),
+      };
+      updateNotificationDeliveryStatus(notification.id, {
+        deliveredAt: notification.deliveredAt,
+        deliveryError: 'Deferred: no notification destinations configured',
+      });
       deferredCount += 1;
       if (deferredCount === 1) {
         logger.warn({
@@ -813,6 +872,7 @@ async function processNotificationDeliveries(assistant: ClementineAssistant): Pr
     const attemptCountByDestination = { ...(job.attemptCountByDestination ?? {}) };
     const nextAttemptAtByDestination = { ...(job.nextAttemptAtByDestination ?? {}) };
     const lastErrorByDestination = { ...(job.lastErrorByDestination ?? {}) };
+    delete nextAttemptAtByDestination[NO_DESTINATION_RETRY_KEY];
     const successfulDestinations: string[] = [];
     let lastError = '';
     let attemptedThisPass = 0;
@@ -943,6 +1003,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const recoveredChats = reportInterruptedChatRuns();
   if (recoveredChats > 0) {
     logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart');
+  }
+  const reconciledHarnessSessions = reconcileDormantTerminalWorkSessions();
+  if (reconciledHarnessSessions.reconciled > 0) {
+    logger.warn(
+      {
+        reconciled: reconciledHarnessSessions.reconciled,
+        completed: reconciledHarnessSessions.completed,
+        failed: reconciledHarnessSessions.failed,
+      },
+      'Reconciled stale non-chat harness sessions with terminal event evidence',
+    );
   }
   // Sweep records that got stuck active across a previous crash/restart.
   // Without this, the dashboard "NOW" panel still reports phantom in-flight

@@ -17,7 +17,7 @@ import {
   tryHandleHarnessApprovalReply,
   type DiscordHarnessTransport,
 } from './discord-harness.js';
-import { buildSlackHarnessTransport, handleSlackHarnessMessage, toSlackMrkdwn } from './slack-harness.js';
+import { buildSlackHarnessTransport, handleSlackHarnessMessage, slackHarnessConversationId, toSlackMrkdwn } from './slack-harness.js';
 import { ClementineAssistant } from '../assistant/core.js';
 import { claimInbound, completeInbound } from './inbox-store.js';
 import type { ApprovalResolutionResult } from '../types.js';
@@ -340,8 +340,17 @@ function requireClient(): WebClient {
   return slackApp.client;
 }
 
-export async function sendSlackChannelMessage(channelId: string, text: string): Promise<void> {
-  await requireClient().chat.postMessage({ channel: channelId, text: toSlackMrkdwn(text) || '…', mrkdwn: true });
+export async function sendSlackChannelMessage(
+  channelId: string,
+  text: string,
+  options: { threadTs?: string } = {},
+): Promise<void> {
+  await requireClient().chat.postMessage({
+    channel: channelId,
+    thread_ts: options.threadTs,
+    text: toSlackMrkdwn(text) || '…',
+    mrkdwn: true,
+  });
 }
 
 export async function sendSlackDirectMessage(
@@ -361,8 +370,9 @@ export async function sendSlackChannelMessageWithBlocks(
   channelId: string,
   text: string,
   blocks: KnownBlock[],
+  options: { threadTs?: string } = {},
 ): Promise<void> {
-  await postWithOptionalBlocks(requireClient(), channelId, text, blocks);
+  await postWithOptionalBlocks(requireClient(), channelId, text, blocks, options);
 }
 
 async function postWithOptionalBlocks(
@@ -370,16 +380,18 @@ async function postWithOptionalBlocks(
   channel: string,
   text: string,
   blocks?: KnownBlock[],
+  options: { threadTs?: string } = {},
 ): Promise<void> {
   const body = toSlackMrkdwn(text);
   if (blocks && blocks.length > 0) {
     await client.chat.postMessage({
       channel,
+      thread_ts: options.threadTs,
       text: (body || '…').slice(0, 2900),
       blocks: [{ type: 'section', text: { type: 'mrkdwn', text: (body || '…').slice(0, 2900) } }, ...blocks],
     });
   } else {
-    await client.chat.postMessage({ channel, text: body || '…', mrkdwn: true });
+    await client.chat.postMessage({ channel, thread_ts: options.threadTs, text: body || '…', mrkdwn: true });
   }
 }
 
@@ -471,9 +483,10 @@ async function dispatchInbound(opts: {
   }
   // Approval-resume shortcut: "approve apr-xxxx" while a session is paused.
   const transport = buildSlackHarnessTransport({ client: opts.client, channel: opts.channelId, threadTs: opts.threadTs });
+  const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs);
   try {
     const handled = await tryHandleHarnessApprovalReply({
-      channelId: opts.channelId,
+      channelId: conversationId,
       prompt: opts.prompt,
       transport,
       allowGlobalApprovalFallback: !opts.threadTs, // DMs (no thread) allow the global fallback, like Discord DMs
@@ -524,7 +537,8 @@ async function handleSlackAction(opts: {
   }
 
   if (action === 'session-resume') {
-    const bound = bindDiscordHarnessSession({ channelId: opts.channelId, sessionId: targetId, userId: opts.userId });
+    const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs ?? opts.messageTs);
+    const bound = bindDiscordHarnessSession({ channelId: conversationId, sessionId: targetId, userId: opts.userId });
     await opts.respondEphemeral(bound
       ? `Bound this conversation to \`${targetId}\`. Your next message continues that session.`
       : `Session \`${targetId}\` was not found.`);
@@ -540,8 +554,9 @@ async function handleSlackAction(opts: {
         return;
       }
       const transport = buildSlackHarnessTransport({ client: opts.client, channel: opts.channelId, threadTs: opts.threadTs ?? opts.messageTs });
+      const conversationId = slackHarnessConversationId(opts.channelId, opts.threadTs ?? opts.messageTs);
       const handled = await tryHandleHarnessApprovalReply({
-        channelId: opts.channelId,
+        channelId: conversationId,
         prompt: `${approved ? 'approve' : 'reject'} ${targetId}`,
         transport,
         allowGlobalApprovalFallback: false,

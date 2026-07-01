@@ -6,8 +6,10 @@ import {
   renderBackgroundTaskStatus,
 } from '../execution/background-task-status.js';
 import { enqueueDurableChatTask } from '../execution/background-promote.js';
+import type { BackgroundTaskRecord } from '../execution/background-tasks.js';
 import { bindBackgroundRunGoal, holdTaskForLater, listHeldTasks, getHeldTask } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
+import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
 
@@ -19,6 +21,49 @@ function planToNextActions(plan: string): string[] {
     .map((line) => line.replace(/^\s*(?:[-*+]|\d+[.)])\s*/, '').trim())
     .filter((line) => line.length > 0)
     .slice(0, 12);
+}
+
+export function backgroundRouteForOriginSession(sessionId: string): Pick<BackgroundTaskRecord, 'source' | 'channel' | 'userId'> {
+  try {
+    const row = getHarnessSession(sessionId);
+    if (!row) return { source: 'desktop' };
+    const metadata = row.metadata ?? {};
+    const rawChannel = String(row.channel ?? metadata.source ?? '').trim();
+    const source = rawChannel === 'discord' || rawChannel === 'slack' || rawChannel === 'webhook'
+      || rawChannel === 'cli' || rawChannel === 'gateway' || rawChannel === 'mobile'
+      ? rawChannel as BackgroundTaskRecord['source']
+      : 'desktop';
+    const slackChannelId = typeof metadata.slackChannelId === 'string' && metadata.slackChannelId.trim()
+      ? metadata.slackChannelId.trim()
+      : '';
+    const slackThreadTs = typeof metadata.slackThreadTs === 'string' && metadata.slackThreadTs.trim()
+      ? metadata.slackThreadTs.trim()
+      : '';
+    const channelId = source === 'slack' && slackChannelId
+      ? (slackThreadTs ? `${slackChannelId}:${slackThreadTs}` : slackChannelId)
+      : typeof metadata.channelId === 'string' && metadata.channelId.trim()
+        ? metadata.channelId.trim()
+        : typeof metadata.discordChannelId === 'string' && metadata.discordChannelId.trim()
+          ? metadata.discordChannelId.trim()
+          : '';
+    const channel = (source === 'discord' || source === 'slack') && channelId
+      ? `${source}:${channelId}`
+      : rawChannel || undefined;
+    const metadataUser = typeof metadata.userId === 'string' && metadata.userId.trim()
+      ? metadata.userId.trim()
+      : source === 'slack' && typeof metadata.slackUserId === 'string' && metadata.slackUserId.trim()
+        ? metadata.slackUserId.trim()
+        : typeof metadata.discordUserId === 'string' && metadata.discordUserId.trim()
+          ? metadata.discordUserId.trim()
+          : undefined;
+    return {
+      source,
+      channel,
+      userId: row.userId ?? metadataUser,
+    };
+  } catch {
+    return { source: 'desktop' };
+  }
 }
 
 const statusSchema = z.enum([
@@ -114,11 +159,14 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           : '',
       ].filter(Boolean).join('\n');
 
+      const originRoute = backgroundRouteForOriginSession(sessionId);
       const task = enqueueDurableChatTask({
         message: objective,
         composedPrompt,
         sessionId,
-        source: 'desktop',
+        userId: originRoute.userId,
+        channel: originRoute.channel,
+        source: originRoute.source,
         maxMinutes: max_minutes ?? undefined,
       });
 

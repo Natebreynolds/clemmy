@@ -17,6 +17,8 @@ const { createFocus } = await import('../memory/focus.js');
 const { renderHarnessMemoryContext } = await import('./harness-context.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const { rememberFact } = await import('../memory/facts.js');
+const { checkpointWorkingMemory } = await import('../memory/working-memory.js');
+const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
 
 test('query-driven recall: a request-relevant fact is surfaced UP FRONT for a matching message (never knowledge-starve the brain)', () => {
   resetMemoryDb();
@@ -43,6 +45,66 @@ test('query-driven recall: no query ⇒ no per-request recall section (byte-iden
   resetMemoryDb();
   rememberFact({ kind: 'project', content: 'Market_Leader__c marks market leader accounts.' });
   assert.doesNotMatch(renderHarnessMemoryContext({ sessionId: 's' }), /## Relevant To Your Request/);
+});
+
+test('same-session completed external actions are visible in shared harness context', () => {
+  const session = createSession({ kind: 'chat', channel: 'test' });
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] },
+  });
+
+  const context = renderHarnessMemoryContext({ sessionId: session.id, partition: 'volatile' });
+  assert.match(context, /## Completed Actions This Conversation/);
+  assert.match(context, /ALREADY DONE in THIS conversation/);
+  assert.match(context, /OUTLOOK_SEND_EMAIL/);
+  assert.match(context, /casey@example\.com/);
+});
+
+test('workflow-step harness context sees completed actions from sibling step sessions', () => {
+  const step1 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Prompt Action Flow::step-1',
+    metadata: { workflowRunId: 'prompt-action-run', workflowName: 'Prompt Action Flow', stepId: 'step-1' },
+  });
+  appendEvent({
+    sessionId: step1.id,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'CRM_UPDATE', targets: ['account:42'] },
+  });
+  const step2 = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Prompt Action Flow::step-2',
+    metadata: { workflowRunId: 'prompt-action-run', workflowName: 'Prompt Action Flow', stepId: 'step-2' },
+  });
+
+  const context = renderHarnessMemoryContext({ sessionId: step2.id, partition: 'volatile' });
+
+  assert.match(context, /## Completed Actions This Conversation/);
+  assert.match(context, /ALREADY DONE in THIS workflow run/);
+  assert.match(context, /CRM_UPDATE/);
+  assert.match(context, /account:42/);
+});
+
+test('harness context prefers per-session working-memory checkpoints over global memory', () => {
+  checkpointWorkingMemory('sess-harness-wm', {
+    turn: 4,
+    toolCallsTotal: 9,
+    lastText: 'Recovered 12 prospects; next verify the publish queue.',
+  });
+
+  const context = renderHarnessMemoryContext({ sessionId: 'sess-harness-wm', partition: 'volatile' });
+
+  assert.match(context, /## Working Memory/);
+  assert.match(context, /In-flight Checkpoint/);
+  assert.match(context, /Recovered 12 prospects/);
 });
 
 test('Autonomy section: YOLO tells the model it has STANDING approval and not to seek sign-off', () => {

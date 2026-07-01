@@ -39,3 +39,36 @@ test('completionOutputPreview falls back to summary for legacy completions', () 
     'Legacy public completion.',
   );
 });
+
+test('message response serializer preserves route and stop diagnostics', () => {
+  assert.deepEqual(
+    __test__.serializeMessageResponse({
+      text: 'hello',
+      sessionId: 'sess-webhook-route',
+      runId: 'run-webhook-route',
+      stoppedReason: 'max-turns-with-grace',
+      turnsUsed: 12,
+      route: {
+        routeKind: 'harness',
+        surface: 'webhook',
+        effectiveModel: 'glm-4.5',
+        falloverFrom: 'claude_agent_sdk_brain',
+      },
+    }),
+    {
+      response: 'hello',
+      session_id: 'sess-webhook-route',
+      run_id: 'run-webhook-route',
+      queued_task_id: undefined,
+      pending_approval_id: undefined,
+      stopped_reason: 'max-turns-with-grace',
+      turns_used: 12,
+      route: {
+        routeKind: 'harness',
+        surface: 'webhook',
+        effectiveModel: 'glm-4.5',
+        falloverFrom: 'claude_agent_sdk_brain',
+      },
+    },
+  );
+});

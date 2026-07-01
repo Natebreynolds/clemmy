@@ -134,6 +134,7 @@ export interface NotificationDestination {
   type: 'generic_webhook' | 'discord_webhook' | 'discord_channel' | 'discord_user' | 'slack_webhook' | 'slack_channel' | 'slack_user' | 'web_push';
   url?: string;
   channelId?: string;
+  threadTs?: string;
   guildId?: string;
   userId?: string;
   /** Web Push subscription endpoint (push service URL). */
@@ -628,6 +629,7 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
   const explicitDiscordChannelId = typeof metadata.discordChannelId === 'string' ? metadata.discordChannelId : '';
   const explicitSlackUserId = typeof metadata.slackUserId === 'string' ? metadata.slackUserId : '';
   const explicitSlackChannelId = typeof metadata.slackChannelId === 'string' ? metadata.slackChannelId : '';
+  const explicitSlackThreadTs = typeof metadata.slackThreadTs === 'string' ? metadata.slackThreadTs : '';
 
   const derived: NotificationDestination[] = [];
   if (explicitDiscordUserId) {
@@ -662,10 +664,15 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
   }
   if (explicitSlackChannelId) {
     derived.push({
-      id: `derived-slack-channel:${explicitSlackChannelId}`,
-      name: `Slack Channel ${explicitSlackChannelId}`,
+      id: explicitSlackThreadTs
+        ? `derived-slack-channel:${explicitSlackChannelId}:${explicitSlackThreadTs}`
+        : `derived-slack-channel:${explicitSlackChannelId}`,
+      name: explicitSlackThreadTs
+        ? `Slack Channel ${explicitSlackChannelId} Thread ${explicitSlackThreadTs}`
+        : `Slack Channel ${explicitSlackChannelId}`,
       type: 'slack_channel',
       channelId: explicitSlackChannelId,
+      threadTs: explicitSlackThreadTs || undefined,
       enabled: true,
       createdAt: notification.createdAt,
     });

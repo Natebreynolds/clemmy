@@ -64,6 +64,34 @@ test('queueWorkflowRun: writes originSessionId when provided (Gap E)', () => {
   assert.equal(rec.originSessionId, 'sess-chat-1');
 });
 
+test('queueWorkflowRun: duplicate attaches the current origin so report-back can still land here', () => {
+  const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' });
+  assert.equal(first.status, 'queued');
+
+  const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-dup' });
+  assert.equal(second.status, 'duplicate');
+
+  const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.equal(rec.originSessionId, 'sess-chat-dup');
+  assert.ok(!('originSessionIds' in rec), 'single origin stays on the legacy field only');
+});
+
+test('queueWorkflowRun: duplicate preserves primary origin and adds secondary origin observers', () => {
+  const first = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-a' });
+  assert.equal(first.status, 'queued');
+
+  const second = queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-b' });
+  assert.equal(second.status, 'duplicate');
+
+  const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.equal(rec.originSessionId, 'sess-chat-a');
+  assert.deepEqual(rec.originSessionIds, ['sess-chat-a', 'sess-chat-b']);
+
+  queueWorkflowRun('audit-brief', { url: 'https://x.com' }, { originSessionId: 'sess-chat-b' });
+  const rec2 = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
+  assert.deepEqual(rec2.originSessionIds, ['sess-chat-a', 'sess-chat-b'], 'duplicate observer is not repeated');
+});
+
 test('queueWorkflowRun: omits originSessionId when absent → scheduled/dashboard records unchanged (Gap E)', () => {
   queueWorkflowRun('audit-brief', { url: 'https://y.com' });
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
@@ -155,6 +183,26 @@ test('requeueWorkflowFromRun carries originSessionId from the prior run (re-run 
     .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { originSessionId?: string });
   assert.equal(fresh.length, 1);
   assert.equal(fresh[0].originSessionId, 'sess-abc');
+});
+
+test('requeueWorkflowFromRun preserves duplicate observer origins from the prior run', () => {
+  writeAuditWorkflow();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const origId = 'orig-with-multi-origin';
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: 'audit-brief', inputs: { url: 'https://x.co' }, status: 'completed', originSessionId: 'sess-a', originSessionIds: ['sess-a', 'sess-b'] }),
+    'utf-8',
+  );
+
+  requeueWorkflowFromRun(origId);
+  const fresh = readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((f) => f.endsWith('.json') && f !== `${origId}.json`)
+    .map((f) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, f), 'utf-8')) as { originSessionId?: string; originSessionIds?: string[] });
+
+  assert.equal(fresh.length, 1);
+  assert.equal(fresh[0].originSessionId, 'sess-a');
+  assert.deepEqual(fresh[0].originSessionIds, ['sess-a', 'sess-b']);
 });
 
 test('requeueWorkflowFailedItemsFromRun queues lineage for only final failed forEach items', () => {

@@ -18,7 +18,12 @@ const { buildWorkflowStepAgent } = await import('./workflow-step-agent.js');
 const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
 
 const INTENT = 'scrape competitor pricing pages for a pricing analysis';
-const instr = (a: { instructions?: unknown }): string => (typeof a.instructions === 'string' ? a.instructions : '');
+const instr = async (a: { instructions?: unknown }): Promise<string> => {
+  if (typeof a.instructions === 'function') {
+    return String(await (a.instructions as (ctx: unknown, agent: unknown) => unknown)({ context: {} }, a));
+  }
+  return String(a.instructions ?? '');
+};
 
 test('an UNBOUND step surfaces the remembered tool; a LOCKED step does not', async () => {
   rememberToolChoice({
@@ -29,8 +34,8 @@ test('an UNBOUND step surfaces the remembered tool; a LOCKED step does not', asy
   const unbound = await buildWorkflowStepAgent({ userInput: INTENT, lockTools: ['*'] });
   const locked = await buildWorkflowStepAgent({ userInput: INTENT, lockTools: ['GMAIL_SEND_EMAIL'] });
 
-  assert.match(instr(unbound), /FIRECRAWL_SCRAPE/, 'the unbound step sees the proven tool for its intent');
-  assert.doesNotMatch(instr(locked), /FIRECRAWL_SCRAPE/, 'a surface-locked step is not given the recall noise');
+  assert.match(await instr(unbound), /FIRECRAWL_SCRAPE/, 'the unbound step sees the proven tool for its intent');
+  assert.doesNotMatch(await instr(locked), /FIRECRAWL_SCRAPE/, 'a surface-locked step is not given the recall noise');
 });
 
 test('kill-switch CLEMMY_WORKFLOW_STEP_RECALL=off ⇒ no recall injected', async () => {
@@ -38,7 +43,7 @@ test('kill-switch CLEMMY_WORKFLOW_STEP_RECALL=off ⇒ no recall injected', async
   process.env.CLEMMY_WORKFLOW_STEP_RECALL = 'off';
   try {
     const a = await buildWorkflowStepAgent({ userInput: INTENT, lockTools: ['*'] });
-    assert.doesNotMatch(instr(a), /FIRECRAWL_SCRAPE/);
+    assert.doesNotMatch(await instr(a), /FIRECRAWL_SCRAPE/);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_WORKFLOW_STEP_RECALL; else process.env.CLEMMY_WORKFLOW_STEP_RECALL = prev;
   }
@@ -46,5 +51,5 @@ test('kill-switch CLEMMY_WORKFLOW_STEP_RECALL=off ⇒ no recall injected', async
 
 test('a step with NO userInput gets the plain static instructions (no store read)', async () => {
   const a = await buildWorkflowStepAgent({ lockTools: ['*'] });
-  assert.doesNotMatch(instr(a), /FIRECRAWL_SCRAPE/);
+  assert.doesNotMatch(await instr(a), /FIRECRAWL_SCRAPE/);
 });

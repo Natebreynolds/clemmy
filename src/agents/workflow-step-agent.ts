@@ -204,9 +204,10 @@ export async function buildWorkflowStepAgent(
   const learnedRecall = (!surfaceLocked && options.userInput && workflowStepRecallEnabled())
     ? renderToolChoicesForContext(8, undefined, options.userInput)
     : '';
+  const baseInstructions = harnessInstructions(STEP_INSTRUCTIONS, { includeRememberedToolChoices: false });
   const instructions = learnedRecall
-    ? `${harnessInstructions(STEP_INSTRUCTIONS)}\n\n${learnedRecall}`
-    : harnessInstructions(STEP_INSTRUCTIONS);
+    ? () => `${baseInstructions()}\n\n${learnedRecall}`
+    : baseInstructions;
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'WorkflowStep',
     instructions,

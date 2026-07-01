@@ -83,6 +83,20 @@ test('surfaces ONLY interrupted chat runs; leaves clean + non-chat sessions alon
   assert.ok(!hasInterruptedEvent(wf.id), 'a non-chat session is never flagged');
 });
 
+test('boot scan finds an interrupted chat behind newer session pages', () => {
+  const interrupted = HarnessSession.create({ kind: 'chat', title: 'older interrupted task' });
+  interrupted.setRunInFlight('2026-06-07T00:00:00.000Z');
+
+  for (let i = 0; i < 125; i += 1) {
+    HarnessSession.create({ kind: 'chat', title: `newer clean chat ${i}` });
+  }
+
+  const recovered = reportInterruptedChatRuns(() => 1500);
+  assert.equal(recovered, 1, 'older interrupted chat behind the default first page is recovered');
+  assert.equal(HarnessSession.load(interrupted.id)?.runInFlightSince(), null);
+  assert.ok(hasInterruptedEvent(interrupted.id), 'older interrupted chat got a non-silent restart notice');
+});
+
 test('idempotent: a second boot scan finds nothing (marker already cleared)', () => {
   const s = HarnessSession.create({ kind: 'chat', title: 'x' });
   s.setRunInFlight('2026-06-07T00:00:00.000Z');
