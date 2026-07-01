@@ -47,6 +47,7 @@ import { resolveProvider } from './model-wire-registry.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
+import { nonFilterableToolExcludes } from './tool-policy.js';
 import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
@@ -80,8 +81,7 @@ const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>();
  *  tools (workflow_*, composio_execute_tool), so they convert cleanly. */
 const HARNESS_FILTERABLE_TOOLS: ReadonlySet<string> = new Set(LOCAL_MCP_TOOL_NAMES as readonly string[]);
 function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
-  if (!names || names.length === 0) return true;
-  return names.every((n) => HARNESS_FILTERABLE_TOOLS.has(n));
+  return nonFilterableToolExcludes(names, HARNESS_FILTERABLE_TOOLS).length === 0;
 }
 
 const REUSE_USER_INPUT_TERMINALS = new Set<string>([

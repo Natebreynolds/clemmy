@@ -27,6 +27,7 @@ import { addNotification, reapStaleNotifications } from '../runtime/notification
 import { reapExpiredGoals } from '../agents/plan-proposals.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { previousLocalDayKey, runTaskLedgerHygiene } from '../tasks/task-ledger-hygiene.js';
+import { runReportOnlyCurator } from './curator.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -116,6 +117,7 @@ interface MemoryMaintenanceState {
   lastGoalReapDay?: string;
   lastTaskLedgerHygieneDay?: string;
   lastNotificationReapDay?: string;
+  lastCuratorReportDay?: string;
 }
 const MAINTENANCE_STATE_FILE = path.join(STATE_DIR, 'memory-maintenance-state.json');
 
@@ -183,6 +185,11 @@ const TASK_LEDGER_HYGIENE_DAILY_MINUTE = 55;
 // offset from the goal reaper's 5:00.
 const NOTIFICATION_REAP_NIGHTLY_HOUR = 5;
 const NOTIFICATION_REAP_NIGHTLY_MINUTE = 15;
+
+// Report-only curator. Reads memory/skills/workflows/procedural tool choices and
+// writes a daily drift report; it never mutates those stores.
+const CURATOR_REPORT_DAILY_HOUR = 5;
+const CURATOR_REPORT_DAILY_MINUTE = 30;
 
 // Tier C3 — episodic_pointers TTL reaper cadence (~1h, same as the
 // tool_outputs reaper it shadows).
@@ -566,6 +573,26 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'check-in reaper nightly job failed');
+      }
+    }
+  }
+
+  // Hermes-inspired curator foundation: report-only and recoverable by design.
+  // It produces a small daily JSON report that can later back an approval-gated
+  // cleanup UI. No memory, skill, workflow, or tool-choice mutation happens here.
+  if (isAtOrAfterDailyTime(now, CURATOR_REPORT_DAILY_HOUR, CURATOR_REPORT_DAILY_MINUTE)) {
+    const curatorEnabled = (getRuntimeEnv('CLEMMY_CURATOR_REPORT', 'on') || 'on').toLowerCase() !== 'off';
+    if (curatorEnabled && maintenanceState.lastCuratorReportDay !== today) {
+      maintenanceState.lastCuratorReportDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const { report, path: reportPath } = runReportOnlyCurator(now);
+        logger.info(
+          { reportPath, findings: report.findings.length, counts: report.counts },
+          'report-only curator completed',
+        );
+      } catch (err) {
+        logger.warn({ err }, 'report-only curator failed');
       }
     }
   }

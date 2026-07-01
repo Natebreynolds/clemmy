@@ -34,7 +34,7 @@ import {
   renderTranscriptTurns,
 } from './session-transcript.js';
 import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
-import { buildAgentContextPacket } from './context-packet.js';
+import { buildCanonicalContextPack } from './canonical-context.js';
 import { getHarnessBudgetSettings, getElevatedBudget } from './budget-settings.js';
 import type { HarnessBudgetRuntime } from './budget-settings.js';
 import {
@@ -3437,13 +3437,19 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     const objective = goalObjectiveString(activeGoalForTurn);
     if (objective) classifierInput = objective;
   }
-  const contextPacket = buildAgentContextPacket(classifierInput, {
-    enabled: turnMemoryPrimer.enabled,
-    hitCount: turnMemoryPrimer.hitCount,
-    source: turnMemoryPrimer.source ?? null,
-    injected: Boolean(turnMemoryPrimer.text),
-    skippedReason: turnMemoryPrimer.skippedReason ?? null,
-  }, { sessionKind: session.sessionRow.kind, sessionId: options.sessionId });
+  const canonicalContext = buildCanonicalContextPack({
+    input: classifierInput,
+    sessionId: options.sessionId,
+    sessionKind: session.sessionRow.kind,
+    memory: {
+      enabled: turnMemoryPrimer.enabled,
+      hitCount: turnMemoryPrimer.hitCount,
+      source: turnMemoryPrimer.source ?? null,
+      injected: Boolean(turnMemoryPrimer.text),
+      skippedReason: turnMemoryPrimer.skippedReason ?? null,
+    },
+  });
+  const contextPacket = canonicalContext.turn;
   safeAppend({
     sessionId: options.sessionId,
     turn,
@@ -3475,6 +3481,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       healthWarnings: contextPacket.healthWarnings,
       agentSystem: contextPacket.agentSystem,
       multiItem: contextPacket.multiItem,
+      contextPack: {
+        version: canonicalContext.version,
+        source: canonicalContext.source,
+        diagnostics: canonicalContext.diagnostics,
+      },
       injectedBytes: contextPacket.text.length,
     },
   });

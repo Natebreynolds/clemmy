@@ -43,6 +43,7 @@ import { DEFAULT_MAX_TURNS, wrapToolForHarness, workerThrashGuardEnabled, type W
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { ClaudeSdkProviderOverloadError } from '../runtime/harness/claude-agent-sdk.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
+import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -1254,6 +1255,34 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const instructions = codeModeMandate
     ? () => `${baseInstructions()}\n\n${codeModeMandate}`
     : baseInstructions;
+  const assembledTools = [
+    plannerTool,
+    buildRequestApprovalTool(),
+    buildAskUserQuestionTool(),
+    buildOfferBackgroundTool(),
+    runWorkerTool,
+    ...jitDiscoveryTools,
+  ];
+  const toolPolicy = resolveEffectiveToolPolicy({
+    surface: 'orchestrator',
+    lane: options.allowToolJit === true ? 'chat' : 'execution',
+    tools: assembledTools.map((toolRef) => toolRef as Tool<RuntimeContextValue>),
+    excludeToolNames: options.excludeToolNames,
+    reason: 'orchestrator local harness tools',
+  });
+  if (options.sessionId) {
+    try {
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'tool_policy_resolved',
+        data: { ...toolPolicy.diagnostics },
+      });
+    } catch {
+      // Tool policy telemetry is diagnostic only.
+    }
+  }
 
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'Clem',
@@ -1287,15 +1316,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // kill check + pre-increment limit check. No-op when
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even
     // before the flag flips default-on.
-    tools: [plannerTool, buildRequestApprovalTool(), buildAskUserQuestionTool(), buildOfferBackgroundTool(), runWorkerTool, ...jitDiscoveryTools]
-      // Per-call tool-exclusion (narrowed surface for architect / autonomy lanes
-      // riding the harness loop). No-op when excludeToolNames is absent/empty.
-      .filter((t) => {
-        const names = options.excludeToolNames;
-        if (!names || names.length === 0) return true;
-        const name = (t as unknown as { name?: string }).name;
-        return !name || !names.includes(name);
-      })
+    tools: toolPolicy.tools
       .map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.) the
     // user has configured. Tools surface as `<server>__<tool>` (e.g.

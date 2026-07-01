@@ -178,6 +178,10 @@ export const EVENT_TYPES = [
   // surface and an A/B can attribute token/accuracy deltas. Sibling of
   // mcp_tool_scope; only emitted when a reduction occurred.
   'tool_jit_scope',
+  // Central tool-policy resolver: emitted at model-boundary construction after
+  // allow/deny resolution so every brain can show which local tool surface it
+  // actually received. Telemetry only; never alters dispatch.
+  'tool_policy_resolved',
   // The goal-alignment judge ran on an irreversible write and PASSED
   // (fulfills=true) — the aligned-proceed case is otherwise silent, so this
   // proves the judge fired BEFORE a YOLO silent-proceed (the 2026-06-22
