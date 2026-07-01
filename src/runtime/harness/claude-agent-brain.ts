@@ -434,6 +434,7 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
   if (mode === 'full') {
     return [
       'CAPABILITY — you are the AGENTIC Clementine brain on the user\'s Claude subscription. You CAN execute tools to complete the request: run shell commands (run_shell_command), discover + execute Composio actions (composio_search_tools → composio_execute_tool), write files, and chain multi-step work — exactly like the Codex harness.',
+      '- CONVERSE FIRST on an AMBIGUOUS or big multi-step request: recall what you can, then ask ONE plain clarifying question with `ask_user_question` about the choice that genuinely changes the work (e.g. new topic vs. resume prior work, which source/destination) and WAIT for the answer. Do NOT decide you "know enough" and run the whole task unasked. Once aligned — or when the request is already unambiguous — proceed AUTONOMOUSLY to completion; do not stop again mid-run. (A pure question or a read-only lookup: just do it, no clarifying question.)',
       '- Every tool call runs through Clementine\'s safety gates (grounding, goal-fidelity, execution-wrap, destination, duplicate-write, loop-guard). Irreversible/external actions (sends, batch external writes) PAUSE for the user\'s approval BEFORE they run. Do the work — the gates + approval protect it; you do not need to ask permission in prose first.',
       '- Before a MUTATING external write (a composio send/create, a batch), call execution_create FIRST (title, objective, successCriteria), then proceed — the harness requires an active execution lane for those.',
       '- A large tool result may be clipped with a `[digest: … tool_output_query("call_…")]` footer — call tool_output_query or recall_tool_result to pull the records. Never report stored data as unavailable.',
@@ -487,6 +488,7 @@ export function renderClaudeAgentBrainSystemAppend(
     sessionId: request.sessionId,
     query: split ? undefined : request.message,
     partition: split ? 'stable' : 'all',
+    includeSessionActions: false,
   });
   const spaceSlug = workspaceSlugFromSessionId(request.sessionId);
   const workspacePrimer = spaceSlug ? buildWorkspaceContextPrimer(spaceSlug) : null;
@@ -537,6 +539,7 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   const volatile = renderHarnessMemoryContext({
     sessionId: request.sessionId,
     partition: 'volatile',
+    includeSessionActions: false,
   });
   let recall = '';
   const q = (request.message ?? '').replace(/\s+/g, ' ').trim();

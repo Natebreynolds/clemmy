@@ -539,6 +539,96 @@ function initOnlyMessage(): any {
 function successResultMessage(text: string): any {
   return { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: text, duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] };
 }
+
+test('dispatch_background_task is terminal in the SDK lane', async () => {
+  let interrupted = false;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const q = stubsFor((async function* () {
+      yield initOnlyMessage();
+      yield {
+        type: 'assistant',
+        session_id: 's',
+        uuid: 'a',
+        parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'toolu_bg',
+            name: 'mcp__clementine-local__dispatch_background_task',
+            input: { objective: 'Count markdown files' },
+          }],
+        },
+      } as any;
+      yield {
+        type: 'user',
+        session_id: 's',
+        uuid: 'u',
+        parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_bg',
+            content: 'Dispatched "Count markdown files" to the background (task bg-test) with a goal contract.',
+          }],
+        },
+      } as any;
+      yield successResultMessage('wrong foreground answer');
+    })());
+    return Object.assign(q, { interrupt: async () => { interrupted = true; } });
+  }) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'please background this',
+    sessionId: 'sdk-dispatch-terminal',
+    modelId: 'claude-sonnet-4-6',
+    allowedLocalMcpTools: ['dispatch_background_task'],
+  });
+
+  assert.equal(interrupted, true);
+  assert.equal(r.limitHit, false);
+  assert.deepEqual(r.toolUses, ['mcp__clementine-local__dispatch_background_task']);
+  assert.match(r.text, /started "Count markdown files" as a background task \(bg-test\)/);
+  assert.doesNotMatch(r.text, /wrong foreground answer/);
+});
+
+test('ask_user_question is terminal in the SDK lane — the question surfaces inline, run stops', async () => {
+  let interrupted = false;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const q = stubsFor((async function* () {
+      yield initOnlyMessage();
+      yield {
+        type: 'assistant', session_id: 's', uuid: 'a', parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: 'toolu_ask',
+          name: 'mcp__clementine-local__ask_user_question',
+          input: { agentSlug: 'clementine', question: 'New topic, or resume the Salesforce work? And Airtable or the Google Sheet for the 5 firms?' },
+        }] },
+      } as any;
+      yield {
+        type: 'user', session_id: 's', uuid: 'u', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_ask', content: 'Check-in created: ci-123. The user has been notified.' }] },
+      } as any;
+      yield successResultMessage('should not run the task before the answer');
+    })());
+    return Object.assign(q, { interrupt: async () => { interrupted = true; } });
+  }) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'scrape 5 firms',
+    sessionId: 'sdk-ask-terminal',
+    modelId: 'claude-sonnet-5',
+    allowedLocalMcpTools: ['ask_user_question'],
+  });
+
+  assert.equal(interrupted, true, 'the run stopped on the question');
+  assert.equal(r.limitHit, false);
+  // The QUESTION (from the tool input) is the reply — not the check-in receipt, not the
+  // premature task answer.
+  assert.match(r.text, /New topic, or resume the Salesforce work\?/);
+  assert.doesNotMatch(r.text, /Check-in created/);
+  assert.doesNotMatch(r.text, /should not run the task/);
+});
+
 // A query that HAMMERS a mutating tool through the host `canUseTool` (simulating
 // the SDK's pre-tool gate) until the ceiling interrupts, then ends. The SDK
 // aborts the turn on an interrupting deny, modeled here as a thrown stream error.

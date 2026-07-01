@@ -184,6 +184,13 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
 
 export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'ping',
+  // Converse-first: the Claude brain's rubric says to ask ONE clarifying question
+  // up front for an ambiguous / multi-step request — but it had NO tool to do it, so
+  // it fell through to execution (2026-07-01: it proceeded where the Codex brain asked).
+  // In READ_ONLY so it flows into every profile (a read-only brain can still ask).
+  // It is a terminal-after-tool (below): calling it stops the turn + surfaces the
+  // question, and the user's next message answers it.
+  'ask_user_question',
   'memory_search',
   'memory_read',
   'memory_recall',
@@ -576,7 +583,7 @@ function bareMcpToolName(rawName: string): string {
   return rawName.split('__').at(-1) ?? rawName;
 }
 
-const TERMINAL_AFTER_TOOL_NAMES = new Set(['dispatch_background_task']);
+const TERMINAL_AFTER_TOOL_NAMES = new Set(['dispatch_background_task', 'ask_user_question']);
 
 function isTerminalAfterTool(rawName: string | null | undefined): boolean {
   return typeof rawName === 'string' && TERMINAL_AFTER_TOOL_NAMES.has(bareMcpToolName(rawName));
@@ -590,6 +597,14 @@ function renderTerminalToolReply(rawName: string, input: unknown, output: string
     const title = match?.[1] || (typeof inputObjective === 'string' && inputObjective.trim() ? inputObjective.trim() : 'the task');
     const taskId = match?.[2];
     return `On it - I started "${title}" as a background task${taskId ? ` (${taskId})` : ''}. It will keep running in the daemon and report back here when it finishes or gets stuck.`;
+  }
+  if (bare === 'ask_user_question') {
+    // Surface the QUESTION inline (from the tool input) so the turn ends on a clean
+    // clarifying question the user answers in their next message — the conversational
+    // beat. Render from the input, not the tool output (which is a check-in receipt),
+    // so the question shows even if the check-in record write hiccuped.
+    const q = (input as { question?: unknown } | null | undefined)?.question;
+    return typeof q === 'string' && q.trim() ? q.trim() : (output.trim() || 'I have a quick question before I proceed.');
   }
   return output.trim() || `${bare} completed.`;
 }
