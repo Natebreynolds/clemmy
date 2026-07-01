@@ -5,6 +5,7 @@ import { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR, ensureDir } from '../tools/shared.js'
 import { listWorkflows } from '../memory/workflow-store.js';
 import { reapRunEventDir } from './workflow-events.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 
 /**
  * Workflow scheduling tick.
@@ -221,6 +222,13 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
       // record the dedupe exactly as before.
       if (cronMatches(schedule, now, wf.trigger?.timezone) && state.lastRunByMinute[dedupeKey] === minuteKey) {
         result.deduped.push(wf.name);
+        recordOperationalEvent({
+          source: 'workflow',
+          type: 'workflow_trigger_deduped',
+          severity: 'warn',
+          actor: 'workflow-scheduler',
+          payload: { workflowName: wf.name, schedule, reason: 'already_fired_this_minute' },
+        });
       }
       continue;
     }
@@ -237,6 +245,13 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
     if (pending >= MAX_PENDING_PER_WORKFLOW) {
       result.deduped.push(wf.name);
       emitQueueBackpressureNotice(wf.name, pending);
+      recordOperationalEvent({
+        source: 'workflow',
+        type: 'workflow_trigger_deduped',
+        severity: 'warn',
+        actor: 'workflow-scheduler',
+        payload: { workflowName: wf.name, schedule, reason: 'backpressure', pending },
+      });
       // Mark the latest matched minute "seen" so we don't recheck it.
       state.lastRunByMinute[dedupeKey] = latestKey;
       continue;
@@ -245,9 +260,16 @@ export async function processWorkflowSchedules(): Promise<ScheduledFireResult> {
     try {
       // A long-missed window collapses to ONE catch-up run (not N), so a
       // daily 8am report fires once after a closed-overnight laptop reopens.
-      enqueueScheduledRun(wf.name);
+      const runId = enqueueScheduledRun(wf.name);
       state.lastRunByMinute[dedupeKey] = latestKey;
       result.fired.push(wf.name);
+      recordOperationalEvent({
+        source: 'workflow',
+        type: 'workflow_trigger_fired',
+        workflowRunId: runId,
+        actor: 'workflow-scheduler',
+        payload: { workflowName: wf.name, schedule, missed, source: 'schedule' },
+      });
       logger.info({ workflow: wf.name, schedule, minuteKey: latestKey, missed }, 'Scheduled workflow run enqueued');
       if (missed > 0) {
         emitCatchupNotice(wf.name, missed, latestKey);
@@ -361,7 +383,9 @@ function emitCatchupNotice(workflowName: string, missed: number, firedMinuteKey:
   }
 }
 
-function enqueueScheduledRun(workflowName: string): void {
+/** Writes the queued run record and returns its id (so the caller can correlate a
+ *  workflow_trigger_fired telemetry event to the run it enqueued). */
+function enqueueScheduledRun(workflowName: string): string {
   ensureDir(WORKFLOW_RUNS_DIR);
   const id = `sched-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const filePath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
@@ -373,6 +397,7 @@ function enqueueScheduledRun(workflowName: string): void {
     source: 'schedule',
   };
   writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
+  return id;
 }
 
 /**

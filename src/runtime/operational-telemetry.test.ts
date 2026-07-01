@@ -103,6 +103,37 @@ test('operational event type list has no duplicates', () => {
   assert.equal(new Set(OPERATIONAL_EVENT_TYPES).size, OPERATIONAL_EVENT_TYPES.length);
 });
 
+test('WS2 visibility taxonomy: harness / scheduler / verdict / retry types are registered', () => {
+  for (const type of [
+    // harness run lifecycle + swarm + background task
+    'harness_turn_started',
+    'harness_turn_completed',
+    'harness_run_completed',
+    'harness_run_failed',
+    'worker_spawned',
+    'worker_queued',
+    'worker_completed',
+    'worker_failed',
+    'worker_capped',
+    'auto_continue',
+    'background_task_created',
+    'background_task_started',
+    'background_task_finished',
+    'background_task_parked',
+    // scheduler (cron)
+    'cron_job_started',
+    'cron_job_completed',
+    'cron_job_failed',
+    // safety verdicts
+    'gate_verdict',
+    'judge_verdict',
+    // workflow retry
+    'workflow_node_retried',
+  ]) {
+    assert.ok(isOperationalEventType(type), `missing operational type ${type}`);
+  }
+});
+
 test('recordOperationalEvent persists redacted envelopes and list filters them', () => {
   const db = new Database(':memory:');
   try {

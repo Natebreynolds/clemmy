@@ -101,12 +101,30 @@ export function _resetWorkerConcurrencyForTest(): void {
   globalGate.queue = [];
 }
 
+/** Reported when a worker actually has to WAIT for a session slot (the per-session
+ *  cap is already saturated) — so the caller can emit a worker_queued telemetry
+ *  event WITHOUT this pure, I/O-free module taking on a telemetry dependency. */
+export interface WorkerQueuedInfo {
+  /** Waiters ahead of this one, plus this one (≥1). */
+  queueDepth: number;
+  perSessionCap: number;
+  globalCap: number;
+}
+
 /**
  * Acquire a worker slot for `sessionId`. Resolves immediately if slots are free,
  * otherwise waits FIFO until they free. Returns an idempotent release fn — call it
  * exactly once (in a finally) when the worker execution finishes or throws.
+ *
+ * `onQueued` (optional) is invoked ONCE, synchronously, only when the caller will
+ * actually wait on the per-session gate (the common throttle). It carries the
+ * queue depth + caps so the caller owns the telemetry emit and this module stays
+ * pure/in-memory.
  */
-export async function acquireWorkerSlot(sessionId: string): Promise<() => void> {
+export async function acquireWorkerSlot(
+  sessionId: string,
+  onQueued?: (info: WorkerQueuedInfo) => void,
+): Promise<() => void> {
   if (gateDisabled()) return () => {}; // MASTER off — fully unbounded (documented escape hatch)
 
   // SESSION slot FIRST (a worker waiting for a session slot holds nothing), THEN the GLOBAL
@@ -114,7 +132,14 @@ export async function acquireWorkerSlot(sessionId: string): Promise<() => void> 
   const key = sessionId || '__global__';
   let gate = gates.get(key);
   if (!gate) { gate = { active: 0, queue: [] }; gates.set(key, gate); }
-  const releaseSession = await acquireOnGate(gate, maxConcurrency());
+  const perSessionCap = maxConcurrency();
+  if (onQueued && gate.active >= perSessionCap) {
+    // This acquire will block on the FIFO queue — surface it before we await.
+    try {
+      onQueued({ queueDepth: gate.queue.length + 1, perSessionCap, globalCap: maxGlobalConcurrency() });
+    } catch { /* telemetry must never break the throttle */ }
+  }
+  const releaseSession = await acquireOnGate(gate, perSessionCap);
   const releaseGlobal = globalGateDisabled() ? () => {} : await acquireOnGate(globalGate, maxGlobalConcurrency());
 
   const g = gate;

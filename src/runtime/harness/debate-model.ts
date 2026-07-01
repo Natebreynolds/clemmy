@@ -57,6 +57,7 @@ import {
 // boundary-judge.test (chooseBoundaryJudgeFamily), and any judgeCrossFamilyEnabled use.
 export { debateBrainsAvailable, judgeCrossFamilyEnabled, chooseBoundaryJudgeFamily };
 import { harnessRunContextStorage } from './brackets.js';
+import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -1485,6 +1486,26 @@ const TRACE_MAX_BYTES = 2_000_000;
 const TRACE_KEEP_LINES = 400;
 function recordDebateTrace(rec: Record<string, unknown>): void {
   if (process.env.NODE_ENV === 'test') return;
+  // Mirror the fusion judge/checker outcome into the operational store so the
+  // dashboard sees the otherwise-invisible reconciliation turn (a judge_verdict
+  // for every debate/verify pass). Best-effort — never affects the turn.
+  try {
+    recordOperationalEvent({
+      source: 'safety',
+      type: 'judge_verdict',
+      sessionId: harnessRunContextStorage.getStore()?.sessionId,
+      actor: 'fusion',
+      payload: {
+        judge: rec.path === 'verify' ? 'verify_checker' : 'debate',
+        ...(typeof rec.judge === 'string' ? { judgeModel: rec.judge } : {}),
+        outcome: typeof rec.outcome === 'string' ? rec.outcome : 'reconciled',
+        ...(typeof rec.divergence === 'number' ? { divergence: rec.divergence } : {}),
+        ...(typeof rec.n === 'number' ? { n: rec.n } : {}),
+      },
+    });
+  } catch {
+    /* operational mirror is best-effort */
+  }
   try {
     const p = debateTracePath();
     mkdirSync(path.dirname(p), { recursive: true });

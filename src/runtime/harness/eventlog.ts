@@ -4,6 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BASE_DIR } from '../../config.js';
 import { actionBus } from '../action-bus.js';
+import { mirrorEventToOperational } from './eventlog-operational-mirror.js';
 
 /**
  * Event log — the spine of the 0.3 harness.
@@ -97,6 +98,13 @@ export const EVENT_TYPES = [
   // SDK brain auto-continued past a per-query max-turns budget instead of parking
   // on "say continue" (F1). Carries the attempt # and whether it's still limited.
   'sdk_auto_continue',
+  // The Claude Agent SDK's child process compacted its own context mid-run
+  // (subtype 'compact_boundary' relay; pre/post tokens + trigger). Mirror of the
+  // Codex lane's condenser_applied — proves long runs manage context instead of
+  // dying at the window cliff.
+  'sdk_compact_boundary',
+  // The SDK reported a FAILED compaction (status message compact_result:'failed').
+  'sdk_compact_failed',
   // Tool-injection scoping: emitted at agent construction so traces can
   // explain why a run saw a small external MCP surface instead of every
   // configured server tool.
@@ -137,6 +145,12 @@ export const EVENT_TYPES = [
   // FAILED (e.g. composio schema rejection) — the duplicate-target gate nets
   // one matching prior per failure so corrected retries aren't "duplicates".
   'external_write_failed',
+  // S3 orphan ledger: a MUTATING external write TIMED OUT. The harness stops
+  // waiting but the request MAY have landed server-side (it is aborted at the
+  // network layer only when CLEMMY_TOOL_ABORT_ON_TIMEOUT is on — recorded in
+  // `aborted`). Durable audit of maybe-landed writes, and the signal the
+  // orphaned-write retry corrective consults before a blind same-shape retry.
+  'external_write_orphaned',
   // Always-on telemetry: a run_worker sub-agent hit its turn ceiling
   // (MaxTurnsExceeded). Worker nested runs carry no harness hooks, so this is
   // the only signal of worker turn-cap hits — used to recalibrate
@@ -735,6 +749,10 @@ export function appendEvent(input: AppendEventInput): EventRow {
     event,
     session: session ? summarizeSessionForSignal(session) : undefined,
   });
+  // Mirror whitelisted events into the operational-telemetry store so the
+  // dashboard / Slack / Discord see run lifecycle, swarms, verdicts and
+  // fallovers without touching the hot files. Fail-open — never throws.
+  mirrorEventToOperational(event, session);
   return event;
 }
 

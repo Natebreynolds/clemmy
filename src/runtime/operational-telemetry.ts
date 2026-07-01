@@ -34,6 +34,9 @@ export const WORKFLOW_OPERATIONAL_EVENT_TYPES = [
   'workflow_trigger_fired',
   'workflow_trigger_deduped',
   'workflow_resume_replayed',
+  // A workflow step / forEach item failed transiently and is being retried
+  // after backoff (mirrored from the runner's step_retry / item_retry events).
+  'workflow_node_retried',
 ] as const;
 
 export const MODEL_OPERATIONAL_EVENT_TYPES = [
@@ -74,12 +77,23 @@ export const SAFETY_OPERATIONAL_EVENT_TYPES = [
   'side_effect_planned',
   'side_effect_executed',
   'side_effect_compensated',
+  // A MUTATING external call timed out — the harness stopped waiting (and, when
+  // abort-on-timeout is on, cancelled the socket) but the write MAY have landed
+  // server-side. Mirrored from harness external_write_orphaned so maybe-landed
+  // writes are dashboard-visible, not just in the session ledger.
+  'side_effect_orphaned',
   'transaction_guard_opened',
   'transaction_guard_committed',
   'transaction_guard_rolled_back',
   'specular_simulation_started',
   'specular_simulation_completed',
   'specular_simulation_failed',
+  // A tool-boundary gate (guardrail) reached a verdict on an action —
+  // allowed-with-warning / blocked. Mirrored from harness guardrail_tripped.
+  'gate_verdict',
+  // An LLM judge reached a verdict on a deliverable / irreversible write
+  // (goal-alignment, output-grounding, or a fusion debate/verify checker).
+  'judge_verdict',
 ] as const;
 
 export const TOOL_OPERATIONAL_EVENT_TYPES = [
@@ -89,6 +103,34 @@ export const TOOL_OPERATIONAL_EVENT_TYPES = [
   'tool_approval_pending',
 ] as const;
 
+// Harness run-lifecycle + swarm + background-task telemetry. Most of these are
+// mirrored from the harness eventlog (eventlog-operational-mirror.ts); the
+// worker_spawned/queued + background_task_* rows are direct emits from the
+// tool/execution layer where the eventlog is dark.
+export const HARNESS_OPERATIONAL_EVENT_TYPES = [
+  'harness_turn_started',
+  'harness_turn_completed',
+  'harness_run_completed',
+  'harness_run_failed',
+  'worker_spawned',
+  'worker_queued',
+  'worker_completed',
+  'worker_failed',
+  'worker_capped',
+  'auto_continue',
+  'background_task_created',
+  'background_task_started',
+  'background_task_finished',
+  'background_task_parked',
+] as const;
+
+// Scheduler (cron) run lifecycle — direct emits from the daemon runner.
+export const SCHEDULER_OPERATIONAL_EVENT_TYPES = [
+  'cron_job_started',
+  'cron_job_completed',
+  'cron_job_failed',
+] as const;
+
 export const OPERATIONAL_EVENT_TYPES = [
   ...WORKFLOW_OPERATIONAL_EVENT_TYPES,
   ...MODEL_OPERATIONAL_EVENT_TYPES,
@@ -96,6 +138,8 @@ export const OPERATIONAL_EVENT_TYPES = [
   ...MEMORY_OPERATIONAL_EVENT_TYPES,
   ...SAFETY_OPERATIONAL_EVENT_TYPES,
   ...TOOL_OPERATIONAL_EVENT_TYPES,
+  ...HARNESS_OPERATIONAL_EVENT_TYPES,
+  ...SCHEDULER_OPERATIONAL_EVENT_TYPES,
 ] as const;
 
 export type WorkflowOperationalEventType = (typeof WORKFLOW_OPERATIONAL_EVENT_TYPES)[number];
@@ -104,6 +148,8 @@ export type WorkspaceOperationalEventType = (typeof WORKSPACE_OPERATIONAL_EVENT_
 export type MemoryOperationalEventType = (typeof MEMORY_OPERATIONAL_EVENT_TYPES)[number];
 export type SafetyOperationalEventType = (typeof SAFETY_OPERATIONAL_EVENT_TYPES)[number];
 export type ToolOperationalEventType = (typeof TOOL_OPERATIONAL_EVENT_TYPES)[number];
+export type HarnessOperationalEventType = (typeof HARNESS_OPERATIONAL_EVENT_TYPES)[number];
+export type SchedulerOperationalEventType = (typeof SCHEDULER_OPERATIONAL_EVENT_TYPES)[number];
 export type OperationalEventType = (typeof OPERATIONAL_EVENT_TYPES)[number];
 
 const OPERATIONAL_EVENT_TYPE_SET: ReadonlySet<string> = new Set(OPERATIONAL_EVENT_TYPES);

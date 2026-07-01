@@ -72,6 +72,12 @@ export interface FallbackOptions {
    * first-byte stall window so the hang becomes a fallover, not a dead-end.
    */
   firstByteTimeoutMs?: number;
+  /** Correlation for the model_fallover telemetry — without these the emit is
+   *  session-blind and the dashboard can't attribute a fallover to the run that
+   *  triggered it. Threaded from router-model.ts off the active harness run
+   *  context; optional so non-harness callers are unaffected. */
+  sessionId?: string;
+  workflowRunId?: string;
 }
 
 /** A brain went silent past the first-byte fallover budget — switch brains. */
@@ -202,10 +208,13 @@ export class FallbackModel implements Model {
       type: 'model_fallover',
       severity: 'warn',
       actor: 'fallback-model',
+      sessionId: this.opts.sessionId,
+      workflowRunId: this.opts.workflowRunId,
       payload: {
         from: this.chain[i].label,
         to: this.chain[i + 1].label,
         reason,
+        stage: 'router',
       },
     });
   }

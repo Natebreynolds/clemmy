@@ -77,6 +77,35 @@ test('queued acquires wait until a slot frees (FIFO hand-off)', async () => {
   });
 });
 
+test('onQueued fires ONLY when the caller actually waits, with the queue depth + caps', async () => {
+  await withEnv({ CLEMMY_WORKER_MAX_CONCURRENCY: '1', CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: '5' }, async () => {
+    _resetWorkerConcurrencyForTest();
+    const queued: Array<{ queueDepth: number; perSessionCap: number; globalCap: number }> = [];
+    const onQueued = (info: { queueDepth: number; perSessionCap: number; globalCap: number }) => queued.push(info);
+
+    // First acquire has a free slot → no wait, no onQueued.
+    const r1 = await acquireWorkerSlot('sess-Q', onQueued);
+    assert.equal(queued.length, 0, 'an immediately-available slot does not report queued');
+
+    // Second acquire must wait (cap=1 saturated) → onQueued fires before it blocks.
+    const p2 = acquireWorkerSlot('sess-Q', onQueued);
+    await Promise.resolve();
+    assert.equal(queued.length, 1, 'a waiting acquire reports queued exactly once');
+    assert.deepEqual(queued[0], { queueDepth: 1, perSessionCap: 1, globalCap: 5 });
+
+    // A third waiter deepens the queue.
+    const p3 = acquireWorkerSlot('sess-Q', onQueued);
+    await Promise.resolve();
+    assert.equal(queued.length, 2);
+    assert.equal(queued[1].queueDepth, 2, 'queue depth grows with backlog');
+
+    r1();
+    (await p2)();
+    (await p3)();
+    assert.equal(_activeWorkerSlots('sess-Q'), 0, 'gate drained');
+  });
+});
+
 test('double-release is idempotent (never corrupts the count)', async () => {
   await withEnv({ CLEMMY_WORKER_MAX_CONCURRENCY: '2' }, async () => {
     _resetWorkerConcurrencyForTest();

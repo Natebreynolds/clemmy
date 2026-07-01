@@ -291,6 +291,13 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
   const startedAt = new Date().toISOString();
   const startMs = Date.now();
   const stopHeartbeat = startCronHeartbeat(job, startedAt, startMs);
+  recordOperationalEvent({
+    source: 'scheduler',
+    type: 'cron_job_started',
+    sessionId: `cron:${job.name}`,
+    actor: `cron:${job.name}`,
+    payload: { job: job.name, source, mode: job.mode },
+  });
   try {
     const prompt = [
       `Cron job: ${job.name}`,
@@ -354,6 +361,14 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       metadata: { job: job.name, source, ...(route ? { route } : {}), ...(verdict.delivered ? {} : { status: 'blocked' }) },
     });
     logger.info({ job: job.name, source, delivered: verdict.delivered, route }, verdict.delivered ? 'Cron job completed' : 'Cron job blocked (not done)');
+    recordOperationalEvent({
+      source: 'scheduler',
+      type: 'cron_job_completed',
+      severity: verdict.delivered ? 'info' : 'warn',
+      sessionId: `cron:${job.name}`,
+      actor: `cron:${job.name}`,
+      payload: { job: job.name, source, delivered: verdict.delivered, durationMs: Date.now() - startMs, ...(verdict.delivered ? {} : { blockedReason: verdict.reason }) },
+    });
   } catch (error) {
     appendRunLog(job.name, {
       status: 'error',
@@ -373,6 +388,14 @@ async function runCronJob(assistant: ClementineAssistant, job: CronJobRecord, so
       metadata: { job: job.name, source, status: 'error' },
     });
     logger.error({ err: error, job: job.name, source }, 'Cron job failed');
+    recordOperationalEvent({
+      source: 'scheduler',
+      type: 'cron_job_failed',
+      severity: 'error',
+      sessionId: `cron:${job.name}`,
+      actor: `cron:${job.name}`,
+      payload: { job: job.name, source, durationMs: Date.now() - startMs, error: error instanceof Error ? error.message : String(error) },
+    });
   } finally {
     closePlanScope(`cron:${job.name}`, 'cron-run-finished');
     stopHeartbeat();

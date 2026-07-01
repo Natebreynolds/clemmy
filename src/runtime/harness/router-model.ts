@@ -24,6 +24,7 @@ import { resolveProvider } from './model-wire-registry.js';
 import { codexModelsAvailable, claudeModelsAvailable } from './model-role-options.js';
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { maybeWrapWithFaultInjection } from './fault-inject.js';
+import { harnessRunContextStorage } from './brackets.js';
 import { getActiveAuthMode, getByoBackendConfig, getClaudeBrainModel, getModelRoutingMode, getRuntimeEnv, MODELS } from '../../config.js';
 import { withModelRouteMetrics, type ModelRouteDecisionSource } from '../model-route-metrics.js';
 import pino from 'pino';
@@ -66,9 +67,15 @@ export class RouterModelProvider implements ModelProvider {
       // next, so switch. firstByteTimeoutMs: a silent provider falls over before
       // the loop's stall watchdog fires.
       const chain = this.buildBrainChain(primary);
+      // Correlate a fallover to the run that triggered it. getModel runs inside
+      // the harness run ALS (the loop wraps runner.run), so the active sessionId
+      // is available here; workflow step sessions encode the run id in the id.
+      const sessionId = harnessRunContextStorage.getStore()?.sessionId;
       resolved = withModelFallback(chain, {
         falloverOn429: true,
         firstByteTimeoutMs: brainFalloverFirstByteMs(),
+        sessionId,
+        workflowRunId: workflowRunIdFromSessionId(sessionId),
       });
     }
     const requested = typeof modelName === 'string' && modelName.trim().length > 0 ? modelName.trim() : MODELS.primary;
@@ -150,4 +157,12 @@ export class RouterModelProvider implements ModelProvider {
 
 function routeSourceForModelName(modelName?: string): ModelRouteDecisionSource {
   return typeof modelName === 'string' && modelName.trim().length > 0 ? 'explicit' : 'default';
+}
+
+/** Workflow step sessions are keyed `workflow:<runId>:<stepId>` — pull the run id
+ *  so a fallover on a workflow step correlates to its run. Undefined otherwise. */
+function workflowRunIdFromSessionId(sessionId?: string): string | undefined {
+  if (!sessionId || !sessionId.startsWith('workflow:')) return undefined;
+  const parts = sessionId.split(':');
+  return parts.length >= 2 && parts[1] ? parts[1] : undefined;
 }

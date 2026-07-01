@@ -200,9 +200,11 @@ const LEGACY_WORKFLOW_OPERATIONAL: Readonly<Record<string, { type: OperationalEv
   step_started: { type: 'workflow_node_started', source: 'workflow' },
   step_completed: { type: 'workflow_node_completed', source: 'workflow' },
   step_failed: { type: 'workflow_node_failed', source: 'workflow' },
+  step_retry: { type: 'workflow_node_retried', source: 'workflow' },
   item_started: { type: 'workflow_node_started', source: 'workflow' },
   item_completed: { type: 'workflow_node_completed', source: 'workflow' },
   item_failed: { type: 'workflow_node_failed', source: 'workflow' },
+  item_retry: { type: 'workflow_node_retried', source: 'workflow' },
   approval_requested: { type: 'approval_required', source: 'safety' },
   approval_granted: { type: 'approval_resolved', source: 'safety' },
   approval_rejected: { type: 'approval_resolved', source: 'safety' },
@@ -211,7 +213,15 @@ const LEGACY_WORKFLOW_OPERATIONAL: Readonly<Record<string, { type: OperationalEv
 };
 
 function mirrorWorkflowOperationalEvent(workflowName: string, runId: string, event: WorkflowEvent): void {
-  const mapped = LEGACY_WORKFLOW_OPERATIONAL[event.kind];
+  // step_advisory is a family of non-failing quality flags; only the
+  // brain_fallover variant is an operational event — the workflow-runner's parity
+  // twin of the chat lane's model_fallover. Every other advisory reason is
+  // intentionally NOT mirrored.
+  let mapped = LEGACY_WORKFLOW_OPERATIONAL[event.kind];
+  if (event.kind === 'step_advisory') {
+    if (event.meta?.reason !== 'brain_fallover') return;
+    mapped = { type: 'model_fallover', source: 'model' };
+  }
   const type: OperationalEventType | null = mapped?.type
     ?? (isOperationalEventType(event.kind) ? event.kind : null);
   if (!type) return;
@@ -239,8 +249,12 @@ function mirrorWorkflowOperationalEvent(workflowName: string, runId: string, eve
 }
 
 function severityForWorkflowEvent(event: WorkflowEvent): OperationalEventSeverity {
+  // A transient retry is a recovery signal, not a terminal failure — flag it
+  // 'warn' even though the triggering error may be attached to the event.
+  if (event.kind.endsWith('_retry')) return 'warn';
   if (event.error || event.kind.endsWith('_failed')) return 'error';
   if (event.kind.endsWith('_rejected') || event.kind.endsWith('_deduped')) return 'warn';
+  if (event.kind === 'step_advisory' && event.meta?.reason === 'brain_fallover') return 'warn';
   return 'info';
 }
 

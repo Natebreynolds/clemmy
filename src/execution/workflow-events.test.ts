@@ -34,12 +34,38 @@ type TestStep = { id: string; prompt: string; forEach?: string; dependsOn?: stri
 const asSteps = (s: TestStep[]): Parameters<typeof reconstructWorkflowRunQueue>[2] => s as unknown as Parameters<typeof reconstructWorkflowRunQueue>[2];
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
 
 function cleanup(): void {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
 test.after(() => cleanup());
+
+test('operational mirror: step_retry / item_retry → workflow_node_retried (severity warn)', () => {
+  const wf = 'retry-mirror'; const run = 'retry-run-1';
+  appendWorkflowEvent(wf, run, { kind: 'step_retry', stepId: 's1', meta: { attempt: 2 } });
+  appendWorkflowEvent(wf, run, { kind: 'item_retry', stepId: 's2', itemKey: 'x', meta: { attempt: 1 } });
+  const retried = listOperationalEvents({ workflowRunId: run, limit: 50 }).filter((e) => e.type === 'workflow_node_retried');
+  assert.equal(retried.length, 2, 'both retry kinds mirror to workflow_node_retried');
+  for (const row of retried) {
+    assert.equal(row.source, 'workflow');
+    assert.equal(row.severity, 'warn');
+  }
+});
+
+test('operational mirror: step_advisory{reason:brain_fallover} → model_fallover; other advisories are NOT mirrored', () => {
+  const wf = 'advisory-mirror'; const run = 'advisory-run-1';
+  appendWorkflowEvent(wf, run, { kind: 'step_advisory', stepId: 's1', meta: { reason: 'brain_fallover', from: 'claude', to: 'codex' } });
+  appendWorkflowEvent(wf, run, { kind: 'step_advisory', stepId: 's1', meta: { reason: 'skill_execution_miss' } });
+  const rows = listOperationalEvents({ workflowRunId: run, limit: 50 });
+  const fallovers = rows.filter((e) => e.type === 'model_fallover');
+  assert.equal(fallovers.length, 1, 'only the brain_fallover advisory mirrors');
+  assert.equal(fallovers[0].source, 'model');
+  assert.equal(fallovers[0].severity, 'warn');
+  // The non-fallover advisory produced no operational row at all.
+  assert.equal(rows.length, 1, 'a non-fallover advisory is not mirrored');
+});
 
 test('reconstructWorkflowRunQueue: done/running/blocked + forEach progress from the durable log (queue visibility)', () => {
   const wf = 'queue-vis'; const run = 'q1';

@@ -7,6 +7,7 @@ import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { textResult } from './shared.js';
 
 /**
@@ -81,7 +82,28 @@ export function registerWorkerTools(server: McpServer): void {
 
       const workerModel = resolveClaudeWorkerModel();
       // P6 concurrency cap: at most K workers in flight per session; excess queue.
-      const release = await acquireWorkerSlot(sessionId);
+      // worker_queued fires only when this worker actually has to wait for a slot.
+      const release = await acquireWorkerSlot(sessionId, (info) => {
+        try {
+          recordOperationalEvent({
+            source: 'harness',
+            type: 'worker_queued',
+            sessionId,
+            actor: 'run_worker',
+            payload: { item: input.item, lane: 'sdk_brain', ...info },
+          });
+        } catch { /* telemetry is best-effort */ }
+      });
+      // worker_spawned: a slot was acquired and the worker is about to run.
+      try {
+        recordOperationalEvent({
+          source: 'harness',
+          type: 'worker_spawned',
+          sessionId,
+          actor: 'run_worker',
+          payload: { item: input.item, model: workerModel, lane: 'sdk_brain' },
+        });
+      } catch { /* telemetry is best-effort */ }
       try {
         const result = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
         const ok = !/^\s*ERROR:/i.test(result.text ?? '');

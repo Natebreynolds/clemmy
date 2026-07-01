@@ -27,6 +27,7 @@ import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession } from '../runtime/harness/eventlog.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
+import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -208,6 +209,39 @@ function ensureTaskDir(): void {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Mirror a background-task lifecycle transition into the operational-telemetry
+ * store so the dashboard / Slack / Discord can show background work in flight,
+ * parked, and finished — the eventlog is dark for these standalone tasks. The
+ * `created` event correlates to the ORIGIN chat session; every later transition
+ * correlates to the task's own run session (`background:<id>`). Fail-open.
+ */
+type BackgroundTaskOperationalType =
+  | 'background_task_created'
+  | 'background_task_started'
+  | 'background_task_finished'
+  | 'background_task_parked';
+
+function emitBackgroundTaskOperational(
+  type: BackgroundTaskOperationalType,
+  task: BackgroundTaskRecord,
+  payload: Record<string, unknown> = {},
+  severity: OperationalEventSeverity = 'info',
+): void {
+  try {
+    recordOperationalEvent({
+      source: 'harness',
+      type,
+      severity,
+      sessionId: type === 'background_task_created' ? task.originSessionId : task.runSessionId,
+      actor: 'background-task',
+      payload: { taskId: task.id, title: task.title, ...payload },
+    });
+  } catch {
+    /* telemetry is best-effort — never break a task transition */
+  }
 }
 
 function makeTaskId(now = new Date()): string {
@@ -460,6 +494,7 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     silent: true,
     metadata: taskNotificationMetadata(task),
   });
+  emitBackgroundTaskOperational('background_task_created', task, { runSessionId: task.runSessionId });
   return task;
 }
 
@@ -614,6 +649,7 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
       createHarnessSession({ id: runSessionId, kind: 'execution', title: updated?.title ?? task.title ?? 'Background task' });
     }
   } catch { /* trace pre-registration is best-effort; the worker creates it anyway */ }
+  if (updated) emitBackgroundTaskOperational('background_task_started', updated);
   return updated;
 }
 
@@ -687,6 +723,7 @@ export function markBackgroundTaskDone(id: string, result: string): BackgroundTa
     // Async report-back: also feed the result into the origin session's
     // context so Clementine resumes from it, not just a notification.
     enqueueBackgroundTaskOutcomeTurn(updated, 'done', result);
+    emitBackgroundTaskOperational('background_task_finished', updated, { status: 'done' });
   }
   return updated;
 }
@@ -724,6 +761,7 @@ export function markBackgroundTaskAwaitingInput(id: string, questionId: string, 
     // Surface the question into the origin chat too, so the user can answer in
     // the conversation (the answer is routed back via queueBackgroundTaskInputResolution).
     enqueueBackgroundTaskOutcomeTurn(updated, 'needs_input', question);
+    emitBackgroundTaskOperational('background_task_parked', updated, { reason: 'awaiting_input' }, 'warn');
   }
   return updated;
 }
@@ -782,6 +820,7 @@ export function markBackgroundTaskAwaitingContinue(id: string, reason: string, r
       'needs_input',
       `Task ${updated.id} reached its internal run budget before finishing. Reply \`continue\` to queue the next background turn, or resume it from the Tasks board.`,
     );
+    emitBackgroundTaskOperational('background_task_parked', updated, { reason: 'awaiting_continue' }, 'warn');
   }
   return updated;
 }
@@ -825,6 +864,7 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
     // Report-back without fail: a BLOCKED task must reach Clementine's context,
     // not just a notification — so she can surface the blocker or resolve it.
     enqueueBackgroundTaskOutcomeTurn(updated, 'blocked', reason);
+    emitBackgroundTaskOperational('background_task_parked', updated, { reason: 'blocked' }, 'warn');
   }
   return updated;
 }
@@ -853,6 +893,7 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
     if (status === 'failed') {
       enqueueBackgroundTaskOutcomeTurn(updated, 'failed', updated.error ?? error);
     }
+    emitBackgroundTaskOperational('background_task_finished', updated, { status }, 'error');
   }
   return updated;
 }

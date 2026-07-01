@@ -53,6 +53,8 @@ const { SessionStore } = await import('../memory/session-store.js');
 const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../runtime/harness/fanout-ledger.js');
 const { createSession, appendEvent, getSession } = await import('../runtime/harness/eventlog.js');
 const { listNotifications } = await import('../runtime/notifications.js');
+const { markBackgroundTaskBlocked } = await import('./background-tasks.js');
+const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -86,6 +88,47 @@ test('requestBackgroundDrain is a safe no-op with no kick registered, and honors
     if (prev === undefined) delete process.env.CLEMMY_BG_DRAIN_KICK; else process.env.CLEMMY_BG_DRAIN_KICK = prev;
     registerBackgroundDrainKick(() => {});
   }
+});
+
+test('operational mirror: background task lifecycle emits created → started → finished + parked/failed', () => {
+  const opsFor = (taskId: string) =>
+    listOperationalEvents({ limit: 400 }).filter((e) => (e.payload as { taskId?: string }).taskId === taskId);
+
+  // create → running → done
+  const a = createBackgroundTask({ title: 'Lifecycle A', prompt: 'do A' });
+  const created = opsFor(a.id).find((e) => e.type === 'background_task_created');
+  assert.ok(created, 'created emitted');
+  assert.equal((created!.payload as { runSessionId?: string }).runSessionId, a.runSessionId);
+  markBackgroundTaskRunning(a.id);
+  markBackgroundTaskDone(a.id, 'done result');
+  const aTypes = opsFor(a.id).map((e) => e.type);
+  assert.ok(aTypes.includes('background_task_started'), 'started emitted');
+  const finished = opsFor(a.id).find((e) => e.type === 'background_task_finished');
+  assert.ok(finished, 'finished emitted');
+  assert.equal((finished!.payload as { status?: string }).status, 'done');
+
+  // parked: awaiting_input
+  const b = createBackgroundTask({ title: 'Lifecycle B', prompt: 'do B' });
+  markBackgroundTaskAwaitingInput(b.id, 'q-1', 'need input?');
+  const bParked = opsFor(b.id).find((e) => e.type === 'background_task_parked');
+  assert.ok(bParked, 'awaiting_input parked emitted');
+  assert.equal((bParked!.payload as { reason?: string }).reason, 'awaiting_input');
+  assert.equal(bParked!.severity, 'warn');
+
+  // failed → finished with error severity
+  const c = createBackgroundTask({ title: 'Lifecycle C', prompt: 'do C' });
+  markBackgroundTaskFailed(c.id, 'boom', 'failed');
+  const cFinished = opsFor(c.id).find((e) => e.type === 'background_task_finished');
+  assert.ok(cFinished, 'failed → finished emitted');
+  assert.equal((cFinished!.payload as { status?: string }).status, 'failed');
+  assert.equal(cFinished!.severity, 'error');
+
+  // blocked → parked
+  const d = createBackgroundTask({ title: 'Lifecycle D', prompt: 'do D' });
+  markBackgroundTaskBlocked(d.id, 'missing creds', 'blocked text');
+  const dParked = opsFor(d.id).find((e) => e.type === 'background_task_parked');
+  assert.ok(dParked, 'blocked → parked emitted');
+  assert.equal((dParked!.payload as { reason?: string }).reason, 'blocked');
 });
 
 test('resumeInterruptedBackgroundTasks re-queues once and respects the cap', () => {
