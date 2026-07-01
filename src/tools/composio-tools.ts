@@ -420,6 +420,12 @@ export async function maybeAutoRememberComposioChoice(
 ): Promise<void> {
   try {
     const failed = detectComposioFailure(result).failed;
+    // Async-aware learning: a queued RECEIPT (a DataForSEO task_post handle, an Apify
+    // run handle) is NOT a completed outcome — the job hasn't produced a result yet.
+    // Neither credit it as a success nor learn it as the proven tool for the intent
+    // (that would teach "task_post = the answer" when it only QUEUES). The real
+    // outcome is decided when the result is fetched. Guarded by the same kill-switch.
+    if (!failed && composioAsyncResolveEnabled() && detectJobReceipt(toolSlug, result)) return;
     // Thread 2 — close the outcome loop: credit (success) or blame (failure)
     // whatever proven choice points at this slug on EVERY execute, not just
     // discovery-followed ones. Flag-gated no-op when off; best-effort.

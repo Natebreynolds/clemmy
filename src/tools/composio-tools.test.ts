@@ -248,6 +248,21 @@ test('auto-remember: a successful execute after a search memorizes intent→slug
   assert.ok(!(rec?.choice?.invocationTemplate ?? '').includes('connected_account_id'));
 });
 
+test('auto-remember: a QUEUED RECEIPT (task_post) memorizes nothing — the job has no result yet', async () => {
+  const intent = 'zzq-queued-receipt-guard-unique-probe-intent-42';
+  noteComposioSearchIntent('sess-auto-receipt', intent);
+  // A DataForSEO TASK_POST returns a receipt (status_code 20100, result:null) — a
+  // queued job, NOT the answer. It must NOT be learned as the proven tool for this
+  // intent (that would teach "task_post = the answer" when it only queues).
+  await maybeAutoRememberComposioChoice(
+    'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST',
+    { tasks: [{ keyword: 'x', location_code: 2840, language_code: 'en' }] },
+    { successful: true, data: { tasks: [{ id: 'task-1', result: null, status_code: 20100, status_message: 'Task Created.' }] } },
+    'sess-auto-receipt',
+  );
+  assert.equal(recallToolChoice(intent), null, 'a queued receipt is not a completed outcome — learn nothing');
+});
+
 test('auto-remember: a FAILED execute memorizes nothing', async () => {
   const intent = 'send an outlook email failing';
   noteComposioSearchIntent('sess-auto-2', intent);
