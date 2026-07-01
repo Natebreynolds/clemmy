@@ -19,9 +19,12 @@ import { planBrain, provisionDaemon } from './provision.js';
 import { openHarnessDb, summarizeAllSessions } from './score.js';
 import { fanoutMultiItem } from './scenarios/fanout-multi-item.js';
 import { continuityRecall } from './scenarios/continuity-recall.js';
+import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
+import { approvalParkResume } from './scenarios/approval-park-resume.js';
+import { cronReportBack } from './scenarios/cron-report-back.js';
 import type { BrainKind, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
-const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall];
+const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
 function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDef[]; scoreOnly?: string; keep: boolean } {

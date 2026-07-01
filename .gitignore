@@ -70,3 +70,4 @@ vendor/
 
 # Local Netlify folder
 .netlify
+proof-report.json

@@ -189,6 +189,16 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     return res.status;
   };
 
+  const request = async (method: string, apiPath: string, body?: unknown): Promise<{ status: number; json: unknown }> => {
+    const res = await fetch(`${baseUrl}${apiPath}`, {
+      method,
+      headers,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    return { status: res.status, json: await res.json().catch(() => ({})) };
+  };
+
   const stop = async (stopOpts?: { keepHome?: boolean }): Promise<void> => {
     try { proc.kill('SIGTERM'); } catch { /* already dead */ }
     await new Promise((r) => setTimeout(r, 1500));
@@ -198,5 +208,5 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     }
   };
 
-  return { home, port, secret, baseUrl, chat, approve, log: () => logChunks.join(''), stop };
+  return { home, port, secret, baseUrl, chat, approve, request, log: () => logChunks.join(''), stop };
 }

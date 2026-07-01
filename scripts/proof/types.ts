@@ -35,6 +35,8 @@ export interface DaemonHandle {
   baseUrl: string;
   chat(message: string, sessionId: string, timeoutMs?: number): Promise<TurnResult>;
   approve(approvalId: string, decision: 'approve' | 'reject'): Promise<number>;
+  /** Authenticated JSON request against the daemon's console API. */
+  request(method: string, apiPath: string, body?: unknown): Promise<{ status: number; json: unknown }>;
   /** Everything the daemon printed so far (stdout+stderr). */
   log(): string;
   /** keepHome=true preserves the temp home for forensics (failed runs). */
