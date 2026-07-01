@@ -76,10 +76,18 @@ export function claudeSubscriptionTransport(): ClaudeSubscriptionTransport {
 
 export function claudeCliModelArg(modelId: string): string {
   const id = (modelId || '').trim().toLowerCase();
-  if (/\bopus\b|claude-opus/.test(id)) return 'opus';
-  if (/\bfable\b|claude-fable/.test(id)) return 'fable';
-  if (/\bhaiku\b|claude-haiku/.test(id)) return 'haiku';
-  if (/\bsonnet\b|claude-sonnet|^claude-/.test(id)) return 'sonnet';
+  // A FULL Anthropic model name (claude-<family>-<version…>). The claude CLI accepts these and
+  // runs the EXACT model — VERIFIED 2026-07-01: claude-sonnet-5 / claude-sonnet-4-6 /
+  // claude-opus-4-8 / claude-fable-5 each resolve to themselves. Pass it through FIRST so a
+  // NON-latest pick (e.g. claude-sonnet-4-6) is not silently upgraded to the family alias's
+  // latest — the picker-fidelity bug where every claude-sonnet-* collapsed to bare 'sonnet'
+  // (= the newest sonnet), so "Sonnet 4.6" and "Sonnet 5" ran the SAME model.
+  if (/^claude-(?:opus|sonnet|haiku|fable)-\d/.test(id)) return id;
+  // Bare family words → the CLI alias for the LATEST of that family (e.g. 'sonnet' → newest sonnet).
+  if (/\bopus\b/.test(id)) return 'opus';
+  if (/\bfable\b/.test(id)) return 'fable';
+  if (/\bhaiku\b/.test(id)) return 'haiku';
+  if (/\bsonnet\b|^claude-/.test(id)) return 'sonnet';
   return modelId || 'sonnet';
 }
 

@@ -52,11 +52,22 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-test('claudeCliModelArg maps Clementine Claude ids to Claude Code aliases', () => {
-  assert.equal(claudeCliModelArg('claude-opus-4-8'), 'opus');
-  assert.equal(claudeCliModelArg('claude-sonnet-4-6'), 'sonnet');
-  assert.equal(claudeCliModelArg('claude-haiku-4-5'), 'haiku');
-  assert.equal(claudeCliModelArg('claude-fable-5'), 'fable');
+test('claudeCliModelArg passes a FULL model name through (exact model, fidelity), aliases bare words', () => {
+  // Full Anthropic names → passed through so the CLI runs the EXACT model (verified live: the
+  // CLI accepts each and resolves it to itself). Fixes the picker-fidelity bug where every
+  // claude-sonnet-* collapsed to bare 'sonnet' (= newest), so 4.6 and 5 ran the SAME model.
+  assert.equal(claudeCliModelArg('claude-opus-4-8'), 'claude-opus-4-8');
+  assert.equal(claudeCliModelArg('claude-sonnet-4-6'), 'claude-sonnet-4-6');
+  assert.equal(claudeCliModelArg('claude-sonnet-5'), 'claude-sonnet-5');
+  assert.equal(claudeCliModelArg('claude-fable-5'), 'claude-fable-5');
+  assert.equal(claudeCliModelArg('claude-haiku-4-5'), 'claude-haiku-4-5');
+  // Bare family words → the CLI alias for the LATEST of that family.
+  assert.equal(claudeCliModelArg('sonnet'), 'sonnet');
+  assert.equal(claudeCliModelArg('opus'), 'opus');
+  assert.equal(claudeCliModelArg('fable'), 'fable');
+  // An unversioned / unknown claude-* falls back to the sonnet alias (prior default preserved).
+  assert.equal(claudeCliModelArg('claude-agent-sdk'), 'sonnet');
+  assert.equal(claudeCliModelArg(''), 'sonnet');
 });
 
 test('buildClaudeHeadlessArgs uses print-mode stream-json without bare mode', () => {
@@ -66,7 +77,7 @@ test('buildClaudeHeadlessArgs uses print-mode stream-json without bare mode', ()
   assert.equal(args.includes('--output-format'), true);
   assert.equal(args.includes('stream-json'), true);
   assert.equal(args.includes('--model'), true);
-  assert.equal(args[args.indexOf('--model') + 1], 'opus');
+  assert.equal(args[args.indexOf('--model') + 1], 'claude-opus-4-8');
 });
 
 test('buildClaudeHeadlessEnv uses OAuth token and strips API-key envs', async () => {
@@ -171,7 +182,7 @@ test('ClaudeHeadlessModel streams deltas and emits a conformant done event', asy
     events.push(event as any);
   }
 
-  assert.equal(captured.args?.[captured.args.indexOf('--model') + 1], 'opus');
+  assert.equal(captured.args?.[captured.args.indexOf('--model') + 1], 'claude-opus-4-8');
   assert.match(captured.prompt ?? '', /Speak plainly/);
   assert.equal(captured.env?.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-test-token');
   assert.deepEqual(events.map((e) => e.type), ['response_started', 'output_text_delta', 'output_text_delta', 'response_done']);

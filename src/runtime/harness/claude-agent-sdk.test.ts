@@ -186,7 +186,7 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.equal(capture.call.prompt, 'Call ping.');
   assert.equal(capture.call.options.env.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-sdk-test-token');
   assert.equal(capture.call.options.env.ANTHROPIC_API_KEY, undefined);
-  assert.equal(capture.call.options.model, 'sonnet');
+  assert.equal(capture.call.options.model, 'claude-sonnet-4-6');
   assert.equal(capture.call.options.permissionMode, 'dontAsk');
   assert.equal(capture.call.options.mcpServers['clementine-local'].env.CLEMENTINE_HOME, TMP_HOME);
   assert.equal(capture.call.options.mcpServers['clementine-local'].env.CLEMENTINE_MCP_SESSION_ID, 'sdk-clementine-session');
