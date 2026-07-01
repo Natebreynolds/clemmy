@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectJobReceipt, asyncReceiptBanner } from './async-job.js';
+import { detectJobReceipt, asyncReceiptBanner, autoPollJob, type JobReceipt } from './async-job.js';
 
 // Real DataForSEO TASK_POST envelope (keyword: best coffee austin).
 const DFS_TASK_POST = {
@@ -75,4 +75,55 @@ test('an Apify run that already SUCCEEDED (finishedAt set) is NOT a queued recei
 test('a DataForSEO error envelope is NOT a receipt', () => {
   const err = { data: { tasks: [{ id: 'x', result: null, status_code: 40400, status_message: 'Not Found.' }] } };
   assert.equal(detectJobReceipt('DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST', err), null);
+});
+
+// ── A3: bounded Apify auto-poll (fake exec + injectable sleep — no real credits) ──
+const APIFY_RECEIPT: JobReceipt = detectJobReceipt('APIFY_RUN_ACTOR', APIFY_RUN)!;
+
+test('autoPollJob: Apify run polled to SUCCEEDED returns the real dataset items', async () => {
+  const calls: string[] = [];
+  let status = 'RUNNING';
+  const exec = async (slug: string, args: Record<string, unknown>) => {
+    calls.push(slug);
+    if (slug === 'APIFY_GET_LIST_OF_RUNS') {
+      status = status === 'RUNNING' ? 'RUNNING' : 'SUCCEEDED';
+      // flip to SUCCEEDED on the 2nd status check
+      if (calls.filter((c) => c === 'APIFY_GET_LIST_OF_RUNS').length >= 2) status = 'SUCCEEDED';
+      return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status, defaultDatasetId: '71epPtxtXZshtjnV4' }] } };
+    }
+    if (slug === 'APIFY_GET_DATASET_ITEMS') {
+      assert.equal(args.datasetId, '71epPtxtXZshtjnV4', 'fetches the run\'s own dataset');
+      return { data: [{ hello: 'world' }], successful: true };
+    }
+    throw new Error(`unexpected slug ${slug}`);
+  };
+  const res = await autoPollJob(APIFY_RECEIPT, exec, { sleep: async () => {} });
+  assert.equal(res.resolved, true, 'resolved to the real result');
+  assert.deepEqual(res.result, { data: [{ hello: 'world' }], successful: true });
+  assert.ok(calls.includes('APIFY_GET_DATASET_ITEMS'), 'fetched dataset items');
+});
+
+test('autoPollJob: a FAILED run does NOT fetch items and falls back (resolved:false)', async () => {
+  const exec = async (slug: string) => {
+    if (slug === 'APIFY_GET_LIST_OF_RUNS') return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'FAILED' }] } };
+    throw new Error('should not fetch dataset for a failed run');
+  };
+  const res = await autoPollJob(APIFY_RECEIPT, exec, { sleep: async () => {} });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /FAILED/);
+});
+
+test('autoPollJob: budget overrun falls back to the corrective (resolved:false)', async () => {
+  let t = 0;
+  const exec = async () => ({ data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'RUNNING' }] } });
+  const res = await autoPollJob(APIFY_RECEIPT, exec, { now: () => (t += 30_000), sleep: async () => {} });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /budget/);
+});
+
+test('autoPollJob: a non-Apify receipt is never auto-polled (DataForSEO falls back)', async () => {
+  const dfs = detectJobReceipt('DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST', DFS_TASK_POST)!;
+  const res = await autoPollJob(dfs, async () => { throw new Error('must not poll'); }, { sleep: async () => {} });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /family-not-auto-pollable/);
 });

@@ -11,7 +11,7 @@ import {
   listConnectedToolkits,
   listAllToolkits,
 } from '../integrations/composio/client.js';
-import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled } from '../integrations/composio/async-job.js';
+import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob } from '../integrations/composio/async-job.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier } from '../memory/tool-choice-store.js';
@@ -653,7 +653,18 @@ async function runComposioExecute(
       // inert on a normal result. Kill-switch CLEMMY_COMPOSIO_ASYNC_RESOLVE.
       if (!failure.failed && composioAsyncResolveEnabled()) {
         const receipt = detectJobReceipt(toolSlug, result);
-        if (receipt) output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
+        if (receipt) {
+          // For the one UNAMBIGUOUS case (an Apify async run), the harness polls to
+          // completion itself and returns the REAL output — the model never has to
+          // know it was async. Any other family / a poll overrun falls back to the
+          // id-bearing corrective (never worse than model-driven). Bounded latency.
+          const poll = await autoPollJob(receipt, (slug, a) => executeComposioTool(slug, a, effectiveConnectionId));
+          if (poll.resolved) {
+            output = `${formatComposioExecuteOutput(poll.result, { ...options, toolSlug })}\n\n[auto-resolved] Polled the queued ${receipt.family} job (${poll.polls} check${poll.polls === 1 ? '' : 's'}) and fetched the real result — this IS the final output.`;
+          } else {
+            output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
+          }
+        }
       }
 
       // Only count/advise on SUCCESS — a failed call isn't "an item processed".
