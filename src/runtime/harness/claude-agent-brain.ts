@@ -214,12 +214,23 @@ export function looksLikeToolNarration(text: string, toolUses: string[]): boolea
     // the `<system>` prefix defeated the old line-anchored header). The optional
     // `<tag>`/`</tag>` prefix keeps it line-anchored so mid-sentence prose never trips.
     /(^|\n)\s*(?:<\/?[a-z][a-z0-9_-]*>\s*)?\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
+    // Bracketed tool reference the model prints as its answer: "[Tool: OUTLOOK_GET_…]",
+    // "[Calling tool X]", "[Using composio_execute_tool]" (2026-07-01 live: a Scorpion
+    // calendar turn on the Sonnet-5 brain answered with "[Tool: OUTLOOK_OUTLOOK_GET_CALENDAR_VIEW]").
+    /(^|\n)\s*\[\s*(?:tool|calling|using|invoking|call)\b[^\]]*\]/i.test(t) ||
     // Tagged markers some models emit: "<tool_call>", "[tool_call]".
     /(^|\n)\s*[<\[]\s*tool[\s_-]*call\b/i.test(t) ||
     /(^|\n)\s*function\s*\n?\s*\{/.test(t) ||
     /System:\s*tool result/i.test(t) ||
     // A bare tool-call-shaped JSON payload (command / tool_slug / tool_name / arguments).
     /(^|\n)\s*\{\s*"(command|tool_slug|tool_name|arguments)"\s*:/i.test(t) ||
+    // OpenAI/function-calling JSON the model PRINTS instead of invoking:
+    // `{"tool_call":{"name":"composio_search_tools","arguments":{…}}}` and the bare
+    // `{"name":"x","arguments":{…}}` / `"function":{"name":…}` shapes (2026-07-01 live:
+    // a Scorpion calendar turn on the Claude brain printed exactly this + fired no tool).
+    /"tool_call"\s*:\s*\{/i.test(t) ||
+    /"name"\s*:\s*"[a-z0-9_.-]+"\s*,\s*"arguments"\s*:/i.test(t) ||
+    /"function"\s*:\s*\{\s*"name"\s*:/i.test(t) ||
     /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t)
   );
 }
@@ -239,7 +250,11 @@ export function looksLikeStreamingNarration(text: string): boolean {
     // Header form, incl. a leading hallucinated `<system>`/`<assistant>` wrapper tag
     // (2026-06-30 live: "<system>Tool call: composio_search_tools — {…}</system>").
     /(^|\n)\s*(?:<\/?[a-z][a-z0-9_-]*>\s*)?\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
-    /(^|\n)\s*[<[]\s*tool[\s_-]*call\b/i.test(t)
+    /(^|\n)\s*[<[]\s*tool[\s_-]*call\b/i.test(t) ||
+    // Function-calling JSON printed as text (see looksLikeToolNarration) — suppress the
+    // stream so the raw `{"tool_call":{…}}` never reaches the bubble.
+    /"tool_call"\s*:\s*\{/i.test(t) ||
+    /"function"\s*:\s*\{\s*"name"\s*:/i.test(t)
   );
 }
 

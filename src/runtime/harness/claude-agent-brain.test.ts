@@ -794,6 +794,16 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('<system>Tool call: composio_search_tools — {"query": "apify run actor facebook ad library scraper dataset items"}</system>', []), true);
   assert.equal(looksLikeToolNarration('I\'ll set that up.\n\n<system>Tool call: offer_background — {"summary": "Build the Meta-ads workspace", "options": ["background", "hold", "now"]}</system>', []), true);
   assert.equal(looksLikeToolNarration('<assistant>Tool call: space_save — {"slug":"x"}</assistant>', []), true);
+  // The 2026-07-01 live failure (Scorpion calendar, Sonnet-5 brain): the brain PRINTED
+  // OpenAI-style function-calling JSON and a "[Tool: NAME]" reference instead of firing the
+  // tool — nothing ran. Both exact live shapes must trip.
+  assert.equal(looksLikeToolNarration("I'll pull today's events now.\n\n{\"tool_call\":{\"name\":\"composio_search_tools\",\"arguments\":{\"query\":\"outlook calendar\"}}}", []), true);
+  assert.equal(looksLikeToolNarration('[Tool: OUTLOOK_OUTLOOK_GET_CALENDAR_VIEW]', []), true);
+  assert.equal(looksLikeToolNarration('{"name":"composio_execute_tool","arguments":{"tool_slug":"X"}}', []), true);
+  assert.equal(looksLikeToolNarration('{"function":{"name":"run_shell_command","arguments":{}}}', []), true);
+  // …but these SHAPES must not false-flag normal prose that merely mentions the words:
+  assert.equal(looksLikeToolNarration('The [tool] I recommend is the calendar view — want me to pull it?', []), false);
+  assert.equal(looksLikeToolNarration('Your event is named "Weekly Sync" and the arguments we set look right.', []), false);
   // Real tool calls happened ⇒ not narration, even if text mentions tools / XML.
   assert.equal(looksLikeToolNarration('Tool:run_shell_command', ['mcp__clementine-local__run_shell_command']), false);
   assert.equal(looksLikeToolNarration('<invoke name="run_shell_command">', ['run_shell_command']), false);
