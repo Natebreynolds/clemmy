@@ -37,6 +37,22 @@ function maxTurns(step: WorkflowStepInput, fullLane: boolean): number {
   return Number.isFinite(raw) && raw >= 1 ? raw : (fullLane ? 24 : 6);
 }
 
+/** DEFAULT ON. When a workflow step hits its per-query turn budget while STILL making
+ *  forward progress, auto-continue instead of BLOCKING the step (parity with the chat
+ *  brain's F1). Off (CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE=off) ⇒ prior
+ *  block-on-budget behavior (the runner's self-heal/retry then handles it). */
+function workflowStepAutoContinueEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+function maxWorkflowStepAutoContinues(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE_MAX', '4') ?? '4', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 4;
+}
+function workflowStepAutoContinueWallMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE_WALL_MS', '900000') ?? '900000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 900_000;
+}
+
 export function requiredLocalMcpToolsForWorkflowStep(step: WorkflowStepInput, fullLane: boolean): string[] {
   if (!fullLane) return [];
   const out = new Set<string>();
@@ -193,19 +209,48 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   fullLane?: boolean;
 }): Promise<ClaudeAgentSdkWorkflowStepResult> {
   const fullLane = Boolean(args.fullLane);
+  const stepRunOptions = {
+    modelId: args.modelId,
+    sessionId: args.sessionId,
+    systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step, fullLane }),
+    allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only'),
+    requiredLocalMcpTools: requiredLocalMcpToolsForWorkflowStep(args.step, fullLane),
+    agentic: fullLane,
+    maxTurns: maxTurns(args.step, fullLane),
+    outputSchema: claudeWorkflowStepOutputSchema(),
+  };
   let result: ClaudeAgentSdkRunResult;
   try {
-    result = await runClaudeAgentSdkImpl({
-      prompt: args.prompt,
-      modelId: args.modelId,
-      sessionId: args.sessionId,
-      systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step, fullLane }),
-      allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only'),
-      requiredLocalMcpTools: requiredLocalMcpToolsForWorkflowStep(args.step, fullLane),
-      agentic: fullLane,
-      maxTurns: maxTurns(args.step, fullLane),
-      outputSchema: claudeWorkflowStepOutputSchema(),
-    });
+    result = await runClaudeAgentSdkImpl({ prompt: args.prompt, ...stepRunOptions });
+    // F3 — auto-continue past the per-query turn budget on a forward-progressing step
+    // instead of BLOCKING it (parity with the chat brain's F1). A heavy / multi-item
+    // step must not halt just because it hit the per-query turn cap while still making
+    // tool progress. Bounded by count + wall-clock; a continuation error keeps the prior
+    // partial (which then blocks honestly below).
+    if (result.limitHit && workflowStepAutoContinueEnabled()) {
+      const autoStart = Date.now();
+      let autos = 0;
+      while (
+        result.limitHit
+        && result.toolUses.length > 0
+        && autos < maxWorkflowStepAutoContinues()
+        && (Date.now() - autoStart) < workflowStepAutoContinueWallMs()
+      ) {
+        let cont: ClaudeAgentSdkRunResult;
+        try {
+          cont = await runClaudeAgentSdkImpl({
+            prompt:
+              `You hit the per-turn tool budget but this step is NOT finished. Progress so far:\n${(result.text || '').trim().slice(0, 1200)}\n\n`
+              + `Continue and FINISH the step from the original instructions — do NOT redo completed work. When done, call workflow_step_result exactly once.`,
+            ...stepRunOptions,
+          });
+        } catch {
+          break; // a continuation error → keep the prior partial (it blocks honestly below)
+        }
+        autos += 1;
+        result = { ...cont, toolUses: [...result.toolUses, ...cont.toolUses] };
+      }
+    }
   } catch (err) {
     if (err instanceof ClaudeAgentSdkToolSurfaceError) {
       // A tool-surface miss has TWO causes that must be handled differently:

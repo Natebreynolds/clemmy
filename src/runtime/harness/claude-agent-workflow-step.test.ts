@@ -304,6 +304,9 @@ test('runClaudeAgentSdkWorkflowStep RE-THROWS (transient, self-heal) when the MC
 });
 
 test('runClaudeAgentSdkWorkflowStep converts SDK turn limits into a blocked workflow result', async () => {
+  // Isolate the pure block-conversion path (F3 auto-continue off) — a permanently
+  // limited step's auto-continue behavior is covered by the F3 tests below.
+  process.env.CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE = 'off';
   setClaudeAgentSdkWorkflowStepRunForTest(async () => ({
     text: 'I reached the turn budget. Say "continue" to keep going.',
     limitHit: true,
@@ -314,20 +317,66 @@ test('runClaudeAgentSdkWorkflowStep converts SDK turn limits into a blocked work
     modelUsage: { provider: 'claude', model: 'claude-sonnet-4-6' },
   }));
 
-  const result = await runClaudeAgentSdkWorkflowStep({
-    step,
-    workflowName: 'Report Workflow',
-    prompt: 'Do the workflow step.',
-    modelId: 'claude-sonnet-4-6',
-  });
+  try {
+    const result = await runClaudeAgentSdkWorkflowStep({
+      step,
+      workflowName: 'Report Workflow',
+      prompt: 'Do the workflow step.',
+      modelId: 'claude-sonnet-4-6',
+    });
 
-  assert.deepEqual(result.output, {
-    blocked: true,
-    reason: 'Claude reached the workflow-step turn budget before finishing this step.',
+    assert.deepEqual(result.output, {
+      blocked: true,
+      reason: 'Claude reached the workflow-step turn budget before finishing this step.',
+    });
+    assert.equal(result.structured, true);
+    assert.equal(result.sdkSessionId, 'sdk-workflow-session');
+    assert.deepEqual(result.toolUses, ['mcp__clementine-local__skill_read']);
+    assert.deepEqual(result.usage, { input_tokens: 12, output_tokens: 4 });
+    assert.deepEqual(result.modelUsage, { provider: 'claude', model: 'claude-sonnet-4-6' });
+  } finally {
+    delete process.env.CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE;
+  }
+});
+
+test('F3: a workflow step that hits its turn budget WITH progress auto-continues and finishes (not blocked)', async () => {
+  let calls = 0;
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+    calls += 1;
+    if (calls === 1) {
+      // Made tool progress but hit the per-query turn cap.
+      return { text: 'partial: did 2 of 5', sessionId: 's', model: 'claude-sonnet-5', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: true };
+    }
+    return {
+      text: '{"status":"completed","output":{"report":"all 5 done"}}',
+      structuredOutput: { status: 'completed', output: { report: 'all 5 done' } },
+      sessionId: 's', model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false,
+    };
   });
-  assert.equal(result.structured, true);
-  assert.equal(result.sdkSessionId, 'sdk-workflow-session');
-  assert.deepEqual(result.toolUses, ['mcp__clementine-local__skill_read']);
-  assert.deepEqual(result.usage, { input_tokens: 12, output_tokens: 4 });
-  assert.deepEqual(result.modelUsage, { provider: 'claude', model: 'claude-sonnet-4-6' });
+  const result = await runClaudeAgentSdkWorkflowStep({ step, workflowName: 'WF', prompt: 'do 5 items', modelId: 'claude-sonnet-5', fullLane: true });
+  assert.equal(calls, 2, 'auto-continued once past the step turn budget');
+  assert.deepEqual(result.output, { report: 'all 5 done' }, 'finished — not blocked on turn budget');
+  assert.notEqual((result.output as { blocked?: boolean }).blocked, true);
+});
+
+test('F3: a step limit-hit with NO tool progress still BLOCKS (anti-loop)', async () => {
+  let calls = 0;
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => { calls += 1; return { text: 'stuck', sessionId: 's', toolUses: [], limitHit: true }; });
+  const result = await runClaudeAgentSdkWorkflowStep({ step, workflowName: 'WF', prompt: 'x', modelId: 'claude-sonnet-5', fullLane: true });
+  assert.equal(calls, 1, 'no auto-continue without tool progress');
+  assert.equal((result.output as { blocked?: boolean }).blocked, true, 'blocks honestly on the turn budget');
+});
+
+test('F3: kill-switch off ⇒ blocks on the turn budget (prior behavior)', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE = 'off';
+  let calls = 0;
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => { calls += 1; return { text: 'partial', sessionId: 's', toolUses: ['x'], limitHit: true }; });
+  try {
+    const result = await runClaudeAgentSdkWorkflowStep({ step, workflowName: 'WF', prompt: 'x', modelId: 'claude-sonnet-5', fullLane: true });
+    assert.equal(calls, 1, 'no auto-continue when off');
+    assert.equal((result.output as { blocked?: boolean }).blocked, true);
+  } finally {
+    delete process.env.CLEMMY_CLAUDE_SDK_WORKFLOW_STEP_AUTO_CONTINUE;
+  }
 });
