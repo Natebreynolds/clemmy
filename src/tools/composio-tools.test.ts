@@ -156,6 +156,17 @@ test('formatComposioExecuteOutput: prepends a do-not-retry corrective on a faile
   assert.match(out, /400 Client Error/);
 });
 
+test('formatComposioExecuteOutput: a hard failure surfaces CROSS-SURFACE alternatives (intent threaded from the slug)', () => {
+  resetEventLog();
+  const failed = { successful: false, error: 'Bad Request: invalid recipient address' };
+  const out = formatComposioExecuteOutput(failed, { toolSlug: 'GMAIL_SEND_EMAIL' });
+  // The slug seeds intent "gmail send email" → capability registry "send email" → the
+  // alternatives now render (were inert before: callers passed no intent). Alternatives
+  // span OTHER surfaces, not just the failed Composio tool — the "smart re-discovery" ask.
+  assert.match(out, /alternativ/i, 'offers alternatives on a hard failure');
+  assert.match(out, /cli_mail_send|outlook|manual/i, 'alternatives span other surfaces/tools, not just the failed one');
+});
+
 test('formatComposioExecuteOutput: a TIMEOUT on a long-running job steers to ASYNC start+poll, not a same-call retry', () => {
   resetEventLog();
   // The live 2026-06-24 case: a blocking sync Apify actor run exceeded the 5-min

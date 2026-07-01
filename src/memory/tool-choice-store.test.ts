@@ -631,3 +631,19 @@ test('matchToolChoicesForStep: an embedded command still binds (already-bound sh
   const boundPrompt = 'Run `sf data query --query "SELECT Id FROM Account"` to pull the accounts.';
   assert.ok(matchToolChoicesForStep(boundPrompt, { choices: [sfSoqlChoice] }).length >= 1);
 });
+
+test('matchToolChoicesForStep drops a NET-NEGATIVE remembered choice so a broken tool stops resurfacing on steps', () => {
+  // A healthy choice keeps the pool non-empty; a broken (net-negative) choice that
+  // matches the step must NOT be bound — it should be dropped so the step rediscovers.
+  rememberToolChoice({ intent: 'query salesforce accounts records healthy', description: 'x',
+    choice: { kind: 'composio', identifier: 'SALESFORCE_QUERY_RECORDS' } });
+  rememberToolChoice({ intent: 'list airtable records for prospects', description: 'x',
+    choice: { kind: 'composio', identifier: 'AIRTABLE_LIST_RECORDS' } });
+  // Net-negative: 2 failures / 0 wins → score 0.25 < TOOL_CHOICE_SCORE_FLOOR (0.34).
+  updateToolChoiceOutcome('list airtable records for prospects', 'failure');
+  updateToolChoiceOutcome('list airtable records for prospects', 'failure');
+
+  const matches = matchToolChoicesForStep('List Airtable records for prospects.');
+  assert.equal(matches.find((m) => m.identifier === 'AIRTABLE_LIST_RECORDS'), undefined,
+    'the net-negative airtable choice is not bound to the step (dropped by the outcome floor)');
+});

@@ -888,6 +888,18 @@ export function matchToolChoicesForStep(
     return [];
   }
 
+  // Don't auto-bind/advise a NET-NEGATIVE remembered choice onto a step — a broken-
+  // but-not-yet-streak-invalidated tool (e.g. 2 failures / 0 wins, score < floor, but
+  // < the 3-loss auto-invalidate streak) would otherwise keep resurfacing here. The
+  // advertised context block already drops these (renderToolChoicesForContext); recall
+  // and step-match did not, so a shaky tool kept getting bound. Same empty-pool guard:
+  // if filtering leaves no active choice, keep the unfiltered set (rediscovery still
+  // works via the token gates below, just without the score veto).
+  if (isProceduralOutcomesEnabled()) {
+    const filtered = records.filter((r) => !r.choice || computeChoiceScore(r.choice) >= TOOL_CHOICE_SCORE_FLOOR);
+    if (filtered.some((r) => r.choice)) records = filtered;
+  }
+
   const out: StepToolChoiceMatch[] = [];
   for (const rec of records) {
     if (!rec.choice) continue; // inactive (invalidated, not yet rediscovered)

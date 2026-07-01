@@ -174,6 +174,17 @@ function formatFallbackSuggestions(intent: string, failedTool: string, failureTy
  *  the model adapts on failure #1 instead of retrying identically. Names the
  *  tool the model actually called (`composio_execute_tool` or the dynamic
  *  `cx_<slug>`) and the slug, so the corrective is unambiguous on both paths. */
+/** Derive a natural-language intent seed from a Composio slug so the cross-surface
+ *  alternatives machinery (getCapabilitiesForIntent) can actually match a pattern.
+ *  GMAIL_SEND_EMAIL → "gmail send email". Without this the callers passed no intent,
+ *  it defaulted to a placeholder, and the whole "here are your alternatives (incl. a
+ *  native MCP / CLI for the same capability)" path was inert. */
+function intentSeedFromSlug(toolSlug?: string): string | undefined {
+  if (!toolSlug) return undefined;
+  const seed = toolSlug.replace(/[_\-]+/g, ' ').trim().toLowerCase();
+  return seed || undefined;
+}
+
 function composioFailureCorrective(
   summary: string,
   opts: { toolName?: string; toolSlug?: string; notFound?: boolean; transient?: boolean; intent?: string } = {},
@@ -285,7 +296,7 @@ export function formatComposioExecuteOutput(
   const { failed, summary, notFound } = detectComposioFailure(value);
   if (!failed) return body; // success: the GLOBAL id-index (formatRecallableToolText) handles resource lists
   const transient = workerThrashGuardEnabled() && !notFound && isTransientStepError(summary);
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient }) + '\n\n' + body;
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
 }
 
 /**
@@ -347,7 +358,7 @@ export function composioThrownErrorOutput(
   // The thrown path carries the real error object (status/cause) — classify on
   // it directly so undici `fetch failed`→ECONNRESET is correctly transient.
   const transient = workerThrashGuardEnabled() && !notFound && isTransientStepError(err);
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient }) + '\n\n' + body;
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
 }
 
 /** Run a Composio execution and format BOTH outcomes through the corrective
