@@ -34,6 +34,7 @@ import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
 import { workerItemAlreadyCapped } from './worker-respawn-guard.js';
+import { acquireWorkerSlot } from './worker-concurrency.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -758,6 +759,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const input = params as WorkerToolInput;
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
+      // P6: throttle concurrent worker fan-out per session so N parallel run_worker
+      // calls can't open N provider calls at once and storm a rate limit. Bounds BOTH
+      // worker lanes (this wraps before the route branch). Released in the finally.
+      const releaseWorkerSlot = await acquireWorkerSlot(sessionId ?? '');
+      try {
       const turn = extractTurn(runContext);
       const toolCallId = details?.toolCall?.callId ?? null;
       const workerModel = route.model ?? resolveRoleModel('worker').modelId;
@@ -911,6 +917,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       } catch (err) {
         appendWorkerResult({ item: input.item, ok: false, model: route.model ?? workerModel, toolUses: [], reason: workerResultReason(err) });
         throw err;
+      }
+      } finally {
+        releaseWorkerSlot();
       }
     },
   }) as Tool<RuntimeContextValue>;
