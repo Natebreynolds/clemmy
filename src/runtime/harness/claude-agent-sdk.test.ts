@@ -17,6 +17,7 @@ const {
   ClaudeAgentSdkToolSurfaceError,
   buildAllowOnlyToolsPermission,
   buildClaudeAgentSdkLocalMcpServers,
+  buildScopedNativeMcpServers,
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
   setClaudeAgentSdkQueryForTest,
@@ -622,11 +623,52 @@ test('ask_user_question is terminal in the SDK lane — the question surfaces in
 
   assert.equal(interrupted, true, 'the run stopped on the question');
   assert.equal(r.limitHit, false);
+  assert.equal(r.stoppedReason, 'awaiting-input');
   // The QUESTION (from the tool input) is the reply — not the check-in receipt, not the
   // premature task answer.
   assert.match(r.text, /New topic, or resume the Salesforce work\?/);
   assert.doesNotMatch(r.text, /Check-in created/);
   assert.doesNotMatch(r.text, /should not run the task/);
+});
+
+test('ask_user_question approval auto-resolve is non-terminal in the SDK lane', async () => {
+  let interrupted = false;
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const q = stubsFor((async function* () {
+      yield initOnlyMessage();
+      yield {
+        type: 'assistant', session_id: 's', uuid: 'a', parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: 'toolu_ask_yolo',
+          name: 'mcp__clementine-local__ask_user_question',
+          input: { question: 'Want me to send the rest now?', purpose: 'approval' },
+        }] },
+      } as any;
+      yield {
+        type: 'user', session_id: 's', uuid: 'u', parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_ask_yolo',
+            content: 'YOLO standing approval is in effect — NOT pausing for sign-off on an action you were already asked to do. Proceed now with your best default.',
+          }],
+        },
+      } as any;
+      yield successResultMessage('finished after standing approval');
+    })());
+    return Object.assign(q, { interrupt: async () => { interrupted = true; } });
+  }) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'send the rest',
+    sessionId: 'sdk-ask-yolo-nonterminal',
+    modelId: 'claude-sonnet-5',
+    allowedLocalMcpTools: ['ask_user_question'],
+  });
+
+  assert.equal(interrupted, false, 'auto-resolved approval ask should not interrupt the run');
+  assert.equal(r.stoppedReason, undefined);
+  assert.equal(r.text, 'finished after standing approval');
 });
 
 // A query that HAMMERS a mutating tool through the host `canUseTool` (simulating
@@ -811,4 +853,35 @@ test('retries are bounded and then the overload surfaces', async () => {
   setClaudeAgentSdkQueryForTest(((_p: any) => { calls++; return throwingQuery('API Error: 529 Overloaded'); }) as any);
   await assert.rejects(runClaudeAgentSdk({ prompt: 'hi', modelId: 'claude-sonnet-4-6' }), /529/);
   assert.equal(calls, 3, '1 initial + 2 retries (default cap), then throws');
+});
+
+test('buildScopedNativeMcpServers: an SEO turn attaches the native dataforseo MCP (scoped), kill-switch off yields none', async () => {
+  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
+  const mcpDir = path.join(TMP_HOME, 'mcp');
+  mkdirSync(mcpDir, { recursive: true });
+  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
+    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
+    supabase: { type: 'stdio', command: 'npx', args: ['supabase-mcp'], description: 'db', enabled: true },
+  }), 'utf-8');
+  invalidateMcpServerDiscoveryCache();
+
+  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
+  try {
+    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; // default on
+    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on'; // ensure scoping engages
+    const seo = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
+    assert.ok(seo.dataforseo, 'the dataforseo native MCP attaches for an SEO turn');
+    assert.equal((seo.dataforseo as any).type, 'stdio');
+    assert.equal((seo.dataforseo as any).command, 'npx');
+    assert.ok((seo.dataforseo as any).env.DATAFORSEO_USERNAME, 'the server env is carried through');
+    assert.equal(seo.supabase, undefined, 'an unrelated native server is scoped OUT of an SEO turn');
+
+    process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = 'off';
+    assert.deepEqual(buildScopedNativeMcpServers('get SEO rankings'), {}, 'kill-switch off ⇒ no native attach');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
+    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
+    invalidateMcpServerDiscoveryCache();
+  }
 });

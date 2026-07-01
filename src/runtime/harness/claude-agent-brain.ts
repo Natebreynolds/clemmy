@@ -11,7 +11,11 @@ import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
-import { pullRecentTurnsForSession, renderRecentSessionActions } from './session-transcript.js';
+import {
+  pullRecentTurnsForSession,
+  renderRecentActionsForHarnessHistory,
+  renderCrossSessionPrefixesForModel,
+} from './session-transcript.js';
 import { gatherSessionSkills } from './skill-execution.js';
 import { renderSkillsIndex } from '../../memory/skill-store.js';
 import { markRunInFlight } from './restart-recovery.js';
@@ -502,7 +506,7 @@ export function renderClaudeAgentBrainSystemAppend(
   // instead (it grows each action, so it's volatile and must not bust the cache).
   let sessionActions = '';
   if (!split && sessionHistoryEnabled()) {
-    try { sessionActions = renderRecentSessionActions(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
+    try { sessionActions = renderRecentActionsForHarnessHistory(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
   }
   return [
     'You are Clementine running as the main brain through the official Claude Agent SDK inside the Clementine harness.',
@@ -578,9 +582,13 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   }
   let sessionActions = '';
   if (sessionHistoryEnabled()) {
-    try { sessionActions = renderRecentSessionActions(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
+    try { sessionActions = renderRecentActionsForHarnessHistory(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
   }
-  return [volatile, recall, sessionActions].filter(Boolean).join('\n\n');
+  let continuationContext = '';
+  if (sessionHistoryEnabled()) {
+    try { continuationContext = renderCrossSessionPrefixesForModel(openEventLog(), request.sessionId); } catch { continuationContext = ''; }
+  }
+  return [volatile, continuationContext, recall, sessionActions].filter(Boolean).join('\n\n');
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(
@@ -658,9 +666,10 @@ export async function respondViaClaudeAgentSdkBrain(
   const isSpaceSession = workspaceSlugFromSessionId(sessionId) != null;
   if (!getSession(sessionId)) {
     const titleSeed = request.message.trim().replace(/\s+/g, ' ');
+    const sessionKind = surface === 'background' ? 'execution' : 'chat';
     createSession({
       id: sessionId,
-      kind: 'chat',
+      kind: sessionKind,
       channel: request.channel,
       userId: request.userId,
       title: titleSeed.length > 80 ? `${titleSeed.slice(0, 77)}...` : titleSeed,
@@ -822,6 +831,10 @@ export async function respondViaClaudeAgentSdkBrain(
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
     agentic: mode === 'full',
+    // Scope the native external MCP servers to THIS turn's intent (the user's message)
+    // so the Claude brain reaches native capabilities (dataforseo, browsermcp, …) like
+    // the Codex lane, without attaching all of them.
+    nativeMcpScopeInput: request.message,
     maxTurns: maxTurns(),
     maxWallClockMs: request.maxWallClockMs,
     shouldCancel: request.shouldCancel,
@@ -914,6 +927,7 @@ export async function respondViaClaudeAgentSdkBrain(
   let result: ClaudeAgentSdkRunResult;
   try {
     result = await runWithSalvage({ prompt: request.message, ...runOptions });
+    const resultIsAwaitingInput = (): boolean => result.stoppedReason === 'awaiting-input';
 
     // Phase 1.3: ONE shared budget across all post-result corrective continuations
     // (narration, reasoning-leak, judge) so they can't compound into 4-5 full-context
@@ -926,7 +940,7 @@ export async function respondViaClaudeAgentSdkBrain(
     // tool-call protocol, it described a call instead of making one — retry ONCE
     // with a hard nudge to actually invoke the tool. Kill-switch
     // CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-    if (continuationsUsed < continuationBudget && !result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
+    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && modeCanAuthorOrExecute(mode) && narrationRetryEnabled() && looksLikeToolNarration(result.text, result.toolUses)) {
       const retry = await runContinuation({
         prompt:
           `Your previous attempt WROTE OUT a tool call as text (e.g. a "Tool call: …" / "**Tool call: …**" header, a "<invoke name=…>…</invoke>" block, a "function { … }" block, or a fake "System: tool result …") instead of running it — so nothing actually happened. ` +
@@ -944,7 +958,7 @@ export async function respondViaClaudeAgentSdkBrain(
     // memory instead of doing the task. Retry ONCE, telling it the context is
     // trusted and to just do the work. Any mode (a read turn can spiral too).
     // Shares the kill-switch CLEMMY_CLAUDE_SDK_NARRATION_RETRY.
-    if (continuationsUsed < continuationBudget && !result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
+    if (continuationsUsed < continuationBudget && !resultIsAwaitingInput() && !result.limitHit && narrationRetryEnabled() && looksLikeReasoningLeak(result.text, result.toolUses)) {
       const retry = await runContinuation({
         prompt:
           `Your previous attempt did NOT do the task — instead you wrote out internal deliberation about whether your own context/memory is trustworthy or "injected". ` +
@@ -965,6 +979,7 @@ export async function respondViaClaudeAgentSdkBrain(
     if (
       completionJudgeEnabled() &&
       modeCanAuthorOrExecute(mode) &&
+      !resultIsAwaitingInput() &&
       !result.limitHit &&
       (
         result.toolUses.length > 0 ||
@@ -1080,7 +1095,8 @@ export async function respondViaClaudeAgentSdkBrain(
   if (request.onChunk && finalDelta) await request.onChunk(finalDelta);
   // Long-running parity: a turn-budget stop surfaces as a graceful
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
-  const stoppedReason: AssistantResponse['stoppedReason'] = result.limitHit ? 'max-turns-with-grace' : 'success';
+  const stoppedReason: AssistantResponse['stoppedReason'] =
+    result.stoppedReason ?? (result.limitHit ? 'max-turns-with-grace' : 'success');
   // Report-back / observability parity (gap analysis): the harness loop emits
   // conversation_completed + runtime.completed on a clean terminal so the Tasks
   // board, report-back, and watchdog see the run. The Agent SDK lane runs its
@@ -1106,7 +1122,11 @@ export async function respondViaClaudeAgentSdkBrain(
       role: 'system',
       type: 'conversation_completed',
       data: {
-        reason: result.limitHit ? 'awaiting_continue' : 'claude_agent_sdk_brain',
+        reason: result.limitHit
+          ? 'awaiting_continue'
+          : stoppedReason === 'awaiting-input'
+            ? 'awaiting_user_input'
+            : 'claude_agent_sdk_brain',
         summary: text.slice(0, 400),
         reply: text,
         // Move 4: surface degraded verification so a self-judged / judge-failed-open
@@ -1133,6 +1153,7 @@ export async function respondViaClaudeAgentSdkBrain(
       usage: result.usage,
       modelUsage: result.modelUsage,
       limitHit: result.limitHit ?? false,
+      stoppedReason,
     },
   };
 }

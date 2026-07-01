@@ -15,12 +15,16 @@ import { BASE_DIR, PKG_DIR, getRuntimeEnv } from '../../config.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
+import { discoverMcpServers } from '../mcp-config.js';
+import { resolveMcpToolScope } from '../mcp-tool-scope.js';
+import type { ManagedMcpServer } from '../../types.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import { buildGatedToolPermission } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
+import type { RunStoppedReason } from '../../types.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -399,6 +403,62 @@ function normalizeToolName(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+/** DEFAULT ON. Attach the user's NATIVE external MCP servers (dataforseo, browsermcp,
+ *  supabase, …) to the Claude SDK brain in agentic mode, so it has parity with the
+ *  Codex lane instead of being blind to them (a skill saying "use the dataforseo MCP"
+ *  used to dead-end on Claude). Off ⇒ prior behavior (local server only). */
+function claudeSdkNativeMcpEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NATIVE_MCP', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+/** Match a server name against the scope's allowed slugs (mirrors mcp-servers.ts
+ *  serverMatchesAllowedSlugs). Empty/undefined slugs ⇒ match all. */
+function nativeServerMatchesScope(serverName: string, allowedServerSlugs?: string[]): boolean {
+  if (!allowedServerSlugs || allowedServerSlugs.length === 0) return true;
+  const name = normalizeToolName(serverName);
+  return allowedServerSlugs.some((slug) => {
+    const n = normalizeToolName(slug);
+    return n.length > 0 && (name === n || name.includes(n) || n.includes(name));
+  });
+}
+
+function toClaudeSdkMcpConfig(s: ManagedMcpServer): McpServerConfig | null {
+  if (s.type === 'stdio' && s.command) {
+    return { type: 'stdio', command: s.command, args: s.args ?? [], env: mergedSpawnEnv(s.env ?? {}), timeout: 10 * 60 * 1000 } as McpServerConfig;
+  }
+  if ((s.type === 'http' || s.type === 'sse') && s.url) {
+    return { type: s.type, url: s.url, ...(s.headers ? { headers: s.headers } : {}) } as McpServerConfig;
+  }
+  return null;
+}
+
+/**
+ * The user's NATIVE external MCP servers, SCOPED by the turn's intent (reuses
+ * resolveMcpToolScope so an SEO turn attaches dataforseo, a browser turn attaches
+ * browsermcp/playwright, etc. — never all of them at once = no bloat). Only used in
+ * agentic mode: the SDK's canUseTool gate (buildGatedToolPermission) then covers every
+ * native call — dataforseo__* etc. classify as READ (auto-allow) and any native
+ * write/unknown classifies as write (approval), so no gate is bypassed. Fail-open → {}.
+ */
+export function buildScopedNativeMcpServers(scopeInput?: string): Record<string, McpServerConfig> {
+  if (!claudeSdkNativeMcpEnabled()) return {};
+  try {
+    const all = discoverMcpServers().filter((s) => s.enabled);
+    if (all.length === 0) return {};
+    const scope = resolveMcpToolScope({ userInput: scopeInput ?? '' });
+    if (scope.allowAll === false && (scope.allowedServerSlugs ?? []).length === 0) return {};
+    const out: Record<string, McpServerConfig> = {};
+    for (const s of all) {
+      if (!scope.allowAll && !nativeServerMatchesScope(s.name, scope.allowedServerSlugs)) continue;
+      const cfg = toClaudeSdkMcpConfig(s);
+      if (cfg) out[s.name] = cfg;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export function buildAllowOnlyToolsPermission(allowedTools: string[]): CanUseTool {
   const allowed = new Set(allowedTools.map(normalizeToolName).filter(Boolean));
   return async (toolName) => {
@@ -490,6 +550,13 @@ export interface ClaudeAgentSdkRunOptions {
    */
   agentic?: boolean;
   /**
+   * The user's message/intent for THIS turn, used to SCOPE which native external MCP
+   * servers (dataforseo, browsermcp, …) attach — so the Claude brain reaches those
+   * capabilities like the Codex lane instead of being blind to them. Only honored in
+   * agentic mode (the canUseTool gate covers native calls). Absent ⇒ no native attach.
+   */
+  nativeMcpScopeInput?: string;
+  /**
    * JIT tool-RAG (Claude-brain port). When set, the in-process MCP server is
    * spawned advertising ONLY these tools, so the model receives only their schemas
    * (fewer input tokens). The brain computes it per turn via selectToolsForTurn;
@@ -548,6 +615,8 @@ export interface ClaudeAgentSdkRunResult {
    *  rather than finishing. The caller surfaces a graceful "say continue" instead
    *  of a hard error — parity with the harness loop's auto-continue-on-limit. */
   limitHit?: boolean;
+  /** Typed stop reason for non-successful-but-non-error terminal states. */
+  stoppedReason?: RunStoppedReason;
 }
 
 function extractAssistantToolUses(message: SDKMessage): string[] {
@@ -607,6 +676,21 @@ function renderTerminalToolReply(rawName: string, input: unknown, output: string
     return typeof q === 'string' && q.trim() ? q.trim() : (output.trim() || 'I have a quick question before I proceed.');
   }
   return output.trim() || `${bare} completed.`;
+}
+
+function terminalToolStoppedReason(rawName: string): RunStoppedReason | undefined {
+  return bareMcpToolName(rawName) === 'ask_user_question' ? 'awaiting-input' : undefined;
+}
+
+function terminalToolShouldHalt(rawName: string, output: string): boolean {
+  const bare = bareMcpToolName(rawName);
+  if (bare !== 'ask_user_question') return true;
+  // ask_user_question can be intentionally non-halting in YOLO when the model
+  // only asked for sign-off on work already authorized. The tool result is the
+  // authoritative signal: it says NOT pausing and instructs the model to proceed.
+  // In that case the SDK run must keep going; otherwise Claude would strand a
+  // standing-approval turn as if it needed user input.
+  return !/NOT pausing|standing approval|not waiting/i.test(output);
 }
 
 function reflectionToolName(rawName: string | null, input: unknown): string | null {
@@ -812,7 +896,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     settingSources: [],
     skills: [],
     tools: [],
-    mcpServers: buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
+    mcpServers: {
+      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
+      // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
+      // canUseTool gate then covers every native call. Gives the Claude brain parity
+      // with the Codex lane instead of being blind to native MCPs.
+      ...(agentic ? buildScopedNativeMcpServers(options.nativeMcpScopeInput) : {}),
+    },
+    // Native tools are intentionally NOT in allowedTools — with permissionMode
+    // 'default' (agentic) they are visible via mcpServers and every call routes through
+    // canUseTool (reads auto-allow, writes → approval). Non-agentic denies them (safe).
     allowedTools: sdkToolNamesForLocalMcp(allowed),
     canUseTool,
     permissionMode: agentic ? 'default' : 'dontAsk',
@@ -886,6 +979,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // an empty foreground context. Stop at the tool boundary and let the outcome
   // report-back re-enter the origin conversation when the daemon finishes.
   let terminalToolReply: string | null = null;
+  let terminalToolReason: RunStoppedReason | undefined;
   // FIRST-BYTE-SAFE overload retry: re-run the whole query on an Anthropic
   // overload/5xx ONLY while nothing has been committed yet (no tool executed,
   // nothing streamed to the user) — so a retry can't double-act or duplicate
@@ -901,6 +995,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     streamedAny = false;
     threwTurnLimit = false;
     terminalToolReply = null;
+    terminalToolReason = undefined;
     // Fresh per attempt: an overload retry re-runs the turn from scratch (and only
     // happens pre-commit, so these are ~0 anyway), but reset for correctness.
     ceilingState.total = 0;
@@ -964,7 +1059,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
             reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
           }
           if (!tr.isError && source && isTerminalAfterTool(source.name)) {
+            if (!terminalToolShouldHalt(source.name, tr.output)) continue;
             terminalToolReply = renderTerminalToolReply(source.name, source.input, tr.output);
+            terminalToolReason = terminalToolStoppedReason(source.name);
             try { await stream?.interrupt?.(); } catch { /* best-effort */ }
             break;
           }
@@ -1021,6 +1118,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       usage: result?.usage,
       modelUsage: result?.modelUsage,
       limitHit: false,
+      stoppedReason: terminalToolReason,
     };
   }
 
