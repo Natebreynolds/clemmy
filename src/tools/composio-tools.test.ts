@@ -141,6 +141,51 @@ test('formatComposioExecuteOutput: NOT-FOUND failures tell her to DISCOVER ids, 
   assert.doesNotMatch(out, /SAME arguments will return the SAME error/);
 });
 
+test('detectComposioFailure: distinguishes a NOT-CONNECTED toolkit from a wrong-id not-found', () => {
+  // "Connected account not found for toolkit X" ALSO matches the not-found regex,
+  // so the DISTINCT not-connected flag is what lets the corrective avoid the wrong
+  // "the connection works, the id doesn't" advice.
+  const nc = detectComposioFailure({ successful: false, error: 'Connected account not found for toolkit GMAIL' });
+  assert.equal(nc.failed, true);
+  assert.equal(nc.notConnected, true);
+  assert.equal(detectComposioFailure({ successful: false, error: 'No connected account found' }).notConnected, true);
+  // A genuine wrong-id not-found is NOT flagged as not-connected.
+  assert.equal(detectComposioFailure({ successful: false, error: 'Table "Current Prospects" not found' }).notConnected, false);
+});
+
+test('formatComposioExecuteOutput: a NOT-CONNECTED toolkit steers to connect it, NOT to hunt for ids', () => {
+  resetEventLog();
+  const notConnected = { successful: false, error: 'Connected account not found for toolkit GMAIL' };
+  const out = formatComposioExecuteOutput(notConnected, { toolSlug: 'GMAIL_SEND_EMAIL' });
+  assert.match(out, /NOT CONNECTED \(slug=GMAIL_SEND_EMAIL\)/);
+  assert.match(out, /GMAIL/);
+  assert.match(out, /composio_status/);
+  assert.match(out, /not\s+connected/i);
+  // Crucially it is NOT the wrong-identifier corrective (which claims the connection works).
+  assert.doesNotMatch(out, /the connection works/);
+  assert.doesNotMatch(out, /DISCOVER the real options first/);
+});
+
+test('composioThrownErrorOutput: a THROWN not-connected error also gets the connect-it corrective, not the id-discovery one', () => {
+  resetEventLog();
+  const out = composioThrownErrorOutput(
+    new Error('Connected account not found for toolkit SLACK'),
+    { toolName: 'composio_execute_tool', toolSlug: 'SLACK_SEND_MESSAGE' },
+  );
+  assert.match(out, /NOT CONNECTED \(slug=SLACK_SEND_MESSAGE\)/);
+  assert.match(out, /SLACK/);
+  assert.doesNotMatch(out, /the connection works/);
+});
+
+test('formatComposioExecuteOutput: a genuine record-not-found STILL gets the id-discovery corrective (characterization)', () => {
+  resetEventLog();
+  const notFound = { successful: false, error: 'Record not found' };
+  const out = formatComposioExecuteOutput(notFound, { toolSlug: 'AIRTABLE_GET_RECORD' });
+  assert.match(out, /NOT FOUND \(slug=AIRTABLE_GET_RECORD\)/);
+  assert.match(out, /the connection works, the id you used doesn't exist/);
+  assert.doesNotMatch(out, /NOT CONNECTED/);
+});
+
 test('formatComposioExecuteOutput: prepends a do-not-retry corrective on a failed call', () => {
   resetEventLog();
   const failed = {

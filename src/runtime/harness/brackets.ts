@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, getToolOutput } from './eventlog.js';
+import { runWithToolAbortSignal } from '../tool-abort-context.js';
 import { getHarnessBudgetSettings } from './budget-settings.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
@@ -54,6 +56,7 @@ import {
   asyncJobTimeoutCorrective,
   writeJobTimeoutCorrective,
   toolTimeoutSelfCorrectEnabled,
+  toolAbortOnTimeoutEnabled,
 } from './tool-error-corrective.js';
 
 /**
@@ -290,7 +293,7 @@ export function withTimeout<T>(
   work: Promise<T>,
   ms: number,
   toolName: string,
-  options?: { isPaused?: () => boolean; pauseRecheckMs?: number },
+  options?: { isPaused?: () => boolean; pauseRecheckMs?: number; onTimeout?: () => void },
 ): Promise<T> {
   const pauseRecheckMs = options?.pauseRecheckMs ?? 30_000;
   return new Promise<T>((resolve, reject) => {
@@ -309,6 +312,12 @@ export function withTimeout<T>(
         setTimeout(fireOrDefer, pauseRecheckMs).unref?.();
         return;
       }
+      // onTimeout fires ONLY on the actual rejection — never on the pause-defer
+      // re-arm above (the tool is parked, not stuck) and never after `work`
+      // already settled (the `settled` guard). S3 uses it to abort the live
+      // request; the late AbortError that abort produces is consumed by the
+      // `work.then` rejection handler below, so it can't escape as unhandled.
+      try { options?.onTimeout?.(); } catch { /* abort hook is best-effort */ }
       reject(new ToolTimeout(toolName, ms));
     };
     setTimeout(fireOrDefer, ms).unref?.();
@@ -434,6 +443,110 @@ function timeoutCorrectiveFor(toolName: string, parsedInput: unknown, timeoutMs:
   return mutating
     ? writeJobTimeoutCorrective(toolName, summary, where)
     : asyncJobTimeoutCorrective(toolName, summary, where);
+}
+
+// ─── S3 orphan ledger + orphaned-write retry corrective ─────────────────────
+//
+// A MUTATING external write that TIMES OUT may have landed server-side (the
+// harness stops waiting; abort is best-effort). `recordExternalWriteOrphan`
+// writes a durable audit event on that timeout; the orphaned-write retry gate
+// (runBrackets, block 2c1.5) consults it so a blind same-shape retry — which the
+// DUPLICATE_EXTERNAL_WRITE hard wall covers only for SEND/PUBLISH — first gets a
+// verify-before-retry corrective. Informs, never hard-blocks (house doctrine).
+
+/** Short, stable digest of a tool call's args for the orphan audit record. */
+function shortArgsDigest(parsedInput: unknown): string {
+  try {
+    const text = typeof parsedInput === 'string' ? parsedInput : JSON.stringify(parsedInput);
+    return createHash('sha256').update(text ?? '').digest('hex').slice(0, 12);
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** Record that a mutating external write TIMED OUT (durable audit of a
+ *  maybe-landed write). No-ops for reads/non-writes and when there is no
+ *  session. Telemetry only — never throws into the corrective path. */
+function recordExternalWriteOrphan(
+  sessionId: string | undefined,
+  toolName: string,
+  parsedInput: unknown,
+  timeoutMs: number,
+): void {
+  if (!sessionId) return;
+  try {
+    const shape = classifyExternalWrite(toolName, parsedInput);
+    if (!shape.mutating) return;
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'external_write_orphaned',
+      data: {
+        tool: toolName,
+        slug: shape.shapeKey ?? null,
+        targets: extractDuplicateIdentityKeys(parsedInput).slice(0, 8),
+        argsDigest: shortArgsDigest(parsedInput),
+        timeoutMs,
+        aborted: toolAbortOnTimeoutEnabled(),
+      },
+    });
+  } catch { /* telemetry write must never block the corrective */ }
+}
+
+/** (session, shape, target) combos whose orphaned-retry corrective already
+ *  surfaced once — a speed bump, not a wall: the CONSCIOUS retry after the model
+ *  verified via read-back passes. In-memory by design (a daemon restart fails
+ *  toward letting the write through, which is the non-blocking default). */
+const orphanRetryWarned = new Set<string>();
+
+/** Does this mutating write hit a (shape, target) whose prior attempt is on the
+ *  orphan ledger for this session? Returns the matching target or null. */
+function findOrphanedWriteMatch(
+  sessionId: string,
+  shapeKey: string | undefined,
+  targets: string[],
+): { target: string } | null {
+  if (!shapeKey || targets.length === 0) return null;
+  let orphans: Array<{ slug?: string | null; targets?: string[] }>;
+  try {
+    orphans = listEvents(sessionId, { types: ['external_write_orphaned'] })
+      .map((ev) => ev.data as { slug?: string | null; targets?: string[] });
+  } catch {
+    return null;
+  }
+  if (orphans.length === 0) return null;
+  for (const target of targets) {
+    const t = target.toLowerCase();
+    const hit = orphans.some((o) =>
+      (o.slug ?? undefined) === shapeKey &&
+      (o.targets ?? []).some((x) => String(x).toLowerCase() === t));
+    if (hit) return { target: t };
+  }
+  return null;
+}
+
+/** Thrown when a mutating write is retried against a shape/target whose prior
+ *  attempt TIMED OUT and may have landed. Surfaced to the model as a SOFT tool
+ *  error (same disposition as DuplicateExternalWriteError) so it verifies via a
+ *  read-back and then re-issues — it never hard-aborts the run. */
+export class OrphanedWriteRetryError extends Error {
+  public readonly toolName: string;
+  public readonly shapeKey: string | undefined;
+  public readonly target: string;
+  constructor(opts: { toolName: string; shapeKey: string | undefined; target: string }) {
+    super(
+      `ORPHANED_WRITE_RETRY: an earlier ${opts.shapeKey ?? opts.toolName} to ${opts.target} in this session TIMED OUT — ` +
+        'the harness stopped waiting but the write MAY HAVE LANDED server-side, so retrying blindly could create a DUPLICATE. ' +
+        'FIRST verify whether it landed: READ THE TARGET BACK with a *_GET / *_LIST / *_SEARCH action for this same record/object. ' +
+        'Only write again if it is confirmed ABSENT (prefer an UPSERT or idempotency key if the toolkit supports one). ' +
+        'This is a one-time check — the conscious retry after you verify will go through.',
+    );
+    this.name = 'OrphanedWriteRetryError';
+    this.toolName = opts.toolName;
+    this.shapeKey = opts.shapeKey;
+    this.target = opts.target;
+  }
 }
 
 /** Per-role max-turn caps. The loop passes these into `Runner({maxTurns})`. */
@@ -1102,6 +1215,40 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] execution-wrap gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
+    // 2c1.5. Orphaned-write retry speed bump (S3 · informs, doesn't block).
+    // A prior same-session same-shape MUTATING write TIMED OUT and may have landed
+    // server-side (the orphan ledger). The DUPLICATE_EXTERNAL_WRITE hard wall
+    // covers only irreversible SEND/PUBLISH, so a blindly-retried reversible
+    // *_CREATE_* can silently duplicate. Surface a verify-before-retry corrective
+    // ONCE (soft tool error → the model reads the target back, then re-issues the
+    // conscious retry, which passes). Fail-open; warn-once so it can never loop.
+    try {
+      const shape = classifyExternalWrite(tool.name, parsedInput);
+      if (shape.mutating) {
+        const targets = extractDuplicateIdentityKeys(parsedInput);
+        const match = findOrphanedWriteMatch(ctx.sessionId, shape.shapeKey, targets);
+        if (match) {
+          const warnKey = `${ctx.sessionId}::${shape.shapeKey}::${match.target}`;
+          if (!orphanRetryWarned.has(warnKey)) {
+            orphanRetryWarned.add(warnKey);
+            try {
+              appendEvent({
+                sessionId: ctx.sessionId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: { kind: 'orphaned_write_retry', toolName: tool.name, shapeKey: shape.shapeKey ?? null, target: match.target },
+              });
+            } catch { /* telemetry write must never block */ }
+            throw new OrphanedWriteRetryError({ toolName: tool.name, shapeKey: shape.shapeKey, target: match.target });
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof OrphanedWriteRetryError) throw err;
+      // eslint-disable-next-line no-console
+      console.warn('[harness] orphaned-write retry check threw (fail-open)', err instanceof Error ? err.message : err);
+    }
     // 2c2. Grounding + duplicate-target gates (integrity at the
     // irreversible-write boundary — the 2026-06-11 Eley incident class).
     // Runs for IRREVERSIBLE shapes only (SEND/PUBLISH). Both fail open on
@@ -1765,12 +1912,25 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // propagate — these SHOULD abort the run.
         throw err;
       }
-      const invokeOnce = () => withTimeout(
-        (async () => originalInvoke.call(tt, runContext, input, details))(),
-        timeoutMs,
-        tool.name,
-        { isPaused: isPausedFactory(ctx?.sessionId) },
-      );
+      const invokeOnce = () => {
+        // S3 abort-on-timeout: a per-invocation controller whose signal rides the
+        // ALS into the tool's fetch layer (Composio merges it via AbortSignal.any).
+        // onTimeout → ac.abort() so a timed-out call is CANCELLED at the network
+        // layer instead of running on and burning provider credits. Kill-switch
+        // off ⇒ no controller, no ALS signal, no onTimeout — identical to before.
+        const ac = toolAbortOnTimeoutEnabled() ? new AbortController() : undefined;
+        const start = () => originalInvoke.call(tt, runContext, input, details);
+        const work = (async () => (ac ? runWithToolAbortSignal(ac.signal, start) : start()))();
+        return withTimeout(
+          work,
+          timeoutMs,
+          tool.name,
+          {
+            isPaused: isPausedFactory(ctx?.sessionId),
+            onTimeout: ac ? () => ac.abort(new ToolTimeout(tool.name, timeoutMs)) : undefined,
+          },
+        );
+      };
       // run_worker: isolate the worker's loop-guard window so 44 parallel
       // workers don't poison the one shared tracker (the cross-worker
       // exact_args_repeat/same_mut_tool_repeat aggregate that cancelled the
@@ -1852,8 +2012,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
           }
           return result;
         } catch (err) {
-          if (err instanceof ToolTimeout && toolTimeoutSelfCorrectEnabled()) {
-            return timeoutCorrectiveFor(tool.name, parsedInput, timeoutMs);
+          if (err instanceof ToolTimeout) {
+            // S3 orphan ledger: a mutating write in this long-job class timed out
+            // and may have landed — record it before self-correcting (or before it
+            // propagates when self-correct is off). No-ops for reads.
+            recordExternalWriteOrphan(ctx?.sessionId, tool.name, parsedInput, timeoutMs);
+            if (toolTimeoutSelfCorrectEnabled()) {
+              return timeoutCorrectiveFor(tool.name, parsedInput, timeoutMs);
+            }
           }
           throw err;
         }
@@ -1887,23 +2053,31 @@ export function wrapToolForHarness<T extends WrappableTool>(
     }
     let result: unknown;
     try {
+      // S3 abort-on-timeout (legacy execute twin — mirrors the invoke path above).
+      const ac = toolAbortOnTimeoutEnabled() ? new AbortController() : undefined;
+      const start = () => originalExecute(input, runContext);
+      const work = (async () => (ac ? runWithToolAbortSignal(ac.signal, start) : start()))();
       result = await withTimeout(
-        (async () => originalExecute(input, runContext))(),
+        work,
         timeoutMs,
         tool.name,
-        { isPaused: isPausedFactory(ctx?.sessionId) },
+        {
+          isPaused: isPausedFactory(ctx?.sessionId),
+          onTimeout: ac ? () => ac.abort(new ToolTimeout(tool.name, timeoutMs)) : undefined,
+        },
       );
     } catch (err) {
       // Same general self-correction as the invoke path: a long-job timeout on an
       // external-API / MCP tool returns the async/verify corrective as the result
       // (run continues) instead of propagating ToolTimeout to the ask-user pause.
       // Non-class tools (internal-60s, shell, draft_plan) keep propagating.
-      if (
-        err instanceof ToolTimeout &&
-        isTimeoutSelfCorrectTool(tool.name) &&
-        toolTimeoutSelfCorrectEnabled()
-      ) {
-        return timeoutCorrectiveFor(tool.name, input, timeoutMs);
+      if (err instanceof ToolTimeout && isTimeoutSelfCorrectTool(tool.name)) {
+        // S3 orphan ledger — mirrors the invoke path (records a maybe-landed write
+        // whether or not self-correct returns the corrective). No-ops for reads.
+        recordExternalWriteOrphan(ctx?.sessionId, tool.name, input, timeoutMs);
+        if (toolTimeoutSelfCorrectEnabled()) {
+          return timeoutCorrectiveFor(tool.name, input, timeoutMs);
+        }
       }
       throw err;
     }
@@ -1939,6 +2113,7 @@ export function softToolError(err: unknown): string | null {
     err instanceof GoalFidelityCheckFailedError ||
     err instanceof OutputGroundingCheckFailedError ||
     err instanceof DuplicateExternalWriteError ||
+    err instanceof OrphanedWriteRetryError ||
     err instanceof ImplicitDestinationError ||
     err instanceof UnverifiedDestinationError
   ) {

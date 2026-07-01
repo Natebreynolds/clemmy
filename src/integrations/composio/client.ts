@@ -4,6 +4,7 @@ import { Composio } from '@composio/core';
 import { BASE_DIR } from '../../config.js';
 import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
 import { getSecretStore } from '../../runtime/secrets/index.js';
+import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
 import {
   executeComposioCliTool,
   getComposioCliStatus,
@@ -228,7 +229,58 @@ export function getComposio(): Composio | null {
   const apiKey = readComposioEnv('COMPOSIO_API_KEY');
   if (!apiKey) return null;
   singleton = new Composio({ apiKey });
+  installAbortAwareFetch(singleton);
   return singleton;
+}
+
+/**
+ * Make the Composio HTTP client honor a per-tool-call AbortSignal carried on the
+ * harness abort context (runtime/tool-abort-context). When a tool call times out,
+ * brackets.ts aborts its controller; without this wrap the underlying request keeps
+ * running and burns provider credits (the 2026-06-24 Apify case).
+ *
+ * The @composio/core SDK's `execute` path (whose exact error-string shapes feed the
+ * version-retry regex below) stays completely intact — we only wrap the underlying
+ * @composio/client (Stainless) instance's `fetch`, which it stores as a plain mutable
+ * property and invokes as `this.fetch.call(undefined, url, init)` (verified in the
+ * installed client.js). We merge the ALS signal into each request's existing signal
+ * via `AbortSignal.any`.
+ *
+ * Fully fail-open: any structural surprise, no ALS signal, or the kill-switch off
+ * (⇒ no controller is ever created in brackets, so no ALS signal is set) leaves fetch
+ * behaving exactly as before. Exported for the fetch-merge unit test. */
+export function installAbortAwareFetch(composio: Composio): void {
+  try {
+    const client = rawComposioClient(composio) as {
+      fetch?: (url: unknown, init?: Record<string, unknown>) => Promise<unknown>;
+      __clemAbortAware?: boolean;
+    } | null;
+    if (!client || typeof client.fetch !== 'function' || client.__clemAbortAware) return;
+    const original = client.fetch;
+    // The SDK calls `this.fetch.call(undefined, ...)`, so the wrapper must not rely
+    // on `this`; the original is global fetch and is likewise invoked unbound.
+    const wrapped = (url: unknown, init?: Record<string, unknown>): Promise<unknown> => {
+      let signal: AbortSignal | undefined;
+      try { signal = currentToolAbortSignal(); } catch { signal = undefined; }
+      if (!signal) return original.call(undefined, url, init);
+      try {
+        const existing = init && (init as { signal?: unknown }).signal;
+        const parts = [existing, signal].filter(
+          (s): s is AbortSignal => Boolean(s) && typeof (s as AbortSignal).addEventListener === 'function',
+        );
+        const merged = typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function' && parts.length > 0
+          ? AbortSignal.any(parts)
+          : signal;
+        return original.call(undefined, url, { ...(init ?? {}), signal: merged });
+      } catch {
+        return original.call(undefined, url, init); // fail-open — abort is best-effort, never required for correctness
+      }
+    };
+    client.fetch = wrapped;
+    Object.defineProperty(client, '__clemAbortAware', { value: true, enumerable: false });
+  } catch {
+    /* fail-open: leave fetch untouched */
+  }
 }
 
 export function isComposioEnabled(): boolean {

@@ -78,8 +78,17 @@ export interface FormatComposioToolOutputOptions {
 const COMPOSIO_NOT_FOUND_RE =
   /INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND|model[_\s-]?not[_\s-]?found|not[_\s-]?found|no such (?:table|object|record|model|view|base|field|column)|unknown (?:table|object|record|field|column)|does\s*n.?t exist|could not be found|NOT_FOUND/i;
 
-export function detectComposioFailure(value: unknown): { failed: boolean; summary: string; notFound: boolean } {
-  const none = { failed: false, summary: '', notFound: false } as const;
+/** A failure whose cause is "this TOOLKIT isn't connected" — a missing/absent
+ *  connected account, NOT a wrong id. This ALSO matches COMPOSIO_NOT_FOUND_RE
+ *  ("… not found"), so it MUST be checked FIRST: the not-found corrective tells
+ *  the model "the connection works, the id doesn't" and sends it hunting for
+ *  table/field ids that will never resolve. The cure here is to connect the
+ *  toolkit (composio_status / ask the user), not to discover ids. */
+const COMPOSIO_NOT_CONNECTED_RE =
+  /connected account[^.]{0,30}not found|no connected accounts?\s+found|ConnectedAccountNotFound|no connected account\b/i;
+
+export function detectComposioFailure(value: unknown): { failed: boolean; summary: string; notFound: boolean; notConnected: boolean } {
+  const none = { failed: false, summary: '', notFound: false, notConnected: false } as const;
   if (!isRecord(value)) return { ...none };
   const data = isRecord(value.data) ? value.data : undefined;
   // Authoritative markers: `successful === false` and `http_error` are
@@ -110,10 +119,12 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 240);
-  // Test not-found against ALL the error fields, not just the one that won the
-  // summary — Airtable puts http_error="403" but the not-found phrase in message.
-  const notFound = COMPOSIO_NOT_FOUND_RE.test(`${httpError} ${topError} ${dataMessage}`);
-  return { failed: true, summary, notFound };
+  // Test not-found/not-connected against ALL the error fields, not just the one
+  // that won the summary — Airtable puts http_error="403" but the phrase in message.
+  const allFields = `${httpError} ${topError} ${dataMessage}`;
+  const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(allFields);
+  const notFound = COMPOSIO_NOT_FOUND_RE.test(allFields);
+  return { failed: true, summary, notFound, notConnected };
 }
 
 /**
@@ -204,7 +215,7 @@ function intentSeedFromSlug(toolSlug?: string): string | undefined {
 
 function composioFailureCorrective(
   summary: string,
-  opts: { toolName?: string; toolSlug?: string; notFound?: boolean; transient?: boolean; intent?: string } = {},
+  opts: { toolName?: string; toolSlug?: string; notFound?: boolean; notConnected?: boolean; transient?: boolean; intent?: string } = {},
 ): string {
   const label = opts.toolName || 'composio_execute_tool';
   const where = opts.toolSlug ? ` (slug=${opts.toolSlug})` : '';
@@ -215,6 +226,19 @@ function composioFailureCorrective(
   const intent = opts.intent || 'accomplish this task';
   const fallbackSuggestions = formatFallbackSuggestions(intent, failedTool, failureType);
 
+  // NOT-CONNECTED FIRST (before not-found): "Connected account not found for
+  // toolkit X" ALSO matches the not-found regex, but the not-found corrective
+  // ("the connection works, the id doesn't") is WRONG here and sends the model
+  // hunting for table/field ids that never resolve. The real cure is to connect
+  // the toolkit. Derive the toolkit from the slug's first segment when present.
+  if (opts.notConnected) {
+    const toolkit = (opts.toolSlug?.split('_')[0] || '').toUpperCase() || 'this toolkit';
+    return [
+      `⚠️ ${label} NOT CONNECTED${where}: ${summary}`,
+      `The toolkit "${toolkit}" is NOT connected — there is no connected account for it. This is NOT a wrong id and NOT a schema problem, so do NOT hunt for table/field/record ids (that will loop).`,
+      `Do this: call \`composio_status\` to confirm which toolkits are connected, then tell the user that ${toolkit} needs to be connected (via the Composio connections screen) before this action can run. Do NOT retry the identical call until ${toolkit} is connected.`,
+    ].join('\n');
+  }
   // Timeout FIRST (before the transient branch): a long-running job (an actor
   // run, a big scrape/export, a blocking sync "get dataset items") that exceeded
   // its window must switch to the async start+poll pattern — retrying the SAME
@@ -310,10 +334,10 @@ export function formatComposioExecuteOutput(
   options: FormatComposioToolOutputOptions = {},
 ): string {
   const body = formatComposioToolOutput(value, options);
-  const { failed, summary, notFound } = detectComposioFailure(value);
+  const { failed, summary, notFound, notConnected } = detectComposioFailure(value);
   if (!failed) return body; // success: the GLOBAL id-index (formatRecallableToolText) handles resource lists
   const transient = workerThrashGuardEnabled() && !notFound && isTransientStepError(summary);
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, notConnected, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
 }
 
 /**
@@ -370,12 +394,13 @@ export function composioThrownErrorOutput(
   const rawMessage = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
   const message = enrichComposioErrorMessage(err, rawMessage).replace(/\s+/g, ' ').trim();
   const summary = message.slice(0, 240) || 'unknown error';
+  const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(message);
   const notFound = COMPOSIO_NOT_FOUND_RE.test(message);
   const body = formatComposioToolOutput({ error: message, toolSlug: options.toolSlug ?? null }, options);
   // The thrown path carries the real error object (status/cause) — classify on
   // it directly so undici `fetch failed`→ECONNRESET is correctly transient.
   const transient = workerThrashGuardEnabled() && !notFound && isTransientStepError(err);
-  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
+  return composioFailureCorrective(summary, { toolName: options.toolName, toolSlug: options.toolSlug, notFound, notConnected, transient, intent: intentSeedFromSlug(options.toolSlug) }) + '\n\n' + body;
 }
 
 /** Run a Composio execution and format BOTH outcomes through the corrective

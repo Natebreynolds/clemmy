@@ -22,7 +22,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 // Dynamic imports — see eventlog.test.ts for why.
-const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput } = await import('./eventlog.js');
+const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents } = await import('./eventlog.js');
 const {
   assertNotKilled,
   KillRequested,
@@ -43,6 +43,7 @@ const {
   softToolError,
   parallelPreWriteGatesEnabled,
   startGate,
+  OrphanedWriteRetryError,
 } = await import('./brackets.js');
 
 test.after(() => {
@@ -299,6 +300,64 @@ test('withTimeout fires once isPaused() returns false', async () => {
   }
   // Let the late work settle so the timer doesn't leak past the test.
   await work;
+});
+
+// ─── withTimeout onTimeout hook (S3 abort) ──────────────────────────────────
+// The hook fires EXACTLY ONCE, only on the real rejection — never on a success,
+// never on the pause-defer re-arm path.
+
+test('withTimeout onTimeout: fires exactly once on a real timeout', async () => {
+  const slow = new Promise<string>((resolve) => setTimeout(() => resolve('late'), 500));
+  let calls = 0;
+  await assert.rejects(
+    () => withTimeout(slow, 15, 'aborter', { onTimeout: () => { calls += 1; } }),
+    (err: unknown) => err instanceof ToolTimeout,
+  );
+  await slow; // drain
+  assert.equal(calls, 1, 'onTimeout fired once on timeout');
+});
+
+test('withTimeout onTimeout: never fires when work completes in time', async () => {
+  let calls = 0;
+  const value = await withTimeout(Promise.resolve('done'), 50, 'fast', { onTimeout: () => { calls += 1; } });
+  assert.equal(value, 'done');
+  await new Promise((r) => setTimeout(r, 60)); // outlive the nominal timeout window
+  assert.equal(calls, 0, 'onTimeout must not fire on success');
+});
+
+test('withTimeout onTimeout: never fires on the pause-defer re-arm path', async () => {
+  // Parked the whole time → withTimeout re-arms forever and the work eventually
+  // wins; onTimeout must never fire because it never actually rejected.
+  const work = new Promise<string>((resolve) => setTimeout(() => resolve('done'), 40));
+  let calls = 0;
+  const value = await withTimeout(work, 10, 'parked', {
+    isPaused: () => true,
+    pauseRecheckMs: 10,
+    onTimeout: () => { calls += 1; },
+  });
+  assert.equal(value, 'done');
+  assert.equal(calls, 0, 'onTimeout must not fire while parked/re-arming');
+});
+
+test('withTimeout onTimeout: fires once (not per re-arm) after unpause', async () => {
+  const work = new Promise<string>((resolve) => setTimeout(() => resolve('late'), 500));
+  let paused = true;
+  let calls = 0;
+  const flip = setTimeout(() => { paused = false; }, 30);
+  try {
+    await assert.rejects(
+      () => withTimeout(work, 12, 'parked_then_fire', {
+        isPaused: () => paused,
+        pauseRecheckMs: 12,
+        onTimeout: () => { calls += 1; },
+      }),
+      (err: unknown) => err instanceof ToolTimeout,
+    );
+  } finally {
+    clearTimeout(flip);
+  }
+  await work;
+  assert.equal(calls, 1, 'onTimeout fired exactly once, only on the real rejection after unpause');
 });
 
 test('timeoutForTool: run_shell_command uses the shell budget', () => {
@@ -580,6 +639,100 @@ test('isTimeoutSelfCorrectTool: external-API/MCP class only', () => {
   for (const t of ['run_worker', 'draft_plan', 'memory_search', 'write_file', 'run_shell_command', 'read_file']) {
     assert.equal(isTimeoutSelfCorrectTool(t), false, `${t} should NOT self-correct`);
   }
+});
+
+// ─── S3 orphan ledger + orphaned-write retry corrective ────────────────────
+//
+// A mutating external write that TIMES OUT records an external_write_orphaned
+// audit event (a maybe-landed write); a read does not. A later same-shape retry
+// then gets a verify-before-retry corrective ONCE (informs, doesn't hard-block).
+
+/** Run a composio timeout in an EXPLICIT session (the shared runTscTimeout uses a
+ *  fixed sessionId, which would cross-contaminate these per-session assertions). */
+async function runComposioTimeoutInSession(sessionId: string, input: unknown): Promise<unknown> {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  try {
+    const counter = new ToolCallsCounter(10);
+    const slow = async () => { await tscSleep(200); return 'ran'; };
+    const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: slow }, { timeoutMs: 50 });
+    return await withHarnessRunContext({ sessionId, counter }, async () =>
+      (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+        .invoke(null, JSON.stringify(input), { toolCall: { callId: 'c-orphan' } }));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+test('orphan ledger: a mutating composio timeout records external_write_orphaned; a read does NOT', async () => {
+  const writeSess = createSession({ kind: 'chat' }).id;
+  await runComposioTimeoutInSession(writeSess, { tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'orphan@example.com' } });
+  const orphans = listEvents(writeSess, { types: ['external_write_orphaned'] });
+  assert.equal(orphans.length, 1, 'mutating write timeout records exactly one orphan');
+  assert.equal(orphans[0].data.slug, 'AIRTABLE_CREATE_RECORD');
+  assert.ok((orphans[0].data.targets as string[]).includes('orphan@example.com'), 'target captured');
+  assert.equal(typeof orphans[0].data.argsDigest, 'string');
+  assert.equal(orphans[0].data.aborted, true, 'aborted flag reflects the default-on kill-switch');
+
+  const readSess = createSession({ kind: 'chat' }).id;
+  await runComposioTimeoutInSession(readSess, { tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: { datasetId: 'ds1' } });
+  assert.equal(listEvents(readSess, { types: ['external_write_orphaned'] }).length, 0, 'a read timeout records no orphan');
+});
+
+test('orphaned-write retry: a same-shape retry after an orphan gets the verify-first corrective; a different shape does not', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  try {
+    const sess = createSession({ kind: 'chat' }).id;
+    // Seed the orphan ledger: a prior AIRTABLE_CREATE_RECORD to dup@example.com timed out.
+    appendEvent({
+      sessionId: sess, turn: 0, role: 'system', type: 'external_write_orphaned',
+      data: { tool: 'composio_execute_tool', slug: 'AIRTABLE_CREATE_RECORD', targets: ['dup@example.com'], argsDigest: 'seed', timeoutMs: 50, aborted: true },
+    });
+    const counter = new ToolCallsCounter(10);
+    const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => 'OK' }, {});
+    const invoke = (args: unknown, callId: string) =>
+      (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+        .invoke(null, JSON.stringify(args), { toolCall: { callId } });
+    await withHarnessRunContext({ sessionId: sess, counter }, async () => {
+      // 1) matching same-shape/target retry → soft verify-first corrective (NOT executed)
+      const first = String(await invoke({ tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'dup@example.com', n: 1 } }, 'r1'));
+      assert.match(first, /refused by harness/i);
+      assert.match(first, /ORPHANED_WRITE_RETRY|READ THE TARGET BACK|verify/i);
+      // 2) the CONSCIOUS retry (same shape+target) now passes — warn-once speed bump
+      const second = String(await invoke({ tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'dup@example.com', n: 2 } }, 'r2'));
+      assert.doesNotMatch(second, /ORPHANED_WRITE_RETRY/);
+      assert.match(second, /OK/);
+      // 3) a DIFFERENT target (no matching orphan) is unaffected
+      const other = String(await invoke({ tool_slug: 'AIRTABLE_CREATE_RECORD', arguments: { email: 'fresh@example.com', n: 3 } }, 'r3'));
+      assert.doesNotMatch(other, /ORPHANED_WRITE_RETRY/);
+      assert.match(other, /OK/);
+    });
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('OrphanedWriteRetryError: is a soft tool error (informs, never hard-aborts)', () => {
+  const err = new OrphanedWriteRetryError({ toolName: 'composio_execute_tool', shapeKey: 'AIRTABLE_CREATE_RECORD', target: 'dup@example.com' });
+  const soft = softToolError(err);
+  assert.ok(soft && soft.startsWith('Tool call refused by harness:'), 'surfaces as a recoverable soft error');
 });
 
 // ─── Move 2: confirm-first gate (batch external writes / worker fan-out) ───

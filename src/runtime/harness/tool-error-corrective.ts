@@ -183,3 +183,14 @@ export function mcpErrorCorrectiveEnabled(): boolean {
 export function toolTimeoutSelfCorrectEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_TOOL_TIMEOUT_SELF_CORRECT', 'on') ?? 'on').toLowerCase() !== 'off';
 }
+
+/** Kill-switch. Validated-default-ON (set CLEMMY_TOOL_ABORT_ON_TIMEOUT=off to disable).
+ *  When ON, a withTimeout kill of a wrapped tool call ALSO aborts the per-invocation
+ *  AbortController (brackets.ts), which the Composio fetch layer merges into the live
+ *  request — so a timed-out call is actually CANCELLED at the network layer instead of
+ *  running on and burning provider credits. Off ⇒ no abort() call + the fetch merge is
+ *  inert (no ALS signal is ever set), i.e. behavior identical to before S3. Read via
+ *  getRuntimeEnv so the value applies under launchd, matching the other kill-switches. */
+export function toolAbortOnTimeoutEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_TOOL_ABORT_ON_TIMEOUT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
