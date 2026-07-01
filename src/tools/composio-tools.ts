@@ -884,14 +884,23 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     execute: async (_input, context, details) => {
       const credentials = await getComposioRuntimeStatus();
       const connections = credentials.enabled ? await listConnectedToolkits() : [];
+      // Emit BOTH the `toolkit` and `slug` element keys and BOTH the `connections`
+      // and `connectedAccounts` top-level keys — a Code Mode program (or the model)
+      // that probes for the connection commonly reaches for `connectedAccounts` and
+      // `.slug`, and reading the wrong key returned undefined → "No connection found"
+      // even though the ACTIVE connection was fine (2026-07-01 Codex/Airtable block).
+      // Zero extra cost (listConnectedToolkits already ran + is cached).
+      const connectionList = connections.map((connection) => ({
+        toolkit: connection.slug,
+        slug: connection.slug,
+        connectionId: connection.connectionId,
+        status: connection.status,
+        account: connection.accountLabel ?? connection.alias ?? null,
+      }));
       return formatComposioToolOutput({
         ...credentials,
-        connections: connections.map((connection) => ({
-          toolkit: connection.slug,
-          connectionId: connection.connectionId,
-          status: connection.status,
-          account: connection.accountLabel ?? connection.alias ?? null,
-        })),
+        connections: connectionList,
+        connectedAccounts: connectionList,
       }, { context, details, toolName: 'composio_status' });
     },
   });

@@ -71,7 +71,9 @@ function buildIntegrationsContext(): string {
         '  1. Call `composio_search_tools` with a query describing what you need (e.g. "outlook list unread messages today", "gmail search messages", "salesforce query accounts"). It returns matching slugs.',
         '  2. Call `composio_execute_tool` with the returned `tool_slug` and an `arguments` JSON string. This uses the connected OAuth account and respects the approval taxonomy.',
         '',
-        'Only fall back to "I can\'t do that" after you\'ve actually searched. Use `composio_status` only to inspect what is connected.',
+        'You do NOT need to find or pass a connection/account id — `composio_execute_tool` AUTO-RESOLVES the live connection for the toolkit. Just call the action directly (e.g. `AIRTABLE_LIST_BASES` with `{}`). Do NOT write a program to hunt for the connection in `composio_status` first — that is where these calls go wrong. Only pass `connected_account_id` to disambiguate when the user has MULTIPLE accounts on ONE toolkit.',
+        '',
+        'Only fall back to "I can\'t do that" after you\'ve actually run the action. Use `composio_status` only to inspect what is connected — its `connections` (aka `connectedAccounts`) list carries `{toolkit, slug, connectionId, status}` per connection.',
       ].join('\n'));
     }
   } catch {
