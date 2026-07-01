@@ -642,6 +642,13 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('<tool_call>\n{"name":"skill_read"}', []), true);
   assert.equal(looksLikeToolNarration('[tool_call] skill_read', []), true);
   assert.equal(looksLikeToolNarration('{"tool_slug": "SALESFORCE_RUN_SOQL_QUERY", "arguments": {}}', []), true);
+  // The 2026-06-30 live failure (v0.12.46 desktop): the brain wrapped its tool calls
+  // in a hallucinated <system>…</system> pseudo-tag, so a Workspace build + Composio
+  // search + offer_background all narrated and NOTHING ran. The `<system>` prefix
+  // defeated the old line-anchored header. Both exact live strings must now trip.
+  assert.equal(looksLikeToolNarration('<system>Tool call: composio_search_tools — {"query": "apify run actor facebook ad library scraper dataset items"}</system>', []), true);
+  assert.equal(looksLikeToolNarration('I\'ll set that up.\n\n<system>Tool call: offer_background — {"summary": "Build the Meta-ads workspace", "options": ["background", "hold", "now"]}</system>', []), true);
+  assert.equal(looksLikeToolNarration('<assistant>Tool call: space_save — {"slug":"x"}</assistant>', []), true);
   // Real tool calls happened ⇒ not narration, even if text mentions tools / XML.
   assert.equal(looksLikeToolNarration('Tool:run_shell_command', ['mcp__clementine-local__run_shell_command']), false);
   assert.equal(looksLikeToolNarration('<invoke name="run_shell_command">', ['run_shell_command']), false);
@@ -670,6 +677,8 @@ test('looksLikeStreamingNarration suppresses live streaming the moment tool-call
   assert.equal(looksLikeStreamingNarration('Tool call: workflow_get'), true);
   assert.equal(looksLikeStreamingNarration('<tool_call>'), true);
   assert.equal(looksLikeStreamingNarration('[tool_call] skill_read'), true);
+  // 2026-06-30 live: the <system>-wrapped header must cut the stream too.
+  assert.equal(looksLikeStreamingNarration('<system>Tool call: composio_search_tools — {"query": "x"}</system>'), true);
   // Clean prose must keep streaming — no false cut mid-answer.
   assert.equal(looksLikeStreamingNarration('Pulled your 5 deals — here is the summary.'), false);
   assert.equal(looksLikeStreamingNarration('Here is what each tool call does in the pipeline.'), false);

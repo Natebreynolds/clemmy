@@ -198,8 +198,13 @@ export function looksLikeToolNarration(text: string, toolUses: string[]): boolea
   const t = (text || '').trim();
   if (!t) return false;
   return (
-    // "Tool: x", "Tool call: x", "**Tool call: x**", "Tool_call: x" at line start.
-    /(^|\n)\s*\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
+    // "Tool: x", "Tool call: x", "**Tool call: x**", "Tool_call: x" at line start —
+    // ALSO when wrapped in a leading pseudo-tag the model hallucinates, e.g.
+    // "<system>Tool call: composio_search_tools — {…}</system>" (2026-06-30 live: a
+    // Workspace build + composio search + offer_background all narrated in this shape;
+    // the `<system>` prefix defeated the old line-anchored header). The optional
+    // `<tag>`/`</tag>` prefix keeps it line-anchored so mid-sentence prose never trips.
+    /(^|\n)\s*(?:<\/?[a-z][a-z0-9_-]*>\s*)?\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
     // Tagged markers some models emit: "<tool_call>", "[tool_call]".
     /(^|\n)\s*[<\[]\s*tool[\s_-]*call\b/i.test(t) ||
     /(^|\n)\s*function\s*\n?\s*\{/.test(t) ||
@@ -222,7 +227,9 @@ export function looksLikeStreamingNarration(text: string): boolean {
   if (!t) return false;
   return (
     /<\/?(?:antml:)?(?:function_calls\b|invoke\s+name\s*=|parameter\s+name\s*=)/i.test(t) ||
-    /(^|\n)\s*\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
+    // Header form, incl. a leading hallucinated `<system>`/`<assistant>` wrapper tag
+    // (2026-06-30 live: "<system>Tool call: composio_search_tools — {…}</system>").
+    /(^|\n)\s*(?:<\/?[a-z][a-z0-9_-]*>\s*)?\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t) ||
     /(^|\n)\s*[<[]\s*tool[\s_-]*call\b/i.test(t)
   );
 }
