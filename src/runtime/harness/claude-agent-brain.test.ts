@@ -24,7 +24,7 @@ const {
   frameTrustedMemory,
   sdkStreamingEnabled,
 } = brain;
-const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, getSession, listEvents, resetEventLog, writeToolOutput } = await import('./eventlog.js');
 const { ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
 
 beforeEach(() => {
@@ -36,6 +36,8 @@ beforeEach(() => {
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS;
   delete process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE;
+  delete process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT;
+  delete process.env.CLEMMY_CLAUDE_SDK_SESSION_HISTORY;
   delete process.env.CLEMMY_CLAUDE_SDK_JUDGE_MAX_CONTINUATIONS;
   delete process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY;
   delete process.env.CLEMMY_CLAUDE_SDK_STREAMING;
@@ -260,6 +262,32 @@ test('renderClaudeAgentBrainTurnContext bounds slow hybrid recall and falls back
   const elapsedMs = Date.now() - start;
   assert.ok(elapsedMs < 1500, `slow recall must not stall turn-context assembly; elapsed ${elapsedMs}ms`);
   assert.doesNotMatch(ctx, /Relevant To Your Request\n- /, 'timed-out recall block is omitted');
+});
+
+test('Claude brain carries same-session external-write ledger in the volatile turn context', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  createSession({ id: 'brain-actions-split', kind: 'chat', title: 'actions' });
+  appendEvent({ sessionId: 'brain-actions-split', turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'OUTLOOK_SEND_EMAIL', targets: ['casey@example.com'] } });
+
+  const ctx = await renderClaudeAgentBrainTurnContext({ message: 'continue', sessionId: 'brain-actions-split' });
+
+  assert.match(ctx, /ALREADY DONE in THIS conversation/);
+  assert.match(ctx, /OUTLOOK_SEND_EMAIL/);
+  assert.match(ctx, /casey@example\.com/);
+  assert.equal(ctx.match(/ALREADY DONE in THIS conversation/g)?.length, 1);
+});
+
+test('Claude brain carries same-session external-write ledger in system append when context split is off', () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'off';
+  createSession({ id: 'brain-actions-nosplit', kind: 'chat', title: 'actions' });
+  appendEvent({ sessionId: 'brain-actions-nosplit', turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'CRM_UPDATE', targets: ['record:acct-42'] } });
+
+  const prompt = renderClaudeAgentBrainSystemAppend('home', { message: 'continue', sessionId: 'brain-actions-nosplit' }, 'full');
+
+  assert.match(prompt, /ALREADY DONE in THIS conversation/);
+  assert.match(prompt, /CRM_UPDATE/);
+  assert.match(prompt, /record:acct-42/);
+  assert.equal(prompt.match(/ALREADY DONE in THIS conversation/g)?.length, 1);
 });
 
 test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors excludes, creates a session, and streams final text', async () => {
@@ -636,6 +664,32 @@ test('F1: no forward progress (0 tool calls) does NOT auto-continue — still pa
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'x', sessionId: 'brain-autocont-noprog' });
   assert.equal(calls, 1, 'a limit-hit with NO tool progress must not auto-continue (anti-loop)');
   assert.match(res.text, /Say "continue"/);
+});
+
+test('H2: a skill loaded before the turn cap is RE-INJECTED into the auto-continue (not dropped)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  createSession({ id: 'brain-skill-cont', kind: 'chat', title: 's' });
+  // Simulate a skill_read earlier in the run: the tool_called event + the stored body.
+  appendEvent({ sessionId: 'brain-skill-cont', turn: 0, role: 'Clem', type: 'tool_called', data: { tool: 'skill_read', callId: 'sk1', args: { name: 'client-seo-report' } } });
+  writeToolOutput({ sessionId: 'brain-skill-cont', callId: 'sk1', tool: 'skill_read', output: 'Skill: client-seo-report\nmanifest…\n---\nSTEP 1: pull ranked keywords. STEP 2: compute the SEO_MAGIC_SCORE_XYZ. STEP 3: render the branded HTML.' });
+
+  const prompts: string[] = [];
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    calls += 1;
+    prompts.push(options.prompt ?? '');
+    if (calls === 1) return { text: 'Did step 1 (keywords), hit the budget.', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: true };
+    return { text: 'Finished — rendered the branded report.', sessionId: 's', toolUses: ['mcp__clementine-local__composio_execute_tool'], limitHit: false };
+  });
+
+  await respondViaClaudeAgentSdkBrain('home', { message: 'run the seo report skill for the firm', sessionId: 'brain-skill-cont' });
+
+  assert.equal(calls, 2, 'auto-continued once');
+  // The continuation prompt (call 2) must carry the skill body — else the model
+  // would hand-roll the deliverable and get bounced by the skill-execution gate.
+  assert.match(prompts[1], /SEO_MAGIC_SCORE_XYZ/, 'the skill procedure was re-injected into the continuation');
+  assert.match(prompts[1], /KEEP FOLLOWING/);
 });
 
 test('F1: kill-switch CLEMMY_CLAUDE_SDK_AUTO_CONTINUE=off ⇒ parks on limit (prior behavior)', async () => {

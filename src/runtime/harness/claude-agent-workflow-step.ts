@@ -239,9 +239,12 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
         let cont: ClaudeAgentSdkRunResult;
         try {
           cont = await runClaudeAgentSdkImpl({
+            // Re-include the step's ORIGINAL instructions (which carry any skill body
+            // prepended by applySkillToPrompt) — the stateless SDK lane would otherwise
+            // lose the skill procedure on the continuation and hand-roll the deliverable.
             prompt:
-              `You hit the per-turn tool budget but this step is NOT finished. Progress so far:\n${(result.text || '').trim().slice(0, 1200)}\n\n`
-              + `Continue and FINISH the step from the original instructions — do NOT redo completed work. When done, call workflow_step_result exactly once.`,
+              `You hit the per-turn tool budget but this step is NOT finished. The step's ORIGINAL instructions (INCLUDING any skill procedure) — KEEP FOLLOWING them:\n\n${args.prompt.slice(0, 12000)}\n\n---\nYour progress so far:\n${(result.text || '').trim().slice(0, 1200)}\n\n`
+              + `Continue and FINISH the step — do NOT redo completed work. When done, call workflow_step_result exactly once.`,
             ...stepRunOptions,
           });
         } catch {

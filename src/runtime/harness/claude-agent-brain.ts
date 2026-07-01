@@ -12,6 +12,8 @@ import { searchFactsHybrid } from '../../memory/facts.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { pullRecentTurnsForSession, renderRecentSessionActions } from './session-transcript.js';
+import { gatherSessionSkills } from './skill-execution.js';
+import { renderSkillsIndex } from '../../memory/skill-store.js';
 import { markRunInFlight } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
@@ -518,9 +520,28 @@ export function renderClaudeAgentBrainSystemAppend(
     '',
     frameTrustedMemory(persistentContext),
     '',
+    // Installed-skills MENU — the Claude brain was BLIND to it (only the Codex lane
+    // injected renderSkillsIndex), so it couldn't know a relevant skill existed and
+    // skipped the prescribed procedure. Compact index only (names + one-liners); the
+    // body loads on demand via skill_read.
+    renderClaudeBrainSkillsBlock(),
+    '',
     'How you operate here:',
     CLAUDE_BRAIN_RUBRIC,
   ].filter(Boolean).join('\n\n');
+}
+
+/** The compact installed-skills menu for the Claude brain's system append. When a
+ *  skill applies (design/report/audit/etc.), the brain calls skill_read to load it
+ *  and MUST follow it. Empty when no skills are installed. */
+function renderClaudeBrainSkillsBlock(): string {
+  try {
+    const index = renderSkillsIndex();
+    if (!index.trim()) return '';
+    return `INSTALLED SKILLS (call skill_read "<name>" to load one, then FOLLOW its procedure — do not hand-roll a skill's deliverable):\n${index}`;
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -1003,6 +1024,19 @@ export async function respondViaClaudeAgentSdkBrain(
     if (result.limitHit && sdkAutoContinueEnabled()) {
       const autoStart = Date.now();
       let autoContinues = 0;
+      // Re-inject any SKILL bodies loaded this run into the continuation. The stateless
+      // SDK lane rebuilds each query from the transcript, which EXCLUDES tool results —
+      // so a `skill_read` from turn 1 is LOST on the continuation, and the model would
+      // hand-roll the back half (then get bounced by the skill-execution gate → oscillate).
+      // Carry the procedure forward so a skill-driven multi-tool run survives the turn cap.
+      const reinjectedSkills = (() => {
+        try {
+          const skills = gatherSessionSkills(sessionId);
+          if (skills.length === 0) return '';
+          const bodies = skills.map((s) => `## Skill you already loaded: ${s.name} — KEEP FOLLOWING it\n${s.body.slice(0, 8000)}`).join('\n\n');
+          return `\n\nThese are the skill procedure(s) you loaded earlier this run (their content is not in this fresh context) — FOLLOW them for the remaining work; you do NOT need to skill_read again:\n${bodies}\n`;
+        } catch { return ''; }
+      })();
       while (
         result.limitHit
         && result.toolUses.length > 0
@@ -1012,7 +1046,7 @@ export async function respondViaClaudeAgentSdkBrain(
         const progress = (result.text || '').trim().slice(0, 1500);
         const cont = await runContinuation({
           prompt:
-            `You hit the per-turn tool budget but the task is NOT finished. Your progress so far:\n${progress}\n\n`
+            `You hit the per-turn tool budget but the task is NOT finished. Your progress so far:\n${progress}${reinjectedSkills}\n\n`
             + `Continue from where you left off and FINISH ALL remaining items from the original request: "${request.message}". `
             + `Do NOT redo items already completed above — do the REMAINING ones. Produce the concrete results (data/artifact), and do not stop to ask.`,
           ...cleanContinuationRunOptions(),
