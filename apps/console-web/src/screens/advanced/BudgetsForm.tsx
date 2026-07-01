@@ -12,9 +12,9 @@ import { getSettings, patchBudget, type BudgetSettings } from '@/lib/settings';
 import { cn } from '@/lib/cn';
 
 const PRESETS: { key: NonNullable<BudgetSettings['preset']>; label: string; desc: string }[] = [
-  { key: 'standard', label: 'Standard', desc: 'Quick tasks, asks often' },
-  { key: 'long', label: 'Long', desc: 'Bigger jobs, keeps going' },
-  { key: 'unlimited', label: 'Unlimited', desc: 'Supervised, runs far' },
+  { key: 'standard', label: 'Standard', desc: '40 steps · 120 min · pauses to check in' },
+  { key: 'long', label: 'Long', desc: '160 steps · 8 hrs · keeps going' },
+  { key: 'unlimited', label: 'Unlimited', desc: 'No time cap · very high ceilings · supervised' },
 ];
 
 export function BudgetsForm() {
@@ -28,7 +28,7 @@ export function BudgetsForm() {
     // Live values are nested under runtimeBudget.settings (snapshot shape).
     const b = settings.data?.runtimeBudget?.settings;
     if (b && !form) {
-      setForm({ preset: b.preset, maxConversationSteps: b.maxConversationSteps, maxConversationWallMinutes: b.maxConversationWallMinutes, maxTurns: b.maxTurns, toolCallsPerTurn: b.toolCallsPerTurn, checkInMinutes: b.checkInMinutes, autoContinueOnLimit: b.autoContinueOnLimit });
+      setForm({ preset: b.preset, maxConversationSteps: b.maxConversationSteps, maxConversationWallMinutes: b.maxConversationWallMinutes, maxTurns: b.maxTurns, toolCallsPerTurn: b.toolCallsPerTurn, maxParallelWorkers: b.maxParallelWorkers, checkInMinutes: b.checkInMinutes, autoContinueOnLimit: b.autoContinueOnLimit });
     }
   }, [settings.data, form]);
 
@@ -44,7 +44,7 @@ export function BudgetsForm() {
     if (!form) return;
     setSaving(true);
     try {
-      await patchBudget({ maxConversationSteps: form.maxConversationSteps, maxConversationWallMinutes: form.maxConversationWallMinutes, maxTurns: form.maxTurns, toolCallsPerTurn: form.toolCallsPerTurn, checkInMinutes: form.checkInMinutes, autoContinueOnLimit: form.autoContinueOnLimit });
+      await patchBudget({ maxConversationSteps: form.maxConversationSteps, maxConversationWallMinutes: form.maxConversationWallMinutes, maxTurns: form.maxTurns, toolCallsPerTurn: form.toolCallsPerTurn, maxParallelWorkers: form.maxParallelWorkers, checkInMinutes: form.checkInMinutes, autoContinueOnLimit: form.autoContinueOnLimit });
       setSaved(true);
       void qc.invalidateQueries({ queryKey: ['settings'] });
     } finally { setSaving(false); }
@@ -78,12 +78,17 @@ export function BudgetsForm() {
             <Field label="Max run time (minutes)" hint="Wall-clock cutoff for the whole run. 0 = no time cap.">{(id) => <Input id={id} type="number" min={0} value={form.maxConversationWallMinutes ?? ''} onChange={(e) => set('maxConversationWallMinutes', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
             <Field label="Max turns" hint="Conversation turns before pausing.">{(id) => <Input id={id} type="number" min={1} value={form.maxTurns ?? ''} onChange={(e) => set('maxTurns', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
             <Field label="Tool calls per turn" hint="Cap within a single turn.">{(id) => <Input id={id} type="number" min={1} value={form.toolCallsPerTurn ?? ''} onChange={(e) => set('toolCallsPerTurn', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
+            <Field label="Max parallel work" hint="How many items Clementine works at once when she fans a big job into a swarm. Higher = faster on 100-item jobs; lower = gentler on rate limits.">{(id) => <Input id={id} type="number" min={1} max={64} value={form.maxParallelWorkers ?? ''} onChange={(e) => set('maxParallelWorkers', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
             <Field label="Check in every (minutes)">{(id) => <Input id={id} type="number" min={1} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
           </div>
-          <div className="mb-5 flex items-center gap-3">
+          {typeof form.maxConversationSteps === 'number' && form.maxConversationSteps < 20 && (
+            <p className="mb-3 text-small text-warning">Heads up: {form.maxConversationSteps} steps is low — a multi-step task may stop before it finishes. Raise it (or turn on auto-continue) for big jobs.</p>
+          )}
+          <div className="mb-1 mt-2 flex items-center gap-3">
             <Switch checked={!!form.autoContinueOnLimit} onChange={(v) => set('autoContinueOnLimit', v)} label="Auto-continue on limit" />
-            <span className="text-body text-fg">Keep going automatically when a limit is hit</span>
+            <span className="text-body text-fg">What happens at a limit</span>
           </div>
+          <p className="mb-5 text-small text-muted">{form.autoContinueOnLimit ? 'On: when a limit is hit, Clementine keeps going automatically (best for long unattended jobs).' : 'Off: when a limit is hit, Clementine PAUSES and waits for you to say “continue” (best for staying in control — but a long job will stop partway).'}</p>
 
           <div className="flex items-center gap-3">
             <Button onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</Button>

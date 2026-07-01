@@ -1,4 +1,4 @@
-import { renderHarnessMemoryContext } from '../../agents/harness-context.js';
+import { renderCanonicalMemoryContext } from './canonical-context.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
 import {
@@ -18,6 +18,7 @@ import {
 } from './session-transcript.js';
 import { gatherSessionSkills } from './skill-execution.js';
 import { renderSkillsIndex } from '../../memory/skill-store.js';
+import { detectMultiItemIntent, fanoutDirectiveLine } from './context-packet.js';
 import { markRunInFlight } from './restart-recovery.js';
 import { actionBus } from '../action-bus.js';
 import {
@@ -36,6 +37,7 @@ import {
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
+import { resolveEffectiveToolNames, type ToolNamePolicyResult } from './tool-policy.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -358,9 +360,14 @@ function toolProfileForMode(mode: ClaudeAgentBrainMode): ClaudeAgentSdkToolProfi
   return 'read_only';
 }
 
-function allowedToolsForRequest(request: AssistantRequest, mode: ClaudeAgentBrainMode): string[] {
-  const excluded = new Set(request.excludeToolNames ?? []);
-  return defaultClaudeAgentSdkAllowedLocalTools(toolProfileForMode(mode)).filter((toolName) => !excluded.has(toolName));
+function toolPolicyForRequest(request: AssistantRequest, mode: ClaudeAgentBrainMode): ToolNamePolicyResult {
+  return resolveEffectiveToolNames({
+    surface: 'claude_agent_sdk_brain',
+    lane: mode,
+    toolNames: defaultClaudeAgentSdkAllowedLocalTools(toolProfileForMode(mode)),
+    excludeToolNames: request.excludeToolNames,
+    reason: 'claude-agent-sdk allowed local MCP tools',
+  });
 }
 
 function modeCanAuthorOrExecute(mode: ClaudeAgentBrainMode): boolean {
@@ -491,7 +498,7 @@ export function renderClaudeAgentBrainSystemAppend(
   // turns); the volatile tail + this-session actions move to the user turn (see
   // renderClaudeAgentBrainTurnContext). Split OFF: the old single-append behavior
   // (full context + query recall + sessionActions here) — byte-identical.
-  const persistentContext = renderHarnessMemoryContext({
+  const persistentContext = renderCanonicalMemoryContext({
     sessionId: request.sessionId,
     query: split ? undefined : request.message,
     partition: split ? 'stable' : 'all',
@@ -562,7 +569,7 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   // Render the volatile tail WITHOUT the query so its FTS-only recall block is
   // omitted — we replace it below with HYBRID recall (FTS ∪ semantic) so the
   // Claude lane stops knowledge-starving on paraphrased requests (Phase 4).
-  const volatile = renderHarnessMemoryContext({
+  const volatile = renderCanonicalMemoryContext({
     sessionId: request.sessionId,
     partition: 'volatile',
     includeSessionActions: false,
@@ -588,7 +595,18 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   if (sessionHistoryEnabled()) {
     try { continuationContext = renderCrossSessionPrefixesForModel(openEventLog(), request.sessionId); } catch { continuationContext = ''; }
   }
-  return [volatile, continuationContext, recall, sessionActions].filter(Boolean).join('\n\n');
+  // Fan-out directive (parity with the Codex/orchestrator lane, which builds this in
+  // buildAgentContextPacket). The Claude brain used to be BLIND to it — it hardcoded
+  // multiItem detected=false and its rubric never mentioned run_worker — so a big same-shape
+  // job ("scrape 100 accounts, analyze each") was ground through SEQUENTIALLY until it hit the
+  // step cap and parked at ~item #15. Now a detected multi-item turn gets the loud
+  // "do NOT serialize — run_worker in parallel waves" directive so she actually swarms.
+  let fanoutDirective = '';
+  try {
+    const multi = detectMultiItemIntent(request.message ?? '');
+    if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
+  } catch { fanoutDirective = ''; }
+  return [volatile, continuationContext, recall, sessionActions, fanoutDirective].filter(Boolean).join('\n\n');
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(
@@ -636,7 +654,7 @@ function emitClaudeAgentSdkBrainContextTelemetry(
         mcp: { lane: 'claude_agent_sdk_brain' },
         healthWarnings: [],
         agentSystem: { lane: 'claude_agent_sdk_brain' },
-        multiItem: { detected: false },
+        multiItem: { detected: (() => { try { return detectMultiItemIntent(request.message ?? '').isMultiItem; } catch { return false; } })() },
         injectedBytes,
       },
     });
@@ -749,7 +767,17 @@ export async function respondViaClaudeAgentSdkBrain(
   // those on the MCP surface, so the model receives fewer tool schemas. Brain lanes
   // are interactive (a user is present), so allowLane=true. Off / no-signal / no
   // embeddings → the full profile (byte-identical). Never throws into the turn.
-  const fullAllowed = allowedToolsForRequest(request, mode);
+  const fullToolPolicy = toolPolicyForRequest(request, mode);
+  const fullAllowed = fullToolPolicy.names;
+  try {
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'tool_policy_resolved',
+      data: { ...fullToolPolicy.diagnostics },
+    });
+  } catch { /* tool policy telemetry must never block the turn */ }
   const jitDecision = resolveToolJitDecision({ allowLane: true, sessionId });
   let jitAllowed = fullAllowed;
   let mcpToolAllowlist: string[] | undefined;

@@ -19,6 +19,7 @@ export interface BudgetSettings {
   maxConversationWallMinutes?: number;
   maxTurns?: number;
   toolCallsPerTurn?: number;
+  maxParallelWorkers?: number;
   checkInMinutes?: number;
   autoContinueOnLimit?: boolean;
 }

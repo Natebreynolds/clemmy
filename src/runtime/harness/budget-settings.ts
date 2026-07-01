@@ -9,6 +9,9 @@ export interface HarnessBudgetSettings {
   maxConversationWallMinutes: number;
   maxTurns: number;
   toolCallsPerTurn: number;
+  /** How many workers run in parallel per session when Clementine fans a big job out into a
+   *  swarm (run_worker). Higher = faster on 100-item jobs; lower = gentler on rate limits. */
+  maxParallelWorkers: number;
   checkInMinutes: number;
   autoContinueOnLimit: boolean;
 }
@@ -33,6 +36,7 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     // wall before doing any actual work. 40 leaves room for real
     // multi-step work while still catching runaway model behavior.
     toolCallsPerTurn: 40,
+    maxParallelWorkers: 6,
     checkInMinutes: 10,
     autoContinueOnLimit: false,
   },
@@ -42,6 +46,7 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     maxConversationWallMinutes: 480,
     maxTurns: 120,
     toolCallsPerTurn: 80,
+    maxParallelWorkers: 8,
     checkInMinutes: 5,
     autoContinueOnLimit: true,
   },
@@ -55,6 +60,7 @@ const PRESETS: Record<HarnessBudgetPreset, HarnessBudgetSettings> = {
     maxConversationWallMinutes: 0,
     maxTurns: 500,
     toolCallsPerTurn: 64,
+    maxParallelWorkers: 12,
     checkInMinutes: 3,
     autoContinueOnLimit: true,
   },
@@ -66,6 +72,7 @@ const ENV_KEYS = {
   maxConversationWallMinutes: 'HARNESS_MAX_CONVERSATION_WALL_MINUTES',
   maxTurns: 'HARNESS_ORCHESTRATOR_MAX_TURNS',
   toolCallsPerTurn: 'HARNESS_TOOL_CALLS_PER_TURN',
+  maxParallelWorkers: 'CLEMMY_WORKER_MAX_CONCURRENCY',
   checkInMinutes: 'HARNESS_CHECK_IN_MINUTES',
   autoContinueOnLimit: 'HARNESS_AUTO_CONTINUE_ON_LIMIT',
 } as const;
@@ -109,6 +116,7 @@ export function getHarnessBudgetSettings(): HarnessBudgetRuntime {
     maxConversationWallMs: maxConversationWallMinutes > 0 ? maxConversationWallMinutes * 60 * 1000 : 0,
     maxTurns: intEnv(ENV_KEYS.maxTurns, defaults.maxTurns, 1, 2_000),
     toolCallsPerTurn: intEnv(ENV_KEYS.toolCallsPerTurn, defaults.toolCallsPerTurn, 1, 256),
+    maxParallelWorkers: intEnv(ENV_KEYS.maxParallelWorkers, defaults.maxParallelWorkers, 1, 64),
     checkInMinutes: intEnv(ENV_KEYS.checkInMinutes, defaults.checkInMinutes, 1, 240),
     autoContinueOnLimit: boolEnv(ENV_KEYS.autoContinueOnLimit, defaults.autoContinueOnLimit),
     unlimited: preset === 'unlimited' || maxConversationWallMinutes === 0,
@@ -147,6 +155,7 @@ export function getElevatedBudget(current: HarnessBudgetRuntime): HarnessBudgetR
     maxConversationWallMs: elevatedWallMinutes > 0 ? elevatedWallMinutes * 60 * 1000 : 0,
     maxTurns: Math.max(current.maxTurns, long.maxTurns),
     toolCallsPerTurn: Math.max(current.toolCallsPerTurn, long.toolCallsPerTurn),
+    maxParallelWorkers: Math.max(current.maxParallelWorkers, long.maxParallelWorkers),
     checkInMinutes: Math.min(current.checkInMinutes, long.checkInMinutes),
     autoContinueOnLimit: true, // critical — the standard preset's `false` is the trap
     unlimited: current.unlimited,
@@ -174,6 +183,7 @@ export function saveHarnessBudgetSettings(input: Partial<Record<keyof HarnessBud
     maxConversationWallMinutes: clampNumber(input.maxConversationWallMinutes, base.maxConversationWallMinutes, 0, 525_600),
     maxTurns: clampNumber(input.maxTurns, base.maxTurns, 1, 2_000),
     toolCallsPerTurn: clampNumber(input.toolCallsPerTurn, base.toolCallsPerTurn, 1, 256),
+    maxParallelWorkers: clampNumber(input.maxParallelWorkers, base.maxParallelWorkers, 1, 64),
     checkInMinutes: clampNumber(input.checkInMinutes, base.checkInMinutes, 1, 240),
     autoContinueOnLimit: typeof input.autoContinueOnLimit === 'boolean'
       ? input.autoContinueOnLimit
@@ -185,6 +195,7 @@ export function saveHarnessBudgetSettings(input: Partial<Record<keyof HarnessBud
   updateEnvKey(ENV_KEYS.maxConversationWallMinutes, String(next.maxConversationWallMinutes));
   updateEnvKey(ENV_KEYS.maxTurns, String(next.maxTurns));
   updateEnvKey(ENV_KEYS.toolCallsPerTurn, String(next.toolCallsPerTurn));
+  updateEnvKey(ENV_KEYS.maxParallelWorkers, String(next.maxParallelWorkers));
   updateEnvKey(ENV_KEYS.checkInMinutes, String(next.checkInMinutes));
   updateEnvKey(ENV_KEYS.autoContinueOnLimit, next.autoContinueOnLimit ? 'true' : 'false');
   process.env[ENV_KEYS.preset] = next.preset;
@@ -192,6 +203,7 @@ export function saveHarnessBudgetSettings(input: Partial<Record<keyof HarnessBud
   process.env[ENV_KEYS.maxConversationWallMinutes] = String(next.maxConversationWallMinutes);
   process.env[ENV_KEYS.maxTurns] = String(next.maxTurns);
   process.env[ENV_KEYS.toolCallsPerTurn] = String(next.toolCallsPerTurn);
+  process.env[ENV_KEYS.maxParallelWorkers] = String(next.maxParallelWorkers);
   process.env[ENV_KEYS.checkInMinutes] = String(next.checkInMinutes);
   process.env[ENV_KEYS.autoContinueOnLimit] = next.autoContinueOnLimit ? 'true' : 'false';
   return getHarnessBudgetSettings();

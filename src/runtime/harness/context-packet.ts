@@ -202,7 +202,7 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
  * imperative "do NOT serialize" + a one-line forEach-workflow suggestion (P2);
  * 3<=N<8 gets a soft offer that leaves the model's per-item judgment intact.
  */
-function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): string {
+export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): string {
   const kind = intent.itemKind ? ` ${intent.itemKind}` : ' items';
   const n = intent.itemCount;
   const cappedWaveSize = Math.max(1, Math.min(8, Math.round(waveSize || 8)));

@@ -33,9 +33,9 @@ const GOLDEN = {
   // HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
   instructions: { len: 36370, sha16: '9c57dae779c73f50' },
   native: { len: 35135, sha16: 'f0ba7753baa96a15' },
-  claudeBrain: { len: 3784, sha16: 'bf714e5eda902800' },
+  claudeBrain: { len: 4676, sha16: '5ea8acff93c8e07f' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 7597, sha16: 'fc24ad887bd7057e' },
+  lean: { len: 8489, sha16: 'ec235a5240caaf97' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
