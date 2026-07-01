@@ -15,7 +15,7 @@ import { MODELS, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
-import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks } from '../execution/background-tasks.js';
+import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, registerBackgroundDrainKick } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
@@ -1108,6 +1108,20 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   setImmediate(drainBackgroundTasks);
   const backgroundTimer = setInterval(drainBackgroundTasks, 15_000);
   backgroundTimer.unref?.();
+  // Wire the immediate-drain kick: a freshly enqueued task (dispatch_background_task,
+  // chat/mobile/discord auto-promotion) drains NOW instead of waiting for the 15s
+  // tick, so it fires + turns RUNNING + becomes expandable right away. Single-flight
+  // guarded inside processBackgroundTasks, so a kick can never double-run a task.
+  registerBackgroundDrainKick((limit) => {
+    setImmediate(() => {
+      processBackgroundTasks(assistant, limit ?? 1).catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Immediate background drain kick failed',
+        );
+      });
+    });
+  });
 
   // Workflow watchdog — reports-back safety net. Runs on its OWN timer
   // (not the main loop) precisely because the failure it catches is the

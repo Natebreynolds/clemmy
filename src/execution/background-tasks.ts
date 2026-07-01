@@ -161,6 +161,36 @@ const BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP = (() => {
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
 let backgroundProcessorInFlight = false;
 
+// ── Immediate drain kick ──────────────────────────────────────────────────────
+// A newly enqueued background task used to fire ONLY on the daemon's 15s tick (or
+// never, if the daemon loop isn't running in-process), so "run in the background"
+// left a `pending` record that never executed, never turned RUNNING on the board,
+// and had no harness session to expand (2026-06-30 live). The daemon owns the
+// `assistant` handle, so it registers a kick here on boot; the enqueue choke point
+// (enqueueDurableChatTask) requests an immediate drain. Best-effort: if no daemon
+// loop registered a kick (e.g. a dashboard-only process), the task still drains on
+// the next tick / restart — never worse than before. Kill-switch CLEMMY_BG_DRAIN_KICK.
+let backgroundDrainKick: ((limit?: number) => void) | null = null;
+
+/** Called once by the daemon runner (which owns `assistant`) to wire the immediate
+ *  drain path. */
+export function registerBackgroundDrainKick(fn: (limit?: number) => void): void {
+  backgroundDrainKick = fn;
+}
+
+/** Request an immediate single-task drain right after enqueue, instead of waiting
+ *  for the daemon's 15s tick. No-op when no kick is registered. */
+export function requestBackgroundDrain(limit = 1): void {
+  if ((process.env.CLEMMY_BG_DRAIN_KICK ?? 'on').toLowerCase() === 'off') return;
+  const fn = backgroundDrainKick;
+  if (!fn) return;
+  try {
+    fn(limit);
+  } catch {
+    /* the 15s tick remains the backstop */
+  }
+}
+
 function ensureTaskDir(): void {
   mkdirSync(BACKGROUND_TASK_DIR, { recursive: true });
 }

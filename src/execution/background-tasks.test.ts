@@ -43,6 +43,8 @@ const {
   staleTaskKind,
   findStaleBackgroundTasks,
   STALE_TASK_AGE_MS,
+  registerBackgroundDrainKick,
+  requestBackgroundDrain,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -51,6 +53,36 @@ const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../ru
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('enqueueDurableChatTask kicks the drain immediately (fires without waiting for the 15s tick)', () => {
+  const kicks: Array<number | undefined> = [];
+  registerBackgroundDrainKick((limit) => kicks.push(limit));
+  try {
+    const task = enqueueDurableChatTask({ message: 'Build the Meta-ads workspace', sessionId: 'sess-kick-1', source: 'desktop' });
+    assert.equal(task.status, 'pending', 'task is enqueued pending');
+    assert.deepEqual(kicks, [1], 'enqueue requested exactly one immediate single-task drain');
+  } finally {
+    registerBackgroundDrainKick(() => {});
+  }
+});
+
+test('requestBackgroundDrain is a safe no-op with no kick registered, and honors the kill-switch', () => {
+  // Unregister by installing a throwing kick then clearing via the kill-switch path.
+  const kicks: number[] = [];
+  registerBackgroundDrainKick((limit) => kicks.push(limit ?? -1));
+  const prev = process.env.CLEMMY_BG_DRAIN_KICK;
+  try {
+    process.env.CLEMMY_BG_DRAIN_KICK = 'off';
+    requestBackgroundDrain(1);
+    assert.deepEqual(kicks, [], 'kill-switch off ⇒ no kick fired');
+    process.env.CLEMMY_BG_DRAIN_KICK = 'on';
+    requestBackgroundDrain(2);
+    assert.deepEqual(kicks, [2], 'kill-switch on ⇒ kick fired with the requested limit');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_BG_DRAIN_KICK; else process.env.CLEMMY_BG_DRAIN_KICK = prev;
+    registerBackgroundDrainKick(() => {});
+  }
 });
 
 test('resumeInterruptedBackgroundTasks re-queues once and respects the cap', () => {

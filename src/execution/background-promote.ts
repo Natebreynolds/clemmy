@@ -24,7 +24,7 @@
 import { MODELS } from '../config.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { deriveTitle } from '../memory/derive-title.js';
-import { createBackgroundTask, type BackgroundTaskRecord } from './background-tasks.js';
+import { createBackgroundTask, requestBackgroundDrain, type BackgroundTaskRecord } from './background-tasks.js';
 import { requestKill, listEvents } from '../runtime/harness/eventlog.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 
@@ -166,7 +166,7 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
   const prompt = input.composedPrompt?.trim()
     || stripBackgroundPrefix(input.message)
     || input.message;
-  return createBackgroundTask({
+  const task = createBackgroundTask({
     title: deriveTitle(input.message) || deriveTitle(prompt),
     prompt,
     originSessionId: input.sessionId,
@@ -176,6 +176,12 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',
   });
+  // Kick the daemon to drain THIS task now rather than on its next 15s tick — the
+  // single choke point for every create path (dispatch_background_task, chat/mobile/
+  // discord auto-promotion), so a backgrounded task actually fires, turns RUNNING on
+  // the board, and registers a harness session to expand — instead of sitting pending.
+  requestBackgroundDrain(1);
+  return task;
 }
 
 // ── User-initiated "background it" control (the Claude Code ctrl+b model) ──────
