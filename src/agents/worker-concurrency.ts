@@ -13,14 +13,26 @@
  * drop — every item still completes). Pure in-memory, no I/O, so the FIFO ordering
  * is unit-testable in isolation.
  *
- * Kill-switch CLEMMY_WORKER_MAX_CONCURRENCY: a positive integer sets the cap
- * (default 6); `0` / `off` / `unlimited` disables the gate entirely (unbounded, the
- * pre-2026-06-30 behavior).
+ * TWO ceilings, both enforced:
+ *  - PER-SESSION (CLEMMY_WORKER_MAX_CONCURRENCY, default 6): at most K workers per session.
+ *  - GLOBAL (CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL, default max(perSession, 12)): a hard cap
+ *    across ALL sessions, so several sessions swarming at once (or the per-session cap being
+ *    widened) can't blow past the provider's real concurrency and storm 429/529. A worker
+ *    acquires its SESSION slot FIRST, then the GLOBAL slot — consistent lock order (no
+ *    deadlock) and no global slot is ever held by a worker still waiting for a session slot.
+ *    The global default (12) is ≥ the per-session default (6), so a single session is never
+ *    further limited — the global cap only bites when multiple sessions run concurrently.
+ *
+ * CLEMMY_WORKER_MAX_CONCURRENCY=0/off/unlimited is the MASTER off — fully unbounded, both
+ * gates disabled (the documented pre-2026-06-30 escape hatch, unchanged). With any positive
+ * per-session value (incl. the default 6) the global ceiling also applies, unless it is
+ * independently disabled via CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL=0/off/unlimited.
  */
 
 const DEFAULT_MAX_CONCURRENCY = 6;
+const DEFAULT_GLOBAL_MAX_CONCURRENCY = 12;
 
-/** True when the gate is disabled (unbounded) via the kill-switch. */
+/** True when the per-session gate is disabled (unbounded) via the kill-switch. */
 function gateDisabled(): boolean {
   const v = (process.env.CLEMMY_WORKER_MAX_CONCURRENCY ?? '').trim().toLowerCase();
   return v === '0' || v === 'off' || v === 'unlimited';
@@ -33,57 +45,85 @@ function maxConcurrency(): number {
   return DEFAULT_MAX_CONCURRENCY;
 }
 
-interface SessionGate {
+/** True when the global ceiling is disabled. */
+function globalGateDisabled(): boolean {
+  const v = (process.env.CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL ?? '').trim().toLowerCase();
+  return v === '0' || v === 'off' || v === 'unlimited';
+}
+
+/** The process-global in-flight ceiling across ALL sessions. */
+function maxGlobalConcurrency(): number {
+  const raw = Number.parseInt(process.env.CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL ?? '', 10);
+  if (Number.isFinite(raw) && raw >= 1) return raw;
+  return Math.max(maxConcurrency(), DEFAULT_GLOBAL_MAX_CONCURRENCY);
+}
+
+interface Gate {
   active: number;
   /** FIFO queue of waiters; resolving one HANDS OVER a slot (active stays constant). */
   queue: Array<() => void>;
 }
 
-const gates = new Map<string, SessionGate>();
+const gates = new Map<string, Gate>();
+const globalGate: Gate = { active: 0, queue: [] };
+
+/** Acquire one slot on a gate (FIFO). Returns an idempotent per-gate release. */
+async function acquireOnGate(gate: Gate, max: number): Promise<() => void> {
+  if (gate.active < max) {
+    gate.active += 1;
+  } else {
+    await new Promise<void>((resolve) => gate.queue.push(resolve));
+  }
+  let released = false;
+  return () => {
+    if (released) return; // idempotent — a double-release must not corrupt the count
+    released = true;
+    const next = gate.queue.shift();
+    if (next) next(); // hand our slot to the next waiter — active stays the same
+    else gate.active -= 1;
+  };
+}
 
 /** For tests: current in-flight count for a session (0 if none). */
 export function _activeWorkerSlots(sessionId: string): number {
   return gates.get(sessionId || '__global__')?.active ?? 0;
 }
 
+/** For tests: current GLOBAL in-flight worker count across all sessions. */
+export function _activeGlobalWorkerSlots(): number {
+  return globalGate.active;
+}
+
 /** For tests: reset all gate state. */
 export function _resetWorkerConcurrencyForTest(): void {
   gates.clear();
+  globalGate.active = 0;
+  globalGate.queue = [];
 }
 
 /**
- * Acquire a worker slot for `sessionId`. Resolves immediately if a slot is free,
- * otherwise waits FIFO until one frees. Returns an idempotent release fn — call it
+ * Acquire a worker slot for `sessionId`. Resolves immediately if slots are free,
+ * otherwise waits FIFO until they free. Returns an idempotent release fn — call it
  * exactly once (in a finally) when the worker execution finishes or throws.
  */
 export async function acquireWorkerSlot(sessionId: string): Promise<() => void> {
-  if (gateDisabled()) return () => {};
+  if (gateDisabled()) return () => {}; // MASTER off — fully unbounded (documented escape hatch)
+
+  // SESSION slot FIRST (a worker waiting for a session slot holds nothing), THEN the GLOBAL
+  // slot — so we never tie up a scarce global slot on a worker that's still queued per-session.
   const key = sessionId || '__global__';
   let gate = gates.get(key);
-  if (!gate) {
-    gate = { active: 0, queue: [] };
-    gates.set(key, gate);
-  }
+  if (!gate) { gate = { active: 0, queue: [] }; gates.set(key, gate); }
+  const releaseSession = await acquireOnGate(gate, maxConcurrency());
+  const releaseGlobal = globalGateDisabled() ? () => {} : await acquireOnGate(globalGate, maxGlobalConcurrency());
 
-  if (gate.active < maxConcurrency()) {
-    gate.active += 1;
-  } else {
-    // No free slot: wait until a releaser HANDS its slot to us (active unchanged).
-    await new Promise<void>((resolve) => gate!.queue.push(resolve));
-  }
-
+  const g = gate;
   let released = false;
   return () => {
-    if (released) return; // idempotent — a double-release must not corrupt the count
+    if (released) return;
     released = true;
-    const g = gates.get(key);
-    if (!g) return;
-    const next = g.queue.shift();
-    if (next) {
-      next(); // hand our slot to the next waiter — active stays the same
-    } else {
-      g.active -= 1;
-      if (g.active <= 0 && g.queue.length === 0) gates.delete(key); // GC the drained gate
-    }
+    releaseGlobal();
+    releaseSession();
+    if (g.active <= 0 && g.queue.length === 0) gates.delete(key); // GC the drained gate
   };
 }

@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { acquireWorkerSlot, _activeWorkerSlots, _resetWorkerConcurrencyForTest } = await import('./worker-concurrency.js');
+const { acquireWorkerSlot, _activeWorkerSlots, _activeGlobalWorkerSlots, _resetWorkerConcurrencyForTest } = await import('./worker-concurrency.js');
 
 function withEnv(over: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
   const prev: Record<string, string | undefined> = {};
@@ -109,5 +109,35 @@ test('per-session isolation — one busy session does not block another', async 
     const b = await pb;
     assert.equal(bAcquired, true, 'a different session gets its own slot immediately');
     a(); b();
+  });
+});
+
+test('GLOBAL ceiling bounds total workers ACROSS sessions (cross-session storm cap)', async () => {
+  await withEnv({ CLEMMY_WORKER_MAX_CONCURRENCY: '6', CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: '4' }, async () => {
+    _resetWorkerConcurrencyForTest();
+    // 3 sessions × 2 workers = 6 desired; per-session cap (6) would allow all, but the
+    // GLOBAL cap (4) holds the line across sessions.
+    let running = 0;
+    const releases: Array<() => void> = [];
+    const attempts = ['s1', 's1', 's2', 's2', 's3', 's3'].map((s) =>
+      acquireWorkerSlot(s).then((r) => { running += 1; releases.push(r); return r; }));
+    await new Promise((r) => setTimeout(r, 15)); // let the acquires settle
+    assert.equal(_activeGlobalWorkerSlots(), 4, 'exactly 4 hold a global slot');
+    assert.equal(running, 4, 'only 4 run; the other 2 wait on the global ceiling despite free per-session slots');
+    releases[0](); releases[1](); // free 2 → the 2 waiters proceed
+    await Promise.all(attempts);
+    assert.equal(running, 6, 'all 6 eventually run as global slots free (throttle, never drop)');
+    releases.forEach((r) => r());
+    assert.equal(_activeGlobalWorkerSlots(), 0, 'global gate fully drains');
+  });
+});
+
+test('GLOBAL ceiling default (12) never further limits a single session on the default per-session cap (6)', async () => {
+  await withEnv({ CLEMMY_WORKER_MAX_CONCURRENCY: undefined, CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: undefined }, async () => {
+    _resetWorkerConcurrencyForTest();
+    // One session, 6 workers = the per-session default; global default (12) ≥ 6 so nothing extra blocks.
+    const releases = await Promise.all(Array.from({ length: 6 }, () => acquireWorkerSlot('solo')));
+    assert.equal(releases.length, 6, 'all 6 acquire immediately — global default does not bite a single session');
+    releases.forEach((r) => r());
   });
 });

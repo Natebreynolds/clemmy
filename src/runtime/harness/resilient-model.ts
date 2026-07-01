@@ -135,15 +135,25 @@ function backoffMs(attempt: number, cls: ErrorClass): number {
     ? RATE_LIMIT_BASE_BACKOFF_MS
     : BASE_BACKOFF_MS;
   const exp = base * Math.pow(2, attempt);
-  // +/- 20% jitter so concurrent runs don't re-hammer the same frame.
-  const jitter = exp * 0.2 * (0.5 - deterministicJitter(attempt));
+  // Jitter SEEDED PER INVOCATION (not just by attempt) so CONCURRENT calls that fail at the
+  // same attempt don't compute the IDENTICAL backoff and retry in lockstep — a synchronized
+  // thundering herd that turns one overload into an oscillating wave (the burst opened by a
+  // swarm + its judges). The salt only needs to DIFFER between interleaved calls, not be
+  // random (Math.random is unavailable in some sandboxes); the ±bound is unchanged.
+  const jitter = exp * 0.2 * (0.5 - deterministicJitter(attempt, nextJitterSalt()));
   return Math.min(MAX_BACKOFF_MS, Math.round(exp + jitter));
 }
 
+let jitterSalt = 0;
+function nextJitterSalt(): number {
+  jitterSalt = (jitterSalt + 1) % 1_000_000;
+  return jitterSalt;
+}
+
 // Cheap deterministic jitter (Math.random is unavailable in some sandboxes and
-// non-deterministic for tests). Varies by attempt without a PRNG.
-function deterministicJitter(attempt: number): number {
-  const x = Math.sin((attempt + 1) * 12.9898) * 43758.5453;
+// non-deterministic for tests). Varies by attempt AND a per-invocation salt without a PRNG.
+function deterministicJitter(attempt: number, salt: number): number {
+  const x = Math.sin((attempt + 1) * 12.9898 + salt * 78.233) * 43758.5453;
   return x - Math.floor(x);
 }
 
