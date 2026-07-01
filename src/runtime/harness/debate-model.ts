@@ -50,6 +50,7 @@ import {
   debateBrainsAvailable,
   judgeCrossFamilyEnabled,
   chooseBoundaryJudgeFamily,
+  boundaryCodexJudgeModel,
 } from './judge-family.js';
 // Re-exported from the judge-family leaf (moved out of this file) so existing
 // importers of debate-model keep working: console-routes (debateBrainsAvailable),
@@ -958,7 +959,11 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
     if (checker.provider === brain.provider && checker.modelId === brain.modelId) {
       const choice = judgeChoice();
       if (choice === 'codex' && codexAvailable() && brain.provider !== 'codex') {
-        checker = { modelId: MODELS.primary, provider: 'codex', source: 'default' };
+        // Use a REAL Codex id, not MODELS.primary — the OPENAI_MODEL_PRIMARY slot can
+        // be repurposed to a BYO/GLM id (glm-5.2), which the router then sends to the
+        // BYO endpoint and storms with 429s (labelled provider:'codex' but wired to
+        // BYO). boundaryCodexJudgeModel() (gpt-5.4-mini) is a guaranteed-Codex checker.
+        checker = { modelId: boundaryCodexJudgeModel(), provider: 'codex', source: 'default' };
       } else if (choice === 'claude' && claudeAvailable() && brain.provider !== 'claude') {
         checker = { modelId: getDebateCheckerModel(), provider: 'claude', source: 'default' };
       } else {
