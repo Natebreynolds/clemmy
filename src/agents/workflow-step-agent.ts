@@ -8,6 +8,15 @@ import type { RuntimeContextValue } from '../types.js';
 import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { harnessInstructions } from './harness-context.js';
+import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
+import { getRuntimeEnv } from '../config.js';
+
+/** DEFAULT ON. Inject the "Remembered Tool Choices" recall into an UNBOUND workflow
+ *  step so it uses the proven tool for its intent — the same learned recall chat
+ *  gets. Off (CLEMMY_WORKFLOW_STEP_RECALL=off) ⇒ static step instructions only. */
+function workflowStepRecallEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKFLOW_STEP_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
+}
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
 import { OrchestratorDecisionSchema } from './orchestrator.js';
 
@@ -187,9 +196,20 @@ export async function buildWorkflowStepAgent(
     filterToolsForStep(all),
     options.lockTools,
   ) as Tool<RuntimeContextValue>[];
+  // Recall the proven tool for this step's intent — but ONLY for an UNBOUND step.
+  // A step whose allowedTools LOCK the surface already has its tool chosen, so the
+  // recall block would be noise; an unbound / composio step is where the model picks
+  // a tool and benefits from "for this intent, X worked before" (parity with chat).
+  const surfaceLocked = stepAllowedToolsLock(options.lockTools);
+  const learnedRecall = (!surfaceLocked && options.userInput && workflowStepRecallEnabled())
+    ? renderToolChoicesForContext(8, undefined, options.userInput)
+    : '';
+  const instructions = learnedRecall
+    ? `${harnessInstructions(STEP_INSTRUCTIONS)}\n\n${learnedRecall}`
+    : harnessInstructions(STEP_INSTRUCTIONS);
   return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
     name: 'WorkflowStep',
-    instructions: harnessInstructions(STEP_INSTRUCTIONS),
+    instructions,
     // Step orchestration (OrchestratorDecisionSchema, multi-tool) stays on the
     // brain/primary tier unless the step carries an intent-routed model override
     // (see workflow-runner runStepViaHarness). The RouterModelProvider dispatches
