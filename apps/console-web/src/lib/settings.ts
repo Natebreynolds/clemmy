@@ -15,6 +15,8 @@ export interface UserProfile {
 
 export interface BudgetSettings {
   preset?: 'standard' | 'long' | 'unlimited';
+  maxConversationSteps?: number;
+  maxConversationWallMinutes?: number;
   maxTurns?: number;
   toolCallsPerTurn?: number;
   checkInMinutes?: number;

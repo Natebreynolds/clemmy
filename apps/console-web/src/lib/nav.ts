@@ -32,7 +32,7 @@ export const ADVANCED_NAV: NavDest[] = [
   { path: '/advanced/tools', label: 'Tools', icon: Wrench, hint: 'Registered tool catalog' },
   { path: '/advanced/diagnostics', label: 'Diagnostics', icon: Stethoscope, hint: 'Health, logs & storage' },
   { path: '/advanced/observability', label: 'Observability', icon: Activity, hint: 'Live operational telemetry feed' },
-  { path: '/advanced/budgets', label: 'How hard it works', icon: Gauge, hint: 'Runtime budgets' },
+  { path: '/advanced/budgets', label: 'Run limits', icon: Gauge, hint: 'How far a run goes — steps, time & caps' },
   { path: '/agents', label: 'Agents', icon: Users, hint: 'Your specialized team & how they talk' },
   { path: '/advanced/autonomy', label: 'Autonomy', icon: Sliders, hint: 'When Clementine acts on its own' },
   { path: '/advanced/evolution', label: 'Evolution', icon: Sparkles, hint: 'Nightly self-research reports' },

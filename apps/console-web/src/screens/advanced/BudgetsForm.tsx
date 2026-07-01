@@ -28,7 +28,7 @@ export function BudgetsForm() {
     // Live values are nested under runtimeBudget.settings (snapshot shape).
     const b = settings.data?.runtimeBudget?.settings;
     if (b && !form) {
-      setForm({ preset: b.preset, maxTurns: b.maxTurns, toolCallsPerTurn: b.toolCallsPerTurn, checkInMinutes: b.checkInMinutes, autoContinueOnLimit: b.autoContinueOnLimit });
+      setForm({ preset: b.preset, maxConversationSteps: b.maxConversationSteps, maxConversationWallMinutes: b.maxConversationWallMinutes, maxTurns: b.maxTurns, toolCallsPerTurn: b.toolCallsPerTurn, checkInMinutes: b.checkInMinutes, autoContinueOnLimit: b.autoContinueOnLimit });
     }
   }, [settings.data, form]);
 
@@ -44,14 +44,14 @@ export function BudgetsForm() {
     if (!form) return;
     setSaving(true);
     try {
-      await patchBudget({ maxTurns: form.maxTurns, toolCallsPerTurn: form.toolCallsPerTurn, checkInMinutes: form.checkInMinutes, autoContinueOnLimit: form.autoContinueOnLimit });
+      await patchBudget({ maxConversationSteps: form.maxConversationSteps, maxConversationWallMinutes: form.maxConversationWallMinutes, maxTurns: form.maxTurns, toolCallsPerTurn: form.toolCallsPerTurn, checkInMinutes: form.checkInMinutes, autoContinueOnLimit: form.autoContinueOnLimit });
       setSaved(true);
       void qc.invalidateQueries({ queryKey: ['settings'] });
     } finally { setSaving(false); }
   };
 
   return (
-    <Page title="How hard Clementine works" subtitle="Runtime budgets" width="reading">
+    <Page title="Run limits" subtitle="How far a run goes before it pauses or stops" width="reading">
       {settings.isLoading ? <Card className="p-5"><Skeleton className="h-64 w-full" /></Card> : !form ? (
         <Card className="p-5 text-body text-muted">Couldn't load settings.{' '}
           <button type="button" onClick={() => settings.refetch()} className="text-primary hover:underline cursor-pointer">Try again</button>
@@ -71,9 +71,13 @@ export function BudgetsForm() {
             ))}
           </div>
 
+          <h3 className="mb-1 text-h3 text-fg">Cap how far a run can go</h3>
+          <p className="mb-3 text-small text-muted">Hard limits — a run stops (or checks in) when it hits any of these, whatever the preset. Lower them to keep runs short; raise them to let a big job (e.g. scraping + enriching 100 leads) finish without pausing.</p>
           <div className="grid gap-x-4 sm:grid-cols-2">
+            <Field label="Max steps (whole run)" hint="Total tool calls across the run before it pauses — the main cap for long, multi-item jobs.">{(id) => <Input id={id} type="number" min={1} value={form.maxConversationSteps ?? ''} onChange={(e) => set('maxConversationSteps', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
+            <Field label="Max run time (minutes)" hint="Wall-clock cutoff for the whole run. 0 = no time cap.">{(id) => <Input id={id} type="number" min={0} value={form.maxConversationWallMinutes ?? ''} onChange={(e) => set('maxConversationWallMinutes', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
             <Field label="Max turns" hint="Conversation turns before pausing.">{(id) => <Input id={id} type="number" min={1} value={form.maxTurns ?? ''} onChange={(e) => set('maxTurns', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
-            <Field label="Tool calls per turn">{(id) => <Input id={id} type="number" min={1} value={form.toolCallsPerTurn ?? ''} onChange={(e) => set('toolCallsPerTurn', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
+            <Field label="Tool calls per turn" hint="Cap within a single turn.">{(id) => <Input id={id} type="number" min={1} value={form.toolCallsPerTurn ?? ''} onChange={(e) => set('toolCallsPerTurn', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
             <Field label="Check in every (minutes)">{(id) => <Input id={id} type="number" min={1} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', e.target.value === '' ? undefined : Number(e.target.value))} />}</Field>
           </div>
           <div className="mb-5 flex items-center gap-3">
