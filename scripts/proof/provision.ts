@@ -9,7 +9,7 @@
  * read-only from the daemon's perspective. No Composio/API keys are seeded,
  * so scenarios physically cannot reach external services.
  */
-import { mkdtempSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, copyFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { randomBytes } from 'node:crypto';
@@ -104,6 +104,17 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
 
   // Isolation assertion: the temp home starts with NO state.
   if (existsSync(path.join(home, 'state'))) throw new Error('temp home unexpectedly pre-populated');
+
+  // Seed ONLY Clementine's own model sign-in files (the runtime factory refuses
+  // to boot without one — "Run clementine auth login-device"). Deliberately NOT
+  // the secrets vault: it carries Composio/API keys, and the sandbox must stay
+  // physically unable to reach external services. Databases, memory and every
+  // other state file start EMPTY: that's the isolation contract.
+  mkdirSync(path.join(home, 'state'), { recursive: true });
+  for (const authFile of ['auth.json', 'claude-auth.json']) {
+    const src = path.join(REAL_CLEM_HOME, 'state', authFile);
+    if (existsSync(src)) copyFileSync(src, path.join(home, 'state', authFile));
+  }
 
   const logChunks: string[] = [];
   const proc: ChildProcess = spawn(process.execPath, [DAEMON_ENTRY, 'service'], {

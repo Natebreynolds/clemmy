@@ -52,11 +52,13 @@ export const fanoutMultiItem: ScenarioDef = {
       db.close();
     } catch { /* scored checks below handle null */ }
 
-    const workerCalls = metrics?.toolCalls['run_worker'] ?? 0;
+    // The SDK brain lane logs each worker as a worker_result event; the Codex
+    // lane logs run_worker tool_called events. Either is proof of fan-out.
+    const workerCalls = Math.max(metrics?.toolCalls['run_worker'] ?? 0, metrics?.workerResults ?? 0);
     checks.push({
-      name: 'fan-out elected (run_worker ≥ 2)',
+      name: 'fan-out elected (workers ≥ 2)',
       pass: workerCalls >= 2,
-      detail: `run_worker × ${workerCalls}`,
+      detail: `workers × ${workerCalls}${metrics?.workerFailures ? ` (${metrics.workerFailures} failed)` : ''}`,
     });
     checks.push({
       name: 'no limit-exceeded park',

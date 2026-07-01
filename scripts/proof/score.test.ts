@@ -47,6 +47,8 @@ function buildFixtureHome(): string {
   ev('tool_called', { tool: 'run_worker', callId: 'c1' }, 2_000);
   ev('tool_called', { tool: 'run_worker', callId: 'c2' }, 2_500);
   ev('tool_called', { tool: 'remember_fact', callId: 'c3' }, 9_000);
+  ev('worker_result', { item: 'firm-1', ok: true }, 9_500);
+  ev('worker_result', { item: 'firm-2', ok: false }, 9_800);
   ev('guardrail_tripped', { kind: 'test' }, 10_000);
   ev('turn_ended', {}, 30_000);
   ev('conversation_completed', { reply: 'done' }, 30_100);
@@ -68,6 +70,8 @@ test('sessionMetrics computes counts, TTFT, and latency from the fixture', () =>
     assert.equal(m.toolCalls['remember_fact'], 1);
     assert.equal(m.toolCallTotal, 3);
     assert.equal(m.guardrailsTripped, 1);
+    assert.equal(m.workerResults, 2);
+    assert.equal(m.workerFailures, 1);
     assert.equal(m.completedEvents, 1);
     assert.equal(m.limitExceededEvents, 0);
     assert.equal(m.primerInjectedBytes, 512);

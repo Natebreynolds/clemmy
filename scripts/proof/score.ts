@@ -25,6 +25,9 @@ export interface SessionMetrics {
   guardrailsTripped: number;
   externalWrites: number;
   autoContinues: number;
+  /** run_worker fan-out results (the SDK lane logs worker_result, not tool_called). */
+  workerResults: number;
+  workerFailures: number;
   completedEvents: number;
   limitExceededEvents: number;
   primerInjectedBytes: number | null;
@@ -52,6 +55,8 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
   let guardrailsTripped = 0;
   let externalWrites = 0;
   let autoContinues = 0;
+  let workerResults = 0;
+  let workerFailures = 0;
   let completedEvents = 0;
   let limitExceededEvents = 0;
   let primerInjectedBytes: number | null = null;
@@ -83,6 +88,11 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
           openTurnFirstAction = null;
         }
         break;
+      case 'worker_result': {
+        workerResults += 1;
+        try { if ((JSON.parse(ev.data_json) as { ok?: boolean }).ok === false) workerFailures += 1; } catch { /* count as ok */ }
+        break;
+      }
       case 'guardrail_tripped': guardrailsTripped += 1; break;
       case 'external_write': externalWrites += 1; break;
       case 'sdk_auto_continue': autoContinues += 1; break;
@@ -117,6 +127,8 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
     guardrailsTripped,
     externalWrites,
     autoContinues,
+    workerResults,
+    workerFailures,
     completedEvents,
     limitExceededEvents,
     primerInjectedBytes,
