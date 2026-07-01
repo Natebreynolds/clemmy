@@ -131,6 +131,8 @@ export function recordModelUsage(args: {
    *  model's window. utilization = inputTokens / contextWindowTokens. */
   contextWindowTokens?: number;
   windowUtilization?: number;
+  /** Spawn → first stream message (Claude SDK lane cold-start latency). */
+  firstByteMs?: number;
 }): void {
   const source = args.sessionId || 'unknown';
   const event = {
@@ -148,6 +150,7 @@ export function recordModelUsage(args: {
     promptComponents: args.promptComponents,
     contextWindowTokens: args.contextWindowTokens,
     windowUtilization: args.windowUtilization,
+    firstByteMs: args.firstByteMs,
     // Join keys for the State layer — derived, so every workflow lane gets them
     // for free (no per-model-lane call-site change). Absent for non-workflow calls.
     ...parseWorkflowSource(source),

@@ -908,6 +908,7 @@ function recordClaudeAgentSdkUsage(
   options: ClaudeAgentSdkRunOptions,
   result: SDKResultMessage | null,
   init: SDKSystemMessage | null,
+  timing?: { firstByteMs: number | null },
 ): void {
   try {
     const totals = usageTotalsFromResult(result);
@@ -923,6 +924,7 @@ function recordClaudeAgentSdkUsage(
       totalTokens: totals.totalTokens,
       durationMs: numeric((result as { duration_ms?: unknown } | null)?.duration_ms),
       responseId: typeof responseId === 'string' ? responseId : undefined,
+      ...(timing && timing.firstByteMs !== null ? { firstByteMs: timing.firstByteMs } : {}),
       ...(contextWindowTokens
         ? {
             contextWindowTokens,
@@ -1043,6 +1045,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   let init: SDKSystemMessage | null = null;
   let toolUses: string[] = [];
   const toolCallLedger: Array<{ callId: string; name: string; argsPreview: string }> = [];
+  // WS5-L2: child-process spawn → first stream message. THE cold-start metric —
+  // the SDK spawns a fresh `claude` process per query(), and this is the only
+  // place that latency is observable. Latest attempt wins (that one produced the result).
+  let firstByteMs: number | null = null;
   // Learning OUT (brain continuity). The Agent SDK runs its tool loop OUTSIDE
   // the @openai/agents RunHooks, so the onToolEnd → scheduleReflection path the
   // Codex loop uses (hooks.ts) never fires here. Without this, a Claude
@@ -1086,6 +1092,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     init = null;
     toolUses = [];
     toolCallLedger.length = 0;
+    firstByteMs = null;
     lastAssistantText = '';
     streamedText = '';
     streamedAny = false;
@@ -1107,6 +1114,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       }
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
       for await (const message of stream) {
+        if (firstByteMs === null) firstByteMs = Date.now() - startedAt;
         if (options.shouldCancel && await options.shouldCancel()) {
           try { await stream?.interrupt?.(); } catch { /* best-effort */ }
           throw new AgentRuntimeCancelledError('Run cancelled by caller.');
@@ -1218,7 +1226,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   }
 
   if (terminalToolReply) {
-    recordClaudeAgentSdkUsage(options, result, init);
+    recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
     return {
       text: terminalToolReply,
       sessionId: result?.session_id ?? init?.session_id,
@@ -1233,7 +1241,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   }
 
   if (threwTurnLimit) {
-    recordClaudeAgentSdkUsage(options, result, init);
+    recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
     return {
       text: partialLimitText(),
       sessionId: result?.session_id ?? init?.session_id,
@@ -1253,7 +1261,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     // (mirrors the harness loop's max-turns-with-grace) instead of throwing a
     // raw "Claude Agent SDK failed" error that the caller reports as run_failed.
     if (result.subtype === 'error_max_turns') {
-      recordClaudeAgentSdkUsage(options, result, init);
+      recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
       return {
         text: partialLimitText(),
         sessionId: result.session_id,
@@ -1265,7 +1273,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         limitHit: true,
       };
     }
-    recordClaudeAgentSdkUsage(options, result, init);
+    recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
     const resultText = JSON.stringify(result);
     if (isContextOverflowMessage(resultText)) {
       // Overflow arrives as a generic error_during_execution result (no distinct
@@ -1275,7 +1283,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     }
     throw new Error(`Claude Agent SDK failed: ${resultText.slice(0, 800)}`);
   }
-  recordClaudeAgentSdkUsage(options, result, init);
+  recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
   return {
     text: bestSuccessText(result.result, lastAssistantText, streamedText),
     structuredOutput: result.structured_output,
