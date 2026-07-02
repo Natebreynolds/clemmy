@@ -11,7 +11,8 @@ import {
   listConnectedToolkits,
   listAllToolkits,
 } from '../integrations/composio/client.js';
-import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob } from '../integrations/composio/async-job.js';
+import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor } from '../integrations/composio/async-job.js';
+import { parkComposioJob } from '../integrations/composio/job-watcher.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier } from '../memory/tool-choice-store.js';
@@ -731,13 +732,45 @@ async function runComposioExecute(
           } else if (/^run\s+(FAILED|ABORTED|TIMED)/i.test(reason)) {
             // The run TERMINALLY FAILED — do NOT steer her to keep polling a dead run.
             output = `⚠️ The ${receipt.family} run ${receipt.jobId} ${reason.replace(/^run\s+/i, '')} — it did NOT produce results. Do NOT poll it again. Start a FRESH run (re-invoke the actor, optionally with a smaller scope) or report the failure (with the run id) to the user.\n\n${output}`;
-          } else if (reason === 'budget-exceeded') {
-            // Still RUNNING after the (now 4-min) auto-poll window → a genuinely long job.
-            // Steer to backgrounding (which polls + reports back) rather than grinding manual
-            // polls in-chat with no wait primitive (burns the turn budget / risks giving up).
-            output = `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (offer_background / dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
           } else {
-            output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
+            // Not resolved inline: a genuinely-long Apify run (budget-exceeded) or a
+            // family whose result-getter needs a live lookup (DataForSEO/Firecrawl,
+            // reason 'family-not-auto-pollable'). If this family HAS a poll recipe and
+            // we have an origin session to report back to, hand it to the background
+            // job-watcher — it polls deterministically to completion and delivers the
+            // REAL result to this conversation, so the model never grinds manual polls.
+            // Parking is FAIL-OPEN: any miss (flag off, no session, error) keeps the
+            // id-bearing banner (never worse than today).
+            // Park ONLY when the job is genuinely pollable-but-not-inline: a long
+            // Apify run (budget-exceeded, always has its ids) or a family whose
+            // getter needs a live lookup (DataForSEO/Firecrawl → 'family-not-auto-
+            // pollable' WITH a poll recipe). A missing-ids Apify, a transient
+            // poll error, or auto-poll disabled keeps the immediate banner.
+            const hasPollRecipe = Boolean(recipeFor(receipt.family)?.poll);
+            const shouldPark = reason === 'budget-exceeded'
+              || (reason === 'family-not-auto-pollable' && hasPollRecipe);
+            let parked: ReturnType<typeof parkComposioJob> = null;
+            if (sid && shouldPark) {
+              try {
+                parked = parkComposioJob(receipt, {
+                  toolSlug,
+                  connectionId: effectiveConnectionId,
+                  originSessionId: sid,
+                });
+              } catch {
+                parked = null; // fail-open to the banner
+              }
+            }
+            if (parked) {
+              const verb = parked.deduped ? 'is already being watched as' : 'is now handled by';
+              output = `⏳ This ${receipt.family} job (id "${receipt.jobId}") ${verb} background task ${parked.taskId}. The harness will poll it to completion and report the REAL result back to this conversation automatically — do NOT poll it yourself or wait here. Continue with other work; the finished output will arrive as a background-task completion.\n\n${output}`;
+            } else if (reason === 'budget-exceeded') {
+              // No session / parking off — steer to backgrounding rather than grinding
+              // manual polls in-chat with no wait primitive.
+              output = `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (offer_background / dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
+            } else {
+              output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
+            }
           }
         }
       }

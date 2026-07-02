@@ -7,7 +7,20 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectJobReceipt, asyncReceiptBanner, autoPollJob, type JobReceipt } from './async-job.js';
+import {
+  detectJobReceipt,
+  asyncReceiptBanner,
+  autoPollJob,
+  pickDataforseoGetterSlug,
+  pollJobToResolution,
+  checkJobOnce,
+  resolveJobGetter,
+  registerJobFamily,
+  recipeFor,
+  type JobReceipt,
+  type ComposioToolkitTool,
+  type JobFamilyRecipe,
+} from './async-job.js';
 
 // Real DataForSEO TASK_POST envelope (keyword: best coffee austin).
 const DFS_TASK_POST = {
@@ -126,4 +139,169 @@ test('autoPollJob: a non-Apify receipt is never auto-polled (DataForSEO falls ba
   const res = await autoPollJob(dfs, async () => { throw new Error('must not poll'); }, { sleep: async () => {} });
   assert.equal(res.resolved, false);
   assert.match(res.reason ?? '', /family-not-auto-pollable/);
+});
+
+// ── S1: DataForSEO runtime getter discovery ──────────────────────────────────────
+const DFS_BASE = 'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC';
+const tool = (slug: string, inputParameters?: unknown): ComposioToolkitTool => ({ slug, name: slug, inputParameters });
+
+test('pickDataforseoGetterSlug: prefers ADVANCED over REGULAR/GET/HTML', () => {
+  const tools = [
+    tool(`${DFS_BASE}_TASK_GET_HTML`),
+    tool(`${DFS_BASE}_TASK_GET_REGULAR`),
+    tool(`${DFS_BASE}_TASK_GET_ADVANCED`),
+    tool(`${DFS_BASE}_TASK_GET`),
+    tool('DATAFORSEO_UNRELATED_ACTION'),
+  ];
+  assert.equal(pickDataforseoGetterSlug(`${DFS_BASE}_TASK_POST`, tools), `${DFS_BASE}_TASK_GET_ADVANCED`);
+});
+
+test('pickDataforseoGetterSlug: zero candidates → null (never invents a slug)', () => {
+  assert.equal(pickDataforseoGetterSlug(`${DFS_BASE}_TASK_POST`, [tool('DATAFORSEO_SOMETHING_ELSE')]), null);
+  assert.equal(pickDataforseoGetterSlug(`${DFS_BASE}_TASK_POST`, []), null);
+});
+
+test('pickDataforseoGetterSlug: ambiguous unknown variants → null', () => {
+  const tools = [tool(`${DFS_BASE}_TASK_GET_FOO`), tool(`${DFS_BASE}_TASK_GET_BAR`)];
+  assert.equal(pickDataforseoGetterSlug(`${DFS_BASE}_TASK_POST`, tools), null);
+});
+
+test('pickDataforseoGetterSlug: drops a getter whose schema explicitly lacks an id param', () => {
+  const tools = [
+    tool(`${DFS_BASE}_TASK_GET_ADVANCED`, { properties: { keyword: {} } }), // no id → dropped
+    tool(`${DFS_BASE}_TASK_GET_REGULAR`, { properties: { id: {} } }),        // has id → kept
+  ];
+  assert.equal(pickDataforseoGetterSlug(`${DFS_BASE}_TASK_POST`, tools), `${DFS_BASE}_TASK_GET_REGULAR`);
+});
+
+test('resolveJobGetter: DataForSEO discovers the getter via an injected toolkit list', async () => {
+  const dfs = detectJobReceipt(`${DFS_BASE}_TASK_POST`, DFS_TASK_POST)!;
+  const plan = await resolveJobGetter(dfs, async () => { throw new Error('exec unused'); }, {
+    listToolkitTools: async () => [tool(`${DFS_BASE}_TASK_GET_ADVANCED`), tool(`${DFS_BASE}_TASK_GET_REGULAR`)],
+  });
+  assert.equal(plan?.getterSlug, `${DFS_BASE}_TASK_GET_ADVANCED`);
+});
+
+// ── S1: DataForSEO checkOnce + shared-loop poll ───────────────────────────────────
+const dfsReceipt = (): JobReceipt => detectJobReceipt(`${DFS_BASE}_TASK_POST`, DFS_TASK_POST)!;
+const dfsPlan = { getterSlug: `${DFS_BASE}_TASK_GET_ADVANCED` };
+const DFS_GETTER_LIST = async () => [tool(`${DFS_BASE}_TASK_GET_ADVANCED`)];
+
+test('checkJobOnce: DataForSEO done when status_code 20000 + non-null result', async () => {
+  const exec = async (slug: string, args: Record<string, unknown>) => {
+    assert.equal(slug, `${DFS_BASE}_TASK_GET_ADVANCED`);
+    assert.equal(args.id, dfsReceipt().jobId);
+    return { data: { tasks: [{ id: dfsReceipt().jobId, status_code: 20000, result: [{ keyword: 'k', rank: 1 }] }] } };
+  };
+  const check = await checkJobOnce(dfsPlan, dfsReceipt(), exec);
+  assert.equal(check.state, 'done');
+  assert.ok(check.result, 'carries the real payload');
+});
+
+test('checkJobOnce: DataForSEO pending while still queued (20100 / null result)', async () => {
+  const exec = async () => ({ data: { tasks: [{ id: dfsReceipt().jobId, status_code: 20100, result: null }] } });
+  const check = await checkJobOnce(dfsPlan, dfsReceipt(), exec);
+  assert.equal(check.state, 'pending');
+});
+
+test('checkJobOnce: DataForSEO error status_code is terminal-bad', async () => {
+  const exec = async () => ({ data: { tasks: [{ id: dfsReceipt().jobId, status_code: 40501, result: null }] } });
+  const check = await checkJobOnce(dfsPlan, dfsReceipt(), exec);
+  assert.equal(check.state, 'failed');
+  assert.match(check.reason ?? '', /40501/);
+});
+
+test('pollJobToResolution: DataForSEO polled to done returns the real result', async () => {
+  let calls = 0;
+  const exec = async () => {
+    calls += 1;
+    if (calls < 2) return { data: { tasks: [{ id: dfsReceipt().jobId, status_code: 20100, result: null }] } };
+    return { data: { tasks: [{ id: dfsReceipt().jobId, status_code: 20000, result: [{ keyword: 'k' }] }] } };
+  };
+  const res = await pollJobToResolution(dfsReceipt(), exec, { listToolkitTools: DFS_GETTER_LIST, sleep: async () => {} });
+  assert.equal(res.resolved, true);
+  assert.ok(res.result);
+});
+
+test('pollJobToResolution: an unrecognized/never-ready DataForSEO shape falls back at budget', async () => {
+  let t = 0;
+  const exec = async () => ({ data: { weird: 'shape' } }); // no tasks[] → pending forever
+  const res = await pollJobToResolution(dfsReceipt(), exec, {
+    listToolkitTools: DFS_GETTER_LIST,
+    now: () => (t += 30_000),
+    sleep: async () => {},
+  });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /budget-exceeded/);
+});
+
+test('pollJobToResolution: DataForSEO with no discoverable getter falls back (never worse than banner)', async () => {
+  const res = await pollJobToResolution(dfsReceipt(), async () => ({}), { listToolkitTools: async () => [], sleep: async () => {} });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /dataforseo-getter-not-found/);
+});
+
+// ── S1: Firecrawl poll recipe ─────────────────────────────────────────────────────
+const FIRECRAWL_INPROGRESS = { data: { id: 'fc-123', status: 'scraping', data: [] }, successful: true };
+const fcReceipt = (): JobReceipt => detectJobReceipt('FIRECRAWL_CRAWL_URLS', FIRECRAWL_INPROGRESS)!;
+
+test('Firecrawl in-progress crawl is detected as a receipt', () => {
+  const r = fcReceipt();
+  assert.equal(r.family, 'firecrawl');
+  assert.equal(r.jobId, 'fc-123');
+});
+
+test('checkJobOnce: Firecrawl completed → done; failed/cancelled → terminal-bad', async () => {
+  const done = await checkJobOnce({ getterSlug: 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB' }, fcReceipt(),
+    async (slug, args) => {
+      assert.equal(slug, 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB');
+      assert.equal(args.id, 'fc-123');
+      return { data: { status: 'completed', data: [{ markdown: '# p' }] } };
+    });
+  assert.equal(done.state, 'done');
+  assert.ok(done.result);
+
+  const failed = await checkJobOnce({ getterSlug: 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB' }, fcReceipt(),
+    async () => ({ data: { status: 'failed' } }));
+  assert.equal(failed.state, 'failed');
+  assert.match(failed.reason ?? '', /failed/);
+});
+
+// ── S1: one-entry extensibility (a fake 4th family) ───────────────────────────────
+test('registerJobFamily: a 4th family plugs in with one entry (detect + poll)', async () => {
+  const fourth: JobFamilyRecipe = {
+    family: 'fakefam',
+    detect(s, d, slug) {
+      if (!s.startsWith('FAKEFAM')) return null;
+      if (typeof d.job_id === 'string' && d.done !== true) {
+        return { family: 'fakefam', jobId: d.job_id, originSlug: slug, pollGuidance: `poll fake job ${d.job_id}` };
+      }
+      return null;
+    },
+    poll: {
+      inlineAutoResolve: true,
+      unresolvableReason: 'fakefam-unresolvable',
+      async resolveGetter() { return { getterSlug: 'FAKEFAM_GET' }; },
+      async checkOnce(_plan, receipt, exec) {
+        const r = (await exec('FAKEFAM_GET', { id: receipt.jobId })) as { done?: boolean; payload?: unknown };
+        return r.done ? { state: 'done', result: r.payload } : { state: 'pending' };
+      },
+    },
+  };
+  const dispose = registerJobFamily(fourth);
+  try {
+    assert.ok(recipeFor('fakefam'), 'registered');
+    const receipt = detectJobReceipt('FAKEFAM_START_JOB', { data: { job_id: 'f-9', done: false } });
+    assert.ok(receipt, 'detected via the registry');
+    assert.equal(receipt!.family, 'fakefam');
+    // Inline auto-resolve drives the fake family through the SAME shared loop.
+    let n = 0;
+    const exec = async () => (++n >= 2 ? { done: true, payload: { ok: 1 } } : { done: false });
+    const res = await autoPollJob(receipt!, exec, { sleep: async () => {} });
+    assert.equal(res.resolved, true);
+    assert.deepEqual(res.result, { ok: 1 });
+  } finally {
+    dispose();
+  }
+  assert.equal(recipeFor('fakefam'), undefined, 'disposer removed it');
 });

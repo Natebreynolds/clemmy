@@ -19,6 +19,8 @@ import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks,
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
+import { processComposioJobWatchTick } from '../integrations/composio/job-watcher.js';
+import { executeComposioTool } from '../integrations/composio/client.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
@@ -1216,6 +1218,25 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       });
     });
   });
+
+  // Composio background job-watcher: a DETERMINISTIC poller (not an LLM worker) for
+  // queued Composio jobs the tool call-site parked — a genuinely-long Apify scrape,
+  // or a DataForSEO/Firecrawl async job whose result-getter needs a live lookup. Runs
+  // on its OWN 15s timer (like the background drain) so it never waits behind the main
+  // loop; each due record is polled once and its owning background task reports the
+  // REAL result back to the origin session on completion. The exec binds the record's
+  // connectionId (executeComposioTool's 3rd arg). Fail-open.
+  const tickComposioJobs = () => {
+    processComposioJobWatchTick((slug, args, connectionId) => executeComposioTool(slug, args, connectionId))
+      .catch((err) => {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Composio job-watch tick failed',
+        );
+      });
+  };
+  const composioJobTimer = setInterval(tickComposioJobs, 15_000);
+  composioJobTimer.unref?.();
 
   // Workflow watchdog — reports-back safety net. Runs on its OWN timer
   // (not the main loop) precisely because the failure it catches is the
