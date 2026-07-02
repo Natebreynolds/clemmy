@@ -25,6 +25,7 @@ import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { BoardColumn } from '@/components/board/BoardColumn';
 import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
+import { NowStrip } from '@/components/board/NowStrip';
 import {
   listBoard, COLUMNS, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
   type BoardCard, type BoardColumnId, type BoardButtonIntent,
@@ -133,6 +134,10 @@ export function BackgroundTasks() {
           </div>
         </div>
       )}
+
+      {/* Live "running now" rail — rides the telemetry SSE, independent of the
+          board poll, so swarms / tool calls / brain switches show as they happen. */}
+      <NowStrip cards={cards} onOpen={setOpen} />
 
       {board.isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">

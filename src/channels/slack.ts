@@ -28,8 +28,8 @@ import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-ta
 import { queueBackgroundTaskApprovalResolution, listBackgroundTasks, createBackgroundTask } from '../execution/background-tasks.js';
 import { rememberFact, getMemoryHealthSummary } from '../memory/facts.js';
 import { getNotification, markNotificationRead, requeueNotificationDelivery } from '../runtime/notifications.js';
-import { loadCronJobs, loadWorkflows } from '../dashboard/state.js';
-import { getNextRun } from '../shared/cron.js';
+import { buildActivitySnapshot, formatElapsed, formatNextRun, type RunningNowItem } from '../shared/activity-snapshot.js';
+import { actionBus } from '../runtime/action-bus.js';
 
 const logger = pino({ name: 'clementine-next.slack' });
 
@@ -53,6 +53,57 @@ let startPromise: Promise<void> | null = null;
 // Threads we've already named via assistant.threads.setTitle (once per thread;
 // in-memory is fine — the title persists in Slack, this just avoids re-titling).
 const titledThreads = new Set<string>();
+
+// ── App Home live-refresh ────────────────────────────────────────────────────
+// Users who recently opened the Home tab (userId → last-opened ms). The Home
+// view is a persistent command center, so when the daemon finishes work or an
+// approval appears we republish it for these users — a global mechanism, never
+// a hardcoded id. Openers older than the TTL are pruned so we don't push
+// forever to someone who looked once.
+const recentHomeOpeners = new Map<string, number>();
+const HOME_OPENER_TTL_MS = 30 * 60 * 1000;
+// Debounce republishes so a burst of operational events (a swarm finishing)
+// coalesces into one refresh per window instead of hammering views.publish.
+const HOME_REPUBLISH_DEBOUNCE_MS = 45_000;
+let homeRepublishTimer: ReturnType<typeof setTimeout> | null = null;
+// Operational lifecycle events worth a Home refresh.
+const HOME_REFRESH_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'harness_run_completed',
+  'background_task_finished',
+  'approval_required',
+]);
+
+/** Publish the App Home command center for one user. Best-effort; never throws. */
+async function republishHomeFor(userId: string): Promise<void> {
+  if (!slackApp || !userId || !userAllowedSlack(userId)) return;
+  try {
+    await slackApp.client.views.publish({ user_id: userId, view: { type: 'home', blocks: buildAppHomeBlocks() } });
+  } catch (err) {
+    logger.warn({ err }, 'app_home republish failed');
+  }
+}
+
+/** Republish the Home for everyone who opened it within the TTL. Prunes stale openers. */
+async function republishHomeForRecentOpeners(): Promise<void> {
+  const cutoff = Date.now() - HOME_OPENER_TTL_MS;
+  const users: string[] = [];
+  for (const [userId, at] of recentHomeOpeners) {
+    if (at < cutoff) recentHomeOpeners.delete(userId);
+    else users.push(userId);
+  }
+  await Promise.all(users.map((u) => republishHomeFor(u)));
+}
+
+/** Trailing-edge debounced republish — coalesces a burst into one refresh. */
+function scheduleHomeRepublish(): void {
+  if (homeRepublishTimer) return;
+  homeRepublishTimer = setTimeout(() => {
+    homeRepublishTimer = null;
+    void republishHomeForRecentOpeners();
+  }, HOME_REPUBLISH_DEBOUNCE_MS);
+  // Don't keep the process alive just for a Home refresh.
+  if (typeof homeRepublishTimer.unref === 'function') homeRepublishTimer.unref();
+}
 
 /** Recall-sharpened starter prompts for the assistant pane: real active goals +
  *  in-flight tasks first, then evergreen starters. Best-effort; never throws.
@@ -102,7 +153,19 @@ function buildAppHomeBlocks(): KnownBlock[] {
     ...safe(() => listBackgroundTasks({ status: 'awaiting_input' }), []),
     ...safe(() => listBackgroundTasks({ status: 'awaiting_continue' }), []),
   ];
-  const running = safe(() => listBackgroundTasks({ status: 'running' }), []);
+  // Running work + upcoming schedule come from the ONE shared snapshot every
+  // surface consumes, so Slack, Discord, and the dashboard agree on "in flight"
+  // — including mid-turn harness sessions and live worker fan-out, which the old
+  // running-tasks-only gather couldn't see. Fail-open to an empty snapshot.
+  const snapshot = safe(() => buildActivitySnapshot(), {
+    runningNow: [] as RunningNowItem[],
+    upcoming: [] as Array<{ kind: 'cron' | 'workflow'; name: string; nextRunAt: string }>,
+    needsYou: { count: 0 },
+    recentDone: [],
+    counts: { running: 0, needsYou: 0, upcoming: 0, recentDone: 0, doneToday: 0, failed: 0 },
+  });
+  const running = snapshot.runningNow;
+  const upcoming = snapshot.upcoming;
   const recent = (a: { completedAt?: string; updatedAt?: string }, b: { completedAt?: string; updatedAt?: string }) =>
     (b.completedAt ?? b.updatedAt ?? '').localeCompare(a.completedAt ?? a.updatedAt ?? '');
   // Failures the user should SEE (previously invisible) — scoped to the last 14
@@ -122,29 +185,6 @@ function buildAppHomeBlocks(): KnownBlock[] {
   const doneAll = safe(() => listBackgroundTasks({ status: 'done' }).sort(recent), []);
   const goals = safe(() => listActiveGoalContracts(), [] as Array<{ originatingRequest?: string }>);
   const mem = safe(() => getMemoryHealthSummary(), { activeFacts: 0, pinned: 0, byKind: {} as Record<string, number>, newest: null, recallHitRate: null });
-
-  // Upcoming scheduled runs: cron jobs + workflows carrying a schedule, soonest first.
-  const formatNextRun = (iso: string): string => {
-    const ms = Date.parse(iso) - Date.now();
-    if (!Number.isFinite(ms) || ms < 0) return 'soon';
-    const min = Math.round(ms / 60000);
-    if (min < 60) return `in ${Math.max(1, min)}m`;
-    const hr = Math.round(min / 60);
-    if (hr < 24) return `in ${hr}h`;
-    return `in ${Math.round(hr / 24)}d`;
-  };
-  const upcoming = safe(() => {
-    const items: Array<{ name: string; when: string; at: number }> = [];
-    const add = (name: string, schedule: string | undefined, enabled: boolean): void => {
-      if (!enabled || !schedule) return;
-      const iso = getNextRun(schedule);
-      if (!iso) return;
-      items.push({ name, when: formatNextRun(iso), at: Date.parse(iso) });
-    };
-    for (const j of safe(() => loadCronJobs(), [])) add(j.name, j.schedule, j.enabled !== false);
-    for (const w of safe(() => loadWorkflows(), [])) add(w.name, w.trigger?.schedule, w.enabled !== false);
-    return items.sort((a, b) => a.at - b.at);
-  }, [] as Array<{ name: string; when: string; at: number }>);
 
   const needsYou = approvals.length + checkIns.length + goalDrafts.length + plansNeedInput.length + blockedTasks.length;
   const today = new Date().toISOString().slice(0, 10);
@@ -168,7 +208,7 @@ function buildAppHomeBlocks(): KnownBlock[] {
     { type: 'context', elements: [{ type: 'mrkdwn', text:
       `🎯 *${goals.length}* goals   ·   ⚙️ *${running.length}* running   ·   ⏸️ *${needsYou}* waiting on you` }] },
     { type: 'context', elements: [{ type: 'mrkdwn', text:
-      `📊 *${doneToday}* done today   ·   *${running.length}* running${failed.length ? `   ·   ❌ *${failed.length}* failed` : ''}${upcoming.length ? `   ·   ⏰ next ${upcoming[0].when}` : ''}` }] },
+      `📊 *${doneToday}* done today   ·   *${running.length}* running${failed.length ? `   ·   ❌ *${failed.length}* failed` : ''}${upcoming.length ? `   ·   ⏰ next ${formatNextRun(upcoming[0].nextRunAt)}` : ''}` }] },
     { type: 'context', elements: [{ type: 'mrkdwn', text: memBits.join('   ·   ') }] },
     { type: 'context', elements: [{ type: 'mrkdwn', text: '💬 Open the *Messages* tab to talk to me, or type `/clem` anywhere.' }] },
     { type: 'divider' },
@@ -241,8 +281,16 @@ function buildAppHomeBlocks(): KnownBlock[] {
   if (running.length === 0) {
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_Nothing running right now._' } });
   } else {
-    for (const t of running.slice(0, 8)) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `⚙️ ${clip(t.title || 'Task', 160)}  \`running\`` } });
+    for (const item of running.slice(0, 8)) {
+      // kind label + title + compact elapsed + "· N workers" when fanned out +
+      // approval marker — the richer row the snapshot now makes possible.
+      const label = item.kind === 'queued' ? 'queued' : item.kind;
+      const bits: string[] = [`\`${label}\``];
+      const elapsed = formatElapsed(item.elapsedMs);
+      if (elapsed) bits.push(elapsed);
+      if (item.workers && item.workers.active > 0) bits.push(`· ${item.workers.active} worker${item.workers.active === 1 ? '' : 's'}`);
+      if (item.needsApproval) bits.push('⏳ needs approval');
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `⚙️ ${clip(item.title || 'Task', 140)}  ${bits.join('  ')}` } });
     }
   }
 
@@ -251,7 +299,7 @@ function buildAppHomeBlocks(): KnownBlock[] {
     blocks.push({ type: 'divider' });
     blocks.push({ type: 'header', text: { type: 'plain_text', text: `Upcoming (${upcoming.length})`, emoji: true } });
     for (const u of upcoming.slice(0, 5)) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `⏰ ${clip(u.name || 'Scheduled', 120)}  —  *${u.when}*` } });
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `⏰ ${clip(u.name || 'Scheduled', 120)}  —  *${formatNextRun(u.nextRunAt)}*` } });
     }
   }
 
@@ -947,6 +995,11 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
           threadTs: b.message?.thread_ts,
           respondEphemeral,
         });
+        // An approve/reject changes what the Home should show (the approval
+        // leaves "Needs you") — refresh it for the acting user right away.
+        if (b.user?.id && /^clementine:(approve|reject):/.test(actionId)) {
+          void republishHomeFor(b.user.id);
+        }
       } catch (err) {
         logger.error({ err, actionId }, 'Slack action handling failed');
         await respondEphemeral(err instanceof Error ? err.message : String(err));
@@ -979,6 +1032,8 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
       const e = event as { user?: string; tab?: string };
       if (e.tab && e.tab !== 'home') return;
       if (!e.user || !userAllowedSlack(e.user)) return;
+      // Remember this opener so daemon-side lifecycle events can refresh their Home.
+      recentHomeOpeners.set(e.user, Date.now());
       try {
         await client.views.publish({ user_id: e.user, view: { type: 'home', blocks: buildAppHomeBlocks() } });
       } catch (err) {
@@ -1091,6 +1146,15 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
     slackApp = app;
     connected = true;
     startedAt = new Date().toISOString();
+
+    // Keep the persistent App Home fresh: when the daemon finishes a run/task or
+    // raises an approval, debounce-republish the Home for everyone who recently
+    // opened it. Global mechanism (no hardcoded users); best-effort.
+    actionBus.subscribe((busEvent) => {
+      if (busEvent.kind !== 'operational.event') return;
+      if (!HOME_REFRESH_EVENT_TYPES.has(busEvent.event.type)) return;
+      scheduleHomeRepublish();
+    });
     try {
       const auth = await app.client.auth.test();
       botUserId = (auth.user_id as string) ?? '';

@@ -9,7 +9,7 @@
  *    `workflow:<suffix>` sessions), so they poll the run-events endpoint.
  */
 import { useEffect, useState } from 'react';
-import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot } from 'lucide-react';
+import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, Users, GitBranch, RefreshCw, Layers, Upload } from 'lucide-react';
 import { runHarnessStream, humanHarnessText } from '@/lib/chat';
 import { apiGet } from '@/lib/api';
 import { cn } from '@/lib/cn';
@@ -39,6 +39,14 @@ const HARNESS_MILESTONES: Record<string, { label: string; icon: typeof Radio; to
   guardrail_tripped: { label: 'Guardrail', icon: AlertCircle, tone: 'warning' },
   run_failed: { label: 'Failed', icon: AlertCircle, tone: 'danger' },
   conversation_completed: { label: 'Completed', icon: CheckCircle2, tone: 'success' },
+  // Swarm + long-run milestones (already in the SSE pipe — just unmapped).
+  worker_result: { label: 'Worker finished', icon: Users, tone: 'success' },
+  worker_capped: { label: 'Worker hit turn cap', icon: Users, tone: 'warning' },
+  brain_fallover: { label: 'Switched brain', icon: GitBranch, tone: 'warning' },
+  sdk_auto_continue: { label: 'Auto-continued', icon: RefreshCw, tone: 'muted' },
+  sdk_compact_boundary: { label: 'Compacted context', icon: Layers, tone: 'muted' },
+  external_write: { label: 'External write', icon: Upload, tone: 'live' },
+  external_write_orphaned: { label: 'Write timed out — may have landed', icon: AlertCircle, tone: 'warning' },
 };
 
 const WORKFLOW_MILESTONES: Record<string, { label: string; icon: typeof Radio; tone: TraceRow['tone'] }> = {

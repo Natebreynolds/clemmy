@@ -25,6 +25,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 // workflow sessions to drive what shows in the Discord bot status.
 const listPendingHarnessApprovals = approvalRegistry.listPending;
 import { listSessions as listHarnessSessions } from '../runtime/harness/eventlog.js';
+import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import {
   DISCORD_ALLOWED_CHANNELS,
   DISCORD_ALLOWED_USERS,
@@ -1266,6 +1267,27 @@ function renderDiscordStatusForContext(input: {
     userNotifications.some((notification) => notification.id === item.notificationId),
   );
 
+  // Running-now block from the shared snapshot — Discord's status used to show
+  // NO in-flight work (the parity defect vs. the dashboard/Slack). Best-effort.
+  let snapshot: ReturnType<typeof buildActivitySnapshot> | null = null;
+  try { snapshot = buildActivitySnapshot(); } catch { snapshot = null; }
+  const runningLines: string[] = [];
+  if (snapshot) {
+    runningLines.push(`Running now: ${snapshot.counts.running}`);
+    for (const item of snapshot.runningNow.slice(0, 5)) {
+      const bits: string[] = [];
+      const elapsed = formatElapsed(item.elapsedMs);
+      if (elapsed) bits.push(elapsed);
+      if (item.workers && item.workers.active > 0) bits.push(`${item.workers.active}w`);
+      if (item.needsApproval) bits.push('needs approval');
+      const suffix = bits.length ? ` (${bits.join(' · ')})` : '';
+      const title = item.title.length > 70 ? `${item.title.slice(0, 69)}…` : item.title;
+      runningLines.push(`  • ${title}${suffix}`);
+    }
+    if (snapshot.counts.upcoming > 0) runningLines.push(`Upcoming scheduled: ${snapshot.counts.upcoming}`);
+    runningLines.push(`Waiting on someone: ${snapshot.needsYou.count}`);
+  }
+
   return [
     `Discord status: ${discordStatus.connected ? 'connected' : 'disconnected'}`,
     `Bot: ${discordStatus.userTag ?? 'unknown'}`,
@@ -1273,6 +1295,7 @@ function renderDiscordStatusForContext(input: {
     `Your pending approvals: ${ownedApprovals.length}`,
     `Your notifications: ${userNotifications.filter((item) => !item.read).length} unread / ${userNotifications.length} total`,
     `Your queued deliveries: ${queuedForUser.length}`,
+    ...runningLines,
   ].join('\n');
 }
 
@@ -1808,6 +1831,26 @@ function applyLivePresence(client: Client): void {
       client.user.setPresence({
         status: 'online',
         activities: [{ name: `${base}${elapsedStr}`, type: ActivityType.Watching }],
+      });
+      return;
+    }
+  } catch { /* fall through */ }
+
+  // Priority 2.5 — any other running work (background tasks + mid-turn harness
+  // sessions) surfaced from the shared snapshot. Discord presence previously
+  // ignored this entirely, so a busy daemon looked idle. Counts come from the
+  // one snapshot every surface shares.
+  try {
+    const snapshot = buildActivitySnapshot();
+    const runningCount = snapshot.counts.running;
+    if (runningCount > 0) {
+      const top = snapshot.runningNow[0];
+      const label = top?.title
+        ? `${top.title.length > 84 ? `${top.title.slice(0, 83)}…` : top.title}${runningCount > 1 ? ` +${runningCount - 1}` : ''}`
+        : `${runningCount} task${runningCount === 1 ? '' : 's'}`;
+      client.user.setPresence({
+        status: 'online',
+        activities: [{ name: label, type: ActivityType.Watching }],
       });
       return;
     }

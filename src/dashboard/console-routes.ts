@@ -214,6 +214,7 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { isHarnessSessionCurrentlyWorking } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
@@ -701,22 +702,10 @@ function harnessSessionSourceLabel(session: HarnessSessionRow): string {
   return session.channel || session.kind;
 }
 
-function isHarnessTerminalEvent(type: HarnessEventRow['type']): boolean {
-  return type === 'conversation_completed'
-    || type === 'run_completed'
-    || type === 'run_failed'
-    || type === 'approval_requested'
-    || type === 'awaiting_user_input';
-}
-
-function isHarnessSessionCurrentlyWorking(session: HarnessSessionRow, activeWindowCutoff: number): boolean {
-  if (session.status !== 'active') return false;
-  const updatedMs = Date.parse(session.updatedAt);
-  if (!Number.isFinite(updatedMs) || updatedMs < activeWindowCutoff) return false;
-  const latest = listHarnessEvents(session.id, { limit: 1, desc: true })[0];
-  if (!latest) return false;
-  return !isHarnessTerminalEvent(latest.type);
-}
+// isHarnessSessionCurrentlyWorking (+ its terminal-event helper) moved to
+// src/shared/activity-snapshot.ts so the command center, Slack, and Discord
+// share one definition of "mid-turn right now". Imported above; behavior is
+// identical (status='active' + fresh non-terminal event within the window).
 
 const ACTIVE_WORK_SESSION_PAGE_SIZE = 500;
 

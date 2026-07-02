@@ -26,7 +26,7 @@ export interface OperationalEvent {
   payload: Record<string, unknown>;
 }
 
-export const OPERATIONAL_SOURCES = ['workflow', 'model', 'workspace', 'memory', 'safety', 'tool'] as const;
+export const OPERATIONAL_SOURCES = ['workflow', 'model', 'workspace', 'memory', 'safety', 'tool', 'harness', 'scheduler'] as const;
 export type OperationalSource = (typeof OPERATIONAL_SOURCES)[number];
 
 export interface TelemetryQuery {
