@@ -922,7 +922,13 @@ test('full mode: narration retry kill-switch off ⇒ no retry', async () => {
   process.env.CLEMMY_CLAUDE_SDK_NARRATION_RETRY = 'off';
   let runs = 0;
   setClaudeAgentSdkBrainRunForTest(async () => { runs += 1; return { text: 'Tool:run_shell_command\n\nfunction\n{"command":"x"}', sessionId: 's', toolUses: [] }; });
-  await respondViaClaudeAgentSdkBrain('home', { message: 'do it', sessionId: 'brain-narrate-off' });
+  // New contract (live 2026-07-01 Discord calendar): a narration give-up THROWS a
+  // typed error so the bridge can fall the turn over to the other brain (zero
+  // tools ran ⇒ safe re-run). The error message carries the graceful fallback copy.
+  await assert.rejects(
+    respondViaClaudeAgentSdkBrain('home', { message: 'do it', sessionId: 'brain-narrate-off' }),
+    (err: Error) => err.name === 'ClaudeSdkNarrationGiveUpError' && /did not go through as a real tool call/.test(err.message),
+  );
   assert.equal(runs, 1, 'no retry when the kill-switch is off');
 });
 

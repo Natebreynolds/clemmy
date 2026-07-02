@@ -330,6 +330,18 @@ function maxTurns(): number {
   return Number.isFinite(raw) && raw >= 1 ? raw : 24;
 }
 
+/** The SDK brain's final reply was SHAPED like a printed tool call with zero
+ *  real tool uses and the retry corrective didn't fix it — a dead turn unless
+ *  another brain takes it. Zero side effects by definition ⇒ safe to re-run.
+ *  message carries the graceful user-facing fallback copy. */
+export class ClaudeSdkNarrationGiveUpError extends Error {
+  readonly narrationGiveUp = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'ClaudeSdkNarrationGiveUpError';
+  }
+}
+
 /** A2 reduced-context retry: drop the query-recall block from a turn context.
  *  Recall is re-derivable (the model can search memory); constraints, session
  *  actions (the double-send guard) and continuation context are NOT — keep them. */
@@ -1170,7 +1182,18 @@ export async function respondViaClaudeAgentSdkBrain(
   // the self-reinforcing loop). Replace with a neutral, honest fallback. Only when no real tool
   // fired (a legitimate summary that mentions a tool is fine).
   if (!result.limitHit && result.toolUses.length === 0 && looksLikeToolCallShape(text)) {
-    text = 'I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.';
+    // SELF-HEAL, not apology (live 2026-07-01 Discord calendar): a narration
+    // give-up means ZERO tools ran, so re-dispatching the whole turn on the
+    // OTHER brain is side-effect-safe — throw a typed error so the bridge's
+    // cross-brain fallover completes the ask for real. The bridge falls back
+    // to this error's graceful message when fallover is off/unavailable.
+    markRunInFlight(sessionId, false);
+    try {
+      appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'narration_giveup_fallover', preview: text.slice(0, 120) } });
+    } catch { /* telemetry best-effort */ }
+    throw new ClaudeSdkNarrationGiveUpError(
+      'I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.',
+    );
   }
   // Deliver only the missing final chunk. If the exact final already streamed,
   // avoid a double-render. If a judge/retry replaced the answer, append the

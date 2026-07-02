@@ -487,6 +487,12 @@ export async function respondPreferHarness(
     } catch (err) {
       const recovered = await recoverChatBrainFailure(surface, request, err, detach);
       if (recovered) return recovered;
+      // Narration give-up with no fallover available: the error's message IS the
+      // graceful user-facing copy — ship it as a normal reply, never a raw error
+      // (zero tools ran; there is nothing to report as failed).
+      if (err instanceof Error && (err as { narrationGiveUp?: boolean }).narrationGiveUp === true) {
+        return { text: err.message } as AssistantResponse;
+      }
       throw err;
     } finally {
       detach();

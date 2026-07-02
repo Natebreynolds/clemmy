@@ -620,3 +620,20 @@ test('isChatBrainFalloverEligible: ANY genuine Claude-brain failure switches bra
     if (prev === undefined) delete process.env.CLEMMY_BRAIN_FALLOVER; else process.env.CLEMMY_BRAIN_FALLOVER = prev;
   }
 });
+
+test('narration give-up is fallover-eligible; without fallover it ships the graceful copy, never a raw error', async () => {
+  const { ClaudeSdkNarrationGiveUpError } = await import('./claude-agent-brain.js');
+  const err = new ClaudeSdkNarrationGiveUpError('I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.');
+  // Eligible for the cross-brain re-run (zero tools ran ⇒ side-effect-safe).
+  assert.equal(isChatBrainFalloverEligible(err), true);
+  // And the bridge's catch converts it to a graceful reply when fallover is unavailable
+  // (kill-switch off ⇒ recoverChatBrainFailure returns null ⇒ text floor).
+  process.env.CLEMMY_BRAIN_FALLOVER = 'off';
+  try {
+    assert.equal(isChatBrainFalloverEligible(err), false, 'fallover disabled');
+    assert.equal((err as { narrationGiveUp?: boolean }).narrationGiveUp, true, 'floor marker present for the bridge catch');
+    assert.match(err.message, /did not go through as a real tool call/);
+  } finally {
+    delete process.env.CLEMMY_BRAIN_FALLOVER;
+  }
+});
