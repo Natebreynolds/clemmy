@@ -466,6 +466,14 @@ function buildDiscordRestTransport(channelId: string) {
     async sendError(content: string) {
       await sendDiscordRestChunks(channelId, content);
     },
+    // Post overflow / post-token-expiry parts as fresh messages in the same
+    // REST channel. Without this the harness's finalFlush drops every chunk
+    // past the first (it guards on `transport.sendFollowup`), so replies over
+    // ~1900 chars lost their tail on the DM-polling path. sendDiscordRestChunks
+    // splits on paragraph/word boundaries, same as the initial send.
+    async sendFollowup(content: string) {
+      await sendDiscordRestChunks(channelId, content);
+    },
   };
 }
 
@@ -952,18 +960,21 @@ function renderCombinedApprovalList(
 }
 
 function renderApprovalCardContent(approval: PendingApproval): string {
+  // No session / id line: the Approve/Edit/Reject buttons carry the id in
+  // their custom_ids, so surfacing the raw uuid to the user was noise that
+  // made the card read like debug output.
   return [
     `🔐 **Approval needed — ${approval.toolName}**`,
     summarizeApprovalAction(approval),
-    `_session ${approval.sessionId} · id \`${approval.id.slice(0, 8)}\`_`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 function renderHarnessApprovalCardContent(approval: approvalRegistry.PendingApprovalRow): string {
+  // See renderApprovalCardContent: ids live in the button custom_ids, not the
+  // user-facing text.
   return [
     `🔐 **Approval needed — ${approval.subject}**`,
     approval.tool ? approval.tool : '',
-    `_session ${approval.sessionId} · id \`${approval.approvalId}\`_`,
   ].filter(Boolean).join('\n');
 }
 
@@ -1300,9 +1311,15 @@ function renderDiscordStatusForContext(input: {
 }
 
 function approvalResultText(result: ApprovalResolutionResult): string {
+  // Human copy, not `Approval approved: <uuid>` — the raw id read like debug
+  // output and told the user nothing. The id stays where it's functional
+  // (button custom_ids / the resume plumbing), out of the user-facing text.
+  const headline = result.status === 'approved'
+    ? 'Approved — continuing the run.'
+    : 'Rejected — stopping that action.';
   return [
-    `Approval ${result.status}: \`${result.approvalId}\``,
-    result.nextApprovalId ? `Next approval pending: \`${result.nextApprovalId}\`` : '',
+    headline,
+    result.nextApprovalId ? 'Another approval is still pending — I’ll surface it next.' : '',
     '',
     result.text,
   ].filter(Boolean).join('\n');
@@ -1409,6 +1426,10 @@ async function continueDiscordSessionFromButton(input: {
 export const __test__ = {
   continueDiscordSessionFromButton,
   renderGatewayTail,
+  renderApprovalCardContent,
+  renderHarnessApprovalCardContent,
+  approvalResultText,
+  buildDiscordRestTransport,
 };
 
 async function handleDiscordCommand(message: Message<boolean>, assistant: ClementineAssistant, prompt: string): Promise<boolean> {

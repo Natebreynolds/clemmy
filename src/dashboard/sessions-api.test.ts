@@ -116,6 +116,33 @@ test('detail returns turns and the right continueHint per store', () => {
   assert.equal(wfDetail!.continueHint, null);
 });
 
+test('detail hides synthetic outcome turns but keeps real user + assistant turns (workflow run)', () => {
+  const step = createSession({
+    kind: 'workflow',
+    channel: 'workflow',
+    title: 'Report Flow::only',
+    metadata: { source: 'workflow', workflowName: 'Report Flow', workflowRunId: 'run-synthetic', stepId: 'only' },
+  });
+  appendEvent({ sessionId: step.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'kick off the report' } });
+  // Synthetic report-back injected by runtime/outcome.ts — must not render as a user bubble.
+  appendEvent({
+    sessionId: step.id,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: '[workflow run run-synthetic completed] Report Flow\n\nDone.', synthetic: true, source: 'outcome' },
+  });
+  appendEvent({ sessionId: step.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Report is ready.' } });
+
+  const detail = getUnifiedSessionDetail(`harness:${step.id}`);
+  assert.ok(detail);
+  assert.deepEqual(
+    detail!.turns.map((t) => `${t.role}:${t.text}`),
+    ['user:kick off the report', 'assistant:Report is ready.'],
+    'synthetic turn hidden; real user turn + assistant reply render',
+  );
+});
+
 test('detail returns null for unknown / malformed ids', () => {
   assert.equal(getUnifiedSessionDetail('desktop:nope'), null);
   assert.equal(getUnifiedSessionDetail('harness:nope'), null);

@@ -263,12 +263,12 @@ function bumpAndReschedule(record: ComposioJobRecord, now: number, message: stri
   });
 }
 
-/** Count items in a terminal result for the done summary (best-effort). */
-function countItems(result: unknown): number | null {
+/** The first array of items nested in a terminal result (best-effort). */
+function firstItemArray(result: unknown): unknown[] | null {
   const seen: unknown[] = [result];
   for (let i = 0; i < seen.length && i < 6; i += 1) {
     const v = seen[i];
-    if (Array.isArray(v)) return v.length;
+    if (Array.isArray(v)) return v;
     if (v && typeof v === 'object') {
       const o = v as Record<string, unknown>;
       for (const key of ['items', 'data', 'results', 'records', 'tasks']) {
@@ -277,6 +277,12 @@ function countItems(result: unknown): number | null {
     }
   }
   return null;
+}
+
+/** Count items in a terminal result for the done summary (best-effort). */
+function countItems(result: unknown): number | null {
+  const items = firstItemArray(result);
+  return items ? items.length : null;
 }
 
 function doneSummary(record: ComposioJobRecord, result: unknown): string {
@@ -289,6 +295,53 @@ function doneSummary(record: ComposioJobRecord, result: unknown): string {
     body = String(result);
   }
   return `The Composio ${record.family} job ${record.jobId} finished — this is the real result.${countNote}\n\n${body}`;
+}
+
+/** Clip a single field value so a preview line stays short. */
+function clipField(value: string): string {
+  const v = value.trim().replace(/\s+/g, ' ');
+  return v.length > 80 ? `${v.slice(0, 79)}…` : v;
+}
+
+/** A short, readable one-liner for a single result item (best-effort). Picks up
+ *  to 3 string/number fields from an object; strings/numbers stand alone. */
+function readableItemLine(item: unknown): string {
+  if (item == null) return '';
+  if (typeof item === 'string') return clipField(item);
+  if (typeof item === 'number' || typeof item === 'boolean') return String(item);
+  if (typeof item !== 'object') return '';
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(item as Record<string, unknown>)) {
+    if (parts.length >= 3) break;
+    if (typeof value === 'string' && value.trim()) parts.push(`${key}: ${clipField(value)}`);
+    else if (typeof value === 'number' || typeof value === 'boolean') parts.push(`${key}: ${value}`);
+  }
+  return parts.join(' · ');
+}
+
+/**
+ * The HUMAN-facing completion notification for a Composio job: a conversational
+ * sentence plus up to 3 readable preview lines derived from the items — NOT the
+ * raw JSON. The full JSON stays in the model-facing `result` (doneSummary).
+ * Best-effort: any gap degrades to just the sentence.
+ */
+export function humanJobNotification(record: ComposioJobRecord, result: unknown): string {
+  const n = countItems(result);
+  const head = n !== null
+    ? `Your ${record.family} job finished — ${n} item${n === 1 ? '' : 's'} retrieved.`
+    : `Your ${record.family} job finished.`;
+  let preview: string[] = [];
+  try {
+    const items = firstItemArray(result) ?? [];
+    for (const item of items) {
+      if (preview.length >= 3) break;
+      const line = readableItemLine(item);
+      if (line) preview.push(`- ${line}`);
+    }
+  } catch {
+    preview = [];
+  }
+  return preview.length ? `${head}\n\n${preview.join('\n')}` : head;
 }
 
 function deadlineGuidance(record: ComposioJobRecord): string {
@@ -384,7 +437,11 @@ export async function processComposioJobWatchTick(
     }
 
     if (check.state === 'done') {
-      markBackgroundTaskDone(record.taskId, doneSummary(record, check.result));
+      markBackgroundTaskDone(
+        record.taskId,
+        doneSummary(record, check.result),
+        { notificationBody: humanJobNotification(record, check.result) },
+      );
       deleteRecord(record);
       continue;
     }

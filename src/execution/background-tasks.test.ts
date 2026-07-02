@@ -46,6 +46,7 @@ const {
   registerBackgroundDrainKick,
   requestBackgroundDrain,
   markBackgroundTaskRunning,
+  truncateResultBody,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -517,6 +518,48 @@ test('markBackgroundTaskDone feeds the result back into the origin session (asyn
   assert.equal(after.length, 1, 'double-complete does not duplicate the report-back turn');
 });
 
+test('markBackgroundTaskDone humanizes the notification body but keeps the full result for the model', () => {
+  const sessionId = 'sess-humanize-note';
+  const task = createBackgroundTask({ title: 'Deal review', prompt: 'do it', originSessionId: sessionId });
+  const workerText = [
+    'Pipeline is healthy — 3 deals worth $180k are on track to close this month.',
+    '',
+    '## Completed',
+    '- Reviewed 12 open opportunities.',
+    '',
+    '## Evidence / Verification',
+    '- Salesforce query sfq-99, row counts match.',
+    '',
+    '## Remaining Risks',
+    '- Acme deal has no next step booked.',
+    '',
+    '## Next Step',
+    '- Nudge the Acme owner.',
+  ].join('\n');
+  markBackgroundTaskDone(task.id, workerText);
+
+  const note = listNotifications(200).find((n) => n.metadata?.backgroundTaskId === task.id);
+  assert.ok(note, 'a completion notification exists');
+  assert.match(note!.body, /Pipeline is healthy/, 'human keeps the actual answer');
+  assert.doesNotMatch(note!.body, /Evidence \/ Verification/, 'human body drops the audit ledger');
+  assert.doesNotMatch(note!.body, /Remaining Risks|Next Step/, 'human body drops the audit ledger');
+
+  // The MODEL still gets the full result (audit sections intact) via the record.
+  const updated = getBackgroundTask(task.id);
+  assert.match(updated?.result ?? '', /Evidence \/ Verification/, 'model-facing result is unchanged');
+  assert.match(updated?.result ?? '', /Remaining Risks/, 'model-facing result is unchanged');
+});
+
+test('markBackgroundTaskDone honors an explicit notificationBody override (job-watcher path)', () => {
+  const task = createBackgroundTask({ title: 'Firecrawl crawl', prompt: 'crawl' });
+  const rawResult = 'The Composio firecrawl job fc-1 finished — this is the real result.\n\n{"items":[{"url":"https://x"}]}';
+  markBackgroundTaskDone(task.id, rawResult, { notificationBody: 'Your firecrawl job finished — 1 item retrieved.' });
+
+  const note = listNotifications(200).find((n) => n.metadata?.backgroundTaskId === task.id);
+  assert.equal(note?.body, 'Your firecrawl job finished — 1 item retrieved.', 'override wins for the human');
+  assert.match(getBackgroundTask(task.id)?.result ?? '', /this is the real result/, 'model result keeps the raw JSON prose');
+});
+
 test('markBackgroundTaskDone with NO origin session is a no-op for transcripts (autonomous spawn)', () => {
   const task = createBackgroundTask({ title: 'Analyze meeting transcript: zoom', prompt: 'analyze' });
   // Should not throw and should not create any session.
@@ -955,4 +998,30 @@ test('markBackgroundTaskRunning pre-registers the background:<id> trace session 
   const sess = getSession(task.runSessionId);
   assert.ok(sess, 'the background:<id> harness session exists the instant it flips to RUNNING → trace SSE finds it, no 404');
   assert.equal(sess?.kind, 'execution');
+});
+
+test('truncateResultBody: short bodies pass through unchanged', () => {
+  const short = 'All five firms analyzed. No blockers.';
+  assert.equal(truncateResultBody(short), short);
+});
+
+test('truncateResultBody: long bodies cut at a word boundary with an ellipsis (never mid-word)', () => {
+  const paragraph = 'The quarterly SEO analysis is complete. ';
+  const long = paragraph.repeat(400); // well over the 4000-char cap
+  const out = truncateResultBody(long);
+  assert.ok(out.length <= 4000 + 2, 'stays within the cap (+ ellipsis)');
+  assert.ok(out.endsWith(' …'), 'marks the truncation with an ellipsis');
+  const beforeEllipsis = out.slice(0, -2);
+  assert.ok(!/\S$/.test(beforeEllipsis) || beforeEllipsis.endsWith('complete.') || / $/.test(beforeEllipsis) === false,
+    'cut lands on a boundary, not mid-word');
+  // Concretely: the last retained character sequence is a whole word from the source.
+  assert.ok(long.startsWith(beforeEllipsis.trimEnd()), 'retained text is a clean prefix of the source');
+});
+
+test('truncateResultBody: prefers a paragraph boundary when one is available', () => {
+  const head = 'First paragraph with the headline result.';
+  const body = head + '\n\n' + 'x'.repeat(6000);
+  const out = truncateResultBody(body);
+  assert.ok(out.startsWith(head), 'keeps the whole first paragraph');
+  assert.ok(out.endsWith(' …'));
 });

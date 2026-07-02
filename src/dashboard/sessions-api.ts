@@ -283,6 +283,9 @@ function harnessSearchText(summary: UnifiedSessionSummary): string {
 
 function workflowEventTurn(event: HarnessEventRow): (UnifiedSessionTurn & { seq: number }) | null {
   if (event.type === 'user_input_received') {
+    // Synthetic user turns (outcome relays / report-back directives from
+    // runtime/outcome.ts) are machine input — never render them as user bubbles.
+    if (event.data.synthetic === true) return null;
     const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
     return text ? { role: 'user', text, createdAt: event.createdAt, seq: event.seq } : null;
   }

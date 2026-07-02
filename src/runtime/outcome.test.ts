@@ -127,9 +127,12 @@ test('deliverOutcome: harness origins receive report-back in eventlog, not a des
     .filter((event) => typeof event.data?.text === 'string' && event.data.text.startsWith('[background task bg-h1 '));
   assert.equal(reports.length, 1);
   assert.match(String(reports[0].data.text), /completed]/);
+  assert.equal(reports[0].data.synthetic, true, 'the report-back is flagged synthetic (machine input)');
 
+  // The report-back reaches the MODEL via the eventlog (asserted above), but is
+  // HIDDEN from the USER-facing transcript — a synthetic turn is not a user bubble.
   const transcript = reconstructHarnessTranscript(sessionId).map((t) => t.text);
-  assert.ok(transcript.some((text) => text.startsWith('[background task bg-h1 completed]')));
+  assert.ok(!transcript.some((text) => text.startsWith('[background task bg-h1 completed]')), 'synthetic report-back is not rendered as a user turn');
 
   assert.equal(deliverOutcome(
     { status: 'done', summary: 'counted 9 files again' },

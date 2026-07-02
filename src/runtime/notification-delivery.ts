@@ -7,6 +7,7 @@ import {
   sendDiscordChannelMessageWithComponents,
   sendDiscordDirectMessage,
 } from '../channels/discord.js';
+import { toDiscordMarkdown } from '../channels/discord-harness.js';
 import {
   buildSlackActionsForNotification,
   sendSlackChannelMessage,
@@ -129,6 +130,48 @@ function shouldDeliverSlackNotification(notification: NotificationRecord): boole
   return shouldDeliverBotNotification(notification, 'slackInlineHandled');
 }
 
+// Terminal report-backs — a finished run's output — are the notifications that
+// must LAND somewhere the user actually sees. Workflow + cron notifications
+// exist only to report a completed run; background-task completion/failure
+// carry the actual result. (The mid-run background lifecycle pings are already
+// suppressed by shouldDeliverBotNotification.) Title-prefix matching mirrors
+// the idiom that gate already uses.
+const TERMINAL_EXECUTION_TITLE_PREFIXES = [
+  'background task completed:',
+  'background task failed:',
+  'background task aborted:',
+  'background task interrupted:',
+];
+
+function isTerminalReportBack(notification: NotificationRecord): boolean {
+  if (notification.kind === 'workflow' || notification.kind === 'cron') return true;
+  if (notification.kind === 'execution') {
+    const title = notification.title.trim().toLowerCase();
+    return TERMINAL_EXECUTION_TITLE_PREFIXES.some((prefix) => title.startsWith(prefix));
+  }
+  return false;
+}
+
+// Decide which thread (if any) a Slack channel delivery should post into.
+// Slack IM (direct-message) channel ids start with 'D'. A terminal report-back
+// that originated in a Slack assistant-pane DM carries that pane's thread_ts;
+// threading a completion back into the now-stale pane buries it in "hidden
+// history" — no unread badge, only findable by scrolling the pane. For IM
+// channels we DROP the stale thread so the result lands as a fresh top-level
+// DM in the Messages surface. Real channels ('C'/'G') keep the thread — there
+// the thread IS the ongoing conversation, and mid-run approvals (which resume
+// off a threaded reply) still thread correctly everywhere.
+function slackThreadForDelivery(
+  notification: NotificationRecord,
+  destination: NotificationDestination,
+): string | undefined {
+  const threadTs = destination.threadTs;
+  if (!threadTs) return undefined;
+  const isImChannel = (destination.channelId ?? '').startsWith('D');
+  if (isImChannel && isTerminalReportBack(notification)) return undefined;
+  return threadTs;
+}
+
 function buildDiscordComponentsForNotification(notification: NotificationRecord) {
   if (notification.kind !== 'approval') return undefined;
   return buildActionsForNotification(notification.metadata);
@@ -231,13 +274,14 @@ export async function deliverNotificationToDestination(
     }
     if (!shouldDeliverSlackNotification(notification)) return;
     const blocks = buildSlackBlocksForNotification(notification);
+    const threadTs = slackThreadForDelivery(notification, destination);
     if (blocks && blocks.length > 0) {
       await sendSlackChannelMessageWithBlocks(destination.channelId, buildSlackBotMessage(notification), blocks, {
-        threadTs: destination.threadTs,
+        threadTs,
       });
     } else {
       await sendSlackChannelMessage(destination.channelId, buildSlackBotMessage(notification), {
-        threadTs: destination.threadTs,
+        threadTs,
       });
     }
     return;
@@ -270,7 +314,9 @@ export async function deliverNotificationToDestination(
     // (i/N) labels on multi-part messages so the user knows there's
     // more coming.
     const header = `**${notification.title}**`;
-    const chunks = splitForDiscord(`${header}\n${notification.body}`);
+    // Same GFM→Discord adaptation as the bot path (buildDiscordBotMessage) so a
+    // table/deep-header body doesn't arrive as raw pipes over a webhook either.
+    const chunks = splitForDiscord(toDiscordMarkdown(`${header}\n${notification.body}`));
     const total = chunks.length;
     for (let i = 0; i < total; i++) {
       const label = total > 1 ? ` *(${i + 1}/${total})*` : '';
@@ -307,7 +353,10 @@ export async function deliverNotificationToDestination(
  */
 function buildDiscordBotMessage(notification: NotificationRecord): string {
   const header = `**${notification.title}**`;
-  return `${header}\n${notification.body}`;
+  // Adapt GFM tables / deep headers / horizontal rules into the subset
+  // Discord actually renders, so a report body doesn't arrive looking like
+  // raw test output (bold title is left intact by the pass).
+  return toDiscordMarkdown(`${header}\n${notification.body}`);
 }
 
 export async function testNotificationDestination(destination: NotificationDestination): Promise<void> {
@@ -331,4 +380,7 @@ export async function testNotificationDestination(destination: NotificationDesti
 export const notificationDeliveryInternalsForTest = {
   buildDiscordComponentsForNotification,
   shouldDeliverDiscordNotification,
+  isTerminalReportBack,
+  slackThreadForDelivery,
+  buildDiscordBotMessage,
 };

@@ -25,9 +25,15 @@ const {
   parkComposioJob,
   processComposioJobWatchTick,
   composioBgDeferEnabled,
+  humanJobNotification,
 } = await import('./job-watcher.js');
 const { getBackgroundTask, listBackgroundTasks, updateBackgroundTask } = await import('../../execution/background-tasks.js');
+const { listNotifications } = await import('../../runtime/notifications.js');
 import type { JobReceipt } from './async-job.js';
+import type { ComposioJobRecord } from './job-watcher.js';
+
+const rec = (over: Partial<ComposioJobRecord> = {}): ComposioJobRecord =>
+  ({ family: 'firecrawl', jobId: 'j-1', ...over } as ComposioJobRecord);
 
 function jobFiles(): string[] {
   return existsSync(JOB_DIR) ? readdirSync(JOB_DIR).filter((f) => f.endsWith('.json')) : [];
@@ -79,6 +85,38 @@ test('tick: a completed job marks the task DONE and deletes the record', async (
   assert.equal(task!.status, 'done');
   assert.match(task!.result ?? '', /2 items/, 'done summary reports the item count');
   assert.ok(!jobFiles().some((f) => f.startsWith('firecrawl-fc-done')), 'record deleted on terminal');
+
+  // The HUMAN notification is conversational, not the raw JSON dump.
+  const note = listNotifications(200).find((n) => n.metadata?.backgroundTaskId === parked!.taskId);
+  assert.ok(note, 'completion notification exists');
+  assert.match(note!.body, /Your firecrawl job finished — 2 items retrieved\./, 'conversational sentence');
+  assert.doesNotMatch(note!.body, /[{}]/, 'no raw JSON in the human body');
+});
+
+test('humanJobNotification: sentence + up to 3 readable preview lines from object items', () => {
+  const result = {
+    items: [
+      { url: 'https://acme.example/pricing', title: 'Pricing', wordCount: 812 },
+      { url: 'https://acme.example/about', title: 'About Us' },
+      { url: 'https://acme.example/blog', title: 'Blog' },
+      { url: 'https://acme.example/contact', title: 'Contact' },
+    ],
+  };
+  const body = humanJobNotification(rec({ family: 'firecrawl' }), result);
+  assert.match(body, /^Your firecrawl job finished — 4 items retrieved\./);
+  const lines = body.split('\n').filter((l) => l.startsWith('- '));
+  assert.equal(lines.length, 3, 'caps the preview at 3 lines');
+  assert.match(lines[0], /url: https:\/\/acme\.example\/pricing/);
+  assert.match(lines[0], /title: Pricing/);
+  assert.doesNotMatch(body, /[{}]/, 'no raw JSON');
+});
+
+test('humanJobNotification: degrades to just the sentence when items are not readable', () => {
+  assert.equal(humanJobNotification(rec({ family: 'apify' }), 'not-an-array'), 'Your apify job finished.');
+  assert.equal(
+    humanJobNotification(rec({ family: 'dataforseo' }), { data: [] }),
+    'Your dataforseo job finished — 0 items retrieved.',
+  );
 });
 
 test('tick: a terminally-failed job marks the task FAILED and deletes the record', async () => {

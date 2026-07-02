@@ -1081,6 +1081,8 @@ export const __test__ = {
   globalApprovalRowsForDm,
   isDiscordTokenExpired,
   maybeRouteParkedBackgroundReply,
+  renderBody,
+  renderFullBody,
   renderSessionPickerText,
   sessionPickerComponents,
   /** Inject a fresh channel→session mapping (Step 5 typed-plan-approval tests). */
@@ -1544,10 +1546,32 @@ function renderBody(state: DisplayState): string {
   const ctx = typeof state.contextPct === 'number' && state.contextPct > 30
     ? ` · ctx ${Math.min(99, Math.round(state.contextPct))}%`
     : '';
-  const body = elapsed
+  const status = elapsed
     ? `_${verb} · ${elapsed}${counter}${ctx}_`
     : `_${verb}${counter}${ctx}_`;
+  // While the reply is streaming in (onChunk fills state.summary before the
+  // turn is done), show a TAIL of it below the status line so the user
+  // watches the answer form — mirrors how Slack's assistant pane streams.
+  // Without this, every long run looked identical to a stuck one: just the
+  // one-line "working…" status. The status line stays on top as the live
+  // "still going" signal.
+  const tail = streamingTail(state.summary);
+  const body = tail ? `${status}\n\n${tail}` : status;
   return body.length > MAX_DISCORD_MESSAGE ? body.slice(0, MAX_DISCORD_MESSAGE - 1) + '…' : body;
+}
+
+// The most recent slice of the streaming reply, capped so status + tail stay
+// comfortably under the per-message limit. Cuts at a word boundary and marks
+// the dropped head with a leading ellipsis so it reads as "…forming reply".
+const STREAM_TAIL_CHARS = 1_500;
+function streamingTail(summary: string): string {
+  const trimmed = (summary ?? '').trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= STREAM_TAIL_CHARS) return trimmed;
+  const tail = trimmed.slice(trimmed.length - STREAM_TAIL_CHARS);
+  const firstSpace = tail.indexOf(' ');
+  const clean = firstSpace > 0 && firstSpace < 40 ? tail.slice(firstSpace + 1) : tail;
+  return `…${clean}`;
 }
 
 /** Human-friendly "Ns" / "Nm Ms" / "Nh Mm" elapsed time. Returns
@@ -1630,6 +1654,87 @@ function humanHarnessText(value: unknown, fallback = ''): string {
   return text;
 }
 
+// ── Discord markdown adaptation ────────────────────────────────────────────
+// Discord's markdown is a SUBSET of the GitHub-flavored markdown the harness
+// emits: it renders #/##/### headers, *italic*, **bold**, lists, and code
+// blocks — but NOT pipe tables (they show as raw `| a | b |` lines), NOT
+// #### and deeper headers (they render literally), and NOT `---` horizontal
+// rules. This pass adapts those three shapes so a reply that leans on tables
+// or deep headers reads clean instead of "like test output". Sibling of
+// slack-harness.ts:toSlackMrkdwn. Pure + fail-open — any surprise returns the
+// input untouched so a formatting quirk can never block a reply.
+const DISCORD_TABLE_GUTTER = '  ';
+
+function isTableSeparatorLine(line: string): boolean {
+  const t = line.trim();
+  if (!t.includes('-')) return false;
+  // A GFM header/body divider: cells of dashes with optional alignment colons,
+  // separated by pipes (outer pipes optional).
+  return /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$/.test(t);
+}
+
+function splitTableRow(line: string): string[] {
+  let t = line.trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|')) t = t.slice(0, -1);
+  return t.split('|').map((cell) => cell.trim());
+}
+
+function renderAlignedTable(header: string[], rows: string[][]): string {
+  const cols = Math.max(header.length, ...rows.map((r) => r.length));
+  const widths: number[] = [];
+  for (let c = 0; c < cols; c++) {
+    let w = (header[c] ?? '').length;
+    for (const r of rows) w = Math.max(w, (r[c] ?? '').length);
+    widths[c] = w;
+  }
+  const padRow = (cells: string[]): string => {
+    const parts: string[] = [];
+    for (let c = 0; c < cols; c++) parts.push((cells[c] ?? '').padEnd(widths[c]));
+    return parts.join(DISCORD_TABLE_GUTTER).trimEnd();
+  };
+  const out = [padRow(header), widths.map((w) => '-'.repeat(w)).join(DISCORD_TABLE_GUTTER)];
+  for (const r of rows) out.push(padRow(r));
+  // A fenced code block preserves the monospace alignment in Discord.
+  return '```\n' + out.join('\n') + '\n```';
+}
+
+function convertPipeTablesToCodeBlocks(text: string): string {
+  const lines = text.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const next = lines[i + 1];
+    if (line.includes('|') && next !== undefined && isTableSeparatorLine(next)) {
+      const header = splitTableRow(line);
+      const rows: string[][] = [];
+      let j = i + 2;
+      for (; j < lines.length; j++) {
+        if (lines[j].trim() === '' || !lines[j].includes('|')) break;
+        rows.push(splitTableRow(lines[j]));
+      }
+      out.push(renderAlignedTable(header, rows));
+      i = j - 1;
+    } else {
+      out.push(line);
+    }
+  }
+  return out.join('\n');
+}
+
+export function toDiscordMarkdown(text: string): string {
+  if (!text) return text;
+  try {
+    return convertPipeTablesToCodeBlocks(text)
+      // #### heading (and deeper) → **bold** (Discord only renders #/##/###).
+      .replace(/^#{4,6}\s+(.+)$/gm, '**$1**')
+      // Horizontal rules (---, ***, ___ on their own line) → drop the line.
+      .replace(/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/gm, '');
+  } catch {
+    return text;
+  }
+}
+
 /**
  * Final-message renderer — no truncation. Used by finalFlush when the
  * conversation reaches a terminal state. The caller pairs this with
@@ -1643,7 +1748,11 @@ function humanHarnessText(value: unknown, fallback = ''): string {
  * summary.
  */
 function renderFullBody(state: DisplayState): string {
-  const head = state.summary ? `> ${state.summary}\n\n` : '';
+  // Plain text, not a `> ` blockquote: Discord only blockquotes the FIRST
+  // line, so a multi-line reply rendered as a quote looked broken (line 1
+  // greyed, the rest normal). Run the reply through toDiscordMarkdown so
+  // GFM tables / deep headers land in a shape Discord actually renders.
+  const head = state.summary ? `${toDiscordMarkdown(state.summary)}\n\n` : '';
   let activity = '';
   if (!state.done) {
     const lines: string[] = [];

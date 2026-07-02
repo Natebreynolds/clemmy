@@ -56,6 +56,10 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
   const turns: UnifiedSessionTurn[] = [];
   for (const event of events) {
     if (event.type === 'user_input_received') {
+      // Skip synthetic user turns (outcome relays / report-back directives from
+      // runtime/outcome.ts). The user never typed them, so they must not render
+      // as user bubbles — the model-facing history keeps them.
+      if (event.data.synthetic === true) continue;
       const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
       if (text) turns.push({ role: 'user', text, createdAt: event.createdAt });
     } else if (event.type === 'conversation_completed') {

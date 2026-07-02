@@ -12,6 +12,7 @@ import pino from 'pino';
 import { BASE_DIR, MODELS } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
 import { deliverOutcome } from '../runtime/outcome.js';
+import { humanizeReportBody } from '../runtime/report-voice.js';
 import { getGoalPinForDelegation } from '../agents/plan-proposals.js';
 import { ExecutionStore } from './store.js';
 import type { AssistantResponse, RunStoppedReason } from '../types.js';
@@ -250,6 +251,29 @@ function makeTaskId(now = new Date()): string {
 
 function clean(value: string, maxChars: number): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+/**
+ * Bound a result preview for the completion notification body — cutting at a
+ * paragraph/sentence/word boundary (never mid-word) and marking the cut with
+ * an ellipsis. The raw `.slice(0, N)` chopped mid-word and read like broken
+ * output. Newlines are preserved (unlike `clean`) so a multi-paragraph report
+ * keeps its shape. The full result is saved to disk (writeFullResultFile) and
+ * the channel splitters fan long bodies across messages, so this is purely a
+ * clean preview cap.
+ */
+export function truncateResultBody(result: string, max = RESULT_TRUNCATE_CHARS): string {
+  if (result.length <= max) return result;
+  const window = result.slice(0, max);
+  let cut = window.lastIndexOf('\n\n');
+  if (cut < max / 2) cut = window.lastIndexOf('\n');
+  if (cut < max / 2) {
+    const sentence = Math.max(window.lastIndexOf('. '), window.lastIndexOf('? '), window.lastIndexOf('! '));
+    if (sentence > max / 2) cut = sentence + 1;
+  }
+  if (cut < max / 2) cut = window.lastIndexOf(' ');
+  if (cut < max / 2) cut = max;
+  return result.slice(0, cut).trimEnd() + ' …';
 }
 
 function taskFilePath(id: string): string {
@@ -698,7 +722,11 @@ function enqueueBackgroundTaskOutcomeTurn(
   );
 }
 
-export function markBackgroundTaskDone(id: string, result: string): BackgroundTaskRecord | null {
+export function markBackgroundTaskDone(
+  id: string,
+  result: string,
+  opts?: { notificationBody?: string },
+): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task) return null;
   const resultPath = writeFullResultFile(task, result);
@@ -711,11 +739,16 @@ export function markBackgroundTaskDone(id: string, result: string): BackgroundTa
     error: undefined,
   });
   if (updated) {
+    // The HUMAN sees a conversational body: a caller-supplied one when the raw
+    // result is machine-shaped (e.g. the job-watcher's JSON), otherwise the
+    // worker's text with its audit ledger stripped. The MODEL still gets the
+    // full `result` (result file + `enqueueBackgroundTaskOutcomeTurn` below).
+    const notificationBody = opts?.notificationBody ?? humanizeReportBody(result);
     addNotification({
       id: `${Date.now()}-background-${updated.id}-done`,
       kind: 'execution',
       title: `Background task completed: ${updated.title}`,
-      body: result.slice(0, 2000),
+      body: truncateResultBody(notificationBody),
       createdAt: nowIso(),
       read: false,
       metadata: taskNotificationMetadata(updated),

@@ -285,8 +285,30 @@ function maybeScheduleProactiveReport(sessionId: string, outcome: Outcome, ctx: 
       // step-boundary fallover as a normal chat turn so a transient on that
       // brain doesn't drop the report. Best-effort; absent = today's behavior.
       const fallover = buildChatFalloverWiring({ userInput: directive, sessionId, buildAgent: buildOrchestratorAgent });
+      // Record the machine directive as a SYNTHETIC user turn (same flags the
+      // passive outcome turn above carries) so the desktop transcript never
+      // shows "Relay the outcome to the user NOW…" as if the user typed it —
+      // the user-facing read paths skip data.synthetic. The model still
+      // receives the directive via runConversation's `input`; passing
+      // reuseRecordedUserInput stops the loop from re-logging it as a plain
+      // (un-flagged) user turn. Best-effort — the surrounding catch covers it.
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'user',
+        type: 'user_input_received',
+        data: {
+          text: directive,
+          synthetic: true,
+          source: 'outcome',
+          sourceLabel: ctx.sourceLabel,
+          sourceId: ctx.sourceId,
+          status: outcome.status,
+        },
+      });
       await runConversation({
         agent, sessionId, input: directive, judgeCompletion: false,
+        reuseRecordedUserInput: true,
         falloverModelIds: fallover.falloverModelIds,
         rebuildAgentForBrain: fallover.rebuildAgentForBrain,
       });

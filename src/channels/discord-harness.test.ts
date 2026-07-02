@@ -18,6 +18,7 @@ import {
   isContinueCompletionReason,
   parseApprovalIntent,
   parseHarnessCommand,
+  toDiscordMarkdown,
   __test__,
 } from './discord-harness.js';
 import type { PendingApprovalRow } from '../runtime/harness/approval-registry.js';
@@ -524,4 +525,79 @@ test('isDiscordTokenExpired: unrelated errors are NOT misclassified', () => {
   assert.equal(__test__.isDiscordTokenExpired(null), false);
   assert.equal(__test__.isDiscordTokenExpired(undefined), false);
   assert.equal(__test__.isDiscordTokenExpired('plain string error'), false);
+});
+
+// ── Discord rendering: final reply is plain text, not a broken blockquote ──
+test('renderFullBody: multi-line reply is plain text (no `> ` blockquote)', () => {
+  const state = { ...freshState(), done: true, summary: 'Line one\nLine two\nLine three' };
+  const body = __test__.renderFullBody(state);
+  assert.ok(!body.startsWith('> '), 'reply must not be blockquoted');
+  assert.ok(!body.includes('\n> '), 'no interior blockquote markers either');
+  assert.ok(body.includes('Line two') && body.includes('Line three'), 'all lines survive');
+});
+
+test('renderFullBody: adapts a GFM table in the final reply', () => {
+  const summary = 'Results:\n\n| A | B |\n| --- | --- |\n| 1 | 22 |';
+  const state = { ...freshState(), done: true, summary };
+  const body = __test__.renderFullBody(state);
+  assert.match(body, /```/, 'table wrapped in a code block');
+  assert.ok(!/\| --- \|/.test(body), 'no raw GFM separator row');
+});
+
+// ── Discord rendering: streamed reply is visible while the turn runs ──
+test('renderBody: while streaming, shows a tail of the reply below the status line', () => {
+  const state = { ...freshState(), done: false, status: 'drafting', summary: 'The answer is forming nicely.' };
+  const body = __test__.renderBody(state);
+  assert.match(body, /drafting/, 'status line still present');
+  assert.match(body, /The answer is forming nicely\./, 'streamed reply is shown');
+});
+
+test('renderBody: long streaming reply is tail-clipped with a leading ellipsis', () => {
+  const long = 'x'.repeat(50) + ' ' + 'END-OF-REPLY-MARKER '.repeat(200);
+  const state = { ...freshState(), done: false, status: 'working', summary: long };
+  const body = __test__.renderBody(state);
+  assert.ok(body.length <= 1_900, 'body stays under the Discord per-message cap');
+  assert.match(body, /…/, 'leading ellipsis marks the clipped head');
+  assert.match(body, /END-OF-REPLY-MARKER/, 'the most recent text is what survives');
+});
+
+test('renderBody: done state is unchanged — just the summary, no status line', () => {
+  const state = { ...freshState(), done: true, summary: 'final answer' };
+  assert.equal(__test__.renderBody(state), 'final answer');
+});
+
+// ── toDiscordMarkdown: adapt GFM to the subset Discord renders ──
+test('toDiscordMarkdown: pipe table → aligned code block', () => {
+  const md = '| Col | Score |\n| --- | --- |\n| Acme | 12 |\n| Beta | 340 |';
+  const out = toDiscordMarkdown(md);
+  assert.ok(out.startsWith('```') && out.trimEnd().endsWith('```'), 'wrapped in a fenced code block');
+  assert.ok(!out.includes('| --- |'), 'GFM separator row removed');
+  // "Col" (3) pads to col width 4, plus the 2-space gutter ⇒ 3 spaces.
+  assert.match(out, /Col {3}Score/, 'header padded to the widest cell');
+  assert.match(out, /Beta {2}340/, 'rows aligned');
+});
+
+test('toDiscordMarkdown: table without outer pipes still converts', () => {
+  const md = 'A | B\n--- | ---\n1 | 2';
+  const out = toDiscordMarkdown(md);
+  assert.match(out, /```/);
+  assert.ok(!out.includes('--- | ---'));
+});
+
+test('toDiscordMarkdown: #### and deeper headers demote to bold; #/##/### kept', () => {
+  assert.equal(toDiscordMarkdown('#### Deep'), '**Deep**');
+  assert.equal(toDiscordMarkdown('##### Deeper'), '**Deeper**');
+  assert.equal(toDiscordMarkdown('### Kept'), '### Kept');
+});
+
+test('toDiscordMarkdown: horizontal rules are stripped', () => {
+  // The rule line plus its surrounding blank lines collapse cleanly.
+  assert.equal(toDiscordMarkdown('above\n\n---\n\nbelow'), 'above\n\nbelow');
+  assert.equal(toDiscordMarkdown('***'), '');
+});
+
+test('toDiscordMarkdown: plain prose and empty input pass through untouched', () => {
+  assert.equal(toDiscordMarkdown('just a normal **bold** line with a [link](https://x)'),
+    'just a normal **bold** line with a [link](https://x)');
+  assert.equal(toDiscordMarkdown(''), '');
 });
