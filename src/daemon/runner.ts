@@ -20,6 +20,7 @@ import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRu
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { processComposioJobWatchTick } from '../integrations/composio/job-watcher.js';
+import { runRoutePolicyJob } from '../runtime/harness/route-policy.js';
 import { executeComposioTool } from '../integrations/composio/client.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
@@ -1237,6 +1238,26 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   };
   const composioJobTimer = setInterval(tickComposioJobs, 15_000);
   composioJobTimer.unref?.();
+
+  // Adaptive route policy — the periodic OFFLINE learning job (Phase E). Groups
+  // recent route outcomes by (role, intent, model), scores them with the
+  // existing scorer, and rebuilds model_route_policy. The hot path only READS
+  // the table (resolveRoleModel, kill-switch CLEMMY_ROUTE_POLICY); this tick is
+  // observe-only bookkeeping and always runs. Hourly + once shortly after boot
+  // so a fresh install has scores as soon as it has outcomes. Never throws.
+  const tickRoutePolicy = () => {
+    const result = runRoutePolicyJob();
+    if (result) {
+      logger.info(
+        { policyVersion: result.policyVersion, rows: result.rowsWritten, windowDays: result.windowDays },
+        'route-policy job rebuilt model_route_policy',
+      );
+    }
+  };
+  const routePolicyBootTimer = setTimeout(tickRoutePolicy, 90_000);
+  routePolicyBootTimer.unref?.();
+  const routePolicyTimer = setInterval(tickRoutePolicy, 60 * 60_000);
+  routePolicyTimer.unref?.();
 
   // Workflow watchdog — reports-back safety net. Runs on its OWN timer
   // (not the main loop) precisely because the failure it catches is the

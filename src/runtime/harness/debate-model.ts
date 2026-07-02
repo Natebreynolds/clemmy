@@ -44,6 +44,8 @@ import { resolveByoProviderForModel } from './byo-providers.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import { resolveRoleModel, codexSafeFast, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
+import { resolveProvider } from './model-wire-registry.js';
+import { recordModelRouteDecision, recordModelRouteOutcome } from '../model-route-metrics.js';
 import {
   claudeAvailable,
   codexAvailable,
@@ -1505,6 +1507,28 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
     });
   } catch {
     /* operational mirror is best-effort */
+  }
+  // Route-outcome capture (adaptive routing evidence): one decision+outcome per
+  // judge pass so the policy job scores JUDGE models too. Latency is not cleanly
+  // attributable at this seam and is omitted (the scorer tolerates missing
+  // fields). Fail-open.
+  try {
+    const judgeModel = typeof rec.judge === 'string' && rec.judge ? rec.judge : resolveRoleModel('judge').modelId;
+    const outcome = typeof rec.outcome === 'string' ? rec.outcome : 'reconciled';
+    const decisionId = recordModelRouteDecision({
+      sessionId: harnessRunContextStorage.getStore()?.sessionId,
+      role: 'judge',
+      resolvedModel: judgeModel,
+      provider: resolveProvider(judgeModel),
+      source: 'default',
+      reason: { seam: rec.path === 'verify' ? 'verify_checker' : 'debate', outcome },
+    });
+    recordModelRouteOutcome({
+      decisionId,
+      status: /failed|timeout/i.test(outcome) ? 'failed' : 'success',
+    });
+  } catch {
+    /* metrics must never affect a judge pass */
   }
   try {
     const p = debateTracePath();

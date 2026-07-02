@@ -8,6 +8,8 @@ import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/model-route-metrics.js';
+import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { textResult } from './shared.js';
 
 /**
@@ -104,13 +106,38 @@ export function registerWorkerTools(server: McpServer): void {
           payload: { item: input.item, model: workerModel, lane: 'sdk_brain' },
         });
       } catch { /* telemetry is best-effort */ }
+      // Route-outcome capture (adaptive routing evidence): one decision+outcome
+      // pair per worker run so the policy job scores WORKER models, not just the
+      // brain. Fail-open — metrics must never fail a worker.
+      const routeStartedAt = Date.now();
+      const routeDecisionId = recordModelRouteDecision({
+        sessionId,
+        role: 'worker',
+        intent: input.intent || undefined,
+        resolvedModel: workerModel,
+        provider: resolveProvider(workerModel),
+        source: 'default',
+        reason: { lane: 'sdk_brain', item: input.item },
+      });
       try {
         const result = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
         const ok = !/^\s*ERROR:/i.test(result.text ?? '');
         recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel);
+        recordModelRouteOutcome({
+          decisionId: routeDecisionId,
+          status: ok ? 'success' : 'failed',
+          latencyMs: Date.now() - routeStartedAt,
+          toolSuccess: ok,
+        });
         return textResult(result.text);
       } catch (err) {
         recordResult(false, firstLine(err), workerModel);
+        recordModelRouteOutcome({
+          decisionId: routeDecisionId,
+          status: 'failed',
+          latencyMs: Date.now() - routeStartedAt,
+          errorClass: err instanceof Error ? err.name : typeof err,
+        });
         return textResult(`ERROR: worker for "${input.item}" failed: ${firstLine(err)}`);
       } finally {
         release();

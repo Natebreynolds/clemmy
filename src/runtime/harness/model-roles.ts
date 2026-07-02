@@ -35,6 +35,7 @@ import {
   DEFAULT_CODEX_MODEL,
 } from '../../config.js';
 import { validateRoleModelBinding } from './model-role-options.js';
+import { pickRoutePolicyModel } from './route-policy.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
 import {
@@ -73,11 +74,13 @@ export interface InactiveRoleBinding {
 export interface ResolvedRoleModel {
   modelId: string;
   provider: ModelProviderClass;
-  source: 'default' | 'settings' | 'chat-rule' | 'session';
+  source: 'default' | 'settings' | 'chat-rule' | 'session' | 'policy';
   inactiveBinding?: InactiveRoleBinding;
   /** The binding's free-form intent slug that matched this resolution (set only
    *  when an intent-scoped binding won) — drives the routing trace + hit/miss. */
   matchedIntent?: string;
+  /** Set when the learned route policy won: the evidence behind the pick. */
+  policy?: { score: number; defaultScore: number; sampleCount: number; policyVersion: number };
 }
 
 /** Kill-switch. off ⇒ resolveRoleModel returns ONLY the provider-derived default
@@ -278,6 +281,38 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
     if (!firstInvalid) firstInvalid = { match, reason: v.reason };
   }
   const modelId = defaultForRole(role);
+  // Learned route policy — consulted ONLY when no explicit binding matched
+  // (user bindings always win), bounded by min-samples/floor/hysteresis inside
+  // pickRoutePolicyModel, and live-validated exactly like a binding. Empty
+  // policy table / kill-switch off ⇒ falls through byte-identically.
+  try {
+    const pick = pickRoutePolicyModel(role, querySlug || undefined, modelId,
+      (candidateId) => validateRoleModelBinding(role, candidateId).ok);
+    if (pick) {
+      return {
+        modelId: pick.modelId,
+        provider: resolveProvider(pick.modelId),
+        source: 'policy',
+        ...(querySlug ? { matchedIntent: querySlug } : {}),
+        policy: {
+          score: pick.score,
+          defaultScore: pick.defaultScore,
+          sampleCount: pick.sampleCount,
+          policyVersion: pick.policyVersion,
+        },
+        ...(firstInvalid
+          ? {
+              inactiveBinding: {
+                modelId: firstInvalid.match.modelId,
+                provider: resolveProvider(firstInvalid.match.modelId),
+                source: firstInvalid.match.source,
+                reason: firstInvalid.reason,
+              },
+            }
+          : {}),
+      };
+    }
+  } catch { /* the policy read must never break resolution */ }
   return firstInvalid
     ? {
         modelId,

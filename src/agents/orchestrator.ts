@@ -36,6 +36,8 @@ import { buildWorkerJobPrompt, resolveWorkerMaxTurns, WorkerToolInputSchema, typ
 import { workerItemAlreadyCapped } from './worker-respawn-guard.js';
 import { acquireWorkerSlot } from './worker-concurrency.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
+import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -810,11 +812,44 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // Move 5: durable per-worker completion record — restart-surviving coverage
       // + spend for a long 100-subagent run (the in-memory fanout ledger is lost
       // on a daemon restart). Best-effort; never blocks fan-out.
-      const appendWorkerResult = (data: { item: string; ok: boolean; model?: string | null; toolUses?: string[]; tokens?: number; reason?: string }): void => {
+      const workerRouteStartedAt = Date.now();
+      const appendWorkerResult = (data: { item: string; ok: boolean; model?: string | null; toolUses?: string[]; tokens?: number; reason?: string; preRun?: boolean }): void => {
         if (!sessionId) return;
+        const { preRun, ...eventData } = data;
         try {
-          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...data, toolCallId } });
+          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, toolCallId } });
         } catch { /* durable trace is best-effort */ }
+        // Route-outcome capture (adaptive routing evidence): score WORKER models,
+        // not just the brain. Skipped for pre-run refusals (respawn guard) — those
+        // are not the model's outcome. Fail-open.
+        if (preRun) return;
+        try {
+          const ranModel = data.model || workerModel;
+          const traceSource = route.trace?.source;
+          const source: ModelRouteDecisionSource = traceSource === 'default' || !traceSource
+            ? 'default'
+            : traceSource === 'policy'
+              ? 'policy'
+              : route.trace?.matchedIntent
+                ? 'intent_binding'
+                : 'binding';
+          const decisionId = recordModelRouteDecision({
+            sessionId,
+            role: 'worker',
+            intent: input.intent || undefined,
+            resolvedModel: ranModel,
+            provider: resolveProvider(ranModel),
+            source,
+            reason: { lane: 'orchestrator', item: input.item },
+          });
+          recordModelRouteOutcome({
+            decisionId,
+            status: data.ok ? 'success' : 'failed',
+            latencyMs: Date.now() - workerRouteStartedAt,
+            totalTokens: data.tokens,
+            toolSuccess: data.ok,
+          });
+        } catch { /* metrics must never block fan-out */ }
       };
       const workerResultReason = (value: unknown): string => {
         const raw = value instanceof Error ? value.message : typeof value === 'string' ? value : String(value ?? '');
@@ -851,7 +886,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // guard; workerItemAlreadyCapped is fail-open so it can never block fan-out.
       if (workerThrashGuardEnabled() && sessionId && workerItemAlreadyCapped(sessionId, input.item)) {
         const message = `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
-        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message) });
+        appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
         return message;
       }
       if (claudeAgentSdkWorkerEnabled(workerModel)) {

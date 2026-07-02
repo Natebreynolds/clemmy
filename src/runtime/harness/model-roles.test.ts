@@ -361,3 +361,96 @@ test('codexSafeFast: a genuine all_in BYO brain KEEPS the BYO fast slot (intende
     assert.equal(codexSafeFast(), 'glm-5.2', 'when the user really is on BYO, the fast slot is what they intend');
   });
 });
+
+test('route policy: empty policy table ⇒ resolveRoleModel is byte-identical to static defaults', async () => {
+  const { resetModelRouteMetricsForTest } = await import('../model-route-metrics.js');
+  const { clearRoutePolicyCache } = await import('./route-policy.js');
+  resetModelRouteMetricsForTest();
+  clearRoutePolicyCache();
+  withEnv({ CLEMMY_MODEL_ROLES: undefined }, () => {
+    const r = resolveRoleModel('worker');
+    assert.equal(r.source, 'default');
+    assert.equal(r.modelId, defaultForRole('worker'));
+    assert.equal(r.policy, undefined);
+  });
+});
+
+test('route policy: a measured winner overrides the default with source=policy; kill-switch restores static', async () => {
+  const { resetModelRouteMetricsForTest, recordModelRouteDecision, recordModelRouteOutcome } = await import('../model-route-metrics.js');
+  const { runRoutePolicyJob, clearRoutePolicyCache } = await import('./route-policy.js');
+  resetModelRouteMetricsForTest();
+  clearRoutePolicyCache();
+
+  const NOW = new Date('2026-07-01T12:00:00.000Z');
+  const seed = (model: string, n: number, successRate: number): void => {
+    for (let i = 0; i < n; i++) {
+      const id = recordModelRouteDecision({ role: 'worker', resolvedModel: model, provider: 'claude', source: 'default', now: NOW });
+      recordModelRouteOutcome({ decisionId: id, status: i < Math.round(n * successRate) ? 'success' : 'failed', latencyMs: 1000, now: NOW });
+    }
+  };
+
+  // The binding validator only accepts models on a CONNECTED backend — seed the
+  // Clementine Claude sign-in into the isolated test home (same shape the SDK
+  // tests use) so claude-* ids count as available.
+  const { writeFileSync: wf, mkdirSync: mkd } = await import('node:fs');
+  const stateDir = path.join(process.env.CLEMENTINE_HOME as string, 'state');
+  mkd(stateDir, { recursive: true });
+  wf(path.join(stateDir, 'claude-auth.json'), JSON.stringify({
+    accessToken: 'sk-ant-oat01-model-roles-test',
+    refreshToken: 'refresh',
+    expiresAt: Date.now() + 60 * 60 * 1000,
+    scopes: ['user:inference'],
+  }), 'utf-8');
+  withEnv({ CLEMMY_MODEL_ROLES: undefined, AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, () => {
+    const staticDefault = defaultForRole('worker');
+    // The default is measured WEAK; a validated alternative is measured STRONG.
+    // Use a real Claude model id so validateRoleModelBinding accepts it.
+    seed(staticDefault, 12, 0.4);
+    seed('claude-sonnet-5', 12, 1);
+    runRoutePolicyJob({ now: NOW });
+    clearRoutePolicyCache();
+
+    const r = resolveRoleModel('worker');
+    assert.equal(r.source, 'policy', 'learned policy won');
+    assert.equal(r.modelId, 'claude-sonnet-5');
+    assert.ok(r.policy && r.policy.score > r.policy.defaultScore);
+
+    // Kill-switch off ⇒ static default again (instant reversibility).
+    withEnv({ CLEMMY_ROUTE_POLICY: 'off' }, () => {
+      const off = resolveRoleModel('worker');
+      assert.equal(off.source, 'default');
+      assert.equal(off.modelId, staticDefault);
+    });
+  });
+  resetModelRouteMetricsForTest();
+  clearRoutePolicyCache();
+});
+
+test('route policy: an explicit user binding ALWAYS beats the learned policy', async () => {
+  const { resetModelRouteMetricsForTest, recordModelRouteDecision, recordModelRouteOutcome } = await import('../model-route-metrics.js');
+  const { runRoutePolicyJob, clearRoutePolicyCache } = await import('./route-policy.js');
+  resetModelRouteMetricsForTest();
+  clearRoutePolicyCache();
+
+  const NOW = new Date('2026-07-01T12:00:00.000Z');
+  withEnv({ AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, () => {
+    const staticDefault = defaultForRole('worker');
+    for (const [model, rate] of [[staticDefault, 0.4], ['claude-sonnet-5', 1]] as const) {
+      for (let i = 0; i < 12; i++) {
+        const id = recordModelRouteDecision({ role: 'worker', resolvedModel: model, provider: 'claude', source: 'default', now: NOW });
+        recordModelRouteOutcome({ decisionId: id, status: i < Math.round(12 * rate) ? 'success' : 'failed', now: NOW });
+      }
+    }
+    runRoutePolicyJob({ now: NOW });
+    clearRoutePolicyCache();
+
+    const binding = JSON.stringify([{ role: 'worker', modelId: 'claude-opus-4-8', scope: 'durable', source: 'settings' }]);
+    withEnv({ CLEMMY_MODEL_ROLES: binding }, () => {
+      const r = resolveRoleModel('worker');
+      assert.equal(r.source, 'settings', 'the user binding wins over the policy');
+      assert.equal(r.modelId, 'claude-opus-4-8');
+    });
+  });
+  resetModelRouteMetricsForTest();
+  clearRoutePolicyCache();
+});
