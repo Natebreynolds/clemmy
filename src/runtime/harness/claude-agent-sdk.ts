@@ -953,6 +953,12 @@ function bestSuccessText(resultText: string | undefined, lastAssistantText: stri
 
 export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Promise<ClaudeAgentSdkRunResult> {
   const env = await buildClaudeHeadlessEnv();
+  // The local MCP server imports the whole harness (~13s cold boot measured on
+  // the packaged app; worse under load) — the CLI's default MCP startup window
+  // is ~30s, and missing it silently strips ALL local tools from the turn (the
+  // live 2026-07-01 'only SEO tools' incidents). Give startup a real budget;
+  // per-call timeouts still come from the server config's own `timeout`.
+  if (!env.MCP_TIMEOUT) env.MCP_TIMEOUT = '120000';
   const allowed = options.allowedLocalMcpTools ?? defaultClaudeAgentSdkAllowedLocalTools();
   // Agentic lane requires a session id (the gate chain + approval read/write the
   // session's event log). Without one, fall back to the read-only allowlist.

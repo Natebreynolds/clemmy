@@ -1248,3 +1248,16 @@ test('overflow A2: committed overflow with ZERO external writes falls through to
   assert.equal(calls, 2, 'reduced retry ran instead of dying unsalvaged');
   assert.match(res.text, /finished after retry/);
 });
+
+test('brain runOptions demand the local-MCP sentinel so tool starvation throws instead of running blind', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  let seen: string[] | undefined;
+  setClaudeAgentSdkBrainRunForTest(async (opts: any) => {
+    seen = opts.requiredLocalMcpTools;
+    return { text: 'ok', toolUses: [] };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
+  await respondViaClaudeAgentSdkBrain('home', { message: 'hi', sessionId: 'sentinel-check' });
+  assert.deepEqual(seen, ['memory_recall'], 'local-server sentinel demanded on every brain run');
+});

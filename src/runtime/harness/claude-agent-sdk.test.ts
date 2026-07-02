@@ -933,3 +933,13 @@ test('runClaudeAgentSdk surfaces SDK compaction signals + context-window health 
   assert.equal((usage[0] as any).contextWindowTokens, 200_000);
   assert.equal((usage[0] as any).windowUtilization, 0.5);
 });
+
+test('SDK child env gets a real MCP startup window (local server cold boot > default 30s under load)', async () => {
+  const capture: { call?: any } = {};
+  setClaudeAgentSdkQueryForTest(((params: any) => { capture.call = params; return queryFromMessages([
+    { type: 'system', subtype: 'init', model: 'claude-opus-4-8', session_id: 's', uuid: 'u', apiKeySource: 'none', claude_code_version: '2.1.181', cwd: process.cwd(), tools: [], mcp_servers: [], permissionMode: 'dontAsk', slash_commands: [], output_style: 'default', skills: [], plugins: [] } as any,
+    { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: 'ok', duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] } as any,
+  ], {}); }) as any);
+  await runClaudeAgentSdk({ prompt: 'hi', sessionId: 'mcp-timeout-check' });
+  assert.equal(capture.call.options.env.MCP_TIMEOUT, '120000');
+});

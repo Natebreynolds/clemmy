@@ -869,6 +869,13 @@ export async function respondViaClaudeAgentSdkBrain(
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
     agentic: mode === 'full',
+    // TOOL-STARVATION GUARD (live 2026-07-01: the local MCP server's ~13s cold
+    // boot intermittently missed the CLI's startup window under load — the brain
+    // then ran with ONLY external MCP tools and narrated/refused local actions,
+    // silently). If the local server didn't attach, these sentinels are absent
+    // from the SDK init → typed ClaudeAgentSdkToolSurfaceError → the bridge's
+    // cross-brain fallover completes the turn on Codex instead of a blind run.
+    requiredLocalMcpTools: ['memory_recall'],
     // Scope the native external MCP servers to THIS turn's intent (the user's message)
     // so the Claude brain reaches native capabilities (dataforseo, browsermcp, …) like
     // the Codex lane, without attaching all of them.
