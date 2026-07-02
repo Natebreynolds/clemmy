@@ -334,3 +334,24 @@ test('NEVER STARVE: pruning still engages for a genuinely large surface that exc
     assert.ok(sel.exposed.has('cx_tool_7'), 'the most relevant tool is retrieved');
   });
 });
+
+test('background-dispatch intent pins the background task tools past a worst-case JIT prune', async () => {
+  const tools: JitTool[] = [
+    ...CORE_SAMPLE.map((name) => ({ name, description: `desc for ${name}` })),
+    { name: 'dispatch_background_task', description: 'Dispatch work to a background task' },
+    { name: 'background_task_status', description: 'Check a background task' },
+    { name: 'background_tasks_recent', description: 'List recent background tasks' },
+    ...Array.from({ length: 220 }, (_, i) => ({ name: `filler_${i}`, description: `Filler tool ${i} for crowding` })),
+  ];
+  await withEnv({ CLEMMY_TOOL_JIT_BUDGET_TOKENS: '200' }, async () => {
+    const zeroRank: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
+    const sel = await selectToolsForTurn({
+      tools,
+      userInput: 'Yes, run it properly now — dispatch the background task.',
+      rankFn: zeroRank,
+    });
+    for (const name of ['dispatch_background_task', 'background_task_status', 'background_tasks_recent']) {
+      assert.ok(sel.exposed.has(name), `${name} survives the prune on background intent`);
+    }
+  });
+});

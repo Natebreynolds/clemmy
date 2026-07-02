@@ -174,6 +174,25 @@ function looksLikeWorkspaceAuthoringIntent(query: string): boolean {
     || new RegExp(String.raw`\b${nouns}\b[\s\S]{0,100}\b${verbs}\b`).test(q);
 }
 
+/** Background-dispatch intent pin (same class as the workspace pin, v0.12.33):
+ *  a session whose history skews the semantic ranker elsewhere (live 2026-07-01:
+ *  an SEO-heavy session pruned dispatch_background_task off the surface, the
+ *  model announced "dispatching now" with nothing to invoke). When the user is
+ *  asking for background/deferred work, these must survive selection. */
+const BACKGROUND_INTENT_TOOLS: ReadonlySet<string> = new Set([
+  'dispatch_background_task',
+  'background_task_status',
+  'background_tasks_recent',
+  'offer_background',
+]);
+
+function looksLikeBackgroundDispatchIntent(query: string): boolean {
+  const q = query.toLowerCase();
+  return /\bbackground\b/.test(q)
+    || /\b(dispatch|queue|park|defer)\b[\s\S]{0,60}\b(task|job|run|work)\b/.test(q)
+    || /\b(while i('|a)?m (away|out|gone)|overnight|when it('|i)?s done|report back)\b/.test(q);
+}
+
 const DEFAULT_TOP_K = 16;
 // MEASURED (measure-tool-jit-accuracy.ts, text-embedding-3-small): real domain-named
 // intents score their needed tool ≥0.33 (median 0.44); noise/weak matches sit ≤0.19.
@@ -306,9 +325,14 @@ export async function selectToolsForTurn(opts: {
   if (!query) return exposeAll('no-query');
 
   const present = opts.tools.filter((t) => TOOL_JIT_CORE.has(t.name)).map((t) => t.name);
-  const intentPinned = looksLikeWorkspaceAuthoringIntent(query)
-    ? opts.tools.filter((t) => WORKSPACE_INTENT_TOOLS.has(t.name)).map((t) => t.name)
-    : [];
+  const intentPinned = [
+    ...(looksLikeWorkspaceAuthoringIntent(query)
+      ? opts.tools.filter((t) => WORKSPACE_INTENT_TOOLS.has(t.name)).map((t) => t.name)
+      : []),
+    ...(looksLikeBackgroundDispatchIntent(query)
+      ? opts.tools.filter((t) => BACKGROUND_INTENT_TOOLS.has(t.name) && !TOOL_JIT_CORE.has(t.name)).map((t) => t.name)
+      : []),
+  ];
   const recallSet = new Set(opts.recallPinned ?? []);
   const recallPinned = recallSet.size > 0
     ? opts.tools.filter((t) => recallSet.has(t.name) && !TOOL_JIT_CORE.has(t.name)).map((t) => t.name)
