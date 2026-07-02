@@ -162,11 +162,16 @@ export function renderFocusForInstructions(): string {
 
 const CONSTRAINTS_SHOWN = 20;
 // Per-line bound for injected memory content (recall bullets, constraint
-// bodies). A single runaway fact must not blow the volatile context tail.
-const CONTEXT_LINE_MAX_CHARS = 500;
+// bodies). A single runaway fact must not blow the volatile context tail —
+// but the cut is MARKED so the model knows to fetch the full fact rather
+// than treat the visible prefix as complete (an operative URL/id can sit
+// past the bound).
+const CONTEXT_LINE_MAX_CHARS = 1000;
 function clipContextLine(text: string): string {
   const t = text.trim();
-  return t.length <= CONTEXT_LINE_MAX_CHARS ? t : `${t.slice(0, CONTEXT_LINE_MAX_CHARS - 1)}…`;
+  return t.length <= CONTEXT_LINE_MAX_CHARS
+    ? t
+    : `${t.slice(0, CONTEXT_LINE_MAX_CHARS)} …[truncated — search memory for the full fact]`;
 }
 function renderActiveConstraints(): string {
   try {

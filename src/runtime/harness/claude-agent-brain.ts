@@ -568,9 +568,14 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
     try {
       const hits = await withTimeout(searchFactsHybridImpl(q, 6), queryRecallTimeoutMs(), []);
       const bullets = hits
-        // 500-char per-bullet bound: recall content is injected every turn
-        // and was one of the last unbounded context inputs on this lane.
-        .map((f) => `- ${String(f.content ?? '').trim().slice(0, 500)}`)
+        // Per-bullet bound: recall content is injected every turn and was one
+        // of the last unbounded context inputs on this lane. The cut is MARKED
+        // so a fact whose operative tail (URL/id) sits past the bound reads as
+        // incomplete, not as the whole fact.
+        .map((f) => {
+          const content = String(f.content ?? '').trim();
+          return `- ${content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — search memory for the full fact]`}`;
+        })
         .filter((l) => l.length > 2)
         .join('\n');
       if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
@@ -915,13 +920,16 @@ export async function respondViaClaudeAgentSdkBrain(
       // context: recall dropped, prior turns halved to the last 2 — but the
       // session-actions block KEPT (it is the double-send guard).
       if (claudeSdkSalvageEnabled() && err instanceof ClaudeSdkContextOverflowError) {
+        // err.committed counts ANY tool call (incl. reads) — but re-running is
+        // only unsafe when external WRITES landed. Salvage when they did; when
+        // the ledger shows none (read-heavy research run — the common overflow),
+        // fall through to the reduced-context retry: re-running reads is safe.
         if (err.committed) {
           const salvagedOverflow = salvageCommittedResult(sessionId);
           if (salvagedOverflow) {
             try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_salvaged', reason: 'context_overflow_after_commit' } }); } catch { /* best-effort */ }
             return salvagedOverflow;
           }
-          throw err;
         }
         try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: { kind: 'claude_sdk_overflow_retry', reason: 'context_overflow_reduced_retry' } }); } catch { /* best-effort */ }
         return await runClaudeAgentSdkImpl({

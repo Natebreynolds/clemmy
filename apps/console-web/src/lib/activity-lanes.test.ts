@@ -56,14 +56,37 @@ test('a harness lane picks up kind/title and folds worker counts', () => {
   assert.equal(lane.workers.failed, 1);
 });
 
-test('worker_capped counts as a failure and clears an active slot', () => {
+test('worker_capped is a badge only — its worker_result (worker_failed) owns the slot decrement', () => {
+  // A capped worker emits BOTH worker_capped (turn-cap signal) and a failed
+  // worker_result; counting both double-decremented active (review finding).
   const lanes = fold([
     ev({ type: 'worker_spawned', sessionId: 's1' }),
     ev({ type: 'worker_capped', sessionId: 's1' }),
+    ev({ type: 'worker_failed', sessionId: 's1' }),
   ]);
   const lane = lanes.get('s1')!;
   assert.equal(lane.workers.active, 0);
   assert.equal(lane.workers.failed, 1);
+  assert.equal(lane.badges.capped, 1);
+});
+
+test('completions never erase genuine waiters: queued decrements on SPAWN, not on completion', () => {
+  const lanes = fold([
+    ev({ type: 'worker_spawned', sessionId: 's1' }),
+    ev({ type: 'worker_spawned', sessionId: 's1' }),
+    ev({ type: 'worker_queued', sessionId: 's1' }),
+    ev({ type: 'worker_queued', sessionId: 's1' }),
+    // The two non-queued workers finish while both waiters still wait.
+    ev({ type: 'worker_completed', sessionId: 's1' }),
+    ev({ type: 'worker_completed', sessionId: 's1' }),
+  ]);
+  const lane = lanes.get('s1')!;
+  assert.equal(lane.workers.queued, 2, 'waiters still visible');
+  assert.equal(lane.workers.active, 0);
+  // A waiter gets its slot → spawned dequeues it.
+  foldOperationalEvent(lanes, ev({ type: 'worker_spawned', sessionId: 's1' }));
+  assert.equal(lanes.get('s1')!.workers.queued, 1);
+  assert.equal(lanes.get('s1')!.workers.active, 1);
 });
 
 test('openTool tracks a started tool call until it completes', () => {

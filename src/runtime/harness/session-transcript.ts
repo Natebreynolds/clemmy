@@ -300,7 +300,23 @@ export function renderCrossSessionPrefixesForModel(
         return '';
       }
     }).filter(Boolean);
-    return clipHistory(texts.join('\n\n'), CROSS_SESSION_PREFIXES_TOTAL_MAX_CHARS);
+    // Total bound keeps the NEWEST prefixes: rows are seq-ascending, and the
+    // latest prefix carries the CURRENT resume's handoff context — drop the
+    // oldest whole prefixes first, never the tail of the newest (review
+    // finding: a head-keeping clip lost exactly the context that matters).
+    const kept: string[] = [];
+    let budget = CROSS_SESSION_PREFIXES_TOTAL_MAX_CHARS;
+    for (let i = texts.length - 1; i >= 0; i--) {
+      const cost = texts[i].length + (kept.length > 0 ? 2 : 0);
+      if (cost > budget) {
+        if (kept.length === 0) kept.unshift(clipHistory(texts[i], budget));
+        else kept.unshift('[older session prefixes omitted]');
+        break;
+      }
+      kept.unshift(texts[i]);
+      budget -= cost;
+    }
+    return kept.join('\n\n');
   } catch {
     return '';
   }

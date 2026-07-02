@@ -229,7 +229,7 @@ export function parkComposioJob(receipt: JobReceipt, ctx: ParkContext): ParkResu
     jobId: receipt.jobId,
     datasetId: receipt.datasetId,
     actorId: receipt.actorId,
-    getterSlug: undefined,
+    getterSlug: (receipt as { getterSlug?: string }).getterSlug,
     toolSlug: ctx.toolSlug,
     connectionId: ctx.connectionId ?? '',
     originSessionId: ctx.originSessionId,

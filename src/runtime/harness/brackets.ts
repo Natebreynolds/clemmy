@@ -508,20 +508,33 @@ function findOrphanedWriteMatch(
   targets: string[],
 ): { target: string } | null {
   if (!shapeKey || targets.length === 0) return null;
-  let orphans: Array<{ slug?: string | null; targets?: string[] }>;
+  let orphans: Array<{ seq: number; slug?: string | null; targets?: string[] }>;
   try {
     orphans = listEvents(sessionId, { types: ['external_write_orphaned'] })
-      .map((ev) => ev.data as { slug?: string | null; targets?: string[] });
+      .map((ev) => ({ seq: ev.seq, ...(ev.data as { slug?: string | null; targets?: string[] }) }));
   } catch {
     return null;
   }
   if (orphans.length === 0) return null;
   for (const target of targets) {
     const t = target.toLowerCase();
-    const hit = orphans.some((o) =>
+    const hit = orphans.filter((o) =>
       (o.slug ?? undefined) === shapeKey &&
       (o.targets ?? []).some((x) => String(x).toLowerCase() === t));
-    if (hit) return { target: t };
+    if (hit.length === 0) continue;
+    // Verified-retry pass-through: the timeout corrective ALREADY told the
+    // model to read the target back before retrying. Any tool activity AFTER
+    // the orphan means it did exactly that (or otherwise acted deliberately) —
+    // bouncing again would stack a redundant verify→retry cycle on top of the
+    // one it just completed (review finding). Only a BLIND immediate retry
+    // (zero intervening tool returns) gets the speed bump.
+    const latestOrphanSeq = Math.max(...hit.map((o) => o.seq));
+    try {
+      const verified = listEvents(sessionId, { types: ['tool_returned'] })
+        .some((ev) => ev.seq > latestOrphanSeq);
+      if (verified) return null;
+    } catch { /* can't tell — keep the speed bump */ }
+    return { target: t };
   }
   return null;
 }

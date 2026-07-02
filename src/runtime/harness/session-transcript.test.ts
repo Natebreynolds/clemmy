@@ -372,3 +372,23 @@ test('renderCrossSessionPrefixesForModel clips a runaway prefix (per-prefix and 
   assert.ok(rendered.length <= 6_100, `total bound holds (got ${rendered.length} chars)`);
   assert.match(rendered, /\[session history truncated\]/);
 });
+
+test('renderCrossSessionPrefixesForModel keeps the NEWEST prefix when the total bound trims', () => {
+  resetEventLog();
+  const sid = createSession({ kind: 'chat' }).id;
+  for (let i = 0; i < 4; i++) {
+    appendEvent({
+      sessionId: sid,
+      turn: 0,
+      role: 'system',
+      type: 'cross_session_prefix',
+      data: { text: `[PREFIX ${i}] ${'x'.repeat(1900)}` },
+    });
+  }
+  const rendered = renderCrossSessionPrefixesForModel(openEventLog(), sid, 4);
+  // The newest prefix (3) carries the CURRENT resume's handoff — it must survive;
+  // the oldest is what gets dropped.
+  assert.match(rendered, /\[PREFIX 3\]/, 'newest prefix survives the total bound');
+  assert.doesNotMatch(rendered, /\[PREFIX 0\]/, 'oldest prefix is dropped first');
+  assert.ok(rendered.length <= 6_200, `total bound holds (${rendered.length})`);
+});

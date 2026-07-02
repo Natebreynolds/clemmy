@@ -35,6 +35,7 @@ import { loadProactivityPolicy } from './proactivity-policy.js';
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
 import { workerItemAlreadyCapped } from './worker-respawn-guard.js';
 import { acquireWorkerSlot } from './worker-concurrency.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -763,8 +764,29 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // P6: throttle concurrent worker fan-out per session so N parallel run_worker
       // calls can't open N provider calls at once and storm a rate limit. Bounds BOTH
       // worker lanes (this wraps before the route branch). Released in the finally.
-      const releaseWorkerSlot = await acquireWorkerSlot(sessionId ?? '');
+      // worker_queued/worker_spawned mirror the SDK lane's emits (worker-tools.ts)
+      // so Codex-brain swarms are just as visible on the NowStrip/Slack/Discord.
+      const releaseWorkerSlot = await acquireWorkerSlot(sessionId ?? '', (info) => {
+        try {
+          recordOperationalEvent({
+            source: 'harness',
+            type: 'worker_queued',
+            sessionId: sessionId ?? undefined,
+            actor: 'run_worker',
+            payload: { item: input.item, lane: 'orchestrator', ...info },
+          });
+        } catch { /* telemetry is best-effort */ }
+      });
       try {
+      try {
+        recordOperationalEvent({
+          source: 'harness',
+          type: 'worker_spawned',
+          sessionId: sessionId ?? undefined,
+          actor: 'run_worker',
+          payload: { item: input.item, model: route.model ?? resolveRoleModel('worker').modelId, lane: 'orchestrator' },
+        });
+      } catch { /* telemetry is best-effort */ }
       const turn = extractTurn(runContext);
       const toolCallId = details?.toolCall?.callId ?? null;
       const workerModel = route.model ?? resolveRoleModel('worker').modelId;

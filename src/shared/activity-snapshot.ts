@@ -135,19 +135,29 @@ function computeSessionActivity(sinceIso: string): Map<string, SessionActivity> 
     });
   };
   try {
-    for (const ev of listOperationalEvents({ source: 'harness', since: sinceIso, limit: 1000 })) {
+    // Fold OLDEST-first: the counter model (queued → spawn dequeues → complete
+    // decrements) is order-dependent and the store returns newest-first.
+    for (const ev of [...listOperationalEvents({ source: 'harness', since: sinceIso, limit: 1000 })].reverse()) {
       switch (ev.type) {
-        case 'worker_spawned': bump(ev.sessionId, { workersActive: 1 }); break;
+        // Spawn dequeues one waiter IF any is waiting (emit order: queued →
+        // slot frees → spawned; a spawn that never queued must not go negative);
+        // capped workers ALSO emit worker_failed via their worker_result, so
+        // capped must not decrement a second time (review finding).
+        case 'worker_spawned': {
+          const hadWaiter = (map.get(ev.sessionId ?? '')?.workersQueued ?? 0) > 0;
+          bump(ev.sessionId, { workersActive: 1, ...(hadWaiter ? { workersQueued: -1 } : {}) });
+          break;
+        }
         case 'worker_queued': bump(ev.sessionId, { workersQueued: 1 }); break;
         case 'worker_completed':
-        case 'worker_failed':
-        case 'worker_capped': bump(ev.sessionId, { workersActive: -1 }); break;
+        case 'worker_failed': bump(ev.sessionId, { workersActive: -1 }); break;
+        case 'worker_capped': break;
         default: break;
       }
     }
   } catch { /* observability read is best-effort */ }
   try {
-    for (const ev of listOperationalEvents({ source: 'safety', since: sinceIso, limit: 1000 })) {
+    for (const ev of [...listOperationalEvents({ source: 'safety', since: sinceIso, limit: 1000 })].reverse()) {
       if (ev.type === 'approval_required') bump(ev.sessionId, { approvalsOpen: 1 });
       else if (ev.type === 'approval_resolved') bump(ev.sessionId, { approvalsOpen: -1 });
     }

@@ -218,7 +218,7 @@ test('recall + constraint lines are bounded: a runaway fact cannot blow the vola
     const title = section.split('\n', 1)[0] ?? '';
     if (!/Relevant To Your Request|Standing Constraints/.test(title)) continue;
     for (const line of section.split('\n').filter((l) => l.startsWith('- '))) {
-      assert.ok(line.length <= 520, `injected line bounded (got ${line.length} chars in "${title}")`);
+      assert.ok(line.length <= 1060, `injected line bounded (got ${line.length} chars in "${title}")`);
     }
   }
 });

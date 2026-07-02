@@ -23,7 +23,7 @@ export interface ActivityLane {
   /** Internal: open tool calls by toolCallId, from which openTool is derived. */
   openTools: Record<string, { name: string; sinceTs: string }>;
   workers: { active: number; queued: number; done: number; failed: number };
-  badges: { fallover: number; retries: number; gateVerdicts: number; autoContinues: number };
+  badges: { fallover: number; retries: number; gateVerdicts: number; autoContinues: number; capped: number };
   needsApproval: boolean;
   startedAt?: string;
   lastEventAt: string;
@@ -60,7 +60,7 @@ function createLane(key: string, event: OperationalEvent): ActivityLane {
     workflowRunId: event.workflowRunId,
     openTools: {},
     workers: { active: 0, queued: 0, done: 0, failed: 0 },
-    badges: { fallover: 0, retries: 0, gateVerdicts: 0, autoContinues: 0 },
+    badges: { fallover: 0, retries: 0, gateVerdicts: 0, autoContinues: 0, capped: 0 },
     needsApproval: false,
     startedAt: event.ts,
     lastEventAt: event.ts,
@@ -123,8 +123,16 @@ export function foldOperationalEvent(
       }
       break;
     }
+    // Worker accounting (no per-worker ids in the payload, so this is a counter
+    // model): a QUEUED worker leaves the queue when it SPAWNS — the emit order
+    // is queued → (slot frees) → spawned. Completions decrement ACTIVE only;
+    // decrementing queued there erased genuine waiters when non-queued workers
+    // finished first (review finding). worker_capped is a turn-cap signal for
+    // a worker whose worker_result (→ worker_failed) also arrives — count the
+    // badge, not a second slot decrement.
     case 'worker_spawned':
       lane.workers.active += 1;
+      if (lane.workers.queued > 0) lane.workers.queued -= 1;
       break;
     case 'worker_queued':
       lane.workers.queued += 1;
@@ -132,13 +140,13 @@ export function foldOperationalEvent(
     case 'worker_completed':
       lane.workers.done += 1;
       lane.workers.active = Math.max(0, lane.workers.active - 1);
-      lane.workers.queued = Math.max(0, lane.workers.queued - 1);
       break;
     case 'worker_failed':
-    case 'worker_capped':
       lane.workers.failed += 1;
       lane.workers.active = Math.max(0, lane.workers.active - 1);
-      lane.workers.queued = Math.max(0, lane.workers.queued - 1);
+      break;
+    case 'worker_capped':
+      lane.badges.capped += 1;
       break;
     case 'model_fallover':
       lane.badges.fallover += 1;

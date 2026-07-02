@@ -1224,3 +1224,21 @@ test('A3: the auto-continue prompt carries the tool-call recall ledger (callIds 
   assert.match(contPrompt, /toolu_abc123/, 'earlier callId handed to the continuation');
   assert.match(contPrompt, /APIFY_GET_DATASET_ITEMS/, 'args preview present');
 });
+
+test('overflow A2: committed overflow with ZERO external writes falls through to the reduced retry (reads are safe)', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  delete process.env.CLEMMY_CLAUDE_SDK_SALVAGE;
+  createSession({ id: 'overflow-committed-reads', kind: 'chat', title: 'read-heavy overflow' });
+  // No external_write events — a read-heavy research run that overflowed mid-run.
+  let calls = 0;
+  setClaudeAgentSdkBrainRunForTest(async () => {
+    calls += 1;
+    if (calls === 1) throw new ClaudeSdkContextOverflowError('prompt is too long', true);
+    return { text: 'finished after retry', toolUses: [] };
+  });
+  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'ok' }));
+  const res = await respondViaClaudeAgentSdkBrain('home', { message: 'research everything', sessionId: 'overflow-committed-reads' });
+  assert.equal(calls, 2, 'reduced retry ran instead of dying unsalvaged');
+  assert.match(res.text, /finished after retry/);
+});

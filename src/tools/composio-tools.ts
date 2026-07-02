@@ -11,7 +11,7 @@ import {
   listConnectedToolkits,
   listAllToolkits,
 } from '../integrations/composio/client.js';
-import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor } from '../integrations/composio/async-job.js';
+import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter } from '../integrations/composio/async-job.js';
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
@@ -752,11 +752,18 @@ async function runComposioExecute(
             let parked: ReturnType<typeof parkComposioJob> = null;
             if (sid && shouldPark) {
               try {
-                parked = parkComposioJob(receipt, {
-                  toolSlug,
-                  connectionId: effectiveConnectionId,
-                  originSessionId: sid,
-                });
+                // Park only if the result-getter actually RESOLVES (review
+                // finding: a DataForSEO endpoint with no matching *_TASK_GET*
+                // would otherwise sit in the watcher heartbeating for 60min
+                // before blocking — the banner is more honest). The resolved
+                // slug rides into the record so the watcher never re-discovers.
+                const plan = await resolveJobGetter(receipt, (slug, a) => executeComposioTool(slug, a, effectiveConnectionId));
+                if (plan) {
+                  parked = parkComposioJob(
+                    { ...receipt, ...(plan.getterSlug ? { getterSlug: plan.getterSlug } : {}) } as typeof receipt,
+                    { toolSlug, connectionId: effectiveConnectionId, originSessionId: sid },
+                  );
+                }
               } catch {
                 parked = null; // fail-open to the banner
               }

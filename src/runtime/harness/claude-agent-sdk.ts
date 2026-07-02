@@ -23,7 +23,7 @@ import { buildGatedToolPermission } from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
-import { appendEvent } from './eventlog.js';
+import { appendEvent, writeToolOutput } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 
@@ -1013,10 +1013,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     },
     ...(options.outputSchema ? { outputFormat: { type: 'json_schema', schema: options.outputSchema } } : {}),
     // With settingSources:[] no user/project settings load, so auto-compaction
-    // was default-dependent. Pin it ON explicitly: long agentic runs must
-    // compact rather than die at the context cliff. (managedSettings is the
-    // policy tier — nothing else is set, so this is a single-knob override.)
-    managedSettings: { autoCompactEnabled: true },
+    // was default-dependent. Pin it ON explicitly via the plain `settings`
+    // tier (equivalent to --settings): long agentic runs must compact rather
+    // than die at the context cliff. NOT managedSettings — that policy tier is
+    // filtered restrictive-only and silently DROPS non-restrictive keys like
+    // autoCompactEnabled (review finding: the pin never took effect there).
+    settings: { autoCompactEnabled: true },
   };
 
   // CHAT multi-turn history: prepend the prior session turns as an authoritative
@@ -1167,6 +1169,15 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         for (const tr of extractToolResults(message)) {
           const source = toolById.get(tr.callId);
           emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name);
+          // A3 recall contract: park every result under the SDK's OWN tool_use id
+          // (toolu_…) — the id the continuation ledger hands out. Without this,
+          // outputs live only under harness-generated mcp-<uuid> ids (and only
+          // when clipped), so every tool_output_query(toolu_…) would miss.
+          if (options.sessionId && tr.output && !tr.isError) {
+            try {
+              writeToolOutput({ sessionId: options.sessionId, callId: tr.callId, tool: source ? mcpToolTail(source.name) : null, output: tr.output });
+            } catch { /* recall parking must never break the run */ }
+          }
           if (reflectLearning && tr.output) {
             const tool = source ? reflectionToolName(source.name, source.input) : null;
             reflectImpl({ sessionId: reflectSessionId as string, callId: tr.callId, tool, output: tr.output });
@@ -1275,11 +1286,21 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     }
     recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
     const resultText = JSON.stringify(result);
-    if (isContextOverflowMessage(resultText)) {
-      // Overflow arrives as a generic error_during_execution result (no distinct
-      // SDK subtype) — previously this hit the raw throw below and the run died
-      // with no salvage. TYPED so the brain's salvage/reduced-retry path runs.
-      throw new ClaudeSdkContextOverflowError(resultText.slice(0, 800), toolUses.length > 0 || streamedAny);
+    // Overflow arrives as a generic error_during_execution result (no distinct
+    // SDK subtype). Classify from the ERROR fields ONLY — never the full
+    // serialized result: the model's own partial text mentioning "context
+    // limit" must not misclassify an unrelated failure as overflow (review
+    // finding: false 'partial success' salvage).
+    // ERROR fields only — deliberately NOT `result` (it can carry the model's
+    // partial ANSWER, which mentioning "context limit" must not trigger this).
+    const errorFields = result as { errors?: unknown[]; error?: unknown };
+    const errorText = [
+      ...(Array.isArray(errorFields.errors) ? errorFields.errors : []),
+      errorFields.error,
+    ].filter((v) => v !== undefined && v !== null).map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join('\n');
+    if (isContextOverflowMessage(errorText)) {
+      // TYPED so the brain's salvage/reduced-retry path runs.
+      throw new ClaudeSdkContextOverflowError(errorText.slice(0, 800), toolUses.length > 0 || streamedAny);
     }
     throw new Error(`Claude Agent SDK failed: ${resultText.slice(0, 800)}`);
   }
