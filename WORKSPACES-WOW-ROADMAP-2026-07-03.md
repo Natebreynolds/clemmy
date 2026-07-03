@@ -79,3 +79,35 @@ TURN level is our biggest realistic speed lever:
 
 Sequencing: (1) shipped · (2) after Trace+Replay lands (verify needs cheap replayed
 evals) · (3) independent, small · (4) horizon.
+
+## Execution review contract — Connection Command Center + Task Cockpit (2026-07-03)
+
+Nathan assigned #1+#2 to the notification-work agent; this session reviews every
+commit against these criteria (agreed traps, not new rules):
+
+**Connection Command Center**
+- MERGE, don't multiply: the Doctor + Connect screen + Notification settings must
+  converge toward ONE surface. A fourth parallel door = the too-many-doors debt.
+- Capability probes must be LIVE checks (actually attempt a DM-permission probe /
+  channel read), not inferences from config. A green light the user can't trust
+  is worse than none.
+- Test-fire buttons route through the REAL delivery path (the queue + receipts),
+  not a side send — otherwise the test passes while production delivery fails.
+- "Send results here" writes the SAME BackgroundReportBackTarget the runtime
+  reads (one schema, no parallel routing store).
+
+**Task Cockpit**
+- UPGRADE the existing Tasks board / BackgroundTasks surfaces — do NOT stand up a
+  parallel board (the fork pattern). One task, one canonical surface.
+- Data comes from existing stores: attempt_records ("tried"), needs_input
+  ("needs"), reportBackTarget ("lands where"), SSE trace (live activity). New
+  UI, no new state stores.
+- Buttons reuse canonical actions: hold/resume/cancel exist (v0.12.29-32);
+  "retry" should re-dispatch through enqueueDurableChatTask, "post elsewhere"
+  through the reportBackTarget update — never bespoke side paths.
+- Every button's effect must land in the eventlog (the receipt trail is the
+  product).
+
+**Both**: suite green per commit · no console-web state duplicated from the
+daemon (fetch, don't mirror) · the packaged-app build (in flight) is the final
+gate before any of this ships.
