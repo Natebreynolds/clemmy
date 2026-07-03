@@ -12,7 +12,7 @@
  * (SKIPs don't count) — usable as a pre-release gate next to test:smoke.
  */
 import { execSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { planBrain, provisionDaemon } from './provision.js';
@@ -46,6 +46,55 @@ function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDe
     ? ALL_SCENARIOS.filter((s) => scenarioNames.includes(s.name))
     : ALL_SCENARIOS;
   return { brains: brains.length ? brains : [...ALL_BRAINS], scenarios, scoreOnly, keep };
+}
+
+/** Distinct model-family tags ('claude' | 'codex' | 'byo') that actually served
+ *  calls in a proof home. Two evidence sources, union'd: the isolated
+ *  token-usage NDJSON (definitive when present — appendFileSync, but some lanes
+ *  record sparsely on short turns) and the eventlog's model-routing markers
+ *  (worker_model_routed provider + the SDK-brain transport tag). "Can't prove"
+ *  stays an empty set — for a brain matrix that is a FAIL, not a shrug. */
+function servedModelFamilies(home: string): Set<string> {
+  const families = new Set<string>();
+  const classify = (model: string): void => {
+    const m = model.toLowerCase();
+    if (!m) return;
+    if (m.includes('claude')) families.add('claude');
+    else if (/^gpt|^o\d|codex/.test(m)) families.add('codex');
+    else families.add('byo');
+  };
+  try {
+    const dir = path.join(home, 'state', 'token-usage');
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith('.ndjson')) continue;
+      for (const line of readFileSync(path.join(dir, file), 'utf-8').split('\n')) {
+        if (!line.trim()) continue;
+        try { classify(String((JSON.parse(line) as { model?: unknown }).model ?? '')); } catch { /* skip */ }
+      }
+    }
+  } catch { /* no usage dir → eventlog below is the only evidence */ }
+  try {
+    const db = openHarnessDb(home);
+    const rows = db.prepare(
+      "SELECT data_json FROM events WHERE type IN ('turn_model_routed', 'worker_model_routed', 'reasoning_effort') LIMIT 500",
+    ).all() as Array<{ data_json: string }>;
+    for (const row of rows) {
+      try {
+        const data = JSON.parse(row.data_json) as { model?: string; modelId?: string; provider?: string; transport?: string };
+        if (typeof data.model === 'string') classify(data.model);
+        else if (typeof data.modelId === 'string') classify(data.modelId);
+        else if (data.provider === 'claude' || (data.transport ?? '').includes('claude_agent_sdk')) families.add('claude');
+      } catch { /* skip */ }
+    }
+    db.close();
+  } catch { /* no db → whatever the usage log said stands */ }
+  return families;
+}
+
+function brainFamilyServed(brain: BrainKind, served: Set<string>): boolean {
+  if (brain === 'claude') return served.has('claude');
+  if (brain === 'codex') return served.has('codex');
+  return served.has('byo'); // glm rides the byo lane
 }
 
 function fmtMs(ms: number | null | undefined): string {
@@ -117,6 +166,29 @@ async function main(): Promise<void> {
         outcomes.push({ scenario: scenario.name, brain: brainKind, status: 'FAIL', checks: [], latency: [], error: err instanceof Error ? err.message : String(err) });
         console.log(`    ❌ FAIL (${err instanceof Error ? err.message : String(err)})`);
       }
+    }
+    // Brain-served assertion: a "claude" leg's green scoreboard must not be
+    // earnable by codex. The graceful brain-fallback is BY DESIGN for users
+    // (an invalid Claude token mid-run switched every turn to Codex with zero
+    // dead turns — 2026-07-03), but for a BRAIN MATRIX leg it silently
+    // invalidates the label. Read the temp home's usage log and FAIL the leg
+    // when the requested brain's model family never served a call.
+    const served = servedModelFamilies(daemon.home);
+    const brainOk = brainFamilyServed(brainKind, served);
+    outcomes.push({
+      scenario: '(brain-served)',
+      brain: brainKind,
+      status: brainOk ? 'PASS' : 'FAIL',
+      checks: [{
+        name: `turns served by the ${brainKind} brain`,
+        pass: brainOk,
+        detail: `model families in usage log: [${[...served].join(', ') || 'none'}]`,
+      }],
+      latency: [],
+    });
+    if (!brainOk) {
+      anyFailed = true;
+      console.log(`  ❌ brain mismatch — requested ${brainKind}, served by [${[...served].join(', ') || 'none'}] (check model sign-in; the graceful fallback may have switched brains)`);
     }
     if (anyFailed) console.log(`  (keeping ${daemon.home} for forensics)`);
     await daemon.stop({ keepHome: anyFailed || keep });

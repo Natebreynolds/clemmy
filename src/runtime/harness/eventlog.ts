@@ -105,6 +105,10 @@ export const EVENT_TYPES = [
   // has it too; this copy makes TTFT scoreable from the eventlog (proof
   // harness, speculative-routing acceptance telemetry).
   'sdk_first_byte',
+  // WHICH model/lane served a chat turn (respond bridge, once per turn):
+  // {model, routeKind, surface}. The durable answer to "who actually served
+  // this?" — brain-matrix assertions, fallover forensics, route-policy audit.
+  'turn_model_routed',
   // The Claude Agent SDK's child process compacted its own context mid-run
   // (subtype 'compact_boundary' relay; pre/post tokens + trigger). Mirror of the
   // Codex lane's condenser_applied — proves long runs manage context instead of

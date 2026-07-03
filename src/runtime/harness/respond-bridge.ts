@@ -37,7 +37,7 @@
 import { runConversation } from './loop.js';
 import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
 import { configureHarnessRuntime } from './codex-client.js';
-import { clearKill, createSession, getSession, listEvents, requestKill, type EventRow } from './eventlog.js';
+import { appendEvent, clearKill, createSession, getSession, listEvents, requestKill, type EventRow } from './eventlog.js';
 import { listPending } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
@@ -387,6 +387,13 @@ export async function respondViaHarness(
         })
       : {};
 
+    // Durable "who served this turn" marker (harness lane): usage recording is
+    // sparse on short turns and chat events carry no model identity — this one
+    // event is the source of truth for brain-matrix assertions + route audit.
+    try {
+      const routed = routeForHarness(surface, request, opts.modelOverride);
+      appendEvent({ sessionId, turn: 0, role: 'system', type: 'turn_model_routed', data: { model: routed.effectiveModel, routeKind: routed.routeKind, surface } });
+    } catch { /* telemetry only */ }
     const result = await runConversationImpl({
       agent,
       sessionId,
@@ -542,6 +549,12 @@ export async function respondPreferHarness(
     };
     try {
       const response = await claudeAgentBrainImpl(surface, request);
+      // Durable "who served this turn" marker (SDK brain lane) — mirror of the
+      // harness-lane emit below; the route carries the model the SDK reported.
+      try {
+        const routed = routeForClaudeSdkBrain(surface, request, response);
+        appendEvent({ sessionId: request.sessionId, turn: 0, role: 'system', type: 'turn_model_routed', data: { model: routed.effectiveModel, routeKind: routed.routeKind, surface } });
+      } catch { /* telemetry only */ }
       return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
     } catch (err) {
       const recovered = await recoverChatBrainFailure(surface, request, err, detach);
