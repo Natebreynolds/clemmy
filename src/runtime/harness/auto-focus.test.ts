@@ -225,3 +225,30 @@ test('maybeAutoFocusSession leaves an existing active focus alone', () => {
   assert.equal(maybeAutoFocusSession({ sessionId: sess.id }), null);
   assert.equal(getActiveFocus()?.id, existing.id);
 });
+
+test('harness boilerplate (unparsed-decision apology, synthetic retries) NEVER becomes the focus', () => {
+  resetAll();
+  const sess = createSession({ kind: 'chat', title: 'research the five firms' });
+  // The real ask, followed by a synthetic parse-retry recorded like an input.
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'user_input_received', data: { text: 'research the five law firms and rank them' } });
+  appendEvent({
+    sessionId: sess.id, turn: 2, role: 'system', type: 'user_input_received',
+    data: { text: 'Your previous response could not be parsed into the required structured decision. Re-issue it now as the exact decision object.' },
+  });
+  for (let i = 0; i < 8; i += 1) {
+    appendEvent({ sessionId: sess.id, turn: 2, role: 'Clem', type: 'tool_called', data: { tool: 'memory_search' } });
+  }
+  // The turn dead-ends with the apology summary (the 2026-07-03 pollution shape).
+  appendEvent({
+    sessionId: sess.id, turn: 2, role: 'system', type: 'conversation_completed',
+    data: { reason: 'no_structured_output', summary: "Clementine produced a response that couldn't be structured. Please ask again." },
+  });
+
+  const result = maybeAutoFocusSession({ sessionId: sess.id });
+  const active = getActiveFocus();
+  if (result || active) {
+    assert.ok(!/couldn't be structured|could not be parsed/i.test(active?.title ?? ''), `boilerplate title leaked: ${active?.title}`);
+    assert.ok(!/couldn't be structured|could not be parsed/i.test(active?.summary ?? ''), `boilerplate summary leaked: ${active?.summary}`);
+    assert.match(active?.title ?? '', /law firms|research/i, 'the focus reflects the REAL ask');
+  }
+});

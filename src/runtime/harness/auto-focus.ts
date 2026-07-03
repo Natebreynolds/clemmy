@@ -37,21 +37,37 @@ function cleanLine(value: unknown, maxChars: number): string {
   return `${cleaned.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
 }
 
+/** Harness-internal boilerplate that must NEVER become the user's focus: the
+ *  unparsed-decision apology and the synthetic stall/parse retry prompts. A
+ *  proof run (2026-07-03) pinned "Clementine produced a response that couldn't
+ *  be structured. Please ask again." as the ACTIVE focus — which then polluted
+ *  every later turn's context. Patterns mirror loop.ts's synthetic-retry family
+ *  (kept local: loop.ts imports this module, so importing back would cycle). */
+const INTERNAL_BOILERPLATE_RE =
+  /couldn't be structured|could not be parsed into the required structured decision|previous response was prose, not an action|did not make progress on the directive/i;
+
+function isInternalBoilerplate(text: string): boolean {
+  return INTERNAL_BOILERPLATE_RE.test(text);
+}
+
 function summaryFromOutput(value: unknown): string {
   if (!value) return '';
   if (typeof value === 'object') {
     const v = value as Record<string, unknown>;
-    return cleanLine(v.reply ?? v.summary, 500);
+    const line = cleanLine(v.reply ?? v.summary, 500);
+    return isInternalBoilerplate(line) ? '' : line;
   }
   if (typeof value !== 'string') return '';
   const raw = value.trim();
   if (!raw) return '';
+  let out: string;
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return cleanLine(parsed.reply ?? parsed.summary, 500);
+    out = cleanLine(parsed.reply ?? parsed.summary, 500);
   } catch {
-    return cleanLine(raw, 500);
+    out = cleanLine(raw, 500);
   }
+  return isInternalBoilerplate(out) ? '' : out;
 }
 
 function latestConversationSummary(events: EventRow[]): string {
@@ -76,7 +92,8 @@ function latestUserInput(events: EventRow[]): string {
       ? (event.data as { text?: unknown }).text
       : (event.data as { input?: unknown }).input;
     const cleaned = cleanLine(text, 120);
-    if (cleaned) return cleaned;
+    // Synthetic retry prompts are recorded like inputs but are NOT the user's ask.
+    if (cleaned && !isInternalBoilerplate(cleaned)) return cleaned;
   }
   return '';
 }
