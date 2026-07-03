@@ -104,6 +104,7 @@ async function main(): Promise<void> {
     let anyFailed = false;
     for (const scenario of scenarios) {
       console.log(`  ▶ ${scenario.name} …`);
+      daemon.markLog(); // scope daemon.log() (storm check) to THIS scenario
       try {
         const result = await scenario.run(daemon);
         const failed = result.checks.some((c) => !c.pass);

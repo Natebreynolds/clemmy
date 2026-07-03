@@ -37,8 +37,11 @@ export interface DaemonHandle {
   approve(approvalId: string, decision: 'approve' | 'reject'): Promise<number>;
   /** Authenticated JSON request against the daemon's console API. */
   request(method: string, apiPath: string, body?: unknown): Promise<{ status: number; json: unknown }>;
-  /** Everything the daemon printed so far (stdout+stderr). */
+  /** Daemon stdout+stderr since the last markLog() (whole boot log before the first mark). */
   log(): string;
+  /** Advance the log window — the runner calls this between scenarios so one
+   *  early provider-back-pressure burst can't fail every later storm check. */
+  markLog(): void;
   /** keepHome=true preserves the temp home for forensics (failed runs). */
   stop(opts?: { keepHome?: boolean }): Promise<void>;
 }

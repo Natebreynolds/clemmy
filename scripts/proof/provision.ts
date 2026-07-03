@@ -214,5 +214,11 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
     }
   };
 
-  return { home, port, secret, baseUrl, chat, approve, request, log: () => logChunks.join(''), stop };
+  // log() is scoped to the CURRENT scenario: markLog() (called by the runner
+  // between scenarios) advances the window so one early provider-back-pressure
+  // burst can't fail the storm check of every scenario after it.
+  let logMark = 0;
+  const log = (): string => logChunks.join('').slice(logMark);
+  const markLog = (): void => { logMark = logChunks.join('').length; };
+  return { home, port, secret, baseUrl, chat, approve, request, log, markLog, stop };
 }
