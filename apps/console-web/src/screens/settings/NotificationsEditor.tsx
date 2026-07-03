@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, CheckCircle2, Clock3, Hash, Loader2, MessageCircle, PencilLine, Plus, RefreshCw, Send, Trash2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Clock3, Hash, Loader2, MessageCircle, PencilLine, Plus, RefreshCw, Send, ShieldCheck, Trash2 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
@@ -9,7 +9,8 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import {
-  listDestinations, addDestination, testDestination, toggleDestination, deleteDestination, getNotificationDoctor,
+  listDestinations, addDestination, testDestination, toggleDestination, deleteDestination, getNotificationDoctor, runNotificationAcceptance,
+  type ChannelAcceptanceReport, type ChannelAcceptanceResult, type ChannelAcceptanceStatus,
   type DeliveryReceipt, type DeliverySurfaceHealth, type DestinationType, type NotificationDestination, type NotificationDoctor,
 } from '@/lib/notifications';
 
@@ -36,6 +37,8 @@ export function NotificationsEditor() {
   const [userId, setUserId] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
+  const [acceptance, setAcceptance] = useState<ChannelAcceptanceReport | null>(null);
+  const [acceptanceError, setAcceptanceError] = useState('');
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['notif-destinations'] });
@@ -62,12 +65,34 @@ export function NotificationsEditor() {
     finally { setBusy(null); }
   };
 
+  const runAcceptance = async () => {
+    setBusy('acceptance');
+    setAcceptanceError('');
+    try {
+      const report = await runNotificationAcceptance(true);
+      setAcceptance(report);
+      refresh();
+    } catch (e) {
+      setAcceptanceError((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <Card className="p-5">
       <h3 className="mb-1 text-h3 text-fg">Connection command center</h3>
       <p className="mb-4 text-small text-muted">Slack, Discord, and result delivery routes.</p>
 
-      <DeliveryDoctor data={doctor.data} loading={doctor.isLoading} onRefresh={refresh} />
+      <DeliveryDoctor
+        data={doctor.data}
+        loading={doctor.isLoading}
+        acceptance={acceptance}
+        acceptanceBusy={busy === 'acceptance'}
+        acceptanceError={acceptanceError}
+        onRefresh={refresh}
+        onRunAcceptance={() => void runAcceptance()}
+      />
 
       {dests.isLoading ? <Skeleton className="h-20 w-full" /> : rows.length > 0 && (
         <div className="mb-5 mt-5 space-y-4">
@@ -163,7 +188,23 @@ function formatTime(value?: string) {
   return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-function DeliveryDoctor({ data, loading, onRefresh }: { data?: NotificationDoctor; loading: boolean; onRefresh: () => void }) {
+function DeliveryDoctor({
+  data,
+  loading,
+  acceptance,
+  acceptanceBusy,
+  acceptanceError,
+  onRefresh,
+  onRunAcceptance,
+}: {
+  data?: NotificationDoctor;
+  loading: boolean;
+  acceptance: ChannelAcceptanceReport | null;
+  acceptanceBusy: boolean;
+  acceptanceError: string;
+  onRefresh: () => void;
+  onRunAcceptance: () => void;
+}) {
   if (loading && !data) return <Skeleton className="mb-5 h-44 w-full" />;
   if (!data) return null;
 
@@ -174,9 +215,15 @@ function DeliveryDoctor({ data, loading, onRefresh }: { data?: NotificationDocto
           <div className="text-small font-semibold text-fg">Live channel health</div>
           <div className="text-caption text-faint">Last checked {formatTime(data.generatedAt)}</div>
         </div>
-        <Button variant="secondary" size="sm" onClick={onRefresh}>
-          <RefreshCw className="h-4 w-4" aria-hidden /> Refresh
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" size="sm" onClick={onRunAcceptance} disabled={acceptanceBusy}>
+            {acceptanceBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />}
+            Run acceptance
+          </Button>
+          <Button variant="secondary" size="sm" onClick={onRefresh}>
+            <RefreshCw className="h-4 w-4" aria-hidden /> Refresh
+          </Button>
+        </div>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
@@ -218,6 +265,10 @@ function DeliveryDoctor({ data, loading, onRefresh }: { data?: NotificationDocto
         ))}
       </div>
 
+      {(acceptance || acceptanceError) && (
+        <AcceptanceResults report={acceptance} error={acceptanceError} />
+      )}
+
       <div>
         <div className="mb-2 text-small font-semibold text-fg">Recent delivery receipts</div>
         {data.recentReceipts.length === 0 ? (
@@ -250,6 +301,62 @@ function receiptStatusTone(status: DeliveryReceipt['status']): 'success' | 'warn
   if (status === 'partial') return 'warning';
   if (status === 'failed') return 'danger';
   return 'neutral';
+}
+
+function acceptanceTone(status: ChannelAcceptanceStatus): 'success' | 'warning' | 'danger' | 'neutral' {
+  if (status === 'passed') return 'success';
+  if (status === 'failed') return 'danger';
+  return 'neutral';
+}
+
+function AcceptanceResults({ report, error }: { report: ChannelAcceptanceReport | null; error: string }) {
+  if (error) {
+    return (
+      <div className="flex items-start gap-2 rounded-md border border-danger/30 bg-danger-tint px-3 py-3 text-small text-danger">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+        <span>{error}</span>
+      </div>
+    );
+  }
+  if (!report) return null;
+
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-small font-semibold text-fg">Acceptance run</div>
+          <div className="text-caption text-faint">
+            {formatTime(report.generatedAt)} · {report.passed} passed · {report.failed} failed · {report.skipped} skipped
+          </div>
+        </div>
+        <StatusPill tone={acceptanceTone(report.status)}>{report.status}</StatusPill>
+      </div>
+      {report.results.length === 0 ? (
+        <div className="rounded-sm bg-subtle px-3 py-2 text-small text-muted">No Slack or Discord routes are configured yet.</div>
+      ) : (
+        <ul className="space-y-2">
+          {report.results.map((result) => <AcceptanceResultRow key={result.id} result={result} />)}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function AcceptanceResultRow({ result }: { result: ChannelAcceptanceResult }) {
+  return (
+    <li className="rounded-sm bg-subtle px-3 py-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="truncate text-small font-medium text-fg">{result.name}</div>
+          <div className="truncate text-caption text-faint">{TYPE_LABEL[result.type]} · {result.surface}</div>
+          <div className={result.status === 'failed' ? 'mt-1 truncate text-caption text-danger' : 'mt-1 truncate text-caption text-muted'}>
+            {result.message}
+          </div>
+        </div>
+        <StatusPill tone={acceptanceTone(result.status)}>{result.status}</StatusPill>
+      </div>
+    </li>
+  );
 }
 
 function SurfaceMetric({

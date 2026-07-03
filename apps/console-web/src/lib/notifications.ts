@@ -65,11 +65,37 @@ export interface NotificationDoctor {
   recentReceipts: DeliveryReceipt[];
 }
 
+export type ChannelAcceptanceStatus = 'passed' | 'failed' | 'skipped';
+
+export interface ChannelAcceptanceResult {
+  id: string;
+  name: string;
+  type: DestinationType;
+  surface: 'slack' | 'discord';
+  status: ChannelAcceptanceStatus;
+  message: string;
+  startedAt: string;
+  completedAt: string;
+}
+
+export interface ChannelAcceptanceReport {
+  generatedAt: string;
+  live: boolean;
+  status: ChannelAcceptanceStatus;
+  passed: number;
+  failed: number;
+  skipped: number;
+  results: ChannelAcceptanceResult[];
+}
+
 export const listDestinations = () =>
   apiGet<{ destinations: NotificationDestination[] }>('/api/notifications/destinations');
 
 export const getNotificationDoctor = () =>
   apiGet<NotificationDoctor>('/api/notifications/doctor');
+
+export const runNotificationAcceptance = (live = true) =>
+  apiPost<ChannelAcceptanceReport>('/api/notifications/acceptance/run', { live });
 
 export const addDestination = (body: Partial<NotificationDestination>) =>
   apiPost('/api/notifications/destinations', body);

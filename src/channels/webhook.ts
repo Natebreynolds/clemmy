@@ -51,6 +51,7 @@ import {
 } from '../runtime/notifications.js';
 import { buildNotificationDoctor } from '../runtime/notification-doctor.js';
 import { testNotificationDestination } from '../runtime/notification-delivery.js';
+import { runChannelAcceptance } from '../runtime/channel-acceptance.js';
 import { fetchDiscordInstallInfo } from './discord-install.js';
 import { getDiscordRuntimeStatus } from './discord.js';
 import { getSlackRuntimeStatus } from './slack.js';
@@ -906,6 +907,20 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
           slackProactiveChannel: SLACK_PROACTIVE_CHANNEL || undefined,
         },
       }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/notifications/acceptance/run', requireAuth, async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { live?: unknown };
+      const report = await runChannelAcceptance({
+        destinations: listNotificationDestinations(),
+        live: body.live !== false,
+        deliver: testNotificationDestination,
+      });
+      res.json(report);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

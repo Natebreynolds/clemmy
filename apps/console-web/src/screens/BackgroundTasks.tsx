@@ -15,7 +15,7 @@ import {
   useSensor, useSensors, closestCorners,
   type DragStartEvent, type DragEndEvent,
 } from '@dnd-kit/core';
-import { X, Archive } from 'lucide-react';
+import { X, Archive, PlayCircle } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -27,7 +27,7 @@ import { BoardColumn } from '@/components/board/BoardColumn';
 import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
 import { NowStrip } from '@/components/board/NowStrip';
 import {
-  listBoard, COLUMNS, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
+  listBoard, COLUMNS, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel, seedDemoAgenticFlow,
   type BoardCard, type BoardColumnId, type BoardButtonIntent,
 } from '@/lib/board';
 
@@ -41,6 +41,7 @@ export function BackgroundTasks() {
   const [active, setActive] = useState<BoardCard | null>(null);
   const [open, setOpen] = useState<BoardCard | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
+  const [demoBusy, setDemoBusy] = useState(false);
   const [keptStale, setKeptStale] = useState(false); // "Keep them" dismisses the banner for this view
 
   const staleCards = useMemo(() => cards.filter((c) => c.stale), [cards]);
@@ -105,11 +106,39 @@ export function BackgroundTasks() {
     void qc.invalidateQueries({ queryKey: ['board'] });
   };
 
+  const onLaunchDemo = async () => {
+    setDemoBusy(true);
+    try {
+      const result = await seedDemoAgenticFlow();
+      if (!result.ok || !result.task) {
+        flash({ tone: 'danger', text: result.reason || 'Demo task could not be created.' });
+        return;
+      }
+      const refreshed = await board.refetch();
+      const card = refreshed.data?.cards.find((item) => item.id === result.task?.id);
+      if (card) setOpen(card);
+      flash({ tone: 'success', text: `Demo task “${result.task.title}” is ready.` });
+    } catch (err) {
+      const message = err && typeof err === 'object' && 'message' in err ? String((err as { message: unknown }).message) : 'Demo task failed.';
+      flash({ tone: 'danger', text: message });
+    } finally {
+      setDemoBusy(false);
+      void qc.invalidateQueries({ queryKey: ['board'] });
+    }
+  };
+
   return (
     <Page
       title="Tasks"
       subtitle="Everything Clementine is working on — drag to cancel or start, click a card to watch it live."
-      actions={<Button variant="secondary" onClick={() => void board.refetch()}>Refresh</Button>}
+      actions={(
+        <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" onClick={() => void onLaunchDemo()} disabled={demoBusy}>
+            <PlayCircle className="h-4 w-4" aria-hidden /> {demoBusy ? 'Launching' : 'Launch demo'}
+          </Button>
+          <Button variant="secondary" onClick={() => void board.refetch()}>Refresh</Button>
+        </div>
+      )}
     >
       {!board.isLoading && staleCards.length > 0 && !keptStale && (
         <div className="mb-4 flex flex-col gap-2 rounded-lg border border-warning/40 bg-warning-tint/50 p-4">

@@ -16,7 +16,7 @@ import type { Express, Request, Response } from 'express';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import {
-  spaceStore, resolveInSpace, resolveSpaceDir, isValidSpaceSlug,
+  spaceStore, resolveInSpace, resolveSpaceDir, isValidSpaceSlug, buildSpaceHealthSnapshot,
 } from '../spaces/store.js';
 import {
   readData, writeData, appendNote, listNotes, appendAudit, listAudit,
@@ -151,7 +151,8 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
   // ---- Management --------------------------------------------------------
   app.get('/api/console/spaces', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    res.json({ spaces: spaceStore.list(req.query.archived === '1') });
+    const spaces = spaceStore.list(req.query.archived === '1');
+    res.json({ spaces: spaces.map((space) => ({ ...space, health: buildSpaceHealthSnapshot(space) })) });
   });
 
   app.post('/api/console/spaces', (req, res) => {
@@ -179,7 +180,8 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       viewSource = readFileSync(vf, 'utf-8');
       viewMtimeMs = statSync(vf).mtimeMs; // lets the UI auto-reload on ANY view edit (incl. write_file)
     } catch { /* no view yet */ }
-    res.json({ space: rec, viewSource, viewMtimeMs, notes: listNotes(slug, 50), audit: listAudit(slug, 50) });
+    const health = buildSpaceHealthSnapshot(rec);
+    res.json({ space: { ...rec, health }, viewSource, viewMtimeMs, notes: listNotes(slug, 50), audit: listAudit(slug, 50), health });
   });
 
   app.patch('/api/console/spaces/:id', (req, res) => {

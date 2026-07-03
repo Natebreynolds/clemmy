@@ -1,7 +1,7 @@
 import {
   MessageCircle, Inbox, Zap, Plug, Brain, Video, LayoutDashboard,
   BarChart3, Wrench, Stethoscope, Gauge, Sliders, Sparkles,
-  Settings, HelpCircle, ListChecks, Users, FlaskConical, Goal, Activity,
+  Settings, HelpCircle, ListChecks, Users, FlaskConical, Goal, Activity, GitBranch,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -32,6 +32,7 @@ export const ADVANCED_NAV: NavDest[] = [
   { path: '/advanced/tools', label: 'Tools', icon: Wrench, hint: 'Registered tool catalog' },
   { path: '/advanced/diagnostics', label: 'Diagnostics', icon: Stethoscope, hint: 'Health, logs & storage' },
   { path: '/advanced/observability', label: 'Observability', icon: Activity, hint: 'Live operational telemetry feed' },
+  { path: '/advanced/traces', label: 'Trace Lab', icon: GitBranch, hint: 'Harness run timeline & replay preview' },
   { path: '/advanced/budgets', label: 'Run limits', icon: Gauge, hint: 'How far a run goes — steps, time & caps' },
   { path: '/agents', label: 'Agents', icon: Users, hint: 'Your specialized team & how they talk' },
   { path: '/advanced/autonomy', label: 'Autonomy', icon: Sliders, hint: 'When Clementine acts on its own' },

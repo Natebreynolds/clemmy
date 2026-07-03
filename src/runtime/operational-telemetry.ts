@@ -101,6 +101,11 @@ export const TOOL_OPERATIONAL_EVENT_TYPES = [
   'tool_call_completed',
   'tool_call_failed',
   'tool_approval_pending',
+  // A successful Composio call was SHAPE-classified as a queued async receipt by the
+  // family-agnostic generic detector (not a known family). Emitted so the heuristic's
+  // precision is watchable in prod — payload carries slug/toolkit/jobId + the outcome
+  // (parked | banner). A spike of these on normal completes is the false-positive signal.
+  'composio_async_generic_detected',
 ] as const;
 
 // Harness run-lifecycle + swarm + background-task telemetry. Most of these are
@@ -117,6 +122,10 @@ export const HARNESS_OPERATIONAL_EVENT_TYPES = [
   'worker_completed',
   'worker_failed',
   'worker_capped',
+  // A configured non-Claude WORKER model was ignored because the SDK-brain
+  // cross-provider lane is off (CLEMMY_SDK_BRAIN_CROSS_WORKER=off) — a visible
+  // warning instead of a silent fallback to the Claude brain model.
+  'worker_model_ignored',
   'auto_continue',
   'background_task_created',
   'background_task_started',

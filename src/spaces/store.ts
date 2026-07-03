@@ -139,6 +139,46 @@ export interface SpaceRecord {
   manifestErrors?: string[];
 }
 
+export type SpaceFreshnessState = 'no_sources' | 'fresh' | 'stale' | 'never_refreshed';
+
+export interface SpaceRunnerHealth {
+  kind: 'dataSource' | 'action';
+  id: string;
+  runner: string;
+  present: boolean;
+  invalid?: string;
+}
+
+export interface SpaceHealthSnapshot {
+  id: string;
+  title: string;
+  status: SpaceStatus;
+  version: number;
+  generatedAt: string;
+  counts: {
+    dataSources: number;
+    actions: number;
+    revisions: number;
+    runners: number;
+  };
+  view: {
+    entry: string;
+    exists: boolean;
+    bytes: number;
+    mtime?: string;
+  };
+  runners: SpaceRunnerHealth[];
+  freshness: {
+    state: SpaceFreshnessState;
+    lastRefreshedAt?: string;
+    ageMs?: number;
+    staleAfterMs: number;
+  };
+  issues: string[];
+}
+
+const DEFAULT_STALE_AFTER_MS = 36 * 60 * 60 * 1000;
+
 function ensureDir(dir: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
@@ -355,6 +395,96 @@ function readManifest(slug: string): SpaceRecord | undefined {
   }
 }
 
+function declaredRunnerHealth(record: SpaceRecord): SpaceRunnerHealth[] {
+  const out: SpaceRunnerHealth[] = [];
+  for (const src of record.dataSources) {
+    if (!src.runner) continue;
+    const invalid = runnerFilenameError(src.runner) ?? undefined;
+    let present = false;
+    if (!invalid) {
+      try { present = existsSync(resolveInSpace(record.id, path.join('data', src.runner))); } catch { present = false; }
+    }
+    out.push({ kind: 'dataSource', id: src.id, runner: src.runner, present, ...(invalid ? { invalid } : {}) });
+  }
+  for (const action of record.actions) {
+    if (!action.runner) continue;
+    const invalid = runnerFilenameError(action.runner) ?? undefined;
+    let present = false;
+    if (!invalid) {
+      try { present = existsSync(resolveInSpace(record.id, path.join('data', action.runner))); } catch { present = false; }
+    }
+    out.push({ kind: 'action', id: action.id, runner: action.runner, present, ...(invalid ? { invalid } : {}) });
+  }
+  return out;
+}
+
+export function buildSpaceHealthSnapshot(
+  record: SpaceRecord,
+  opts: { now?: number; staleAfterMs?: number } = {},
+): SpaceHealthSnapshot {
+  const now = opts.now ?? Date.now();
+  const staleAfterMs = opts.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const issues: string[] = [...(record.manifestErrors ?? [])];
+  let view: SpaceHealthSnapshot['view'] = { entry: record.viewEntry, exists: false, bytes: 0 };
+  try {
+    const viewFile = resolveInSpace(record.id, record.viewEntry);
+    const st = statSync(viewFile);
+    if (st.isFile()) {
+      view = {
+        entry: record.viewEntry,
+        exists: true,
+        bytes: st.size,
+        mtime: st.mtime.toISOString(),
+      };
+    }
+  } catch {
+    view = { entry: record.viewEntry, exists: false, bytes: 0 };
+  }
+  if (!view.exists) issues.push(`view entry "${record.viewEntry}" is missing`);
+
+  const runners = declaredRunnerHealth(record);
+  for (const runner of runners) {
+    const label = runner.kind === 'dataSource' ? 'data source' : 'action';
+    if (runner.invalid) {
+      issues.push(`${label} "${runner.id}" runner "${runner.runner}" is invalid: ${runner.invalid}`);
+    } else if (!runner.present) {
+      issues.push(`${label} "${runner.id}" declares data/${runner.runner}, but the file is missing`);
+    }
+  }
+
+  let freshness: SpaceHealthSnapshot['freshness'];
+  if (record.dataSources.length === 0) {
+    freshness = { state: 'no_sources', staleAfterMs };
+  } else if (!record.lastRefreshedAt) {
+    freshness = { state: 'never_refreshed', staleAfterMs };
+    issues.push('data sources have never refreshed');
+  } else {
+    const parsed = Date.parse(record.lastRefreshedAt);
+    const ageMs = Number.isFinite(parsed) ? Math.max(0, now - parsed) : undefined;
+    const state: SpaceFreshnessState = ageMs !== undefined && ageMs <= staleAfterMs ? 'fresh' : 'stale';
+    freshness = { state, lastRefreshedAt: record.lastRefreshedAt, ...(ageMs !== undefined ? { ageMs } : {}), staleAfterMs };
+    if (state === 'stale') issues.push(`last data refresh is older than ${Math.round(staleAfterMs / 3_600_000)} hours`);
+  }
+
+  return {
+    id: record.id,
+    title: record.title,
+    status: record.status,
+    version: record.version,
+    generatedAt: new Date(now).toISOString(),
+    counts: {
+      dataSources: record.dataSources.length,
+      actions: record.actions.length,
+      revisions: record.revisions.length,
+      runners: runners.length,
+    },
+    view,
+    runners,
+    freshness,
+    issues,
+  };
+}
+
 export interface SaveSpaceInput {
   id: string;
   title: string;
@@ -563,6 +693,15 @@ export class SpaceStore {
       actor: 'space-store',
       payload: { mutation: 'reindex' },
     });
+  }
+
+  health(slug: string): SpaceHealthSnapshot | undefined {
+    const rec = this.get(slug);
+    return rec ? buildSpaceHealthSnapshot(rec) : undefined;
+  }
+
+  listHealth(includeArchived = false): SpaceHealthSnapshot[] {
+    return this.list(includeArchived).map((rec) => buildSpaceHealthSnapshot(rec));
   }
 }
 

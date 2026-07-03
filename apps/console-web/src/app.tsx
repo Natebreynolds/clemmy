@@ -50,6 +50,7 @@ export function App() {
             <Route path="/advanced/tools" element={<Advanced />} />
             <Route path="/advanced/diagnostics" element={<Advanced />} />
             <Route path="/advanced/observability" element={<Advanced />} />
+            <Route path="/advanced/traces" element={<Advanced />} />
             <Route path="/advanced/budgets" element={<Advanced />} />
             <Route path="/advanced/autonomy" element={<Advanced />} />
             <Route path="/advanced/evolution" element={<Advanced />} />

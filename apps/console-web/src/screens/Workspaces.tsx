@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Clock } from 'lucide-react';
+import { Plus, Clock, Database, Zap, History, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
@@ -22,8 +22,19 @@ function scheduleHint(space: SpaceRecord): string | null {
   try { return humanizeCron(scheduled.schedule); } catch { return scheduled.schedule; }
 }
 
+function healthLabel(space: SpaceRecord): { tone: Tone; text: string } {
+  const health = space.health;
+  if (!health) return { tone: 'neutral', text: 'health pending' };
+  if (health.issues.length > 0) return { tone: 'warning', text: `${health.issues.length} issue${health.issues.length === 1 ? '' : 's'}` };
+  if (health.freshness.state === 'fresh') return { tone: 'success', text: 'fresh' };
+  if (health.freshness.state === 'no_sources') return { tone: 'neutral', text: 'static' };
+  return { tone: 'warning', text: health.freshness.state.replace('_', ' ') };
+}
+
 function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => void }) {
   const sched = scheduleHint(space);
+  const health = space.health;
+  const healthStatus = healthLabel(space);
   return (
     <button
       type="button"
@@ -49,12 +60,35 @@ function WorkspaceCard({ space, onOpen }: { space: SpaceRecord; onOpen: () => vo
       <div className="flex flex-1 flex-col gap-1 p-4">
         <div className="flex items-center justify-between gap-2">
           <h3 className="truncate text-h3 text-fg">{space.title}</h3>
-          <StatusPill tone={statusTone(space.status)}>{space.status}</StatusPill>
+          <StatusPill tone={healthStatus.tone}>{healthStatus.text}</StatusPill>
         </div>
         <p className="text-caption text-faint">Updated {new Date(space.updatedAt).toLocaleDateString()}</p>
+        {health && (
+          <div className="mt-2 grid grid-cols-3 gap-2 text-caption text-muted">
+            <span className="inline-flex items-center gap-1 truncate">
+              <Database className="h-3.5 w-3.5 shrink-0" aria-hidden /> {health.counts.dataSources}
+            </span>
+            <span className="inline-flex items-center gap-1 truncate">
+              <Zap className="h-3.5 w-3.5 shrink-0" aria-hidden /> {health.counts.actions}
+            </span>
+            <span className="inline-flex items-center gap-1 truncate">
+              <History className="h-3.5 w-3.5 shrink-0" aria-hidden /> v{health.version}
+            </span>
+          </div>
+        )}
         {sched && (
           <p className="mt-1 inline-flex items-center gap-1.5 text-small text-muted">
             <Clock className="h-3.5 w-3.5" aria-hidden /> {sched}
+          </p>
+        )}
+        {health && health.issues.length > 0 && (
+          <p className="mt-1 inline-flex items-center gap-1.5 truncate text-caption text-warning">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden /> {health.issues[0]}
+          </p>
+        )}
+        {health && health.issues.length === 0 && (
+          <p className="mt-1 inline-flex items-center gap-1.5 text-caption text-success">
+            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> View, data, and actions indexed
           </p>
         )}
       </div>

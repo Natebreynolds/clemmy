@@ -19,7 +19,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 const { HarnessSession } = await import('./session.js');
 const { listEvents } = await import('./eventlog.js');
-const { reportInterruptedChatRuns, markRunInFlight } = await import('./restart-recovery.js');
+const { reportInterruptedChatRuns, recoverInterruptedChatRuns, markRunInFlight, restartRecoveryPrimerPrefixForTests } = await import('./restart-recovery.js');
 
 test('exported markRunInFlight: arms + clears a CHAT session, skips non-chat, respects the kill-switch', () => {
   const chat = HarnessSession.create({ kind: 'chat', title: 'c' });
@@ -81,6 +81,39 @@ test('surfaces ONLY interrupted chat runs; leaves clean + non-chat sessions alon
   // clean + workflow sessions untouched
   assert.ok(!hasInterruptedEvent(clean.id), 'a clean run is never flagged');
   assert.ok(!hasInterruptedEvent(wf.id), 'a non-chat session is never flagged');
+});
+
+test('structured recovery prepares a durable replay primer in the harness snapshot', () => {
+  const interrupted = HarnessSession.create({ kind: 'chat', title: 'recoverable long task' });
+  interrupted.updateConversationSnapshot([{ role: 'user', content: 'Research the market and build the report.' }]);
+  interrupted.setRunInFlight('2026-06-07T00:00:00.000Z');
+
+  const summary = recoverInterruptedChatRuns(() => 1234);
+  assert.equal(summary.enabled, true);
+  assert.equal(summary.recovered, 1);
+  assert.equal(summary.notified, 1);
+  assert.equal(summary.records.length, 1);
+  const record = summary.records[0];
+  assert.equal(record.sessionId, interrupted.id);
+  assert.equal(record.replayPrepared, true);
+  assert.equal(record.snapshotItemsBefore, 1);
+  assert.equal(record.snapshotItemsAfter, 2);
+  assert.equal(record.markerCleared, true);
+
+  const items = HarnessSession.load(interrupted.id)!.toInputItems();
+  assert.ok(items.some((it) => {
+    const content = (it as { content?: unknown }).content;
+    return typeof content === 'string'
+      && content.startsWith(restartRecoveryPrimerPrefixForTests())
+      && content.includes('continue');
+  }), 'restart primer is durably replayed on the next turn');
+
+  const notice = listEvents(interrupted.id, { limit: 20 }).find(
+    (e) => e.type === 'conversation_completed'
+      && (e.data as { reason?: string } | undefined)?.reason === 'interrupted_by_restart',
+  );
+  assert.equal((notice?.data as { replayPrepared?: boolean } | undefined)?.replayPrepared, true);
+  assert.equal((notice?.data as { snapshotItemsAfter?: number } | undefined)?.snapshotItemsAfter, 2);
 });
 
 test('boot scan finds an interrupted chat behind newer session pages', () => {

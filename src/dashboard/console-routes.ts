@@ -189,6 +189,8 @@ import {
   findSoleAwaitingInputTaskForOrigin,
   getBackgroundTask,
   listBackgroundTasks,
+  markBackgroundTaskDone,
+  markBackgroundTaskRunning,
   processBackgroundTasks,
   queueBackgroundTaskApprovalResolution,
   queueBackgroundTaskContinue,
@@ -302,6 +304,7 @@ import {
   listTraceSummaries,
   type ListTraceOptions,
 } from '../runtime/harness/trace-lab.js';
+import { buildStartupDoctor } from '../runtime/startup-doctor.js';
 
 function toolEventsDir(): string {
   return path.join(process.env.CLEMENTINE_HOME || BASE_DIR, 'state', 'tool-events');
@@ -4139,6 +4142,15 @@ export function registerConsoleRoutes(
     }
   });
 
+  app.get('/api/console/startup-doctor', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(buildStartupDoctor());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Returns a snapshot of "is Clementine actively working right now?"
    * Used by the desktop auto-updater to decide whether `quitAndInstall`
@@ -6026,7 +6038,55 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.get('/api/console/background-tasks/:id', (req, res) => {
+  app.post('/api/console/demo/agentic-flow', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const reportBackTarget = parseBackgroundReportBackTarget((req.body as { reportBackTarget?: unknown } | undefined)?.reportBackTarget);
+      const task = createBackgroundTask({
+        title: 'Demo: agentic delivery loop',
+        prompt: [
+          'Demonstrate Clementine end to end:',
+          '- queue a durable background task',
+          '- show live task status in the cockpit',
+          '- produce a result with evidence and risks',
+          '- queue the report-back notification for Slack or Discord routes',
+        ].join('\n'),
+        source: 'desktop',
+        maxMinutes: 5,
+        ...(reportBackTarget ? { reportBackTarget } : {}),
+      });
+      markBackgroundTaskRunning(task.id);
+      const result = [
+        '# Demo: Agentic Delivery Loop',
+        '',
+        '## Completed',
+        '- Created a durable background task record.',
+        '- Advanced it through the same running and completed states used by real autonomous work.',
+        '- Queued the completion notification with task metadata so Slack and Discord report-back routing can pick it up.',
+        '- Made the task inspectable in the Tasks cockpit with result, notifications, and delivery metadata.',
+        '',
+        '## Evidence / Verification',
+        `- Task ID: ${task.id}`,
+        '- Route: POST /api/console/demo/agentic-flow',
+        '- Store: state/background-tasks plus state/notifications',
+        '',
+        '## Remaining Risks',
+        '- Live external delivery still depends on configured Slack or Discord routes passing the acceptance runner.',
+        '',
+        '## Next Step',
+        'Open this task in the Tasks board cockpit, then run channel acceptance from Settings.',
+      ].join('\n');
+      const completed = markBackgroundTaskDone(task.id, result, {
+        notificationBody: 'Demo completed. Open the Tasks cockpit to inspect the result, evidence, and delivery metadata.',
+      }) ?? getBackgroundTask(task.id) ?? task;
+      const detail = getBackgroundTaskStatus(task.id);
+      res.json({ ok: true, task: completed, detail });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/background-tasks/:id', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const task = getBackgroundTask(req.params.id);
@@ -6040,7 +6100,28 @@ export function registerConsoleRoutes(
         resultFull = full.length > 50_000 ? `${full.slice(0, 50_000)}\n\n...[truncated for console preview]` : full;
       }
       const detail = getBackgroundTaskStatus(task.id);
-      res.json({ task: { ...task, resultFull }, detail });
+      // Cockpit vitals: give the drawer a live sense of duration / effort / spend
+      // so a running card looks different at 30s vs 30min. All best-effort — a
+      // missing field just drops that metric, never fails the response.
+      const startMs = Date.parse(task.startedAt ?? task.createdAt);
+      const endMs = task.completedAt ? Date.parse(task.completedAt) : Date.now();
+      const elapsedMs = Number.isFinite(startMs) ? Math.max(0, endMs - startMs) : undefined;
+      // Each tool call emits a 'start' phase then an 'end'/'error' — count starts
+      // so paired events aren't double-counted (tool-observability.ts phases).
+      const toolCallCount = (detail?.toolEvents ?? []).filter((event) => event.phase === 'start').length;
+      let tokensUsed: number | undefined;
+      try {
+        const { sumUsageTokensForSource } = await import('../runtime/usage-log.js');
+        const total = sumUsageTokensForSource(task.runSessionId);
+        if (total > 0) tokensUsed = total;
+      } catch { /* usage log is best-effort observability */ }
+      const vitals = {
+        ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+        toolCallCount,
+        ...(tokensUsed !== undefined ? { tokensUsed } : {}),
+        running: !task.completedAt,
+      };
+      res.json({ task: { ...task, resultFull }, detail, vitals });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

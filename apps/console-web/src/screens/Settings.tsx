@@ -8,6 +8,7 @@ import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
 import { ModelsRoutingSection } from './settings/ModelsRoutingSection';
 import { DeveloperModeCard } from './settings/DeveloperModeCard';
+import { StartupDoctorCard } from './settings/StartupDoctorCard';
 import { cn } from '@/lib/cn';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
@@ -58,6 +59,8 @@ export function Settings() {
         </Card>
 
         <ProfileForm />
+
+        <StartupDoctorCard />
 
         <NotificationsEditor />
 

@@ -254,6 +254,156 @@ function gatherPriorSameShapeSends(sessionId: string, toolName: string, shapeKey
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Explainability surface (pure, no judge call)
+// ─────────────────────────────────────────────────────────────────
+
+export interface GoalFidelitySkillSummary {
+  name: string;
+  bodyPreview: string;
+  rendererShortfall: { skill: string; prescribed: string[] } | null;
+}
+
+export interface GoalFidelityEvidenceSummary {
+  toolName: string;
+  irreversible: boolean;
+  shapeKey?: string;
+  targets: string[];
+  currentTarget: string;
+  messageRegionPresent: boolean;
+  priorSameShapeTargets: string[];
+  uniform: boolean;
+  uniformPeerTargets: string[];
+  text: string;
+  payloadPreview: string;
+}
+
+export interface GoalFidelityStateSummary {
+  sessionId: string;
+  generatedAt: string;
+  enabled: boolean;
+  alignmentEnabled: boolean;
+  hasGoal: boolean;
+  goal: string;
+  skills: GoalFidelitySkillSummary[];
+  mode: 'disabled' | 'no_goal' | 'legacy_no_skill' | 'alignment_judge_ready' | 'skill_judge_ready' | 'renderer_block_risk';
+  issues: string[];
+  evidence?: GoalFidelityEvidenceSummary;
+}
+
+function clipOneLine(s: string, max = 900): string {
+  const compact = s.replace(/\s+/g, ' ').trim();
+  return compact.length > max ? `${compact.slice(0, max - 1)}…` : compact;
+}
+
+/**
+ * Inspect the exact goal/skill/evidence inputs the write-time gate would use,
+ * without invoking the LLM judge or mutating failure counters. This gives UI,
+ * APIs, and tests a stable truth surface for "why would this write be judged?"
+ * instead of forcing operators to reverse-engineer it from the event log.
+ */
+export function summarizeGoalFidelityState(
+  sessionId: string,
+  toolName?: string,
+  rawArgs?: unknown,
+): GoalFidelityStateSummary {
+  const issues: string[] = [];
+  const enabled = isGoalFidelityGateEnabled();
+  const alignmentEnabled = isGoalAlignmentGateEnabled();
+  const goal = gatherGoalText(sessionId);
+  let rawSkills: SessionSkill[] = [];
+  try {
+    rawSkills = gatherSessionSkills(sessionId);
+  } catch (err) {
+    issues.push(`skills_unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  const skills = rawSkills.map((skill) => {
+    let rendererShortfall: { skill: string; prescribed: string[] } | null = null;
+    try {
+      rendererShortfall = skillBodyExecutionShortfall(skill.name, skill.body, sessionId, skill.dir);
+    } catch {
+      rendererShortfall = null;
+    }
+    return {
+      name: skill.name,
+      bodyPreview: clipOneLine(skill.body),
+      rendererShortfall,
+    };
+  });
+
+  if (!enabled) issues.push('goal fidelity gate is disabled');
+  if (!goal) issues.push('no recoverable user goal or approved goal contract');
+  if (goal && skills.length === 0 && !alignmentEnabled) issues.push('no loaded skill and the goal-alignment widening is disabled');
+  for (const skill of skills) {
+    if (skill.rendererShortfall) {
+      issues.push(`skill "${skill.name}" has not run prescribed producer: ${skill.rendererShortfall.prescribed.join(', ')}`);
+    }
+  }
+
+  let mode: GoalFidelityStateSummary['mode'] = 'skill_judge_ready';
+  if (!enabled) mode = 'disabled';
+  else if (!goal) mode = 'no_goal';
+  else if (skills.some((skill) => skill.rendererShortfall)) mode = 'renderer_block_risk';
+  else if (skills.length === 0 && !alignmentEnabled) mode = 'legacy_no_skill';
+  else if (skills.length === 0) mode = 'alignment_judge_ready';
+
+  let evidence: GoalFidelityEvidenceSummary | undefined;
+  if (toolName && rawArgs !== undefined) {
+    const targets = extractTargetKeys(rawArgs);
+    let irreversible = false;
+    let shapeKey: string | undefined;
+    try {
+      const shape = classifyExternalWrite(toolName, rawArgs);
+      irreversible = shape.irreversible;
+      shapeKey = shape.shapeKey;
+    } catch (err) {
+      issues.push(`write_shape_unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const currentTarget = targets[0] ?? '';
+    const currentRegion = personalizationRegion(extractMessageBody(rawArgs));
+    const priorSends = gatherPriorSameShapeSends(sessionId, toolName, shapeKey);
+    const uniform = detectBatchUniformity({ currentTarget, currentRegion, priorSends });
+    let text = '(none)';
+    if (uniform.uniform) {
+      text = `This action's opening paragraph is BYTE-IDENTICAL to ${uniform.peerTargets.length} prior same-shape send(s) this session to DISTINCT target(s) (e.g. ${uniform.peerTargets.slice(0, 3).join(', ')}).`;
+    }
+    let payloadPreview = '';
+    try {
+      payloadPreview = clipOneLine(renderPayloadForJudge(toolName, rawArgs), 1200);
+    } catch {
+      payloadPreview = '';
+    }
+    evidence = {
+      toolName,
+      irreversible,
+      shapeKey,
+      targets,
+      currentTarget,
+      messageRegionPresent: currentRegion.length > 0,
+      priorSameShapeTargets: priorSends.map((send) => send.target),
+      uniform: uniform.uniform,
+      uniformPeerTargets: uniform.peerTargets,
+      text,
+      payloadPreview,
+    };
+  }
+
+  return {
+    sessionId,
+    generatedAt: new Date().toISOString(),
+    enabled,
+    alignmentEnabled,
+    hasGoal: !!goal,
+    goal,
+    skills,
+    mode,
+    issues,
+    evidence,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Judge (3b) — one fast fail-open call
 // ─────────────────────────────────────────────────────────────────
 

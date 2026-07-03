@@ -412,6 +412,56 @@ test('background task cockpit routes save report-back target and repost result',
   }
 });
 
+test('GET /api/console/startup-doctor is auth gated and returns runtime/native status', async () => {
+  const authorized = { v: false };
+  const h = await boot(authorized);
+  try {
+    const denied = await fetch(`${h.url}/api/console/startup-doctor`);
+    assert.equal(denied.status, 401);
+
+    authorized.v = true;
+    const res = await fetch(`${h.url}/api/console/startup-doctor`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      status: string;
+      runtime?: { node?: string; nodeModuleVersion?: string };
+      nativeDependencies?: Array<{ name: string; status: string }>;
+    };
+    assert.ok(['ok', 'warning', 'error'].includes(body.status));
+    assert.ok(body.runtime?.node);
+    assert.ok(body.runtime?.nodeModuleVersion);
+    assert.ok(body.nativeDependencies?.some((dep) => dep.name === 'better-sqlite3'));
+  } finally {
+    await h.close();
+  }
+});
+
+test('POST /api/console/demo/agentic-flow seeds an inspectable completed task', async () => {
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/demo/agentic-flow`, { method: 'POST' });
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      ok: boolean;
+      task?: { id: string; title: string; status: string };
+      detail?: { notifications: Array<{ id: string }> };
+    };
+    assert.equal(body.ok, true);
+    assert.equal(body.task?.status, 'done');
+    assert.match(body.task?.title ?? '', /agentic delivery loop/i);
+    const stored = getBackgroundTask(body.task!.id);
+    assert.equal(stored?.status, 'done');
+    assert.ok(stored?.result?.includes('Demo: Agentic Delivery Loop'));
+    assert.ok(body.detail?.notifications.length, 'demo task detail includes the completion notification');
+
+    const notification = listNotifications(50).find((item) => item.metadata?.backgroundTaskId === body.task!.id);
+    assert.ok(notification, 'completion notification is queued for the demo task');
+    assert.equal(notification?.metadata?.runSessionId, stored?.runSessionId);
+  } finally {
+    await h.close();
+  }
+});
+
 test('board action route: cancel is accepted and transitions the task; auth is gated', async () => {
   const task = createBackgroundTask({ title: 'to cancel', prompt: 'p' });
   markBackgroundTaskRunning(task.id);

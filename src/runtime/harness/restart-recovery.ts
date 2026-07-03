@@ -50,8 +50,32 @@ export function markRunInFlight(sessionId: string, on: boolean): void {
 
 const INTERRUPTED_REPLY =
   'This run was interrupted by a restart before it finished. Reply `continue` to pick up where it left off.';
+const REPLAY_PRIMER_PREFIX = '[restart-recovery]';
 const MAX_NOTIFICATIONS = 10;
 const CHAT_SCAN_PAGE_SIZE = 500;
+
+export interface RestartRecoveryRecord {
+  sessionId: string;
+  title?: string;
+  inFlightSince: string;
+  replayPrepared: boolean;
+  replayPrimerChanged: boolean;
+  snapshotItemsBefore: number;
+  snapshotItemsAfter: number;
+  lastResponseIdPresent: boolean;
+  noticeRecorded: boolean;
+  notified: boolean;
+  markerCleared: boolean;
+  errors: string[];
+}
+
+export interface RestartRecoverySummary {
+  enabled: boolean;
+  scanned: number;
+  recovered: number;
+  notified: number;
+  records: RestartRecoveryRecord[];
+}
 
 function listChatSessionsForRecovery(): SessionRow[] {
   const rows: SessionRow[] = [];
@@ -63,24 +87,34 @@ function listChatSessionsForRecovery(): SessionRow[] {
   return rows;
 }
 
+function buildReplayPrimer(sessionId: string, inFlightSince: string): string {
+  return [
+    `${REPLAY_PRIMER_PREFIX} The previous assistant run in this chat was interrupted by a daemon restart before it finished.`,
+    `Session: ${sessionId}`,
+    `Interrupted run started at: ${inFlightSince}`,
+    'When the user asks to continue, resume from the replayed conversation, tool outputs, and audit log. Do not restart from scratch; reconstruct the last known state, state any uncertainty briefly, then continue the interrupted task.',
+  ].join('\n');
+}
+
 /**
  * Scan chat sessions for an in-flight marker left by a run that was killed
  * mid-flight (daemon restart). For each: emit a non-silent conversation_completed
  * so report-back never fails silently, send a bounded notification, and clear the
- * marker. Returns how many runs were recovered. Never throws.
+ * marker. Returns a structured recovery summary. Never throws.
  */
-export function reportInterruptedChatRuns(now: () => number = Date.now): number {
-  if (!enabled()) return 0;
+export function recoverInterruptedChatRuns(now: () => number = Date.now): RestartRecoverySummary {
+  if (!enabled()) return { enabled: false, scanned: 0, recovered: 0, notified: 0, records: [] };
 
   let rows;
   try {
     rows = listChatSessionsForRecovery();
   } catch {
-    return 0;
+    return { enabled: true, scanned: 0, recovered: 0, notified: 0, records: [] };
   }
 
   let recovered = 0;
   let notified = 0;
+  const records: RestartRecoveryRecord[] = [];
   for (const row of rows) {
     let sess: HarnessSession | null = null;
     try {
@@ -98,6 +132,31 @@ export function reportInterruptedChatRuns(now: () => number = Date.now): number 
     }
     if (!since) continue; // not interrupted — completed runs clear their marker
 
+    const record: RestartRecoveryRecord = {
+      sessionId: row.id,
+      ...(row.title ? { title: row.title } : {}),
+      inFlightSince: since,
+      replayPrepared: false,
+      replayPrimerChanged: false,
+      snapshotItemsBefore: 0,
+      snapshotItemsAfter: 0,
+      lastResponseIdPresent: false,
+      noticeRecorded: false,
+      notified: false,
+      markerCleared: false,
+      errors: [],
+    };
+
+    try {
+      record.snapshotItemsBefore = sess.toInputItems().length;
+      record.lastResponseIdPresent = !!sess.previousResponseId();
+      record.replayPrimerChanged = sess.setContextPrimer(REPLAY_PRIMER_PREFIX, buildReplayPrimer(row.id, since));
+      record.snapshotItemsAfter = sess.toInputItems().length;
+      record.replayPrepared = true;
+    } catch (err) {
+      record.errors.push(`replay_primer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     // Non-silent in-session notice (the dock replays it; `continue` resumes).
     try {
       appendEvent({
@@ -111,37 +170,65 @@ export function reportInterruptedChatRuns(now: () => number = Date.now): number 
           summary: INTERRUPTED_REPLY,
           reply: INTERRUPTED_REPLY,
           interruptedAt: since,
+          replayPrepared: record.replayPrepared,
+          replayPrimerChanged: record.replayPrimerChanged,
+          snapshotItemsBefore: record.snapshotItemsBefore,
+          snapshotItemsAfter: record.snapshotItemsAfter,
+          lastResponseIdPresent: record.lastResponseIdPresent,
         },
       });
-    } catch {
-      /* best-effort */
+      record.noticeRecorded = true;
+    } catch (err) {
+      record.errors.push(`notice_event: ${err instanceof Error ? err.message : String(err)}`);
     }
 
+    const tick = now();
     // Bounded proactive notification so the user is told even off-session.
     if (notified < MAX_NOTIFICATIONS) {
       try {
         addNotification({
-          id: `${now()}-chat-interrupted-${row.id}`,
+          id: `${tick}-chat-interrupted-${row.id}`,
           kind: 'system',
           title: 'A chat task was interrupted by a restart',
           body: `${INTERRUPTED_REPLY} (session ${row.id})`,
-          createdAt: new Date(now()).toISOString(),
+          createdAt: new Date(tick).toISOString(),
           read: false,
-          metadata: { sessionId: row.id, reason: 'interrupted_by_restart' },
+          metadata: {
+            sessionId: row.id,
+            reason: 'interrupted_by_restart',
+            replayPrepared: record.replayPrepared,
+          },
         });
         notified += 1;
-      } catch {
-        /* best-effort */
+        record.notified = true;
+      } catch (err) {
+        record.errors.push(`notification: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
     try {
       sess.clearRunInFlight();
+      record.markerCleared = true;
     } catch {
-      /* best-effort */
+      record.errors.push('marker_clear: failed');
     }
+
     recovered += 1;
+    records.push(record);
   }
 
-  return recovered;
+  return { enabled: true, scanned: rows.length, recovered, notified, records };
+}
+
+/**
+ * Back-compat wrapper used by daemon boot logging. Prefer
+ * recoverInterruptedChatRuns() when the caller needs a visible recovery plan.
+ */
+export function reportInterruptedChatRuns(now: () => number = Date.now): number {
+  const summary = recoverInterruptedChatRuns(now);
+  return summary.recovered;
+}
+
+export function restartRecoveryPrimerPrefixForTests(): string {
+  return REPLAY_PRIMER_PREFIX;
 }

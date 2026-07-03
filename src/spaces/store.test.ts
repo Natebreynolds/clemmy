@@ -70,6 +70,33 @@ test('recordRevision snapshots the view + bumps version', () => {
   assert.ok(existsSync(snap));
 });
 
+test('buildSpaceHealthSnapshot surfaces view, runners, freshness, and issues', () => {
+  const slug = 'health-demo';
+  const rec = store.spaceStore.save({
+    id: slug,
+    title: 'Health Demo',
+    dataSources: [{ id: 'pull', runner: 'refresh.mjs' }],
+    actions: [{ id: 'act', runner: 'act.mjs' }],
+  });
+  const viewFile = store.resolveInSpace(slug, 'view/index.html');
+  mkdirSync(path.dirname(viewFile), { recursive: true });
+  writeFileSync(viewFile, '<html>healthy</html>', 'utf-8');
+  const scriptDir = store.resolveInSpace(slug, 'data');
+  mkdirSync(scriptDir, { recursive: true });
+  writeFileSync(path.join(scriptDir, 'refresh.mjs'), 'process.stdout.write("{}")', 'utf-8');
+
+  const health = store.buildSpaceHealthSnapshot(rec, { now: Date.parse('2026-06-09T00:00:00.000Z') });
+  assert.equal(health.view.exists, true);
+  assert.equal(health.counts.dataSources, 1);
+  assert.equal(health.counts.actions, 1);
+  assert.equal(health.counts.runners, 2);
+  assert.equal(health.runners.find((r) => r.runner === 'refresh.mjs')?.present, true);
+  assert.equal(health.runners.find((r) => r.runner === 'act.mjs')?.present, false);
+  assert.equal(health.freshness.state, 'never_refreshed');
+  assert.ok(health.issues.some((issue) => /data\/act\.mjs/.test(issue)));
+  assert.ok(health.issues.some((issue) => /never refreshed/.test(issue)));
+});
+
 test('archive hides from default list; includeArchived shows it; remove deletes dir', () => {
   store.spaceStore.save({ id: 'gone', title: 'Gone' });
   store.spaceStore.archive('gone');

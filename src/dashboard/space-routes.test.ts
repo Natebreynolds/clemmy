@@ -50,7 +50,15 @@ test('POST creates a workspace with a placeholder view; GET list shows it', asyn
 
   const list = await j(await fetch(`${base}/api/console/spaces`));
   assert.equal(list.status, 200);
-  assert.ok(list.body.spaces.some((s: any) => s.id === slug));
+  const listed = list.body.spaces.find((s: any) => s.id === slug);
+  assert.ok(listed);
+  assert.equal(listed.health.view.exists, true);
+  assert.equal(listed.health.counts.revisions, 0);
+
+  const detail = await j(await fetch(`${base}/api/console/spaces/${slug}`));
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.health.id, slug);
+  assert.equal(detail.body.space.health.view.exists, true);
 
   // The placeholder view is served as HTML.
   const view = await fetch(`${base}/console/spaces/${slug}/view`);

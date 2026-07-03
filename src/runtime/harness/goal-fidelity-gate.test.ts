@@ -30,6 +30,7 @@ const {
   personalizationRegion,
   detectBatchUniformity,
   buildGoalFidelityPrompt,
+  summarizeGoalFidelityState,
   evaluateGoalFidelity,
   GoalFidelityCheckFailedError,
   _setGoalFidelityJudgeForTests,
@@ -164,6 +165,45 @@ test('buildGoalFidelityPrompt: includes goal, skill, evidence, payload, and the 
   assert.match(p, /BYTE-IDENTICAL/);
   assert.match(p, /FAIL OPEN/);
   assert.match(p, /DEFINING requirement/);
+});
+
+test('summarizeGoalFidelityState: no goal is visible and does not call the judge', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const summary = summarizeGoalFidelityState(sess.id);
+  assert.equal(summary.hasGoal, false);
+  assert.equal(summary.mode, 'no_goal');
+  assert.ok(summary.issues.some((issue) => /no recoverable user goal/.test(issue)));
+});
+
+test('summarizeGoalFidelityState: exposes loaded skills and batch-uniformity evidence', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  seedGoal(sess.id, 'Email each firm a personalized outreach note that references per-firm research.');
+  seedSkill(sess.id, 'scorpion-outbound', 'Research each firm before writing; never reuse a generic opening across firms.');
+  seedSend(sess.id, SEND, 'a@firm-a.com', GENERIC_OPENING);
+  seedSend(sess.id, SEND, 'b@firm-b.com', GENERIC_OPENING);
+
+  const summary = summarizeGoalFidelityState(sess.id, 'composio_execute_tool', sendArgs(SEND, 'c@firm-c.com', GENERIC_OPENING));
+  assert.equal(summary.hasGoal, true);
+  assert.equal(summary.mode, 'skill_judge_ready');
+  assert.equal(summary.skills[0].name, 'scorpion-outbound');
+  assert.equal(summary.evidence?.uniform, true);
+  assert.deepEqual(summary.evidence?.uniformPeerTargets.sort(), ['a@firm-a.com', 'b@firm-b.com']);
+  assert.match(summary.evidence?.text ?? '', /BYTE-IDENTICAL/);
+});
+
+test('summarizeGoalFidelityState: renderer shortfall is inspectable before the gate blocks', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  seedGoal(sess.id, 'Run the lunar local audit and publish the report.');
+  seedSkill(sess.id, 'lunar-local-audit', 'After gathering data, run scripts/generate-html.js to produce the report.');
+
+  const summary = summarizeGoalFidelityState(sess.id, 'composio_execute_tool', sendArgs('NETLIFY_DEPLOY_SITE_PUBLISH', 'ignored@x.com', 'publish'));
+  assert.equal(summary.mode, 'renderer_block_risk');
+  assert.equal(summary.skills[0].rendererShortfall?.skill, 'lunar-local-audit');
+  assert.deepEqual(summary.skills[0].rendererShortfall?.prescribed, ['generate-html.js']);
+  assert.ok(summary.issues.some((issue) => /generate-html\.js/.test(issue)));
 });
 
 // ─── §7.1 emails class: batch-identical opening blocks; researched allows ──
