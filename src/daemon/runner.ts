@@ -30,7 +30,7 @@ import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
-import { processSpaceSchedules } from '../spaces/scheduler.js';
+import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
 import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { isSpacesEnabled } from '../spaces/store.js';
@@ -1417,6 +1417,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     if (isSpacesEnabled()) {
       await processSpaceSchedules().catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'processSpaceSchedules tick failed');
+      });
+      // Paused-build auto-retry: a workspace parked by a TRANSIENT build-time
+      // failure re-pulls its sources (2 attempts, spaced) and reactivates on
+      // success instead of stranding until the user notices the banner.
+      await retryPausedSpaces().catch((err) => {
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'retryPausedSpaces tick failed');
       });
       // First-ten-minutes activation: once-ever SUGGEST when the user has zero
       // workspaces but a usable connection ("I can build you a Deal Board").
