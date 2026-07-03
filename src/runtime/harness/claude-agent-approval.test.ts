@@ -16,7 +16,7 @@ const { buildGatedToolPermission } = await import('./claude-agent-approval.js');
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const opts = (): unknown => ({ signal: new AbortController().signal, toolUseID: 't' });
-type Perm = (name: string, input: Record<string, unknown>, o: unknown) => Promise<{ behavior: string; message?: string }>;
+type Perm = (name: string, input: Record<string, unknown>, o: unknown) => Promise<{ behavior: string; message?: string; updatedInput?: Record<string, unknown> }>;
 
 async function waitForPending(sessionId: string): Promise<string> {
   for (let i = 0; i < 200; i++) {
@@ -30,9 +30,21 @@ async function waitForPending(sessionId: string): Promise<string> {
 test('gated permission: read/local tools fast-allow, no approval registered', async () => {
   const sess = createSession({ kind: 'chat' });
   const perm = buildGatedToolPermission(sess.id, ['memory_read']) as unknown as Perm;
-  const res = await perm('mcp__clementine-local__memory_read', {}, opts());
+  const res = await perm('mcp__clementine-local__memory_read', { query: 'x' }, opts());
   assert.equal(res.behavior, 'allow');
+  assert.deepEqual(res.updatedInput, { query: 'x' }, 'the CLI control protocol requires updatedInput on EVERY allow');
   assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 0, 'a read never registers an approval');
+});
+
+test('gated permission: auto-approved mutating tool (no human needed) also carries updatedInput', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const perm = buildGatedToolPermission(sess.id, ['memory_read', 'task_hygiene']) as unknown as Perm;
+  // task_hygiene is in the fast-allow list here; the regression this pins is the
+  // ALLOW SHAPE — a bare {behavior:'allow'} fails the CLI's Zod parse
+  // ("updatedInput expected record, received undefined" — 2026-07-02 end-of-day).
+  const res = await perm('mcp__clementine-local__task_hygiene', { mode: 'ledger' }, opts());
+  assert.equal(res.behavior, 'allow');
+  assert.deepEqual(res.updatedInput, { mode: 'ledger' });
 });
 
 test('gated permission: a mutating tool registers + AWAITS + ALLOWS on approve', async () => {
@@ -44,6 +56,7 @@ test('gated permission: a mutating tool registers + AWAITS + ALLOWS on approve',
   approvalRegistry.resolve(approvalId, 'approved', 'test');
   const res = await p;
   assert.equal(res.behavior, 'allow', 'approve → allow');
+  assert.deepEqual(res.updatedInput, { command: 'echo hi' }, 'human-approved allow must echo updatedInput too');
 });
 
 test('gated permission: DENIES on reject', async () => {

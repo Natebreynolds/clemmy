@@ -129,12 +129,16 @@ export function buildGatedToolPermission(sessionId: string, fastAllowTools: stri
     // text, which dumped its tool-call XML into the bubble. Fires for EVERY tool
     // (fast-allow reads included). Best-effort: progress never blocks a tool.
     try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: bare } }); } catch { /* progress only */ }
-    if (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(bare))) {
-      return { behavior: 'allow' } as PermissionResult;
-    }
+    // The CLI's control-protocol schema requires `updatedInput` on EVERY allow
+    // (a bare {behavior:'allow'} fails its Zod parse with "updatedInput expected
+    // record, received undefined" and the tool call dies — 2026-07-02 end-of-day
+    // task_hygiene incident). Echo the original input back unchanged.
     const args = (input ?? {}) as Record<string, unknown>;
+    if (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(bare))) {
+      return { behavior: 'allow', updatedInput: args } as PermissionResult;
+    }
     const { needsApproval } = decideToolApproval({ sessionId, toolName: bare, args });
-    if (!needsApproval) return { behavior: 'allow' } as PermissionResult;
+    if (!needsApproval) return { behavior: 'allow', updatedInput: args } as PermissionResult;
 
     let approvalId: string;
     try {
@@ -151,7 +155,7 @@ export function buildGatedToolPermission(sessionId: string, fastAllowTools: stri
     }
 
     const decision = await awaitApproval(approvalId, options?.signal);
-    if (decision === 'approved') return { behavior: 'allow' } as PermissionResult;
+    if (decision === 'approved') return { behavior: 'allow', updatedInput: args } as PermissionResult;
     const message =
       decision === 'rejected' ? 'You rejected this action, so it was not run.'
       : decision === 'expired' ? 'The approval request expired before it was answered.'

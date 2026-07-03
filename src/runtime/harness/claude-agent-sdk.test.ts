@@ -114,9 +114,11 @@ test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine M
 
 test('buildAllowOnlyToolsPermission allows exact/tail matches and denies everything else', async () => {
   const canUse = buildAllowOnlyToolsPermission(['ping']);
+  // The CLI's control protocol REQUIRES updatedInput on allow — a bare allow
+  // fails its Zod parse and the tool call dies (2026-07-02 task_hygiene).
   assert.deepEqual(
-    await canUse('mcp__clementine-local__ping', {}, { signal: new AbortController().signal, toolUseID: 'a' }),
-    { behavior: 'allow' },
+    await canUse('mcp__clementine-local__ping', { probe: 1 }, { signal: new AbortController().signal, toolUseID: 'a' }),
+    { behavior: 'allow', updatedInput: { probe: 1 } },
   );
   const denied = await canUse('mcp__clementine-local__workflow_create', {}, { signal: new AbortController().signal, toolUseID: 'b' });
   assert.equal(denied.behavior, 'deny');

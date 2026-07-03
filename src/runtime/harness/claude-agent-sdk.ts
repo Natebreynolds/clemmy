@@ -507,11 +507,14 @@ export function buildScopedNativeMcpServers(scopeInput?: string): Record<string,
 
 export function buildAllowOnlyToolsPermission(allowedTools: string[]): CanUseTool {
   const allowed = new Set(allowedTools.map(normalizeToolName).filter(Boolean));
-  return async (toolName) => {
+  return async (toolName, input) => {
     const normalized = normalizeToolName(toolName);
     const tail = toolName.split('__').at(-1) ?? toolName;
     if (allowed.has(normalized) || allowed.has(normalizeToolName(tail))) {
-      return { behavior: 'allow' };
+      // The CLI's control protocol requires `updatedInput` on allow — a bare
+      // allow fails its Zod parse and kills the tool call (see
+      // claude-agent-approval.ts, 2026-07-02 task_hygiene incident).
+      return { behavior: 'allow', updatedInput: (input ?? {}) as Record<string, unknown> };
     }
     return {
       behavior: 'deny',
