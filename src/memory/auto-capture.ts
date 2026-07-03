@@ -70,13 +70,48 @@ const LOW_SIGNAL = /^(approve|approved|reject|rejected|yes|no|ok|okay|cool|perfe
 // prohibition word AND an action verb, EXCLUDING one-off phrasing and the
 // idiom "never mind" so chit-chat can't trip it.
 const PROHIBITION_RE = /\b(?:never|under no circumstances|do not|don'?t|do n'?t)\b/i;
-const PROHIBITION_ACTION_RE = /\b(?:send|sends|email|emails|e-?mail|cc|bcc|share|shares|post|posts|publish|delete|deletes|remove|removes|touch|modify|change|contact|message|reply|forward|push|deploy|overwrite|disclose|expose|text|dm|ping|notify)\b/i;
+const PROHIBITION_ACTION_RE = /\b(?:send|sends|email|emails|e-?mail|cc|bcc|share|shares|post|posts|publish|delete|deletes|remove|removes|touch|modify|change|create|edit|save|write|mark|contact|message|reply|forward|push|deploy|overwrite|disclose|expose|text|dm|ping|notify)\b/i;
 const PROHIBITION_ONE_OFF_RE = /\b(?:this once|just this|right now|today only|for now|this time|that one|never\s*mind)\b/i;
+const NEGATED_ACTION_RE = /\b(?:do not|don'?t|do n'?t)\s+(?:(?:ever|also|just|please|blindly|accidentally|automatically|anything|any|the|a|an|it|this|that|or|and|,|-|\/)\s*){0,8}(?:send|sends|email|emails|e-?mail|cc|bcc|share|shares|post|posts|publish|delete|deletes|remove|removes|touch|modify|change|create|edit|save|write|mark|contact|message|reply|forward|push|deploy|overwrite|disclose|expose|text|dm|ping|notify)\b/i;
+const HARD_PROHIBITION_RE = /\b(?:never|under no circumstances)\b(?:(?![.!?]).){0,120}\b(?:send|sends|email|emails|e-?mail|cc|bcc|share|shares|post|posts|publish|delete|deletes|remove|removes|touch|modify|change|create|edit|save|write|mark|contact|message|reply|forward|push|deploy|overwrite|disclose|expose|text|dm|ping|notify)\b/i;
+const ONE_OFF_TASK_SAFETY_RE = /\b(?:read[- ]only|smoke(?:\s+test)?|live\s+smoke|stress\s+test|draft\s+only|just\s+draft|after the tool returns)\b/i;
+const ONE_OFF_TASK_START_RE = /^\s*(?:hey\s+)?(?:can you|please|check|pull|draft|write|create|build|run|call|use|find|list|research|mock up|take|read|author)\b/i;
+const ONE_OFF_VALIDATION_RE = /\b(?:live\s+validation(?:\s+only)?|validation\s+only|live\s+read[- ]only\s+validation|read[- ]only\s+live\s+validation|read[- ]only\s+validation\s+after|live\s+validation\s+after|live\s+(?:local\s+)?safety\s+validation)\b/i;
+const MEMORY_CAPTURE_OPTOUT_RE = /\b(?:do\s+not|don'?t|do n'?t)\s+(?:save|store|remember|capture|persist)\s+(?:this|it|that|the request|this request)?\s*(?:as|to|in)?\s*(?:a\s+)?(?:memory|durable memory|long[- ]term memory)?\b/i;
+const MUST_CALL_TOOL_RE = /\byou\s+must\s+call\s+\w+/i;
+const DO_NOT_CALL_TOOL_RE = /\bdo\s+not\s+call\s+\w+/i;
+const NO_EXTERNAL_CHANGES_RE = /\bdo\s+not\s+make\s+any\s+external\s+changes\b/i;
+const ONE_OFF_CONNECTED_APP_LOOKUP_START_RE = /^\s*(?:hey\s+)?(?:can you|could you|please|check|pull|read|show|tell me|look|find|list|summari[sz]e|what(?:'s| is)?|do i have|any(?:thing)?)\b/i;
+const ONE_OFF_CONNECTED_APP_LOOKUP_CONTEXT_RE = /\b(?:today|tomorrow|tmrw|tmr|yesterday|right now|currently|this (?:morning|afternoon|week|month)|next (?:day|week)|calendar|inbox|e-?mail|messages?|meetings?|events?|unread|connected|connection|connections|accounts?|usable|stale|available)\b/i;
+
+function hasDirectSafetyProhibition(text: string): boolean {
+  return HARD_PROHIBITION_RE.test(text) || NEGATED_ACTION_RE.test(text);
+}
+
+function isOneOffTaskSafetyInstruction(text: string): boolean {
+  if (!hasDirectSafetyProhibition(text)) return false;
+  if (ONE_OFF_TASK_SAFETY_RE.test(text)) return true;
+  return ONE_OFF_TASK_START_RE.test(text) && /\b(?:today|tomorrow|this request|this run|this turn|just|only)\b/i.test(text);
+}
+
+function isOneOffValidationOrToolProbe(text: string): boolean {
+  return ONE_OFF_VALIDATION_RE.test(text)
+    || MEMORY_CAPTURE_OPTOUT_RE.test(text)
+    || (MUST_CALL_TOOL_RE.test(text) && DO_NOT_CALL_TOOL_RE.test(text) && NO_EXTERNAL_CHANGES_RE.test(text));
+}
+
+function isOneOffConnectedAppLookup(text: string): boolean {
+  return CONNECTED_APP_TERMS.test(text)
+    && ONE_OFF_CONNECTED_APP_LOOKUP_START_RE.test(text)
+    && ONE_OFF_CONNECTED_APP_LOOKUP_CONTEXT_RE.test(text);
+}
 
 function isSafetyProhibition(text: string): boolean {
   return PROHIBITION_RE.test(text)
     && PROHIBITION_ACTION_RE.test(text)
-    && !PROHIBITION_ONE_OFF_RE.test(text);
+    && hasDirectSafetyProhibition(text)
+    && !PROHIBITION_ONE_OFF_RE.test(text)
+    && !isOneOffTaskSafetyInstruction(text);
 }
 
 // Standing-rule capture — a durable "going forward / every Monday / by default"
@@ -192,6 +227,9 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // they were being pinned as "Standing prohibition" and injected into every
   // chat + voice prompt (2026-06-23 fact pollution).
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return [];
+  // One-off validation/probe prompts often contain durable-looking words such as
+  // "instead of" or "must", but they describe this smoke turn, not user memory.
+  if (isOneOffValidationOrToolProbe(text)) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = isSafetyProhibition(text);
@@ -223,7 +261,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
 
-  if (PROJECT_TERMS.test(text) && PROJECT_REQUIREMENT_CUES.test(text)) {
+  if (PROJECT_TERMS.test(text) && PROJECT_REQUIREMENT_CUES.test(text) && !isOneOffValidationOrToolProbe(text)) {
     addCandidate(candidates, {
       kind: 'project',
       content: `Clementine requirement: ${text}`,
@@ -231,7 +269,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
     });
   }
 
-  if (CONNECTED_APP_TERMS.test(text) && CONNECTED_APP_CUES.test(text)) {
+  if (CONNECTED_APP_TERMS.test(text) && CONNECTED_APP_CUES.test(text) && !isOneOffConnectedAppLookup(text)) {
     addCandidate(candidates, {
       kind: 'reference',
       content: `Connected-app context: ${text}`,
@@ -276,7 +314,7 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // This is ADDITIVE — it only fires when the cued paths found nothing,
   // so it never reduces what's captured today. Questions and commands
   // are excluded so we don't store "what's my balance?" as a fact.
-  if (candidates.length === 0 && isDurableDeclarative(text)) {
+  if (candidates.length === 0 && !isOneOffConnectedAppLookup(text) && isDurableDeclarative(text)) {
     addCandidate(candidates, {
       kind: 'user',
       content: text,

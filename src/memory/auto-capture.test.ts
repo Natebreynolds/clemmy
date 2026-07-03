@@ -156,6 +156,89 @@ test('a one-off imperative (no standing marker) is still NOT routed to a fact', 
   assert.deepEqual(extractAutoMemoryCandidates('Send the quarterly report to the leadership team today.'), []);
 });
 
+test('one-off task safety clauses are not promoted into standing prohibitions', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Read-only live smoke. Check tomorrow on my Scorpion calendar. Do not create, edit, send, mark, or modify anything.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Can you check tomorrow on my Scorpion calendar and confirm which Outlook connection you used. Do not create, edit, send, mark, or modify anything.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates("Draft a short outreach email to Wetherington Law Firm. Just draft it, don't send."),
+    [],
+  );
+});
+
+test('live validation tool probes are not promoted into project requirements', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Live validation only: do I have Outlook connected right now? Please answer with the usable Outlook connection count and whether calendar tools are available in this session. Do not save this as memory.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Live read-only validation after the MCP-surface retry patch. You MUST call composio_list_tools with toolkit_slug=outlook and limit=25. Do not call composio_execute_tool and do not make any external changes. After listing, reply with a few available Outlook slugs and whether the list tool was available.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Read-only live validation. Check my Scorpion Outlook calendar for tomorrow, Friday July 3 2026. Do not create, edit, send, mark, or modify anything. Use the available tools instead of saying tools are unavailable. In the answer, include the event title/time if found and mention the connected_account_id used.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Live safety validation. Use the normal local file-write tool to write exactly SAFETY_PROBE_OK to /private/tmp/clementine-live-safety-probe.txt. Do not use shell. If approval is required, request approval and stop; do not bypass approval. This must not touch external services.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Live local safety validation. Use the normal local file-write tool, not shell, to write exactly SAFETY_PROBE_OK to /private/tmp/clementine-live-safety-probe-1783023563.txt. If approval is required, request approval and stop; do not bypass approval. Do not touch external services. In the answer, say whether the file was written or approval is pending.'),
+    [],
+  );
+});
+
+test('explicit memory opt-out suppresses otherwise durable-looking captures', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates('My preferred contract reviewer is Sarah. Do not save this as memory.'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('We use Outlook and Salesforce for client work. Do not store this in memory.'),
+    [],
+  );
+});
+
+test('one-off connected-app lookups are not promoted into durable connected-app context', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Can you check via my calendar what I have tomorrow for Scorpion?'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Can you check my Outlook inbox today?'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Do I have anything on my calendar tmrw?'),
+    [],
+  );
+  assert.deepEqual(
+    extractAutoMemoryCandidates('Do I have Outlook connected right now? Tell me only the usable Outlook connection count, not stale IDs.'),
+    [],
+  );
+});
+
+test('durable connected-app setup/access statements are still captured', () => {
+  const use = extractAutoMemoryCandidates('We use Outlook and Salesforce for client work.');
+  assert.ok(use.some((candidate) => candidate.kind === 'reference' && /^Connected-app context:/.test(candidate.content)));
+
+  const access = extractAutoMemoryCandidates('The agent needs Outlook access for calendar workflows.');
+  assert.ok(access.some((candidate) => candidate.kind === 'reference' && /^Connected-app context:/.test(candidate.content)));
+});
+
+test('"don\'t need to ask first" is not treated as a durable no-send rule', () => {
+  assert.deepEqual(
+    extractAutoMemoryCandidates("Pull a quick read on one of my clients' recent organic search performance and shoot me a summary by email — you don't need to ask first, go ahead and send it over to me."),
+    [],
+  );
+});
+
 test('"always"/"from now on" still route through FEEDBACK_CUES, not the standing branch (byte-identical)', () => {
   // These already matched FEEDBACK_CUES before this change; the gap branch is
   // length-gated so it must NOT add a second "Standing instruction:" candidate.
