@@ -21,16 +21,16 @@
     "release": "./scripts/release-mac-dual-arch.sh"
   },
   "dependencies": {
-    "electron-updater": "^6.8.3",
+    "electron-updater": "^6.8.9",
     "keytar": "^7.9.0"
   },
   "devDependencies": {
-    "@electron/notarize": "^2.5.0",
-    "@electron/rebuild": "^4.0.4",
-    "@types/node": "^22.12.0",
-    "electron": "^33.0.0",
-    "electron-builder": "^25.0.0",
-    "tsx": "^4.19.0",
+    "@electron/notarize": "^3.1.1",
+    "@electron/rebuild": "^4.1.0",
+    "@types/node": "^24.13.2",
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3",
+    "tsx": "^4.22.5",
     "typescript": "^5.7.0"
   },
   "build": {
@@ -134,7 +134,7 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "identity": "Nathan Reynolds (4AR3Y8XD72)",
-      "notarize": true,
+      "notarize": false,
       "target": [
         {
           "target": "dmg",
@@ -195,5 +195,8 @@
   },
   "optionalDependencies": {
     "@recallai/desktop-sdk": "2.0.14"
+  },
+  "engines": {
+    "node": ">=22.15.0"
   }
 }
