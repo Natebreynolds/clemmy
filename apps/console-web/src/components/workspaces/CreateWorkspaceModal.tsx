@@ -1,14 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
-import { Plus, Sparkles, AlertCircle } from 'lucide-react';
+import { Plus, Sparkles, AlertCircle, Plug } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/lib/cn';
-import { createSpace } from '@/lib/spaces';
+import { createSpace, listStarterRecipes, type StarterRecipe } from '@/lib/spaces';
 
 /**
  * Seed-prompt creation modal. Instead of dropping the user on an EMPTY
  * placeholder and making them context-switch to chat, we capture "what do you
  * want to build?" up front, create the workspace, and hand the description back
  * so the view can seed Clem's dock with the build request immediately.
+ *
+ * Starter recipes: the chips are LIVE — fetched from /spaces/starters and
+ * matched against the user's actually-connected apps (a Deal Board chip only
+ * shows "ready" when a CRM is connected). One click seeds the full build
+ * prompt; the static examples below are the offline fallback.
  */
 
 const EXAMPLES: { label: string; prompt: string }[] = [
@@ -39,6 +44,7 @@ export function CreateWorkspaceModal({
   const [description, setDescription] = useState('');
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [starters, setStarters] = useState<StarterRecipe[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -47,6 +53,7 @@ export function CreateWorkspaceModal({
     setDescription('');
     setError(null);
     setCreating(false);
+    listStarterRecipes().then(setStarters).catch(() => setStarters([]));
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', onKey);
     requestAnimationFrame(() => textareaRef.current?.focus());
@@ -99,19 +106,46 @@ export function CreateWorkspaceModal({
             />
           </label>
 
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="inline-flex items-center gap-1 text-caption text-faint"><Sparkles className="h-3.5 w-3.5" aria-hidden /> Try:</span>
-            {EXAMPLES.map((ex) => (
-              <button
-                key={ex.label}
-                type="button"
-                onClick={() => { setDescription(ex.prompt); textareaRef.current?.focus(); }}
-                className="rounded-full border border-border px-2.5 py-1 text-caption text-muted transition-colors hover:border-border-strong hover:text-fg cursor-pointer"
-              >
-                {ex.label}
-              </button>
-            ))}
-          </div>
+          {starters.length > 0 ? (
+            <div className="flex flex-col gap-1.5">
+              <span className="inline-flex items-center gap-1 text-caption text-faint">
+                <Sparkles className="h-3.5 w-3.5" aria-hidden /> Start from a recipe — matched to what you have connected:
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {[...starters].sort((a, b) => Number(b.connected) - Number(a.connected)).map((r) => (
+                  <button
+                    key={r.id}
+                    type="button"
+                    title={r.connected ? r.pitch : `${r.pitch}\n(Connect ${r.connects.join(' / ')} first — or pick it anyway and Clem will walk you through connecting.)`}
+                    onClick={() => { setDescription(r.buildPrompt); setTitle(r.title); textareaRef.current?.focus(); }}
+                    className={cn(
+                      'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-caption transition-colors cursor-pointer',
+                      r.connected
+                        ? 'border-border text-fg hover:border-border-strong'
+                        : 'border-border/60 text-faint hover:text-muted',
+                    )}
+                  >
+                    {r.connected ? null : <Plug className="h-3 w-3" aria-hidden />}
+                    {r.title}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="inline-flex items-center gap-1 text-caption text-faint"><Sparkles className="h-3.5 w-3.5" aria-hidden /> Try:</span>
+              {EXAMPLES.map((ex) => (
+                <button
+                  key={ex.label}
+                  type="button"
+                  onClick={() => { setDescription(ex.prompt); textareaRef.current?.focus(); }}
+                  className="rounded-full border border-border px-2.5 py-1 text-caption text-muted transition-colors hover:border-border-strong hover:text-fg cursor-pointer"
+                >
+                  {ex.label}
+                </button>
+              ))}
+            </div>
+          )}
 
           <label className="flex flex-col gap-1.5">
             <span className="text-small font-medium text-fg">Name <span className="text-faint">(optional)</span></span>

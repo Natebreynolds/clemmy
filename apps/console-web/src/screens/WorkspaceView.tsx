@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import {
   ArrowLeft, RefreshCw, Pause, Play, ExternalLink, PanelRightOpen, X,
-  MessageCircle, RotateCcw, AlertCircle,
+  MessageCircle, RotateCcw, AlertCircle, Database, Zap, History, FileCode2, CheckCircle2, Share2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
@@ -12,7 +12,7 @@ import { Composer } from '@/components/chat/Composer';
 import { useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
 import {
-  getSpace, refreshSpace, patchSpace, rollbackSpace,
+  getSpace, refreshSpace, patchSpace, rollbackSpace, publishSpace,
   spaceViewUrl, spaceSessionId, openApprovalCount, gapQuestions, type SpaceStatus,
 } from '@/lib/spaces';
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
@@ -23,7 +23,7 @@ function statusTone(status: SpaceStatus): Tone {
   return 'neutral';
 }
 
-type DetailTab = 'code' | 'history' | 'audit';
+type DetailTab = 'health' | 'code' | 'history' | 'audit';
 
 export function WorkspaceView() {
   const { id = '' } = useParams();
@@ -50,7 +50,7 @@ export function WorkspaceView() {
   const [busy, setBusy] = useState(false);
   const [dockOpen, setDockOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const [tab, setTab] = useState<DetailTab>('code');
+  const [tab, setTab] = useState<DetailTab>('health');
   const [error, setError] = useState<string | null>(null);
 
   // Seed the dock with the build request passed from the creation modal, so a
@@ -96,6 +96,7 @@ export function WorkspaceView() {
   }
 
   const notes = detail.data?.notes ?? [];
+  const health = detail.data?.health ?? space.health;
   const openApprovals = openApprovalCount(notes);
   const gaps = gapQuestions(notes);
   const refreshFailures = (detail.data?.audit ?? [])
@@ -127,6 +128,21 @@ export function WorkspaceView() {
             onClick={() => act(() => patchSpace(id, { status: space.status === 'paused' ? 'active' : 'paused' }))}
           >
             {space.status === 'paused' ? <><Play className="h-4 w-4" aria-hidden /> Resume</> : <><Pause className="h-4 w-4" aria-hidden /> Pause</>}
+          </Button>
+          <Button
+            variant="secondary" size="sm" disabled={busy}
+            title="Export a static, credential-free snapshot and have Clem deploy it for a shareable link (the data in it becomes visible to anyone with the link)."
+            onClick={() => act(async () => {
+              const snap = await publishSpace(id);
+              setDockOpen(true);
+              void chat.send({
+                text: `I exported a static share snapshot of this workspace (${snap.files.length} files at ${snap.dir}). `
+                  + 'Deploy it with the usual flow and give me the shareable link. '
+                  + 'Before deploying, sanity-check the inlined data — it will be visible to anyone with the link.',
+              });
+            })}
+          >
+            <Share2 className="h-4 w-4" aria-hidden /> Share
           </Button>
           <Button variant="ghost" size="icon" aria-label="Open in new tab" onClick={() => window.open(spaceViewUrl(id), '_blank')}>
             <ExternalLink className="h-4 w-4" aria-hidden />
@@ -166,7 +182,7 @@ export function WorkspaceView() {
         {detailsOpen && (
           <aside className="absolute right-0 top-0 flex h-full w-full max-w-[440px] flex-col border-l border-border bg-surface shadow-lg">
             <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-              {(['code', 'history', 'audit'] as DetailTab[]).map((t) => (
+              {(['health', 'code', 'history', 'audit'] as DetailTab[]).map((t) => (
                 <button
                   key={t}
                   type="button"
@@ -181,6 +197,71 @@ export function WorkspaceView() {
               </button>
             </div>
             <div className="min-h-0 flex-1 overflow-auto p-3">
+              {tab === 'health' && (
+                <div className="space-y-3">
+                  {health ? (
+                    <>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="rounded-md border border-border bg-subtle px-3 py-2">
+                          <p className="flex items-center gap-1.5 text-caption text-faint"><Database className="h-3.5 w-3.5" aria-hidden /> Sources</p>
+                          <p className="text-h3 text-fg">{health.counts.dataSources}</p>
+                        </div>
+                        <div className="rounded-md border border-border bg-subtle px-3 py-2">
+                          <p className="flex items-center gap-1.5 text-caption text-faint"><Zap className="h-3.5 w-3.5" aria-hidden /> Actions</p>
+                          <p className="text-h3 text-fg">{health.counts.actions}</p>
+                        </div>
+                        <div className="rounded-md border border-border bg-subtle px-3 py-2">
+                          <p className="flex items-center gap-1.5 text-caption text-faint"><History className="h-3.5 w-3.5" aria-hidden /> Version</p>
+                          <p className="text-h3 text-fg">v{health.version}</p>
+                        </div>
+                        <div className="rounded-md border border-border bg-subtle px-3 py-2">
+                          <p className="flex items-center gap-1.5 text-caption text-faint"><FileCode2 className="h-3.5 w-3.5" aria-hidden /> View</p>
+                          <p className="truncate text-small text-fg">{health.view.exists ? `${Math.round(health.view.bytes / 1024)} KB` : 'missing'}</p>
+                        </div>
+                      </div>
+                      <div className="rounded-md border border-border bg-surface p-3">
+                        <p className="mb-2 text-small font-semibold text-fg">Freshness</p>
+                        <p className="text-small text-muted">
+                          {health.freshness.state.replace('_', ' ')}
+                          {health.freshness.lastRefreshedAt ? ` · ${new Date(health.freshness.lastRefreshedAt).toLocaleString()}` : ''}
+                        </p>
+                      </div>
+                      <div className="rounded-md border border-border bg-surface p-3">
+                        <p className="mb-2 text-small font-semibold text-fg">Runners</p>
+                        {health.runners.length === 0 ? (
+                          <p className="text-small text-muted">No runner files declared.</p>
+                        ) : (
+                          <ul className="flex flex-col gap-1.5">
+                            {health.runners.map((r) => (
+                              <li key={`${r.kind}-${r.id}-${r.runner}`} className="flex items-center gap-2 text-caption text-muted">
+                                {r.present ? <CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden /> : <AlertCircle className="h-3.5 w-3.5 text-warning" aria-hidden />}
+                                <span className="font-mono text-fg">{r.runner}</span>
+                                <span className="truncate">{r.id}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                      <div className="rounded-md border border-border bg-surface p-3">
+                        <p className="mb-2 text-small font-semibold text-fg">Issues</p>
+                        {health.issues.length === 0 ? (
+                          <p className="text-small text-muted">No issues reported.</p>
+                        ) : (
+                          <ul className="flex flex-col gap-1.5">
+                            {health.issues.map((issue, i) => (
+                              <li key={i} className="flex items-start gap-2 text-small text-warning">
+                                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden /> <span>{issue}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-small text-muted">Health snapshot unavailable.</p>
+                  )}
+                </div>
+              )}
               {tab === 'code' && (
                 <pre className="whitespace-pre-wrap break-words rounded-md bg-subtle p-3 font-mono text-caption text-fg">
                   {detail.data?.viewSource || '(no view yet)'}

@@ -23,6 +23,41 @@ export interface SpaceAction {
 }
 export interface SpaceRevision { version: number; ts: string; bytes: number; file: string }
 export type SpaceStatus = 'active' | 'paused' | 'archived';
+export type SpaceFreshnessState = 'no_sources' | 'fresh' | 'stale' | 'never_refreshed';
+export interface SpaceRunnerHealth {
+  kind: 'dataSource' | 'action';
+  id: string;
+  runner: string;
+  present: boolean;
+  invalid?: string;
+}
+export interface SpaceHealthSnapshot {
+  id: string;
+  title: string;
+  status: SpaceStatus;
+  version: number;
+  generatedAt: string;
+  counts: {
+    dataSources: number;
+    actions: number;
+    revisions: number;
+    runners: number;
+  };
+  view: {
+    entry: string;
+    exists: boolean;
+    bytes: number;
+    mtime?: string;
+  };
+  runners: SpaceRunnerHealth[];
+  freshness: {
+    state: SpaceFreshnessState;
+    lastRefreshedAt?: string;
+    ageMs?: number;
+    staleAfterMs: number;
+  };
+  issues: string[];
+}
 export interface SpaceRecord {
   id: string;
   title: string;
@@ -39,6 +74,7 @@ export interface SpaceRecord {
   lastOpenedAt?: string;
   lastRefreshedAt?: string;
   recipe?: string;
+  health?: SpaceHealthSnapshot;
 }
 export interface SpaceNote { id: string; text: string; kind?: string; meta?: Record<string, unknown>; createdAt: string }
 export interface SpaceAudit { ts: string; method: string; path: string; outcome: string; note?: string }
@@ -49,6 +85,7 @@ export interface SpaceDetail {
   viewMtimeMs?: number;
   notes: SpaceNote[];
   audit: SpaceAudit[];
+  health?: SpaceHealthSnapshot;
 }
 export interface RefreshResult { ok: boolean; sourceId: string; error?: string }
 
@@ -77,6 +114,25 @@ export const refreshSpace = (id: string, sourceId?: string) =>
 
 export const rollbackSpace = (id: string, version: number) =>
   apiPost<{ space: SpaceRecord }>(`/api/console/spaces/${encodeURIComponent(id)}/rollback`, { version });
+
+/** Starter recipes, connection-matched at runtime (connected = buildable now). */
+export interface StarterRecipe {
+  id: string;
+  title: string;
+  pitch: string;
+  connects: string[];
+  buildPrompt: string;
+  connected: boolean;
+}
+export const listStarterRecipes = () =>
+  apiGet<{ starters: StarterRecipe[] }>('/api/console/spaces/starters').then((r) => r.starters);
+
+/** Export a static, share-ready snapshot (no tokens, actions frozen). Returns
+ *  the local folder; ask Clem in the dock to deploy it for a link. */
+export const publishSpace = (id: string) =>
+  apiPost<{ dir: string; files: string[]; bytes: number; rowsBySource: Record<string, number | null> }>(
+    `/api/console/spaces/${encodeURIComponent(id)}/publish`, {},
+  );
 
 /** Tell Clem about an in-workspace interaction (note / ask / threshold). */
 export const reengageSpace = (id: string, body: { trigger?: 'note' | 'ask' | 'threshold'; message?: string; actionId?: string }) =>
