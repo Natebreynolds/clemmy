@@ -17,6 +17,7 @@ import {
 } from '../integrations/composio/client.js';
 import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter } from '../integrations/composio/async-job.js';
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
+import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier } from '../memory/tool-choice-store.js';
@@ -848,7 +849,14 @@ async function runComposioExecute(
           // completion itself and returns the REAL output — the model never has to
           // know it was async. Any other family / a poll overrun falls back to the
           // id-bearing corrective (never worse than model-driven). Bounded latency.
-          const poll = await autoPollJob(receipt, (slug, a) => executeComposioTool(slug, a, effectiveConnectionId));
+          // parkAvailable = we have an origin session to report a parked result back
+          // to. When true the inline poll caps SHORT and overflow parks (turn keeps
+          // moving); when false it blocks the full budget (better than losing the result).
+          const poll = await autoPollJob(
+            receipt,
+            (slug, a) => executeComposioTool(slug, a, effectiveConnectionId),
+            { parkAvailable: Boolean(sid) },
+          );
           const reason = poll.reason ?? '';
           if (poll.resolved) {
             const n = asyncResultItemCount(poll.result);
@@ -890,7 +898,11 @@ async function runComposioExecute(
                 const plan = await resolveJobGetter(receipt, (slug, a) => executeComposioTool(slug, a, effectiveConnectionId));
                 if (plan) {
                   parked = parkComposioJob(
-                    { ...receipt, ...(plan.getterSlug ? { getterSlug: plan.getterSlug } : {}) } as typeof receipt,
+                    {
+                      ...receipt,
+                      ...(plan.getterSlug ? { getterSlug: plan.getterSlug } : {}),
+                      ...(plan.idArg ? { idArg: plan.idArg } : {}),
+                    } as typeof receipt,
                     { toolSlug, connectionId: effectiveConnectionId, originSessionId: sid },
                   );
                 }
@@ -907,6 +919,25 @@ async function runComposioExecute(
               output = `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (offer_background / dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
             } else {
               output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
+            }
+            // Observability for the family-agnostic detector: emit only when the
+            // GENERIC shape-detector fired (never for the known families), so a spike
+            // of these on normal completes is a visible false-positive signal. A
+            // generic receipt always reaches this else (it is never inline-resolved).
+            if (receipt.generic) {
+              recordOperationalEvent({
+                source: 'tool',
+                type: 'composio_async_generic_detected',
+                severity: 'info',
+                sessionId: sid,
+                payload: {
+                  slug: toolSlug,
+                  toolkit: toolkitOfSlug(toolSlug),
+                  jobId: receipt.jobId,
+                  status: receipt.status,
+                  outcome: parked ? 'parked' : 'banner',
+                },
+              });
             }
           }
         }

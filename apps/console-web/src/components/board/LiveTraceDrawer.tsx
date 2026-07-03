@@ -132,6 +132,26 @@ function formatTime(value?: string): string {
   return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
+/** Human elapsed for the vitals timer: <1m shows seconds, then m/s, then h/m. */
+function formatElapsed(ms?: number): string {
+  if (ms === undefined || !Number.isFinite(ms) || ms < 0) return '—';
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min < 60) return `${min}m ${String(sec).padStart(2, '0')}s`;
+  const hr = Math.floor(min / 60);
+  return `${hr}h ${String(min % 60).padStart(2, '0')}m`;
+}
+
+/** Compact token count: 1234 → "1.2k", 1_200_000 → "1.2M". */
+function formatTokens(n?: number): string {
+  if (n === undefined || !Number.isFinite(n)) return '—';
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
 function reportBackTargetText(target?: BackgroundReportBackTarget): string {
   if (!target) return 'No explicit target';
   if (target.type === 'slack_user') return `Slack DM ${target.userId ?? ''}`.trim();
@@ -185,6 +205,7 @@ export function LiveTraceDrawer({
   const [targetThreadTs, setTargetThreadTs] = useState('');
   const [targetKey, setTargetKey] = useState('');
   const [targetNotice, setTargetNotice] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const isWorkflow = card.sourceKind === 'workflow';
   const isBackground = card.sourceKind === 'background';
@@ -195,6 +216,25 @@ export function LiveTraceDrawer({
     { enabled: isBackground },
   );
   const taskDetail = backgroundDetail.data;
+
+  // Tick a 1s clock while a background task is still running so the elapsed
+  // vitals timer moves between the 4s detail polls (server sends the authoritative
+  // elapsedMs; we tick up from the task's start timestamp locally).
+  const taskRunning = Boolean(taskDetail && taskDetail.vitals?.running !== false && !taskDetail.task.completedAt);
+  useEffect(() => {
+    if (!isBackground || !taskRunning) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isBackground, taskRunning]);
+
+  const elapsedMs = useMemo(() => {
+    if (!taskDetail) return undefined;
+    const startBasis = taskDetail.task.startedAt ?? taskDetail.task.createdAt;
+    const startMs = startBasis ? Date.parse(startBasis) : NaN;
+    if (taskRunning && Number.isFinite(startMs)) return Math.max(0, nowMs - startMs);
+    // Terminal (or missing timestamp): trust the server's frozen value.
+    return taskDetail.vitals?.elapsedMs;
+  }, [taskDetail, taskRunning, nowMs]);
 
   useEffect(() => {
     if (!taskDetail?.task.reportBackTarget) return;
@@ -361,6 +401,15 @@ export function LiveTraceDrawer({
               <div className="space-y-4">
                 <div className="grid gap-2 sm:grid-cols-3">
                   <CockpitMetric label="Status" value={taskDetail.task.status} />
+                  <CockpitMetric
+                    label="Elapsed"
+                    value={formatElapsed(elapsedMs)}
+                    live={taskRunning}
+                  />
+                  <CockpitMetric label="Tool calls" value={String(taskDetail.vitals?.toolCallCount ?? taskDetail.detail.toolEvents.length)} />
+                  {taskDetail.vitals?.tokensUsed !== undefined && (
+                    <CockpitMetric label="Tokens" value={formatTokens(taskDetail.vitals.tokensUsed)} />
+                  )}
                   <CockpitMetric label="Report back" value={reportBackTargetText(taskDetail.task.reportBackTarget)} />
                   <CockpitMetric label="Updated" value={formatTime(taskDetail.task.updatedAt)} />
                 </div>
@@ -529,10 +578,13 @@ export function LiveTraceDrawer({
   );
 }
 
-function CockpitMetric({ label, value }: { label: string; value: string }) {
+function CockpitMetric({ label, value, live }: { label: string; value: string; live?: boolean }) {
   return (
     <div className="min-w-0 rounded-md border border-border px-3 py-2">
-      <div className="text-caption font-semibold text-faint">{label}</div>
+      <div className="flex items-center gap-1 text-caption font-semibold text-faint">
+        {live && <Radio className="h-3 w-3 shrink-0 animate-breathe text-primary" />}
+        {label}
+      </div>
       <div className="mt-0.5 truncate text-small text-fg">{value}</div>
     </div>
   );

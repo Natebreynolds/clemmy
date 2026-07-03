@@ -60,6 +60,7 @@ export function asyncJobTimeoutCorrective(label: string, summary: string, where 
   return [
     `⚠️ ${label} TIMED OUT${where}: ${summary}`,
     `A timeout means the call exceeded its time budget. If this is a LONG-RUNNING JOB — an actor/agent run, a large scrape or export, or a blocking "sync get dataset items" call — do NOT retry the SAME blocking call; it will time out again. Use the ASYNC pattern: START the job with an action that returns a run/job id (e.g. a *_RUN / *_ACT_RUNS / *_CREATE / *_START action), then POLL its status/results (e.g. *_GET / *_RUNS_GET / dataset-items) until it finishes.`,
+    `If that START call returns a QUEUED RECEIPT (a bare run/task/job id with no result yet), you do NOT need to hand-poll it in a loop: the harness auto-resolves or backgrounds a queued receipt for you and delivers the real result — just start it and continue.`,
     `Only if this was a brief network blip (NOT a long job) should you retry the identical call ONCE.`,
   ].join('\n\n');
 }

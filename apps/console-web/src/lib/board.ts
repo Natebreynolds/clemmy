@@ -139,6 +139,24 @@ export interface BackgroundTaskDetail {
     toolEvents: BackgroundToolEvent[];
     notifications: BackgroundTaskNotification[];
   };
+  /** Server-computed cockpit vitals — best-effort, any field may be absent. */
+  vitals?: {
+    /** Wall-clock since the task started (frozen at completion). */
+    elapsedMs?: number;
+    /** Distinct tool invocations so far. */
+    toolCallCount: number;
+    /** Model tokens attributed to the run session today (undefined when unknown). */
+    tokensUsed?: number;
+    /** Whether the task is still running (drives the live-ticking timer). */
+    running: boolean;
+  };
+}
+
+export interface DemoAgenticFlowResult {
+  ok: boolean;
+  task?: BackgroundTaskDetail['task'];
+  detail?: BackgroundTaskDetail['detail'];
+  reason?: string;
 }
 
 export const COLUMNS: { id: BoardColumnId; label: string }[] = [
@@ -164,6 +182,9 @@ export const repostBackgroundTaskResult = (id: string, target: BackgroundReportB
     `/api/console/background-tasks/${encodeURIComponent(id)}/repost-result`,
     target,
   );
+
+export const seedDemoAgenticFlow = () =>
+  apiPost<DemoAgenticFlowResult>('/api/console/demo/agentic-flow');
 
 // Queue visibility: the sub-task queue of one workflow run (each step/forEach
 // unit with status + what runs next), reconstructed server-side from the durable

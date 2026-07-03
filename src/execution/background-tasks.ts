@@ -475,6 +475,127 @@ function emitBackgroundTaskCheckIn(
   return updated;
 }
 
+// Loud progress heartbeats: the time-based check-in cadence (checkInMinutes)
+// is delivered to the task's report-back channel — the same destination a
+// terminal notification uses — so a long-running task's "still working"
+// signal actually reaches the user instead of dying in the dashboard feed.
+// Default ON. Kill-switch CLEMMY_LOUD_PROGRESS_CHECKINS=0/false/off reverts to
+// today's silent, dashboard-only behavior for every heartbeat.
+function loudProgressCheckInsEnabled(): boolean {
+  const raw = (process.env.CLEMMY_LOUD_PROGRESS_CHECKINS ?? '').trim().toLowerCase();
+  return raw !== '0' && raw !== 'false' && raw !== 'off';
+}
+
+/** Human-readable elapsed duration for a heartbeat body: "45s", "12m",
+ *  "1h 5m". Kept intentionally terse so the channel line stays scannable. */
+function formatElapsedDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+/**
+ * Pure decision for the time-based heartbeat timer: given the task's current
+ * status and how long since the last heartbeat, should we emit one this tick,
+ * and should it be loud (channel-delivered) or a quiet dashboard ping?
+ *
+ *   - terminal / awaiting states → no heartbeat at all (the completion or
+ *     awaiting notification is the signal; a loud "still working" after the
+ *     task settled would be a wrong, confusing double-message).
+ *   - not yet one interval since the last heartbeat → skip (rate-limit: at
+ *     most one heartbeat per checkInMinutes interval per task).
+ *   - cancelling → quiet dashboard ping only (the loud signal is the imminent
+ *     abort notification; don't double-message the channel).
+ *   - running → loud when the kill-switch is on, otherwise silent (revert to
+ *     the legacy dashboard-only behavior).
+ */
+function decideHeartbeat(input: {
+  status: BackgroundTaskStatus;
+  nowMs: number;
+  lastHeartbeatAtMs: number;
+  intervalMs: number;
+}): { emit: boolean; loud: boolean } {
+  if (input.status !== 'running' && input.status !== 'cancelling') return { emit: false, loud: false };
+  if (input.nowMs - input.lastHeartbeatAtMs < input.intervalMs) return { emit: false, loud: false };
+  if (input.status === 'cancelling') return { emit: true, loud: false };
+  return { emit: true, loud: loudProgressCheckInsEnabled() };
+}
+
+/** Build the substance of a running-task heartbeat: elapsed time, tool-call
+ *  count, and the most recent activity (or the task label as a fallback) so
+ *  the channel line reads like "Still working on <goal> — 12m in, 23 tool
+ *  calls. Currently: <latest activity>." */
+function buildProgressCheckInBody(input: {
+  task: BackgroundTaskRecord;
+  elapsedMs: number;
+  toolCount: number;
+  latestActivitySummary?: string;
+  runId?: string;
+}): string {
+  const activity = (input.latestActivitySummary ?? '').trim() || input.task.title;
+  const calls = `${input.toolCount} tool call${input.toolCount === 1 ? '' : 's'}`;
+  const lines = [
+    `Still working on ${input.task.title} — ${formatElapsedDuration(input.elapsedMs)} in, ${calls}.`,
+  ];
+  if (activity) lines.push(`Currently: ${activity}`);
+  if (input.runId) lines.push(`Run: ${input.runId}`);
+  return lines.join('\n');
+}
+
+/**
+ * Twin of emitBackgroundTaskCheckIn for the time-based progress heartbeat.
+ * Records the dashboard check-in exactly like a silent check-in (same fields,
+ * same feed entry — silent only gates BOT delivery, not the dashboard), but
+ * when `loud` it emits a non-silent notification routed to the task's
+ * report-back target via taskNotificationMetadata (which already honors
+ * allowDiscordCheckIns and the rest of the proactivity policy). Fail-open on
+ * delivery is the queue's job; recording never throws here.
+ */
+function emitBackgroundTaskProgressUpdate(
+  task: BackgroundTaskRecord,
+  input: {
+    loud: boolean;
+    title: string;
+    body: string;
+    runId?: string;
+    metadata?: Record<string, unknown>;
+  },
+): BackgroundTaskRecord {
+  const now = nowIso();
+  const updated = updateBackgroundTask(task.id, {
+    lastCheckInAt: now,
+    lastCheckInMessage: clean(input.body, 700),
+    progressCheckIns: (task.progressCheckIns ?? 0) + 1,
+  }) ?? task;
+
+  addNotification({
+    id: `${Date.now()}-background-${task.id}-checkin-${updated.progressCheckIns ?? 1}`,
+    kind: 'execution',
+    title: input.title,
+    body: input.body,
+    createdAt: now,
+    read: false,
+    silent: !input.loud,
+    metadata: taskNotificationMetadata(updated, {
+      runId: input.runId,
+      ...(input.metadata ?? {}),
+    }),
+  });
+
+  return updated;
+}
+
+export const backgroundHeartbeatInternalsForTest = {
+  loudProgressCheckInsEnabled,
+  formatElapsedDuration,
+  decideHeartbeat,
+  buildProgressCheckInBody,
+};
+
 function writeFullResultFile(task: BackgroundTaskRecord, result: string): string | undefined {
   if (result.length <= RESULT_TRUNCATE_CHARS) return undefined;
   const filePath = path.join(BACKGROUND_TASK_DIR, `${task.id}.result.md`);
@@ -1514,7 +1635,9 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        `Task ${task.id} is now running.`,
 	        `Run: ${run.id}`,
 	        `Soft max runtime: ${task.maxMinutes} minutes`,
-	        'I will send progress check-ins when tool activity shows meaningful movement.',
+	        loudProgressCheckInsEnabled()
+	          ? `I'll check in here about every ${policy.checkInMinutes} minute${policy.checkInMinutes === 1 ? '' : 's'} with progress, and report back here as soon as it's done.`
+	          : 'I will report back here as soon as it is done.',
 	      ].join('\n'),
 	      runId: run.id,
 	      metadata: { status: 'running' },
@@ -1523,30 +1646,60 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	    try {
 	      let toolCount = 0;
+	      let latestActivitySummary = '';
 	      let lastProgressCheckInAt = Date.now();
+	      // The time-based heartbeat runs on its OWN cadence clock, independent of
+	      // the tool-triggered silent pings below, so a busy task's every-5-call
+	      // check-ins can never starve the loud "still working" update the user
+	      // sees in their channel.
+	      let lastHeartbeatAt = Date.now();
+	      const taskStartedAtMs = Date.parse(task.startedAt ?? '') || Date.now();
 	      heartbeatTimer = setInterval(() => {
 	        const latestTask = getBackgroundTask(task.id);
-	        if (!latestTask || (latestTask.status !== 'running' && latestTask.status !== 'cancelling')) return;
+	        if (!latestTask) return;
 	        const now = Date.now();
-	        if (now - lastProgressCheckInAt < progressCheckInMinMs) return;
-	        lastProgressCheckInAt = now;
-	        task = emitBackgroundTaskCheckIn(latestTask, {
-	          title: latestTask.status === 'cancelling'
-	            ? `Background task still cancelling: ${latestTask.title}`
-	            : `Background task heartbeat: ${latestTask.title}`,
-	          body: [
-	            `Task ${latestTask.id} is ${latestTask.status}.`,
-	            `Run: ${run.id}`,
-	            latestTask.status === 'cancelling'
-	              ? 'Cancellation has been requested. I am waiting for the runtime to reach a safe checkpoint.'
-	              : 'The run is still active. No new tool event has landed since the previous check-in.',
-	            `Observed tool calls: ${toolCount}`,
-	          ].join('\n'),
+	        const decision = decideHeartbeat({
+	          status: latestTask.status,
+	          nowMs: now,
+	          lastHeartbeatAtMs: lastHeartbeatAt,
+	          intervalMs: progressCheckInMinMs,
+	        });
+	        if (!decision.emit) return;
+	        lastHeartbeatAt = now;
+	        if (latestTask.status === 'cancelling') {
+	          // Quiet dashboard ping only — the loud signal is the imminent abort.
+	          task = emitBackgroundTaskCheckIn(latestTask, {
+	            title: `Background task still cancelling: ${latestTask.title}`,
+	            body: [
+	              `Task ${latestTask.id} is ${latestTask.status}.`,
+	              `Run: ${run.id}`,
+	              'Cancellation has been requested. I am waiting for the runtime to reach a safe checkpoint.',
+	              `Observed tool calls: ${toolCount}`,
+	            ].join('\n'),
+	            runId: run.id,
+	            metadata: { status: latestTask.status, heartbeat: true, toolCount },
+	          });
+	          return;
+	        }
+	        // Running: a substantive progress update, delivered loud to the
+	        // report-back channel (or silent/dashboard-only when the kill-switch
+	        // is off — decideHeartbeat carries that call in decision.loud).
+	        task = emitBackgroundTaskProgressUpdate(latestTask, {
+	          loud: decision.loud,
+	          title: `Background task update: ${latestTask.title}`,
+	          body: buildProgressCheckInBody({
+	            task: latestTask,
+	            elapsedMs: now - taskStartedAtMs,
+	            toolCount,
+	            latestActivitySummary,
+	            runId: run.id,
+	          }),
 	          runId: run.id,
 	          metadata: {
 	            status: latestTask.status,
 	            heartbeat: true,
 	            toolCount,
+	            elapsedMs: now - taskStartedAtMs,
 	          },
 	        });
 	      }, progressCheckInMinMs);
@@ -1675,6 +1828,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          },
 	          onToolActivity: (activity) => {
 	            toolCount += 1;
+	            // Feed the loud time-based heartbeat its "Currently: …" line.
+	            latestActivitySummary = activity.toolName;
 	            const now = Date.now();
 	            const shouldCheckIn = toolCount === 1 ||
 	              toolCount % PROGRESS_CHECKIN_TOOL_INTERVAL === 0 ||

@@ -3061,30 +3061,37 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // synthetic re-prompts, and workflow/execution/agent sessions carry machine
   // input — neither should become durable "user" facts (2026-06-23 pollution).
   // captureInteractionSignals also self-guards harness-injected text.
+  // Deferred off the first-token path (perceived-latency). The extraction plus
+  // its memory_signals_captured append feed FUTURE turns, never this one — facts
+  // consolidate asynchronously through the Mem0 resolver, so no committed row is
+  // read back this turn (which is why the event records the candidate signals,
+  // not row ids). Running it synchronously here only delayed the model dispatch.
+  // Schedule unconditionally at the top so it still fires exactly once per turn
+  // on every exit path (the microtask is already queued before any early
+  // return); it runs at the first await (compaction) instead of blocking it.
   const shouldCapture = !options.suppressMemoryCapture && row.kind === 'chat';
-  try {
-    const captured = shouldCapture
-      ? captureInteractionSignals({ message: options.input, sessionId: options.sessionId })
-      : { candidates: [], facts: [], profilePatch: undefined, profile: undefined };
-    if (captured.candidates.length > 0 || captured.profilePatch) {
-      // Facts now consolidate asynchronously through the Mem0 resolver,
-      // so committed row ids aren't known synchronously — record the
-      // captured candidate signals instead.
-      safeAppend({
-        sessionId: options.sessionId,
-        turn,
-        role: 'system',
-        type: 'memory_signals_captured',
-        data: {
-          factCount: captured.candidates.length,
-          profilePatch: captured.profilePatch ?? null,
-          reasons: captured.candidates.map((c) => c.reason),
-        },
-      });
-    }
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('captureInteractionSignals failed:', err instanceof Error ? err.message : err);
+  if (shouldCapture) {
+    queueMicrotask(() => {
+      try {
+        const captured = captureInteractionSignals({ message: options.input, sessionId: options.sessionId });
+        if (captured.candidates.length > 0 || captured.profilePatch) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn,
+            role: 'system',
+            type: 'memory_signals_captured',
+            data: {
+              factCount: captured.candidates.length,
+              profilePatch: captured.profilePatch ?? null,
+              reasons: captured.candidates.map((c) => c.reason),
+            },
+          });
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('captureInteractionSignals failed:', err instanceof Error ? err.message : err);
+      }
+    });
   }
 
   const toolCounter = new ToolCallsCounter(
@@ -3122,6 +3129,41 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       onToolStart as (...args: unknown[]) => void,
     );
   }
+
+  // Perceived-latency: kick off the memory primer + semantic-recall query embed
+  // NOW so they run concurrently with compaction below instead of serially after
+  // it. Both depend ONLY on the user input text (via searchVault / embedQuery),
+  // never on compaction's reshaped `items` — verified against buildTurnMemoryPrimer
+  // (reads the vault by query string) and primeTurnRecallVector (embeds the query
+  // string). Awaited at its original consumption site further down.
+  // Turn-stall fix layer 2: the assembly stage keeps a HARD outer timeout. Both
+  // arms have internal bounds, but a live incident once froze a turn at exactly
+  // this stage with zero events — belt and braces: if assembly doesn't settle in
+  // 15s, proceed with a degraded (no-primer) turn instead of hanging the user. The
+  // race leaves the slow promise to settle in the background; it never blocks the
+  // turn again. Starting the timeout from THIS launch (vs. from the await site)
+  // bounds total assembly wall-clock — strictly tighter than before.
+  const syntheticRetryOriginalInput = isSyntheticStallRetryInput(options.input)
+    ? latestHumanInputForStallRetry(options.sessionId)
+    : undefined;
+  const semanticInput = syntheticRetryOriginalInput ?? options.input;
+  const assemblyPromise = Promise.race([
+    Promise.all([
+      buildTurnMemoryPrimer(semanticInput, options.sessionId),
+      primeTurnRecallVector(semanticInput),
+    ]).then((r) => r as [TurnMemoryPrimer, void]),
+    new Promise<null>((resolve) => {
+      const t = setTimeout(() => resolve(null), 15_000);
+      (t as unknown as { unref?: () => void }).unref?.();
+    }),
+  ]);
+  // Both arms are internally guarded and cannot reject today, but launching the
+  // promise here (rather than at the await site) opens a window — the compaction
+  // span below — where a rejection would have no attached handler and surface as
+  // a Node unhandledRejection. Attach a no-op catch so that can never happen; the
+  // real `await assemblyPromise` further down still observes any rejection, so
+  // await semantics are unchanged.
+  void assemblyPromise.catch(() => { /* handled at the await site */ });
 
   // Auto-compact pass (v0.5.10). Runs Layer 1 deterministic trim and
   // Layer 2 LLM summarization between turns BEFORE we serialize input
@@ -3395,30 +3437,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     }
   }
 
-  // Run the memory primer and the semantic-recall query embed concurrently —
-  // the embed stashes the turn's query vector so the (sync) per-turn fact recall
-  // can add a relevance term, at ~no added latency (both are network-bound and
-  // overlap). primeTurnRecallVector never throws.
-  // Turn-stall fix layer 2: the assembly stage gets a HARD outer timeout.
-  // Both arms have internal bounds, but a live incident froze a turn at
-  // exactly this stage with zero events — belt and braces: if assembly
-  // doesn't settle in 15s, proceed with a degraded (no-primer) turn instead
-  // of hanging the user. The race leaves the slow promise to settle in the
-  // background; it never blocks the turn again.
-  const syntheticRetryOriginalInput = isSyntheticStallRetryInput(options.input)
-    ? latestHumanInputForStallRetry(options.sessionId)
-    : undefined;
-  const semanticInput = syntheticRetryOriginalInput ?? options.input;
-  const assemblySettled = await Promise.race([
-    Promise.all([
-      buildTurnMemoryPrimer(semanticInput, options.sessionId),
-      primeTurnRecallVector(semanticInput),
-    ]).then((r) => r as [TurnMemoryPrimer, void]),
-    new Promise<null>((resolve) => {
-      const t = setTimeout(() => resolve(null), 15_000);
-      (t as unknown as { unref?: () => void }).unref?.();
-    }),
-  ]);
+  // The memory primer + semantic-recall query embed were launched above so they
+  // ran concurrently with compaction (neither depends on compaction's output).
+  // Await the settled result here, at its original consumption site — the 15s
+  // hard outer timeout was started at launch, so on timeout we proceed with a
+  // degraded (no-primer) turn exactly as before.
+  const assemblySettled = await assemblyPromise;
   const turnMemoryPrimer: TurnMemoryPrimer = assemblySettled
     ? assemblySettled[0]
     : {

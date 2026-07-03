@@ -1,4 +1,4 @@
-import { Agent } from '@openai/agents';
+import { Agent, Runner, MaxTurnsExceededError } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
@@ -7,9 +7,18 @@ import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from './workflow-step-agent.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
-import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
+import {
+  wrapToolForHarness,
+  withHarnessRunContext,
+  ToolCallsCounter,
+  defaultToolCallsPerTurn,
+  workerThrashGuardEnabled,
+  type WrappableTool,
+} from '../runtime/harness/brackets.js';
 import { getGoalPinForDelegation } from './plan-proposals.js';
 import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
+import { normalizeWorkerOutput } from './worker-output.js';
 
 /**
  * Sub-agents.
@@ -159,6 +168,85 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
     // model to disambiguate (memory_remember vs clementine-local__memory_remember).
     mcpServers: [getOrCreateExternalMcpServers(options.mcpToolScope)],
   });
+}
+
+export interface CrossProviderWorkerResult {
+  text: string;
+  model: string;
+  toolUses: string[];
+}
+
+/** Per-worker loop-guard scope sequence — mirrors brackets.workerScopeIdFromDetails
+ *  so parallel cross-provider workers each get their OWN loop-guard window
+ *  instead of poisoning the one shared session tracker. */
+let crossWorkerScopeSeq = 0;
+
+/**
+ * Run ONE parent-planned item on a NON-Claude worker model, using the SAME
+ * `@openai/agents` Worker agent the orchestrator lane fans out — for the Claude
+ * SDK brain lane, which has no `@openai/agents` run context of its own to invoke
+ * `worker.asTool().invoke(runContext, …)` against. This is the cross-provider
+ * parity path: it reuses `buildWorkerAgent` (harness-wrapped tools, goal-pin
+ * inheritance) and runs it via a standalone `Runner` — the same primitive under
+ * `asTool` — so the resolved model id routes through the global
+ * RouterModelProvider to its real provider (Codex/GLM/BYO/…).
+ *
+ * Parity with the orchestrator's nested worker:
+ *   - installs the parent `sessionId` via withHarnessRunContext so the
+ *     harness-wrapped worker tools resolve the real session (kill/pause/plan-
+ *     scope/recall/gates), not an empty one;
+ *   - a UNIQUE guardrailScopeId so N parallel workers don't poison one loop-guard
+ *     tracker (behind CLEMMY_WORKER_THRASH_GUARD, like the nested lane);
+ *   - the intent-aware worker turn cap (resolveWorkerMaxTurns);
+ *   - the cap → `ERROR:` envelope via normalizeWorkerOutput (identical to the
+ *     nested lane's customOutputExtractor), so a capped worker is a FAILED item,
+ *     never a hollow done, and hooks.ts fires worker_capped.
+ *
+ * Throws only on a genuine execution error (provider down, etc.) — a turn cap is
+ * converted to the ERROR envelope and returned, never thrown, exactly like the
+ * nested asTool path.
+ */
+export async function runCrossProviderWorker(
+  input: WorkerToolInput,
+  modelId: string,
+  sessionId: string,
+): Promise<CrossProviderWorkerResult> {
+  const worker = await buildWorkerAgent({ model: modelId });
+  const guard = workerThrashGuardEnabled();
+  // Base per-item turn budget — mirrors the orchestrator nested lane
+  // (CLEMMY_WORKER_MAX_TURNS default 8, intent-aware ceiling on top).
+  const base = (() => {
+    const n = Number.parseInt(getRuntimeEnv('CLEMMY_WORKER_MAX_TURNS', '8') ?? '8', 10);
+    return Number.isFinite(n) && n >= 2 ? n : 8;
+  })();
+  const maxTurns = guard ? resolveWorkerMaxTurns(input.intent, base) : base;
+  // A generous tool-call ceiling so maxTurns + the identical-args loop-guard stay
+  // the real bounds (a multi-turn worker legitimately makes several calls); this
+  // counter only exists to satisfy the harness context + catch true runaways.
+  const counter = new ToolCallsCounter(Math.max(defaultToolCallsPerTurn(), maxTurns * 4));
+  const scopeId = `${sessionId}::sdkx:${Date.now()}-${(crossWorkerScopeSeq = (crossWorkerScopeSeq + 1) % 1_000_000)}`;
+  const runner = new Runner({ workflowName: 'clementine-sdk-brain-cross-worker', groupId: sessionId });
+  try {
+    const result = await withHarnessRunContext(
+      { sessionId, counter, ...(guard ? { guardrailScopeId: scopeId } : {}) },
+      () =>
+        runner.run(worker, buildWorkerJobPrompt(input), {
+          context: { sessionId, turn: 0 },
+          maxTurns,
+        }),
+    );
+    return { text: normalizeWorkerOutput(result), model: modelId, toolUses: [] };
+  } catch (err) {
+    // A turn cap on a standalone Runner.run THROWS (unlike asTool, which soft-
+    // converts). Mirror the nested lane: turn the cap into the same ERROR
+    // envelope (normalizeWorkerOutput('') → "hit its turn cap …") so the ledger
+    // marks the item failed and worker_capped fires. Real infra errors propagate
+    // to the run_worker handler's catch (which records + returns its ERROR text).
+    if (err instanceof MaxTurnsExceededError) {
+      return { text: normalizeWorkerOutput(''), model: modelId, toolUses: [] };
+    }
+    throw err;
+  }
 }
 
 /**

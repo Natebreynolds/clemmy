@@ -65,9 +65,12 @@ export interface ComposioJobRecord {
   jobId: string;
   datasetId?: string;
   actorId?: string;
-  /** The result-getter slug once discovered (DataForSEO/Firecrawl); cached so we
-   *  don't re-discover every tick. */
+  /** The result-getter slug once discovered (DataForSEO/Firecrawl/generic); cached so
+   *  we don't re-discover every tick. */
   getterSlug?: string;
+  /** The getter's id-input parameter name (generic family only; known families use
+   *  `id`). Cached alongside getterSlug so the watcher polls with the right arg name. */
+  getterIdArg?: string;
   toolSlug: string;
   connectionId: string;
   originSessionId?: string;
@@ -230,6 +233,7 @@ export function parkComposioJob(receipt: JobReceipt, ctx: ParkContext): ParkResu
     datasetId: receipt.datasetId,
     actorId: receipt.actorId,
     getterSlug: (receipt as { getterSlug?: string }).getterSlug,
+    getterIdArg: (receipt as { idArg?: string }).idArg,
     toolSlug: ctx.toolSlug,
     connectionId: ctx.connectionId ?? '',
     originSessionId: ctx.originSessionId,
@@ -402,7 +406,9 @@ export async function processComposioJobWatchTick(
     const boundExec: ComposioExec = (slug, args) => exec(slug, args, record.connectionId || undefined);
 
     // Resolve the result-getter once, then cache it on the record.
-    let plan: PollPlan | null = record.getterSlug ? { getterSlug: record.getterSlug } : null;
+    let plan: PollPlan | null = record.getterSlug
+      ? { getterSlug: record.getterSlug, idArg: record.getterIdArg }
+      : null;
     if (!plan) {
       // Apify needs no discovery (fixed slugs + ids); families with a getter do.
       const recipe = recipeFor(record.family);
@@ -413,6 +419,7 @@ export async function processComposioJobWatchTick(
           plan = null;
         }
         if (plan?.getterSlug) record.getterSlug = plan.getterSlug;
+        if (plan?.idArg) record.getterIdArg = plan.idArg;
       }
     }
     if (!plan) {

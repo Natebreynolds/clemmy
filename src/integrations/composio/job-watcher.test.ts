@@ -172,6 +172,34 @@ test('tick: an externally-cancelled task drops the record (exactly one owner)', 
   assert.ok(!jobFiles().some((f) => f.startsWith('firecrawl-fc-cancel')), 'record dropped');
 });
 
+// ── Generic family: the watcher polls a parked generic job with its inferred id-arg ──
+const genericReceipt = (jobId = 'g-1'): JobReceipt => ({
+  family: 'generic',
+  jobId,
+  status: 'queued',
+  originSlug: 'MYTOOL_CREATE_JOB',
+  generic: true,
+  pollGuidance: `Poll MYTOOL_JOB_STATUS with the id "${jobId}".`,
+  // The wiring rides the resolved getter + its id-arg into the record via the receipt.
+  getterSlug: 'MYTOOL_JOB_STATUS',
+  idArg: 'job_id',
+} as JobReceipt & { getterSlug: string; idArg: string });
+
+test('tick: a parked GENERIC job polls its getter with the inferred id-arg and completes', async () => {
+  const parked = parkComposioJob(genericReceipt('g-done'), { toolSlug: 'MYTOOL_CREATE_JOB', connectionId: 'conn-g' });
+  assert.ok(parked, 'parked');
+  const exec = async (slug: string, args: Record<string, unknown>, connectionId?: string) => {
+    assert.equal(slug, 'MYTOOL_JOB_STATUS', 'uses the cached getter slug (no re-discovery)');
+    assert.equal(args.job_id, 'g-done', 'polls with the inferred id-arg name, not a hardcoded "id"');
+    assert.equal(connectionId, 'conn-g');
+    return { data: { status: 'completed', results: [{ ok: 1 }] } };
+  };
+  await processComposioJobWatchTick(exec);
+  const task = getBackgroundTask(parked!.taskId);
+  assert.equal(task!.status, 'done');
+  assert.ok(!jobFiles().some((f) => f.startsWith('generic-g-done')), 'record deleted on terminal');
+});
+
 test('parkComposioJob: flag off → no-op (null) so the call-site keeps the banner', () => {
   process.env.CLEMMY_COMPOSIO_BG_DEFER = 'off';
   try {

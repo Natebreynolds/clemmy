@@ -80,6 +80,29 @@ test('Discord delivery: background lifecycle pings stay out of Discord', () => {
   }
 });
 
+test('Discord delivery: a loud "background task update:" progress heartbeat reaches the channel', () => {
+  const update = notification({
+    kind: 'execution',
+    title: 'Background task update: the quarterly SEO analysis',
+    body: 'Still working on the quarterly SEO analysis — 12m in, 23 tool calls.\nCurrently: serp_organic_live_advanced',
+    metadata: { backgroundTaskId: 'bg-1', heartbeat: true },
+    // Loud heartbeat: not silent, so it is delivered like a terminal report-back.
+    silent: false,
+  });
+  assert.equal(notificationDeliveryInternalsForTest.shouldDeliverDiscordNotification(update), true);
+  assert.equal(notificationDeliveryInternalsForTest.buildDiscordComponentsForNotification(update), undefined);
+});
+
+test('Discord delivery: a silent (kill-switch off) heartbeat stays dashboard-only', () => {
+  const silentUpdate = notification({
+    kind: 'execution',
+    title: 'Background task update: the quarterly SEO analysis',
+    metadata: { backgroundTaskId: 'bg-1', heartbeat: true },
+    silent: true,
+  });
+  assert.equal(notificationDeliveryInternalsForTest.shouldDeliverDiscordNotification(silentUpdate), false);
+});
+
 test('Discord delivery: completed execution updates still deliver as plain text', () => {
   const completed = notification({
     kind: 'execution',

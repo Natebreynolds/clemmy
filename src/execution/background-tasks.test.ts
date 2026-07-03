@@ -47,6 +47,7 @@ const {
   requestBackgroundDrain,
   markBackgroundTaskRunning,
   truncateResultBody,
+  backgroundHeartbeatInternalsForTest,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -1066,4 +1067,114 @@ test('truncateResultBody: prefers a paragraph boundary when one is available', (
   const out = truncateResultBody(body);
   assert.ok(out.startsWith(head), 'keeps the whole first paragraph');
   assert.ok(out.endsWith(' …'));
+});
+
+// ── Loud progress heartbeats ──────────────────────────────────────────────────
+// Time-based check-ins now reach the report-back channel with substance
+// (elapsed + tool count + current activity), rate-limited to one per interval,
+// default ON, revertible via CLEMMY_LOUD_PROGRESS_CHECKINS.
+const {
+  loudProgressCheckInsEnabled,
+  formatElapsedDuration,
+  decideHeartbeat,
+  buildProgressCheckInBody,
+} = backgroundHeartbeatInternalsForTest;
+
+function heartbeatTask(patch: Record<string, unknown> = {}): any {
+  return { id: 'bg-hb-1', title: 'the quarterly SEO analysis', ...patch };
+}
+
+test('formatElapsedDuration: seconds, minutes, hours', () => {
+  assert.equal(formatElapsedDuration(45_000), '45s');
+  assert.equal(formatElapsedDuration(12 * 60_000), '12m');
+  assert.equal(formatElapsedDuration(60 * 60_000), '1h');
+  assert.equal(formatElapsedDuration(65 * 60_000), '1h 5m');
+});
+
+test('progress heartbeat body carries elapsed time, tool count, and current activity', () => {
+  const body = buildProgressCheckInBody({
+    task: heartbeatTask(),
+    elapsedMs: 12 * 60_000,
+    toolCount: 23,
+    latestActivitySummary: 'serp_organic_live_advanced',
+    runId: 'run-bg-hb-1',
+  });
+  assert.match(body, /Still working on the quarterly SEO analysis/);
+  assert.match(body, /12m in/, 'human elapsed time is present');
+  assert.match(body, /23 tool calls/, 'tool-call count is present');
+  assert.match(body, /Currently: serp_organic_live_advanced/, 'latest activity is surfaced');
+});
+
+test('progress heartbeat body falls back to the task label when no activity seen yet, and singularizes one call', () => {
+  const body = buildProgressCheckInBody({
+    task: heartbeatTask(),
+    elapsedMs: 30_000,
+    toolCount: 1,
+    latestActivitySummary: '',
+  });
+  assert.match(body, /1 tool call\./, 'singular "call" for a single tool call');
+  assert.match(body, /Currently: the quarterly SEO analysis/, 'falls back to the label as the activity');
+});
+
+test('decideHeartbeat: running past the interval emits a LOUD heartbeat by default', () => {
+  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+  delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+  try {
+    assert.equal(loudProgressCheckInsEnabled(), true, 'default ON');
+    const d = decideHeartbeat({ status: 'running', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
+    assert.deepEqual(d, { emit: true, loud: true });
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
+  }
+});
+
+test('decideHeartbeat: within the interval is rate-limited (no second loud message)', () => {
+  const d = decideHeartbeat({ status: 'running', nowMs: 100_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
+  assert.deepEqual(d, { emit: false, loud: false });
+});
+
+test('decideHeartbeat: kill-switch reverts to a silent, dashboard-only ping', () => {
+  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+  process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = '0';
+  try {
+    assert.equal(loudProgressCheckInsEnabled(), false);
+    const d = decideHeartbeat({ status: 'running', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
+    assert.deepEqual(d, { emit: true, loud: false }, 'still recorded on the dashboard, just not loud');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
+  }
+});
+
+test('decideHeartbeat: "false"/"off" also disable loud heartbeats', () => {
+  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+  try {
+    for (const val of ['false', 'OFF', 'False']) {
+      process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = val;
+      assert.equal(loudProgressCheckInsEnabled(), false, `"${val}" disables`);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
+  }
+});
+
+test('decideHeartbeat: terminal and awaiting states stop heartbeats entirely', () => {
+  for (const status of ['done', 'failed', 'aborted', 'interrupted', 'awaiting_approval', 'awaiting_input', 'awaiting_continue'] as const) {
+    const d = decideHeartbeat({ status, nowMs: 10_000_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
+    assert.deepEqual(d, { emit: false, loud: false }, `no heartbeat when ${status}`);
+  }
+});
+
+test('decideHeartbeat: cancelling emits a QUIET dashboard ping (never loud)', () => {
+  const prev = process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+  delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+  try {
+    const d = decideHeartbeat({ status: 'cancelling', nowMs: 200_000, lastHeartbeatAtMs: 0, intervalMs: 180_000 });
+    assert.deepEqual(d, { emit: true, loud: false }, 'cancelling is dashboard-only even with the kill-switch ON');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_LOUD_PROGRESS_CHECKINS;
+    else process.env.CLEMMY_LOUD_PROGRESS_CHECKINS = prev;
+  }
 });

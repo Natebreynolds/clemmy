@@ -7,6 +7,7 @@ import {
   type DisplayState,
 } from './discord-harness.js';
 import { SLACK_BOT_TOKEN } from '../config.js';
+import { isStatusCommand, buildBoardSummary, formatBoardSummaryText } from '../dashboard/board-summary.js';
 
 const logger = pino({ name: 'clementine-next.slack-harness' });
 
@@ -327,6 +328,26 @@ export async function handleSlackHarnessMessage(opts: {
    *  assistant transport so run activity drives assistant.threads.setStatus. */
   setStatus?: (status: string) => Promise<unknown>;
 }): Promise<void> {
+  // Deterministic "status" command: a bare status-intent message is answered
+  // directly from the board stores WITHOUT invoking the brain, so a channel user
+  // can see everything in flight between kickoff and the terminal report-back.
+  // Runs after the caller's inbox claim (dedup), replies thread-aware, and is
+  // fail-open — any error falls through to the normal harness pipeline below.
+  if (isStatusCommand(opts.prompt)) {
+    try {
+      const text = formatBoardSummaryText(buildBoardSummary());
+      await opts.client.chat.postMessage({
+        channel: opts.channelId,
+        thread_ts: opts.threadTs,
+        text: toSlackMrkdwn(text) || '…',
+        mrkdwn: true,
+      });
+      return;
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err), channel: opts.channelId }, 'status command failed; falling through to brain');
+    }
+  }
+
   let effectivePrompt = opts.prompt;
   try {
     const { ingestAttachment, foldAttachmentsIntoMessage, extractYouTubeUrls } = await import('../runtime/attachments.js');

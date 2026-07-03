@@ -116,6 +116,13 @@ function shouldDeliverBotNotification(notification: NotificationRecord, inlineKe
   if (notification.kind === 'execution' && title.startsWith('approved plan queued:')) return false;
   if (notification.kind === 'execution' && title.startsWith('background task queued:')) return false;
   if (notification.kind === 'execution' && title.startsWith('background task started:')) return false;
+  // 'progress:'/'heartbeat:' are the high-frequency, tool-triggered and
+  // cancellation lifecycle pings — dashboard-only (they're also emitted
+  // silent, so the top-of-function silent gate already drops them; these
+  // prefixes keep them suppressed even if a future caller forgets `silent`).
+  // The loud, rate-limited time-based progress channel uses the distinct
+  // 'background task update:' prefix and is intentionally NOT listed here so
+  // it reaches the report-back channel like a terminal report-back does.
   if (notification.kind === 'execution' && title.startsWith('background task progress:')) return false;
   if (notification.kind === 'execution' && title.startsWith('background task heartbeat:')) return false;
 

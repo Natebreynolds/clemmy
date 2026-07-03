@@ -48,6 +48,10 @@ export interface JobReceipt {
   /** The originating tool slug (e.g. the `*_TASK_POST`) — needed for runtime
    *  result-getter discovery on families whose getter is derived from it. */
   originSlug?: string;
+  /** true ⇒ caught by the family-agnostic SHAPE detector (`family:'generic'`), not
+   *  a known registry family. Kept so the wiring can telemeter generic hits (to watch
+   *  the heuristic's precision) and hedge the corrective wording. */
+  generic?: boolean;
   /** Precise, id-bearing guidance on how to fetch the real result. */
   pollGuidance: string;
 }
@@ -77,6 +81,10 @@ export type ComposioExec = (slug: string, args: Record<string, unknown>) => Prom
  *  Firecrawl carry the discovered/fixed result-getter slug. */
 export interface PollPlan {
   getterSlug?: string;
+  /** The getter's id-input parameter name (e.g. `id`, `task_id`, `run_id`). Set only
+   *  by the generic recipe, which infers it from the getter's schema; the known
+   *  families all use `id` and leave this undefined (checkOnce defaults to `id`). */
+  idArg?: string;
 }
 
 /** The outcome of ONE poll attempt. `pending` ⇒ not done yet (retry); `done` ⇒
@@ -349,9 +357,254 @@ const firecrawlRecipe: JobFamilyRecipe = {
   },
 };
 
+// ── Generic (family-agnostic) receipt detection ─────────────────────────────────────
+//
+// The three families above are shape-recipes for KNOWN toolkits. Plenty of other
+// Composio actions follow the same start→poll pattern with their own envelope. This
+// generic detector catches those from SHAPE alone — but only when a result is
+// UNAMBIGUOUSLY a queued receipt: it (a) carries a job/task/run id AND (b) signals a
+// non-terminal status (or an explicit async marker) AND (c) has NO substantive payload.
+// It runs LAST (registry families win), and is deliberately biased HARD toward NOT
+// firing — a false positive on a normal completed result is far costlier than missing
+// a rare async family (which just means the model gets today's behavior). A generic
+// hit whose sibling result-getter can't be inferred degrades to the id-bearing banner
+// (which today's model gets NOTHING of on the success path); one whose getter IS
+// inferable can be parked to the background watcher.
+
+/** Non-terminal status words that, with an id and no payload, mark a queued receipt.
+ *  Kept TIGHT (close to the spec list) — ambiguous entity-states like "active" are
+ *  intentionally excluded so a normal record that merely has a `status` never trips. */
+const GENERIC_NONTERMINAL_STATUS = new Set([
+  'queued', 'pending', 'running', 'in_progress', 'in-progress', 'in progress',
+  'processing', 'accepted', 'submitted', 'enqueued',
+]);
+/** Terminal-OK status words for the generic poll (result is ready). */
+const GENERIC_TERMINAL_OK = new Set([
+  'completed', 'complete', 'succeeded', 'success', 'finished', 'done', 'ready',
+]);
+/** Terminal-BAD status words — the job itself is dead; stop polling. */
+const GENERIC_TERMINAL_FAIL = new Set([
+  'failed', 'error', 'errored', 'cancelled', 'canceled', 'aborted', 'timed_out', 'timed-out',
+]);
+const GENERIC_ID_KEYS = ['task_id', 'job_id', 'run_id', 'request_id', 'taskId', 'jobId', 'runId', 'requestId', 'id'];
+const GENERIC_STATUS_KEYS = ['status', 'state', 'job_status', 'jobStatus', 'run_status'];
+/** Keys that, when carrying real content, mean the result IS present (not a receipt). */
+const GENERIC_PAYLOAD_KEYS = ['data', 'items', 'results', 'records', 'rows', 'output', 'tasks'];
+
+/** A job/task/run id at THIS object level, or undefined. Numbers are stringified.
+ *  Prefers the explicit keys, then accepts a domain id key (`*_id` / camelCase `*Id` /
+ *  exactly `id`) so `video_id` / `exportId` count — but NOT a lowercased word that merely
+ *  ends in "id" (e.g. "valid", "grid"), which would be a false id. */
+function isIdKey(key: string): boolean {
+  const lk = key.toLowerCase();
+  return lk === 'id' || lk.endsWith('_id') || /[a-z]Id$/.test(key);
+}
+function idLikeValue(v: unknown): string | undefined {
+  if (typeof v === 'string' && v.trim()) return v.trim();
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return undefined;
+}
+function findGenericJobId(o: Record<string, unknown>): string | undefined {
+  for (const k of GENERIC_ID_KEYS) {
+    const v = idLikeValue(o[k]);
+    if (v) return v;
+  }
+  for (const [k, raw] of Object.entries(o)) {
+    if (!isIdKey(k)) continue;
+    const v = idLikeValue(raw);
+    if (v) return v;
+  }
+  return undefined;
+}
+
+/** A lowercased status/state string at THIS object level, or undefined. */
+function findGenericStatus(o: Record<string, unknown>): string | undefined {
+  for (const k of GENERIC_STATUS_KEYS) {
+    const v = o[k];
+    if (typeof v === 'string' && v.trim()) return v.trim().toLowerCase();
+  }
+  return undefined;
+}
+
+/** True if the object carries a real result payload (a non-empty data/items/results
+ *  array, a non-empty payload object/string, or a non-null `result`) — in which case
+ *  it is NOT a bare receipt. Conservative: any content ⇒ not-a-receipt. */
+function hasSubstantivePayload(d: Record<string, unknown>): boolean {
+  for (const key of GENERIC_PAYLOAD_KEYS) {
+    const v = d[key];
+    if (Array.isArray(v) && v.length > 0) return true;
+    if (v && typeof v === 'object' && Object.keys(v as object).length > 0) return true;
+    if (typeof v === 'string' && v.trim().length > 0) return true;
+  }
+  // The classic "not ready = null" sentinel: a non-null `result` means it IS ready.
+  const result = d.result;
+  if (Array.isArray(result) && result.length > 0) return true;
+  if (result && typeof result === 'object' && Object.keys(result as object).length > 0) return true;
+  return false;
+}
+
+/** Classify ONE object level as a queued receipt (id + non-terminal status), or null. */
+function genericLevel(o: Record<string, unknown>): { jobId: string; status: string } | null {
+  const jobId = findGenericJobId(o);
+  if (!jobId) return null;
+  const status = findGenericStatus(o);
+  if (status && GENERIC_NONTERMINAL_STATUS.has(status) && !GENERIC_TERMINAL_OK.has(status)) {
+    return { jobId, status };
+  }
+  return null;
+}
+
+/** Family-agnostic receipt detection from shape (see the section header). Requires
+ *  BOTH an id AND a non-terminal signal AND no substantive payload. */
+function detectGenericReceipt(d: Record<string, unknown>, slug: string): JobReceipt | null {
+  if (hasSubstantivePayload(d)) return null; // (c) result already present ⇒ not a receipt
+  let found = genericLevel(d);
+  if (!found) {
+    // Shallow nested envelope: a single small object that itself carries BOTH an id
+    // and a non-terminal status (e.g. `{ job: { id, status } }`). One level only.
+    for (const v of Object.values(d)) {
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const obj = v as Record<string, unknown>;
+        if (Object.keys(obj).length <= 12) {
+          const nested = genericLevel(obj);
+          if (nested) { found = nested; break; }
+        }
+      }
+    }
+  }
+  if (!found) {
+    // Explicit async marker (id + `async:true`/`is_async:true`) with no status word.
+    const jobId = findGenericJobId(d);
+    if (jobId && (d.async === true || d.is_async === true)) found = { jobId, status: 'async' };
+  }
+  if (!found) return null;
+  const toolkit = (slug.split('_')[0] || '').toLowerCase() || 'this';
+  return {
+    family: 'generic',
+    jobId: found.jobId,
+    status: found.status,
+    originSlug: slug,
+    generic: true,
+    pollGuidance:
+      `This ${toolkit} call appears to have returned a QUEUED RECEIPT, not the final result — it carries a `
+      + `job/task id ("${found.jobId}")${found.status && found.status !== 'async' ? ` with status "${found.status}"` : ''} `
+      + `but no result payload yet. If you expected data back and got only this handle, do NOT report it as the answer: `
+      + `find this toolkit's matching status/result getter (a "*_GET" / "*_STATUS" / "*_RESULT" action for the same operation) `
+      + `and poll it with the id until the result is ready. If this WAS the expected response (a fire-and-forget submission), you can proceed.`,
+  };
+}
+
+/**
+ * Choose a sibling result-getter slug for a GENERIC async-start tool from the LIVE
+ * toolkit slug list, purely by token overlap (handles start-verbs in prefix, infix, OR
+ * suffix position — `SOMEAPP_START_EXPORT`, `MYTOOL_CREATE_JOB`, `X_RUN`). The origin
+ * slug's OPERATION-IDENTITY tokens are its `_`-parts minus the toolkit, the start-verb
+ * tokens, and any getter tokens. A candidate must be in the SAME toolkit, carry a getter
+ * token (`STATUS` > `RESULT(S)` > `GET`/`POLL`/`FETCH`/`RETRIEVE`), and share at least one
+ * identity token. The winner has the highest identity overlap, then the best getter rank.
+ * Returns an EXACT slug from the live list, never invented. No identity tokens, zero
+ * candidates, or a genuine tie (same overlap AND getter rank) → null → the caller falls
+ * back to the id-bearing banner (never worse than today). Exported for tests.
+ */
+const GENERIC_START_VERBS = new Set([
+  'START', 'CREATE', 'RUN', 'POST', 'SUBMIT', 'ENQUEUE', 'TRIGGER', 'LAUNCH', 'ACTOR',
+  'TASK', 'GENERATE', 'INITIATE', 'BEGIN', 'DISPATCH', 'KICKOFF', 'SCHEDULE', 'REQUEST',
+]);
+const GENERIC_GETTER_TOKEN_ORDER = ['STATUS', 'RESULTS', 'RESULT', 'GET', 'POLL', 'FETCH', 'RETRIEVE'];
+const GENERIC_GETTER_TOKENS = new Set(GENERIC_GETTER_TOKEN_ORDER);
+
+export function pickSiblingGetterSlug(originSlug: string, tools: ComposioToolkitTool[]): string | null {
+  const s = (originSlug || '').toUpperCase();
+  const tokens = s.split('_').filter(Boolean);
+  if (tokens.length < 2) return null;
+  const toolkit = tokens[0];
+  const identity = new Set(
+    tokens.slice(1).filter((t) => !GENERIC_START_VERBS.has(t) && !GENERIC_GETTER_TOKENS.has(t)),
+  );
+  if (identity.size === 0) return null; // nothing to match the getter on → bail to banner
+
+  const getterRank = (tk: string[]): number => {
+    for (let i = 0; i < GENERIC_GETTER_TOKEN_ORDER.length; i += 1) {
+      if (tk.includes(GENERIC_GETTER_TOKEN_ORDER[i])) return i;
+    }
+    return -1;
+  };
+
+  const scored = tools
+    .map((t) => ({ slug: t.slug, tk: (t.slug || '').toUpperCase().split('_').filter(Boolean) }))
+    .filter((x) => x.tk.join('_') !== s && x.tk[0] === toolkit)
+    .map((x) => ({ slug: x.slug, getterRank: getterRank(x.tk), overlap: x.tk.filter((t) => identity.has(t)).length }))
+    .filter((x) => x.getterRank >= 0 && x.overlap > 0);
+  if (scored.length === 0) return null;
+
+  scored.sort((a, b) => b.overlap - a.overlap || a.getterRank - b.getterRank || a.slug.localeCompare(b.slug));
+  const best = scored[0];
+  // Ambiguity guard: a second candidate tied on BOTH identity overlap and getter rank →
+  // we can't pick safely → bail to the banner.
+  if (scored.filter((x) => x.overlap === best.overlap && x.getterRank === best.getterRank).length > 1) return null;
+  return best.slug;
+}
+
+/** The getter's id-input parameter name, inferred from its schema (required wins over
+ *  optional). Defaults to `id` when the schema is unknown. */
+function pickGetterIdArg(tool: ComposioToolkitTool | undefined): string {
+  const ip = tool?.inputParameters as { properties?: Record<string, unknown>; required?: unknown } | undefined;
+  const props = ip?.properties && typeof ip.properties === 'object' ? Object.keys(ip.properties) : [];
+  const required = Array.isArray(ip?.required) ? (ip!.required as unknown[]).filter((x): x is string => typeof x === 'string') : [];
+  for (const k of GENERIC_ID_KEYS) if (required.includes(k)) return k;
+  for (const k of GENERIC_ID_KEYS) if (props.includes(k)) return k;
+  return 'id';
+}
+
+const GENERIC_GETTER_DISCOVERY_LIMIT = 300;
+
+const genericRecipe: JobFamilyRecipe = {
+  family: 'generic',
+  detect(_s, d, slug) {
+    return detectGenericReceipt(d, slug);
+  },
+  poll: {
+    // Getter discovery needs a live toolkit lookup, so generic jobs are resolved by
+    // the background watcher (parked), never inline — same policy as DataForSEO.
+    inlineAutoResolve: false,
+    unresolvableReason: 'generic-getter-not-found',
+    async resolveGetter(receipt, _exec, deps) {
+      if (!receipt.originSlug) return null;
+      const toolkitSlug = receipt.originSlug.split('_')[0]?.toLowerCase();
+      if (!toolkitSlug) return null;
+      let tools: ComposioToolkitTool[];
+      try {
+        const lister = deps.listToolkitTools
+          ?? (await import('./client.js')).listComposioToolkitTools;
+        tools = await lister(toolkitSlug, GENERIC_GETTER_DISCOVERY_LIMIT);
+      } catch {
+        return null;
+      }
+      const getterSlug = pickSiblingGetterSlug(receipt.originSlug, tools ?? []);
+      if (!getterSlug) return null;
+      const idArg = pickGetterIdArg((tools ?? []).find((t) => (t.slug || '').toUpperCase() === getterSlug.toUpperCase()));
+      return { getterSlug, idArg };
+    },
+    async checkOnce(plan, receipt, exec) {
+      if (!plan.getterSlug) return { state: 'pending' };
+      const res = await exec(plan.getterSlug, { [plan.idArg || 'id']: receipt.jobId });
+      const d = inner(res);
+      if (!d) return { state: 'pending' };
+      const status = findGenericStatus(d);
+      if (status && GENERIC_TERMINAL_FAIL.has(status)) return { state: 'failed', reason: `job ${status}` };
+      // A real payload OR a terminal-OK status ⇒ done. Otherwise still queued.
+      if (hasSubstantivePayload(d)) return { state: 'done', result: res };
+      if (status && GENERIC_TERMINAL_OK.has(status)) return { state: 'done', result: res };
+      return { state: 'pending' };
+    },
+  },
+};
+
 // ── Registry ──────────────────────────────────────────────────────────────────────
 
-const JOB_FAMILIES: JobFamilyRecipe[] = [dataforseoRecipe, apifyRecipe, firecrawlRecipe];
+// generic MUST be last: the known families win (family-specific getter resolution),
+// and generic only catches what none of them claimed.
+const JOB_FAMILIES: JobFamilyRecipe[] = [dataforseoRecipe, apifyRecipe, firecrawlRecipe, genericRecipe];
 
 /** Register an extra family at runtime (used by tests to prove one-entry
  *  extensibility). Returns a disposer that removes it again. */
@@ -406,7 +659,19 @@ export interface AutoPollOpts {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable toolkit-tools lister for getter discovery (defaults to live). */
   listToolkitTools?: (toolkitSlug: string, limit?: number) => Promise<ComposioToolkitTool[]>;
+  /** Explicit poll budget (ms). Defaults to autoPollBudgetMs(). Lets autoPollJob cap
+   *  the INLINE poll short when a park target exists (see parkAvailable). */
+  budgetMs?: number;
+  /** true ⇒ a background park target exists (origin session id present). The inline
+   *  auto-poll then caps SHORT (INLINE_POLL_PARK_CAP_MS) and returns budget-exceeded so
+   *  the caller PARKS the overflow instead of blocking the turn for the full budget. */
+  parkAvailable?: boolean;
 }
+
+/** How long the INLINE auto-poll blocks before it prefers PARKING (when a background
+ *  target exists). Short by design: past this the turn continues and the background
+ *  watcher finishes the job. Rides CLEMMY_COMPOSIO_AUTO_POLL (no new flag). */
+const INLINE_POLL_PARK_CAP_MS = 45_000;
 
 /** DEFAULT ON. Off ⇒ never harness-poll; always fall back to the A1 corrective. */
 export function composioAutoPollEnabled(): boolean {
@@ -471,7 +736,7 @@ export async function pollJobToResolution(
 
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const deadline = now() + autoPollBudgetMs();
+  const deadline = now() + (opts.budgetMs ?? autoPollBudgetMs());
   let polls = 0;
   let backoff = 2000;
   while (now() < deadline) {
@@ -513,5 +778,12 @@ export async function autoPollJob(
   if (!recipe?.poll?.inlineAutoResolve) {
     return { resolved: false, reason: 'family-not-auto-pollable', polls: 0 };
   }
-  return pollJobToResolution(receipt, exec, opts);
+  // Prefer PARKING over a long inline block: when a background park target exists
+  // (origin session present), cap the inline poll SHORT — if the job isn't terminal by
+  // the cap we return budget-exceeded and the caller parks it, so the turn keeps moving
+  // instead of blocking up to the full budget. With NO park target, blocking the full
+  // budget is better than losing the result, so keep the long budget.
+  const budgetMs = opts.budgetMs
+    ?? (opts.parkAvailable ? Math.min(INLINE_POLL_PARK_CAP_MS, autoPollBudgetMs()) : autoPollBudgetMs());
+  return pollJobToResolution(receipt, exec, { ...opts, budgetMs });
 }

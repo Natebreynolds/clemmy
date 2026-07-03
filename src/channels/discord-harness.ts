@@ -61,6 +61,7 @@ import { parseGoalCommand, handleGoalContractCommand } from '../agents/goal-comm
 import { createJsonFieldStreamer } from '../runtime/harness/stream-reply.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
+import { isStatusCommand, buildBoardSummary, formatBoardSummaryText } from '../dashboard/board-summary.js';
 
 const EDIT_DEBOUNCE_MS = 2_000;
 const SAFETY_TIMEOUT_MS = 35 * 60_000;
@@ -2753,6 +2754,19 @@ export async function handleDiscordHarnessMessage(
   message: Message<boolean>,
   prompt: string,
 ): Promise<void> {
+  // Deterministic "status" command: a bare status-intent message is answered
+  // directly from the board stores WITHOUT invoking the brain, so a channel user
+  // can see everything in flight between kickoff and the terminal report-back.
+  // Runs after the caller's inbox claim (dedup) and is fail-open — any error
+  // falls through to the normal harness pipeline below.
+  if (isStatusCommand(prompt)) {
+    try {
+      await message.reply(formatBoardSummaryText(buildBoardSummary()));
+      return;
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'status command failed; falling through to brain');
+    }
+  }
   const transport: DiscordHarnessTransport = {
     async sendInitial(content) {
       const reply = (await message.reply(content)) as unknown as {

@@ -12,6 +12,7 @@ import {
   asyncReceiptBanner,
   autoPollJob,
   pickDataforseoGetterSlug,
+  pickSiblingGetterSlug,
   pollJobToResolution,
   checkJobOnce,
   resolveJobGetter,
@@ -304,4 +305,170 @@ test('registerJobFamily: a 4th family plugs in with one entry (detect + poll)', 
     dispose();
   }
   assert.equal(recipeFor('fakefam'), undefined, 'disposer removed it');
+});
+
+// ── Generic (family-agnostic) receipt detection ───────────────────────────────────
+// The generic detector must catch an UNAMBIGUOUS queued receipt from an UNKNOWN
+// toolkit (id + non-terminal status + no payload) while NEVER firing on a normal
+// completed result — false positives here are very costly, so these adversarial
+// negatives are the load-bearing tests.
+
+test('generic: an unknown-toolkit receipt (id + pending status + no payload) is detected', () => {
+  const r = detectJobReceipt('HEYGEN_CREATE_AVATAR_VIDEO', { data: { video_id: 'vid_42', status: 'pending' }, successful: true });
+  assert.ok(r, 'detected');
+  assert.equal(r!.family, 'generic');
+  assert.equal(r!.generic, true);
+  assert.equal(r!.jobId, 'vid_42');
+  assert.match(asyncReceiptBanner(r!), /QUEUED RECEIPT/);
+  assert.match(r!.pollGuidance, /vid_42/);
+});
+
+test('generic: a nested small envelope carrying id + status is detected', () => {
+  const r = detectJobReceipt('SOMEAPP_START_EXPORT', { data: { job: { id: 'exp_9', status: 'processing' } } });
+  assert.ok(r, 'detected via one-level nesting');
+  assert.equal(r!.jobId, 'exp_9');
+});
+
+test('generic: an explicit async marker (id + async:true, no status) is detected', () => {
+  const r = detectJobReceipt('SOMEAPP_ENQUEUE_TASK', { data: { request_id: 'req_7', async: true } });
+  assert.ok(r);
+  assert.equal(r!.jobId, 'req_7');
+});
+
+test('generic NEGATIVE: an id alone (no status, no async marker) is NOT a receipt', () => {
+  assert.equal(detectJobReceipt('SOMEAPP_CREATE_CONTACT', { data: { id: 'c_1', name: 'Ada' } }), null);
+});
+
+test('generic NEGATIVE: a pending status WITH a populated payload is NOT a receipt', () => {
+  assert.equal(detectJobReceipt('SOMEAPP_LIST_THINGS', { data: { id: 'x', status: 'processing', results: [{ a: 1 }] } }), null);
+  assert.equal(detectJobReceipt('SOMEAPP_GET_ITEMS', { data: { id: 'x', status: 'running', items: [{ a: 1 }] } }), null);
+  assert.equal(detectJobReceipt('SOMEAPP_GET_DATA', { data: { id: 'x', status: 'queued', output: { big: 'payload' } } }), null);
+});
+
+test('generic NEGATIVE: a terminal status (completed/succeeded/sent) is NOT a receipt', () => {
+  assert.equal(detectJobReceipt('SOMEAPP_RUN', { data: { id: 'x', status: 'completed' } }), null);
+  assert.equal(detectJobReceipt('SOMEAPP_RUN', { data: { id: 'x', status: 'succeeded' } }), null);
+  assert.equal(detectJobReceipt('EMAIL_SEND', { data: { id: 'm_1', status: 'sent' } }), null);
+});
+
+test('generic NEGATIVE: an ambiguous entity state ("active") is NOT treated as a receipt', () => {
+  // A user/record that merely carries status "active" must never trip the detector.
+  assert.equal(detectJobReceipt('SOMEAPP_GET_USER', { data: { id: 'u_1', status: 'active' } }), null);
+});
+
+test('generic NEGATIVE: an array of items each with a status field is NOT a receipt', () => {
+  assert.equal(detectJobReceipt('SOMEAPP_SEARCH', { data: [{ id: 1, status: 'running' }, { id: 2, status: 'running' }] }), null);
+});
+
+test('generic does NOT shadow a known family (DataForSEO receipt still resolves as dataforseo)', () => {
+  const r = detectJobReceipt('DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST', DFS_TASK_POST);
+  assert.equal(r!.family, 'dataforseo', 'known family wins over generic');
+});
+
+// ── Generic sibling-getter inference ──────────────────────────────────────────────
+test('pickSiblingGetterSlug: infers the *_STATUS sibling from the start stem, prefers STATUS>RESULT>GET', () => {
+  const tools = [
+    tool('SOMEAPP_START_EXPORT'),
+    tool('SOMEAPP_EXPORT_GET'),
+    tool('SOMEAPP_EXPORT_RESULT'),
+    tool('SOMEAPP_EXPORT_STATUS'),
+    tool('SOMEAPP_UNRELATED'),
+  ];
+  assert.equal(pickSiblingGetterSlug('SOMEAPP_START_EXPORT', tools), 'SOMEAPP_EXPORT_STATUS');
+});
+
+test('pickSiblingGetterSlug: infers across prefix/infix verbs and needs an identity token', () => {
+  // infix verb (CREATE) — matches on the JOB identity token
+  assert.equal(
+    pickSiblingGetterSlug('MYTOOL_CREATE_JOB', [tool('MYTOOL_JOB_STATUS'), tool('MYTOOL_UNRELATED')]),
+    'MYTOOL_JOB_STATUS',
+  );
+  // only toolkit + verb, no identity noun → cannot match safely → null
+  assert.equal(pickSiblingGetterSlug('MYTOOL_RUN', [tool('MYTOOL_STATUS')]), null);
+  // a candidate in a DIFFERENT toolkit is never chosen
+  assert.equal(pickSiblingGetterSlug('MYTOOL_START_EXPORT', [tool('OTHERTOOL_EXPORT_STATUS')]), null);
+});
+
+test('pickSiblingGetterSlug: zero siblings, or a tie at the best rank → null', () => {
+  assert.equal(pickSiblingGetterSlug('SOMEAPP_START_EXPORT', [tool('SOMEAPP_UNRELATED')]), null);
+  // Two distinct *_STATUS siblings share the best rank → ambiguous → bail.
+  const tie = [tool('SOMEAPP_EXPORT_STATUS'), tool('SOMEAPP_EXPORT_JOB_STATUS')];
+  assert.equal(pickSiblingGetterSlug('SOMEAPP_START_EXPORT', tie), null);
+});
+
+test('resolveJobGetter (generic): discovers the sibling getter + its id-arg name from schema', async () => {
+  const receipt = detectJobReceipt('MYTOOL_CREATE_JOB', { data: { job_id: 'j_1', status: 'queued' } })!;
+  const plan = await resolveJobGetter(receipt, async () => { throw new Error('exec unused'); }, {
+    listToolkitTools: async () => [
+      tool('MYTOOL_CREATE_JOB'),
+      tool('MYTOOL_JOB_STATUS', { properties: { job_id: {} }, required: ['job_id'] }),
+    ],
+  });
+  assert.equal(plan?.getterSlug, 'MYTOOL_JOB_STATUS');
+  assert.equal(plan?.idArg, 'job_id', 'poll arg name inferred from the getter schema');
+});
+
+test('checkJobOnce (generic): terminal payload → done; fail status → failed; queued → pending', async () => {
+  const receipt = detectJobReceipt('MYTOOL_CREATE_JOB', { data: { job_id: 'j_1', status: 'queued' } })!;
+  const plan = { getterSlug: 'MYTOOL_JOB_STATUS', idArg: 'job_id' };
+
+  const done = await checkJobOnce(plan, receipt, async (slug, args) => {
+    assert.equal(slug, 'MYTOOL_JOB_STATUS');
+    assert.equal(args.job_id, 'j_1', 'polls with the inferred id-arg name');
+    return { data: { status: 'completed', results: [{ a: 1 }] } };
+  });
+  assert.equal(done.state, 'done');
+  assert.ok(done.result);
+
+  const pending = await checkJobOnce(plan, receipt, async () => ({ data: { status: 'running' } }));
+  assert.equal(pending.state, 'pending');
+
+  const failed = await checkJobOnce(plan, receipt, async () => ({ data: { status: 'failed' } }));
+  assert.equal(failed.state, 'failed');
+});
+
+test('autoPollJob: a generic receipt is never inline-resolved (parks instead)', async () => {
+  const receipt = detectJobReceipt('MYTOOL_CREATE_JOB', { data: { job_id: 'j_1', status: 'queued' } })!;
+  const res = await autoPollJob(receipt, async () => { throw new Error('must not poll inline'); }, { sleep: async () => {} });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /family-not-auto-pollable/);
+});
+
+// ── Inline poll cap → park transition (change #2) ─────────────────────────────────
+test('autoPollJob: with parkAvailable, a still-running Apify run caps SHORT and returns budget-exceeded', async () => {
+  // now advances 5s per poll; the 45s inline cap is hit long before the 240s budget,
+  // so we get budget-exceeded quickly (the caller then parks). Bounded poll count proves
+  // the SHORT cap, not the long one.
+  let t = 0;
+  let polls = 0;
+  const exec = async () => { polls += 1; return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'RUNNING' }] } }; };
+  const res = await autoPollJob(APIFY_RECEIPT, exec, { parkAvailable: true, now: () => (t += 5_000), sleep: async () => {} });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /budget-exceeded/);
+  assert.ok(polls <= 12, `capped short (${polls} polls under the 45s cap, not the 240s budget)`);
+});
+
+test('autoPollJob: without a park target, the FULL long budget is used (blocking beats losing the result)', async () => {
+  // Same 5s/poll clock; with parkAvailable false the budget is 240s, so many more polls
+  // run before budget-exceeded — proving the fallback keeps the long inline budget.
+  let t = 0;
+  let polls = 0;
+  const exec = async () => { polls += 1; return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: 'RUNNING' }] } }; };
+  const res = await autoPollJob(APIFY_RECEIPT, exec, { parkAvailable: false, now: () => (t += 5_000), sleep: async () => {} });
+  assert.equal(res.resolved, false);
+  assert.match(res.reason ?? '', /budget-exceeded/);
+  assert.ok(polls > 12, `used the long budget (${polls} polls, well past the 45s cap)`);
+});
+
+test('autoPollJob: parkAvailable does NOT prevent an EARLY terminal resolve within the cap', async () => {
+  // The cap only bounds the WAIT — a run that finishes fast still resolves inline.
+  let n = 0;
+  const exec = async (slug: string, args: Record<string, unknown>) => {
+    if (slug === 'APIFY_GET_LIST_OF_RUNS') return { data: { items: [{ id: 'Rv5AM2u9CRMGBYt2P', status: (++n >= 2 ? 'SUCCEEDED' : 'RUNNING') }] } };
+    if (slug === 'APIFY_GET_DATASET_ITEMS') { assert.equal(args.datasetId, '71epPtxtXZshtjnV4'); return { data: [{ ok: 1 }] }; }
+    throw new Error(`unexpected ${slug}`);
+  };
+  const res = await autoPollJob(APIFY_RECEIPT, exec, { parkAvailable: true, sleep: async () => {} });
+  assert.equal(res.resolved, true);
+  assert.deepEqual(res.result, { data: [{ ok: 1 }] });
 });

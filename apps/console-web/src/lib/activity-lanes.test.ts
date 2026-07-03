@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { foldOperationalEvent, lanesToSortedArray, type ActivityLane } from './activity-lanes';
+import { foldOperationalEvent, lanesToSortedArray, workerRowsForDisplay, type ActivityLane } from './activity-lanes';
 import type { OperationalEvent } from './telemetry';
 
 let seq = 0;
@@ -87,6 +87,41 @@ test('completions never erase genuine waiters: queued decrements on SPAWN, not o
   foldOperationalEvent(lanes, ev({ type: 'worker_spawned', sessionId: 's1' }));
   assert.equal(lanes.get('s1')!.workers.queued, 1);
   assert.equal(lanes.get('s1')!.workers.active, 1);
+});
+
+test('per-worker rows track item status through queued → running, and drop on completion', () => {
+  const lanes = fold([
+    ev({ type: 'worker_queued', sessionId: 's1', payload: { item: 'acme.com' } }),
+    ev({ type: 'worker_spawned', sessionId: 's1', payload: { item: 'acme.com', model: 'claude-sonnet-5' } }),
+    ev({ type: 'worker_queued', sessionId: 's1', payload: { item: 'globex.com' } }),
+  ]);
+  const rows = workerRowsForDisplay(lanes.get('s1')!);
+  // running first, then queued.
+  assert.deepEqual(rows.map((r) => `${r.item}:${r.status}`), ['acme.com:running', 'globex.com:queued']);
+  assert.equal(rows[0].model, 'claude-sonnet-5');
+  // Completion prunes the row (its count lives in the counter, not the live list).
+  foldOperationalEvent(lanes, ev({ type: 'worker_completed', sessionId: 's1', payload: { item: 'acme.com' } }));
+  assert.deepEqual(workerRowsForDisplay(lanes.get('s1')!).map((r) => r.item), ['globex.com']);
+  assert.equal(lanes.get('s1')!.workers.done, 1);
+});
+
+test('failed and capped workers stay as rows, ordered after running/queued', () => {
+  const lanes = fold([
+    ev({ type: 'worker_spawned', sessionId: 's1', payload: { item: 'a' } }),
+    ev({ type: 'worker_queued', sessionId: 's1', payload: { item: 'b' } }),
+    ev({ type: 'worker_spawned', sessionId: 's1', payload: { item: 'c' } }),
+    ev({ type: 'worker_failed', sessionId: 's1', payload: { item: 'c' } }),
+    ev({ type: 'worker_spawned', sessionId: 's1', payload: { item: 'd' } }),
+    ev({ type: 'worker_capped', sessionId: 's1', payload: { item: 'd' } }),
+  ]);
+  const rows = workerRowsForDisplay(lanes.get('s1')!);
+  assert.deepEqual(rows.map((r) => `${r.item}:${r.status}`), ['a:running', 'b:queued', 'c:failed', 'd:capped']);
+});
+
+test('worker events without an item still fold counters but add no row', () => {
+  const lanes = fold([ev({ type: 'worker_spawned', sessionId: 's1' })]);
+  assert.equal(lanes.get('s1')!.workers.active, 1);
+  assert.equal(workerRowsForDisplay(lanes.get('s1')!).length, 0);
 });
 
 test('openTool tracks a started tool call until it completes', () => {

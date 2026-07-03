@@ -13,13 +13,25 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Radio, Wrench, Users, GitBranch, RefreshCw, Hand } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { subscribeTelemetry } from '@/lib/telemetry';
-import { foldOperationalEvent, lanesToSortedArray, type ActivityLane } from '@/lib/activity-lanes';
+import { foldOperationalEvent, lanesToSortedArray, workerRowsForDisplay, type ActivityLane, type WorkerRow } from '@/lib/activity-lanes';
 import type { BoardCard } from '@/lib/board';
 
 /** Drop terminal lanes shortly after they finish, and stale non-terminal lanes,
  *  so the rail stays a "now" view and the map can't grow unbounded. */
 const TERMINAL_KEEP_MS = 90_000;
 const STALE_LANE_MS = 15 * 60_000;
+
+/** How many per-worker rows to show before collapsing the rest into "+N more",
+ *  so a 30-worker wave can't blow up the rail. */
+const WORKER_ROWS_MAX = 8;
+
+/** Glyph + tone per worker status, matching the count-badge idiom (⚙⏳✕). */
+const WORKER_STATUS_GLYPH: Record<WorkerRow['status'], { glyph: string; className: string }> = {
+  running: { glyph: '⚙', className: 'text-primary' },
+  queued: { glyph: '⏳', className: 'text-muted' },
+  failed: { glyph: '✕', className: 'text-danger' },
+  capped: { glyph: '⚠', className: 'text-warning' },
+};
 
 function elapsedLabel(startedAt: string | undefined, nowMs: number): string {
   if (!startedAt) return '';
@@ -81,6 +93,9 @@ export function NowStrip({ cards, onOpen }: { cards: BoardCard[]; onOpen: (card:
         {rows.map((lane) => {
           const card = cardForLane(lane);
           const clickable = !!card;
+          const workerRows = workerRowsForDisplay(lane);
+          const visibleWorkers = workerRows.slice(0, WORKER_ROWS_MAX);
+          const hiddenWorkers = workerRows.length - visibleWorkers.length;
           return (
             <li key={lane.key}>
               <div
@@ -133,6 +148,25 @@ export function NowStrip({ cards, onOpen }: { cards: BoardCard[]; onOpen: (card:
 
                 <span className="w-9 shrink-0 text-right text-caption text-faint">{elapsedLabel(lane.startedAt, nowMs)}</span>
               </div>
+
+              {workerRows.length > 0 && (
+                <ul className="mb-1 ml-8 mt-0.5 flex flex-col gap-0.5" aria-label="Swarm workers">
+                  {visibleWorkers.map((worker) => {
+                    const status = WORKER_STATUS_GLYPH[worker.status];
+                    return (
+                      <li key={worker.item} className="flex items-center gap-1.5 text-caption text-muted">
+                        <span className={cn('w-3 shrink-0 text-center', status.className, worker.status === 'running' && 'animate-breathe')}>{status.glyph}</span>
+                        <span className="min-w-0 flex-1 truncate">{worker.item}</span>
+                        {worker.model && <span className="hidden text-faint sm:inline">{worker.model}</span>}
+                        <span className="w-8 shrink-0 text-right text-faint">{elapsedLabel(worker.sinceTs, nowMs)}</span>
+                      </li>
+                    );
+                  })}
+                  {hiddenWorkers > 0 && (
+                    <li className="pl-[1.125rem] text-caption text-faint">+{hiddenWorkers} more</li>
+                  )}
+                </ul>
+              )}
             </li>
           );
         })}

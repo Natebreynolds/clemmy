@@ -23,23 +23,70 @@ import { textResult } from './shared.js';
  * Claude SDK worker on ONE item, reusing the shared substrate — the per-session
  * concurrency cap (P6, so parallel calls can't storm a provider), the respawn guard
  * (a re-spawn of an already-capped item is refused), and the durable worker_result
- * ledger. The worker runs on the WORKER role model when it's a Claude model, else the
- * Claude brain model (this lane can only spawn Claude workers), so "brain + workers =
- * Sonnet 5" fans out. Kill-switch CLEMMY_SDK_BRAIN_RUN_WORKER (default on).
+ * ledger.
+ *
+ * Worker model, by role: if the WORKER role resolves to a Claude model, the worker
+ * runs on the Claude Agent SDK (honors "workers = Sonnet 5"). If it resolves to a
+ * NON-Claude model (e.g. gpt-*, glm-*), the worker runs through the SAME
+ * cross-provider @openai/agents Worker the orchestrator lane fans out
+ * (runCrossProviderWorker) — lane parity, so the SDK brain honors a configured
+ * non-Claude worker instead of silently reverting to Claude. Kill-switch
+ * CLEMMY_SDK_BRAIN_CROSS_WORKER (default on) reverts to today's Claude-only
+ * fallback. Master kill-switch CLEMMY_SDK_BRAIN_RUN_WORKER (default on) disables
+ * fan-out entirely.
  */
 function enabled(): boolean {
   return (getRuntimeEnv('CLEMMY_SDK_BRAIN_RUN_WORKER', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
-/** The Claude model this lane spawns the worker on: the worker role if it's a Claude
- *  model (honors "workers = Sonnet 5"), else the Claude brain model (the SDK worker
- *  lane can only run Claude models). */
-export function resolveClaudeWorkerModel(): string {
+/** Cross-provider workers for the SDK brain lane (default on). off/0/false ⇒ a
+ *  configured non-Claude worker model reverts to today's Claude brain fallback
+ *  (clean rollback), and the ignored model is surfaced via telemetry. */
+export function sdkBrainCrossWorkerEnabled(): boolean {
+  const raw = (getRuntimeEnv('CLEMMY_SDK_BRAIN_CROSS_WORKER', 'on') ?? 'on').trim().toLowerCase();
+  return !(raw === 'off' || raw === '0' || raw === 'false');
+}
+
+export interface SdkBrainWorkerRoute {
+  /** The model the worker actually runs on. */
+  modelId: string;
+  /** true ⇒ Claude Agent SDK worker lane; false ⇒ cross-provider @openai/agents worker. */
+  claudeLane: boolean;
+  /** Set when a non-Claude worker model was CONFIGURED but ignored (kill-switch
+   *  off) — surfaced as a visible telemetry warning instead of a silent fallback. */
+  ignoredNonClaudeModel?: string;
+}
+
+/** PURE lane-decision (no config/connectivity reads) so every branch is
+ *  deterministically testable. A Claude model → Claude SDK lane; a non-Claude
+ *  model → cross-provider lane when enabled, else the Claude brain fallback with
+ *  the ignored model surfaced. No resolvable model ⇒ the Claude brain fallback. */
+export function pickSdkBrainWorkerLane(
+  resolvedId: string | undefined,
+  opts: { crossEnabled: boolean; claudeBrainModel: string },
+): SdkBrainWorkerRoute {
+  const isClaude = typeof resolvedId === 'string' && resolvedId.startsWith('claude-');
+  if (isClaude) return { modelId: resolvedId as string, claudeLane: true };
+  if (resolvedId && opts.crossEnabled) return { modelId: resolvedId, claudeLane: false };
+  // Kill-switch off, or no resolvable model ⇒ today's Claude-only fallback.
+  return {
+    modelId: opts.claudeBrainModel,
+    claudeLane: true,
+    ...(resolvedId && !isClaude ? { ignoredNonClaudeModel: resolvedId } : {}),
+  };
+}
+
+/** Pick the worker model + execution lane for the Claude SDK brain, honoring an
+ *  intent-scoped WORKER binding. Fails open to the Claude brain model. */
+export function resolveSdkBrainWorker(intent?: string): SdkBrainWorkerRoute {
+  let resolvedId: string | undefined;
   try {
-    const role = resolveRoleModel('worker').modelId;
-    if (typeof role === 'string' && role.startsWith('claude-')) return role;
-  } catch { /* fall through to the brain model */ }
-  return getClaudeBrainModel();
+    resolvedId = resolveRoleModel('worker', intent).modelId;
+  } catch { /* fall through to the Claude brain model */ }
+  return pickSdkBrainWorkerLane(resolvedId, {
+    crossEnabled: sdkBrainCrossWorkerEnabled(),
+    claudeBrainModel: getClaudeBrainModel(),
+  });
 }
 
 const firstLine = (v: unknown): string => {
@@ -82,7 +129,29 @@ export function registerWorkerTools(server: McpServer): void {
         }
       } catch { /* fail-open */ }
 
-      const workerModel = resolveClaudeWorkerModel();
+      const route = resolveSdkBrainWorker(input.intent || undefined);
+      const workerModel = route.modelId;
+      const transport = route.claudeLane ? 'claude_agent_sdk' : 'cross_provider';
+      // Visible warning when a configured non-Claude worker model is IGNORED
+      // (CLEMMY_SDK_BRAIN_CROSS_WORKER=off) — replaces today's silent fallback so
+      // operators can see why their non-Claude worker isn't running.
+      if (route.ignoredNonClaudeModel) {
+        try {
+          recordOperationalEvent({
+            source: 'harness',
+            type: 'worker_model_ignored',
+            sessionId,
+            actor: 'run_worker',
+            payload: {
+              item: input.item,
+              lane: 'sdk_brain',
+              configuredModel: route.ignoredNonClaudeModel,
+              ranModel: workerModel,
+              reason: 'CLEMMY_SDK_BRAIN_CROSS_WORKER=off',
+            },
+          });
+        } catch { /* telemetry is best-effort */ }
+      }
       // P6 concurrency cap: at most K workers in flight per session; excess queue.
       // worker_queued fires only when this worker actually has to wait for a slot.
       const release = await acquireWorkerSlot(sessionId, (info) => {
@@ -103,7 +172,7 @@ export function registerWorkerTools(server: McpServer): void {
           type: 'worker_spawned',
           sessionId,
           actor: 'run_worker',
-          payload: { item: input.item, model: workerModel, lane: 'sdk_brain' },
+          payload: { item: input.item, model: workerModel, lane: 'sdk_brain', transport },
         });
       } catch { /* telemetry is best-effort */ }
       // Route-outcome capture (adaptive routing evidence): one decision+outcome
@@ -120,7 +189,17 @@ export function registerWorkerTools(server: McpServer): void {
         reason: { lane: 'sdk_brain', item: input.item },
       });
       try {
-        const result = await runClaudeAgentSdkWorker(input, workerModel, sessionId);
+        // Claude worker role → Claude Agent SDK lane; non-Claude → the SAME
+        // cross-provider @openai/agents Worker the orchestrator lane fans out
+        // (lazy import: worker-tools loads into the SDK-brain MCP child; the
+        // cross-provider runner drags in the whole agent surface, so keep it out
+        // of the module graph — mirrors code-mode-tool's runtime imports).
+        const result: { text: string; model?: string } = route.claudeLane
+          ? await runClaudeAgentSdkWorker(input, workerModel, sessionId)
+          : await (async () => {
+              const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
+              return runCrossProviderWorker(input, workerModel, sessionId);
+            })();
         const ok = !/^\s*ERROR:/i.test(result.text ?? '');
         recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel);
         recordModelRouteOutcome({
