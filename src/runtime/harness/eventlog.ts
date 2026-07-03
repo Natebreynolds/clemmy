@@ -101,6 +101,10 @@ export const EVENT_TYPES = [
   // SDK local-MCP startup guard retried because the required local tool surface
   // was empty or no init message arrived before the startup budget.
   'sdk_tool_surface_retry',
+  // Spawn→first-stream-byte latency for one SDK query (WS5-L2). The usage log
+  // has it too; this copy makes TTFT scoreable from the eventlog (proof
+  // harness, speculative-routing acceptance telemetry).
+  'sdk_first_byte',
   // The Claude Agent SDK's child process compacted its own context mid-run
   // (subtype 'compact_boundary' relay; pre/post tokens + trigger). Mirror of the
   // Codex lane's condenser_applied — proves long runs manage context instead of

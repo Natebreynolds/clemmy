@@ -57,8 +57,8 @@ export const continuityRecall: ScenarioDef = {
     return {
       checks,
       latency: [
-        { wallMs: turn1.wallMs, ttftMs: metrics?.latency[0]?.ttftMs ?? null },
-        { wallMs: turn2.wallMs, ttftMs: metrics?.latency[1]?.ttftMs ?? null },
+        { wallMs: turn1.wallMs, ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null },
+        { wallMs: turn2.wallMs, ttftMs: metrics?.latency[1]?.ttftMs ?? metrics?.firstByteMs ?? null },
       ],
       sessionId,
       metrics: metrics ? { turns: metrics.turns, tokensUsed: metrics.tokensUsed, primerInjectedBytes: metrics.primerInjectedBytes } : undefined,

@@ -42,7 +42,7 @@ export const longToolSelfCorrect: ScenarioDef = {
 
     return {
       checks,
-      latency: [{ wallMs: turn.wallMs, ttftMs: metrics?.latency[0]?.ttftMs ?? null }],
+      latency: [{ wallMs: turn.wallMs, ttftMs: metrics?.latency[0]?.ttftMs ?? metrics?.firstByteMs ?? null }],
       sessionId: turn.sessionId,
       metrics: metrics ? { turns: metrics.turns, toolCallTotal: metrics.toolCallTotal } : undefined,
     };

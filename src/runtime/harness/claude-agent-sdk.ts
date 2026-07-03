@@ -1250,7 +1250,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         );
         if (next.done) break;
         const message = next.value;
-        if (firstByteMs === null) firstByteMs = Date.now() - startedAt;
+        if (firstByteMs === null) {
+          firstByteMs = Date.now() - startedAt;
+          // Eventlog copy of the usage-log timing so TTFT is scoreable per
+          // session (proof harness; speculative-routing acceptance telemetry).
+          if (options.sessionId) {
+            try {
+              appendEvent({ sessionId: options.sessionId, turn: 0, role: 'system', type: 'sdk_first_byte', data: { firstByteMs } });
+            } catch { /* telemetry must never break the stream */ }
+          }
+        }
         if (options.shouldCancel && await options.shouldCancel()) {
           try { await stream?.interrupt?.(); } catch { /* best-effort */ }
           throw new AgentRuntimeCancelledError('Run cancelled by caller.');

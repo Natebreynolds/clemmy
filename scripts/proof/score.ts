@@ -46,6 +46,10 @@ export interface SessionMetrics {
   limitExceededEvents: number;
   primerInjectedBytes: number | null;
   latency: TurnLatency[];
+  /** Spawn→first-stream-byte of the session's FIRST SDK query (sdk_first_byte
+   *  event) — the TTFT stand-in on the SDK lane, whose sessions carry no
+   *  turn_started/tool timing for the turn-based ttft above. */
+  firstByteMs: number | null;
 }
 
 export function openHarnessDb(home: string): Database.Database {
@@ -68,6 +72,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
   const toolCalls: Record<string, number> = {};
   let guardrailsTripped = 0;
   let externalWrites = 0;
+  const sdkFirstBytes: number[] = [];
   let autoContinues = 0;
   let workerResults = 0;
   let workerFailures = 0;
@@ -105,6 +110,13 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
       case 'worker_result': {
         workerResults += 1;
         try { if ((JSON.parse(ev.data_json) as { ok?: boolean }).ok === false) workerFailures += 1; } catch { /* count as ok */ }
+        break;
+      }
+      case 'sdk_first_byte': {
+        try {
+          const data = JSON.parse(ev.data_json) as { firstByteMs?: number };
+          if (typeof data.firstByteMs === 'number') sdkFirstBytes.push(data.firstByteMs);
+        } catch { /* ignore malformed */ }
         break;
       }
       case 'guardrail_tripped': guardrailsTripped += 1; break;
@@ -147,6 +159,7 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
     limitExceededEvents,
     primerInjectedBytes,
     latency,
+    firstByteMs: sdkFirstBytes.length > 0 ? sdkFirstBytes[0] : null,
   };
 }
 
