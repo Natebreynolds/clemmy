@@ -52,12 +52,13 @@ test('WORKSPACE_DOCK_TOOLS lists the tools a dock turn needs to edit', () => {
   assert.deepEqual([...WORKSPACE_DOCK_TOOLS], [
     'space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
     'space_get_runner', 'space_edit_runner', 'space_revert_runner', 'space_try_runner', 'space_set_data',
+    'space_publish',
   ]);
 });
 
 test('the Claude tool profiles EXPOSE the space tools (the keystone fix)', () => {
   const full = sdk.defaultClaudeAgentSdkAllowedLocalTools('full');
-  for (const t of ['space_get', 'space_get_view', 'space_get_runner', 'space_list', 'space_edit_view', 'space_edit_runner', 'space_revert_runner', 'space_save', 'space_refresh', 'space_try_runner', 'space_set_data']) {
+  for (const t of ['space_get', 'space_get_view', 'space_get_runner', 'space_list', 'space_edit_view', 'space_edit_runner', 'space_revert_runner', 'space_save', 'space_refresh', 'space_try_runner', 'space_set_data', 'space_publish']) {
     assert.ok(full.includes(t), `full profile missing ${t}`);
   }
   const authoring = sdk.defaultClaudeAgentSdkAllowedLocalTools('local_authoring');
