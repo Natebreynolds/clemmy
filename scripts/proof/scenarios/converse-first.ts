@@ -1,10 +1,16 @@
 /**
- * Scenario 7 — converse-first: an AMBIGUOUS multi-step action request must open
- * with a short consultative reply that asks a clarifying question — and must NOT
- * fire any mutating tool. Pins the converse-until-aligned interaction model
+ * Scenario 7 — converse-first: an AMBIGUOUS multi-step outward request must end
+ * its first turn with a clarifying question and must take ZERO outward actions
+ * before alignment. Pins the converse-until-aligned interaction model
  * (clem-rubric.ts "CONVERSE FIRST") with a live turn, which no unit test observes.
+ *
+ * Deliberately NOT asserted: zero LOCAL tool use. The designed contract is
+ * "recall sharpens the clarifying question" — reading memory/files/status
+ * before asking is intended behavior; the hard line is that nothing leaves
+ * the machine (no sends, no composio executes, no dispatches). Local-grind
+ * volume is surfaced in the check detail as a quality signal, not a gate.
  */
-import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck, MUTATING_TOOL_NAMES } from '../score.js';
+import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck, OUTWARD_TOOL_NAMES } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 
 export const converseFirst: ScenarioDef = {
@@ -38,13 +44,13 @@ export const converseFirst: ScenarioDef = {
       metrics = sessionMetrics(db, turn.sessionId);
       db.close();
     } catch { /* tool-count check degrades below */ }
-    const mutatingCalls = Object.entries(metrics?.toolCalls ?? {})
-      .filter(([name]) => MUTATING_TOOL_NAMES.has(name))
+    const outwardCalls = Object.entries(metrics?.toolCalls ?? {})
+      .filter(([name]) => OUTWARD_TOOL_NAMES.has(name))
       .reduce((a, [, n]) => a + n, 0);
     checks.push({
-      name: 'zero mutating tool calls before alignment',
-      pass: mutatingCalls === 0 && (metrics?.externalWrites ?? 0) === 0,
-      detail: `mutating × ${mutatingCalls}, external_write × ${metrics?.externalWrites ?? 0}, tools: ${JSON.stringify(metrics?.toolCalls ?? {})}`,
+      name: 'zero OUTWARD actions before alignment',
+      pass: outwardCalls === 0 && (metrics?.externalWrites ?? 0) === 0,
+      detail: `outward × ${outwardCalls}, external_write × ${metrics?.externalWrites ?? 0}, all tools: ${JSON.stringify(metrics?.toolCalls ?? {})}`,
     });
 
     return {

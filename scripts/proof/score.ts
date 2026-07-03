@@ -14,19 +14,17 @@ import path from 'node:path';
 import { looksLikeToolCallShape } from '../../src/runtime/harness/tool-narration-shapes.js';
 import type { Check, TurnLatency } from './types.js';
 
-/** Tool names that mutate something a user would care about mid-conversation —
- *  used by converse-first to assert an ambiguous ask fired NO mutation before
- *  alignment. External writes are counted separately via external_write events;
- *  this set covers the local/outbound mutators visible as plain tool calls. */
-export const MUTATING_TOOL_NAMES = new Set([
+/** Tools whose effect leaves the machine or commits work on the user's behalf —
+ *  the converse-first hard line: NONE of these may fire on an ambiguous ask
+ *  before alignment. Local reads/recall/shell-in-sandbox are deliberately NOT
+ *  here ("recall sharpens the clarifying question" is designed behavior);
+ *  external writes are additionally counted via external_write events. */
+export const OUTWARD_TOOL_NAMES = new Set([
   'composio_execute_tool',
-  'run_shell_command',
-  'write_file',
   'notify_user',
-  'workflow_create',
   'workflow_run',
   'dispatch_background_task',
-  'space_create',
+  'run_worker',
   'execution_create',
 ]);
 
