@@ -3,7 +3,7 @@
  */
 import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -108,7 +108,7 @@ test('rejectAgentProposal resolves without creating an agent', () => {
   assert.equal(rejected?.status, 'rejected');
   assert.equal(listAgentProposals().length, 0);
   assert.equal(listAgentProposals({ status: 'all' }).length, 1);
-  assert.equal(loadTeamAgents().length, 0);
+  assert.equal(existsSync(agentFilePath('temporary-analyst')), false);
 });
 
 test('approveAgentProposal refuses to overwrite an existing agent slug', () => {
