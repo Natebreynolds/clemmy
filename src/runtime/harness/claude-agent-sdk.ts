@@ -315,6 +315,9 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   // space_set_data commits a known inline dataset (the one-row-fix path).
   'space_try_runner',
   'space_set_data',
+  // space_publish exports a static share-ready snapshot into the workspace's
+  // own publish/ dir (local write only; the deploy step is separately gated).
+  'space_publish',
 ] as const;
 
 // Mutating tools exposed through the harness gate chain (gated-mutating-tools.ts)

@@ -23,6 +23,7 @@ export function workspaceSlugFromSessionId(sessionId: string): string | null {
 export const WORKSPACE_DOCK_TOOLS = [
   'space_get', 'space_get_view', 'space_list', 'space_edit_view', 'space_save', 'space_refresh',
   'space_get_runner', 'space_edit_runner', 'space_revert_runner', 'space_try_runner', 'space_set_data',
+  'space_publish',
 ] as const;
 
 /**

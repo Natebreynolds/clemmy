@@ -26,6 +26,7 @@ import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-t
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
 import { refreshSpaceData, runScript } from '../spaces/runner.js';
 import { readData, writeData, listNotes, listAudit, appendNote, appendAudit } from '../spaces/data-store.js';
+import { buildPublishSnapshot } from '../spaces/publish.js';
 import { mismatchHint } from '../shared/edit-mismatch.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 
@@ -67,7 +68,7 @@ const dataSourceShape = z.object({
   runner: z.string().max(120).nullable().describe('Filename of a deterministic script you authored (e.g. "refresh.mjs") that prints JSON to stdout. Runs server-side with NO LLM. Mutually exclusive with composio_slug.'),
   composio_slug: z.string().max(120).nullable().describe('A Composio tool slug to call server-side for data (credentials resolve server-side, never in the view). Mutually exclusive with runner.'),
   composio_args_json: z.string().max(4000).nullable().describe('JSON string of frozen args for composio_slug.'),
-  schedule: z.string().max(60).nullable().describe('Optional 5-field cron for an automatic daily/periodic refresh. Omit for on-demand only. (Scheduling activates in a later build phase.)'),
+  schedule: z.string().max(60).nullable().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
   timezone: z.string().max(60).nullable().describe('IANA timezone for the schedule (e.g. "America/Los_Angeles").'),
 });
 
@@ -820,6 +821,34 @@ export function registerSpaceTools(server: McpServer): void {
       appendAudit(slug, { method: 'SET_DATA', path: `/set_data/${sid}`, outcome: 'ok', bytes: write.bytes });
       const n = countRows(parsed);
       return textResult(`Saved ${n == null ? 'data' : `${n} row${n === 1 ? '' : 's'}`} under "${sid}" (${write.bytes} bytes, marked manual). The open Workspace auto-refreshes.`);
+    },
+  );
+
+  server.tool(
+    'space_publish',
+    [
+      'Export a Workspace as a STATIC, share-ready snapshot — the shareable counterpart to the loopback-only live view ("send my client the dashboard").',
+      'The snapshot is a self-contained directory: the current dataset is INLINED (reserved _meta provenance stripped), and refresh/actions/compose/notes are replaced by a clear "published snapshot" notice — no credentials, no daemon URL, nothing live.',
+      'It does NOT deploy. To put it online, deploy the returned directory with your usual site-deploy flow (e.g. a static host) — that deploy is an external write and takes the normal approval. Or just tell the user where the folder is.',
+      'SHARE-CONSCIOUSLY: everything in the inlined dataset becomes readable by anyone with the link. Say so when you hand over the result, and if the data looks sensitive (emails, deal amounts, personal info), ask before deploying.',
+      'Re-publish after data changes to refresh the shared copy — each export is a new timestamped folder (prior exports are kept).',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug to publish.'),
+    },
+    async ({ slug }) => {
+      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
+      const result = buildPublishSnapshot(slug);
+      if (!result.ok) return textResult(`Could not publish "${slug}": ${result.error}`);
+      const rows = Object.entries(result.rowsBySource)
+        .map(([k, n]) => `${k}${n == null ? '' : ` (${n} rows)`}`)
+        .join(', ') || 'no data sources';
+      return textResult(
+        `Published a static snapshot of "${slug}" → ${result.dir}\n`
+        + `${result.files.length} file${result.files.length === 1 ? '' : 's'}, ${result.bytes} bytes. Inlined data: ${rows}.\n`
+        + 'This folder is self-contained and safe to host anywhere (no tokens, actions disabled). '
+        + 'Deploy it with the usual flow if the user wants a link — and remind them the inlined data is visible to anyone who has it.',
+      );
     },
   );
 }

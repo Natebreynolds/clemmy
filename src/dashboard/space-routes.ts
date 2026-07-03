@@ -28,6 +28,7 @@ import {
   enqueueSpaceActionApproval, initSpaceActionApprovals,
 } from '../spaces/space-action-gate.js';
 import { reengageSpace } from '../spaces/reengage.js';
+import { buildPublishSnapshot } from '../spaces/publish.js';
 
 type IsAuthorized = (req: Request) => boolean;
 
@@ -278,6 +279,19 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     writeFileSync(canonical, snapshot, 'utf-8');
     appendAudit(slug, { method: 'POST', path: `/rollback/${revision.version}`, outcome: 'ok' });
     res.json({ space: spaceStore.get(slug), restoredFrom: revision.version });
+  });
+
+  // ---- Publish: export a static share-ready snapshot ----------------------
+  // Local export ONLY (spaces/<slug>/publish/<ts>/, never served): the dataset
+  // is inlined, actions/refresh are frozen, no tokens. Deploying the folder is
+  // a separate (gated) step — the console shows the path; Clem can deploy on ask.
+  app.post('/api/console/spaces/:id/publish', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const slug = req.params.id;
+    if (!isValidSpaceSlug(slug) || !spaceStore.get(slug)) { res.status(404).json({ error: 'not found' }); return; }
+    const result = buildPublishSnapshot(slug);
+    if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+    res.json({ dir: result.dir, files: result.files, bytes: result.bytes, rowsBySource: result.rowsBySource });
   });
 
   // ---- Compose: the LLM step (data → drafted text) -----------------------
