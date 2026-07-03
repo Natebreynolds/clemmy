@@ -294,6 +294,27 @@ function attachLegacyProgressRelay(request: AssistantRequest): () => void {
   });
 }
 
+/** The actual clarifying question (+ options, numbered) from the latest
+ *  awaiting_user_input event — what the user must SEE to answer. Returns null
+ *  when no such event exists (caller falls back to the decision text). */
+function awaitingQuestionText(sessionId: string): string | null {
+  try {
+    const [ev] = listEvents(sessionId, { types: ['awaiting_user_input'], limit: 1, desc: true });
+    if (!ev) return null;
+    const data = ev.data as { question?: unknown; options?: unknown };
+    const question = typeof data.question === 'string' ? data.question.trim() : '';
+    if (!question) return null;
+    const options = Array.isArray(data.options)
+      ? (data.options as unknown[]).filter((o): o is string => typeof o === 'string' && o.trim().length > 0)
+      : [];
+    if (options.length === 0) return question;
+    const numbered = options.map((o, i) => `${i + 1}. ${o}`).join('\n');
+    return `${question}\n${numbered}\n(Reply with a number or in your own words.)`;
+  } catch {
+    return null;
+  }
+}
+
 export async function respondViaHarness(
   surface: HarnessSurface,
   request: AssistantRequest,
@@ -426,7 +447,16 @@ export async function respondViaHarness(
         // Foreground/chat callers treat any non-success reason as a normal reply,
         // so this is forward-only for them — only the background drain branches on it.
         return withRouteDiagnostics({
-          text: replyText || '(no reply produced)',
+          // THE QUESTION, not the summary: the decision's reply is often null on
+          // an ask_user_question park and the summary reads "Asked a clarifying
+          // question…" — every text surface (chat/webhook/Discord/Slack) then
+          // shows the user a REPORT that a question exists instead of the
+          // question itself (observed live 2026-07-03). Prefer a reply that
+          // actually asks; else render the awaiting_user_input event's question
+          // + options verbatim.
+          text: (replyText && /\?/.test(replyText) ? replyText : awaitingQuestionText(sessionId))
+            || replyText
+            || '(no reply produced)',
           sessionId,
           stoppedReason: 'awaiting-input',
           turnsUsed: result.lastTurn,

@@ -726,3 +726,32 @@ test('narration give-up is fallover-eligible; without fallover it ships the grac
     delete process.env.CLEMMY_BRAIN_FALLOVER;
   }
 });
+
+test('awaiting_user_input surfaces THE QUESTION (+ numbered options), never the "asked a question" summary', async () => {
+  const sessionId = 'ask-question-visible';
+  createSession({ id: sessionId, kind: 'chat' });
+  appendEvent({
+    sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+    data: { question: 'Which pipeline do you mean, and where should the update go?', options: ['Sales pipeline → email', 'Sales pipeline → Slack', 'Just clean it up'] },
+  });
+  const run = (async (opts: { sessionId: string }) => ({
+    sessionId: opts.sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1,
+    lastDecision: { summary: 'Asked a clarifying question to identify the pipeline.', reply: null, done: false, nextAction: 'awaiting_user_input', reason: null },
+  })) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: run });
+
+  const res = await respondViaHarness('webhook', { message: 'clean up my pipeline and tell the team', sessionId });
+  assert.match(res.text, /Which pipeline do you mean/, 'the user sees the actual question');
+  assert.match(res.text, /1\. Sales pipeline → email/, 'options are numbered so a channel user can reply "1"');
+  assert.ok(!/Asked a clarifying question to identify/.test(res.text), 'the internal summary never ships as the reply');
+  assert.equal(res.stoppedReason, 'awaiting-input');
+
+  // A decision whose reply ALREADY asks keeps its own wording (no override).
+  const runWithReply = (async (opts: { sessionId: string }) => ({
+    sessionId: opts.sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1,
+    lastDecision: { summary: 's', reply: 'Quick check — email or Slack?', done: false, nextAction: 'awaiting_user_input', reason: null },
+  })) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: runWithReply });
+  const res2 = await respondViaHarness('webhook', { message: 'again', sessionId });
+  assert.equal(res2.text, 'Quick check — email or Slack?');
+});
