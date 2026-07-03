@@ -29,6 +29,7 @@ import { renderSessionHistoryForModel } from '../runtime/harness/session-transcr
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession } from '../runtime/harness/eventlog.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
+import { getWorkspaceDirs } from '../tools/shared.js';
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
@@ -388,6 +389,19 @@ function renderOriginLineageBlock(originSessionId: string | undefined): string {
   ].filter(Boolean).join('\n');
 }
 
+function renderWorkspaceRootsBlock(): string {
+  const roots = getWorkspaceDirs().slice(0, 12);
+  if (roots.length === 0) return '';
+  const primary = roots[0];
+  return [
+    '## Workspace Roots',
+    `Primary workspace root: ${primary}`,
+    'Clementine\'s data directory is not the user workspace. When the task says "Clementine workspace", "this repo", "the project", "workspace", or "worktree", use the primary workspace root unless the user named a different root.',
+    'For local file tools, pass an explicit directory/path from these roots: list_files(directory=...), read_file(path=...), and run_shell_command(cwd=...). Do not rely on default cwd/path behavior for workspace tasks.',
+    ...roots.map((root) => `- ${root}`),
+  ].join('\n');
+}
+
 function buildWorkerPrompt(task: BackgroundTaskRecord): string {
   const policy = loadProactivityPolicy();
   // Carry the spawning chat session's parked GOAL into this delegated worker
@@ -416,6 +430,7 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
     `Soft max runtime: ${task.maxMinutes} minutes`,
     '',
     renderOriginLineageBlock(task.originSessionId),
+    renderWorkspaceRootsBlock(),
     '',
     pinned
       ? `## Pinned Constraint (from the session that started this task — act on EXACTLY this target; do NOT re-discover or substitute a different list)\n${pinned}\n`

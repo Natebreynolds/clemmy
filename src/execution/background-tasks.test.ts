@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -222,6 +222,9 @@ test('processBackgroundTasks opens a sticky plan scope so mutating tools auto-ap
 
 test('processBackgroundTasks embeds origin transcript and action ledger in the worker prompt', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const workspaceRoot = path.join(TMP_HOME, 'workspace-root');
+  mkdirSync(workspaceRoot, { recursive: true });
+  writeFileSync(path.join(TMP_HOME, '.env'), `WORKSPACE_DIRS=${workspaceRoot}\n`, 'utf-8');
   const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Origin chat' });
   appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Use the approved Revill prospect list and do not email Casey twice.' } });
   appendEvent({ sessionId: origin.id, turn: 1, role: 'system', type: 'external_write', data: { shapeKey: 'email_send', targets: ['casey@example.com'] } });
@@ -249,6 +252,11 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   assert.match(workerPromptSeen, /ALREADY DONE/);
   assert.match(workerPromptSeen, /email_send/);
   assert.match(workerPromptSeen, /casey@example\.com/);
+  assert.match(workerPromptSeen, /## Workspace Roots/);
+  assert.match(workerPromptSeen, /Primary workspace root:/);
+  assert.match(workerPromptSeen, /Clementine's data directory is not the user workspace/);
+  assert.match(workerPromptSeen, /list_files\(directory=\.\.\.\), read_file\(path=\.\.\.\), and run_shell_command\(cwd=\.\.\.\)/);
+  assert.match(workerPromptSeen, new RegExp(workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   const updated = getBackgroundTask(task.id);
   assert.equal(updated?.status, 'done');
   assert.equal(updated?.requestedModel, 'claude-sonnet-5');

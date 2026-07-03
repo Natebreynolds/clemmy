@@ -20,7 +20,12 @@ import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
-import { listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
+import {
+  appendEvent as appendHarnessEvent,
+  createSession as createHarnessSession,
+  getSession as getHarnessSession,
+  listEvents as listHarnessEvents,
+} from '../runtime/harness/eventlog.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import type { AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../types.js';
 
@@ -208,6 +213,32 @@ function recordGatewayRoute(
     },
   });
   return route;
+}
+
+function registerQueuedBackgroundOriginTurn(request: GatewayRequest): void {
+  if (!getHarnessSession(request.sessionId)) {
+    createHarnessSession({
+      id: request.sessionId,
+      kind: 'chat',
+      channel: request.channel,
+      userId: request.userId,
+      title: deriveTitle(request.message),
+      metadata: {
+        source: request.source ?? 'gateway',
+        queuedBackgroundOrigin: true,
+      },
+    });
+  }
+  appendHarnessEvent({
+    sessionId: request.sessionId,
+    turn: 0,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: request.message,
+      queuedBackgroundOrigin: true,
+    },
+  });
 }
 
 // A pending "apply your last message to the parked task?" confirmation, keyed by origin
@@ -601,6 +632,7 @@ export class ClementineGateway {
         status: 'queued',
         message: 'Request promoted to a durable background task.',
       });
+      registerQueuedBackgroundOriginTurn(request);
       const task = enqueueDurableChatTask({
         message: request.message,
         sessionId: request.sessionId,

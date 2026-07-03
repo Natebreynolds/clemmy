@@ -44,6 +44,8 @@ export function hasDurableExecutionIntent(message: string): boolean {
   const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
   if (/^\/?(background|bg)\b/.test(lower)) return true;
   if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(lower)) return true;
+  if (/\b(?:move|take|send|put)\s+(?:this|it|that|the request|the task)\s+(?:to|into)\s+the\s+background\b/.test(lower)) return true;
+  if (/\b(?:do|finish)\s+(?:this|it|that|the request|the task)\s+in\s+the\s+background\b/.test(lower)) return true;
   if (/\b(keep working|don't stop|do not stop|long-running|longer running|overnight|take your time)\b/.test(lower)) return true;
   if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(lower)) {
     return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(lower);
@@ -112,9 +114,14 @@ function countHits(text: string, patterns: RegExp[]): number {
 
 /** Strip a leading `/background` / `bg:` command prefix from the user's message. */
 export function stripBackgroundPrefix(message: string): string {
-  return message.trim()
+  const stripped = message.trim()
     .replace(/^\/?(background|bg)\s*[:\-]?\s*/i, '')
+    .replace(
+      /^(?:live validation only:\s*)?(?:please\s+)?(?:(?:move|take|send|put)\s+(?:this|it|that|the request|the task)\s+(?:to|into)\s+the\s+background|(?:run|queue|start|do|finish)\s+(?:this|it|that|the request|the task)\s+(?:in|as|to)?\s*(?:the\s+)?background)\s*(?:(?:[:.,;!-]+|\band\b)\s*)?/i,
+      '',
+    )
     .trim();
+  return stripped;
 }
 
 /**

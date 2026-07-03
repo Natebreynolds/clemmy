@@ -16,7 +16,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
 
 const { ClementineGateway } = await import('./router.js');
-const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { getRun } = await import('../runtime/run-events.js');
 const {
   createBackgroundTask,
@@ -252,6 +252,41 @@ test('gateway auto-promotes broad multi-system data pipelines to background', as
   assert.equal(task!.source, 'mobile');
   assert.match(task!.prompt, /Salesforce/);
   assert.match(task!.prompt, /Airtable CRM/);
+});
+
+test('gateway explicit "move this to the background" with task skips foreground execution', async () => {
+  const sessionId = 'gateway-explicit-background-origin';
+  assert.equal(getSession(sessionId), null, 'precondition: origin session is not already registered');
+  let respondCalled = false;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => {
+      respondCalled = true;
+      return { text: 'foreground', sessionId: req.sessionId };
+    },
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'Live validation only: move this to the background. Read the top-level files and summarize them.',
+    sessionId,
+    channel: 'webhook',
+    source: 'webhook',
+  });
+
+  assert.equal(respondCalled, false, 'foreground chat run should be skipped for explicit background handoff');
+  assert.ok(response.queuedTaskId, 'a durable background task should be queued');
+
+  const task = getBackgroundTask(response.queuedTaskId!);
+  assert.ok(task, 'queued task should be persisted');
+  assert.equal(task!.originSessionId, sessionId);
+  assert.equal(task!.source, 'webhook');
+  assert.match(task!.prompt, /^Read the top-level files and summarize them\./);
+  assert.doesNotMatch(task!.prompt, /move this to the background/i);
+
+  const origin = getSession(sessionId);
+  assert.equal(origin?.kind, 'chat', 'queued-only background origin is registered as a harness chat session');
+  const [originTurn] = listEvents(sessionId, { types: ['user_input_received'], limit: 5, desc: true });
+  assert.equal((originTurn?.data as { queuedBackgroundOrigin?: boolean } | undefined)?.queuedBackgroundOrigin, true);
+  assert.match(String((originTurn?.data as { text?: string } | undefined)?.text ?? ''), /move this to the background/i);
 });
 
 test('gateway records max-turns-with-grace as a non-completed run', async () => {

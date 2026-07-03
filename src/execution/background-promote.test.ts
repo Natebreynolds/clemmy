@@ -43,6 +43,8 @@ test('hasDurableExecutionIntent fires on explicit durable intent and broad data 
   assert.equal(hasDurableExecutionIntent('/background build the site'), true);
   assert.equal(hasDurableExecutionIntent('bg: refactor the auth module'), true);
   assert.equal(hasDurableExecutionIntent('run this in the background'), true);
+  assert.equal(hasDurableExecutionIntent('move this to the background. Read the workspace files.'), true);
+  assert.equal(hasDurableExecutionIntent('please send this to the background: audit the repo'), true);
   assert.equal(hasDurableExecutionIntent('keep working until the audit is done'), true);
   assert.equal(hasDurableExecutionIntent("don't stop until it's shipped"), true);
   assert.equal(hasDurableExecutionIntent('take your time and get it right'), true);
@@ -74,6 +76,8 @@ test('hasDurableExecutionIntent fires on explicit durable intent and broad data 
 test('shouldPromoteToDurable requires intent AND a non-empty instruction', () => {
   // Real durable asks promote.
   assert.equal(shouldPromoteToDurable('/background build the site'), true);
+  assert.equal(shouldPromoteToDurable('move this to the background. Read the workspace files.'), true);
+  assert.equal(shouldPromoteToDurable('Live validation only: move this to the background. Read the top-level files.'), true);
   assert.equal(shouldPromoteToDurable('keep working until the audit is done'), true);
   assert.equal(
     shouldPromoteToDurable('Pull all Salesforce leads, enrich them through Apify and Google reviews, then sync the cleaned records into Airtable.'),
@@ -83,6 +87,7 @@ test('shouldPromoteToDurable requires intent AND a non-empty instruction', () =>
   assert.equal(shouldPromoteToDurable('/background'), false);
   assert.equal(shouldPromoteToDurable('bg:'), false);
   assert.equal(shouldPromoteToDurable('  /bg   '), false);
+  assert.equal(shouldPromoteToDurable('move this to the background'), false);
   // No intent → never promote.
   assert.equal(shouldPromoteToDurable('build me a site'), false);
 });
@@ -90,6 +95,9 @@ test('shouldPromoteToDurable requires intent AND a non-empty instruction', () =>
 test('stripBackgroundPrefix removes a leading background command only', () => {
   assert.equal(stripBackgroundPrefix('/background build the site'), 'build the site');
   assert.equal(stripBackgroundPrefix('bg: refactor auth'), 'refactor auth');
+  assert.equal(stripBackgroundPrefix('move this to the background. Read the workspace files.'), 'Read the workspace files.');
+  assert.equal(stripBackgroundPrefix('Live validation only: move this to the background. Read the top-level files.'), 'Read the top-level files.');
+  assert.equal(stripBackgroundPrefix('please send this to the background: audit the repo'), 'audit the repo');
   assert.equal(stripBackgroundPrefix('build the site'), 'build the site');
   // A non-leading "background" word is preserved.
   assert.equal(stripBackgroundPrefix('explain the background of this case'), 'explain the background of this case');

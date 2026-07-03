@@ -268,10 +268,17 @@ export function runStaleTaskHeartbeat(tasks: BackgroundTaskRecord[], now: number
   const parked = stale.filter((s) => s.kind === 'parked').length;
   const finished = stale.length - parked;
   const weekIndex = Math.floor(now / STALE_TASK_AGE_MS); // 7-day buckets → at most one nudge per window
+  const notificationId = `bgtask-stale-prompt-${weekIndex}`;
+  let alreadyNotified = false;
+  try {
+    alreadyNotified = loadNotifications().some((n) => n.id === notificationId);
+  } catch {
+    // addNotification is still authoritative; this only suppresses duplicate logs.
+  }
   const preview = stale.slice(0, 5).map((s) => `• ${s.task.title}`).join('\n');
   const more = stale.length > 5 ? `\n…and ${stale.length - 5} more` : '';
   addNotification({
-    id: `bgtask-stale-prompt-${weekIndex}`,
+    id: notificationId,
     kind: 'execution',
     title: `${stale.length} old background task${stale.length > 1 ? 's' : ''} — archive them?`,
     body:
@@ -282,6 +289,6 @@ export function runStaleTaskHeartbeat(tasks: BackgroundTaskRecord[], now: number
     read: false,
     metadata: { staleTaskPrompt: true, staleCount: stale.length, finished, parked, staleTaskIds: stale.map((s) => s.task.id) },
   });
-  logger.info({ stale: stale.length, finished, parked }, 'Stale background tasks surfaced for review');
+  if (!alreadyNotified) logger.info({ stale: stale.length, finished, parked }, 'Stale background tasks surfaced for review');
   return { stale: stale.length };
 }
