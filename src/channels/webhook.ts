@@ -350,10 +350,24 @@ function serializeMessageResponse(response: GatewayResponse): {
   };
 }
 
+function resolveApiMessageSession(body: {
+  session_id?: string;
+  sessionId?: string;
+  user_id?: string;
+  userId?: string;
+}): { sessionId: string; userId: string | undefined } {
+  const userId = body.user_id ?? body.userId;
+  return {
+    sessionId: body.session_id ?? body.sessionId ?? `webhook:${userId ?? 'default'}`,
+    userId,
+  };
+}
+
 export const __test__ = {
   completionOutputPreview,
   enrichActivityRun,
   enrichActivityRunDetail,
+  resolveApiMessageSession,
   serializeMessageResponse,
   workflowRunRecordAsActivityRun,
 };
@@ -1664,7 +1678,9 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const body = req.body as {
       text?: string;
       session_id?: string;
+      sessionId?: string;
       user_id?: string;
+      userId?: string;
       model?: string;
     };
 
@@ -1673,13 +1689,13 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       return;
     }
 
-    const sessionId = body.session_id ?? `webhook:${body.user_id ?? 'default'}`;
+    const { sessionId, userId } = resolveApiMessageSession(body);
 
     try {
       const response = await new ClementineGateway(assistant).handleMessage({
         message: body.text,
         sessionId,
-        userId: body.user_id,
+        userId,
         channel: 'webhook',
         model: body.model,
         source: 'webhook',

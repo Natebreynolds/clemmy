@@ -1090,7 +1090,8 @@ const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_
 
 function isSyntheticStallRetryInput(text: string): boolean {
   return text.startsWith('Your previous response was prose, not an action.')
-    || text.startsWith('Your previous response did not make progress on the directive.');
+    || text.startsWith('Your previous response did not make progress on the directive.')
+    || text.startsWith('Your previous response could not be parsed into the required structured decision');
 }
 
 function hasUserFacingReply(decision: OrchestratorDecisionShape | null | undefined): boolean {
@@ -3399,10 +3400,14 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // doesn't settle in 15s, proceed with a degraded (no-primer) turn instead
   // of hanging the user. The race leaves the slow promise to settle in the
   // background; it never blocks the turn again.
+  const syntheticRetryOriginalInput = isSyntheticStallRetryInput(options.input)
+    ? latestHumanInputForStallRetry(options.sessionId)
+    : undefined;
+  const semanticInput = syntheticRetryOriginalInput ?? options.input;
   const assemblySettled = await Promise.race([
     Promise.all([
-      buildTurnMemoryPrimer(options.input, options.sessionId),
-      primeTurnRecallVector(options.input),
+      buildTurnMemoryPrimer(semanticInput, options.sessionId),
+      primeTurnRecallVector(semanticInput),
     ]).then((r) => r as [TurnMemoryPrimer, void]),
     new Promise<null>((resolve) => {
       const t = setTimeout(() => resolve(null), 15_000);
@@ -3413,7 +3418,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     ? assemblySettled[0]
     : {
         enabled: true,
-        query: options.input.replace(/\s+/g, ' ').trim().slice(0, 160),
+        query: semanticInput.replace(/\s+/g, ' ').trim().slice(0, 160),
         hitCount: 0,
         injectedBytes: 0,
         skippedReason: 'assembly_timeout',
@@ -3430,9 +3435,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // complexity / skill / workflow ranking reflect the TASK she is mid-flight on.
   // Fires ONLY on the exact continuation signal (not merely "a goal exists"), so
   // a real user message in a goal-bearing session is still judged on its own
-  // text. Any gap (flag off, no goal, empty objective) → options.input, which is
-  // byte-identical to the prior behavior.
-  let classifierInput = options.input;
+  // text. Synthetic retry prompts classify against the last real human ask so
+  // retry boilerplate cannot accidentally strip external tools.
+  let classifierInput = semanticInput;
   if (continuationClassifyEnabled() && options.input === CONTINUATION_INPUT && activeGoalForTurn) {
     const objective = goalObjectiveString(activeGoalForTurn);
     if (objective) classifierInput = objective;

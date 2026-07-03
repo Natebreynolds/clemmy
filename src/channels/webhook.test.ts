@@ -72,3 +72,18 @@ test('message response serializer preserves route and stop diagnostics', () => {
     },
   );
 });
+
+test('/api/message session resolver accepts snake_case and camelCase ids', () => {
+  assert.deepEqual(
+    __test__.resolveApiMessageSession({ session_id: 'sess-snake', sessionId: 'sess-camel', user_id: 'user-snake' }),
+    { sessionId: 'sess-snake', userId: 'user-snake' },
+  );
+  assert.deepEqual(
+    __test__.resolveApiMessageSession({ sessionId: 'sess-camel', userId: 'user-camel' }),
+    { sessionId: 'sess-camel', userId: 'user-camel' },
+  );
+  assert.deepEqual(
+    __test__.resolveApiMessageSession({ userId: 'user-camel' }),
+    { sessionId: 'webhook:user-camel', userId: 'user-camel' },
+  );
+});

@@ -330,6 +330,52 @@ test('Claude SDK brain overload (uncommitted) falls the turn over to the harness
   assert.equal(res.route?.surface, 'home');
 });
 
+test('Claude SDK brain fallover forces a non-Claude harness model when one is configured', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  const oldByoUrl = process.env.BYO_MODEL_BASE_URL;
+  const oldByoKey = process.env.BYO_MODEL_API_KEY;
+  const oldByoId = process.env.BYO_MODEL_ID;
+  const oldRouting = process.env.MODEL_ROUTING_MODE;
+  process.env.BYO_MODEL_BASE_URL = 'https://example.invalid/v1';
+  process.env.BYO_MODEL_API_KEY = 'test-key';
+  process.env.BYO_MODEL_ID = 'glm-bridge-fallback';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  let capturedModel: string | undefined;
+  try {
+    _setBridgeImplsForTests({
+      configure: okConfigure,
+      buildAgent: (async (opts: { model?: string }) => {
+        capturedModel = opts.model;
+        return FAKE_AGENT;
+      }) as never,
+      runConversation: (async (opts: { sessionId: string }) => ({
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: 'recovered with tools', summary: 's', done: true, nextAction: 'completed' },
+      })) as never,
+      claudeAgentBrain: (async () => {
+        throw new Error('Claude Agent SDK local MCP surface is missing required tool: memory_recall');
+      }) as never,
+    });
+
+    const res = await respondPreferHarness('discord', { message: 'check my calendar', sessionId: 'fallover-model-override' }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+
+    assert.equal(res.text, 'recovered with tools');
+    assert.equal(capturedModel, 'glm-bridge-fallback', 'recovery must not re-enter the Claude headless text-only harness');
+    assert.equal(res.route?.effectiveModel, 'glm-bridge-fallback');
+    assert.equal(res.route?.provider, 'byo');
+    assert.equal(res.route?.falloverFrom, 'claude_agent_sdk_brain');
+  } finally {
+    if (oldByoUrl === undefined) delete process.env.BYO_MODEL_BASE_URL; else process.env.BYO_MODEL_BASE_URL = oldByoUrl;
+    if (oldByoKey === undefined) delete process.env.BYO_MODEL_API_KEY; else process.env.BYO_MODEL_API_KEY = oldByoKey;
+    if (oldByoId === undefined) delete process.env.BYO_MODEL_ID; else process.env.BYO_MODEL_ID = oldByoId;
+    if (oldRouting === undefined) delete process.env.MODEL_ROUTING_MODE; else process.env.MODEL_ROUTING_MODE = oldRouting;
+  }
+});
+
 test('Claude SDK brain UNPARSEABLE-TOOL-CALL (parse failure) also falls the turn over to the harness brain', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';

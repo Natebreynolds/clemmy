@@ -1081,6 +1081,7 @@ export const __test__ = {
   globalApprovalRowsForDm,
   isDiscordTokenExpired,
   maybeRouteParkedBackgroundReply,
+  createDiscordBridgeChunkStreamer,
   renderBody,
   renderFullBody,
   renderSessionPickerText,
@@ -1796,6 +1797,39 @@ function splitForLongReply(text: string): string[] {
   return chunks;
 }
 
+function createDiscordBridgeChunkStreamer(emit: (delta: string) => void): (chunk: string) => void {
+  const jsonStreamer = createJsonFieldStreamer(['reply', 'objective', 'action'], emit);
+  let mode: 'unknown' | 'json' | 'raw' = 'unknown';
+  let pending = '';
+
+  return (chunk: string): void => {
+    if (!chunk) return;
+    if (mode === 'json') {
+      jsonStreamer(chunk);
+      return;
+    }
+    if (mode === 'raw') {
+      emit(chunk);
+      return;
+    }
+
+    pending += chunk;
+    const trimmed = pending.replace(/^\s+/, '');
+    if (!trimmed) return;
+    const first = trimmed[0];
+    if (first === '{' || first === '[') {
+      mode = 'json';
+      jsonStreamer(pending);
+      pending = '';
+      return;
+    }
+
+    mode = 'raw';
+    emit(pending);
+    pending = '';
+  };
+}
+
 /**
  * Transport-agnostic harness conversation runner. Subscribes to the
  * actionBus for the session's events, debounces edits, and resolves
@@ -1994,6 +2028,11 @@ export async function runDiscordHarnessConversation(opts: {
         scheduleEdit();
       }
     }, 1200);
+  });
+  const bridgeOnChunk = createDiscordBridgeChunkStreamer((delta: string): void => {
+    streamBuffer += delta;
+    state.summary = streamBuffer;
+    scheduleEdit();
   });
 
   const flush = async (): Promise<void> => {
@@ -2365,16 +2404,10 @@ export async function runDiscordHarnessConversation(opts: {
         sessionId: session.id,
         channel: channelLabel,
         userId,
-        // Live streaming: the Claude brain emits PLAIN prose (not the
-        // {reply,objective,action} JSON the Codex field-streamer parses), so
-        // accumulate raw deltas and live-edit. The conversation_completed event
-        // replaces this with the authoritative final reply (settle() cancels any
-        // pending stream flush), so streaming can't garble the final message.
-        onChunk: (delta: string): void => {
-          streamBuffer += delta;
-          state.summary = streamBuffer;
-          scheduleEdit();
-        },
+        // Live streaming can come from either Claude SDK (plain prose) or from
+        // harness recovery / direct harness (structured JSON). Auto-classify the
+        // first non-space character so Discord never flashes raw `{ "reply": ... }`.
+        onChunk: bridgeOnChunk,
       }, async (req) => {
         if (claudeAgentSdkBrainEnabled(channel)) {
           return respondViaClaudeAgentSdkBrain(bridgeSurface, req);

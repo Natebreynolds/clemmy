@@ -169,11 +169,12 @@ function routeForLegacyFallback(surface: HarnessSurface, request: AssistantReque
   };
 }
 
-function routeForHarness(surface: HarnessSurface, request: AssistantRequest): AssistantRouteDiagnostics {
+function routeForHarness(surface: HarnessSurface, request: AssistantRequest, modelOverride?: string): AssistantRouteDiagnostics {
   const config = SURFACE_CONFIG[surface];
-  const effectiveModel = config.honorModel && request.model
-    ? request.model
-    : resolveRoleModel('brain').modelId;
+  const effectiveModel = modelOverride
+    ?? (config.honorModel && request.model
+      ? request.model
+      : resolveRoleModel('brain').modelId);
   return {
     routeKind: 'harness',
     surface,
@@ -296,7 +297,7 @@ function attachLegacyProgressRelay(request: AssistantRequest): () => void {
 export async function respondViaHarness(
   surface: HarnessSurface,
   request: AssistantRequest,
-  opts: { reuseRecordedUserInput?: boolean } = {},
+  opts: { reuseRecordedUserInput?: boolean; modelOverride?: string } = {},
 ): Promise<AssistantResponse> {
   const config = SURFACE_CONFIG[surface];
   const sessionId = request.sessionId;
@@ -336,13 +337,14 @@ export async function respondViaHarness(
 
   const detachProgressRelay = attachLegacyProgressRelay(request);
   try {
+    const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
     const agent = await buildAgentImpl({
       userInput: request.message,
       sessionId,
       excludeToolNames: request.excludeToolNames,
       // Only surfaces flagged honorModel forward request.model (workflow steps);
       // every other surface keeps the harness's configured model (byte-identical).
-      ...(config.honorModel && request.model ? { model: request.model } : {}),
+      ...(modelForRun ? { model: modelForRun } : {}),
       // Phase 1 Tool-RAG: JIT tool loading is allowed ONLY on interactive chat
       // lanes (a user is present turn-by-turn). Execution surfaces (cron /
       // background / workflow) have no user and can't recover a dropped built-in
@@ -388,7 +390,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: 'success',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request));
+        }, routeForHarness(surface, request, opts.modelOverride));
       case 'awaiting_user_input':
         // The run asked the user a clarifying question (ask_user_question). It is
         // NOT done — surface a DISTINCT stop reason so a BACKGROUND run parks for
@@ -401,7 +403,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: 'awaiting-input',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request));
+        }, routeForHarness(surface, request, opts.modelOverride));
       case 'awaiting_approval': {
         const pending = listPending({ sessionId, status: 'pending' });
         const first = pending[0];
@@ -414,7 +416,7 @@ export async function respondViaHarness(
           pendingApprovalId: first?.approvalId,
           stoppedReason: 'pending-approval',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request));
+        }, routeForHarness(surface, request, opts.modelOverride));
       }
       case 'limit_exceeded':
         return withRouteDiagnostics({
@@ -422,7 +424,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: 'max-turns-with-grace',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request));
+        }, routeForHarness(surface, request, opts.modelOverride));
       case 'killed':
         // Preserve the legacy cancellation contract: callers (background
         // tasks) classify aborts via this error type.
@@ -432,7 +434,7 @@ export async function respondViaHarness(
           sessionId,
           stoppedReason: 'cancelled',
           turnsUsed: result.lastTurn,
-        }, routeForHarness(surface, request));
+        }, routeForHarness(surface, request, opts.modelOverride));
       case 'failed':
       default:
         throw new Error(result.error || `harness run ${result.status}`);
@@ -507,6 +509,10 @@ function chatBrainFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+function recoveryHarnessModelAfterClaudeFailure(): string | undefined {
+  return falloverBrainModelIds('claude')[0]?.modelId;
+}
+
 /**
  * UNIFIED chat-brain fallover decision, shared by all chat surfaces through
  * respondPreferHarness.
@@ -555,12 +561,14 @@ export async function recoverChatBrainFailure(
   const kind = err instanceof ClaudeSdkProviderOverloadError ? 'overload'
     : isClaudeSdkUnparseableToolCall(err) ? 'parse_failure'
     : 'terminal_error';
-  bridgeLogger.warn({ surface, kind, err: err instanceof Error ? err.message : String(err) },
-    'Claude brain terminal failure — switching the turn over to the harness brain (Codex→GLM); the duplicate-send wall protects any committed write');
+  const recoveryModel = recoveryHarnessModelAfterClaudeFailure();
+  bridgeLogger.warn({ surface, kind, recoveryModel, err: err instanceof Error ? err.message : String(err) },
+    'Claude brain terminal failure — switching the turn over to a non-Claude harness brain when available; the duplicate-send wall protects any committed write');
   detach?.();
   try {
     const recovered = await respondViaHarness(surface, request, {
       reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
+      modelOverride: recoveryModel,
     });
     const route = routeDiagnosticsFromResponse(recovered);
     return route ? withRouteDiagnostics(recovered, { ...route, falloverFrom: 'claude_agent_sdk_brain' }) : recovered;

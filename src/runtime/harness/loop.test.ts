@@ -70,6 +70,7 @@ const { ToolCallsLimitExceeded } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const { getPlanScope, isAutoApprovedByScope } = await import('../../agents/plan-scope.js');
+const { rememberFact } = await import('../../memory/facts.js');
 
 test.after(() => {
   try {
@@ -2393,6 +2394,51 @@ test('runConversation: a malformed finalOutput with ZERO tool work counts as com
     retries.filter((e) => (e.data as { signal?: string }).signal === 'D_decision_unparsed').length,
     0,
     'zero-tool malformed null should not fire the D_decision_unparsed retry',
+  );
+});
+
+test('runConversation: synthetic parse retry classifies against the original tool-backed ask', async () => {
+  resetEventLog();
+  // The "scorpion" shorthand only scopes Outlook because the user has a
+  // pinned-calendar constraint naming that label — seed it so this test
+  // proves the full data-driven chain (constraint fact → label → tool scope).
+  rememberFact({
+    kind: 'constraint',
+    content: 'For Scorpion calendar lookups, use Outlook connection ca_LoopTestRoute1 as the Scorpion calendar connection.',
+  });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: "Clementine produced a response that couldn't be structured. Please ask again." },
+    {
+      finalOutput: {
+        summary: 'Recovered the Scorpion calendar check.',
+        reply: 'Recovered with Outlook calendar tools available.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+    },
+  ]);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Check my scorpion for tomorrow',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const packets = listEventsForConv(sess.id, { types: ['agent_context_packet'] });
+  assert.ok(packets.length >= 2, 'expected original turn plus synthetic retry turn');
+  const retryPacket = packets[1].data as {
+    inputPreview?: string;
+    toolScope?: { allowedServerSlugs?: string[]; reason?: string };
+  };
+  assert.match(retryPacket.inputPreview ?? '', /Check my scorpion for tomorrow/i);
+  assert.ok(
+    (retryPacket.toolScope?.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+    'retry must preserve Outlook calendar reach from the original user ask',
   );
 });
 

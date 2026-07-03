@@ -552,6 +552,22 @@ test('renderBody: while streaming, shows a tail of the reply below the status li
   assert.match(body, /The answer is forming nicely\./, 'streamed reply is shown');
 });
 
+test('createDiscordBridgeChunkStreamer: extracts structured harness JSON instead of flashing raw braces', () => {
+  let out = '';
+  const feed = __test__.createDiscordBridgeChunkStreamer((delta: string) => { out += delta; });
+  for (const chunk of '{"summary":"internal","reply":"Clean Discord reply.","done":true}'.split('')) feed(chunk);
+  assert.equal(out, 'Clean Discord reply.');
+  assert.ok(!out.includes('{"summary"'), 'raw structured envelope never reaches Discord');
+});
+
+test('createDiscordBridgeChunkStreamer: passes Claude SDK plain prose through', () => {
+  let out = '';
+  const feed = __test__.createDiscordBridgeChunkStreamer((delta: string) => { out += delta; });
+  feed('Doing ');
+  feed('the lookup now.');
+  assert.equal(out, 'Doing the lookup now.');
+});
+
 test('renderBody: long streaming reply is tail-clipped with a leading ellipsis', () => {
   const long = 'x'.repeat(50) + ' ' + 'END-OF-REPLY-MARKER '.repeat(200);
   const state = { ...freshState(), done: false, status: 'working', summary: long };
