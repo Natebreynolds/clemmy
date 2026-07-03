@@ -21,8 +21,13 @@ export const converseFirst: ScenarioDef = {
 
     // Deliberately ambiguous + multi-step + outward-facing: the rubric says this
     // exact shape opens with ONE plain clarifying question, not execution.
+    // FICTIONAL system on purpose — the proof home keeps the real $HOME for CLI
+    // OAuth, so a real-sounding ask ("my pipeline") let the brain reach the
+    // actual Salesforce org through `sf` and write real Task records
+    // (2026-07-02). Nothing named "Zephyr deal tracker" exists anywhere, so the
+    // only correct move is to ask.
     const turn = await daemon.chat(
-      'Clean up my pipeline and send the team an update about it.',
+      'Clean up the Zephyr deal tracker and send the crew an update about it.',
       sessionId,
       300_000,
     );
