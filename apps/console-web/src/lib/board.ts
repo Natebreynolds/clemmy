@@ -74,6 +74,73 @@ export interface BoardCard {
   };
 }
 
+export type BackgroundReportBackTargetType = 'slack_user' | 'slack_channel' | 'discord_user' | 'discord_channel';
+
+export interface BackgroundReportBackTarget {
+  type: BackgroundReportBackTargetType;
+  userId?: string;
+  channelId?: string;
+  threadTs?: string;
+}
+
+export interface BackgroundTaskNotification {
+  id: string;
+  title: string;
+  createdAt: string;
+  deliveredAt?: string;
+  deliveryAttempts?: number;
+  deliveryError?: string;
+  deliveredDestinations?: string[];
+  read?: boolean;
+}
+
+export interface BackgroundToolEvent {
+  at: string;
+  toolName: string;
+  phase?: string;
+  outcome?: string;
+  durationMs?: number;
+  argsSummary?: string;
+  errorMessage?: string;
+}
+
+export interface BackgroundTaskDetail {
+  task: {
+    id: string;
+    title: string;
+    prompt: string;
+    status: string;
+    source?: string;
+    originSessionId?: string;
+    runSessionId: string;
+    userId?: string;
+    channel?: string;
+    reportBackTarget?: BackgroundReportBackTarget;
+    createdAt: string;
+    updatedAt: string;
+    startedAt?: string;
+    completedAt?: string;
+    pendingQuestion?: string;
+    pendingQuestionId?: string;
+    pendingApprovalId?: string;
+    lastCheckInAt?: string;
+    lastCheckInMessage?: string;
+    result?: string;
+    resultFull?: string;
+    error?: string;
+    requestedModel?: string;
+    effectiveModel?: string;
+    modelProvider?: string;
+  };
+  detail: {
+    latestActivityAt?: string;
+    latestActivitySummary?: string;
+    pendingApprovals: Array<{ approvalId: string; subject?: string; tool?: string }>;
+    toolEvents: BackgroundToolEvent[];
+    notifications: BackgroundTaskNotification[];
+  };
+}
+
 export const COLUMNS: { id: BoardColumnId; label: string }[] = [
   { id: 'queued', label: 'Queued' },
   { id: 'running', label: 'Running' },
@@ -82,6 +149,21 @@ export const COLUMNS: { id: BoardColumnId; label: string }[] = [
 ];
 
 export const listBoard = () => apiGet<{ cards: BoardCard[]; generatedAt: string }>('/api/console/board');
+
+export const getBackgroundTaskDetail = (id: string) =>
+  apiGet<BackgroundTaskDetail>(`/api/console/background-tasks/${encodeURIComponent(id)}`);
+
+export const setBackgroundTaskReportBackTarget = (id: string, target: BackgroundReportBackTarget) =>
+  apiPost<{ ok: boolean; task?: BackgroundTaskDetail['task']; reason?: string }>(
+    `/api/console/background-tasks/${encodeURIComponent(id)}/report-back-target`,
+    target,
+  );
+
+export const repostBackgroundTaskResult = (id: string, target: BackgroundReportBackTarget) =>
+  apiPost<{ ok: boolean; notificationId?: string; reason?: string }>(
+    `/api/console/background-tasks/${encodeURIComponent(id)}/repost-result`,
+    target,
+  );
 
 // Queue visibility: the sub-task queue of one workflow run (each step/forEach
 // unit with status + what runs next), reconstructed server-side from the durable

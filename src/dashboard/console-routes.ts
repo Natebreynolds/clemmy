@@ -181,8 +181,10 @@ import {
 import type { CheckInUrgency } from '../agents/check-ins.js';
 import {
   archiveBackgroundTask,
+  backgroundTaskNotificationMetadata,
   cancelBackgroundTask,
   createBackgroundTask,
+  type BackgroundReportBackTarget,
   findSoleAwaitingContinueTaskForOrigin,
   findSoleAwaitingInputTaskForOrigin,
   getBackgroundTask,
@@ -193,7 +195,9 @@ import {
   queueBackgroundTaskInputResolution,
   restoreBackgroundTask,
   resumeBackgroundTask,
+  setBackgroundTaskReportBackTarget,
   staleTaskKind,
+  truncateResultBody,
 } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
@@ -292,6 +296,12 @@ import {
   patchUnifiedSession,
   deleteUnifiedSession,
 } from './sessions-api.js';
+import {
+  buildTraceDetail,
+  buildTraceReplayPreview,
+  listTraceSummaries,
+  type ListTraceOptions,
+} from '../runtime/harness/trace-lab.js';
 
 function toolEventsDir(): string {
   return path.join(process.env.CLEMENTINE_HOME || BASE_DIR, 'state', 'tool-events');
@@ -1244,6 +1254,38 @@ interface BoardCard {
   /** Soft-deleted; only present when the board was asked for ?includeArchived=1. */
   archived?: boolean;
   raw: Record<string, unknown>;
+}
+
+function reportBackString(input: unknown, ...keys: string[]): string {
+  if (!input || typeof input !== 'object') return '';
+  const record = input as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function parseBackgroundReportBackTarget(input: unknown): BackgroundReportBackTarget | null {
+  const type = reportBackString(input, 'type');
+  if (type === 'discord_user') {
+    const userId = reportBackString(input, 'userId', 'user_id');
+    return userId ? { type, userId } : null;
+  }
+  if (type === 'discord_channel') {
+    const channelId = reportBackString(input, 'channelId', 'channel_id');
+    return channelId ? { type, channelId } : null;
+  }
+  if (type === 'slack_user') {
+    const userId = reportBackString(input, 'userId', 'user_id');
+    return userId ? { type, userId } : null;
+  }
+  if (type === 'slack_channel') {
+    const channelId = reportBackString(input, 'channelId', 'channel_id');
+    const threadTs = reportBackString(input, 'threadTs', 'thread_ts');
+    return channelId ? { type, channelId, ...(threadTs ? { threadTs } : {}) } : null;
+  }
+  return null;
 }
 
 export function registerConsoleRoutes(
@@ -6004,6 +6046,69 @@ export function registerConsoleRoutes(
     }
   });
 
+  app.post('/api/console/background-tasks/:id/report-back-target', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const task = getBackgroundTask(req.params.id);
+      if (!task) {
+        res.status(404).json({ ok: false, reason: 'background task not found' });
+        return;
+      }
+      const target = parseBackgroundReportBackTarget(req.body);
+      if (!target) {
+        res.status(400).json({ ok: false, reason: 'Valid type plus user_id or channel_id is required.' });
+        return;
+      }
+      const updated = setBackgroundTaskReportBackTarget(task.id, target);
+      if (!updated) {
+        res.status(400).json({ ok: false, reason: 'Could not save that report-back target.' });
+        return;
+      }
+      res.json({ ok: true, task: updated });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/background-tasks/:id/repost-result', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      let task = getBackgroundTask(req.params.id);
+      if (!task) {
+        res.status(404).json({ ok: false, reason: 'background task not found' });
+        return;
+      }
+      const target = parseBackgroundReportBackTarget(req.body);
+      if (target) {
+        task = setBackgroundTaskReportBackTarget(task.id, target) ?? task;
+      }
+
+      const detail = getBackgroundTaskStatus(task.id);
+      const result = detail?.task.resultFull ?? task.result ?? '';
+      if (!result.trim()) {
+        res.status(409).json({ ok: false, reason: 'This task does not have a result to repost yet.' });
+        return;
+      }
+
+      const notificationId = `${Date.now()}-background-${task.id}-repost`;
+      addNotification({
+        id: notificationId,
+        kind: 'execution',
+        title: `Background task result: ${task.title}`,
+        body: truncateResultBody(result),
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: backgroundTaskNotificationMetadata(task, {
+          repostedBackgroundTaskResult: true,
+          status: task.status,
+        }),
+      });
+      res.json({ ok: true, task, notificationId });
+    } catch (err) {
+      res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Unified background-work board (the desktop "Tasks" Kanban). Aggregates
    * every kind of background work into one flat, UN-filtered, normalized card
@@ -7694,6 +7799,50 @@ export function registerConsoleRoutes(
       const limitRaw = q.limit ? Number(q.limit) : NaN;
       if (Number.isFinite(limitRaw)) opts.limit = Math.max(1, Math.min(limitRaw, 1000));
       res.json({ events: listOperationalEvents(opts) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Trace Lab — deterministic harness trace reconstruction from harness.db.
+   * Unlike the live operational feed, this is complete per-session audit history
+   * suitable for replay previews and regression debugging.
+   */
+  const TRACE_KINDS = new Set(['chat', 'execution', 'workflow', 'agent']);
+  const TRACE_STATUSES = new Set(['active', 'paused', 'completed', 'failed', 'cancelled', 'any']);
+  app.get('/api/console/traces', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const q = req.query as Record<string, string | undefined>;
+      const opts: ListTraceOptions = {};
+      const limitRaw = q.limit ? Number(q.limit) : NaN;
+      if (Number.isFinite(limitRaw)) opts.limit = Math.max(1, Math.min(limitRaw, 200));
+      if (q.kind && TRACE_KINDS.has(q.kind)) opts.kind = q.kind as ListTraceOptions['kind'];
+      if (q.status && TRACE_STATUSES.has(q.status)) opts.status = q.status as ListTraceOptions['status'];
+      res.json({ traces: listTraceSummaries(opts) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/traces/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const trace = buildTraceDetail(String(req.params.id ?? ''));
+      if (!trace) { res.status(404).json({ error: 'trace not found' }); return; }
+      res.json({ trace });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/traces/:id/replay-preview', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const replay = buildTraceReplayPreview(String(req.params.id ?? ''));
+      if (!replay) { res.status(404).json({ error: 'trace not found' }); return; }
+      res.json({ replay });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

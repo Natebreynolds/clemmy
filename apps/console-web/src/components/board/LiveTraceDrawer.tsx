@@ -8,13 +8,26 @@
  *  - workflow cards can't use that pipe (their steps run under per-step
  *    `workflow:<suffix>` sessions), so they poll the run-events endpoint.
  */
-import { useEffect, useState } from 'react';
-import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, Users, GitBranch, RefreshCw, Layers, Upload } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { X, Radio, Wrench, CheckCircle2, AlertCircle, Hand, Cpu, Dot, Users, GitBranch, RefreshCw, Layers, Upload, Play, Send, Save } from 'lucide-react';
 import { runHarnessStream, humanHarnessText } from '@/lib/chat';
 import { apiGet } from '@/lib/api';
 import { cn } from '@/lib/cn';
+import { usePoll } from '@/lib/poll';
 import { StatusPill } from '@/components/ui/StatusPill';
-import { cardTone, sourceLabel, type BoardCard } from '@/lib/board';
+import { Button } from '@/components/ui/Button';
+import { Input, Select } from '@/components/ui/Field';
+import {
+  cardTone,
+  getBackgroundTaskDetail,
+  repostBackgroundTaskResult,
+  setBackgroundTaskReportBackTarget,
+  sourceLabel,
+  type BackgroundReportBackTarget,
+  type BackgroundReportBackTargetType,
+  type BoardButtonIntent,
+  type BoardCard,
+} from '@/lib/board';
 import type { HarnessEvent } from '@/lib/types';
 
 interface TraceRow {
@@ -112,13 +125,128 @@ function workflowArtifactsText(value: unknown): string {
   return parts.slice(0, 3).join(' · ');
 }
 
-export function LiveTraceDrawer({ card, onClose }: { card: BoardCard; onClose: () => void }) {
+function formatTime(value?: string): string {
+  if (!value) return 'Not yet';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+function reportBackTargetText(target?: BackgroundReportBackTarget): string {
+  if (!target) return 'No explicit target';
+  if (target.type === 'slack_user') return `Slack DM ${target.userId ?? ''}`.trim();
+  if (target.type === 'slack_channel') return `Slack channel ${target.channelId ?? ''}${target.threadTs ? ` · ${target.threadTs}` : ''}`.trim();
+  if (target.type === 'discord_user') return `Discord DM ${target.userId ?? ''}`.trim();
+  return `Discord channel ${target.channelId ?? ''}`.trim();
+}
+
+function targetValue(target?: BackgroundReportBackTarget): string {
+  return target?.userId ?? target?.channelId ?? '';
+}
+
+function targetThread(target?: BackgroundReportBackTarget): string {
+  return target?.type === 'slack_channel' ? target.threadTs ?? '' : '';
+}
+
+function buildReportBackTarget(type: BackgroundReportBackTargetType, value: string, threadTs: string): BackgroundReportBackTarget | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (type === 'slack_user' || type === 'discord_user') return { type, userId: trimmed };
+  if (type === 'slack_channel') {
+    const thread = threadTs.trim();
+    return { type, channelId: trimmed, ...(thread ? { threadTs: thread } : {}) };
+  }
+  return { type, channelId: trimmed };
+}
+
+function receiptToneFromError(notification: { deliveryError?: string; deliveredAt?: string; deliveredDestinations?: string[] }): 'success' | 'warning' | 'danger' | 'neutral' {
+  const delivered = Boolean(notification.deliveredAt) || Boolean(notification.deliveredDestinations?.length);
+  if (notification.deliveryError && delivered) return 'warning';
+  if (notification.deliveryError) return 'danger';
+  if (delivered) return 'success';
+  return 'neutral';
+}
+
+export function LiveTraceDrawer({
+  card,
+  onClose,
+  onAction,
+}: {
+  card: BoardCard;
+  onClose: () => void;
+  onAction?: (card: BoardCard, intent: BoardButtonIntent) => void;
+}) {
   const [rawHarness, setRawHarness] = useState<HarnessEvent[]>([]);
   const [rawWorkflow, setRawWorkflow] = useState<Array<Record<string, unknown>>>([]);
   const [showRaw, setShowRaw] = useState(false);
   const [current, setCurrent] = useState<string>(card.progressHint || '');
+  const [targetType, setTargetType] = useState<BackgroundReportBackTargetType>('slack_user');
+  const [targetId, setTargetId] = useState('');
+  const [targetThreadTs, setTargetThreadTs] = useState('');
+  const [targetKey, setTargetKey] = useState('');
+  const [targetNotice, setTargetNotice] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
 
   const isWorkflow = card.sourceKind === 'workflow';
+  const isBackground = card.sourceKind === 'background';
+  const backgroundDetail = usePoll(
+    ['background-task-detail', card.id],
+    () => getBackgroundTaskDetail(card.id),
+    4000,
+    { enabled: isBackground },
+  );
+  const taskDetail = backgroundDetail.data;
+
+  useEffect(() => {
+    if (!taskDetail?.task.reportBackTarget) return;
+    const target = taskDetail.task.reportBackTarget;
+    const key = `${target.type}:${targetValue(target)}:${targetThread(target)}`;
+    if (key === targetKey) return;
+    setTargetType(target.type);
+    setTargetId(targetValue(target));
+    setTargetThreadTs(targetThread(target));
+    setTargetKey(key);
+  }, [targetKey, taskDetail?.task.reportBackTarget]);
+
+  const cockpitTarget = useMemo(
+    () => buildReportBackTarget(targetType, targetId, targetThreadTs),
+    [targetId, targetThreadTs, targetType],
+  );
+
+  const saveTarget = async () => {
+    if (!cockpitTarget) {
+      setTargetNotice({ tone: 'danger', text: 'Target ID required.' });
+      return;
+    }
+    try {
+      const response = await setBackgroundTaskReportBackTarget(card.id, cockpitTarget);
+      if (!response.ok) {
+        setTargetNotice({ tone: 'danger', text: response.reason ?? 'Could not save target.' });
+        return;
+      }
+      setTargetNotice({ tone: 'success', text: 'Report-back target saved.' });
+      void backgroundDetail.refetch();
+    } catch (err) {
+      setTargetNotice({ tone: 'danger', text: err instanceof Error ? err.message : 'Could not save target.' });
+    }
+  };
+
+  const repostResult = async () => {
+    if (!cockpitTarget) {
+      setTargetNotice({ tone: 'danger', text: 'Target ID required.' });
+      return;
+    }
+    try {
+      const response = await repostBackgroundTaskResult(card.id, cockpitTarget);
+      if (!response.ok) {
+        setTargetNotice({ tone: 'danger', text: response.reason ?? 'Could not repost result.' });
+        return;
+      }
+      setTargetNotice({ tone: 'success', text: 'Result queued for delivery.' });
+      void backgroundDetail.refetch();
+    } catch (err) {
+      setTargetNotice({ tone: 'danger', text: err instanceof Error ? err.message : 'Could not repost result.' });
+    }
+  };
 
   // Harness SSE for background / run / execution.
   useEffect(() => {
@@ -177,6 +305,7 @@ export function LiveTraceDrawer({ card, onClose }: { card: BoardCard; onClose: (
       });
 
   const tone = cardTone(card);
+  const taskResult = taskDetail?.task.resultFull ?? taskDetail?.task.result ?? '';
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={`Live trace: ${card.title}`}>
@@ -202,6 +331,163 @@ export function LiveTraceDrawer({ card, onClose }: { card: BoardCard; onClose: (
           </div>
           <p className="mt-1 text-body text-fg">{current || 'Waiting for activity…'}</p>
         </div>
+
+        {isBackground && (
+          <div className="border-b border-border px-5 py-4">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-small font-semibold text-fg">Task cockpit</div>
+                <div className="text-caption text-faint">{taskDetail?.task.id ?? card.id}</div>
+              </div>
+              {onAction && (
+                <div className="flex flex-wrap gap-2">
+                  {card.primaryAction === 'continue' && (
+                    <Button size="sm" onClick={() => onAction(card, 'resume')}>
+                      <Play className="h-4 w-4" aria-hidden /> Continue
+                    </Button>
+                  )}
+                  {card.actions.includes('cancel') && (
+                    <Button size="sm" variant="secondary" onClick={() => onAction(card, 'cancel')}>
+                      <X className="h-4 w-4" aria-hidden /> Cancel
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {backgroundDetail.isLoading && !taskDetail ? (
+              <p className="text-body text-faint">Loading task details…</p>
+            ) : taskDetail ? (
+              <div className="space-y-4">
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <CockpitMetric label="Status" value={taskDetail.task.status} />
+                  <CockpitMetric label="Report back" value={reportBackTargetText(taskDetail.task.reportBackTarget)} />
+                  <CockpitMetric label="Updated" value={formatTime(taskDetail.task.updatedAt)} />
+                </div>
+
+                {(taskDetail.task.pendingQuestion || taskDetail.task.pendingApprovalId || taskDetail.task.error || taskDetail.detail.latestActivitySummary) && (
+                  <div className="rounded-md border border-border bg-subtle px-3 py-2.5">
+                    {taskDetail.task.pendingQuestion && (
+                      <div className="mb-2">
+                        <div className="text-caption font-semibold text-warning">Needs input</div>
+                        <div className="text-small text-fg">{taskDetail.task.pendingQuestion}</div>
+                      </div>
+                    )}
+                    {taskDetail.task.pendingApprovalId && (
+                      <div className="mb-2">
+                        <div className="text-caption font-semibold text-warning">Needs approval</div>
+                        <div className="text-small text-fg">{taskDetail.task.pendingApprovalId}</div>
+                      </div>
+                    )}
+                    {taskDetail.task.error && (
+                      <div className="mb-2">
+                        <div className="text-caption font-semibold text-danger">Error</div>
+                        <div className="text-small text-fg">{taskDetail.task.error}</div>
+                      </div>
+                    )}
+                    {taskDetail.detail.latestActivitySummary && (
+                      <div>
+                        <div className="text-caption font-semibold text-faint">Latest activity</div>
+                        <div className="text-small text-fg">{taskDetail.detail.latestActivitySummary}</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="rounded-md border border-border px-3 py-3">
+                  <div className="mb-2 flex items-center gap-2 text-small font-semibold text-fg">
+                    <Send className="h-4 w-4" aria-hidden /> Report-back target
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <Select value={targetType} onChange={(e) => setTargetType(e.target.value as BackgroundReportBackTargetType)} aria-label="Report-back target type">
+                      <option value="slack_user">Slack DM</option>
+                      <option value="slack_channel">Slack channel</option>
+                      <option value="discord_user">Discord DM</option>
+                      <option value="discord_channel">Discord channel</option>
+                    </Select>
+                    <Input
+                      value={targetId}
+                      onChange={(e) => setTargetId(e.target.value)}
+                      placeholder={targetType.endsWith('_user') ? 'User ID' : 'Channel ID'}
+                      aria-label="Report-back target ID"
+                    />
+                    {targetType === 'slack_channel' && (
+                      <Input
+                        value={targetThreadTs}
+                        onChange={(e) => setTargetThreadTs(e.target.value)}
+                        placeholder="Thread timestamp"
+                        aria-label="Slack thread timestamp"
+                        className="sm:col-span-2"
+                      />
+                    )}
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <Button size="sm" variant="secondary" onClick={() => void saveTarget()}>
+                      <Save className="h-4 w-4" aria-hidden /> Save target
+                    </Button>
+                    <Button size="sm" onClick={() => void repostResult()} disabled={!taskResult}>
+                      <Send className="h-4 w-4" aria-hidden /> Repost result
+                    </Button>
+                    {targetNotice && (
+                      <span className={cn('text-caption', targetNotice.tone === 'danger' ? 'text-danger' : 'text-success')}>
+                        {targetNotice.text}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {taskResult && (
+                  <div>
+                    <div className="mb-1 text-small font-semibold text-fg">Result</div>
+                    <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-md bg-canvas p-3 text-caption text-muted">
+                      {taskResult.slice(0, 4000)}
+                    </pre>
+                  </div>
+                )}
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <div className="mb-1 text-small font-semibold text-fg">Tools</div>
+                    {taskDetail.detail.toolEvents.length === 0 ? (
+                      <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No tool events.</div>
+                    ) : (
+                      <ul className="space-y-1.5">
+                        {taskDetail.detail.toolEvents.slice(-5).map((event) => (
+                          <li key={`${event.at}-${event.toolName}-${event.phase ?? ''}`} className="rounded-md border border-border px-2.5 py-2 text-caption">
+                            <div className="truncate font-semibold text-fg">{event.toolName} {event.phase ?? ''}</div>
+                            <div className="truncate text-faint">{event.outcome ?? event.errorMessage ?? event.argsSummary ?? formatTime(event.at)}</div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                  <div>
+                    <div className="mb-1 text-small font-semibold text-fg">Delivery</div>
+                    {taskDetail.detail.notifications.length === 0 ? (
+                      <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No notifications.</div>
+                    ) : (
+                      <ul className="space-y-1.5">
+                        {taskDetail.detail.notifications.slice(-5).map((notification) => (
+                          <li key={notification.id} className="rounded-md border border-border px-2.5 py-2 text-caption">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0 truncate font-semibold text-fg">{notification.title}</div>
+                              <StatusPill tone={receiptToneFromError(notification)}>
+                                {notification.deliveryError ? 'issue' : notification.deliveredAt ? 'sent' : 'queued'}
+                              </StatusPill>
+                            </div>
+                            <div className="truncate text-faint">{notification.deliveryError ?? notification.deliveredDestinations?.join(', ') ?? formatTime(notification.createdAt)}</div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <p className="text-body text-danger">Task details unavailable.</p>
+            )}
+          </div>
+        )}
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {!showRaw ? (
@@ -239,6 +525,15 @@ export function LiveTraceDrawer({ card, onClose }: { card: BoardCard; onClose: (
           </button>
         </footer>
       </div>
+    </div>
+  );
+}
+
+function CockpitMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-md border border-border px-3 py-2">
+      <div className="text-caption font-semibold text-faint">{label}</div>
+      <div className="mt-0.5 truncate text-small text-fg">{value}</div>
     </div>
   );
 }

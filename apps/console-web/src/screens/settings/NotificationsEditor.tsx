@@ -10,10 +10,11 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import {
   listDestinations, addDestination, testDestination, toggleDestination, deleteDestination, getNotificationDoctor,
-  type DeliveryReceipt, type DeliverySurfaceHealth, type DestinationType, type NotificationDoctor,
+  type DeliveryReceipt, type DeliverySurfaceHealth, type DestinationType, type NotificationDestination, type NotificationDoctor,
 } from '@/lib/notifications';
 
 const TYPE_LABEL: Record<DestinationType, string> = {
+  generic_webhook: 'Generic webhook',
   discord_webhook: 'Discord webhook',
   discord_channel: 'Discord channel',
   discord_user: 'Discord DM',
@@ -29,7 +30,7 @@ export function NotificationsEditor() {
   const rows = dests.data?.destinations ?? [];
 
   const [name, setName] = useState('');
-  const [type, setType] = useState<DestinationType>('discord_webhook');
+  const [type, setType] = useState<DestinationType>('discord_channel');
   const [url, setUrl] = useState('');
   const [channelId, setChannelId] = useState('');
   const [userId, setUserId] = useState('');
@@ -63,30 +64,37 @@ export function NotificationsEditor() {
 
   return (
     <Card className="p-5">
-      <h3 className="mb-1 text-h3 text-fg">Notifications</h3>
-      <p className="mb-4 text-small text-muted">Where Clementine sends updates and reports.</p>
+      <h3 className="mb-1 text-h3 text-fg">Connection command center</h3>
+      <p className="mb-4 text-small text-muted">Slack, Discord, and result delivery routes.</p>
 
       <DeliveryDoctor data={doctor.data} loading={doctor.isLoading} onRefresh={refresh} />
 
       {dests.isLoading ? <Skeleton className="h-20 w-full" /> : rows.length > 0 && (
-        <ul className="mb-5 mt-5 space-y-2">
-          {rows.map((d) => (
-            <li key={d.id} className="flex items-center gap-3 rounded-md border border-border px-3 py-2.5">
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-body font-medium text-fg">{d.name}</div>
-                <div className="truncate text-caption text-faint">{TYPE_LABEL[d.type] ?? d.type}{destinationDetail(d)}</div>
-              </div>
-              <StatusPill tone={d.enabled ? 'success' : 'neutral'}>{d.enabled ? 'On' : 'Off'}</StatusPill>
-              <Switch checked={!!d.enabled} onChange={async (v) => { setBusy(d.id); try { await toggleDestination(d.id, v); } finally { setBusy(null); refresh(); } }} label={`Toggle ${d.name}`} />
-              <Button variant="ghost" size="icon" aria-label="Test" title="Send a test" disabled={busy === d.id} onClick={async () => { setBusy(d.id); try { await testDestination(d.id); refresh(); } finally { setBusy(null); } }}>
-                {busy === d.id ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Send className="h-4 w-4" aria-hidden />}
-              </Button>
-              <Button variant="ghost" size="icon" aria-label="Delete" title="Delete" onClick={async () => { await deleteDestination(d.id); refresh(); }}>
-                <Trash2 className="h-4 w-4" aria-hidden />
-              </Button>
-            </li>
+        <div className="mb-5 mt-5 space-y-4">
+          {destinationGroups(rows).map((group) => (
+            <div key={group.label}>
+              <div className="mb-2 text-small font-semibold text-fg">{group.label}</div>
+              <ul className="space-y-2">
+                {group.rows.map((d) => (
+                  <li key={d.id} className="flex items-center gap-3 rounded-md border border-border px-3 py-2.5">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-body font-medium text-fg">{d.name}</div>
+                      <div className="truncate text-caption text-faint">{TYPE_LABEL[d.type] ?? d.type}{destinationDetail(d)}</div>
+                    </div>
+                    <StatusPill tone={d.enabled ? 'success' : 'neutral'}>{d.enabled ? 'On' : 'Off'}</StatusPill>
+                    <Switch checked={!!d.enabled} onChange={async (v) => { setBusy(d.id); try { await toggleDestination(d.id, v); } finally { setBusy(null); refresh(); } }} label={`Toggle ${d.name}`} />
+                    <Button variant="ghost" size="icon" aria-label="Test" title="Send a test" disabled={busy === d.id} onClick={async () => { setBusy(d.id); try { await testDestination(d.id); refresh(); } finally { setBusy(null); } }}>
+                      {busy === d.id ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Send className="h-4 w-4" aria-hidden />}
+                    </Button>
+                    <Button variant="ghost" size="icon" aria-label="Delete" title="Delete" onClick={async () => { await deleteDestination(d.id); refresh(); }}>
+                      <Trash2 className="h-4 w-4" aria-hidden />
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </div>
           ))}
-        </ul>
+        </div>
       )}
 
       <div className="grid gap-2 sm:grid-cols-2">
@@ -98,6 +106,7 @@ export function NotificationsEditor() {
           <option value="slack_webhook">Slack webhook</option>
           <option value="slack_channel">Slack channel</option>
           <option value="slack_user">Slack DM</option>
+          <option value="generic_webhook">Generic webhook</option>
         </Select>
         {isWebhook && <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Webhook URL" aria-label="Webhook URL" className="sm:col-span-2" />}
         {isChannel && <Input value={channelId} onChange={(e) => setChannelId(e.target.value)} placeholder={type.startsWith('slack') ? 'Slack channel ID' : 'Discord channel ID'} aria-label="Channel ID" className="sm:col-span-2" />}
@@ -105,7 +114,7 @@ export function NotificationsEditor() {
       </div>
       <div className="mt-3 flex items-center gap-3">
         <Button size="sm" onClick={add} disabled={busy === 'add' || !name.trim()}>
-          {busy === 'add' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plus className="h-4 w-4" aria-hidden />} Add destination
+          {busy === 'add' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plus className="h-4 w-4" aria-hidden />} Add result route
         </Button>
         {error && <span className="text-small text-danger">{error}</span>}
       </div>
@@ -116,6 +125,14 @@ export function NotificationsEditor() {
 function destinationDetail(destination: { channelId?: string; channel_id?: string; userId?: string; user_id?: string; url?: string }) {
   const value = destination.userId ?? destination.user_id ?? destination.channelId ?? destination.channel_id ?? destination.url;
   return value ? ` · ${value}` : '';
+}
+
+function destinationGroups(rows: NotificationDestination[]): Array<{ label: string; rows: NotificationDestination[] }> {
+  return [
+    { label: 'Slack routes', rows: rows.filter((row) => row.type.startsWith('slack_')) },
+    { label: 'Discord routes', rows: rows.filter((row) => row.type.startsWith('discord_')) },
+    { label: 'Webhook routes', rows: rows.filter((row) => row.type === 'generic_webhook') },
+  ].filter((group) => group.rows.length > 0);
 }
 
 function surfaceTone(surface: DeliverySurfaceHealth): 'success' | 'warning' | 'danger' | 'neutral' {
@@ -154,7 +171,7 @@ function DeliveryDoctor({ data, loading, onRefresh }: { data?: NotificationDocto
     <div className="mb-5 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <div className="text-small font-semibold text-fg">Connection doctor</div>
+          <div className="text-small font-semibold text-fg">Live channel health</div>
           <div className="text-caption text-faint">Last checked {formatTime(data.generatedAt)}</div>
         </div>
         <Button variant="secondary" size="sm" onClick={onRefresh}>
@@ -176,6 +193,20 @@ function DeliveryDoctor({ data, loading, onRefresh }: { data?: NotificationDocto
               <Capability ok={surface.canDm} icon={MessageCircle} label="DM" />
               <Capability ok={surface.canPostChannel} icon={Hash} label="Channel" />
               <Capability ok={surface.canEdit} icon={PencilLine} label="Edit" />
+            </div>
+            <div className="mt-3 grid gap-2 text-caption sm:grid-cols-2">
+              <SurfaceMetric
+                label="Last delivery"
+                value={surface.lastDeliveryStatus ? surface.lastDeliveryStatus : 'None'}
+                detail={surface.lastDeliveryTitle ? `${surface.lastDeliveryTitle} · ${formatTime(surface.lastDeliveryAt)}` : undefined}
+                tone={surface.lastDeliveryStatus ? receiptStatusTone(surface.lastDeliveryStatus) : 'neutral'}
+              />
+              <SurfaceMetric
+                label="Failed delivery"
+                value={surface.recentFailureCount > 0 ? `${surface.recentFailureCount}` : 'None'}
+                detail={surface.lastFailureTitle ? `${surface.lastFailureTitle} · ${formatTime(surface.lastFailureAt)}` : undefined}
+                tone={surface.recentFailureCount > 0 ? 'danger' : 'success'}
+              />
             </div>
             {surface.issues.length > 0 && (
               <div className="mt-3 flex items-start gap-2 rounded-sm bg-warning-tint px-2.5 py-2 text-caption text-warning">
@@ -210,6 +241,35 @@ function DeliveryDoctor({ data, loading, onRefresh }: { data?: NotificationDocto
           </ul>
         )}
       </div>
+    </div>
+  );
+}
+
+function receiptStatusTone(status: DeliveryReceipt['status']): 'success' | 'warning' | 'danger' | 'neutral' {
+  if (status === 'delivered') return 'success';
+  if (status === 'partial') return 'warning';
+  if (status === 'failed') return 'danger';
+  return 'neutral';
+}
+
+function SurfaceMetric({
+  label,
+  value,
+  detail,
+  tone,
+}: {
+  label: string;
+  value: string;
+  detail?: string;
+  tone: 'success' | 'warning' | 'danger' | 'neutral';
+}) {
+  return (
+    <div className="min-w-0 rounded-sm bg-subtle px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate text-faint">{label}</span>
+        <StatusPill tone={tone}>{value}</StatusPill>
+      </div>
+      {detail && <div className="mt-1 truncate text-muted">{detail}</div>}
     </div>
   );
 }

@@ -36,6 +36,12 @@ export interface DeliverySurfaceHealth {
   allowedUserCount: number;
   allowedChannelCount: number;
   details: Record<string, string | number | boolean | undefined>;
+  lastDeliveryAt?: string;
+  lastDeliveryStatus?: DeliveryReceipt['status'];
+  lastDeliveryTitle?: string;
+  lastFailureAt?: string;
+  lastFailureTitle?: string;
+  recentFailureCount: number;
   issues: string[];
 }
 
@@ -119,6 +125,48 @@ function buildReceipt(notification: NotificationRecord): DeliveryReceipt {
   };
 }
 
+function notificationSurfaceIds(notification: NotificationRecord): DeliverySurfaceId[] {
+  const metadata = notification.metadata ?? {};
+  const surfaces = new Set<DeliverySurfaceId>();
+  const reportType = typeof metadata.reportBackTargetType === 'string' ? metadata.reportBackTargetType : '';
+  if (reportType.startsWith('slack_')) surfaces.add('slack');
+  if (reportType.startsWith('discord_')) surfaces.add('discord');
+  if (typeof metadata.slackUserId === 'string' || typeof metadata.slackChannelId === 'string') surfaces.add('slack');
+  if (typeof metadata.discordUserId === 'string' || typeof metadata.discordChannelId === 'string') surfaces.add('discord');
+  for (const destination of notification.deliveredDestinations ?? []) {
+    const lower = destination.toLowerCase();
+    if (lower.includes('slack')) surfaces.add('slack');
+    if (lower.includes('discord')) surfaces.add('discord');
+  }
+  const error = notification.deliveryError?.toLowerCase() ?? '';
+  if (error.includes('slack')) surfaces.add('slack');
+  if (error.includes('discord')) surfaces.add('discord');
+  return [...surfaces];
+}
+
+function surfaceDeliveryStats(notifications: NotificationRecord[], surface: DeliverySurfaceId): {
+  lastDeliveryAt?: string;
+  lastDeliveryStatus?: DeliveryReceipt['status'];
+  lastDeliveryTitle?: string;
+  lastFailureAt?: string;
+  lastFailureTitle?: string;
+  recentFailureCount: number;
+} {
+  const receipts = notifications
+    .filter((notification) => !notification.silent && notificationSurfaceIds(notification).includes(surface))
+    .map(buildReceipt);
+  const last = receipts[0];
+  const failures = receipts.filter((receipt) => receipt.status === 'failed' || receipt.status === 'partial');
+  return {
+    lastDeliveryAt: last?.deliveredAt ?? last?.createdAt,
+    lastDeliveryStatus: last?.status,
+    lastDeliveryTitle: last?.title,
+    lastFailureAt: failures[0]?.deliveredAt ?? failures[0]?.createdAt,
+    lastFailureTitle: failures[0]?.title,
+    recentFailureCount: failures.length,
+  };
+}
+
 function surfaceIssues(input: {
   enabled: boolean;
   connected: boolean;
@@ -163,6 +211,7 @@ export function buildNotificationDoctor(input: {
     || hasEnabledDestination(destinations, 'discord_webhook')
   );
   const discordConfigured = enabledDiscordDestinationCount > 0 || discordAllowedUsers.length > 0 || discordAllowedChannels.length > 0;
+  const discordDeliveryStats = surfaceDeliveryStats(input.notifications, 'discord');
 
   const slackEnabled = input.slack?.enabled === true;
   const slackConnected = input.slack?.connected === true || input.slack?.listening === true;
@@ -177,6 +226,7 @@ export function buildNotificationDoctor(input: {
     || slackAllowedUsers.length > 0
     || slackAllowedChannels.length > 0
     || Boolean(config.slackProactiveChannel);
+  const slackDeliveryStats = surfaceDeliveryStats(input.notifications, 'slack');
 
   const surfaces: DeliverySurfaceHealth[] = [
     {
@@ -198,6 +248,7 @@ export function buildNotificationDoctor(input: {
         startedAt: input.slack?.startedAt,
         proactiveChannel: config.slackProactiveChannel,
       },
+      ...slackDeliveryStats,
       issues: surfaceIssues({
         enabled: slackEnabled,
         connected: slackConnected,
@@ -225,6 +276,7 @@ export function buildNotificationDoctor(input: {
         installUrl: input.discord?.installUrl,
         startedAt: input.discord?.startedAt,
       },
+      ...discordDeliveryStats,
       issues: surfaceIssues({
         enabled: discordEnabled,
         connected: discordConnected,

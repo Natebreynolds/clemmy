@@ -421,6 +421,22 @@ function taskNotificationMetadata(task: BackgroundTaskRecord, extra: Record<stri
   };
 }
 
+export function backgroundTaskNotificationMetadata(
+  task: BackgroundTaskRecord,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return taskNotificationMetadata(task, extra);
+}
+
+export function setBackgroundTaskReportBackTarget(
+  id: string,
+  target: BackgroundReportBackTarget,
+): BackgroundTaskRecord | null {
+  const normalized = normalizeReportBackTarget(target);
+  if (!normalized) return null;
+  return updateBackgroundTask(id, { reportBackTarget: normalized });
+}
+
 function emitBackgroundTaskCheckIn(
   task: BackgroundTaskRecord,
   input: {

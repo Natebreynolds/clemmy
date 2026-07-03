@@ -175,7 +175,7 @@ export function BackgroundTasks() {
         </DndContext>
       )}
 
-      {open && <LiveTraceDrawer card={open} onClose={() => setOpen(null)} />}
+      {open && <LiveTraceDrawer card={open} onClose={() => setOpen(null)} onAction={(card, intent) => void onCardAction(card, intent)} />}
 
       {toast && (
         <div

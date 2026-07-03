@@ -87,4 +87,13 @@ test('buildNotificationDoctor summarizes recent delivery receipts and explicit r
   assert.equal(doctor.recentReceipts[2].id, 'partial');
   assert.equal(doctor.recentReceipts[2].status, 'partial');
   assert.equal(doctor.recentReceipts[2].targetSummary, 'E2E Local Webhook');
+  const discord = doctor.surfaces.find((surface) => surface.id === 'discord');
+  assert.equal(discord?.lastDeliveryStatus, 'delivered');
+  assert.equal(discord?.lastDeliveryTitle, 'Background task completed: Demo');
+  assert.equal(discord?.lastFailureTitle, 'Background task failed: Demo');
+  assert.equal(discord?.recentFailureCount, 1);
+  const slack = doctor.surfaces.find((surface) => surface.id === 'slack');
+  assert.equal(slack?.lastDeliveryStatus, 'failed');
+  assert.equal(slack?.lastFailureTitle, 'Background task failed: Demo');
+  assert.equal(slack?.recentFailureCount, 2);
 });

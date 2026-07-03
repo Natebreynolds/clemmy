@@ -34,6 +34,7 @@ const { CRON_TRIGGERS_DIR, WORKFLOW_RUNS_DIR } = await import('../tools/shared.j
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { appendEvent: appendHarnessEvent, createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
+const { listNotifications } = await import('../runtime/notifications.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -364,6 +365,48 @@ test('board action route: resume re-queues an awaiting_continue background task'
     assert.equal(body.task?.status, 'pending');
     assert.equal(getBackgroundTask(task.id)?.status, 'pending');
     assert.ok(getBackgroundTask(task.id)?.continueResolution, 'continuation context is queued');
+  } finally {
+    await h.close();
+  }
+});
+
+test('background task cockpit routes save report-back target and repost result', async () => {
+  const task = createBackgroundTask({ title: 'share report', prompt: 'p' });
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskDone(task.id, 'Final report body');
+  const h = await boot();
+  try {
+    const targetRes = await fetch(`${h.url}/api/console/background-tasks/${task.id}/report-back-target`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'slack_channel', channel_id: 'C123', thread_ts: '1700000000.000100' }),
+    });
+    assert.equal(targetRes.status, 200);
+    const targetBody = await targetRes.json() as { ok: boolean; task?: { reportBackTarget?: unknown } };
+    assert.equal(targetBody.ok, true);
+    assert.deepEqual(getBackgroundTask(task.id)?.reportBackTarget, {
+      type: 'slack_channel',
+      channelId: 'C123',
+      threadTs: '1700000000.000100',
+    });
+
+    const repostRes = await fetch(`${h.url}/api/console/background-tasks/${task.id}/repost-result`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'discord_channel', channel_id: 'D456' }),
+    });
+    assert.equal(repostRes.status, 200);
+    const repostBody = await repostRes.json() as { ok: boolean; notificationId?: string };
+    assert.equal(repostBody.ok, true);
+    assert.ok(repostBody.notificationId);
+    assert.deepEqual(getBackgroundTask(task.id)?.reportBackTarget, { type: 'discord_channel', channelId: 'D456' });
+
+    const notification = listNotifications(20).find((item) => item.id === repostBody.notificationId);
+    assert.ok(notification, 'repost notification is queued');
+    assert.equal(notification?.metadata?.backgroundTaskId, task.id);
+    assert.equal(notification?.metadata?.reportBackTargetType, 'discord_channel');
+    assert.equal(notification?.metadata?.reportBackTargetId, 'D456');
+    assert.equal(notification?.metadata?.discordChannelId, 'D456');
   } finally {
     await h.close();
   }

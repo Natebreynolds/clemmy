@@ -1,6 +1,7 @@
 import { apiGet, apiPost, api } from './api';
 
 export type DestinationType =
+  | 'generic_webhook'
   | 'discord_webhook'
   | 'discord_channel'
   | 'discord_user'
@@ -35,6 +36,12 @@ export interface DeliverySurfaceHealth {
   allowedUserCount: number;
   allowedChannelCount: number;
   details?: Record<string, string | number | boolean | undefined>;
+  lastDeliveryAt?: string;
+  lastDeliveryStatus?: DeliveryReceipt['status'];
+  lastDeliveryTitle?: string;
+  lastFailureAt?: string;
+  lastFailureTitle?: string;
+  recentFailureCount: number;
   issues: string[];
 }
 
