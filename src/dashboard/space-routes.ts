@@ -29,6 +29,8 @@ import {
 } from '../spaces/space-action-gate.js';
 import { reengageSpace } from '../spaces/reengage.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
+import { availableStarterRecipes } from '../spaces/starter-recipes.js';
+import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
 
 type IsAuthorized = (req: Request) => boolean;
 
@@ -279,6 +281,16 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
     writeFileSync(canonical, snapshot, 'utf-8');
     appendAudit(slug, { method: 'POST', path: `/rollback/${revision.version}`, outcome: 'ok' });
     res.json({ space: spaceStore.get(slug), restoredFrom: revision.version });
+  });
+
+  // ---- Starter recipes: the "start from a recipe" activation list ---------
+  // Runtime-filtered against the user's actually-connected toolkits (never a
+  // hardcoded vendor list); connection-free recipes are always present.
+  app.get('/api/console/spaces/starters', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    let slugs: string[] = [];
+    try { slugs = (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean); } catch { /* offline → connection-free only */ }
+    res.json({ starters: availableStarterRecipes(slugs) });
   });
 
   // ---- Publish: export a static share-ready snapshot ----------------------

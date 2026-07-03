@@ -31,6 +31,8 @@ import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processSpaceSchedules } from '../spaces/scheduler.js';
+import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
+import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { isSpacesEnabled } from '../spaces/store.js';
 import { sweepStaleExecutions, sweepCrashedExecutions, sweepStaleBlockedExecutions } from '../execution/store.js';
 import { sweepStaleRuns } from '../runtime/run-events.js';
@@ -1415,6 +1417,14 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     if (isSpacesEnabled()) {
       await processSpaceSchedules().catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'processSpaceSchedules tick failed');
+      });
+      // First-ten-minutes activation: once-ever SUGGEST when the user has zero
+      // workspaces but a usable connection ("I can build you a Deal Board").
+      // Deterministic + marker-guarded + probe-throttled; never auto-builds.
+      await maybeOfferStarterWorkspace({
+        listConnectedSlugs: async () => (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean),
+      }).catch((err) => {
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'starter-workspace offer check failed');
       });
     }
     // When the run lane is active, draining happens on its own timer
