@@ -3,7 +3,20 @@ import * as approvalRegistry from './approval-registry.js';
 import { isExpired } from './approval-registry.js';
 import { appendEvent } from './eventlog.js';
 import { addNotification } from '../notifications.js';
-import { decideToolApproval } from '../../agents/tool-taxonomy.js';
+import { decideToolApproval, needsApprovalFromTaxonomy } from '../../agents/tool-taxonomy.js';
+import { needsApprovalForShellSmart, needsApprovalForWriteFile } from '../../tools/computer-tools.js';
+
+/** The execution trio must run the SAME per-call approval logic the Codex lane
+ *  uses (smart shell deny-list, sensitive-path write checks, composio read/write
+ *  slug classification) — they are in the SDK profile's ADVERTISE list, and
+ *  blanket fast-allowing that list let `sf data create record` write real CRM
+ *  records with zero approval on default scope (proof converse-first,
+ *  2026-07-02). Each returns the Codex-lane needsApproval(runContext, input). */
+const EXECUTION_APPROVAL_FNS: Record<string, (rc: unknown, input: unknown) => Promise<boolean>> = {
+  run_shell_command: needsApprovalForShellSmart(),
+  write_file: needsApprovalForWriteFile(),
+  composio_execute_tool: needsApprovalFromTaxonomy('composio_execute_tool'),
+};
 
 /**
  * The async approval gate for the AGENTIC Claude Agent SDK lane.
@@ -134,11 +147,26 @@ export function buildGatedToolPermission(sessionId: string, fastAllowTools: stri
     // record, received undefined" and the tool call dies — 2026-07-02 end-of-day
     // task_hygiene incident). Echo the original input back unchanged.
     const args = (input ?? {}) as Record<string, unknown>;
-    if (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(bare))) {
-      return { behavior: 'allow', updatedInput: args } as PermissionResult;
+    // Execution trio FIRST — these are always in the profile's advertise list,
+    // so the fastAllow shortcut below must never cover them. Same per-call
+    // logic as the Codex lane: "Bash is bash" (reads auto-allow), destructive
+    // shapes + CRM/SaaS writes + sensitive paths → human approval (plan-scope
+    // and YOLO still auto-approve inside the shared decision path).
+    const executionApproval = EXECUTION_APPROVAL_FNS[bare];
+    if (executionApproval) {
+      let needs = true;
+      try {
+        needs = await executionApproval({ context: { sessionId } }, args);
+      } catch { /* fail closed → ask the human */ }
+      if (!needs) return { behavior: 'allow', updatedInput: args } as PermissionResult;
+      // fall through to the register/surface/await flow below
+    } else {
+      if (fastAllow.has(normalizeToolName(toolName)) || fastAllow.has(normalizeToolName(bare))) {
+        return { behavior: 'allow', updatedInput: args } as PermissionResult;
+      }
+      const { needsApproval } = decideToolApproval({ sessionId, toolName: bare, args });
+      if (!needsApproval) return { behavior: 'allow', updatedInput: args } as PermissionResult;
     }
-    const { needsApproval } = decideToolApproval({ sessionId, toolName: bare, args });
-    if (!needsApproval) return { behavior: 'allow', updatedInput: args } as PermissionResult;
 
     let approvalId: string;
     try {

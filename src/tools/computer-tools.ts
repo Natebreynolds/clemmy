@@ -130,7 +130,9 @@ export function shellCommandNeedsApproval(rawCommand: unknown): boolean {
     // (SOQL SELECT) — neither mutates, so they are deliberately NOT listed.
     // Over-gating them parked read-only prospect pulls for approval (the
     // `sf org display && sf data query` shape, observed 2026-06-17).
-    /(^|[\s;&|])sf\s+(data\s+(update|insert|delete|upsert|import|tree)|org\s+(login|logout|create|delete|switch)|project\s+(deploy|retrieve|delete|generate)|deploy\b|alias\s+(set|unset))/,
+    // `data create` was missing from the alternation — `sf data create record`
+    // wrote real CRM Tasks with zero approval (proof converse-first, 2026-07-02).
+    /(^|[\s;&|])sf\s+(data\s+(create|update|insert|delete|upsert|import|tree)|org\s+(login|logout|create|delete|switch)|project\s+(deploy|retrieve|delete|generate)|deploy\b|alias\s+(set|unset))/,
     // GitHub CLI mutations
     /(^|[\s;&|])gh\s+(repo\s+(create|delete|fork|clone|sync|edit|archive|rename|set-default)|pr\s+(create|close|merge|edit|review|comment|ready|reopen)|issue\s+(create|close|edit|comment|reopen|transfer|delete|pin|unpin)|release\s+(create|delete|edit|upload|download)|workflow\s+(run|disable|enable)|secret\s+(set|delete)|auth\s+(login|logout|refresh|token)|api\s+(post|put|patch|delete))/,
     // HTTP mutations
@@ -164,7 +166,7 @@ export function shellCommandNeedsApproval(rawCommand: unknown): boolean {
  * execute-class behavior (which still respects plan-scope) for
  * write/unknown commands.
  */
-function needsApprovalForShellSmart() {
+export function needsApprovalForShellSmart() {
   // Inverted polarity: auto-approve by default; pause only on
   // recognized destructive shapes (rm, git push, package installs,
   // sf data update, curl POST, etc.). The full hard-block list in
@@ -189,7 +191,7 @@ function needsApprovalForReadFile() {
   return async (_runContext: unknown, input: unknown): Promise<boolean> => inputTargetsSensitivePath('read_file', input);
 }
 
-function needsApprovalForWriteFile() {
+export function needsApprovalForWriteFile() {
   const base = needsApprovalUnlessInPlanScope('write_file');
   return async (runContext: unknown, input: unknown): Promise<boolean> => {
     if (inputTargetsSensitivePath('write_file', input)) return true;

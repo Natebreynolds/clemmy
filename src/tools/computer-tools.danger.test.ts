@@ -48,6 +48,9 @@ test('G6: Salesforce data/org MUTATIONS still require approval (no under-gating)
   for (const cmd of [
     'sf data update record --sobject Account --record-id 001 --values "Name=X"',
     'sf data delete record --sobject Account --record-id 001',
+    // `create` was MISSING from the alternation — this exact shape wrote real
+    // CRM Tasks with zero approval (proof converse-first, 2026-07-02).
+    "sf data create record --sobject Task --values \"WhatId=006 Subject='Follow up'\" --target-org me@org.com",
     'sf data import tree --files data.json',
     'sf org login web',
     'sf org delete scratch --target-org my-org',
