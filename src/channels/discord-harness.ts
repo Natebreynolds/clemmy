@@ -96,6 +96,12 @@ export function shouldPostExpiryCheckIn(input: {
   return input.now - input.lastCheckInAt >= POST_EXPIRY_CHECKIN_MS;
 }
 
+export function shouldStreamLiveTextToMessage(channel: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (channel !== 'discord') return true;
+  const raw = (env.CLEMMY_DISCORD_LIVE_TEXT_STREAMING ?? 'off').trim().toLowerCase();
+  return raw === 'on' || raw === 'true' || raw === '1' || raw === 'yes';
+}
+
 // Structured logger for Discord edit failures. The previous
 // `catch { }` blocks at the edit sites swallowed errors silently —
 // rate limits, token expiry (Discord interaction tokens die at 15
@@ -1081,6 +1087,7 @@ export const __test__ = {
   globalApprovalRowsForDm,
   isDiscordTokenExpired,
   maybeRouteParkedBackgroundReply,
+  shouldStreamLiveTextToMessage,
   createDiscordBridgeChunkStreamer,
   renderBody,
   renderFullBody,
@@ -2013,7 +2020,9 @@ export async function runDiscordHarnessConversation(opts: {
 
   // Extract clean reply/plan text from the structured-output JSON stream
   // (raw deltas are JSON — see stream-reply.ts).
+  const liveTextStreaming = shouldStreamLiveTextToMessage(channel);
   const onChunk = createJsonFieldStreamer(['reply', 'objective', 'action'], (delta: string): void => {
+    if (!liveTextStreaming) return;
     streamBuffer += delta;
     // Schedule a flush if not already pending. Use a faster debounce (1200ms)
     // than the event-based debounce (2000ms) so tokens appear sooner.
@@ -2030,6 +2039,7 @@ export async function runDiscordHarnessConversation(opts: {
     }, 1200);
   });
   const bridgeOnChunk = createDiscordBridgeChunkStreamer((delta: string): void => {
+    if (!liveTextStreaming) return;
     streamBuffer += delta;
     state.summary = streamBuffer;
     scheduleEdit();

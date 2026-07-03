@@ -78,6 +78,7 @@ export interface BackgroundTaskRecord {
   runSessionId: string;
   userId?: string;
   channel?: string;
+  reportBackTarget?: BackgroundReportBackTarget;
   /** Requested model at enqueue/drain time. `model` is the legacy requested slot;
    *  these explicit fields make fallback/fallover diagnostics legible. */
   requestedModel?: string;
@@ -149,12 +150,19 @@ export interface CreateBackgroundTaskInput {
   originSessionId?: string;
   userId?: string;
   channel?: string;
+  reportBackTarget?: BackgroundReportBackTarget;
   model?: string;
   maxMinutes?: number;
   source?: BackgroundTaskRecord['source'];
   resumedFromTaskId?: string;
   resumeCount?: number;
 }
+
+export type BackgroundReportBackTarget =
+  | { type: 'discord_user'; userId: string }
+  | { type: 'discord_channel'; channelId: string }
+  | { type: 'slack_user'; userId: string }
+  | { type: 'slack_channel'; channelId: string; threadTs?: string };
 
 const BACKGROUND_TASK_DIR = path.join(BASE_DIR, 'state', 'background-tasks');
 const RESULT_TRUNCATE_CHARS = 4000;
@@ -315,19 +323,100 @@ function parseTaskChannelForNotification(channel?: string): {
   return {};
 }
 
+function normalizeReportBackTarget(target: BackgroundReportBackTarget | undefined): BackgroundReportBackTarget | undefined {
+  if (!target) return undefined;
+  if (target.type === 'discord_user') {
+    const userId = target.userId.trim();
+    return userId ? { type: 'discord_user', userId } : undefined;
+  }
+  if (target.type === 'discord_channel') {
+    const channelId = target.channelId.trim();
+    return channelId ? { type: 'discord_channel', channelId } : undefined;
+  }
+  if (target.type === 'slack_user') {
+    const userId = target.userId.trim();
+    return userId ? { type: 'slack_user', userId } : undefined;
+  }
+  const channelId = target.channelId.trim();
+  const threadTs = target.threadTs?.trim();
+  return channelId ? { type: 'slack_channel', channelId, ...(threadTs ? { threadTs } : {}) } : undefined;
+}
+
+function defaultReportBackTarget(input: { source?: BackgroundTaskRecord['source']; userId?: string; channel?: string }): BackgroundReportBackTarget | undefined {
+  const source = input.source;
+  const userId = input.userId?.trim();
+  const channel = parseTaskChannelForNotification(input.channel);
+
+  // Slack background work should report to the requester by default. A Slack
+  // channel/thread route can bury a long-running task's completion where the
+  // user does not get a clear unread DM.
+  if (source === 'slack') {
+    if (userId) return { type: 'slack_user', userId };
+    if (channel.slackChannelId) {
+      return {
+        type: 'slack_channel',
+        channelId: channel.slackChannelId,
+        ...(channel.slackThreadTs ? { threadTs: channel.slackThreadTs } : {}),
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function reportBackTargetMetadata(target: BackgroundReportBackTarget | undefined): Record<string, unknown> {
+  if (!target) return {};
+  if (target.type === 'discord_user') {
+    return {
+      reportBackTargetType: target.type,
+      reportBackTargetId: target.userId,
+      discordUserId: target.userId,
+    };
+  }
+  if (target.type === 'discord_channel') {
+    return {
+      reportBackTargetType: target.type,
+      reportBackTargetId: target.channelId,
+      discordChannelId: target.channelId,
+    };
+  }
+  if (target.type === 'slack_user') {
+    return {
+      reportBackTargetType: target.type,
+      reportBackTargetId: target.userId,
+      slackUserId: target.userId,
+    };
+  }
+  return {
+    reportBackTargetType: target.type,
+    reportBackTargetId: target.threadTs ? `${target.channelId}:${target.threadTs}` : target.channelId,
+    slackChannelId: target.channelId,
+    slackThreadTs: target.threadTs,
+  };
+}
+
 function taskNotificationMetadata(task: BackgroundTaskRecord, extra: Record<string, unknown> = {}): Record<string, unknown> {
   const channel = parseTaskChannelForNotification(task.channel);
   const allowDiscordCheckIns = loadProactivityPolicy().allowDiscordCheckIns;
+  const reportBackTarget = normalizeReportBackTarget(task.reportBackTarget)
+    ?? defaultReportBackTarget({ source: task.source, userId: task.userId, channel: task.channel });
+  const targetMetadata = reportBackTargetMetadata(reportBackTarget);
   return {
     backgroundTaskId: task.id,
     sessionId: task.originSessionId,
     runSessionId: task.runSessionId,
     userId: task.userId,
     channel: task.channel,
-    discordUserId: allowDiscordCheckIns && task.channel?.startsWith('discord:') ? task.userId : undefined,
-    discordChannelId: allowDiscordCheckIns ? channel.discordChannelId : undefined,
-    slackChannelId: channel.slackChannelId,
-    slackThreadTs: channel.slackThreadTs,
+    originDiscordChannelId: channel.discordChannelId,
+    originSlackChannelId: channel.slackChannelId,
+    originSlackThreadTs: channel.slackThreadTs,
+    discordUserId: targetMetadata.discordUserId ?? (allowDiscordCheckIns && task.channel?.startsWith('discord:') ? task.userId : undefined),
+    discordChannelId: targetMetadata.discordChannelId ?? (allowDiscordCheckIns ? channel.discordChannelId : undefined),
+    slackUserId: targetMetadata.slackUserId,
+    slackChannelId: targetMetadata.slackChannelId ?? (!reportBackTarget ? channel.slackChannelId : undefined),
+    slackThreadTs: targetMetadata.slackThreadTs ?? (!reportBackTarget ? channel.slackThreadTs : undefined),
+    reportBackTargetType: targetMetadata.reportBackTargetType,
+    reportBackTargetId: targetMetadata.reportBackTargetId,
     ...extra,
   };
 }
@@ -509,6 +598,8 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     runSessionId: `background:${id}`,
     userId: input.userId,
     channel: input.channel,
+    reportBackTarget: normalizeReportBackTarget(input.reportBackTarget)
+      ?? defaultReportBackTarget({ source: input.source ?? 'gateway', userId: input.userId, channel: input.channel }),
     requestedModel: input.model,
     model: input.model,
     maxMinutes: Math.max(1, Math.min(240, Math.floor(input.maxMinutes ?? 60))),
@@ -1140,6 +1231,7 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
     model: task.model,
     maxMinutes: task.maxMinutes,
     source: task.source,
+    reportBackTarget: task.reportBackTarget,
     resumedFromTaskId: task.id,
     resumeCount: (task.resumeCount ?? 0) + 1,
   });

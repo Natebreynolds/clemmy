@@ -53,7 +53,7 @@ const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-sco
 const { SessionStore } = await import('../memory/session-store.js');
 const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../runtime/harness/fanout-ledger.js');
 const { createSession, appendEvent, getSession } = await import('../runtime/harness/eventlog.js');
-const { listNotifications } = await import('../runtime/notifications.js');
+const { listNotifications, getNotificationDestinationsForRecord } = await import('../runtime/notifications.js');
 const { markBackgroundTaskBlocked } = await import('./background-tasks.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
 
@@ -816,7 +816,7 @@ test('markBackgroundTaskAwaitingInput parks the task with the question', () => {
   assert.match(parked?.pendingQuestion ?? '', /market-leaders/);
 });
 
-test('awaiting-input notifications preserve originating Discord and Slack channel metadata', () => {
+test('awaiting-input notifications preserve origin metadata and route Slack report-backs to requester DM', () => {
   const discordTask = createBackgroundTask({
     title: 'Discord follow-up',
     prompt: 'ask in Discord',
@@ -830,6 +830,7 @@ test('awaiting-input notifications preserve originating Discord and Slack channe
     .find((item) => item.metadata?.backgroundTaskId === discordTask.id);
   assert.equal(discordNote?.metadata?.discordUserId, 'discord-user-1');
   assert.equal(discordNote?.metadata?.discordChannelId, 'discord-channel-1');
+  assert.equal(discordNote?.metadata?.originDiscordChannelId, 'discord-channel-1');
 
   const slackTask = createBackgroundTask({
     title: 'Slack follow-up',
@@ -840,10 +841,43 @@ test('awaiting-input notifications preserve originating Discord and Slack channe
     channel: 'slack:C123:1700000000.000100',
   });
   markBackgroundTaskAwaitingInput(slackTask.id, 'q-slack-routing', 'Which Slack segment?');
+  const storedSlackTask = getBackgroundTask(slackTask.id);
+  assert.deepEqual(storedSlackTask?.reportBackTarget, { type: 'slack_user', userId: 'U123' });
   const slackNote = listNotifications(200)
     .find((item) => item.metadata?.backgroundTaskId === slackTask.id);
-  assert.equal(slackNote?.metadata?.slackChannelId, 'C123');
-  assert.equal(slackNote?.metadata?.slackThreadTs, '1700000000.000100');
+  assert.equal(slackNote?.metadata?.slackUserId, 'U123');
+  assert.equal(slackNote?.metadata?.reportBackTargetType, 'slack_user');
+  assert.equal(slackNote?.metadata?.reportBackTargetId, 'U123');
+  assert.equal(slackNote?.metadata?.slackChannelId, undefined);
+  assert.equal(slackNote?.metadata?.slackThreadTs, undefined);
+  assert.equal(slackNote?.metadata?.originSlackChannelId, 'C123');
+  assert.equal(slackNote?.metadata?.originSlackThreadTs, '1700000000.000100');
+  assert.ok(slackNote, 'Slack notification recorded');
+  const slackDests = getNotificationDestinationsForRecord(slackNote);
+  assert.ok(slackDests.some((dest) => dest.type === 'slack_user' && dest.userId === 'U123'), 'Slack requester DM is the explicit route');
+  assert.ok(!slackDests.some((dest) => dest.type === 'slack_channel' && dest.channelId === 'C123'), 'origin thread is not reused as the report-back route');
+});
+
+test('completed Slack background tasks DM the requester by default', () => {
+  const task = createBackgroundTask({
+    title: 'Finish Slack report',
+    prompt: 'finish the report in the background',
+    originSessionId: 'slack:C999:1700000000.000200',
+    source: 'slack',
+    userId: 'U999',
+    channel: 'slack:C999:1700000000.000200',
+  });
+  markBackgroundTaskDone(task.id, '## Completed\nThe report is ready.');
+  const note = listNotifications(300)
+    .find((item) => item.metadata?.backgroundTaskId === task.id && item.title.startsWith('Background task completed:'));
+  assert.ok(note, 'completion notification recorded');
+  assert.equal(note.metadata?.slackUserId, 'U999');
+  assert.equal(note.metadata?.slackChannelId, undefined);
+  assert.equal(note.metadata?.originSlackChannelId, 'C999');
+  assert.equal(note.metadata?.originSlackThreadTs, '1700000000.000200');
+  const dests = getNotificationDestinationsForRecord(note);
+  assert.ok(dests.some((dest) => dest.type === 'slack_user' && dest.userId === 'U999'), 'completion routes to requester DM');
+  assert.ok(!dests.some((dest) => dest.type === 'slack_channel' && dest.channelId === 'C999'), 'completion does not disappear into the origin thread');
 });
 
 test('queueBackgroundTaskInputResolution re-queues with the freeform answer', () => {

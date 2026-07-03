@@ -527,6 +527,14 @@ test('isDiscordTokenExpired: unrelated errors are NOT misclassified', () => {
   assert.equal(__test__.isDiscordTokenExpired('plain string error'), false);
 });
 
+test('shouldStreamLiveTextToMessage: Discord partial prose streaming is opt-in', () => {
+  assert.equal(__test__.shouldStreamLiveTextToMessage('discord', {} as never), false);
+  assert.equal(__test__.shouldStreamLiveTextToMessage('discord', { CLEMMY_DISCORD_LIVE_TEXT_STREAMING: 'on' } as never), true);
+  assert.equal(__test__.shouldStreamLiveTextToMessage('discord', { CLEMMY_DISCORD_LIVE_TEXT_STREAMING: 'true' } as never), true);
+  assert.equal(__test__.shouldStreamLiveTextToMessage('discord', { CLEMMY_DISCORD_LIVE_TEXT_STREAMING: 'off' } as never), false);
+  assert.equal(__test__.shouldStreamLiveTextToMessage('slack', {} as never), true);
+});
+
 // ── Discord rendering: final reply is plain text, not a broken blockquote ──
 test('renderFullBody: multi-line reply is plain text (no `> ` blockquote)', () => {
   const state = { ...freshState(), done: true, summary: 'Line one\nLine two\nLine three' };

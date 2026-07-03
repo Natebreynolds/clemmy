@@ -8,6 +8,11 @@ import matter from 'gray-matter';
 import { ClementineAssistant } from '../assistant/core.js';
 import {
   BASE_DIR,
+  DISCORD_ALLOWED_CHANNELS,
+  DISCORD_DM_ALLOWED_USERS,
+  SLACK_ALLOWED_CHANNELS,
+  SLACK_ALLOWED_USERS,
+  SLACK_PROACTIVE_CHANNEL,
   WEBHOOK_ALLOW_LAN,
   WEBHOOK_HOST,
   WEBHOOK_PORT,
@@ -44,8 +49,11 @@ import {
   removeNotificationDestination,
   upsertNotificationDestination,
 } from '../runtime/notifications.js';
+import { buildNotificationDoctor } from '../runtime/notification-doctor.js';
 import { testNotificationDestination } from '../runtime/notification-delivery.js';
 import { fetchDiscordInstallInfo } from './discord-install.js';
+import { getDiscordRuntimeStatus } from './discord.js';
+import { getSlackRuntimeStatus } from './slack.js';
 import { readEnvFile, writeEnvFile } from '../setup/env-file.js';
 import {
   authorizeToolkit,
@@ -883,6 +891,26 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     res.json({ destinations: listNotificationDestinations() });
   });
 
+  app.get('/api/notifications/doctor', requireAuth, (_req, res) => {
+    try {
+      res.json(buildNotificationDoctor({
+        destinations: listNotificationDestinations(),
+        notifications: listNotifications(300),
+        discord: getDiscordRuntimeStatus(),
+        slack: getSlackRuntimeStatus(),
+        config: {
+          discordAllowedUsers: DISCORD_DM_ALLOWED_USERS,
+          discordAllowedChannels: DISCORD_ALLOWED_CHANNELS,
+          slackAllowedUsers: SLACK_ALLOWED_USERS,
+          slackAllowedChannels: SLACK_ALLOWED_CHANNELS,
+          slackProactiveChannel: SLACK_PROACTIVE_CHANNEL || undefined,
+        },
+      }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/notifications/destinations', requireAuth, (req, res) => {
     const body = req.body as {
       name?: string;
@@ -893,22 +921,28 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       guild_id?: string;
       user_id?: string;
     };
-    const type = body.type === 'discord_webhook' || body.type === 'discord_channel' || body.type === 'discord_user'
+    const type = body.type === 'discord_webhook'
+      || body.type === 'discord_channel'
+      || body.type === 'discord_user'
+      || body.type === 'slack_webhook'
+      || body.type === 'slack_channel'
+      || body.type === 'slack_user'
+      || body.type === 'generic_webhook'
       ? body.type
       : 'generic_webhook';
     if (!body.name) {
       res.status(400).json({ error: 'Missing name' });
       return;
     }
-    if ((type === 'generic_webhook' || type === 'discord_webhook') && !body.url) {
+    if ((type === 'generic_webhook' || type === 'discord_webhook' || type === 'slack_webhook') && !body.url) {
       res.status(400).json({ error: 'Missing url' });
       return;
     }
-    if (type === 'discord_channel' && !body.channel_id) {
+    if ((type === 'discord_channel' || type === 'slack_channel') && !body.channel_id) {
       res.status(400).json({ error: 'Missing channel_id' });
       return;
     }
-    if (type === 'discord_user' && !body.user_id) {
+    if ((type === 'discord_user' || type === 'slack_user') && !body.user_id) {
       res.status(400).json({ error: 'Missing user_id' });
       return;
     }
@@ -1597,6 +1631,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
     const url = typeof req.body.url === 'string' ? req.body.url.trim() : '';
     const channelId = typeof req.body.channel_id === 'string' ? req.body.channel_id.trim() : '';
+    const guildId = typeof req.body.guild_id === 'string' ? req.body.guild_id.trim() : '';
     const userId = typeof req.body.user_id === 'string' ? req.body.user_id.trim() : '';
     const type = req.body.type === 'discord_webhook'
       ? 'discord_webhook'
@@ -1604,13 +1639,19 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         ? 'discord_channel'
         : req.body.type === 'discord_user'
           ? 'discord_user'
-        : 'generic_webhook';
+          : req.body.type === 'slack_webhook'
+            ? 'slack_webhook'
+            : req.body.type === 'slack_channel'
+              ? 'slack_channel'
+              : req.body.type === 'slack_user'
+                ? 'slack_user'
+                : 'generic_webhook';
     if (
       name &&
       (
-        ((type === 'generic_webhook' || type === 'discord_webhook') && url) ||
-        (type === 'discord_channel' && channelId) ||
-        (type === 'discord_user' && userId)
+        ((type === 'generic_webhook' || type === 'discord_webhook' || type === 'slack_webhook') && url) ||
+        ((type === 'discord_channel' || type === 'slack_channel') && channelId) ||
+        ((type === 'discord_user' || type === 'slack_user') && userId)
       )
     ) {
       upsertNotificationDestination({
@@ -1618,6 +1659,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         name,
         url: url || undefined,
         channelId: channelId || undefined,
+        guildId: guildId || undefined,
         userId: userId || undefined,
         type,
         enabled: true,

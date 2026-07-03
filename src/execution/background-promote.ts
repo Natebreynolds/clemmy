@@ -24,7 +24,7 @@
 import { MODELS } from '../config.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { deriveTitle } from '../memory/derive-title.js';
-import { createBackgroundTask, requestBackgroundDrain, type BackgroundTaskRecord } from './background-tasks.js';
+import { createBackgroundTask, requestBackgroundDrain, type BackgroundReportBackTarget, type BackgroundTaskRecord } from './background-tasks.js';
 import { requestKill, listEvents } from '../runtime/harness/eventlog.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 
@@ -152,6 +152,7 @@ export interface EnqueueDurableChatTaskInput {
   sessionId: string;
   userId?: string;
   channel?: string;
+  reportBackTarget?: BackgroundReportBackTarget;
   /** Worker model override; defaults to the deep-reasoning model. */
   model?: string;
   /** Surface that promoted the turn (for board/notification attribution). */
@@ -179,6 +180,7 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     originSessionId: input.sessionId,
     userId: input.userId,
     channel: input.channel,
+    reportBackTarget: input.reportBackTarget,
     model: input.model ?? MODELS.deep,
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',
