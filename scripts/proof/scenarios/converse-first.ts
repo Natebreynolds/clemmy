@@ -30,20 +30,32 @@ export const converseFirst: ScenarioDef = {
     const checks: Check[] = [];
     checks.push({ name: 'HTTP 200', pass: turn.httpStatus === 200, detail: `status ${turn.httpStatus}` });
     checks.push(reportBackCheck(turn.text));
-    checks.push({
-      name: 'reply asks a clarifying question',
-      pass: /\?/.test(turn.text),
-      detail: /\?/.test(turn.text) ? undefined : turn.text.slice(0, 200),
-    });
-    checks.push(narrationCheck(turn.text));
-    checks.push(stormCheck(daemon.log()));
 
     let metrics = null;
+    let askedViaEvent = false;
     try {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, turn.sessionId);
+      // The Codex lane asks via the ask_user_question tool and parks
+      // awaiting_user_input; the chat endpoint then returns the decision
+      // SUMMARY (no "?"), so the eventlog is the source of truth for
+      // "a clarifying question was actually posed".
+      const row = db.prepare(
+        "SELECT data_json FROM events WHERE session_id = ? AND type = 'awaiting_user_input' LIMIT 1",
+      ).get(turn.sessionId) as { data_json?: string } | undefined;
+      if (row?.data_json) {
+        try { askedViaEvent = Boolean((JSON.parse(row.data_json) as { question?: string }).question?.trim()); } catch { askedViaEvent = true; }
+      }
       db.close();
-    } catch { /* tool-count check degrades below */ }
+    } catch { /* checks below degrade to text-only */ }
+
+    checks.push({
+      name: 'asks a clarifying question (reply or awaiting_user_input)',
+      pass: /\?/.test(turn.text) || askedViaEvent,
+      detail: /\?/.test(turn.text) || askedViaEvent ? undefined : turn.text.slice(0, 200),
+    });
+    checks.push(narrationCheck(turn.text));
+    checks.push(stormCheck(daemon.log()));
     const outwardCalls = Object.entries(metrics?.toolCalls ?? {})
       .filter(([name]) => OUTWARD_TOOL_NAMES.has(name))
       .reduce((a, [, n]) => a + n, 0);
