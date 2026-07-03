@@ -667,6 +667,49 @@ test('isChatBrainFalloverEligible: ANY genuine Claude-brain failure switches bra
   }
 });
 
+test('parse-exhaustion completion re-runs ONCE on the next brain instead of shipping the apology', async () => {
+  // Seed a connected Claude so falloverBrainModelIds('codex') has a target
+  // (the harness brain under AUTH_MODE=api_key resolves to the codex class).
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const path = await import('node:path');
+  mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
+  writeFileSync(path.join(TEST_HOME, 'state', 'claude-auth.json'), JSON.stringify({
+    accessToken: 'sk-ant-oat01-test', refreshToken: 'r', expiresAt: Date.now() + 3_600_000,
+  }), 'utf-8');
+
+  const models: Array<string | undefined> = [];
+  const recordingBuilder = (async (opts: { model?: string }) => { models.push(opts.model); return FAKE_AGENT; }) as never;
+  let calls = 0;
+  const run = (async (opts: { sessionId: string }) => {
+    calls += 1;
+    if (calls === 1) {
+      // Dead turn: parse retries exhausted, apology summary, completedReason set.
+      return { sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3, completedReason: 'no_structured_output' };
+    }
+    return {
+      sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+      lastDecision: { summary: 's', reply: 'recovered on the other brain', done: true, nextAction: 'completed', reason: null },
+    };
+  }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: run });
+
+  const res = await respondViaHarness('webhook', { message: 'do the thing', sessionId: 'parse-exhaustion-fallover' });
+  assert.equal(calls, 2, 'the dead turn must be re-run exactly once');
+  assert.match(res.text, /recovered on the other brain/, 'the recovered reply ships, not the apology');
+  assert.ok(models[1], 'the re-run pinned a modelOverride (the next brain)');
+  assert.notEqual(models[1], models[0], 'the re-run must not use the same model');
+
+  // And the guard: a re-run that ALSO dead-ends must NOT recurse.
+  calls = 0;
+  const alwaysDead = (async (opts: { sessionId: string }) => {
+    calls += 1;
+    return { sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3, completedReason: 'no_structured_output', lastDecision: { summary: 'apology', reply: null, done: true, nextAction: 'completed', reason: null } };
+  }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: alwaysDead });
+  await respondViaHarness('webhook', { message: 'do the thing', sessionId: 'parse-exhaustion-no-recurse' });
+  assert.equal(calls, 2, 'exactly one recovery hop — never a loop');
+});
+
 test('narration give-up is fallover-eligible; without fallover it ships the graceful copy, never a raw error', async () => {
   const { ClaudeSdkNarrationGiveUpError } = await import('./claude-agent-brain.js');
   const err = new ClaudeSdkNarrationGiveUpError('I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.');

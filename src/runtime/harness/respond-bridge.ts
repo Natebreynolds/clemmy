@@ -384,13 +384,40 @@ export async function respondViaHarness(
         : (result.lastDecision?.summary ?? '');
 
     switch (result.status) {
-      case 'completed':
+      case 'completed': {
+        // Parse-exhaustion DEAD turn (retries burned, apology text, near-zero
+        // tool work) → re-run ONCE on the next brain instead of shipping the
+        // apology — the harness-lane mirror of the Claude-brain narration
+        // give-up fallover. Guarded on !opts.modelOverride so the recovery hop
+        // can never recurse, and the duplicate-send wall protects any
+        // committed write on the re-run. Kill-switch: CLEMMY_BRAIN_FALLOVER.
+        if (result.completedReason === 'no_structured_output' && !opts.modelOverride && chatBrainFalloverEnabled()) {
+          try {
+            const usedModel = modelForRun ?? resolveRoleModel('brain').modelId;
+            const currentBrain = resolveProvider(usedModel) as BrainProviderClass;
+            const next = falloverBrainModelIds(currentBrain)[0];
+            if (next) {
+              bridgeLogger.warn({ surface, currentBrain, recoveryModel: next.modelId },
+                'harness brain exhausted structured-decision retries — re-running the turn once on the next brain instead of shipping the apology');
+              const recovered = await respondViaHarness(surface, request, {
+                reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
+                modelOverride: next.modelId,
+              });
+              const route = routeDiagnosticsFromResponse(recovered);
+              return route ? withRouteDiagnostics(recovered, { ...route, falloverFrom: 'harness_parse_exhaustion' }) : recovered;
+            }
+          } catch (falloverErr) {
+            bridgeLogger.warn({ surface, err: falloverErr instanceof Error ? falloverErr.message : String(falloverErr) },
+              'parse-exhaustion fallover failed — shipping the original completion');
+          }
+        }
         return withRouteDiagnostics({
           text: replyText || '(no reply produced)',
           sessionId,
           stoppedReason: 'success',
           turnsUsed: result.lastTurn,
         }, routeForHarness(surface, request, opts.modelOverride));
+      }
       case 'awaiting_user_input':
         // The run asked the user a clarifying question (ask_user_question). It is
         // NOT done — surface a DISTINCT stop reason so a BACKGROUND run parks for

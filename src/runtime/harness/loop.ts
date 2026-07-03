@@ -843,6 +843,10 @@ export interface RunConversationResult {
   lastDecision?: OrchestratorDecisionShape;
   lastTurn: number;
   error?: string;
+  /** Set when a 'completed' status is actually a DEAD turn (parse retries
+   *  exhausted / stall give-up) — the respond bridge uses it to re-run the
+   *  turn ONCE on the next brain instead of shipping the apology. */
+  completedReason?: 'no_structured_output' | 'sub_agent_stalled';
 }
 
 function positiveIntEnv(key: string, fallback: number): number {
@@ -2010,6 +2014,7 @@ async function runConversationCore(
         steps: stepIndex,
         lastDecision,
         lastTurn,
+        completedReason: stallInfo ? 'sub_agent_stalled' : 'no_structured_output',
       };
     }
 
