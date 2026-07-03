@@ -53,8 +53,9 @@ exports.default = async function notarizing(context) {
 
   console.log(`  [notarize] uploading ${appName}.app to Apple notary service (this can take a few minutes)…`);
   const start = Date.now();
+  // @electron/notarize v3 removed the legacy `tool` option — notarytool is the
+  // only path now; passing the old key throws on validation.
   await notarizeFn({
-    tool: 'notarytool',
     appPath,
     appleId,
     appleIdPassword: applePassword,
