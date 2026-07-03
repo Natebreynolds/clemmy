@@ -7,6 +7,7 @@ import { listWorkflows } from '../../memory/workflow-store.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
 import { pinnedCalendarRuleLabels } from './constraint-guard.js';
+import { pitfallsForSkills } from './known-pitfalls.js';
 import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-system-guidance.js';
 import type { FanoutPosture } from '../../dashboard/agent-system-metrics.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
@@ -315,6 +316,17 @@ function rankSkills(input: string): RankedContextCandidate[] {
   }
 }
 
+/** The pre-flight error-library line for a raw user input — rank the likely
+ *  skills, pull their freshest pitfall lessons. Shared with the Claude brain
+ *  lane, which does not consume the context packet (lane-parity export). */
+export function knownPitfallLineForInput(input: string): string | null {
+  try {
+    return pitfallsForSkills(rankSkills(input).map((s) => s.name));
+  } catch {
+    return null;
+  }
+}
+
 function rankWorkflows(input: string): RankedContextCandidate[] {
   const queryTokens = tokens(input);
   if (queryTokens.length === 0) return [];
@@ -487,6 +499,10 @@ export function buildAgentContextPacket(
     memoryLine,
     `External MCP scope: ${toolScope.allowAll ? 'all external tools allowed' : `${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''}`} (${toolScope.reason}).`,
     ...renderCandidates('Likely skills', skills, 'If one is relevant, call skill_read before creating the deliverable.'),
+    // Pre-flight error library: the freshest distilled lessons for the skills
+    // this turn will likely use — surfaced BEFORE acting so a known mistake
+    // isn't repeated (they used to be reachable only via skill_read).
+    pitfallsForSkills(skills.map((s) => s.name)),
     ...renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.'),
     healthWarnings.length > 0 ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}` : 'Health warnings: none.',
     agentSystem.text,

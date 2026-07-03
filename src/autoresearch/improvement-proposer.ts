@@ -45,8 +45,18 @@ import type { ObservatoryReport } from './observatory.js';
 
 type ToolHealth = ObservatoryReport['toolHealth'][number];
 
-export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact' | 'workflow_step';
+export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact' | 'workflow_step' | 'step_revert' | 'step_efficiency';
 export type ProposalStatus = 'pending' | 'approved' | 'applied' | 'dismissed';
+
+/** The keep-if-better verdict on an APPLIED proposal, measured from REAL runs
+ *  after appliedAt — never a synthetic score. */
+export interface ProposalOutcome {
+  verdict: 'improved' | 'regressed' | 'pending_data';
+  checkedAt: string;
+  /** Distinct runs of the target workflow started after appliedAt. */
+  runsExamined: number;
+  detail: string;
+}
 /** auto = appliable through the gated flow; manual = the human edits code, approval only acknowledges. */
 export type ApplyMode = 'auto' | 'manual';
 
@@ -65,6 +75,11 @@ export interface ImprovementProposal {
   status: ProposalStatus;
   proposedAt: string;
   appliedAt?: string;
+  /** For workflow_step proposals: the normalized problem this fix targets —
+   *  the key the outcome evaluator watches for in post-apply runs. */
+  signature?: string;
+  /** Keep-if-better: filled in by evaluateAppliedProposals from real runs. */
+  outcome?: ProposalOutcome;
 }
 
 const STORE_DIR = path.join(BASE_DIR, 'state', 'autoresearch');
@@ -295,22 +310,209 @@ export function proposalsFromStepFailures(observations: StepFailureObservation[]
   for (const e of recur.values()) {
     if (e.runs.size < 2) continue; // recurring = ≥2 distinct runs
     const target = `${e.workflow}::${e.stepId}`;
-    out.push(mkProposal({
-      kind: 'workflow_step',
-      target,
-      applyMode: 'auto',
-      proposedText: `Recurring issue (seen in ${e.runs.size} runs): this step keeps failing its contract — "${trimProblem(e.problem)}". Before finishing, explicitly satisfy this; if the data genuinely isn't available, return {"blocked": true, "reason": "<why>"} instead of an incomplete result.`,
-      rationale: `Step "${e.stepId}" of workflow "${e.workflow}" hit the same contract problem in ${e.runs.size} separate runs — a prompt addendum steers future runs to address the recurring gap (reversible).`,
-      evidence: `same problem in ${e.runs.size} distinct runs: "${trimProblem(e.problem)}"`,
-    }, nowIso, `workflow_step:${target}:${normalizeProblem(e.problem)}`));
+    out.push({
+      ...mkProposal({
+        kind: 'workflow_step',
+        target,
+        applyMode: 'auto',
+        proposedText: `Recurring issue (seen in ${e.runs.size} runs): this step keeps failing its contract — "${trimProblem(e.problem)}". Before finishing, explicitly satisfy this; if the data genuinely isn't available, return {"blocked": true, "reason": "<why>"} instead of an incomplete result.`,
+        rationale: `Step "${e.stepId}" of workflow "${e.workflow}" hit the same contract problem in ${e.runs.size} separate runs — a prompt addendum steers future runs to address the recurring gap (reversible).`,
+        evidence: `same problem in ${e.runs.size} distinct runs: "${trimProblem(e.problem)}"`,
+      }, nowIso, `workflow_step:${target}:${normalizeProblem(e.problem)}`),
+      signature: normalizeProblem(e.problem),
+    });
   }
   return out;
+}
+
+// ── keep-if-better: outcome verdicts on APPLIED proposals ─────────────────────
+//
+// The closed loop the propose→apply flow was missing: after a human applies a
+// workflow_step fix, the ONLY honest score is whether the targeted problem
+// actually stopped recurring in REAL runs. Deterministic, zero tokens: re-uses
+// the same run-history scan that drafted the proposal. A regression drafts a
+// human-gated step_revert suggestion (the pre-apply definition is already
+// snapshotted by workflow-step-edit backups) — nothing ever auto-reverts.
+
+/** Run ids embed their mint time (Date.now() prefix, optionally "sched-"). */
+export function runIdTimestampMs(runId: string): number | null {
+  const m = /^(?:sched-)?(\d{12,14})\b/.exec(runId);
+  if (!m) return null;
+  const ms = Number.parseInt(m[1], 10);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export interface EvaluateOutcomeDeps {
+  collectStepFailures?: () => StepFailureObservation[];
+  /** Distinct run ids of a workflow, newest-first. Injectable for tests. */
+  listRunIds?: (workflow: string) => string[];
+  nowIso?: string;
+}
+
+/** Minimum post-apply runs before a verdict — one clean run proves little. */
+const OUTCOME_MIN_RUNS = 2;
+
+/**
+ * Fill in `outcome` on applied workflow_step proposals and draft step_revert
+ * suggestions for the regressed ones. Idempotent per (proposal, runsExamined):
+ * verdicts refresh as more runs land; a regression's revert suggestion is
+ * id-seeded so it never duplicates. Best-effort; never throws.
+ */
+export function evaluateAppliedProposals(deps: EvaluateOutcomeDeps = {}): { checked: number; improved: number; regressed: number; pending: number } {
+  const counts = { checked: 0, improved: 0, regressed: 0, pending: 0 };
+  try {
+    const list = readStore();
+    const applied = list.filter((p) => p.kind === 'workflow_step' && p.status === 'applied' && p.appliedAt && p.signature);
+    if (applied.length === 0) return counts;
+
+    const nowIso = deps.nowIso ?? new Date().toISOString();
+    const observations = (deps.collectStepFailures ?? defaultCollectStepFailures)();
+    const listRunIds = deps.listRunIds ?? ((workflow: string) => { try { return listWorkflowRunIds(workflow, 20); } catch { return []; } });
+    const reverts: ImprovementProposal[] = [];
+
+    for (const p of applied) {
+      const parsed = splitWorkflowStepTarget(p.target);
+      if (!parsed) continue;
+      const appliedMs = Date.parse(p.appliedAt as string);
+      if (!Number.isFinite(appliedMs)) continue;
+      counts.checked += 1;
+
+      const runsSince = listRunIds(parsed.workflow)
+        .filter((runId) => { const t = runIdTimestampMs(runId); return t != null && t > appliedMs; });
+      if (runsSince.length < OUTCOME_MIN_RUNS) {
+        counts.pending += 1;
+        p.outcome = { verdict: 'pending_data', checkedAt: nowIso, runsExamined: runsSince.length, detail: `waiting for ${OUTCOME_MIN_RUNS}+ post-apply runs (${runsSince.length} so far)` };
+        continue;
+      }
+      const since = new Set(runsSince);
+      const recurredIn = observations
+        .filter((o) => o.workflow === parsed.workflow && o.stepId === parsed.stepId && since.has(o.runId))
+        .filter((o) => o.problems.some((prob) => normalizeProblem(prob) === p.signature))
+        .map((o) => o.runId);
+
+      if (recurredIn.length === 0) {
+        counts.improved += 1;
+        p.outcome = { verdict: 'improved', checkedAt: nowIso, runsExamined: runsSince.length, detail: `targeted problem absent in ${runsSince.length} post-apply runs` };
+      } else {
+        counts.regressed += 1;
+        p.outcome = { verdict: 'regressed', checkedAt: nowIso, runsExamined: runsSince.length, detail: `targeted problem recurred in ${recurredIn.length}/${runsSince.length} post-apply runs` };
+        reverts.push(mkProposal({
+          kind: 'step_revert',
+          target: p.target,
+          applyMode: 'manual',
+          proposedText: `The addendum applied ${p.appliedAt} did NOT stop the recurring problem (seen again in ${recurredIn.length} of ${runsSince.length} runs since). Consider reverting it via the workflow-step-edit backup and trying a different fix.`,
+          rationale: 'Keep-if-better: a fix that measurably didn\'t help should be rolled back, not accumulated.',
+          evidence: `problem "${p.signature}" recurred post-apply in runs: ${recurredIn.slice(0, 3).join(', ')}${recurredIn.length > 3 ? '…' : ''}`,
+        }, nowIso, `step_revert:${p.target}:${p.signature}`));
+      }
+    }
+
+    writeStore(list);
+    if (reverts.length > 0) recordProposals(reverts);
+  } catch { /* the outcome pass must never break the tick */ }
+  return counts;
 }
 
 /** Mine run history → workflow_step proposals. */
 export function buildWorkflowStepProposals(deps: WorkflowStepDeps = {}): ImprovementProposal[] {
   const observations = (deps.collectStepFailures ?? defaultCollectStepFailures)();
   return proposalsFromStepFailures(observations, deps.nowIso ?? new Date().toISOString());
+}
+
+// ── step_efficiency: cost/latency outliers from the SAME run history ──────────
+//
+// The attempt_record events already carry per-attempt {durationMs, tokens}
+// (sampled from the usage-log run/step join) — nothing consumed them for
+// improvement. A step that consistently costs several times its sibling steps
+// is a prompt/shape problem worth a human look. MANUAL mode (informational
+// directive): approving only acknowledges — no automatic prompt surgery from
+// a cost signal.
+
+export interface StepMetricObservation {
+  workflow: string;
+  stepId: string;
+  runId: string;
+  durationMs?: number;
+  tokens?: number;
+}
+
+function defaultCollectStepMetrics(): StepMetricObservation[] {
+  const out: StepMetricObservation[] = [];
+  try {
+    for (const workflow of listWorkflowNamesWithRuns()) {
+      for (const runId of listWorkflowRunIds(workflow, 20)) {
+        for (const ev of readWorkflowEvents(workflow, runId)) {
+          if (ev.kind !== 'attempt_record' || !ev.stepId || !ev.attempt?.metrics) continue;
+          const { durationMs, tokens } = ev.attempt.metrics;
+          if (durationMs == null && tokens == null) continue;
+          out.push({ workflow, stepId: ev.stepId, runId, durationMs, tokens });
+        }
+      }
+    }
+  } catch { /* best-effort */ }
+  return out;
+}
+
+const EFFICIENCY_OUTLIER_FACTOR = 3;
+const EFFICIENCY_MIN_RUNS = 3;
+const EFFICIENCY_TOKEN_FLOOR = 20_000;
+const EFFICIENCY_DURATION_FLOOR_MS = 60_000;
+
+function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  return s.length === 0 ? 0 : s[Math.floor(s.length / 2)];
+}
+
+/** Pure: per-workflow, a step whose average tokens/duration is ≥3× the median
+ *  of its SIBLING steps (and above an absolute floor) across ≥3 runs → one
+ *  manual, informational proposal. Sibling-relative so a workflow that is
+ *  expensive everywhere (deep research) never false-fires. */
+export function proposalsFromStepMetrics(observations: StepMetricObservation[], nowIso: string): ImprovementProposal[] {
+  const byWorkflow = new Map<string, Map<string, StepMetricObservation[]>>();
+  for (const o of observations) {
+    const steps = byWorkflow.get(o.workflow) ?? new Map<string, StepMetricObservation[]>();
+    const rows = steps.get(o.stepId) ?? [];
+    rows.push(o);
+    steps.set(o.stepId, rows);
+    byWorkflow.set(o.workflow, steps);
+  }
+  const out: ImprovementProposal[] = [];
+  for (const [workflow, steps] of byWorkflow) {
+    if (steps.size < 2) continue; // sibling-relative needs siblings
+    const avg = (rows: StepMetricObservation[], pick: (o: StepMetricObservation) => number | undefined): { value: number; runs: number } => {
+      const vals = rows.map(pick).filter((v): v is number => typeof v === 'number' && v > 0);
+      return { value: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0, runs: new Set(rows.map((r) => r.runId)).size };
+    };
+    for (const metric of ['tokens', 'durationMs'] as const) {
+      const perStep = [...steps.entries()].map(([stepId, rows]) => ({ stepId, ...avg(rows, (o) => o[metric]) }));
+      const measurable = perStep.filter((s) => s.value > 0);
+      if (measurable.length < 2) continue;
+      for (const s of measurable) {
+        const siblings = measurable.filter((x) => x.stepId !== s.stepId).map((x) => x.value);
+        const sib = median(siblings);
+        const floor = metric === 'tokens' ? EFFICIENCY_TOKEN_FLOOR : EFFICIENCY_DURATION_FLOOR_MS;
+        if (s.runs < EFFICIENCY_MIN_RUNS || sib <= 0 || s.value < floor || s.value < sib * EFFICIENCY_OUTLIER_FACTOR) continue;
+        const target = `${workflow}::${s.stepId}`;
+        const ratio = (s.value / sib).toFixed(1);
+        const human = metric === 'tokens'
+          ? `${Math.round(s.value / 1000)}K tokens vs sibling median ${Math.round(sib / 1000)}K`
+          : `${Math.round(s.value / 1000)}s vs sibling median ${Math.round(sib / 1000)}s`;
+        out.push(mkProposal({
+          kind: 'step_efficiency',
+          target,
+          applyMode: 'manual',
+          proposedText: `Step "${s.stepId}" of "${workflow}" averages ${ratio}× its sibling steps on ${metric === 'tokens' ? 'token spend' : 'latency'} (${human}, ${s.runs} runs). Consider tightening its prompt, splitting it, or moving bulk data to a runner/recall instead of inline context.`,
+          rationale: 'A step that consistently costs several times its siblings is the workflow\'s efficiency ceiling — one targeted edit buys the most.',
+          evidence: `${human} across ${s.runs} runs`,
+        }, nowIso, `step_efficiency:${target}:${metric}`));
+      }
+    }
+  }
+  return out;
+}
+
+export function buildStepEfficiencyProposals(deps: { collectStepMetrics?: () => StepMetricObservation[]; nowIso?: string } = {}): ImprovementProposal[] {
+  return proposalsFromStepMetrics((deps.collectStepMetrics ?? defaultCollectStepMetrics)(), deps.nowIso ?? new Date().toISOString());
 }
 
 // ── persistence ──────────────────────────────────────────────────────────────
@@ -374,16 +576,21 @@ export function listPendingProposals(): ImprovementProposal[] {
 export function proposeFromReport(report: ObservatoryReport, deps: ProposerDeps = {}): { ran: boolean; added: number; total: number } {
   if (!proposerEnabled()) return { ran: false, added: 0, total: 0 };
   try {
-    // Two sources: report-based (tools/skills/memory) + run-history-based
-    // (workflow_step — a workflow's own steps improving over time).
+    // Three sources: report-based (tools/skills/memory), run-history contract
+    // failures (workflow_step), and run-history cost/latency outliers
+    // (step_efficiency) — a workflow's own steps improving over time.
     const fresh = [
       ...buildImprovementProposals(report, deps),
       ...buildWorkflowStepProposals({
         collectStepFailures: deps.collectStepFailures,
         nowIso: deps.nowIso,
       }),
+      ...buildStepEfficiencyProposals({ nowIso: deps.nowIso }),
     ];
     const { added, total } = recordProposals(fresh);
+    // Keep-if-better: refresh outcome verdicts on previously-applied fixes from
+    // the same run-history scan (drafts human-gated step_revert on regression).
+    evaluateAppliedProposals({ collectStepFailures: deps.collectStepFailures, nowIso: deps.nowIso });
     return { ran: true, added, total };
   } catch {
     return { ran: false, added: 0, total: 0 };

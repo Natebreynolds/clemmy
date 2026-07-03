@@ -18,7 +18,7 @@ import {
 } from './session-transcript.js';
 import { gatherSessionSkills } from './skill-execution.js';
 import { renderSkillsIndex } from '../../memory/skill-store.js';
-import { detectMultiItemIntent, fanoutDirectiveLine } from './context-packet.js';
+import { detectMultiItemIntent, fanoutDirectiveLine, knownPitfallLineForInput } from './context-packet.js';
 import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
 import { createReplyStreamExtractor } from './reply-stream.js';
 import { markRunInFlight } from './restart-recovery.js';
@@ -612,7 +612,13 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
     const multi = detectMultiItemIntent(request.message ?? '');
     if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
   } catch { fanoutDirective = ''; }
-  return [volatile, continuationContext, recall, sessionActions, fanoutDirective].filter(Boolean).join('\n\n');
+  // Pre-flight error library (parity with the context packet's Known-pitfalls
+  // line — this lane doesn't consume the packet): the freshest distilled
+  // lessons for the skills this turn will likely use, so a known failure mode
+  // isn't repeated. Bounded to a couple of lines; empty for most turns.
+  let pitfalls = '';
+  try { pitfalls = knownPitfallLineForInput(request.message ?? '') ?? ''; } catch { pitfalls = ''; }
+  return [volatile, continuationContext, recall, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n');
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(

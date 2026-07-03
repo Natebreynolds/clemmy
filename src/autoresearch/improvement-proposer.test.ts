@@ -400,3 +400,98 @@ test('approveProposal: an auto skill_pitfall applies via appendSkillPitfall (dry
   assert.match(loadSkill('outreach')!.body, /composio_execute_tool` failed 75%/);
   assert.equal(listPendingProposals().length, 0);
 });
+
+// ── keep-if-better outcome loop (Track 4a) ────────────────────────────────────
+
+test('evaluateAppliedProposals: problem gone in post-apply runs → improved; recurring → regressed + human-gated step_revert', async () => {
+  const { evaluateAppliedProposals, proposalsFromStepFailures: mk, recordProposals: record, listProposals: list, runIdTimestampMs } =
+    await import('./improvement-proposer.js');
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+
+  // Run ids embed their mint time.
+  assert.equal(runIdTimestampMs('1783052757607-89c716'), 1783052757607);
+  assert.equal(runIdTimestampMs('sched-1783036811744-b6e45d'), 1783036811744);
+  assert.equal(runIdTimestampMs('weird-id'), null);
+
+  const APPLIED_MS = 1_783_000_000_000;
+  const before = (n: number) => `${APPLIED_MS - n * 60_000}-aa`;
+  const after = (n: number) => `${APPLIED_MS + n * 60_000}-bb`;
+  const obs = (workflow: string, runId: string, problems: string[]): StepFailureObservation =>
+    ({ workflow, stepId: 's1', runId, problems });
+
+  // Two applied proposals: wf-good's fix worked; wf-bad's problem recurs post-apply.
+  const seed = [
+    ...mk([obs('wf-good', before(2), ['missing summary field']), obs('wf-good', before(1), ['missing summary field'])], NOW),
+    ...mk([obs('wf-bad', before(2), ['empty rows returned']), obs('wf-bad', before(1), ['empty rows returned'])], NOW),
+  ].map((p) => ({ ...p, status: 'applied' as const, appliedAt: new Date(APPLIED_MS).toISOString() }));
+  record(seed);
+
+  const counts = evaluateAppliedProposals({
+    nowIso: NOW,
+    listRunIds: (wf) => [after(1), after(2), before(1), before(2)],
+    collectStepFailures: () => [
+      // wf-good: post-apply runs are clean (only PRE-apply failures exist).
+      obs('wf-good', before(1), ['missing summary field']),
+      // wf-bad: the SAME problem (digits differ → same normalized signature) recurs after apply.
+      obs('wf-bad', after(1), ['empty rows returned']),
+    ],
+  });
+  assert.equal(counts.checked, 2);
+  assert.equal(counts.improved, 1);
+  assert.equal(counts.regressed, 1);
+
+  const all = list();
+  const good = all.find((p) => p.target === 'wf-good::s1' && p.kind === 'workflow_step');
+  const bad = all.find((p) => p.target === 'wf-bad::s1' && p.kind === 'workflow_step');
+  assert.equal(good?.outcome?.verdict, 'improved');
+  assert.equal(bad?.outcome?.verdict, 'regressed');
+
+  const revert = all.find((p) => p.kind === 'step_revert');
+  assert.ok(revert, 'a regression drafts a step_revert suggestion');
+  assert.equal(revert?.status, 'pending');
+  assert.equal(revert?.applyMode, 'manual', 'nothing ever auto-reverts');
+  assert.equal(revert?.target, 'wf-bad::s1');
+
+  // Fewer than 2 post-apply runs → pending_data, no verdict.
+  const pendingCounts = evaluateAppliedProposals({
+    nowIso: NOW,
+    listRunIds: () => [after(1), before(1), before(2)],
+    collectStepFailures: () => [],
+  });
+  assert.equal(pendingCounts.pending, 2);
+});
+
+// ── step_efficiency outliers (Track 4c) ───────────────────────────────────────
+
+test('proposalsFromStepMetrics: a step 3x+ its sibling median (above floors, 3+ runs) → ONE manual step_efficiency proposal', async () => {
+  const { proposalsFromStepMetrics } = await import('./improvement-proposer.js');
+  const row = (workflow: string, stepId: string, runId: string, tokens: number, durationMs = 10_000) =>
+    ({ workflow, stepId, runId, tokens, durationMs });
+
+  const observations = [
+    // heavy_step: 90K tokens avg over 3 runs; siblings ~10K → 9x, above the 20K floor.
+    row('wf', 'heavy_step', 'r1', 90_000), row('wf', 'heavy_step', 'r2', 95_000), row('wf', 'heavy_step', 'r3', 85_000),
+    row('wf', 'light_a', 'r1', 10_000), row('wf', 'light_a', 'r2', 11_000), row('wf', 'light_a', 'r3', 9_000),
+    row('wf', 'light_b', 'r1', 12_000), row('wf', 'light_b', 'r2', 8_000), row('wf', 'light_b', 'r3', 10_000),
+  ];
+  const out = proposalsFromStepMetrics(observations, NOW);
+  assert.equal(out.length, 1, JSON.stringify(out.map((p) => p.target)));
+  assert.equal(out[0].kind, 'step_efficiency');
+  assert.equal(out[0].target, 'wf::heavy_step');
+  assert.equal(out[0].applyMode, 'manual');
+  assert.match(out[0].proposedText, /token spend/);
+
+  // Below the absolute floor → silence, even at a high ratio (cheap workflows aren't worth a nudge).
+  const cheap = [
+    row('wf2', 'a', 'r1', 9_000), row('wf2', 'a', 'r2', 9_000), row('wf2', 'a', 'r3', 9_000),
+    row('wf2', 'b', 'r1', 1_000), row('wf2', 'b', 'r2', 1_000), row('wf2', 'b', 'r3', 1_000),
+  ];
+  assert.equal(proposalsFromStepMetrics(cheap.map((r) => ({ ...r, durationMs: 1_000 })), NOW).length, 0);
+
+  // Fewer than 3 runs → silence.
+  const twoRuns = observations.filter((o) => o.runId !== 'r3');
+  assert.equal(proposalsFromStepMetrics(twoRuns, NOW).length, 0);
+
+  // A single-step workflow (no siblings) → silence.
+  assert.equal(proposalsFromStepMetrics(observations.filter((o) => o.stepId === 'heavy_step'), NOW).length, 0);
+});
