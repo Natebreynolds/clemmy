@@ -266,3 +266,24 @@ test('falloverBrainModelIds — Claude→Codex→GLM order, excludes current, []
     assert.deepEqual(falloverBrainModelIds('claude').map((c) => c.provider), ['codex']);
   });
 });
+
+test('falloverBrainModelIds — a repurposed OPENAI_MODEL_PRIMARY (BYO id) cannot knock connected Codex out of the chain', () => {
+  writeAuthFiles(); // codex + claude OAuth present
+  // Nathan's real config class: OPENAI_MODEL_PRIMARY repurposed to glm-5.2. The
+  // codex slot used to borrow that id verbatim, resolve to BYO, and get dropped
+  // by the mis-route guard — Codex silently vanished from claude→X recovery
+  // (observed 2026-07-02: every recovery went straight to glm-5.2).
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.z.ai/api/paas/v4',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'glm-5.2',
+    OPENAI_MODEL_PRIMARY: 'glm-5.2',
+    MODEL_ROUTING_MODE: 'off',
+    AUTH_MODE: 'claude_oauth',
+  }, () => {
+    const chain = falloverBrainModelIds('claude');
+    assert.deepEqual(chain.map((c) => c.provider), ['codex', 'byo'], 'Codex must survive the repurposed primary slot');
+    const codex = chain.find((c) => c.provider === 'codex');
+    assert.notEqual(codex?.modelId, 'glm-5.2', 'the codex entry must not carry a BYO id');
+  });
+});

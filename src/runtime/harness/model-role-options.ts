@@ -1,5 +1,6 @@
 import {
   CLAUDE_MODEL_PRESETS,
+  DEFAULT_CODEX_MODEL,
   MODEL_PRESETS,
   MODELS,
   getClaudeBrainModel,
@@ -65,20 +66,32 @@ export type BrainProviderClass = 'codex' | 'claude' | 'byo';
  * mid-run, where in-stream fallover can't fire (FallbackModel only switches
  * before the first byte). `all_in` mode returns [] (one provider, nowhere to go).
  */
+/** The model id a fallover-to-codex should run on. Normally MODELS.primary —
+ *  but when that slot is repurposed to a BYO id (OPENAI_MODEL_PRIMARY=glm-*),
+ *  it routes to BYO, the mis-route guard below drops the entry, and Codex is
+ *  SILENTLY excluded from the chain even though its OAuth is connected (the
+ *  claude→glm-only recoveries, 2026-07-02 daemon.log). Fall back to the
+ *  canonical Codex default so a connected Codex always stays reachable.
+ *  Mirrors codexSafePrimary()/codexSafeFast() in model-roles.ts. */
+function falloverCodexModelId(): string {
+  try {
+    if (resolveProvider(MODELS.primary) === 'codex') return MODELS.primary;
+  } catch { /* unknown id → use the canonical default */ }
+  return DEFAULT_CODEX_MODEL;
+}
+
 export function falloverBrainModelIds(current: BrainProviderClass): Array<{ provider: BrainProviderClass; modelId: string }> {
   if (getModelRoutingMode() === 'all_in') return [];
   const out: Array<{ provider: BrainProviderClass; modelId: string }> = [];
-  if (current !== 'codex' && codexModelsAvailable()) out.push({ provider: 'codex', modelId: MODELS.primary });
+  if (current !== 'codex' && codexModelsAvailable()) out.push({ provider: 'codex', modelId: falloverCodexModelId() });
   if (current !== 'claude' && claudeModelsAvailable()) out.push({ provider: 'claude', modelId: getClaudeBrainModel() });
   const byo = getByoBackendConfig();
   if (current !== 'byo' && byo.configured) out.push({ provider: 'byo', modelId: byo.primaryId || MODELS.primary });
-  // Correctness guard: every entry's modelId must actually ROUTE to its claimed
-  // provider, and no two entries may collapse to the same wire provider. The
-  // codex entry borrows MODELS.primary, which is normally a gpt-* (codex) id —
-  // but if a config overrides it to a BYO model (e.g. OPENAI_MODEL_PRIMARY=glm-*),
-  // that entry would resolve to BYO and duplicate the BYO target (a redundant
-  // same-brain "fallover" that re-hits the failing provider). Drop mis-routed +
-  // duplicate entries so a fallover always reaches a genuinely DIFFERENT brain.
+  // Correctness guard (backstop): every entry's modelId must actually ROUTE to
+  // its claimed provider, and no two entries may collapse to the same wire
+  // provider — a mis-routed entry would be a redundant same-brain "fallover"
+  // that re-hits the failing provider. The codex entry is already repurpose-safe
+  // via falloverCodexModelId(); this guard still protects the other slots.
   const seen = new Set<string>([current]);
   return out.filter((e) => {
     let resolved: string;
