@@ -755,3 +755,49 @@ test('awaiting_user_input surfaces THE QUESTION (+ numbered options), never the 
   const res2 = await respondViaHarness('webhook', { message: 'again', sessionId });
   assert.equal(res2.text, 'Quick check — email or Slack?');
 });
+
+test('parse-exhaustion recovery is GATED on external writes — a run that committed a write ships the honest completion, never a blind re-run', async () => {
+  // The invariant (mirror of loop.ts step-boundary canSwitch): only rerun
+  // across brains when the external_write count did not increase during the
+  // run. If anything was sent/updated/created, re-driving the turn on another
+  // brain could double-act — salvage or ask instead.
+  const sessionId = 'parse-exhaustion-write-gate';
+  createSession({ id: sessionId, kind: 'chat' });
+  let calls = 0;
+  const runThatWrites = (async (opts: { sessionId: string }) => {
+    calls += 1;
+    // The run commits an external write BEFORE dying at parse exhaustion.
+    appendEvent({
+      sessionId: opts.sessionId, turn: 1, role: 'system', type: 'external_write',
+      data: { tool: 'composio_execute_tool', shapeKey: 'salesforce:update' },
+    });
+    return {
+      sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3,
+      completedReason: 'no_structured_output',
+      lastDecision: { summary: 'apology', reply: null, done: true, nextAction: 'completed', reason: null },
+    };
+  }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: runThatWrites });
+  const res = await respondViaHarness('webhook', { message: 'update the account', sessionId });
+  assert.equal(calls, 1, 'NO recovery hop — the run committed an external write');
+  assert.match(res.text, /apology/, 'the honest completion ships instead of a blind re-run');
+
+  // Control: the SAME dead turn with no external write still recovers.
+  const sessionId2 = 'parse-exhaustion-no-write-recovers';
+  createSession({ id: sessionId2, kind: 'chat' });
+  let calls2 = 0;
+  const cleanDeadThenRecover = (async (opts: { sessionId: string }) => {
+    calls2 += 1;
+    if (calls2 === 1) {
+      return { sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3, completedReason: 'no_structured_output' };
+    }
+    return {
+      sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+      lastDecision: { summary: 's', reply: 'recovered cleanly', done: true, nextAction: 'completed', reason: null },
+    };
+  }) as never;
+  _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: cleanDeadThenRecover });
+  const res2 = await respondViaHarness('webhook', { message: 'update the account', sessionId: sessionId2 });
+  assert.equal(calls2, 2, 'clean dead turn still gets the recovery hop');
+  assert.match(res2.text, /recovered cleanly/);
+});

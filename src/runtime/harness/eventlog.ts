@@ -233,6 +233,14 @@ export const EVENT_TYPES = [
   // {reason, kind, toModel, attempt}). Telemetry + the visible parity twin of the
   // workflow runner's step_advisory{reason:'brain_fallover'}.
   'brain_fallover',
+  // Parse-exhaustion recovery marker: a `conversation_completed` with
+  // reason 'no_structured_output' (the internal "couldn't be structured"
+  // apology) is being re-run once on the next brain. Appended BEFORE the
+  // recovery hop so transcript reconstruction can suppress the apology turn
+  // and show ONLY the recovered reply. Carries {reason, recoveryModel,
+  // supersededAt?}. Absent when a genuine dead-end apology has no recovery,
+  // so the sole reply still renders. (2026-07-03.)
+  'conversation_superseded',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

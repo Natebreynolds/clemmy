@@ -3147,11 +3147,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     ? latestHumanInputForStallRetry(options.sessionId)
     : undefined;
   const semanticInput = syntheticRetryOriginalInput ?? options.input;
+  // The recall-vector embed is FIRE-AND-FORGET, not awaited: it stashes into a
+  // TTL'd slot that per-turn fact recall reads OPPORTUNISTICALLY (late arrival
+  // still helps mid-turn recalls; absence just drops the relevance term). The
+  // primer's hybrid race is bounded at 800ms, but the embed's OpenAI fetch is
+  // 6s + retries — awaiting the PAIR let a slow embeddings endpoint gate every
+  // turn's first token (live 2026-07-03: 9.9s pre-brain on a greeting, 3.8s on
+  // the next ask, both from embed fetch timeouts while the primer had already
+  // fallen back). primeTurnRecallVector never rejects; the catch is belt.
+  void primeTurnRecallVector(semanticInput).catch(() => {});
   const assemblyPromise = Promise.race([
-    Promise.all([
-      buildTurnMemoryPrimer(semanticInput, options.sessionId),
-      primeTurnRecallVector(semanticInput),
-    ]).then((r) => r as [TurnMemoryPrimer, void]),
+    buildTurnMemoryPrimer(semanticInput, options.sessionId),
     new Promise<null>((resolve) => {
       const t = setTimeout(() => resolve(null), 15_000);
       (t as unknown as { unref?: () => void }).unref?.();
@@ -3444,7 +3450,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // degraded (no-primer) turn exactly as before.
   const assemblySettled = await assemblyPromise;
   const turnMemoryPrimer: TurnMemoryPrimer = assemblySettled
-    ? assemblySettled[0]
+    ? assemblySettled
     : {
         enabled: true,
         query: semanticInput.replace(/\s+/g, ' ').trim().slice(0, 160),

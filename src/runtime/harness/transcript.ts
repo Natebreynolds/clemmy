@@ -47,14 +47,40 @@ export function humanHarnessText(value: unknown, fallback = ''): string {
  * session's events. User turns come from `user_input_received` (data.text);
  * assistant turns from `conversation_completed` (data.reply ?? data.summary).
  * Empty assistant turns (reason-only completions) are skipped.
+ *
+ * Parse-exhaustion recovery (respond-bridge): a `conversation_completed` with
+ * reason 'no_structured_output' (the internal "couldn't be structured" apology)
+ * that is later followed by a `conversation_superseded` marker is dropped — the
+ * recovered reply from the next brain is the ONE final answer the user sees. A
+ * no_structured_output completion with NO superseding marker (recovery disabled
+ * or unavailable) is a genuine dead end and still renders; the sole reply is
+ * never silently dropped.
  */
 export function reconstructHarnessTranscript(sessionId: string, limit = 1000): UnifiedSessionTurn[] {
   const events = listEvents(sessionId, {
-    types: ['user_input_received', 'conversation_completed'],
+    types: ['user_input_received', 'conversation_completed', 'conversation_superseded'],
     limit,
   });
+  // Pair each `conversation_superseded` marker with the nearest preceding
+  // un-claimed no_structured_output completion (the marker is appended right
+  // after its apology, before the recovery hop). Only that specific apology is
+  // suppressed, so a later independent apology in the same session still renders.
+  const supersededIdx = new Set<number>();
+  for (let i = 0; i < events.length; i++) {
+    if (events[i].type !== 'conversation_superseded') continue;
+    for (let j = i - 1; j >= 0; j--) {
+      const prev = events[j];
+      if (prev.type === 'conversation_completed'
+        && prev.data.reason === 'no_structured_output'
+        && !supersededIdx.has(j)) {
+        supersededIdx.add(j);
+        break;
+      }
+    }
+  }
   const turns: UnifiedSessionTurn[] = [];
-  for (const event of events) {
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
     if (event.type === 'user_input_received') {
       // Skip synthetic user turns (outcome relays / report-back directives from
       // runtime/outcome.ts). The user never typed them, so they must not render
@@ -63,6 +89,9 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
       if (text) turns.push({ role: 'user', text, createdAt: event.createdAt });
     } else if (event.type === 'conversation_completed') {
+      // A superseded parse-exhaustion apology is internal — the recovered reply
+      // renders in its place. Skip it (never the only reply — see supersededIdx).
+      if (supersededIdx.has(i)) continue;
       const text = humanHarnessText(event.data.reply ?? event.data.summary, '');
       if (text) turns.push({ role: 'assistant', text, createdAt: event.createdAt });
     }

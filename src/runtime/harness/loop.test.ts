@@ -3662,3 +3662,51 @@ test('dispatchedBackgroundWorkflowRun: detects a queued workflow_run this turn, 
   });
   assert.equal(dispatchedBackgroundWorkflowRun(sess2.id, 1), false, 'a refused dispatch still gets judged');
 });
+
+test('speed: a hanging embeddings provider cannot gate model dispatch (fire-and-forget recall vector)', async () => {
+  // Live incident 2026-07-03: the OpenAI embeddings endpoint degraded (6s fetch
+  // timeouts + retries) and, because the turn awaited Promise.all(primer,
+  // primeTurnRecallVector), EVERY turn paid the full embed wait before the
+  // model dispatched — 9.9s pre-brain on a greeting. The recall vector is an
+  // opportunistic enrichment (TTL'd slot read at fact-recall time; late arrival
+  // still helps, absence just drops the relevance term), so it must be
+  // fire-and-forget. This pins that: an embed that NEVER resolves must not
+  // delay the model beyond the primer's own bounded budget.
+  resetEventLog();
+  const { _setEmbeddingProviderForTest } = await import('../../memory/embeddings.js');
+  const sess = HarnessSession.create({ kind: 'chat' });
+  _setEmbeddingProviderForTest({
+    name: 'hang',
+    model: 'hang-test',
+    dim: 4,
+    embed: () => new Promise(() => { /* never resolves */ }),
+  } as never);
+  try {
+    let modelDispatchedAtMs = 0;
+    const startedAtMs = Date.now();
+    const runRunner: RunRunnerFn = async (_agent, items) => {
+      modelDispatchedAtMs = Date.now();
+      return {
+        history: items as never,
+        lastResponseId: undefined,
+        finalOutput: { summary: 'fast', reply: 'hi', done: true, nextAction: 'completed', reason: null },
+      } as never;
+    };
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'hello there',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+    assert.equal(result.status, 'completed');
+    assert.ok(modelDispatchedAtMs > 0, 'model was dispatched');
+    const preBrainMs = modelDispatchedAtMs - startedAtMs;
+    // Pre-fix this waited on the hanging embed until the 15s assembly outer
+    // race fired. Post-fix the wait is the primer's own bounded budget (800ms
+    // hybrid race + fts overhead). 5s = generous CI headroom, far below 15s.
+    assert.ok(preBrainMs < 5_000, `pre-brain wait gated by hanging embed: ${preBrainMs}ms`);
+  } finally {
+    _setEmbeddingProviderForTest(undefined as never);
+  }
+});

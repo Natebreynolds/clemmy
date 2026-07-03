@@ -33,6 +33,10 @@ function progressLabel(ev: HarnessEvent): string | null {
     case 'tool_called': return tool ? `Using ${tool.replace(/_/g, ' ')}…` : 'Using a tool…';
     case 'tool_returned': return tool ? `Got results from ${tool.replace(/_/g, ' ')}` : 'Got results';
     case 'handoff': return 'Handing off…';
+    // Structured-decision repair loop (stall retry): without a label these
+    // attempts are INVISIBLE — a 2026-07-03 codex turn burned ~51s across three
+    // silent attempts and read as "the agent just isn't working".
+    case 'stall_retry_attempted': return 'That reply came back malformed — retrying…';
     case 'memory_signals_captured': return 'Learning from this…';
     default: return null;
   }

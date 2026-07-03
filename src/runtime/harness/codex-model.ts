@@ -1341,7 +1341,7 @@ function parseCodexBlock(block: string): AnyCodexEvent | null {
 // Codex item → SDK AgentOutputItem
 // ----------------------------------------------------------------------
 
-function convertCodexItemToSdkOutputItem(item: CodexOutputItem): AgentOutputItem {
+export function convertCodexItemToSdkOutputItem(item: CodexOutputItem): AgentOutputItem {
   if (item.type === 'message') {
     const { id, type, role, status, content, ...providerData } = item;
     return {
@@ -1379,7 +1379,15 @@ function convertCodexItemToSdkOutputItem(item: CodexOutputItem): AgentOutputItem
     return {
       id,
       type: 'reasoning',
-      content: (summary ?? []).map((s) => ({ type: 'summary_text', text: s.text })),
+      // Protocol shape (agents-core ≥0.12): ReasoningItem.content is
+      // z.array(InputText) — entries MUST be type 'input_text'. The raw
+      // codex 'summary_text' type here fails response_done validation and
+      // dead-ends the whole turn as "couldn't be structured" (live incident
+      // 2026-07-03, salesforce turn: any turn whose reasoning produced a
+      // non-empty summary failed; trivial turns passed because an empty
+      // array validates). The raw shape is rebuilt on the request side from
+      // .text alone, so nothing downstream needs 'summary_text'.
+      content: (summary ?? []).map((s) => ({ type: 'input_text', text: s.text })),
       providerData: { ...providerData, encryptedContent: encrypted_content },
     } as unknown as AgentOutputItem;
   }

@@ -22,6 +22,31 @@ test('summarizes done vs failed by callId, lists failed items', () => {
   clearLedger(sid);
 });
 
+test('N-item fan-out with one ERROR envelope: reconciliation reports "M of N failed" with the failed item DISTINCT (no silent absorption)', () => {
+  // Model exactly what the run_worker handler does: for each worker's result
+  // text, ok = !/^\s*ERROR:/i.test(text), then recordWorkerResult. A mixed batch
+  // (real answer, an ERROR envelope, a passed-through malformed-JSON answer) must
+  // reconcile to "1 of 3 failed" with the failed item named — never a hollow done.
+  const sid = 'sess-ledger-mixed';
+  clearLedger(sid);
+  const okGate = (text: string): boolean => !/^\s*ERROR:/i.test(text);
+  const workers: Array<{ callId: string; item: string; text: string }> = [
+    { callId: 'w1', item: 'Acme LLP', text: 'Acme LLP: DA 38, top kw "acme law" pos 4.' },
+    { callId: 'w2', item: 'Bar Law', text: 'ERROR: worker hit its turn cap before finishing this item' },
+    { callId: 'w3', item: 'Qux Legal', text: '{"item":"Qux Legal","authority":51,' }, // malformed JSON, still text
+  ];
+  for (const w of workers) {
+    const ok = okGate(w.text);
+    recordWorkerResult({ sessionId: sid, callId: w.callId, item: w.item, ok, reason: ok ? undefined : w.text });
+  }
+  const s = summarizeLedger(sid);
+  assert.equal(s.total, 3, 'all three items are accounted for');
+  assert.equal(s.done, 2, 'the real answer + the malformed-JSON answer count as done (both ARE text)');
+  assert.equal(s.failed, 1);
+  assert.deepEqual(s.failedItems, ['Bar Law'], 'the capped item is reported distinctly, not silently absorbed');
+  clearLedger(sid);
+});
+
 test('re-recording the same callId UPDATES, never double-counts', () => {
   const sid = 'sess-ledger-dedupe';
   clearLedger(sid);

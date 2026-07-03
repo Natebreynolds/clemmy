@@ -23,6 +23,7 @@ const {
   claudeHeadlessCliAvailable,
   setClaudeHeadlessCliAvailableForTest,
   resolveClaudeCliPath,
+  assistantMessage,
 } = mod;
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
@@ -319,4 +320,33 @@ test('resolveClaudeCliPath: an explicit CLAUDE_CLI_PATH override wins when it ex
     else process.env.CLAUDE_CLI_PATH = prevOverride;
     rmSync(binDir, { recursive: true, force: true });
   }
+});
+
+// ── SDK protocol conformance for response items ────────────────────────────
+// Regression guard for the @openai/agents 0.12 bump (live incident 2026-07-03,
+// first hit on the codex lane): agents-core validates the response_done payload
+// against its zod protocol. This headless transport is a custom Model, so the
+// items it hands the runner must satisfy that protocol directly. Unlike codex,
+// this lane emits exactly ONE output-item shape — an assistant message with an
+// `output_text` part (reasoning/compaction are never produced here; empty turns
+// emit no item at all) — so validating `assistantMessage()` against the INSTALLED
+// protocol covers every producible shape. A future SDK bump that shifts the
+// protocol (e.g. requiring `annotations` on output_text, which we omit) fails
+// here — in CI — instead of live on the user's first real question.
+test('assistantMessage output validates against the installed SDK protocol', async (t) => {
+  const { protocol } = await import('@openai/agents-core');
+  const check = (label: string, text: string) => {
+    const parsed = protocol.OutputModelItem.safeParse(assistantMessage(text));
+    assert.ok(
+      parsed.success,
+      `${label} failed protocol validation: ${JSON.stringify(parsed.success ? null : parsed.error.issues)}`,
+    );
+  };
+
+  await t.test('a normal free-text reply', () => check('text', 'The capital of France is Paris.'));
+  await t.test('a structured-output reply (raw JSON string, no fences)', () => check('json', '{"reply":"hi","done":true}'));
+  await t.test('multiline + unicode content', () => check('multiline', 'Line one\nLíne two — ✅\nLine three'));
+  // Production only calls assistantMessage() for truthy text (empty turns emit
+  // []), but an empty output_text part must still be protocol-legal — guard it.
+  await t.test('an empty-string content part', () => check('empty', ''));
 });

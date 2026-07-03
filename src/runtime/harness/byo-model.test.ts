@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { protocol, withTrace } from '@openai/agents-core';
+import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import { relaxRequestForCompatBackend, wrapCompletionsCreate, liftReasoning, applyGlmThinking, repairToolCallArguments } from './byo-model.js';
 
 // --- test helpers for the wrapped-create repair layer ---------------------
@@ -432,4 +434,166 @@ test('wrap(W2): UNPARSEABLE still uses the generic JSON-only re-ask (shape path 
   const lastSys = reAskMsgs[reAskMsgs.length - 1].content as string;
   assert.ok(/Return ONLY the JSON value/.test(lastSys), 'unparseable path uses the generic nudge');
   assert.equal(JSON.parse(((res.choices as AnyObj[])[0].message as AnyObj).content as string).done, true);
+});
+
+// ── SDK protocol conformance for response items ────────────────────────────
+// Regression guard for the @openai/agents 0.12 bump (live incident 2026-07-03,
+// first hit on the codex lane): agents-core validates the response_done payload
+// against its zod protocol. Unlike codex/claude-headless, this BYO lane does NOT
+// build SDK output items itself — it wraps the OpenAI-compatible
+// `chat.completions.create` and hands chat-completion shapes to the SDK's own
+// `OpenAIChatCompletionsModel`, which builds the protocol items. So the faithful
+// conformance test drives that REAL model through `wrapCompletionsCreate` and
+// validates every producible output item end to end. The BYO-specific risk that
+// mirrors the codex `summary_text` incident is `liftReasoning`: it populates
+// `message.reasoning`, which makes the SDK emit a `reasoning` output item — a
+// shape a healthy content-only turn never carries. These tests cover every
+// completion shape BYO produces (content, structured JSON, reasoning-lift,
+// single/empty/multiple tool calls, refusal) across the streaming and
+// non-streaming paths, so a future SDK bump that shifts the protocol fails here
+// — in CI — instead of live on the user's first real GLM/MiniMax/DeepSeek turn.
+
+function fakeClient(create: (p: AnyObj, o?: unknown) => Promise<unknown>) {
+  return { baseURL: 'http://byo.test', chat: { completions: { create: wrapCompletionsCreate(create as never) } } };
+}
+
+function conformanceModel(message: AnyObj, finish?: string) {
+  const backendCreate = async (): Promise<AnyObj> => ({
+    id: 'c1', created: 1, model: 'glm-5.2', object: 'chat.completion',
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    choices: [{ index: 0, finish_reason: finish ?? (message.tool_calls ? 'tool_calls' : 'stop'), message }],
+  });
+  return new OpenAIChatCompletionsModel(fakeClient(backendCreate) as never, 'glm-5.2');
+}
+
+function conformanceRequest(overrides: AnyObj = {}): AnyObj {
+  return {
+    input: [{ type: 'message', role: 'user', content: 'hi' }],
+    modelSettings: {},
+    tools: [],
+    handoffs: [],
+    outputType: 'text',
+    tracing: false,
+    ...overrides,
+  };
+}
+
+function assertItemsConform(label: string, items: unknown[]): void {
+  items.forEach((item, i) => {
+    const parsed = protocol.OutputModelItem.safeParse(item);
+    assert.ok(
+      parsed.success,
+      `${label} item ${i} (type=${(item as AnyObj)?.type}) failed protocol validation: `
+        + JSON.stringify(parsed.success ? null : parsed.error.issues),
+    );
+  });
+}
+
+// Structured request → BYO downgrades json_schema and marks the body for repair,
+// exercising the structured content path (the reasoning-lift + JSON-repair lane).
+const STRUCTURED_OUTPUT = { type: 'json_schema', name: 'V', strict: true, schema: { type: 'object' } };
+
+async function nonStreamItems(message: AnyObj, reqOverrides: AnyObj = {}): Promise<unknown[]> {
+  return withTrace('byo-conformance', async () => {
+    const res = await conformanceModel(message).getResponse(conformanceRequest(reqOverrides) as never);
+    return res.output as unknown[];
+  });
+}
+
+async function streamItems(message: AnyObj, reqOverrides: AnyObj = {}): Promise<unknown[]> {
+  return withTrace('byo-conformance', async () => {
+    let output: unknown[] = [];
+    for await (const ev of conformanceModel(message).getStreamedResponse(conformanceRequest(reqOverrides) as never) as AsyncIterable<AnyObj>) {
+      if (ev.type === 'response_done') output = (ev.response as AnyObj).output as unknown[];
+    }
+    return output;
+  });
+}
+
+test('conformance(non-stream): plain content reply is a protocol-legal message', async () => {
+  assertItemsConform('plain content', await nonStreamItems({ role: 'assistant', content: 'Paris is the capital of France.' }));
+});
+
+test('conformance(non-stream): structured JSON reply is a protocol-legal message', async () => {
+  assertItemsConform('structured content', await nonStreamItems({ role: 'assistant', content: '{"done":true}' }, { outputType: STRUCTURED_OUTPUT }));
+});
+
+test('conformance(non-stream): reasoning-lift emits protocol-legal reasoning + message (the M3 case)', async () => {
+  // reasoning_content is what liftReasoning() promotes into message.reasoning →
+  // the SDK then emits a `reasoning` item ahead of the message.
+  const items = await nonStreamItems({ role: 'assistant', content: '{"done":true}', reasoning_content: 'I checked the schema first.' }, { outputType: STRUCTURED_OUTPUT });
+  assert.deepEqual(items.map((i) => (i as AnyObj).type), ['reasoning', 'message'], 'reasoning precedes the message');
+  assertItemsConform('reasoning + message', items);
+});
+
+test('conformance(non-stream): a single tool call is a protocol-legal function_call', async () => {
+  assertItemsConform('single tool call', await nonStreamItems({
+    role: 'assistant', content: '',
+    tool_calls: [{ id: 't1', type: 'function', function: { name: 'search', arguments: '{"q":"x"}' } }],
+  }));
+});
+
+test('conformance(non-stream): a no-arg tool call (empty arguments) is protocol-legal', async () => {
+  assertItemsConform('empty-arg tool call', await nonStreamItems({
+    role: 'assistant', content: '',
+    tool_calls: [{ id: 't1', type: 'function', function: { name: 'ping', arguments: '' } }],
+  }));
+});
+
+test('conformance(non-stream): parallel tool calls are each protocol-legal', async () => {
+  const items = await nonStreamItems({
+    role: 'assistant', content: '',
+    tool_calls: [
+      { id: 't1', type: 'function', function: { name: 'a', arguments: '{}' } },
+      { id: 't2', type: 'function', function: { name: 'b', arguments: '{"x":1}' } },
+    ],
+  });
+  assert.deepEqual(items.map((i) => (i as AnyObj).type), ['function_call', 'function_call']);
+  assertItemsConform('parallel tool calls', items);
+});
+
+test('conformance(non-stream): a tool call carrying reasoning is protocol-legal (long-loop case)', async () => {
+  const items = await nonStreamItems({
+    role: 'assistant', content: '', reasoning_content: 'search the inbox first',
+    tool_calls: [{ id: 't1', type: 'function', function: { name: 'search', arguments: '{}' } }],
+  });
+  assert.deepEqual(items.map((i) => (i as AnyObj).type), ['reasoning', 'function_call']);
+  assertItemsConform('reasoning + tool call', items);
+});
+
+test('conformance(non-stream): a refusal message is protocol-legal', async () => {
+  // A compat backend can return `refusal` on a passthrough completion; the SDK
+  // turns it into a refusal content part.
+  assertItemsConform('refusal', await nonStreamItems({ role: 'assistant', content: null, refusal: 'I cannot help with that request.' }));
+});
+
+test('conformance(stream): content reply is a protocol-legal message', async () => {
+  assertItemsConform('stream content', await streamItems({ role: 'assistant', content: 'hello world' }));
+});
+
+test('conformance(stream): reasoning-lift emits protocol-legal reasoning + message', async () => {
+  const items = await streamItems({ role: 'assistant', content: '{"done":false}', reasoning_content: 'thinking about it' }, { outputType: STRUCTURED_OUTPUT });
+  assert.ok(items.some((i) => (i as AnyObj).type === 'reasoning'), 'a reasoning item is present');
+  assertItemsConform('stream reasoning + message', items);
+});
+
+test('conformance(stream): a tool call carrying reasoning is protocol-legal', async () => {
+  const items = await streamItems({
+    role: 'assistant', content: '', reasoning_content: 'plan the call',
+    tool_calls: [{ id: 't1', type: 'function', function: { name: 'search', arguments: '{}' } }],
+  });
+  assert.ok(items.some((i) => (i as AnyObj).type === 'function_call'), 'a function_call item is present');
+  assertItemsConform('stream reasoning + tool call', items);
+});
+
+test('conformance(stream): parallel tool calls are each protocol-legal', async () => {
+  const items = await streamItems({
+    role: 'assistant', content: '',
+    tool_calls: [
+      { id: 't1', type: 'function', function: { name: 'a', arguments: '{}' } },
+      { id: 't2', type: 'function', function: { name: 'b', arguments: '{"x":1}' } },
+    ],
+  });
+  assert.equal(items.filter((i) => (i as AnyObj).type === 'function_call').length, 2);
+  assertItemsConform('stream parallel tool calls', items);
 });

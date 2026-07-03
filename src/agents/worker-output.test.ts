@@ -50,6 +50,38 @@ test('extracts from an SDK result object (finalOutput) and classifies it', () =>
   assert.match(normalizeWorkerOutput({ finalOutput: '' }), /^ERROR:/);
 });
 
+test('MALFORMED JSON where structure was expected passes through VERBATIM (there is no schema at this layer — the worker text IS the answer)', () => {
+  // A worker asked for JSON that returns broken JSON has still produced text.
+  // normalizeWorkerOutput must NOT replace it (that would lose the worker's real
+  // output); the ledger counts it done because it IS text. The layer that cares
+  // about JSON validity is the parent that parses it, not this envelope.
+  const broken = '{"item": "Acme LLP", "authority": 38,';
+  assert.equal(normalizeWorkerOutput(broken), broken, 'raw text handed back unchanged, no silent replacement');
+  // The run_worker handler ok-gate would mark this ok (not ERROR-prefixed).
+  assert.equal(/^\s*ERROR:/i.test(normalizeWorkerOutput(broken)), false);
+
+  // Non-JSON free text is likewise passed through — only empty / generic-apology
+  // / already-ERROR strings are reclassified.
+  const prose = 'Acme has a thin backlink profile; recommend 3 guest posts.';
+  assert.equal(normalizeWorkerOutput(prose), prose);
+});
+
+test('cross-lane cap: normalizeWorkerOutput("") is the EXACT envelope runCrossProviderWorker returns on MaxTurnsExceeded (ledger marks it failed)', () => {
+  // sub-agents.runCrossProviderWorker catches MaxTurnsExceededError and returns
+  // { text: normalizeWorkerOutput('') }. Pin that this yields a failed envelope
+  // the handler ok-gate rejects — cross-provider lane parity with the Claude lane.
+  const capEnvelope = normalizeWorkerOutput('');
+  assert.match(capEnvelope, /^ERROR:/);
+  assert.match(capEnvelope, /turn cap|errored internally|did not complete/i);
+  assert.equal(/^\s*ERROR:/i.test(capEnvelope), true, 'the handler ok-gate marks the cross-lane cap FAILED');
+});
+
+test('a worker that returns the SDK generic apology is reclassified as ERROR, never surfaced as a hollow success', () => {
+  const apology = 'An error occurred while running the tool. Please try again.';
+  const r = normalizeWorkerOutput(apology);
+  assert.match(r, /^ERROR:/, 'a generic apology is a FAILED item, not a done one');
+});
+
 test('never throws on malformed input — falls back to a string', () => {
   assert.doesNotThrow(() => normalizeWorkerOutput(undefined));
   assert.doesNotThrow(() => normalizeWorkerOutput(null));

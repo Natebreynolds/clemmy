@@ -394,6 +394,12 @@ export async function respondViaHarness(
       const routed = routeForHarness(surface, request, opts.modelOverride);
       appendEvent({ sessionId, turn: 0, role: 'system', type: 'turn_model_routed', data: { model: routed.effectiveModel, routeKind: routed.routeKind, surface } });
     } catch { /* telemetry only */ }
+    // Baseline for the parse-exhaustion recovery gate below: a rerun on another
+    // brain is only safe when THIS run committed no external write (the same
+    // invariant as the step-boundary canSwitch guard in loop.ts). The
+    // duplicate-send wall is a second line of defense, not the gate.
+    let extWritesBeforeRun = 0;
+    try { extWritesBeforeRun = listEvents(sessionId, { types: ['external_write'] }).length; } catch { /* fail-open to 0 */ }
     const result = await runConversationImpl({
       agent,
       sessionId,
@@ -417,16 +423,34 @@ export async function respondViaHarness(
         // tool work) → re-run ONCE on the next brain instead of shipping the
         // apology — the harness-lane mirror of the Claude-brain narration
         // give-up fallover. Guarded on !opts.modelOverride so the recovery hop
-        // can never recurse, and the duplicate-send wall protects any
-        // committed write on the re-run. Kill-switch: CLEMMY_BRAIN_FALLOVER.
+        // can never recurse. Kill-switch: CLEMMY_BRAIN_FALLOVER.
+        //
+        // External-write gate: if THIS run recorded any external_write, the
+        // rerun is NOT safe — sent/updated/created side effects must never be
+        // re-driven blindly (mirror of loop.ts canSwitch). In that case the
+        // honest apology ships and the user decides; the duplicate-send wall
+        // remains as defense-in-depth, not the primary gate.
         if (result.completedReason === 'no_structured_output' && !opts.modelOverride && chatBrainFalloverEnabled()) {
+          let extWritesDuringRun = 0;
           try {
+            extWritesDuringRun = Math.max(0, listEvents(sessionId, { types: ['external_write'] }).length - extWritesBeforeRun);
+          } catch { /* fail-open to 0 — the send wall still protects the rerun */ }
+          if (extWritesDuringRun > 0) {
+            bridgeLogger.warn({ surface, extWritesDuringRun },
+              'parse-exhaustion recovery SKIPPED — this run committed external write(s); not re-running another brain over side effects');
+          } else try {
             const usedModel = modelForRun ?? resolveRoleModel('brain').modelId;
             const currentBrain = resolveProvider(usedModel) as BrainProviderClass;
             const next = falloverBrainModelIds(currentBrain)[0];
             if (next) {
               bridgeLogger.warn({ surface, currentBrain, recoveryModel: next.modelId },
                 'harness brain exhausted structured-decision retries — re-running the turn once on the next brain instead of shipping the apology');
+              // Mark the parse-exhausted conversation_completed as superseded BEFORE the
+              // re-run so the desktop transcript reconstruction can skip the internal
+              // apology turn (the recovered reply is the ONE final answer the user sees).
+              try {
+                appendEvent({ sessionId, turn: 0, role: 'system', type: 'conversation_superseded', data: { reason: 'no_structured_output', recoveryModel: next.modelId, supersededAt: (replyText || '').slice(0, 240) } });
+              } catch { /* transcript hygiene only — never block the recovery hop */ }
               const recovered = await respondViaHarness(surface, request, {
                 reuseRecordedUserInput: hasReusableRecordedUserInput(request.sessionId, request.message),
                 modelOverride: next.modelId,

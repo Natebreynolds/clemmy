@@ -687,6 +687,10 @@ const CONSOLE_HARNESS_REPLAY_TYPES = new Set<HarnessEventRow['type']>([
   'approval_resolved',
   'run_completed',
   'conversation_completed',
+  // Parse-exhaustion recovery marker — must replay so a reopened session's
+  // transcript reconstruction can suppress the superseded apology turn and
+  // render only the recovered reply (matches reconstructHarnessTranscript).
+  'conversation_superseded',
   'run_failed',
   'guardrail_tripped',
   'stuck_detected',
@@ -8958,8 +8962,8 @@ export function registerConsoleRoutes(
           }
           return;
         }
-        const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId });
         if (intent && harnessSession) {
+          const agent = await buildOrchestratorAgent({ userInput: effectiveInput, sessionId });
           await runConversationFromResume({
             agent,
             sessionId,
@@ -8969,7 +8973,28 @@ export function registerConsoleRoutes(
           });
           return;
         }
-        await runConversation({ agent, sessionId, input: effectiveInput, judgeCompletion: true, onChunk });
+        // Non-Claude brains (codex/GLM/BYO) route through the SAME bridge spine
+        // as every other chat surface — turn_model_routed marker, mid-run brain
+        // fallover wiring, and the parse-exhaustion recovery that re-runs a
+        // no_structured_output dead turn on the next brain instead of shipping
+        // the "couldn't be structured" apology. Previously this path called
+        // runConversation directly, so the desktop dock was the ONE chat
+        // surface without that recovery (live incident 2026-07-03, codex
+        // salesforce turn). The legacy closure preserves the old direct call as
+        // the bridge's own pre-run fallback (surface flag off / unenforceable
+        // excludes / auth not ready) — never taken after a harness run starts.
+        await respondPreferHarness(
+          'home',
+          { message: effectiveInput, sessionId, channel: 'desktop', userId: 'desktop', onChunk },
+          async (req) => {
+            const agent = await buildOrchestratorAgent({ userInput: req.message, sessionId });
+            const result = await runConversation({ agent, sessionId, input: req.message, judgeCompletion: true, onChunk });
+            const replyText = (result.lastDecision?.reply && result.lastDecision.reply.trim())
+              ? result.lastDecision.reply
+              : (result.lastDecision?.summary ?? '');
+            return { text: replyText, sessionId };
+          },
+        );
       } catch (err) {
         // The loop emits its own run_failed when a turn throws. If we
         // got here, the throw happened BEFORE any turn started

@@ -48,6 +48,56 @@ test('reconstructHarnessTranscript orders turns and skips empty assistant turns'
   );
 });
 
+test('reconstructHarnessTranscript drops a superseded parse-exhaustion apology, keeps the recovered reply', () => {
+  const session = createSession({ kind: 'chat', title: 'test' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'what is the plan?' } });
+  // Parse-exhausted dead turn: the internal "couldn't be structured" apology.
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'no_structured_output', summary: "Clementine produced a response that couldn't be structured. Please ask again." },
+  });
+  // Recovery marker appended before the re-run on the next brain.
+  appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'system',
+    type: 'conversation_superseded',
+    data: { reason: 'no_structured_output', recoveryModel: 'claude-fable-5' },
+  });
+  // The recovered reply from the next brain.
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: "Here's the plan: ship it." } });
+
+  const turns = reconstructHarnessTranscript(session.id);
+  assert.deepEqual(
+    turns.map((t) => `${t.role}:${t.text}`),
+    ['user:what is the plan?', "assistant:Here's the plan: ship it."],
+    'the internal apology is suppressed; only the recovered reply renders',
+  );
+});
+
+test('reconstructHarnessTranscript still renders a parse-exhaustion apology with no superseding marker', () => {
+  const session = createSession({ kind: 'chat', title: 'test' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'still there?' } });
+  // Genuine dead end: recovery disabled/unavailable, so no conversation_superseded follows.
+  appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reason: 'no_structured_output', summary: "Clementine produced a response that couldn't be structured. Please ask again." },
+  });
+
+  const turns = reconstructHarnessTranscript(session.id);
+  assert.deepEqual(
+    turns.map((t) => `${t.role}:${t.text}`),
+    ['user:still there?', "assistant:Clementine produced a response that couldn't be structured. Please ask again."],
+    'the sole reply is never silently dropped',
+  );
+});
+
 test('reconstructHarnessTranscript skips synthetic outcome/directive user turns', () => {
   const session = createSession({ kind: 'chat', title: 'test' });
   appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'run the SEO check' } });

@@ -483,3 +483,61 @@ test('CodexResponsesModel does not retry after a tool call item has escaped retr
     assert.equal(caught.kind, 'codex.sse_truncated');
   });
 });
+
+// ── SDK protocol conformance for response items ────────────────────────────
+// Regression guard for the @openai/agents 0.12 bump (live incident
+// 2026-07-03): agents-core validates the response_done payload against its
+// zod protocol, and ReasoningItem.content entries must be `input_text`. Our
+// converter emitted the raw codex `summary_text` shape, so ANY codex turn
+// whose reasoning produced a non-empty summary failed protocol validation
+// and dead-ended as the "couldn't be structured" sentinel (trivial turns
+// passed only because an empty summary array validates vacuously). These
+// tests validate every converter branch against the INSTALLED protocol
+// schema, so a future SDK bump that shifts the protocol fails here — in CI —
+// instead of live on the user's first real question.
+test('convertCodexItemToSdkOutputItem output validates against the installed SDK protocol', async (t) => {
+  const { protocol } = await import('@openai/agents-core');
+  const { convertCodexItemToSdkOutputItem } = await import('./codex-model.js');
+  const check = (label: string, item: Record<string, unknown>) => {
+    const converted = convertCodexItemToSdkOutputItem(item as never);
+    const parsed = protocol.OutputModelItem.safeParse(converted);
+    assert.ok(
+      parsed.success,
+      `${label} failed protocol validation: ${JSON.stringify(parsed.success ? null : parsed.error.issues)}`,
+    );
+  };
+
+  await t.test('reasoning item with a NON-EMPTY summary (the 0.12 killer case)', () => {
+    check('reasoning', {
+      id: 'rs_1',
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: 'Considering how to query salesforce.' }],
+      encrypted_content: 'gAAAA-opaque',
+    });
+  });
+
+  await t.test('reasoning item with an empty summary', () => {
+    check('reasoning-empty', { id: 'rs_2', type: 'reasoning', summary: [], encrypted_content: 'gAAAA' });
+  });
+
+  await t.test('assistant message with output_text + annotations', () => {
+    check('message', {
+      id: 'msg_1',
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: '{"reply":"hi"}', annotations: [], logprobs: [] }],
+    });
+  });
+
+  await t.test('function call', () => {
+    check('function_call', {
+      id: 'fc_1',
+      type: 'function_call',
+      call_id: 'call_1',
+      name: 'lookup_accounts',
+      arguments: '{"days":10}',
+      status: 'completed',
+    });
+  });
+});

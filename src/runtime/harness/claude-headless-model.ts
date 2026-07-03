@@ -294,7 +294,12 @@ function usageFromClaude(u: ClaudeUsageShape | undefined): Usage {
   });
 }
 
-function assistantMessage(text: string): AgentOutputItem {
+// Exported for the SDK-protocol conformance suite (claude-headless-model.test.ts):
+// this is the ONLY output-item shape this lane hands the agents runner, so the
+// test validates its output against the installed @openai/agents 0.12 protocol
+// (see the codex-model `summary_text` incident 2026-07-03 — agents-core validates
+// the response_done payload against its zod protocol).
+export function assistantMessage(text: string): AgentOutputItem {
   return {
     id: `claude-headless-message-${randomUUID()}`,
     type: 'message',
