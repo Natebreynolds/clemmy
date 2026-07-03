@@ -48,6 +48,30 @@ function pushUnique(models: Array<{ id: string; label: string }>, id: string, la
   models.push({ id: clean, label });
 }
 
+function codexBrainModelChoices(): Array<{ id: string; label: string }> {
+  const models = [...MODEL_PRESETS];
+  for (const id of [MODELS.fast, MODELS.primary, MODELS.deep, DEFAULT_CODEX_MODEL]) {
+    try {
+      if (resolveProvider(id) === 'codex') pushUnique(models, id);
+    } catch {
+      // Unknown/custom ids are ignored here; the router still validates at dispatch.
+    }
+  }
+  return models;
+}
+
+function claudeBrainModelChoices(): Array<{ id: string; label: string }> {
+  const models = [...CLAUDE_MODEL_PRESETS];
+  for (const id of [getClaudeBrainModel(), getDebateCheckerModel()]) {
+    try {
+      if (resolveProvider(id) === 'claude') pushUnique(models, id);
+    } catch {
+      // Unknown/custom ids are ignored here; the router still validates at dispatch.
+    }
+  }
+  return models;
+}
+
 export function codexModelsAvailable(): boolean {
   try {
     return Boolean(getStoredCodexOAuthTokens()?.accessToken);
@@ -236,28 +260,34 @@ export function brainOptions(): BrainOption[] {
   // Codex brain: offer the SPECIFIC gpt-5.x model (like the worker picker) so the
   // brain can be pinned to gpt-5.5 vs gpt-5.4 — not just "Codex". Sourced from the
   // same connected-Codex model list the worker uses; value `codex_oauth:<id>` so
-  // the active-brain route persists the exact model. Falls back to the generic
-  // entry when Codex isn't connected so the row still renders.
+  // the active-brain route persists the exact model. Falls back to unavailable
+  // model-specific rows when Codex isn't connected so effectiveBrainValue remains in-list.
   const codexGroup = connectedModelGroups().find((g) => g.provider === 'codex');
-  if (codexGroup && codexGroup.models.length > 0) {
-    for (const m of codexGroup.models) {
-      opts.push({ id: 'codex_oauth', value: `codex_oauth:${m.id}`, modelId: m.id, label: `Codex — ${m.label}`, available: true });
-    }
-  } else {
-    opts.push({ id: 'codex_oauth', value: 'codex_oauth', label: 'Codex — GPT-5.x', available: false });
+  const codexModels = codexGroup?.models?.length ? codexGroup.models : codexBrainModelChoices();
+  for (const m of codexModels) {
+    opts.push({
+      id: 'codex_oauth',
+      value: `codex_oauth:${m.id}`,
+      modelId: m.id,
+      label: `Codex — ${m.label}`,
+      available: Boolean(codexGroup),
+    });
   }
   // Claude brain: offer each connected Claude model (like the Codex picker) so the
   // brain can be pinned to Sonnet 5 vs Opus 4.8 vs Fable 5 — not just "Claude".
   // value `claude_oauth:<id>` so the active-brain route persists the exact model
-  // (→ CLAUDE_MODEL). Falls back to the generic unavailable row when Claude isn't
-  // connected so the row still renders.
+  // (→ CLAUDE_MODEL). Falls back to unavailable model-specific rows when Claude
+  // isn't connected so effectiveBrainValue remains in-list.
   const claudeGroup = connectedModelGroups().find((g) => g.provider === 'claude');
-  if (claudeGroup && claudeGroup.models.length > 0) {
-    for (const m of claudeGroup.models) {
-      opts.push({ id: 'claude_oauth', value: `claude_oauth:${m.id}`, modelId: m.id, label: `Claude — ${m.label.replace(/^Claude\s+/, '')}`, available: true });
-    }
-  } else {
-    opts.push({ id: 'claude_oauth', value: 'claude_oauth', label: 'Claude — Opus', available: false });
+  const claudeModels = claudeGroup?.models?.length ? claudeGroup.models : claudeBrainModelChoices();
+  for (const m of claudeModels) {
+    opts.push({
+      id: 'claude_oauth',
+      value: `claude_oauth:${m.id}`,
+      modelId: m.id,
+      label: `Claude — ${m.label.replace(/^Claude\s+/, '')}`,
+      available: Boolean(claudeGroup),
+    });
   }
   const seen = new Set<string>();
   for (const provider of getByoProviders()) {

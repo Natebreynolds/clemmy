@@ -1,11 +1,13 @@
 /**
- * Run: CLEMENTINE_HOME=/tmp/clemmy-agent-proposals npx tsx --test src/agents/agent-proposals.test.ts
+ * Run: npx tsx --test src/agents/agent-proposals.test.ts
  */
-import { test, before, beforeEach } from 'node:test';
+import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-const TEST_HOME = '/tmp/clemmy-agent-proposals';
+const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-agent-proposals-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const {
@@ -21,6 +23,10 @@ const { agentFilePath, loadTeamAgents } = await import('../tools/shared.js');
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
   mkdirSync(`${TEST_HOME}/state`, { recursive: true });
+});
+
+after(() => {
+  rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
 beforeEach(() => {

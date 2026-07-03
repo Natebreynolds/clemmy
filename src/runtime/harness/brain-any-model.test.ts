@@ -10,10 +10,16 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { brainOptions, effectiveBrainValue } from './model-role-options.js';
-import { defaultForRole } from './model-roles.js';
-import { resolveByoProviderForModel } from './byo-providers.js';
-import { MODELS } from '../../config.js';
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-brain-any-model-'));
+
+const { brainOptions, effectiveBrainValue } = await import('./model-role-options.js');
+const { defaultForRole } = await import('./model-roles.js');
+const { resolveByoProviderForModel } = await import('./byo-providers.js');
+const { MODELS } = await import('../../config.js');
 
 const ZAI = 'https://api.z.ai/api/paas/v4';
 const TOGETHER = 'https://api.together.ai/v1';
