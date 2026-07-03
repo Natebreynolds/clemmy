@@ -6,6 +6,7 @@ import { listSkills } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
+import { pinnedCalendarRuleLabels } from './constraint-guard.js';
 import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-system-guidance.js';
 import type { FanoutPosture } from '../../dashboard/agent-system-metrics.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
@@ -412,7 +413,7 @@ function renderCandidates(title: string, candidates: RankedContextCandidate[], i
 
 function summarizeToolScope(input: string): AgentContextPacket['toolScope'] {
   try {
-    const scope = resolveMcpToolScope({ userInput: input });
+    const scope = resolveMcpToolScope({ userInput: input, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
     return {
       reason: scope.reason,
       allowAll: scope.allowAll,

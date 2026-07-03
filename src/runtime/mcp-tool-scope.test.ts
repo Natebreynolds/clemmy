@@ -96,6 +96,18 @@ test('resolveMcpToolScope: local/file prompts do not inject external MCP tools',
   assert.ok(!scope.failOpenCandidate);
 });
 
+test('resolveMcpToolScope: a pinned-calendar label + date shorthand is treated as Outlook calendar intent', () => {
+  const scope = resolveMcpToolScope({ userInput: 'Check my scorpion for tomorrow', pinnedCalendarLabels: ['scorpion'] });
+  assert.ok((scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  assert.ok((scope.toolPatterns ?? []).includes('calendar'));
+  assert.match(scope.reason, /outlook/i);
+  assert.ok(!scope.failOpenCandidate);
+
+  // No pinned calendars → the shorthand never fires; the turn stays generic.
+  const generic = resolveMcpToolScope({ userInput: 'Check my scorpion for tomorrow' });
+  assert.ok(!(generic.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+});
+
 // ── Fail-open per class (CANON-REACH-FAILOPEN) ───────────────────────────────
 
 test('resolveMcpToolScope: an unrecognized-intent turn FAILS OPEN so connected apps outside the keyword families are reachable', () => {

@@ -12,7 +12,15 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { formatComposioToolOutput, formatComposioExecuteOutput, detectComposioFailure, composioThrownErrorOutput, asyncResultItemCount } = await import('./composio-tools.js');
+const {
+  formatComposioToolOutput,
+  formatComposioExecuteOutput,
+  detectComposioFailure,
+  composioThrownErrorOutput,
+  asyncResultItemCount,
+  normalizeInlineConnectedAccountId,
+  buildComposioStatusPayload,
+} = await import('./composio-tools.js');
 const {
   closeEventLog,
   resetEventLog,
@@ -72,6 +80,102 @@ test('formatComposioToolOutput falls back to a non-recallable clip without harne
 
   assert.match(output, /truncated/);
   assert.doesNotMatch(output, /recall_tool_result/);
+});
+
+test('normalizeInlineConnectedAccountId lifts accidental inner connection metadata out of provider args', () => {
+  const args = {
+    connected_account_id: 'ca_live_outlook',
+    startDateTime: '2026-07-03T00:00:00',
+    endDateTime: '2026-07-03T23:59:59',
+  };
+
+  const normalized = normalizeInlineConnectedAccountId(args, undefined);
+
+  assert.equal(normalized.connectedAccountId, 'ca_live_outlook');
+  assert.deepEqual(normalized.args, {
+    startDateTime: '2026-07-03T00:00:00',
+    endDateTime: '2026-07-03T23:59:59',
+  });
+});
+
+test('normalizeInlineConnectedAccountId lets the explicit outer connection win and strips junk inner ids', () => {
+  const explicit = normalizeInlineConnectedAccountId(
+    { connected_account_id: 'ca_inner', connectedAccountId: 'ca_camel', q: 'x' },
+    'ca_outer',
+  );
+  assert.equal(explicit.connectedAccountId, 'ca_outer');
+  assert.deepEqual(explicit.args, { q: 'x' });
+
+  const junk = normalizeInlineConnectedAccountId({ connected_account_id: 'null', q: 'x' }, undefined);
+  assert.equal(junk.connectedAccountId, undefined);
+  assert.deepEqual(junk.args, { q: 'x' });
+});
+
+test('buildComposioStatusPayload puts usable connections first and does not expose suppressed ids by default', () => {
+  const connections = [
+    { slug: 'outlook', connectionId: 'ca_personal', status: 'ACTIVE' },
+    { slug: 'outlook', connectionId: 'ca_scorpion', status: 'ACTIVE' },
+    { slug: 'slack', connectionId: 'ca_old_slack', status: 'EXPIRED' },
+  ];
+  const suppressed = [
+    {
+      slug: 'outlook',
+      connectionId: 'ca_stale_entity',
+      status: 'ACTIVE',
+      suppression: {
+        reason: 'entity-mismatch',
+        suppressUntil: '2026-07-03T03:16:03.194Z',
+        lastErrorAt: '2026-07-02T15:16:03.194Z',
+        failures: 1,
+      },
+    },
+    {
+      slug: 'outlook',
+      connectionId: 'ca_expired',
+      status: 'EXPIRED',
+      suppression: {
+        reason: 'expired',
+        suppressUntil: '2026-07-03T03:16:03.194Z',
+        lastErrorAt: '2026-07-02T15:16:03.194Z',
+        failures: 1,
+      },
+    },
+  ];
+
+  const payload = buildComposioStatusPayload({ enabled: true }, connections, suppressed, false);
+  const counts = payload.counts as { usableByToolkit: Record<string, number>; suppressedByToolkit: Record<string, number> };
+  const usable = payload.usableConnections as Array<{ slug: string; connectionId: string }>;
+  const hidden = payload.suppressedConnections as Array<{ slug: string; connectionId?: string; reason: string }>;
+
+  assert.equal(counts.usableByToolkit.outlook, 2);
+  assert.equal(counts.suppressedByToolkit.outlook, 2);
+  assert.deepEqual(
+    usable.filter((connection) => connection.slug === 'outlook').map((connection) => connection.connectionId),
+    ['ca_personal', 'ca_scorpion'],
+  );
+  assert.deepEqual(hidden.map((connection) => connection.reason), ['entity-mismatch', 'expired']);
+  assert.ok(hidden.every((connection) => connection.connectionId === undefined));
+});
+
+test('buildComposioStatusPayload can expose suppressed ids only for explicit diagnostics', () => {
+  const payload = buildComposioStatusPayload(
+    { enabled: true },
+    [],
+    [{
+      slug: 'outlook',
+      connectionId: 'ca_stale_entity',
+      status: 'ACTIVE',
+      suppression: {
+        reason: 'entity-mismatch',
+        suppressUntil: '2026-07-03T03:16:03.194Z',
+        lastErrorAt: '2026-07-02T15:16:03.194Z',
+        failures: 1,
+      },
+    }],
+    true,
+  );
+  const suppressed = payload.suppressedConnections as Array<{ connectionId?: string }>;
+  assert.equal(suppressed[0]?.connectionId, 'ca_stale_entity');
 });
 
 // ── composio-thrash fix: loud, self-correcting failure output ──────────

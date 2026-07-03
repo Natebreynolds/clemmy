@@ -8,8 +8,12 @@ import {
   getComposioCredentialStatus,
   getComposioRuntimeStatus,
   listComposioToolkitTools,
-  listConnectedToolkits,
+  listUsableConnectedToolkits,
+  listSuppressedConnectedToolkits,
+  readComposioConnectionSuppressionState,
+  saveComposioConnectionSuppressionState,
   listAllToolkits,
+  type ConnectedToolkit,
 } from '../integrations/composio/client.js';
 import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter } from '../integrations/composio/async-job.js';
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
@@ -21,15 +25,19 @@ import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
 import { asyncJobTimeoutCorrective } from '../runtime/harness/tool-error-corrective.js';
-import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
+import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, findOutlookCalendarReadConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
 import { resolveCompliantSenderConnection } from '../runtime/harness/sender-verify.js';
 import { validateComposioArgs, formatBatchValidationError } from './composio-batch-validator.js';
 import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
-import { appendEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
 import { getCapabilitiesForIntent } from '../runtime/capability-registry.js';
 import { recordExecution } from '../runtime/graceful-degradation-engine.js';
+import {
+  suppressConnectionAfterHardAuthFailure,
+  type ComposioConnectionSuppressionState,
+} from '../agents/composio-connection-suppression.js';
 
 const DYNAMIC_TOOL_PREFIX = 'cx_';
 const MAX_TOOL_NAME_LENGTH = 64;
@@ -45,6 +53,8 @@ const DEFAULT_DYNAMIC_TOTAL_LIMIT = 120;
 // the alphabetical first page (e.g. outlook_list_messages) are findable.
 const DEFAULT_SEARCH_TOOLKIT_LIMIT = 250;
 const DEFAULT_SEARCH_TOTAL_LIMIT = 25;
+
+type SuppressedConnectedToolkit = ConnectedToolkit & { suppression: { reason?: string; suppressUntil: string } };
 
 // Composio slug → ToolKind classification lives in agents/tool-taxonomy.ts
 // (classifyComposioSlug). The previous ad-hoc READ_ONLY_PREFIXES /
@@ -507,7 +517,7 @@ export async function maybeAutoRememberComposioChoice(
     // pollution). Runtime-discovered toolkits; fail-open so a lookup error never
     // blocks legitimate learning.
     try {
-      const known = (await listConnectedToolkits()).map((t) => t.slug).filter((s): s is string => Boolean(s));
+      const known = (await listUsableConnectedToolkits()).map((t) => t.slug).filter((s): s is string => Boolean(s));
       if (isCrossServiceToolkitMismatch(pending.query, toolSlug, known)) return;
     } catch {
       // fail-open: a guard error must never break learning
@@ -602,7 +612,7 @@ async function enforceStandingConstraints(
       let connections: { connectionId: string; accountEmail?: string; status?: string }[] = [];
       try {
         const toolkit = toolkitOfSlug(toolSlug);
-        connections = (await listConnectedToolkits())
+        connections = (await listUsableConnectedToolkits())
           .filter((c) => c.slug.toLowerCase() === toolkit)
           .map((c) => ({ connectionId: c.connectionId, accountEmail: c.accountEmail, status: c.status }));
       } catch { /* connection listing failure → resolution probes nothing and fails closed */ }
@@ -628,15 +638,131 @@ async function enforceStandingConstraints(
   return { block: null, routeConnectedAccountId };
 }
 
+export function normalizeInlineConnectedAccountId(
+  args: Record<string, unknown>,
+  connectedAccountId: string | undefined,
+): { args: Record<string, unknown>; connectedAccountId: string | undefined } {
+  const inline = args.connected_account_id ?? args.connectedAccountId;
+  let effectiveConnectionId = connectedAccountId;
+  if (!effectiveConnectionId && typeof inline === 'string') {
+    const trimmed = inline.trim();
+    if (trimmed && !['null', 'undefined', 'none'].includes(trimmed.toLowerCase())) {
+      effectiveConnectionId = trimmed;
+    }
+  }
+  delete args.connected_account_id;
+  delete args.connectedAccountId;
+  return { args, connectedAccountId: effectiveConnectionId };
+}
+
+function latestUserInputForContext(context: unknown): string {
+  const sessionId = sessionIdFromRunContext(context);
+  if (!sessionId) return '';
+  try {
+    const [latest] = listEvents(sessionId, { types: ['user_input_received'], limit: 1, desc: true });
+    const text = latest?.data && typeof latest.data.text === 'string' ? latest.data.text : '';
+    return text.slice(0, 2000);
+  } catch {
+    return '';
+  }
+}
+
+function suppressComposioConnectionAfterHardFailure(connectionId: string | undefined, err: unknown): string {
+  if (!connectionId) return '';
+  try {
+    const state = readComposioConnectionSuppressionState() as unknown as ComposioConnectionSuppressionState;
+    const suppression = suppressConnectionAfterHardAuthFailure(state, connectionId, err, Date.now());
+    if (!suppression) return '';
+    saveComposioConnectionSuppressionState(state);
+    return `\n\n[connection-suppressed] Suppressed connection ${connectionId} for ${suppression.reason} until ${suppression.suppressUntil}; future Composio status/search surfaces will avoid it.`;
+  } catch {
+    return '';
+  }
+}
+
+function isActiveConnectionStatus(status: string | undefined): boolean {
+  return /active|enabled|initiat/i.test(status ?? '');
+}
+
+function countByToolkit(connections: Array<{ slug?: string; toolkit?: string }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const connection of connections) {
+    const slug = (connection.slug ?? connection.toolkit ?? '').toLowerCase();
+    if (!slug) continue;
+    counts[slug] = (counts[slug] ?? 0) + 1;
+  }
+  return counts;
+}
+
+export function buildComposioStatusPayload(
+  credentials: Record<string, unknown>,
+  connections: ConnectedToolkit[],
+  suppressedConnections: SuppressedConnectedToolkit[],
+  exposeSuppressedIds = ['1', 'true', 'yes'].includes((process.env.CLEMMY_COMPOSIO_STATUS_EXPOSE_SUPPRESSED_IDS ?? '').toLowerCase()),
+): Record<string, unknown> {
+  const connectionList = connections.map((connection) => ({
+    toolkit: connection.slug,
+    slug: connection.slug,
+    connectionId: connection.connectionId,
+    status: connection.status,
+    account: connection.accountLabel ?? connection.alias ?? null,
+  }));
+  const usableConnections = connectionList.filter((connection) => isActiveConnectionStatus(connection.status));
+  const suppressedConnectionList = suppressedConnections.map((connection) => {
+    const base = {
+      toolkit: connection.slug,
+      slug: connection.slug,
+      status: connection.status,
+      account: connection.accountLabel ?? connection.alias ?? null,
+      reason: connection.suppression.reason ?? 'suppressed',
+      suppressUntil: connection.suppression.suppressUntil,
+    };
+    return exposeSuppressedIds ? { ...base, connectionId: connection.connectionId } : base;
+  });
+
+  return {
+    ...credentials,
+    statusGuidance:
+      'For usable/active connection summaries, count only usableConnections. ' +
+      'Never count suppressedConnections as usable; suppressed connection ids are hidden by default because they are stale/expired/mismatched.',
+    counts: {
+      nonSuppressedConnections: connectionList.length,
+      usableConnections: usableConnections.length,
+      suppressedConnections: suppressedConnectionList.length,
+      usableByToolkit: countByToolkit(usableConnections),
+      suppressedByToolkit: countByToolkit(suppressedConnectionList),
+    },
+    usableConnections,
+    connections: connectionList,
+    connectedAccounts: connectionList,
+    suppressedConnections: suppressedConnectionList,
+    note: suppressedConnectionList.length > 0
+      ? 'Suppressed connections are known stale/expired/mismatched and are intentionally omitted from usableConnections. Do not use or mention their connected_account_id unless the user explicitly asks to reconnect/test that account.'
+      : undefined,
+  };
+}
+
 async function runComposioExecute(
   toolSlug: string,
   args: Record<string, unknown>,
   connectedAccountId: string | undefined,
   options: FormatComposioToolOutputOptions,
 ): Promise<string> {
+  const normalized = normalizeInlineConnectedAccountId(args, connectedAccountId);
+  args = normalized.args;
+  connectedAccountId = normalized.connectedAccountId;
+
   const gate = await enforceStandingConstraints(toolSlug, args, connectedAccountId);
   if (gate.block) return gate.block;
-  const effectiveConnectionId = gate.routeConnectedAccountId ?? connectedAccountId;
+  let effectiveConnectionId = gate.routeConnectedAccountId ?? connectedAccountId;
+  let accountRouteNote = '';
+  if (!effectiveConnectionId) {
+    const calendarRoute = findOutlookCalendarReadConstraint(toolSlug, args, latestUserInputForContext(options.context));
+    if (calendarRoute) {
+      effectiveConnectionId = calendarRoute.routeConnectionId;
+      accountRouteNote = `[account-route] Routed Outlook calendar read to connection ${calendarRoute.routeConnectionId} from standing rule #${calendarRoute.constraint.id}.`;
+    }
+  }
 
   // Pre-dispatch arg validation — schema-grounded when the action's real
   // inputParameters schema has been seen this session (search/list/
@@ -688,12 +814,16 @@ async function runComposioExecute(
       if (gate.routeConnectedAccountId) {
         output += `\n\n[sender-verify] Routed to connection ${gate.routeConnectedAccountId} — its mailbox verified against the standing sender rule.`;
       }
+      if (accountRouteNote) output += `\n\n${accountRouteNote}`;
       if (constraintBanner) output += `\n${constraintBanner}`;
       const sid = sessionIdFromRunContext(options.context);
       maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
 
       // PHASE 5: Record outcome for adaptive tool selection & learning
       const failure = detectComposioFailure(result);
+      if (failure.failed) {
+        output += suppressComposioConnectionAfterHardFailure(effectiveConnectionId, result);
+      }
       try {
         recordExecution({
           toolName: options.toolName || toolSlug,
@@ -810,7 +940,8 @@ async function runComposioExecute(
       const decision = shouldRetryToolCall(err, attempt, recentErrors);
       if (!decision.shouldRetry) {
         // Terminal error or circuit-breaker triggered: return error immediately
-        return composioThrownErrorOutput(err, { ...options, toolSlug });
+        return composioThrownErrorOutput(err, { ...options, toolSlug })
+          + suppressComposioConnectionAfterHardFailure(effectiveConnectionId, err);
       }
 
       // Transient error: wait and retry
@@ -930,7 +1061,7 @@ export async function getDynamicComposioRuntimeTools(options: {
   // a connection is truly dead, the execute call will surface a real
   // error — the user gets actionable feedback instead of "tool not
   // available".
-  const connections = await listConnectedToolkits();
+  const connections = await listUsableConnectedToolkits();
   if (connections.length === 0) return [];
 
   const connectionsByToolkit = new Map<string, typeof connections>();
@@ -992,25 +1123,12 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     parameters: z.object({}),
     execute: async (_input, context, details) => {
       const credentials = await getComposioRuntimeStatus();
-      const connections = credentials.enabled ? await listConnectedToolkits() : [];
-      // Emit BOTH the `toolkit` and `slug` element keys and BOTH the `connections`
-      // and `connectedAccounts` top-level keys — a Code Mode program (or the model)
-      // that probes for the connection commonly reaches for `connectedAccounts` and
-      // `.slug`, and reading the wrong key returned undefined → "No connection found"
-      // even though the ACTIVE connection was fine (2026-07-01 Codex/Airtable block).
-      // Zero extra cost (listConnectedToolkits already ran + is cached).
-      const connectionList = connections.map((connection) => ({
-        toolkit: connection.slug,
-        slug: connection.slug,
-        connectionId: connection.connectionId,
-        status: connection.status,
-        account: connection.accountLabel ?? connection.alias ?? null,
-      }));
-      return formatComposioToolOutput({
-        ...credentials,
-        connections: connectionList,
-        connectedAccounts: connectionList,
-      }, { context, details, toolName: 'composio_status' });
+      const connections = credentials.enabled ? await listUsableConnectedToolkits() : [];
+      const suppressedConnections = credentials.enabled ? await listSuppressedConnectedToolkits() : [];
+      return formatComposioToolOutput(
+        buildComposioStatusPayload(credentials as unknown as Record<string, unknown>, connections, suppressedConnections),
+        { context, details, toolName: 'composio_status' },
+      );
     },
   });
 
@@ -1089,7 +1207,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       // surface a real error if the connection truly is dead. That
       // gives the agent (and the user) accurate, actionable feedback
       // instead of "tool not available" when the tool IS available.
-      const allConnections = await listConnectedToolkits();
+      const allConnections = await listUsableConnectedToolkits();
       // Cold-start nudge: a configured key with ZERO connected apps returns a
       // guidance-free empty result that the model reads as "no such tool".
       // Say what's actually wrong and how to fix it. (Skipped when an explicit

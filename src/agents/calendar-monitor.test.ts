@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -15,7 +15,7 @@ process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 import type { CalendarMonitorDeps, CalEvent } from './calendar-monitor.js';
-const { processCalendarMonitor, scoreEvent } = await import('./calendar-monitor.js');
+const { calendarMonitorInternalsForTest, processCalendarMonitor, scoreEvent } = await import('./calendar-monitor.js');
 
 const NOW = Date.parse('2026-06-16T12:00:00Z');
 // Outlook Graph event fixture; dateTime in UTC without offset (as Graph returns).
@@ -192,4 +192,25 @@ test('processCalendarMonitor: suppresses hard Composio auth failures by connecti
   now += 31 * 60_000;
   assert.equal(await processCalendarMonitor(deps), 0);
   assert.deepEqual(calls, ['ca_good'], 'the hard-failed stale connection is skipped on the next scan');
+});
+
+test('calendar monitor real state loader preserves persisted connection suppressions', () => {
+  const stateFile = path.join(TMP, 'state', 'calendar-monitor.json');
+  writeFileSync(stateFile, JSON.stringify({
+    lastScanAt: '2026-06-16T12:00:00.000Z',
+    surfacedIds: ['ca_good:e1'],
+    suppressedConnections: {
+      ca_bad: {
+        reason: 'expired',
+        suppressUntil: '2026-06-17T00:00:00.000Z',
+        lastErrorAt: '2026-06-16T12:00:00.000Z',
+        failures: 2,
+      },
+    },
+  }), 'utf-8');
+
+  const loaded = calendarMonitorInternalsForTest.loadStateReal();
+  assert.deepEqual(loaded.surfacedIds, ['ca_good:e1']);
+  assert.equal(loaded.suppressedConnections?.ca_bad?.reason, 'expired');
+  assert.equal(loaded.suppressedConnections?.ca_bad?.failures, 2);
 });

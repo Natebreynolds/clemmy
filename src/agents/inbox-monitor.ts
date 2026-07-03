@@ -67,7 +67,7 @@ interface MailProvider {
   parse: (resp: unknown) => UnreadMessage[];
 }
 
-interface InboxMonitorState {
+export interface InboxMonitorState {
   lastScanAt?: string;
   surfacedIds: string[];
   suppressedConnections?: Record<string, ComposioConnectionSuppression>;
@@ -233,7 +233,14 @@ function loadStateReal(): InboxMonitorState {
   if (!existsSync(STATE_FILE)) return { surfacedIds: [] };
   try {
     const s = JSON.parse(readFileSync(STATE_FILE, 'utf-8')) as InboxMonitorState;
-    return { lastScanAt: s.lastScanAt, surfacedIds: Array.isArray(s.surfacedIds) ? s.surfacedIds : [] };
+    const suppressedConnections = s.suppressedConnections && typeof s.suppressedConnections === 'object' && !Array.isArray(s.suppressedConnections)
+      ? s.suppressedConnections
+      : undefined;
+    return {
+      lastScanAt: s.lastScanAt,
+      surfacedIds: Array.isArray(s.surfacedIds) ? s.surfacedIds : [],
+      suppressedConnections,
+    };
   } catch { return { surfacedIds: [] }; }
 }
 function saveStateReal(s: InboxMonitorState): void {
@@ -252,6 +259,8 @@ const REAL_DEPS: InboxMonitorDeps = {
   loadState: loadStateReal,
   saveState: saveStateReal,
 };
+
+export const inboxMonitorInternalsForTest = { loadStateReal, saveStateReal };
 
 function accountLabel(conn: { accountEmail?: string; accountName?: string; slug: string }): string {
   return conn.accountEmail || conn.accountName || conn.slug;

@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { COMPOSIO_AUTH_CONFIGS_URL, __test__, getPreferredUserId, pickToolkitConnection } from './client.js';
+import {
+  COMPOSIO_AUTH_CONFIGS_URL,
+  __test__,
+  filterSuppressedConnectedToolkits,
+  getPreferredUserId,
+  listSuppressedConnectedToolkitViews,
+  pickToolkitConnection,
+} from './client.js';
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {
   const items = [
@@ -64,4 +71,47 @@ test('pickToolkitConnection: resolves the live connection only when unambiguous 
   );
   // No connection for the toolkit → undefined (composio surfaces a clear no-connection error).
   assert.equal(pickToolkitConnection('AIRTABLE_LIST_RECORDS', [c('gmail', 'ca_gmail', 'ACTIVE')]), undefined);
+});
+
+test('filterSuppressedConnectedToolkits hides active-looking stale accounts before model discovery', () => {
+  const c = (slug: string, connectionId: string, status: string) => ({ slug, connectionId, status });
+  const now = Date.parse('2026-07-02T16:30:00Z');
+  const connections = [
+    c('outlook', 'ca_good', 'ACTIVE'),
+    c('outlook', 'ca_stale', 'ACTIVE'),
+    c('outlook', 'ca_expired_suppression', 'ACTIVE'),
+  ];
+  const state = {
+    suppressedConnections: {
+      ca_stale: {
+        reason: 'entity-mismatch',
+        suppressUntil: '2026-07-03T16:30:00Z',
+        lastErrorAt: '2026-07-02T16:29:00Z',
+        failures: 1,
+      },
+      ca_expired_suppression: {
+        reason: 'expired',
+        suppressUntil: '2026-07-02T15:30:00Z',
+        lastErrorAt: '2026-07-02T14:29:00Z',
+        failures: 1,
+      },
+    },
+  };
+
+  assert.deepEqual(
+    filterSuppressedConnectedToolkits(connections, state, now).map((connection) => connection.connectionId),
+    ['ca_good', 'ca_expired_suppression'],
+  );
+  assert.deepEqual(
+    listSuppressedConnectedToolkitViews(connections, state, now).map((connection) => ({
+      connectionId: connection.connectionId,
+      reason: connection.suppression.reason,
+    })),
+    [{ connectionId: 'ca_stale', reason: 'entity-mismatch' }],
+  );
+  assert.equal(
+    pickToolkitConnection('OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW', filterSuppressedConnectedToolkits(connections, state, now)),
+    undefined,
+    'two usable Outlook accounts remain ambiguous; the stale account is not considered',
+  );
 });

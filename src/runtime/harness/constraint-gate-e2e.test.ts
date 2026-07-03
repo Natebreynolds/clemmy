@@ -24,7 +24,7 @@ const { openMemoryDb, closeMemoryDb, resetMemoryDb, MEMORY_DB_PATH, STATE_DIR } 
 // eslint-disable-next-line import/first
 const { rememberFact, listConstraints } = await import('../../memory/facts.js');
 // eslint-disable-next-line import/first
-const { findEmailSendConstraint, checkConstraintViolation, constraintsForToolkit, renderToolkitConstraintBanner } = await import('./constraint-guard.js');
+const { findEmailSendConstraint, findOutlookCalendarReadConstraint, checkConstraintViolation, constraintsForToolkit, renderToolkitConstraintBanner } = await import('./constraint-guard.js');
 // eslint-disable-next-line import/first
 const { verifyOutlookSender, extractMailboxEmails, clearSenderVerificationCache, resolveCompliantSenderConnection } = await import('./sender-verify.js');
 
@@ -269,6 +269,49 @@ test('tool-bound rules: constraints ride with the toolkit they name, globally', 
   assert.equal(renderToolkitConstraintBanner('salesforce'), null);
   assert.equal(constraintsForToolkit('unknown').length, 0);
   assert.equal(constraintsForToolkit('*').length, 0);
+});
+
+test('pinned Outlook calendar reads route to the pinned connection only when the intent names the rule label', () => {
+  const saved = rememberFact({
+    kind: 'constraint',
+    content: 'For Scorpion calendar lookups, use Outlook connection ca_T9pDCuTalAI3 as the Scorpion calendar connection; the other active Outlook connection returned no Scorpion calendar events.',
+  });
+  assert.equal(saved.kind, 'constraint');
+
+  const routed = findOutlookCalendarReadConstraint(
+    'OUTLOOK_GET_CALENDAR_VIEW',
+    { start_date_time: '2026-07-02T00:00:00-07:00', end_date_time: '2026-07-03T00:00:00-07:00' },
+    'Can you check my Scorpion calendar for tomorrow?',
+  );
+  assert.equal(routed?.routeConnectionId, 'ca_T9pDCuTalAI3');
+
+  assert.equal(
+    findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'Can you check my calendar for tomorrow?'),
+    null,
+    'generic calendar reads must not collapse to one pinned account',
+  );
+  assert.equal(
+    findOutlookCalendarReadConstraint('OUTLOOK_CREATE_EVENT', {}, 'Add this to my Scorpion calendar'),
+    null,
+    'calendar writes must stay outside the read-route helper',
+  );
+
+  // The label is data-driven, not hardcoded: a second pinned calendar with a
+  // different org name routes independently, and each intent picks ITS rule.
+  const acme = rememberFact({
+    kind: 'constraint',
+    content: 'For Acme calendar lookups, use Outlook connection ca_AcmeRoute0001.',
+  });
+  assert.equal(acme.kind, 'constraint');
+  assert.equal(
+    findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'anything on the Acme calendar this week?')?.routeConnectionId,
+    'ca_AcmeRoute0001',
+  );
+  assert.equal(
+    findOutlookCalendarReadConstraint('OUTLOOK_GET_CALENDAR_VIEW', {}, 'Can you check my Scorpion calendar for tomorrow?')?.routeConnectionId,
+    'ca_T9pDCuTalAI3',
+    'with several pinned calendars the intent must route to the rule it names',
+  );
 });
 
 test('multi-account resolution: routes the send to the constraint-compliant connection', async () => {

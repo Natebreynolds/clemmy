@@ -15,6 +15,12 @@ import {
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
 const CATALOG_CACHE_FILE = path.join(CACHE_DIR, 'composio-catalog-cache.json');
+const CONNECTION_SUPPRESSION_FILE = path.join(CACHE_DIR, 'composio-connection-suppression.json');
+const CONNECTION_SUPPRESSION_SOURCE_FILES = [
+  CONNECTION_SUPPRESSION_FILE,
+  path.join(CACHE_DIR, 'calendar-monitor.json'),
+  path.join(CACHE_DIR, 'inbox-monitor.json'),
+];
 const SECRET_VAULT_FILE = path.join(CACHE_DIR, 'secrets-vault.json');
 const DEFAULT_USER_ID = 'default';
 const CONNECTIONS_TTL_MS = 60_000;
@@ -73,6 +79,17 @@ export interface ConnectedToolkit {
   createdAt?: string;
 }
 
+export interface ComposioConnectionSuppression {
+  reason?: string;
+  suppressUntil: string;
+  lastErrorAt?: string;
+  failures?: number;
+}
+
+export interface ComposioConnectionSuppressionState {
+  suppressedConnections?: Record<string, ComposioConnectionSuppression>;
+}
+
 export interface CatalogToolkit {
   slug: string;
   name: string;
@@ -89,6 +106,85 @@ export interface ComposioToolkitTool {
   description?: string;
   toolkitSlug?: string;
   inputParameters?: unknown;
+}
+
+function normalizeSuppression(value: unknown): ComposioConnectionSuppression | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const rec = value as Record<string, unknown>;
+  const suppressUntil = typeof rec.suppressUntil === 'string' ? rec.suppressUntil : undefined;
+  if (!suppressUntil) return undefined;
+  return {
+    reason: typeof rec.reason === 'string' ? rec.reason : undefined,
+    suppressUntil,
+    lastErrorAt: typeof rec.lastErrorAt === 'string' ? rec.lastErrorAt : undefined,
+    failures: typeof rec.failures === 'number' ? rec.failures : undefined,
+  };
+}
+
+function isSuppressionActive(rec: ComposioConnectionSuppression | undefined, nowMs: number): rec is ComposioConnectionSuppression {
+  if (!rec) return false;
+  const until = Date.parse(rec.suppressUntil);
+  return Number.isFinite(until) && until > nowMs;
+}
+
+export function readComposioConnectionSuppressionState(nowMs = Date.now()): ComposioConnectionSuppressionState {
+  const suppressedConnections: Record<string, ComposioConnectionSuppression> = {};
+  for (const file of CONNECTION_SUPPRESSION_SOURCE_FILES) {
+    if (!existsSync(file)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+      const raw = parsed.suppressedConnections && typeof parsed.suppressedConnections === 'object'
+        ? parsed.suppressedConnections as Record<string, unknown>
+        : {};
+      for (const [connectionId, value] of Object.entries(raw)) {
+        const rec = normalizeSuppression(value);
+        if (!isSuppressionActive(rec, nowMs)) continue;
+        const existing = suppressedConnections[connectionId];
+        if (!existing || Date.parse(rec.suppressUntil) > Date.parse(existing.suppressUntil)) {
+          suppressedConnections[connectionId] = rec;
+        }
+      }
+    } catch {
+      // A corrupt monitor state file must not hide every Composio connection.
+    }
+  }
+  return Object.keys(suppressedConnections).length > 0 ? { suppressedConnections } : {};
+}
+
+export function saveComposioConnectionSuppressionState(
+  state: ComposioConnectionSuppressionState,
+  nowMs = Date.now(),
+): void {
+  const suppressedConnections: Record<string, ComposioConnectionSuppression> = {};
+  for (const [connectionId, rec] of Object.entries(state.suppressedConnections ?? {})) {
+    if (isSuppressionActive(rec, nowMs)) suppressedConnections[connectionId] = rec;
+  }
+  mkdirSync(CACHE_DIR, { recursive: true });
+  writeFileSync(
+    CONNECTION_SUPPRESSION_FILE,
+    JSON.stringify({ suppressedConnections }, null, 2),
+  );
+}
+
+export function filterSuppressedConnectedToolkits(
+  connections: ConnectedToolkit[],
+  state: ComposioConnectionSuppressionState,
+  nowMs = Date.now(),
+): ConnectedToolkit[] {
+  return connections.filter((connection) => !isSuppressionActive(state.suppressedConnections?.[connection.connectionId], nowMs));
+}
+
+export function listSuppressedConnectedToolkitViews(
+  connections: ConnectedToolkit[],
+  state: ComposioConnectionSuppressionState,
+  nowMs = Date.now(),
+): Array<ConnectedToolkit & { suppression: ComposioConnectionSuppression }> {
+  const out: Array<ConnectedToolkit & { suppression: ComposioConnectionSuppression }> = [];
+  for (const connection of connections) {
+    const suppression = state.suppressedConnections?.[connection.connectionId];
+    if (isSuppressionActive(suppression, nowMs)) out.push({ ...connection, suppression });
+  }
+  return out;
 }
 
 export interface ComposioDashboardToolkit {
@@ -567,6 +663,18 @@ export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
   } catch {
     return connectionsCache?.data ?? [];
   }
+}
+
+export async function listUsableConnectedToolkits(): Promise<ConnectedToolkit[]> {
+  return filterSuppressedConnectedToolkits(
+    await listConnectedToolkits(),
+    readComposioConnectionSuppressionState(),
+  );
+}
+
+export async function listSuppressedConnectedToolkits(): Promise<Array<ConnectedToolkit & { suppression: ComposioConnectionSuppression }>> {
+  const all = await listConnectedToolkits();
+  return listSuppressedConnectedToolkitViews(all, readComposioConnectionSuppressionState());
 }
 
 interface RawCatalogItem {
@@ -1232,7 +1340,7 @@ export async function executeComposioTool(
  */
 export async function resolveToolkitConnectionId(toolSlug: string): Promise<string | undefined> {
   try {
-    return pickToolkitConnection(toolSlug, await listConnectedToolkits());
+    return pickToolkitConnection(toolSlug, await listUsableConnectedToolkits());
   } catch {
     return undefined;
   }

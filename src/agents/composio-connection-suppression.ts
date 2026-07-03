@@ -79,10 +79,44 @@ function classifyHardAuthFailure(err: unknown): ComposioConnectionSuppressionRea
 }
 
 function errorText(err: unknown): string {
-  if (err instanceof Error) return `${err.name}\n${err.message}\n${err.stack ?? ''}`;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
+  const parts: string[] = [];
+  const seen = new WeakSet<object>();
+
+  const push = (value: unknown): void => {
+    if (typeof value === 'string' && value.trim()) parts.push(value);
+    else if (typeof value === 'number' || typeof value === 'boolean') parts.push(String(value));
+  };
+
+  const visit = (value: unknown, depth: number): void => {
+    if (value === null || value === undefined || depth > 4) return;
+    if (typeof value !== 'object') {
+      push(value);
+      return;
+    }
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    const record = value as Record<string, unknown>;
+    push(record.name);
+    push(record.message);
+    push(record.stack);
+    push(record.code);
+    push(record.statusCode);
+    push(record.status);
+    push(record.errorId);
+
+    for (const key of ['cause', 'error', 'data', 'response', 'body', 'details', 'possibleFixes']) {
+      visit(record[key], depth + 1);
+    }
+
+    try {
+      push(JSON.stringify(value));
+    } catch {
+      // Ignore circular/non-serializable SDK objects; direct field reads above
+      // are the durable path.
+    }
+  };
+
+  visit(err, 0);
+  return parts.join('\n');
 }

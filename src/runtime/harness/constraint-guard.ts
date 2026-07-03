@@ -24,7 +24,54 @@ export interface EmailSendConstraint {
   allowedAccount: string;
 }
 
+export interface OutlookCalendarReadConstraint {
+  constraint: ConsolidatedFact;
+  /** The Outlook connected account this calendar read must use. */
+  routeConnectionId: string;
+}
+
 const EMAIL_IN_TEXT = /[\w\-.+]+@[\w\-.]+\.[a-z]{2,}/i;
+const CONNECTION_ID_IN_TEXT = /\bca_[A-Za-z0-9_-]+\b/;
+const OUTLOOK_MUTATING_CALENDAR_RE = /(?:^|[_\W])(?:create|add|insert|update|patch|delete|remove|cancel|send|draft|reply|forward)(?:$|[_\W])/i;
+
+// Vocabulary that can't distinguish one pinned calendar from another. The
+// distinguishing label (an org/workspace/account name) is whatever
+// non-generic word the constraint AND the live intent share — fully
+// data-driven, never a hardcoded account name.
+const GENERIC_CALENDAR_RULE_TOKENS = new Set([
+  'outlook', 'calendar', 'calendars', 'connection', 'connections', 'connected', 'account', 'accounts',
+  'lookup', 'lookups', 'event', 'events', 'meeting', 'meetings', 'schedule', 'scheduling',
+  'appointment', 'appointments', 'read', 'reads', 'reading', 'check', 'checks', 'checking',
+  'view', 'get', 'list', 'use', 'using', 'used', 'for', 'the', 'and', 'this', 'that', 'with',
+  'from', 'only', 'other', 'others', 'active', 'returned', 'return', 'returns', 'not', 'none',
+  'when', 'all', 'any', 'was', 'were', 'been', 'must', 'should', 'always', 'never', 'please',
+  'its', 'instead', 'because', 'via', 'has', 'have', 'had', 'one', 'two', 'both', 'known',
+]);
+
+function constraintLabelTokens(content: string): string[] {
+  const withoutIds = content.replace(new RegExp(CONNECTION_ID_IN_TEXT.source, 'gi'), ' ');
+  const words = withoutIds.toLowerCase().match(/\b[a-z][a-z0-9'-]{2,}\b/g) ?? [];
+  return [...new Set(words.filter((w) => !GENERIC_CALENDAR_RULE_TOKENS.has(w)))];
+}
+
+function escapeForRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isOutlookCalendarReadSlug(toolSlug: string): boolean {
+  const slug = toolSlug.toLowerCase();
+  if (!slug.startsWith('outlook')) return false;
+  if (!/\b(?:calendar|event|events)\b|calendar|event/.test(slug)) return false;
+  return !OUTLOOK_MUTATING_CALENDAR_RE.test(slug);
+}
+
+function argsIntentText(args: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(args).slice(0, 2000);
+  } catch {
+    return '';
+  }
+}
 
 /**
  * Find the active email-account constraint that applies to this composio
@@ -49,6 +96,65 @@ export function findEmailSendConstraint(
     }
   } catch (err) {
     console.error('[constraint-guard] error finding email constraint:', err);
+  }
+  return null;
+}
+
+/**
+ * Distinguishing labels of every pinned-calendar rule (e.g. the org names in
+ * "For <Org> calendar lookups, use Outlook connection ca_..."). Used by the
+ * tool scoper so a shorthand ask that names the org instead of the word
+ * "calendar" still scopes the Outlook tools. Data-driven from constraints —
+ * empty for users with no pinned calendars.
+ */
+export function pinnedCalendarRuleLabels(): string[] {
+  const labels = new Set<string>();
+  try {
+    for (const constraint of listConstraints()) {
+      const content = constraint.content.toLowerCase();
+      if (!content.includes('outlook')) continue;
+      if (!content.includes('calendar')) continue;
+      if (!CONNECTION_ID_IN_TEXT.test(constraint.content)) continue;
+      for (const label of constraintLabelTokens(constraint.content)) labels.add(label);
+    }
+  } catch (err) {
+    console.error('[constraint-guard] error listing pinned calendar labels:', err);
+  }
+  return [...labels];
+}
+
+/**
+ * Find a pinned Outlook calendar read route, e.g. "For <Org> calendar
+ * lookups, use Outlook connection ca_...". This intentionally does NOT apply
+ * to generic calendar reads: a user may have multiple active calendars, so a
+ * read only collapses to a pinned connection when the live intent names the
+ * rule's distinguishing label (the non-generic word the constraint and the
+ * intent share). With several pinned calendars, each intent routes to the
+ * rule whose label it names.
+ */
+export function findOutlookCalendarReadConstraint(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  intentText = '',
+): OutlookCalendarReadConstraint | null {
+  try {
+    if (!isOutlookCalendarReadSlug(toolSlug)) return null;
+    const combinedIntent = `${intentText}\n${argsIntentText(args)}`;
+    if (!combinedIntent.trim()) return null;
+
+    for (const constraint of listConstraints()) {
+      const content = constraint.content.toLowerCase();
+      if (!content.includes('outlook')) continue;
+      if (!content.includes('calendar')) continue;
+      const match = constraint.content.match(CONNECTION_ID_IN_TEXT);
+      if (!match) continue;
+      const intentNamesRule = constraintLabelTokens(constraint.content)
+        .some((label) => new RegExp(`\\b${escapeForRegExp(label)}\\b`, 'i').test(combinedIntent));
+      if (!intentNamesRule) continue;
+      return { constraint, routeConnectionId: match[0] };
+    }
+  } catch (err) {
+    console.error('[constraint-guard] error finding outlook calendar constraint:', err);
   }
   return null;
 }

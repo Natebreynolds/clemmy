@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -16,7 +16,7 @@ process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 import type { InboxMonitorDeps, UnreadMessage } from './inbox-monitor.js';
-const { processInboxMonitor, scoreMessage } = await import('./inbox-monitor.js');
+const { inboxMonitorInternalsForTest, processInboxMonitor, scoreMessage } = await import('./inbox-monitor.js');
 
 // ── fixtures ──────────────────────────────────────────────────────────────
 const outlookResp = (msgs: Array<Partial<UnreadMessage> & { id: string }>): unknown => ({
@@ -209,6 +209,27 @@ test('processInboxMonitor: suppresses hard Composio auth failures by connection 
   now += 16 * 60_000;
   assert.equal(await processInboxMonitor(deps), 0);
   assert.deepEqual(calls, ['ca_good'], 'the hard-failed stale connection is skipped on the next scan');
+});
+
+test('inbox monitor real state loader preserves persisted connection suppressions', () => {
+  const stateFile = path.join(TMP, 'state', 'inbox-monitor.json');
+  writeFileSync(stateFile, JSON.stringify({
+    lastScanAt: '2026-06-16T12:00:00.000Z',
+    surfacedIds: ['ca_good:m1'],
+    suppressedConnections: {
+      ca_bad: {
+        reason: 'entity-mismatch',
+        suppressUntil: '2026-06-17T00:00:00.000Z',
+        lastErrorAt: '2026-06-16T12:00:00.000Z',
+        failures: 3,
+      },
+    },
+  }), 'utf-8');
+
+  const loaded = inboxMonitorInternalsForTest.loadStateReal();
+  assert.deepEqual(loaded.surfacedIds, ['ca_good:m1']);
+  assert.equal(loaded.suppressedConnections?.ca_bad?.reason, 'entity-mismatch');
+  assert.equal(loaded.suppressedConnections?.ca_bad?.failures, 3);
 });
 
 test('processInboxMonitor: excludes promo/survey content even from a real-looking sender', async () => {

@@ -59,7 +59,7 @@ interface CalProvider {
   parse: (resp: unknown) => CalEvent[];
 }
 
-interface CalendarMonitorState {
+export interface CalendarMonitorState {
   lastScanAt?: string;
   surfacedIds: string[];
   suppressedConnections?: Record<string, ComposioConnectionSuppression>;
@@ -235,7 +235,14 @@ function loadStateReal(): CalendarMonitorState {
   if (!existsSync(STATE_FILE)) return { surfacedIds: [] };
   try {
     const s = JSON.parse(readFileSync(STATE_FILE, 'utf-8')) as CalendarMonitorState;
-    return { lastScanAt: s.lastScanAt, surfacedIds: Array.isArray(s.surfacedIds) ? s.surfacedIds : [] };
+    const suppressedConnections = s.suppressedConnections && typeof s.suppressedConnections === 'object' && !Array.isArray(s.suppressedConnections)
+      ? s.suppressedConnections
+      : undefined;
+    return {
+      lastScanAt: s.lastScanAt,
+      surfacedIds: Array.isArray(s.surfacedIds) ? s.surfacedIds : [],
+      suppressedConnections,
+    };
   } catch { return { surfacedIds: [] }; }
 }
 function saveStateReal(s: CalendarMonitorState): void {
@@ -254,6 +261,8 @@ const REAL_DEPS: CalendarMonitorDeps = {
   loadState: loadStateReal,
   saveState: saveStateReal,
 };
+
+export const calendarMonitorInternalsForTest = { loadStateReal, saveStateReal };
 
 function accountLabel(conn: { accountEmail?: string; accountName?: string; slug: string }): string {
   return conn.accountEmail || conn.accountName || conn.slug;

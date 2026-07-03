@@ -56,6 +56,12 @@ export interface McpToolScope {
 
 export interface ResolveMcpToolScopeOptions {
   userInput?: string | null;
+  /**
+   * Distinguishing labels of the user's pinned-calendar rules (from
+   * constraint-guard's pinnedCalendarRuleLabels). Lets a date shorthand that
+   * names the org ("check <org> tomorrow") scope the Outlook tools.
+   */
+  pinnedCalendarLabels?: string[];
 }
 
 const URL_RE = /\bhttps?:\/\/[^\s)]+/i;
@@ -65,6 +71,21 @@ const WEB_RE =
   /\b(scrape|crawl|website|web page|webpage|article|news|browser|search the web|look up|research online|recent article)\b/i;
 const SALESFORCE_RE = /\b(salesforce|sf cli|soql|opportunit(?:y|ies)|account(?:s)?|lead(?:s)?|contact(?:s)?)\b/i;
 const OUTLOOK_RE = /\b(outlook|email|emails|draft(?:s)?|inbox|calendar|meeting invite)\b/i;
+const DATEISH_RE =
+  /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week)|next (?:week|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|\d{1,2}\/\d{1,2}|\d{4}-\d{2}-\d{2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
+// A shorthand ask that names a pinned calendar's org label ("check <org>
+// tomorrow") is Outlook-calendar intent even without the word "calendar".
+// Labels come from the caller (constraint-guard's pinnedCalendarRuleLabels —
+// the user's own pinned-calendar constraint facts); nothing is hardcoded, and
+// this module stays pure. No pinned calendars → this never fires.
+function namesPinnedCalendarLabel(input: string, labels: string[] | undefined): boolean {
+  try {
+    return (labels ?? []).some((label) =>
+      new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(input));
+  } catch {
+    return false;
+  }
+}
 const GOOGLE_SHEETS_RE = /\b(google sheet|googlesheet|spreadsheet|sheet row|sheet tab|worksheet)\b/i;
 const GITHUB_RE =
   /\b(github|pull request|pr\b|repo|repository|branch|commit|gh issue|github issue|issue #\d+)\b/i;
@@ -182,7 +203,8 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   const wantsSeo = SEO_RE.test(input) || (URL_RE.test(input) && /\baudit\b/i.test(input));
   const wantsWeb = WEB_RE.test(input);
   const wantsSalesforce = SALESFORCE_RE.test(input);
-  const wantsOutlook = OUTLOOK_RE.test(input);
+  const wantsOutlook = OUTLOOK_RE.test(input)
+    || (DATEISH_RE.test(input) && namesPinnedCalendarLabel(input, options.pinnedCalendarLabels));
   const wantsGoogleSheets = GOOGLE_SHEETS_RE.test(input);
   const wantsGithub = GITHUB_RE.test(input);
   const hasNamedExternalSystemIntent = wantsSalesforce || wantsOutlook || wantsGoogleSheets || wantsGithub;
@@ -348,13 +370,13 @@ export function isToolScopeContinuation(input?: string | null): boolean {
  * concrete scope → returns the direct (today's) result unchanged.
  */
 export function resolveMcpToolScopeWithContinuity(
-  options: { userInput?: string | null; priorUserInputs?: Array<string | null | undefined> } = {},
+  options: { userInput?: string | null; priorUserInputs?: Array<string | null | undefined>; pinnedCalendarLabels?: string[] } = {},
 ): McpToolScope {
-  const direct = resolveMcpToolScope({ userInput: options.userInput });
+  const direct = resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: options.pinnedCalendarLabels });
   if (scopeIsConcrete(direct)) return direct;
   if (!isToolScopeContinuation(options.userInput)) return direct;
   for (const prior of options.priorUserInputs ?? []) {
-    const inherited = resolveMcpToolScope({ userInput: prior });
+    const inherited = resolveMcpToolScope({ userInput: prior, pinnedCalendarLabels: options.pinnedCalendarLabels });
     // Only inherit a CONCRETE keyword scope (maxTools>0) — never a prior allowAll
     // (a no-prompt/internal turn) which would silently open the whole surface,
     // and never a prior FAIL-OPEN scope (that's a fallback, not a precise
@@ -408,6 +430,7 @@ export function resolveMcpToolScopeWithRecall(
     userInput?: string | null;
     priorUserInputs?: Array<string | null | undefined>;
     learnedMatches?: StepToolChoiceMatch[];
+    pinnedCalendarLabels?: string[];
   } = {},
 ): McpToolScope {
   const base = resolveMcpToolScopeWithContinuity(options);

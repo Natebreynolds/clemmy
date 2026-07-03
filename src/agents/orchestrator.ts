@@ -24,6 +24,7 @@ import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
+import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import type { Tool } from '@openai/agents';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
@@ -649,8 +650,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       ? resolveMcpToolScopeWithRecall({
           userInput: options.userInput,
           priorUserInputs,
+          pinnedCalendarLabels: pinnedCalendarRuleLabels(),
         })
-      : resolveMcpToolScope({ userInput: options.userInput })
+      : resolveMcpToolScope({ userInput: options.userInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() })
   );
   // T1: thread the current input so the fail-open MCP surface can rank the
   // user's connected tools by semantic relevance (run-start only; ignored by
