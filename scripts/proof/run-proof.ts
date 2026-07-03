@@ -22,9 +22,11 @@ import { continuityRecall } from './scenarios/continuity-recall.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
 import { approvalParkResume } from './scenarios/approval-park-resume.js';
 import { cronReportBack } from './scenarios/cron-report-back.js';
+import { gatedMutation } from './scenarios/gated-mutation.js';
+import { converseFirst } from './scenarios/converse-first.js';
 import type { BrainKind, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
-const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack];
+const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
 function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDef[]; scoreOnly?: string; keep: boolean } {

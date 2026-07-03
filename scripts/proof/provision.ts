@@ -67,11 +67,17 @@ export function planBrain(kind: BrainKind): BrainPlan {
     if (apiKey) return { kind, env: { AUTH_MODE: 'api_key', OPENAI_API_KEY: apiKey } };
     return { kind, env: {}, skipReason: 'no ~/.codex and no OPENAI_API_KEY' };
   }
-  // glm — BYO all-in brain. Copy only the BYO/GLM material the real install uses.
-  const byoModel = realEnvValue('BYO_BRAIN_MODEL_ID');
-  if (!byoModel) return { kind, env: {}, skipReason: 'no BYO_BRAIN_MODEL_ID configured in the real home' };
-  const env: Record<string, string> = { MODEL_ROUTING_MODE: 'all_in', BYO_BRAIN_MODEL_ID: byoModel };
-  for (const key of ['ZHIPU_API_KEY', 'GLM_API_KEY', 'BYO_PROVIDERS_JSON', 'OPENROUTER_API_KEY']) {
+  // glm — BYO all-in brain. Copy only the BYO/GLM material the real install
+  // uses. The canonical single-BYO config keys are BYO_MODEL_ID /
+  // BYO_MODEL_API_KEY / BYO_MODEL_BASE_URL (what a real install writes);
+  // BYO_BRAIN_MODEL_ID is accepted as a legacy alias.
+  const byoModel = realEnvValue('BYO_MODEL_ID') ?? realEnvValue('BYO_BRAIN_MODEL_ID');
+  if (!byoModel) return { kind, env: {}, skipReason: 'no BYO_MODEL_ID (or BYO_BRAIN_MODEL_ID) configured in the real home' };
+  const env: Record<string, string> = { MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_ID: byoModel };
+  for (const key of [
+    'BYO_MODEL_API_KEY', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_JUDGE_ID', 'BYO_MODEL_PROVIDER',
+    'ZHIPU_API_KEY', 'GLM_API_KEY', 'BYO_PROVIDERS_JSON', 'OPENROUTER_API_KEY',
+  ]) {
     const v = realEnvValue(key);
     if (v) env[key] = v;
   }
