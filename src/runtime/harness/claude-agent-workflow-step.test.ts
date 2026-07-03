@@ -191,6 +191,8 @@ test('runClaudeAgentSdkWorkflowStep full lane runs the tool-capable gated profil
   assert.equal(captured.agentic, true, 'full lane runs in agentic (gated-mutation) mode');
   assert.equal(captured.maxTurns, 24, 'full lane gets brain-level turn headroom (not the read-only 6)');
   assert.equal(captured.sessionId, 'workflow:run-xyz:scrape', 'gated tools run on the workflow session for plan-scope grants');
+  assert.ok(captured.allowedLocalMcpTools.includes('composio_search_tools'), 'composio search exposed for action discovery');
+  assert.ok(captured.allowedLocalMcpTools.includes('composio_list_tools'), 'composio list exposed for schema discovery');
   assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'), 'composio exposed for external read/write');
   assert.ok(captured.allowedLocalMcpTools.includes('run_shell_command'), 'shell exposed (gated)');
   assert.ok(captured.allowedLocalMcpTools.includes('write_file'), 'file write exposed (gated)');
@@ -198,6 +200,39 @@ test('runClaudeAgentSdkWorkflowStep full lane runs the tool-capable gated profil
   assert.deepEqual(captured.requiredLocalMcpTools, [], 'generic full-lane steps do not over-require every possible tool');
   // Workflow authoring stays out of a step lane even in full mode.
   assert.equal(captured.allowedLocalMcpTools.includes('execution_create'), false);
+});
+
+test('runClaudeAgentSdkWorkflowStep requires and exposes Composio discovery for DataForSEO workflow steps', async () => {
+  let captured: any;
+  setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+    captured = options;
+    return {
+      text: '{"status":"completed","output":{"accounts":[]}}',
+      structuredOutput: { status: 'completed', output: { accounts: [] } },
+      sessionId: 'sdk-workflow-session',
+      model: 'claude-sonnet-5',
+      toolUses: ['mcp__clementine-local__composio_search_tools'],
+    };
+  });
+
+  const seoStep = {
+    id: 'enrich_missing_seo_once',
+    sideEffect: 'read' as const,
+    prompt: 'Use composio_search_tools to discover the DataForSEO action, then use Composio tool DATAFORSEO_GET_BACKLINKS_SUMMARY_LIVE when SEO is missing.',
+  };
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step: seoStep,
+    workflowName: 'morning-prospect-prep',
+    prompt: seoStep.prompt,
+    modelId: 'claude-sonnet-5',
+    sessionId: 'workflow:run-prospect:enrich_missing_seo_once',
+    fullLane: true,
+  });
+
+  assert.deepEqual(result.output, { accounts: [] });
+  assert.ok(captured.allowedLocalMcpTools.includes('composio_search_tools'));
+  assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'));
+  assert.deepEqual(captured.requiredLocalMcpTools.sort(), ['composio_execute_tool', 'composio_search_tools']);
 });
 
 test('runClaudeAgentSdkWorkflowStep passes concrete required tools for Salesforce send steps', async () => {

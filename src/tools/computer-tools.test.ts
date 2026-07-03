@@ -154,6 +154,16 @@ test('write_file overwrite requires explicit overwrite mode', async () => {
   assert.equal(readFileSync(file, 'utf-8'), 'new\n');
 });
 
+test('write_file overwrite is a no-op when content is already identical', async () => {
+  const file = path.join(tmpHome, 'overwrite-identical.md');
+  assert.equal(await invokeWrite({ path: file, content: 'same', mode: null }), `Wrote ${file} (4 chars).`);
+  assert.equal(
+    await invokeWrite({ path: file, content: 'same', mode: 'overwrite' }),
+    `No changes needed for ${file} (4 chars already present).`,
+  );
+  assert.equal(readFileSync(file, 'utf-8'), 'same\n');
+});
+
 test('write_file append creates a missing file', async () => {
   const file = path.join(tmpHome, 'missing.md');
   assert.equal(existsSync(file), false);

@@ -23,9 +23,10 @@ function previewArgs(input: unknown): Record<string, unknown> {
  *
  * The Claude brain/workers run via the official Agent SDK (`query()`), which
  * executes tool calls in ITS OWN loop against this local MCP server — NOT the
- * `@openai/agents` Runner where the 8 safety gates live. The mutating tools
- * (`run_shell_command`, `composio_execute_tool`, `write_file`) are therefore not
- * registered on the MCP surface at all today, so the Agent SDK lane is read-only.
+ * `@openai/agents` Runner where the 8 safety gates live. The execution/discovery
+ * tools (`run_shell_command`, `write_file`, and the Composio status/search/list/
+ * execute chain) are therefore not registered on the MCP surface at all today,
+ * so the Agent SDK lane is read-only.
  *
  * This module registers those tools onto the MCP server, reusing the SAME
  * `@openai/agents` `tool()` definitions the Codex lane uses (no logic
@@ -57,6 +58,16 @@ const GATED_TOOL_SCHEMAS: Record<string, z.ZodRawShape> = {
     content: z.string(),
     mode: z.enum(['create', 'append', 'overwrite']).nullable().optional(),
   },
+  composio_status: {},
+  composio_search_tools: {
+    query: z.string().min(1),
+    toolkit_slug: z.string().min(1).nullable().optional(),
+    limit: z.number().int().positive().max(50).nullable().optional(),
+  },
+  composio_list_tools: {
+    toolkit_slug: z.string().min(1),
+    limit: z.number().int().positive().max(200).nullable().optional(),
+  },
   composio_execute_tool: {
     tool_slug: z.string().min(1),
     arguments: z.string(),
@@ -78,14 +89,20 @@ export function gatedMutationsEnabled(): boolean {
   return (process.env.CLEMENTINE_MCP_GATED_MUTATIONS ?? '').trim().toLowerCase() === 'on';
 }
 
+export interface RegisterGatedMutatingToolsOptions {
+  enabled?: boolean;
+  sessionId?: string;
+}
+
 /**
  * Register the gated mutating tools onto the MCP server. No-op unless
  * CLEMENTINE_MCP_GATED_MUTATIONS=on AND a session id is present (the gates need
  * a session to read the event log against).
  */
-export function registerGatedMutatingTools(server: McpServer): void {
-  if (!gatedMutationsEnabled()) return;
-  const sessionId = process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
+export function registerGatedMutatingTools(server: McpServer, opts: RegisterGatedMutatingToolsOptions = {}): void {
+  const enabled = opts.enabled ?? gatedMutationsEnabled();
+  if (!enabled) return;
+  const sessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
   if (!sessionId) return;
 
   const byName = new Map<string, InvokableTool>();

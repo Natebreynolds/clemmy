@@ -44,6 +44,18 @@ test('bridge registers the mutating tools only when enabled + a session is prese
   assert.equal(noSession.handlers.size, 0, 'no session id → bridge registers nothing');
 });
 
+test('bridge registers the full Composio discovery chain for Claude SDK workflow steps', () => {
+  const sess = createSession({ kind: 'chat' });
+  process.env.CLEMENTINE_MCP_SESSION_ID = sess.id;
+
+  const { server, handlers } = mockServer();
+  registerGatedMutatingTools(server as never);
+
+  for (const name of ['composio_status', 'composio_search_tools', 'composio_list_tools', 'composio_execute_tool']) {
+    assert.ok(handlers.has(name), `bridge registered ${name} on the MCP surface`);
+  }
+});
+
 test('gate bridge: the destination gate FIRES when Claude calls run_shell_command through the bridge', async () => {
   destination._resetDestinationStateForTests?.();
   const sess = createSession({ kind: 'chat' });

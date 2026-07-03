@@ -98,6 +98,9 @@ export const EVENT_TYPES = [
   // SDK brain auto-continued past a per-query max-turns budget instead of parking
   // on "say continue" (F1). Carries the attempt # and whether it's still limited.
   'sdk_auto_continue',
+  // SDK local-MCP startup guard retried because the required local tool surface
+  // was empty or no init message arrived before the startup budget.
+  'sdk_tool_surface_retry',
   // The Claude Agent SDK's child process compacted its own context mid-run
   // (subtype 'compact_boundary' relay; pre/post tokens + trigger). Mirror of the
   // Codex lane's condenser_applied — proves long runs manage context instead of

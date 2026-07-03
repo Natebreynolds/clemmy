@@ -85,16 +85,31 @@ test('defaultClaudeAgentSdkAllowedLocalTools is conservative unless explicitly o
   }
 });
 
-test('buildClaudeAgentSdkLocalMcpServers exposes the local Clementine MCP stdio server', () => {
+test('buildClaudeAgentSdkLocalMcpServers exposes the local Clementine MCP in-process SDK server by default', () => {
   const servers = buildClaudeAgentSdkLocalMcpServers('brain-session-1');
   const local = servers['clementine-local'] as any;
-  assert.equal(local.type, 'stdio');
-  assert.ok(local.command === 'npx' || local.command.length > 0);
-  assert.equal(local.alwaysLoad, true);
-  assert.equal(local.env.CLEMENTINE_HOME, TMP_HOME);
-  assert.equal(local.env.CLEMENTINE_MCP_SESSION_ID, 'brain-session-1');
-  assert.ok(Array.isArray(local.args));
-  assert.ok(local.args.some((arg: string) => arg.includes('mcp-server')));
+  assert.equal(local.type, 'sdk');
+  assert.equal(local.name, 'clementine-local');
+  assert.ok(local.instance, 'in-process MCP server instance should be present');
+});
+
+test('buildClaudeAgentSdkLocalMcpServers can fall back to the local Clementine MCP stdio server', () => {
+  const original = process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
+  try {
+    process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = 'off';
+    const servers = buildClaudeAgentSdkLocalMcpServers('brain-session-1');
+    const local = servers['clementine-local'] as any;
+    assert.equal(local.type, 'stdio');
+    assert.ok(local.command === 'npx' || local.command.length > 0);
+    assert.equal(local.alwaysLoad, true);
+    assert.equal(local.env.CLEMENTINE_HOME, TMP_HOME);
+    assert.equal(local.env.CLEMENTINE_MCP_SESSION_ID, 'brain-session-1');
+    assert.ok(Array.isArray(local.args));
+    assert.ok(local.args.some((arg: string) => arg.includes('mcp-server')));
+  } finally {
+    if (original === undefined) delete process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP;
+    else process.env.CLEMMY_CLAUDE_SDK_INPROCESS_MCP = original;
+  }
 });
 
 test('buildAllowOnlyToolsPermission allows exact/tail matches and denies everything else', async () => {
@@ -123,6 +138,22 @@ function queryFromMessages(messages: SDKMessage[], capture: { params?: any }): Q
     backgroundTasks: async () => false,
   }) as Query;
   capture.params = q;
+  return q;
+}
+
+function hangingQuery(onClose: () => void): Query {
+  const q = {
+    [Symbol.asyncIterator]() { return this; },
+    next() { return new Promise<IteratorResult<SDKMessage>>(() => {}); },
+    close() { onClose(); },
+    interrupt: async () => {},
+    setPermissionMode: async () => {},
+    setModel: async () => {},
+    setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+    streamInput: async () => {},
+    stopTask: async () => false,
+    backgroundTasks: async () => false,
+  } as unknown as Query;
   return q;
 }
 
@@ -188,8 +219,9 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.equal(capture.call.options.env.ANTHROPIC_API_KEY, undefined);
   assert.equal(capture.call.options.model, 'claude-sonnet-4-6');
   assert.equal(capture.call.options.permissionMode, 'dontAsk');
-  assert.equal(capture.call.options.mcpServers['clementine-local'].env.CLEMENTINE_HOME, TMP_HOME);
-  assert.equal(capture.call.options.mcpServers['clementine-local'].env.CLEMENTINE_MCP_SESSION_ID, 'sdk-clementine-session');
+  assert.equal(capture.call.options.mcpServers['clementine-local'].type, 'sdk');
+  assert.equal(capture.call.options.mcpServers['clementine-local'].name, 'clementine-local');
+  assert.ok(capture.call.options.mcpServers['clementine-local'].instance);
   assert.equal(result.text, 'ok');
   assert.deepEqual(result.structuredOutput, { ok: true });
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
@@ -238,6 +270,247 @@ test('runClaudeAgentSdk fails before model work when required local MCP tools ar
       return true;
     },
   );
+});
+
+test('runClaudeAgentSdk retries once when the local MCP surface is temporarily empty', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_params: any) => {
+    calls += 1;
+    if (calls === 1) {
+      return queryFromMessages([
+        {
+          type: 'system',
+          subtype: 'init',
+          model: 'claude-sonnet-4-6',
+          session_id: 'sdk-empty-surface-1',
+          uuid: 'u-empty',
+          apiKeySource: 'none',
+          claude_code_version: '2.1.181',
+          cwd: process.cwd(),
+          tools: [],
+          mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+          permissionMode: 'default',
+          slash_commands: [],
+          output_style: 'default',
+          skills: [],
+          plugins: [],
+        } as any,
+      ], {});
+    }
+    return queryFromMessages([
+      {
+        type: 'system',
+        subtype: 'init',
+        model: 'claude-sonnet-4-6',
+        session_id: 'sdk-empty-surface-2',
+        uuid: 'u-ready',
+        apiKeySource: 'none',
+        claude_code_version: '2.1.181',
+        cwd: process.cwd(),
+        tools: ['mcp__clementine-local__memory_recall'],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default',
+        slash_commands: [],
+        output_style: 'default',
+        skills: [],
+        plugins: [],
+      } as any,
+      {
+        type: 'result',
+        subtype: 'success',
+        session_id: 'sdk-empty-surface-2',
+        uuid: 'u-result',
+        result: 'ready',
+        duration_ms: 1,
+        duration_api_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        stop_reason: 'end_turn',
+        total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 },
+        modelUsage: {},
+        permission_denials: [],
+      } as any,
+    ], {});
+  }) as any);
+
+  const originalRetries = process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES;
+  const originalBackoff = process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS;
+  try {
+    process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES = '1';
+    process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS = '0';
+    const result = await runClaudeAgentSdk({
+      prompt: 'Use memory.',
+      sessionId: 'sdk-empty-surface-session',
+      modelId: 'claude-sonnet-4-6',
+      agentic: true,
+      requiredLocalMcpTools: ['memory_recall'],
+    });
+
+    assert.equal(calls, 2);
+    assert.equal(result.text, 'ready');
+  } finally {
+    if (originalRetries === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES;
+    else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES = originalRetries;
+    if (originalBackoff === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS;
+    else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS = originalBackoff;
+  }
+});
+
+test('runClaudeAgentSdk default empty-surface retry window survives repeated cold-start empty inits', async () => {
+  let calls = 0;
+  setClaudeAgentSdkQueryForTest(((_params: any) => {
+    calls += 1;
+    if (calls <= 2) {
+      return queryFromMessages([
+        {
+          type: 'system',
+          subtype: 'init',
+          model: 'claude-sonnet-4-6',
+          session_id: `sdk-empty-surface-${calls}`,
+          uuid: `u-empty-${calls}`,
+          apiKeySource: 'none',
+          claude_code_version: '2.1.181',
+          cwd: process.cwd(),
+          tools: [],
+          mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+          permissionMode: 'default',
+          slash_commands: [],
+          output_style: 'default',
+          skills: [],
+          plugins: [],
+        } as any,
+      ], {});
+    }
+    return queryFromMessages([
+      {
+        type: 'system',
+        subtype: 'init',
+        model: 'claude-sonnet-4-6',
+        session_id: 'sdk-empty-surface-ready',
+        uuid: 'u-ready',
+        apiKeySource: 'none',
+        claude_code_version: '2.1.181',
+        cwd: process.cwd(),
+        tools: ['mcp__clementine-local__memory_recall'],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default',
+        slash_commands: [],
+        output_style: 'default',
+        skills: [],
+        plugins: [],
+      } as any,
+      {
+        type: 'result',
+        subtype: 'success',
+        session_id: 'sdk-empty-surface-ready',
+        uuid: 'u-result',
+        result: 'ready after cold start',
+        duration_ms: 1,
+        duration_api_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        stop_reason: 'end_turn',
+        total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 },
+        modelUsage: {},
+        permission_denials: [],
+      } as any,
+    ], {});
+  }) as any);
+
+  const originalRetries = process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES;
+  const originalBackoff = process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS;
+  try {
+    delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES;
+    process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS = '0';
+    const result = await runClaudeAgentSdk({
+      prompt: 'Use memory.',
+      sessionId: 'sdk-repeated-empty-surface-session',
+      modelId: 'claude-sonnet-4-6',
+      agentic: true,
+      requiredLocalMcpTools: ['memory_recall'],
+    });
+
+    assert.equal(calls, 3);
+    assert.equal(result.text, 'ready after cold start');
+  } finally {
+    if (originalRetries === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES;
+    else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES = originalRetries;
+    if (originalBackoff === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS;
+    else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS = originalBackoff;
+  }
+});
+
+test('runClaudeAgentSdk retries a required local MCP startup that never emits init before falling through', async () => {
+  let calls = 0;
+  let closed = 0;
+  setClaudeAgentSdkQueryForTest(((_params: any) => {
+    calls += 1;
+    if (calls === 1) return hangingQuery(() => { closed += 1; });
+    return queryFromMessages([
+      {
+        type: 'system',
+        subtype: 'init',
+        model: 'claude-sonnet-4-6',
+        session_id: 'sdk-startup-timeout-ready',
+        uuid: 'u-ready',
+        apiKeySource: 'none',
+        claude_code_version: '2.1.181',
+        cwd: process.cwd(),
+        tools: ['mcp__clementine-local__memory_recall'],
+        mcp_servers: [{ name: 'clementine-local', status: 'connected' }],
+        permissionMode: 'default',
+        slash_commands: [],
+        output_style: 'default',
+        skills: [],
+        plugins: [],
+      } as any,
+      {
+        type: 'result',
+        subtype: 'success',
+        session_id: 'sdk-startup-timeout-ready',
+        uuid: 'u-result',
+        result: 'ready after no-init retry',
+        duration_ms: 1,
+        duration_api_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        stop_reason: 'end_turn',
+        total_cost_usd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 },
+        modelUsage: {},
+        permission_denials: [],
+      } as any,
+    ], {});
+  }) as any);
+
+  const originalStartupMs = process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_FIRST_MESSAGE_MS;
+  const originalStartupRetries = process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_STARTUP_RETRIES;
+  const originalBackoff = process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS;
+  try {
+    process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_FIRST_MESSAGE_MS = '5';
+    process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_STARTUP_RETRIES = '1';
+    process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS = '0';
+    const result = await runClaudeAgentSdk({
+      prompt: 'Use memory.',
+      sessionId: 'sdk-startup-timeout-session',
+      modelId: 'claude-sonnet-4-6',
+      agentic: true,
+      requiredLocalMcpTools: ['memory_recall'],
+    });
+
+    assert.equal(calls, 2);
+    assert.ok(closed >= 1, 'timed-out SDK stream was closed before retrying');
+    assert.equal(result.text, 'ready after no-init retry');
+  } finally {
+    if (originalStartupMs === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_FIRST_MESSAGE_MS;
+    else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_FIRST_MESSAGE_MS = originalStartupMs;
+    if (originalStartupRetries === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_STARTUP_RETRIES;
+    else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_STARTUP_RETRIES = originalStartupRetries;
+    if (originalBackoff === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS;
+    else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS = originalBackoff;
+  }
 });
 
 test('runClaudeAgentSdk records usage for the shared usage dashboard and workflow cost joins', async () => {

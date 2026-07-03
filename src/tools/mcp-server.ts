@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { fileURLToPath } from 'node:url';
 import { registerMemoryTools } from './memory-tools.js';
 import { registerFocusTools } from './focus-tools.js';
 import { registerVaultTools } from './vault-tools.js';
@@ -36,16 +37,20 @@ import type { PluginTool } from '../plugins/types.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 
-const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
-
 // Counter cap for the ambient harness run context. Most tools wrapped here are
 // reads that never touch the counter; the gated mutating tools set their OWN
 // inner context (gated-mutating-tools.ts), so this ambient counter only ever
 // matters as a benign fallback.
 const AMBIENT_COUNTER_LIMIT = 1000;
 
-function installAmbientToolContext(): void {
-  const sessionId = process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
+export interface ClementineMcpServerOptions {
+  sessionId?: string;
+  gatedMutations?: boolean;
+  allowedTools?: string[];
+}
+
+function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
+  const sessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
   if (!sessionId) return;
   const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
@@ -73,8 +78,6 @@ function installAmbientToolContext(): void {
   };
 }
 
-installAmbientToolContext();
-
 // JIT tool-RAG for the Claude Agent SDK lane (Phase 1, Claude-brain port). When the
 // brain decides to JIT-reduce the per-turn tool surface, it spawns THIS server with
 // CLEMENTINE_MCP_ALLOWED_TOOLS=<comma-list> so only those tools are ADVERTISED — and
@@ -83,10 +86,16 @@ installAmbientToolContext();
 // NOT shrink the schema payload — verified against the SDK). Unset (default) → no
 // filtering, every tool registers exactly as before (byte-identical). Installed
 // AFTER the ambient-context wrap so it's the OUTERMOST check (skips before wrapping).
-function installToolAllowlistFilter(): void {
+function installToolAllowlistFilter(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
+  const fromOptions = opts.allowedTools?.map((s) => s.trim()).filter(Boolean);
   const raw = process.env.CLEMENTINE_MCP_ALLOWED_TOOLS?.trim();
-  if (!raw) return;
-  const allowed = new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
+  const allowlist = fromOptions && fromOptions.length > 0
+    ? fromOptions
+    : raw
+      ? raw.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+  if (allowlist.length === 0) return;
+  const allowed = new Set(allowlist);
   // Floor: a health tool that must always exist so the surface is never empty.
   const FLOOR = new Set(['ping']);
   const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
@@ -99,65 +108,74 @@ function installToolAllowlistFilter(): void {
   };
 }
 
-installToolAllowlistFilter();
+export function createClementineMcpServer(opts: ClementineMcpServerOptions = {}): McpServer {
+  ensureToolDirectories();
+  const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
 
-registerMemoryTools(server);
-registerFocusTools(server);
-registerVaultTools(server);
-registerPlanTools(server);
-registerSessionTools(server);
-registerGoalTools(server);
-registerAdminTools(server);
-registerTeamTools(server);
-registerOrchestrationTools(server);
-registerAgentRunsTools(server);
-registerBackgroundTaskTools(server);
-registerWorkerTools(server);
-registerAutonomyActionTools(server);
-registerExecutionTools(server);
-registerProfileTools(server);
-registerCapabilityTools(server);
-registerCliTools(server);
-registerSkillTools(server);
-registerWorkflowScheduleTools(server);
-if (isSpacesEnabled()) registerSpaceTools(server);
-registerMcpStatusTools(server);
-registerMcpServerTools(server);
-registerToolChoiceTools(server);
-registerModelRoleTools(server);
-// Recall tools (read-only): pull the verbatim/sliced payload of a clipped tool
-// result. Needed so the Claude Agent SDK lane can read large outputs (e.g. a
-// 25-row `sf data query`) the harness clipped — without them it hits the same
-// "tool not found" the @openai/agents lane was fixed for.
-registerRecallTools(server);
-registerDynamicTools(server);
-// Agent SDK lane only (CLEMENTINE_MCP_GATED_MUTATIONS=on): expose the mutating
-// tools (shell/composio/write) through the full harness gate chain so the Claude
-// Agent SDK can execute them safely. No-op for the Codex/OpenAI MCP wiring.
-registerGatedMutatingTools(server);
+  installAmbientToolContext(server, opts);
+  installToolAllowlistFilter(server, opts);
 
-// Code Mode (Lane C) — expose run_tool_program on the Claude SDK lane too, so
-// BOTH brains can run a sandboxed program. Flag-gated (CLEMMY_CODE_MODE); the
-// in-program clem calls dispatch through the same gated path under this MCP
-// session. No-op when off.
-if (codeModeEnabled()) {
-  const codeModeSessionId = process.env.CLEMENTINE_MCP_SESSION_ID?.trim() || '';
-  server.tool(
-    'run_tool_program',
-    codeModeDescription(),
-    { program: z.string() },
-    async (input: { program: string }) => {
-      const r = await runCodeModeForSession(input.program, codeModeSessionId);
-      return textResult(
-        r.ok
-          ? `code-mode program returned (${r.rpcCalls} tool call${r.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(r.value)}`
-          : `code-mode program failed: ${r.error}`,
-      );
-    },
-  );
+  registerMemoryTools(server);
+  registerFocusTools(server);
+  registerVaultTools(server);
+  registerPlanTools(server);
+  registerSessionTools(server);
+  registerGoalTools(server);
+  registerAdminTools(server);
+  registerTeamTools(server);
+  registerOrchestrationTools(server);
+  registerAgentRunsTools(server);
+  registerBackgroundTaskTools(server);
+  registerWorkerTools(server);
+  registerAutonomyActionTools(server);
+  registerExecutionTools(server);
+  registerProfileTools(server);
+  registerCapabilityTools(server);
+  registerCliTools(server);
+  registerSkillTools(server);
+  registerWorkflowScheduleTools(server);
+  if (isSpacesEnabled()) registerSpaceTools(server);
+  registerMcpStatusTools(server);
+  registerMcpServerTools(server);
+  registerToolChoiceTools(server);
+  registerModelRoleTools(server);
+  // Recall tools (read-only): pull the verbatim/sliced payload of a clipped tool
+  // result. Needed so the Claude Agent SDK lane can read large outputs (e.g. a
+  // 25-row `sf data query`) the harness clipped — without them it hits the same
+  // "tool not found" the @openai/agents lane was fixed for.
+  registerRecallTools(server);
+  registerDynamicTools(server);
+  // Agent SDK lane only: expose the mutating tools (shell/composio/write) through
+  // the full harness gate chain so the Claude Agent SDK can execute them safely.
+  registerGatedMutatingTools(server, {
+    enabled: opts.gatedMutations,
+    sessionId: opts.sessionId,
+  });
+
+  // Code Mode (Lane C) — expose run_tool_program on the Claude SDK lane too, so
+  // BOTH brains can run a sandboxed program. Flag-gated (CLEMMY_CODE_MODE); the
+  // in-program clem calls dispatch through the same gated path under this MCP
+  // session. No-op when off.
+  if (codeModeEnabled()) {
+    const codeModeSessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim() || '';
+    server.tool(
+      'run_tool_program',
+      codeModeDescription(),
+      { program: z.string() },
+      async (input: { program: string }) => {
+        const r = await runCodeModeForSession(input.program, codeModeSessionId);
+        return textResult(
+          r.ok
+            ? `code-mode program returned (${r.rpcCalls} tool call${r.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(r.value)}`
+            : `code-mode program failed: ${r.error}`,
+        );
+      },
+    );
+  }
+
+  server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
+  return server;
 }
-
-server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
 
 function registerPluginTool(server: McpServer, tool: PluginTool): void {
   // Build a Zod schema from the JSON Schema properties
@@ -195,7 +213,7 @@ function registerPluginTool(server: McpServer, tool: PluginTool): void {
 }
 
 async function main(): Promise<void> {
-  ensureToolDirectories();
+  const server = createClementineMcpServer();
 
   // Load and register user plugins
   const plugins = await loadPlugins();
@@ -218,7 +236,13 @@ async function main(): Promise<void> {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const isDirectRun = process.argv[1]
+  ? fileURLToPath(import.meta.url) === process.argv[1]
+  : false;
+
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

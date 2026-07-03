@@ -926,6 +926,10 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         ].join(' ');
       }
 
+      if (mode === 'overwrite' && exists && readFileSync(filePath, 'utf-8') === content) {
+        return `No changes needed for ${filePath} (${input.content.length} chars already present).`;
+      }
+
       writeFileSync(filePath, content, 'utf-8');
       return `${mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
     },

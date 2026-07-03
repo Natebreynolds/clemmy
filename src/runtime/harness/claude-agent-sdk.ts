@@ -17,6 +17,7 @@ import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
 import { discoverMcpServers } from '../mcp-config.js';
 import { resolveMcpToolScope } from '../mcp-tool-scope.js';
+import { pinnedCalendarRuleLabels } from './constraint-guard.js';
 import type { ManagedMcpServer } from '../../types.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
 import { buildGatedToolPermission } from './claude-agent-approval.js';
@@ -26,6 +27,7 @@ import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, writeToolOutput } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
+import { createClementineMcpServer } from '../../tools/mcp-server.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -93,15 +95,20 @@ export function isContextOverflowMessage(msg: string): boolean {
 export class ClaudeAgentSdkToolSurfaceError extends Error {
   readonly missingTools: string[];
   readonly availableTools: string[];
+  readonly reason?: string;
+  readonly startupTimeoutMs?: number;
 
-  constructor(missingTools: string[], availableTools: string[]) {
+  constructor(missingTools: string[], availableTools: string[], opts: { reason?: string; startupTimeoutMs?: number } = {}) {
     super(
       `Claude Agent SDK local MCP surface is missing required tool${missingTools.length === 1 ? '' : 's'}: `
-      + `${missingTools.join(', ')}. Available tools: ${availableTools.length ? availableTools.join(', ') : '(none)'}`,
+      + `${missingTools.join(', ')}. Available tools: ${availableTools.length ? availableTools.join(', ') : '(none)'}`
+      + `${opts.reason ? `. ${opts.reason}` : ''}`,
     );
     this.name = 'ClaudeAgentSdkToolSurfaceError';
     this.missingTools = missingTools;
     this.availableTools = availableTools;
+    this.reason = opts.reason;
+    this.startupTimeoutMs = opts.startupTimeoutMs;
   }
 }
 
@@ -375,6 +382,11 @@ function localNodeCommand(): string {
   return process.execPath || 'node';
 }
 
+function claudeSdkInProcessMcpEnabled(): boolean {
+  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_SDK_INPROCESS_MCP', 'on') ?? 'on').trim().toLowerCase();
+  return !(raw === 'off' || raw === '0' || raw === 'false' || raw === 'no');
+}
+
 export function buildClaudeAgentSdkLocalMcpServers(
   sessionId?: string,
   gatedMutations = false,
@@ -390,6 +402,19 @@ export function buildClaudeAgentSdkLocalMcpServers(
   // those tools — fewer schemas sent to the model = fewer input tokens. Absent →
   // every tool registers (byte-identical to before).
   const allowlist = (mcpToolAllowlist ?? []).map((t) => t.trim()).filter(Boolean);
+  if (claudeSdkInProcessMcpEnabled()) {
+    return {
+      'clementine-local': {
+        type: 'sdk',
+        name: 'clementine-local',
+        instance: createClementineMcpServer({
+          sessionId,
+          gatedMutations,
+          allowedTools: allowlist,
+        }),
+      },
+    };
+  }
   const env = mergedSpawnEnv({
     CLEMENTINE_HOME: BASE_DIR,
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
@@ -466,7 +491,7 @@ export function buildScopedNativeMcpServers(scopeInput?: string): Record<string,
   try {
     const all = discoverMcpServers().filter((s) => s.enabled);
     if (all.length === 0) return {};
-    const scope = resolveMcpToolScope({ userInput: scopeInput ?? '' });
+    const scope = resolveMcpToolScope({ userInput: scopeInput ?? '', pinnedCalendarLabels: pinnedCalendarRuleLabels() });
     if (scope.allowAll === false && (scope.allowedServerSlugs ?? []).length === 0) return {};
     const out: Record<string, McpServerConfig> = {};
     for (const s of all) {
@@ -609,6 +634,39 @@ function missingRequiredLocalMcpTools(requiredTools: string[] | undefined, adver
 function assertRequiredLocalMcpTools(requiredTools: string[] | undefined, advertisedTools: string[]): void {
   const missing = missingRequiredLocalMcpTools(requiredTools, advertisedTools);
   if (missing.length > 0) throw new ClaudeAgentSdkToolSurfaceError(missing, advertisedTools);
+}
+
+const BASELINE_LOCAL_MCP_TOOLS = new Set(['ping', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file']);
+
+function localMcpSurfaceInitialized(advertisedTools: string[]): boolean {
+  return advertisedTools.some((toolName) => BASELINE_LOCAL_MCP_TOOLS.has(mcpToolTail(toolName)));
+}
+
+function toolSurfaceRetryEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+function maxToolSurfaceRetries(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES', '3') || '3', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 3;
+}
+
+function maxToolSurfaceStartupRetries(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_TOOL_SURFACE_STARTUP_RETRIES', '1') || '1', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1;
+}
+
+function toolSurfaceBackoffMs(attempt: number): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_CLAUDE_SDK_TOOL_SURFACE_BACKOFF_MS', '') || '', 10);
+  const base = Number.isFinite(raw) && raw >= 0 ? raw : 750;
+  return Math.min(5000, base * Math.max(1, attempt + 1));
+}
+
+function toolSurfaceFirstMessageMs(): number {
+  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_SDK_TOOL_SURFACE_FIRST_MESSAGE_MS', '') ?? '').trim().toLowerCase();
+  if (raw === 'off' || raw === '0') return 0;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
 }
 
 export interface ClaudeAgentSdkRunOptions {
@@ -935,6 +993,62 @@ function recordClaudeAgentSdkUsage(
   } catch { /* observability must never break the SDK lane */ }
 }
 
+function requiredLocalMcpTools(options: ClaudeAgentSdkRunOptions): string[] {
+  return [...new Set((options.requiredLocalMcpTools ?? []).map((t) => t.trim()).filter(Boolean))];
+}
+
+function emitToolSurfaceRetryEvent(
+  options: ClaudeAgentSdkRunOptions,
+  err: ClaudeAgentSdkToolSurfaceError,
+  attempt: number,
+  maxRetries: number,
+): void {
+  if (!options.sessionId) return;
+  try {
+    appendEvent({
+      sessionId: options.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'sdk_tool_surface_retry',
+      data: {
+        attempt: attempt + 1,
+        maxRetries,
+        missingTools: err.missingTools,
+        availableToolCount: err.availableTools.length,
+        startupTimeoutMs: err.startupTimeoutMs ?? null,
+        reason: err.reason ?? 'missing_required_tools',
+      },
+    });
+  } catch { /* retry telemetry must never break the SDK lane */ }
+}
+
+async function nextSdkMessageWithStartupTimeout(
+  iterator: AsyncIterator<SDKMessage>,
+  options: ClaudeAgentSdkRunOptions,
+  timeoutMs: number,
+): Promise<IteratorResult<SDKMessage>> {
+  const pending = iterator.next();
+  const required = requiredLocalMcpTools(options);
+  if (timeoutMs <= 0 || required.length === 0) return pending;
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await new Promise<IteratorResult<SDKMessage>>((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new ClaudeAgentSdkToolSurfaceError(required, [], {
+          startupTimeoutMs: timeoutMs,
+          reason: `No SDK init message arrived within ${timeoutMs}ms; local MCP startup did not advertise tools in time.`,
+        }));
+      }, timeoutMs);
+      pending.then(resolve, reject).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function bestLimitHitText(lastAssistantText: string, streamedText: string): string {
   const assistant = lastAssistantText.trim();
   const streamed = streamedText.trim();
@@ -1121,7 +1235,15 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         throw new AgentRuntimeCancelledError('Run cancelled by caller.');
       }
       stream = queryImpl({ prompt: effectivePrompt, options: sdkOptions }) as Query;
-      for await (const message of stream) {
+      const iterator = (stream as AsyncIterable<SDKMessage>)[Symbol.asyncIterator]();
+      while (true) {
+        const next = await nextSdkMessageWithStartupTimeout(
+          iterator,
+          options,
+          firstByteMs === null ? toolSurfaceFirstMessageMs() : 0,
+        );
+        if (next.done) break;
+        const message = next.value;
         if (firstByteMs === null) firstByteMs = Date.now() - startedAt;
         if (options.shouldCancel && await options.shouldCancel()) {
           try { await stream?.interrupt?.(); } catch { /* best-effort */ }
@@ -1199,6 +1321,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         if (terminalToolReply) break;
         result = extractResult(message) ?? result;
       }
+      const required = requiredLocalMcpTools(options);
+      if (!init && required.length > 0) {
+        throw new ClaudeAgentSdkToolSurfaceError(required, [], {
+          reason: 'SDK stream ended before emitting an init message.',
+        });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Our OWN interrupt (tool ceiling / wall-clock) may surface as a thrown
@@ -1208,6 +1336,23 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         threwTurnLimit = true;
       } else if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && result?.subtype !== 'success') {
         threwTurnLimit = true;
+      } else if (err instanceof ClaudeAgentSdkToolSurfaceError) {
+        const committed = toolUses.length > 0 || streamedAny;
+        const maxRetries = err.startupTimeoutMs !== undefined
+          ? maxToolSurfaceStartupRetries()
+          : maxToolSurfaceRetries();
+        if (
+          toolSurfaceRetryEnabled()
+          && !committed
+          && !localMcpSurfaceInitialized(err.availableTools)
+          && attempt < maxRetries
+        ) {
+          try { stream?.close?.(); } catch { /* ignore */ }
+          emitToolSurfaceRetryEvent(options, err, attempt, maxRetries);
+          await sleep(toolSurfaceBackoffMs(attempt));
+          continue;
+        }
+        throw err;
       } else if (isProviderOverloadMessage(msg)) {
         const committed = toolUses.length > 0 || streamedAny;
         // Safe first-byte retry: nothing committed yet and budget remains.
@@ -1237,10 +1382,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Prefer the self-stop reason (ceiling/wall-clock) over the generic turn-budget
   // copy so the user sees WHY Clem held off.
   const partialLimitText = (): string => ceilingState.stopped ?? bestLimitHitText(lastAssistantText, streamedText);
-
-  if (!init && (options.requiredLocalMcpTools?.length ?? 0) > 0) {
-    throw new ClaudeAgentSdkToolSurfaceError(options.requiredLocalMcpTools ?? [], []);
-  }
 
   if (terminalToolReply) {
     recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
