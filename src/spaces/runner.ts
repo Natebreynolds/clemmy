@@ -142,11 +142,17 @@ export function _resetSpaceRefreshQueuesForTest(): void {
  * Refresh one data source (or the first, if sourceId omitted) and persist into
  * data.json under the source id, with a _meta entry. Returns per-source status.
  */
-export async function refreshSpaceData(slug: string, sourceId?: string): Promise<RefreshResult[]> {
-  return enqueueSpaceRefresh(slug, () => refreshSpaceDataLocked(slug, sourceId));
+export interface RefreshSpaceOptions {
+  /** Paused-build auto-retry: probe the sources of a PAUSED workspace (the
+   *  status gate otherwise makes a retry impossible). Archived stays blocked. */
+  allowPaused?: boolean;
 }
 
-async function refreshSpaceDataLocked(slug: string, sourceId?: string): Promise<RefreshResult[]> {
+export async function refreshSpaceData(slug: string, sourceId?: string, opts: RefreshSpaceOptions = {}): Promise<RefreshResult[]> {
+  return enqueueSpaceRefresh(slug, () => refreshSpaceDataLocked(slug, sourceId, opts));
+}
+
+async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: RefreshSpaceOptions = {}): Promise<RefreshResult[]> {
   const rec = spaceStore.get(slug);
   if (!rec) return [{ ok: false, sourceId: sourceId ?? '(none)', error: `no workspace "${slug}"` }];
   if (rec.manifestErrors && rec.manifestErrors.length > 0) {
@@ -156,7 +162,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string): Promise<
       error: `workspace manifest is invalid; fix with space_save before refreshing: ${rec.manifestErrors.join('; ')}`,
     }];
   }
-  if (rec.status === 'paused' || rec.status === 'archived') {
+  if (rec.status === 'archived' || (rec.status === 'paused' && !opts.allowPaused)) {
     return [{ ok: false, sourceId: sourceId ?? '(none)', error: `workspace is ${rec.status}` }];
   }
   const sources = sourceId

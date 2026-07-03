@@ -117,3 +117,71 @@ test('E2: a source with no _reengage signal never fires a re-engage', async () =
   assert.equal(data.listAudit(slug).filter((a) => a.path === '/reengage/threshold').length, 0);
   store.spaceStore.archive(slug);
 });
+
+test('paused-build auto-retry: a transiently-failing source reactivates the workspace; budget caps + spacing hold', async () => {
+  // Archive paused leftovers from earlier tests (shared CLEMENTINE_HOME) so the
+  // retry counters below see exactly this test's workspace.
+  for (const s of store.spaceStore.list()) if (s.status === 'paused') store.spaceStore.archive(s.id);
+  const slug = 'retry-paused';
+  store.spaceStore.save({
+    id: slug, title: 'Retry Me',
+    dataSources: [{ id: 'pull', runner: 'flaky.mjs' }],
+  });
+  // Runner fails while a flag file exists (the "transient outage"), then succeeds.
+  const flag = path.join(process.env.CLEMENTINE_HOME!, 'outage.flag');
+  writeFileSync(flag, 'down', 'utf-8');
+  writeRunner(slug, 'flaky.mjs', `
+import { existsSync } from 'node:fs';
+if (existsSync(${JSON.stringify(flag)})) { console.error('api down'); process.exit(1); }
+process.stdout.write(JSON.stringify({ rows: [1, 2] }));
+`);
+  store.spaceStore.update(slug, { status: 'paused' });
+
+  // Too fresh (< 5 min since pause) → not touched.
+  const now0 = new Date(Date.parse(store.spaceStore.get(slug)!.updatedAt) + 60_000);
+  const early = await sched.retryPausedSpaces(now0);
+  assert.equal(early.examined, 0, 'never races the authoring turn');
+
+  // Attempt 1 (outage still on) → stays paused, budget spent.
+  const now1 = new Date(now0.getTime() + 10 * 60_000);
+  const first = await sched.retryPausedSpaces(now1);
+  assert.equal(first.examined, 1);
+  assert.equal(first.stillPaused, 1);
+  assert.equal(store.spaceStore.get(slug)!.status, 'paused');
+
+  // Immediately again → spacing gate holds (no burn-through).
+  const spaced = await sched.retryPausedSpaces(new Date(now1.getTime() + 60_000));
+  assert.equal(spaced.examined, 0, '15-min spacing between attempts');
+
+  // Outage clears; attempt 2 → data pulls, workspace REACTIVATES.
+  const { rmSync: rm } = await import('node:fs');
+  rm(flag, { force: true });
+  const now2 = new Date(now1.getTime() + 16 * 60_000);
+  const second = await sched.retryPausedSpaces(now2);
+  assert.equal(second.reactivated, 1);
+  assert.equal(store.spaceStore.get(slug)!.status, 'active');
+  assert.deepEqual((data.readData(slug) as any).pull, { rows: [1, 2] });
+
+  // Reactivated → nothing left to retry.
+  const done = await sched.retryPausedSpaces(new Date(now2.getTime() + 20 * 60_000));
+  assert.equal(done.examined, 0);
+  store.spaceStore.archive(slug);
+});
+
+test('paused-build auto-retry: a genuinely-broken source exhausts 2 attempts and stays paused (human decision)', async () => {
+  const slug = 'retry-exhaust';
+  store.spaceStore.save({
+    id: slug, title: 'Broken',
+    dataSources: [{ id: 'pull', runner: 'broken.mjs' }],
+  });
+  writeRunner(slug, 'broken.mjs', 'console.error("always fails"); process.exit(1);');
+  store.spaceStore.update(slug, { status: 'paused' });
+
+  const base = Date.parse(store.spaceStore.get(slug)!.updatedAt) + 10 * 60_000;
+  const a1 = await sched.retryPausedSpaces(new Date(base));
+  const a2 = await sched.retryPausedSpaces(new Date(base + 20 * 60_000));
+  const a3 = await sched.retryPausedSpaces(new Date(base + 40 * 60_000));
+  assert.equal(a1.examined + a2.examined + a3.examined, 2, 'budget = 2 attempts, then stop');
+  assert.equal(store.spaceStore.get(slug)!.status, 'paused', 'a real bug stays a human decision');
+  store.spaceStore.archive(slug);
+});

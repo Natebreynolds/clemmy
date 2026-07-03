@@ -31,6 +31,9 @@ interface SpaceScheduleState {
   /** E2 dedup: per "space:source" → last fired re-engage condition key, so a
    *  persistent threshold pings ONCE (not every scheduled refresh). */
   lastReengageByKey: Record<string, string>;
+  /** Paused-build auto-retry bookkeeping: slug → attempts + last attempt ms.
+   *  Durable so daemon restarts don't reset the retry budget. */
+  pausedRetryBySlug: Record<string, { attempts: number; lastAtMs: number }>;
 }
 
 function loadState(): SpaceScheduleState {
@@ -41,10 +44,11 @@ function loadState(): SpaceScheduleState {
         lastEvaluatedAtMs: typeof parsed.lastEvaluatedAtMs === 'number' ? parsed.lastEvaluatedAtMs : undefined,
         lastRunByMinute: (parsed.lastRunByMinute && typeof parsed.lastRunByMinute === 'object') ? parsed.lastRunByMinute : {},
         lastReengageByKey: (parsed.lastReengageByKey && typeof parsed.lastReengageByKey === 'object') ? parsed.lastReengageByKey : {},
+        pausedRetryBySlug: (parsed.pausedRetryBySlug && typeof parsed.pausedRetryBySlug === 'object') ? parsed.pausedRetryBySlug : {},
       };
     }
   } catch { /* fresh */ }
-  return { lastRunByMinute: {}, lastReengageByKey: {} };
+  return { lastRunByMinute: {}, lastReengageByKey: {}, pausedRetryBySlug: {} };
 }
 
 /**
@@ -151,4 +155,71 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
   state.lastRunByMinute = prune(lastRun, now.getTime());
   saveState(state);
   return { evaluated, fired, errors };
+}
+
+// ── Paused-build auto-retry ───────────────────────────────────────────────────
+//
+// The creation smoke parks a Workspace 'paused' when a data source ERRORS at
+// build time — correct for real bugs, but a transient blip (rate limit, API
+// hiccup, cold auth) used to STRAND the workspace until the user noticed the
+// banner. This tick retries a paused workspace's sources up to MAX_PAUSE_RETRIES
+// times with spacing: all sources pull clean → reactivate + re-engage Clem so
+// she tells the user; still failing → stays paused (a human decision, as
+// designed). Budget is durable in the schedule state, and cleared when a save
+// reactivates the space through the normal path.
+
+const MAX_PAUSE_RETRIES = 2;
+const PAUSE_RETRY_MIN_AGE_MS = 5 * 60 * 1000;      // don't race the authoring turn
+const PAUSE_RETRY_SPACING_MS = 15 * 60 * 1000;     // between attempts
+
+export interface PausedRetryResult { examined: number; reactivated: number; stillPaused: number }
+
+export async function retryPausedSpaces(now: Date = new Date()): Promise<PausedRetryResult> {
+  const state = loadState();
+  const retries = state.pausedRetryBySlug;
+  const out: PausedRetryResult = { examined: 0, reactivated: 0, stillPaused: 0 };
+  const nowMs = now.getTime();
+
+  for (const space of spaceStore.list()) {
+    if (space.status !== 'paused' || space.dataSources.length === 0) {
+      if (space.status === 'active' && retries[space.id]) delete retries[space.id]; // fixed via re-save → reset budget
+      continue;
+    }
+    const pausedAtMs = Date.parse(space.updatedAt);
+    if (Number.isFinite(pausedAtMs) && nowMs - pausedAtMs < PAUSE_RETRY_MIN_AGE_MS) continue;
+    const budget = retries[space.id] ?? { attempts: 0, lastAtMs: 0 };
+    if (budget.attempts >= MAX_PAUSE_RETRIES) continue;
+    if (nowMs - budget.lastAtMs < PAUSE_RETRY_SPACING_MS) continue;
+
+    out.examined += 1;
+    budget.attempts += 1;
+    budget.lastAtMs = nowMs;
+    retries[space.id] = budget;
+
+    let allOk = false;
+    try {
+      const results = await refreshSpaceData(space.id, undefined, { allowPaused: true });
+      allOk = results.length > 0 && results.every((r) => r.ok);
+    } catch { allOk = false; }
+
+    if (allOk) {
+      spaceStore.update(space.id, { status: 'active' });
+      delete retries[space.id];
+      out.reactivated += 1;
+      try {
+        await reengageSpace(space.id, {
+          trigger: 'threshold',
+          message: `Auto-retry succeeded: the data source${space.dataSources.length === 1 ? '' : 's'} that failed when "${space.title}" was built ${space.dataSources.length === 1 ? 'is' : 'are'} pulling cleanly now (attempt ${budget.attempts}) — the workspace is reactivated. Tell the user it's live.`,
+          actionId: `pause-retry-ok:${space.id}:${minuteKey(now)}`,
+          meta: { source: 'pause-retry' },
+        });
+      } catch { /* a wake must never break the tick */ }
+    } else {
+      out.stillPaused += 1;
+    }
+  }
+
+  state.pausedRetryBySlug = retries;
+  saveState(state);
+  return out;
 }

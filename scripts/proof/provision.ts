@@ -168,11 +168,19 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
 
   const chat = async (message: string, sessionId: string, timeoutMs = 600_000): Promise<TurnResult> => {
     const started = Date.now();
+    // Node fetch (undici) kills any response whose HEADERS take >300s by
+    // default — a real workspace-build/long-agent turn legitimately runs past
+    // that, and the scenario died with a bare "fetch failed" (workspace-build,
+    // 2026-07-03). Disable the per-phase timeouts; our AbortSignal owns the
+    // wall clock.
+    const { Agent } = await import('undici');
     const res = await fetch(`${baseUrl}/api/console/home/chat`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ message, sessionId }),
       signal: AbortSignal.timeout(timeoutMs),
+      // @ts-expect-error dispatcher is a Node-fetch (undici) extension
+      dispatcher: new Agent({ headersTimeout: 0, bodyTimeout: 0 }),
     });
     const wallMs = Date.now() - started;
     const body = (await res.json().catch(() => ({}))) as { text?: string; sessionId?: string; pendingApprovalId?: string };
