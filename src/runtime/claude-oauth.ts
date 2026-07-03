@@ -41,7 +41,7 @@ export function saveClaudeTokens(tokens: ClaudeTokenSet): void {
   try { chmodSync(CLAUDE_VAULT_FILE, 0o600); } catch { /* best-effort */ }
 }
 
-function getVaultClaudeTokens(): ClaudeOAuthTokens | null {
+function readVaultClaudeTokens(): ClaudeOAuthTokens | null {
   if (!existsSync(CLAUDE_VAULT_FILE)) return null;
   try {
     const j = JSON.parse(readFileSync(CLAUDE_VAULT_FILE, 'utf-8')) as Record<string, unknown>;
@@ -54,6 +54,11 @@ function getVaultClaudeTokens(): ClaudeOAuthTokens | null {
       source: 'vault',
     };
   } catch { return null; }
+}
+
+let vaultTokenReader = readVaultClaudeTokens;
+function getVaultClaudeTokens(): ClaudeOAuthTokens | null {
+  return vaultTokenReader();
 }
 
 export interface ClaudeOAuthTokens {
@@ -72,7 +77,7 @@ export class ClaudeAuthError extends Error {
   }
 }
 
-function readRawCredentialJson(): string | null {
+function readRawCredentialJsonFromSystem(): string | null {
   // macOS: Keychain. -w prints the secret; may surface a one-time Allow prompt.
   if (process.platform === 'darwin') {
     try {
@@ -91,6 +96,11 @@ function readRawCredentialJson(): string | null {
     try { return readFileSync(credFile, 'utf-8'); } catch { /* ignore */ }
   }
   return null;
+}
+
+let rawCredentialReader = readRawCredentialJsonFromSystem;
+function readRawCredentialJson(): string | null {
+  return rawCredentialReader();
 }
 
 /** Parse Claude Code's stored credential blob into a token set. Tolerates the
@@ -112,15 +122,19 @@ export function parseClaudeCredential(raw: string): ClaudeOAuthTokens {
   };
 }
 
+function getClaudeCodeTokens(): ClaudeOAuthTokens | null {
+  const raw = readRawCredentialJson();
+  if (!raw) return null;
+  try { return { ...parseClaudeCredential(raw), source: 'claude-code' }; }
+  catch { return null; }
+}
+
 /** Read the stored Claude OAuth tokens, preferring Clementine's OWN vault grant
  *  (from the in-app login) over the Claude Code CLI keychain. */
 export function getStoredClaudeTokens(): ClaudeOAuthTokens | null {
   const vault = getVaultClaudeTokens();
   if (vault) return vault;
-  const raw = readRawCredentialJson();
-  if (!raw) return null;
-  try { return { ...parseClaudeCredential(raw), source: 'claude-code' }; }
-  catch { return null; }
+  return getClaudeCodeTokens();
 }
 
 const EXPIRY_SKEW_MS = 60_000;
@@ -166,10 +180,26 @@ export function loadClaudeAccessToken(): string {
 }
 
 const REFRESH_BEFORE_MS = 5 * 60_000;
+let refreshClaudeTokensImpl = refreshClaudeTokens;
+
+function tryClaudeCodeFallback(reason: string): string | null {
+  const cli = getClaudeCodeTokens();
+  if (!cli) return null;
+  try {
+    const token = assertSubscriptionToken(cli);
+    logger.warn({ reason }, 'Using Claude Code subscription token because Clementine Claude vault token is unavailable');
+    return token;
+  } catch {
+    return null;
+  }
+}
 
 /** Async loader that refreshes OUR vault token before expiry (rotating the
  *  refresh token). Never refreshes a Claude Code CLI keychain token — that
- *  would desync the user's CLI login. Use this in the request path. */
+ *  would desync the user's CLI login. If the Clementine-owned vault grant is
+ *  stale and cannot refresh, fall back to a valid Claude Code subscription token
+ *  instead of letting a dead vault token shadow a working CLI login. Use this in
+ *  the request path. */
 export async function loadFreshClaudeAccessToken(): Promise<string> {
   let tokens = getStoredClaudeTokens();
   if (
@@ -179,7 +209,7 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
     tokens.expiresAt && tokens.expiresAt <= Date.now() + REFRESH_BEFORE_MS
   ) {
     try {
-      const refreshed = await refreshClaudeTokens(tokens.refreshToken);
+      const refreshed = await refreshClaudeTokensImpl(tokens.refreshToken);
       saveClaudeTokens({
         accessToken: refreshed.accessToken,
         refreshToken: refreshed.refreshToken ?? tokens.refreshToken, // persist the ROTATED token
@@ -189,10 +219,22 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
       tokens = getStoredClaudeTokens();
       logger.info('Claude subscription token refreshed');
     } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Claude token refresh failed; falling back to current token');
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Claude token refresh failed');
+      const fallback = tryClaudeCodeFallback('vault_refresh_failed');
+      if (fallback) return fallback;
     }
   }
-  return assertSubscriptionToken(tokens);
+  try {
+    return assertSubscriptionToken(tokens);
+  } catch (err) {
+    const fallbackAllowed =
+      err instanceof ClaudeAuthError && (err.kind === 'expired' || err.kind === 'missing');
+    if (tokens?.source === 'vault' && fallbackAllowed) {
+      const fallback = tryClaudeCodeFallback(err.kind);
+      if (fallback) return fallback;
+    }
+    throw err;
+  }
 }
 
 /** True when a usable Claude subscription token is present (for auth-status UI). */
@@ -224,6 +266,20 @@ export function getClaudeAuthSnapshot(): { configured: boolean; reason?: string;
   }
 }
 
-export const __test__ = { parseClaudeCredential, assertSubscriptionToken, OAT_PREFIX, API_KEY_PREFIX };
+export const __test__ = {
+  parseClaudeCredential,
+  assertSubscriptionToken,
+  OAT_PREFIX,
+  API_KEY_PREFIX,
+  setVaultTokenReaderForTests(fn: (() => ClaudeOAuthTokens | null) | null): void {
+    vaultTokenReader = fn ?? readVaultClaudeTokens;
+  },
+  setRawCredentialReaderForTests(fn: (() => string | null) | null): void {
+    rawCredentialReader = fn ?? readRawCredentialJsonFromSystem;
+  },
+  setRefreshClaudeTokensForTests(fn: ((refreshToken: string) => Promise<ClaudeTokenSet>) | null): void {
+    refreshClaudeTokensImpl = fn ?? refreshClaudeTokens;
+  },
+};
 
 void logger; // reserved for refresh-path logging in the decoupled follow-up

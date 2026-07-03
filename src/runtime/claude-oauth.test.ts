@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseClaudeCredential, assertSubscriptionToken, ClaudeAuthError } from './claude-oauth.js';
+import { parseClaudeCredential, assertSubscriptionToken, loadFreshClaudeAccessToken, ClaudeAuthError, __test__ } from './claude-oauth.js';
 
 const FUTURE = Date.now() + 60 * 60_000;
 
@@ -42,4 +42,47 @@ test('billing guard: expired subscription token → kind=expired', () => {
     () => assertSubscriptionToken({ accessToken: 'sk-ant-oat01-old', expiresAt: Date.now() - 1000 }),
     (e) => e instanceof ClaudeAuthError && e.kind === 'expired',
   );
+});
+
+test('fresh loader falls back to Claude Code oat01 when vault refresh fails', async () => {
+  __test__.setVaultTokenReaderForTests(() => ({
+    accessToken: 'sk-ant-oat01-expired-vault',
+    refreshToken: 'refresh',
+    expiresAt: Date.now() - 60_000,
+    source: 'vault',
+  }));
+  __test__.setRawCredentialReaderForTests(() => JSON.stringify({
+    claudeAiOauth: { accessToken: 'sk-ant-oat01-cli-good', expiresAt: FUTURE },
+  }));
+  __test__.setRefreshClaudeTokensForTests(async () => { throw new Error('refresh revoked'); });
+  try {
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-cli-good');
+  } finally {
+    __test__.setVaultTokenReaderForTests(null);
+    __test__.setRawCredentialReaderForTests(null);
+    __test__.setRefreshClaudeTokensForTests(null);
+  }
+});
+
+test('fresh loader never falls back to a Claude Code api03 key', async () => {
+  __test__.setVaultTokenReaderForTests(() => ({
+    accessToken: 'sk-ant-oat01-expired-vault',
+    refreshToken: 'refresh',
+    expiresAt: Date.now() - 60_000,
+    source: 'vault',
+  }));
+  __test__.setRawCredentialReaderForTests(() => JSON.stringify({
+    claudeAiOauth: { accessToken: 'sk-ant-api03-pay-per-token', expiresAt: FUTURE },
+  }));
+  __test__.setRefreshClaudeTokensForTests(async () => { throw new Error('refresh revoked'); });
+  try {
+    await assert.rejects(
+      () => loadFreshClaudeAccessToken(),
+      (e) => e instanceof ClaudeAuthError && e.kind === 'expired',
+    );
+  } finally {
+    __test__.setVaultTokenReaderForTests(null);
+    __test__.setRawCredentialReaderForTests(null);
+    __test__.setRefreshClaudeTokensForTests(null);
+  }
 });

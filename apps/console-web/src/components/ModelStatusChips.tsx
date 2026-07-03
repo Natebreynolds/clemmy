@@ -6,8 +6,8 @@ import { getModelStatus, type ModelStatus, type QuotaWindow } from '@/lib/model-
 /**
  * Compact live chips in the top bar: Codex + Claude 5h/weekly quota (the same
  * windows Codex CLI `/status` and Claude Code show, captured from provider
- * rate-limit headers), plus connection dots for OpenAI and Together (whose
- * balances aren't exposed by their APIs). Each value fades in on update — a
+ * rate-limit headers), plus connection dots for OpenAI and connected BYO
+ * providers (GLM, DeepSeek, MiniMax, Together, etc.). Each value fades in on update — a
  * subtle pulse that's automatically suppressed under prefers-reduced-motion
  * (handled globally in styles.css). Only connected providers render.
  */
@@ -84,14 +84,14 @@ function QuotaChip({
   );
 }
 
-function ConnectedChip({ label }: { label: string }) {
+function ConnectedChip({ label, title }: { label: string; title?: string }) {
   return (
     <span
-      title={`${label} connected`}
+      title={title ?? `${label} connected`}
       className="app-no-drag inline-flex items-center gap-1.5 rounded-md border border-border bg-canvas px-2 py-1 text-caption text-muted"
     >
       <span className="h-1.5 w-1.5 rounded-full bg-success" aria-hidden />
-      <span className="font-medium text-fg">{label}</span>
+      <span className="max-w-[7rem] truncate font-medium text-fg">{label}</span>
     </span>
   );
 }
@@ -126,7 +126,20 @@ export function ModelStatusChips() {
     );
   }
   if (data.openai?.connected) chips.push(<ConnectedChip key="openai" label="OpenAI" />);
-  if (data.together?.connected) chips.push(<ConnectedChip key="together" label="Together" />);
+  const byoProviders = data.byoProviders ?? [];
+  if (byoProviders.length > 0) {
+    for (const provider of byoProviders.filter((p) => p.connected)) {
+      chips.push(
+        <ConnectedChip
+          key={`byo-${provider.id}`}
+          label={provider.label || provider.id}
+          title={`${provider.label || provider.id} connected${provider.modelIds.length ? `\n${provider.modelIds.join('\n')}` : ''}`}
+        />,
+      );
+    }
+  } else if (data.together?.connected) {
+    chips.push(<ConnectedChip key="together" label="Together" />);
+  }
 
   if (chips.length === 0) return null;
   return <div className="hidden items-center gap-1.5 lg:flex">{chips}</div>;

@@ -4523,8 +4523,8 @@ export function registerConsoleRoutes(
 
   // Live model status for the top-bar chips: Codex/Claude 5h+weekly quota windows
   // (captured from provider rate-limit headers) + connection status for OpenAI and
-  // Together (whose balances aren't exposed by their APIs → status-only). Returns
-  // only booleans + percentages + reset times — never a key or secret.
+  // every connected BYO provider (GLM/Z.ai, DeepSeek, MiniMax, Together, ...).
+  // Returns only booleans + percentages + reset times + non-secret provider ids.
   app.get('/api/console/model-status', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -4533,13 +4533,22 @@ export function registerConsoleRoutes(
       // Claude windows come from the dedicated oauth/usage endpoint (cached,
       // lazily refreshed) — only poke it when Claude is actually connected.
       const claudeUsage = claudeConnected ? getClaudeUsageSnapshot() : null;
-      const togetherConnected = getByoProviderSnapshots().some(
-        (p) => p.configured && (p.id === 'together' || p.id === 'together-ai' || /together/i.test(p.label)),
+      const byoProviders = getByoProviderSnapshots()
+        .filter((p) => p.configured)
+        .map((p) => ({
+          id: p.id,
+          label: p.label || p.id,
+          modelIds: p.modelIds,
+          connected: true,
+        }));
+      const togetherConnected = byoProviders.some(
+        (p) => p.id === 'together' || p.id === 'together-ai' || /together/i.test(p.label),
       );
       res.json({
         codex: { connected: codexModelsAvailable(), ...(rl.codex ?? {}) },
         claude: { connected: claudeConnected, ...(claudeUsage ?? {}) },
         openai: { connected: Boolean(getOpenAiApiKey()) },
+        byoProviders,
         together: { connected: togetherConnected },
         updatedAt: Date.now(),
       });

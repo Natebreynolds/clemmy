@@ -79,7 +79,10 @@ export class RouterModelProvider implements ModelProvider {
       });
     }
     const requested = typeof modelName === 'string' && modelName.trim().length > 0 ? modelName.trim() : MODELS.primary;
+    const sessionId = harnessRunContextStorage.getStore()?.sessionId;
     return withModelRouteMetrics(resolved, {
+      sessionId,
+      workflowRunId: workflowRunIdFromSessionId(sessionId),
       role: 'brain',
       requestedModel: requested,
       resolvedModel: primary.label,

@@ -42,6 +42,24 @@ function realEnvValue(key: string): string | undefined {
   return readEnvFile(path.join(REAL_CLEM_HOME, '.env'))[key];
 }
 
+function byoProviderKeyEnvKey(providerId: string): string {
+  const slug = providerId.replace(/[^A-Za-z0-9]/g, '_').toUpperCase();
+  return `BYO_PROVIDER_${slug}_API_KEY`;
+}
+
+function byoProviderIdsFromRegistry(raw: string | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((p) => (p && typeof p === 'object' ? (p as { id?: unknown }).id : undefined))
+      .filter((id): id is string => typeof id === 'string' && /^[A-Za-z0-9._:/-]+$/.test(id) && id !== 'default');
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Build the per-brain env. Missing auth material ⇒ skipReason (the matrix
  * reports SKIP, never FAIL — absence of a subscription isn't a regression).
@@ -76,10 +94,19 @@ export function planBrain(kind: BrainKind): BrainPlan {
   const env: Record<string, string> = { MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_ID: byoModel };
   for (const key of [
     'BYO_MODEL_API_KEY', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_JUDGE_ID', 'BYO_MODEL_PROVIDER',
-    'ZHIPU_API_KEY', 'GLM_API_KEY', 'BYO_PROVIDERS_JSON', 'OPENROUTER_API_KEY',
+    'ZHIPU_API_KEY', 'GLM_API_KEY', 'OPENROUTER_API_KEY',
   ]) {
     const v = realEnvValue(key);
     if (v) env[key] = v;
+  }
+  const registry = realEnvValue('BYO_PROVIDERS') ?? realEnvValue('BYO_PROVIDERS_JSON');
+  if (registry) {
+    env.BYO_PROVIDERS = registry;
+    for (const id of byoProviderIdsFromRegistry(registry)) {
+      const key = byoProviderKeyEnvKey(id);
+      const v = realEnvValue(key);
+      if (v) env[key] = v;
+    }
   }
   return { kind, env };
 }

@@ -146,6 +146,18 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   // surface. Gating it made every workflow step stop for "approve
   // workflow_step_result" in Discord — friction on the step's own output.
   'workflow_step_result',
+  // Workspace authoring tools mutate Clementine's local workspace store
+  // (manifest, view, local runner data, local publish snapshots). They are the
+  // consented local artifact path when the user asks for a workspace. External
+  // sends from a workspace action still gate inside runSpaceAction.
+  'space_save',
+  'space_edit_view',
+  'space_edit_runner',
+  'space_revert_runner',
+  'space_refresh',
+  'space_try_runner',
+  'space_set_data',
+  'space_publish',
 ]);
 
 /**

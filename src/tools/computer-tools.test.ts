@@ -171,6 +171,27 @@ test('write_file append creates a missing file', async () => {
   assert.equal(readFileSync(file, 'utf-8'), 'created by append\n');
 });
 
+test('write_file warns that raw workspace files still require space_save', async () => {
+  const file = path.join(process.env.CLEMENTINE_HOME!, 'spaces', 'proof-cockpit', 'view', 'index.html');
+  const out = await invokeWrite({ path: file, content: '<html><body>Proof</body></html>', mode: null });
+  assert.match(out, /^Wrote /);
+  assert.match(out, /NOT a registered Console workspace/);
+  assert.match(out, /NEXT REQUIRED TOOL CALL/);
+  assert.match(out, /space_save/);
+  assert.match(out, /\/api\/console\/spaces\/proof-cockpit will return 404/);
+  assert.equal(readFileSync(file, 'utf-8'), '<html><body>Proof</body></html>\n');
+});
+
+test('write_file warns when a workspace file lands in the wrong Clementine home', async () => {
+  const file = path.join(tmpHome, 'other', '.clementine-next', 'spaces', 'proof-cockpit', 'view', 'index.html');
+  const out = await invokeWrite({ path: file, content: '<html><body>Wrong home</body></html>', mode: null });
+  assert.match(out, /^Wrote /);
+  assert.match(out, /wrong home for this run/);
+  assert.match(out, new RegExp(process.env.CLEMENTINE_HOME!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(out, /\/api\/console\/spaces\/proof-cockpit will still return 404/);
+  assert.equal(readFileSync(file, 'utf-8'), '<html><body>Wrong home</body></html>\n');
+});
+
 test('installed skill source paths are protected while artifact paths stay writable', () => {
   const skillRoot = path.join(process.env.CLEMENTINE_HOME!, 'skills', 'lunar');
   assert.equal(isProtectedInstalledSkillSourcePath(path.join(skillRoot, 'build.cjs')), true);

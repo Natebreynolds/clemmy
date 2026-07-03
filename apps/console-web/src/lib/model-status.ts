@@ -1,8 +1,8 @@
 import { apiGet } from './api';
 
 // Live model status for the top-bar chips. Codex/Claude expose real 5h + weekly
-// quota windows (captured from provider rate-limit headers); OpenAI and Together
-// are connection-status only (their balances aren't exposed by their APIs).
+// quota windows (captured from provider rate-limit headers); OpenAI and BYO
+// providers are connection-status only (their balances aren't exposed here).
 export interface QuotaWindow {
   usedPercent: number;
   resetAt?: number; // epoch ms
@@ -19,6 +19,8 @@ export interface ModelStatus {
     capturedAt?: number;
   };
   openai: { connected: boolean };
+  byoProviders?: Array<{ id: string; label: string; modelIds: string[]; connected: boolean }>;
+  /** Back-compat alias kept for older renderers/tests; prefer byoProviders. */
   together: { connected: boolean };
   updatedAt: number;
 }

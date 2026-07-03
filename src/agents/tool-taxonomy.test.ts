@@ -102,6 +102,15 @@ test('decideToolApproval: task_hygiene is local bookkeeping and does not ask', (
   assert.equal(decision.reason, 'read-always-auto');
 });
 
+test('decideToolApproval: workspace authoring tools are local bookkeeping and do not ask', () => {
+  setScope('strict');
+  for (const toolName of ['space_save', 'space_refresh', 'space_try_runner', 'space_edit_view', 'space_set_data']) {
+    const decision = decideToolApproval({ toolName });
+    assert.equal(decision.needsApproval, false, toolName);
+    assert.equal(decision.reason, 'read-always-auto', toolName);
+  }
+});
+
 test('classifyTool: memory_review_instructions is a READ (the confirm-first gate forces this call — it must not self-park for approval)', () => {
   // Regression for the 2026-06-17 double-approval on an outbound email batch:
   // the confirm-first gate requires the model to call memory_review_instructions

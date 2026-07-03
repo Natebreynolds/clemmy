@@ -236,7 +236,7 @@ export function registerSpaceTools(server: McpServer): void {
     'space_save',
     [
       'Create or update a Workspace — a persistent, interactive HTML surface you build for the user (a live report, a CRM mini-app, a daily planner, a tracker). Idempotent: pass an existing slug to UPDATE it.',
-      'FIRST write the self-contained view with write_file (inline CSS/JS only — external CDNs are blocked by CSP). Save it under ~/.clementine-next/spaces/<slug>/view/index.html (or any path inside ~/.clementine-next), then call this with view_path pointing at it.',
+      `FIRST write the self-contained view with write_file (inline CSS/JS only — external CDNs are blocked by CSP). Save it under ${BASE_DIR}/spaces/<slug>/view/index.html (or any path inside ${BASE_DIR}), then call this with view_path pointing at it.`,
       'The view calls same-origin data routes the user opens in the desktop: GET /api/console/spaces/<slug>/data, POST /api/console/spaces/<slug>/notes. It can call any /api endpoint (it inherits the session).',
       'A helper `clem` is auto-injected into every served view — PREFER it over hand-writing fetch (fewer wrong-slug/wrong-key bugs): `await clem.data()` → the dataset (keyed by sourceId); `await clem.refresh(sourceId?)`; `await clem.compose(instructions, context)` → a grounded draft (e.g. a personalized email from a row); `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
       'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
@@ -249,7 +249,7 @@ export function registerSpaceTools(server: McpServer): void {
     {
       slug: z.string().min(2).max(63).describe('Workspace id, lowercase kebab-case (e.g. "sf-daily-report"). Reuse to update.'),
       title: z.string().min(1).max(200).describe('Human title shown in the Workspaces gallery.'),
-      view_path: z.string().max(1000).nullable().describe('Path to the HTML file you wrote with write_file (inside ~/.clementine-next). Required when first creating; omit to update only metadata.'),
+      view_path: z.string().max(1000).nullable().describe(`Path to the HTML file you wrote with write_file (inside ${BASE_DIR}). Required when first creating; omit to update only metadata.`),
       data_sources: z.array(dataSourceShape).nullable().describe('Optional declared data sources for server-side (token-free) refresh.'),
       actions: z.array(actionShape).nullable().describe('Optional declared ACTIONS the view can trigger server-side (e.g. send an email via an Outlook Composio tool). The view POSTs {actionId, args} to /api/console/spaces/<slug>/action; credentials resolve server-side. Build the buttons/forms for these into the view.'),
       reengage_triggers: z.array(z.enum(['note', 'ask', 'threshold'])).nullable().describe('Which in-workspace events should wake you to reason: "note" (user left a note), "ask" (user asked in the workspace chat), "threshold" (data crossed a limit).'),

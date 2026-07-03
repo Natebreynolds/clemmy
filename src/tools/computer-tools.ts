@@ -16,6 +16,7 @@ import { ingestAttachment } from '../runtime/attachments.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { isSensitivePath, redactSensitiveText, shellCommandTouchesSensitiveData } from '../runtime/security.js';
+import { SPACES_DIR, isValidSpaceSlug, spaceStore } from '../spaces/store.js';
 
 /**
  * Approval gate for SDK-native tools — delegates to the global
@@ -280,6 +281,46 @@ function resolveAllowedPath(input: string): string {
 
 function ensureTrailingNewline(content: string): string {
   return content.endsWith('\n') ? content : `${content}\n`;
+}
+
+function workspaceAuthoringNotice(filePath: string): string | null {
+  const root = path.resolve(SPACES_DIR);
+  const rel = path.relative(root, filePath);
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+    const parts = rel.split(path.sep).filter(Boolean);
+    const slug = parts[0];
+    const top = parts[1];
+    if (!slug || !isValidSpaceSlug(slug) || (top !== 'view' && top !== 'data')) return null;
+    if (spaceStore.get(slug)) {
+      if (top === 'data') {
+        return `WORKSPACE NOTICE: "${slug}" already exists. After changing data/${parts.slice(2).join('/') || '<runner>'}, call space_refresh("${slug}") or space_save with updated data_sources so the persisted dataset and status match the file.`;
+      }
+      return `WORKSPACE NOTICE: "${slug}" already exists. For a full view rewrite, call space_save({ slug: "${slug}", title: "...", view_path: "${filePath}", ... }) so the change is versioned and smoke-checked; for small edits, prefer space_edit_view.`;
+    }
+
+    const titleHint = slug.split('-').map((part) => part ? `${part[0].toUpperCase()}${part.slice(1)}` : part).join(' ');
+    const runnerHint = top === 'data' && parts[2]
+      ? ` Declare this runner in data_sources, for example data_sources:[{id:"tasks",runner:"${parts[2]}",composio_slug:null,composio_args_json:null,schedule:null,timezone:null}].`
+      : ' Include at least one data_sources entry when the workspace should be live/dynamic.';
+    return [
+      `WORKSPACE NOTICE: "${slug}" is NOT a registered Console workspace yet; raw files under spaces/<slug>/ do not create a workspace and /api/console/spaces/${slug} will return 404.`,
+      `NEXT REQUIRED TOOL CALL before reporting done: space_save({slug:"${slug}",title:"${titleHint}",view_path:"${filePath}",data_sources:[...],actions:null,reengage_triggers:null,reengage_guidance:null,origin_session_id:null}).`,
+      `${runnerHint} Do not report the workspace as ready until space_save returns "Created workspace".`,
+    ].join(' ');
+  }
+
+  const pathParts = filePath.split(path.sep).filter(Boolean);
+  const marker = pathParts.lastIndexOf('.clementine-next');
+  if (marker === -1 || pathParts[marker + 1] !== 'spaces') return null;
+  const slug = pathParts[marker + 2];
+  const top = pathParts[marker + 3];
+  if (!slug || !isValidSpaceSlug(slug) || (top !== 'view' && top !== 'data')) return null;
+  const desired = path.join(SPACES_DIR, slug, ...pathParts.slice(marker + 3));
+  return [
+    `WORKSPACE NOTICE: wrote to ${filePath}, but this daemon's active Clementine home is ${BASE_DIR}.`,
+    `The Console reads workspaces from ${SPACES_DIR}; ${filePath} is the wrong home for this run and /api/console/spaces/${slug} will still return 404.`,
+    `Write the file to ${desired}, then call space_save with view_path under ${SPACES_DIR}.`,
+  ].join(' ');
 }
 
 export function resolveAllowedCwd(input?: string): string {
@@ -918,7 +959,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       if (mode === 'append') {
         const needsBoundary = exists && statSync(filePath).size > 0 && !readFileSync(filePath, 'utf-8').endsWith('\n');
         appendFileSync(filePath, `${needsBoundary ? '\n' : ''}${content}`, 'utf-8');
-        return `Appended ${filePath} (${input.content.length} chars).`;
+        const notice = workspaceAuthoringNotice(filePath);
+        return [`Appended ${filePath} (${input.content.length} chars).`, notice].filter(Boolean).join('\n\n');
       }
 
       if (mode === 'create' && exists) {
@@ -929,11 +971,13 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       }
 
       if (mode === 'overwrite' && exists && readFileSync(filePath, 'utf-8') === content) {
-        return `No changes needed for ${filePath} (${input.content.length} chars already present).`;
+        const notice = workspaceAuthoringNotice(filePath);
+        return [`No changes needed for ${filePath} (${input.content.length} chars already present).`, notice].filter(Boolean).join('\n\n');
       }
 
       writeFileSync(filePath, content, 'utf-8');
-      return `${mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
+      const notice = workspaceAuthoringNotice(filePath);
+      return [`${mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`, notice].filter(Boolean).join('\n\n');
     },
   });
 
