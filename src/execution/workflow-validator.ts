@@ -526,6 +526,17 @@ export function stepLooksMultiItemWithoutForEach(step: WorkflowStepShape): boole
   return true;
 }
 
+/** CALL-2b: a call step's side-effect class for validation — declared sideEffect
+ *  wins, else derived from the tool slug (mirrors callToolSideEffectClass in the
+ *  runner; kept local to avoid a validator→runner import cycle). */
+function callSideEffectClass(step: WorkflowStepShape): 'read' | 'write' | 'send' {
+  if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
+  const t = (step.call?.tool ?? '').toLowerCase();
+  if (/(?:_|^)(?:send|publish|post|email|dispatch|deliver|tweet|dm|message)(?:_|$)/.test(t)) return 'send';
+  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/.test(t)) return 'write';
+  return 'read';
+}
+
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {
   if (!step.deterministic) return null;
   const runner = typeof step.deterministic.runner === 'string' ? step.deterministic.runner.trim() : '';
@@ -655,8 +666,13 @@ export function validateWorkflowDefinition(
       if (step.deterministic) {
         errors.push(`Step "${step.id ?? '?'}" declares both call and deterministic — pick one non-LLM executor.`);
       }
-      if (step.forEach) {
-        errors.push(`Step "${step.id ?? '?'}" declares both call and forEach — per-item structured calls are not supported yet; use a plain forEach step (or split the list step from the call step).`);
+      // CALL-2b: a per-item structured call is allowed ONLY for a READ-class call
+      // (idempotent — safe to retry/resume). A send/write per-item call can
+      // double-fire on retry/crash-resume (a direct call records no external_write
+      // for the guards to see), so it stays blocked until idempotency tracking
+      // lands and is live-tested.
+      if (step.forEach && callSideEffectClass(step) !== 'read') {
+        errors.push(`Step "${step.id ?? '?'}" declares a ${callSideEffectClass(step)}-class call with forEach — a per-item send/write call is not supported yet (double-act risk without per-call idempotency). Use a plain forEach step for the mutating action, or declare sideEffect: read only if the call truly is read-only.`);
       }
     }
     if (step.id) {

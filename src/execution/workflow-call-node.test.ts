@@ -84,12 +84,19 @@ test('validation: a call step needs no prompt but needs a tool; rejects call+det
   const both = validateWorkflowDefinition(frontmatter([{ id: 'x', call: { tool: 't' }, deterministic: { runner: 'r.mjs' } }]));
   assert.ok(both.errors.some((e) => /both call and deterministic/.test(e)));
 
-  // call + forEach → error (v1)
-  const fe = validateWorkflowDefinition(frontmatter([
+  // CALL-2b: a READ-class call + forEach is ALLOWED (idempotent per-item fetch)
+  const readFanout = validateWorkflowDefinition(frontmatter([
     { id: 'list', prompt: 'produce a list', output: { type: 'array' } },
-    { id: 'x', call: { tool: 't' }, forEach: 'list', dependsOn: ['list'] },
+    { id: 'enrich', call: { tool: 'composio_hubspot_get_contact', args: { id: '{{item.id}}' } }, forEach: 'list', dependsOn: ['list'] },
   ]));
-  assert.ok(fe.errors.some((e) => /both call and forEach/.test(e)));
+  assert.equal(readFanout.errors.some((e) => /call with forEach|call and forEach/.test(e)), false, 'read-class call+forEach is allowed');
+
+  // a SEND-class call + forEach → error (double-send risk)
+  const sendFanout = validateWorkflowDefinition(frontmatter([
+    { id: 'list', prompt: 'produce a list', output: { type: 'array' } },
+    { id: 'blast', call: { tool: 'composio_gmail_send_email', args: { to: '{{item.email}}' } }, forEach: 'list', dependsOn: ['list'] },
+  ]));
+  assert.ok(sendFanout.errors.some((e) => /send-class call with forEach/.test(e)), 'send-class call+forEach is blocked');
 });
 
 test('serialization: a call node round-trips through SKILL.md', () => {

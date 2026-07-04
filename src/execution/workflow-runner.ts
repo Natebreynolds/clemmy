@@ -3043,6 +3043,16 @@ export async function executeStep(
             // an external_write — the same double-act guard as crash-resume). Budget
             // 0 unless the flag is on → byte-identical to today by default.
             const runItemOnce = async (): Promise<void> => {
+              // CALL-2b: a structured per-item call executes the tool DIRECTLY
+              // with {{item}} templated into args — zero LLM per item. Validation
+              // restricts this to read-class calls (idempotent → safe to retry/
+              // resume), so no external-write double-act guard is needed here.
+              if (step.call?.tool) {
+                output = await executeWorkflowCallNode(step, ctx, item);
+                // no lane: a direct call has no LLM output to ground (the
+                // claude_sdk grounding advisory below is correctly skipped).
+                return;
+              }
               if (workflowHarnessEnabled(step)) {
                 const r = await runStepViaHarness(
                   step,
