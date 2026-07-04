@@ -47,6 +47,7 @@ export interface WorkflowStepShape {
   forEachNewOnly?: boolean;
   for_each_new_only?: boolean;
   deterministic?: { runner?: string };
+  call?: { tool?: string; args?: Record<string, unknown> };
   usesSkill?: string;
   uses_skill?: string;
   allowedTools?: string[];
@@ -640,8 +641,23 @@ export function validateWorkflowDefinition(
   let duplicates = 0;
   for (const step of steps) {
     if (!step.id) errors.push('A step is missing an id.');
-    if (!step.prompt || step.prompt.trim().length < 3) {
+    // A structured call step (or deterministic runner) needs no prompt — its
+    // action is the tool call / script, not a model instruction.
+    const stepHasCall = Boolean(step.call && typeof step.call === 'object' && typeof step.call.tool === 'string' && step.call.tool.trim());
+    if (!stepHasCall && !step.deterministic && (!step.prompt || step.prompt.trim().length < 3)) {
       errors.push(`Step "${step.id ?? '?'}" has no substantive prompt.`);
+    }
+    // CALL-1 structural rules.
+    if (step.call !== undefined) {
+      if (!stepHasCall) {
+        errors.push(`Step "${step.id ?? '?'}" declares call but no tool. Set call.tool to the tool slug, or remove call.`);
+      }
+      if (step.deterministic) {
+        errors.push(`Step "${step.id ?? '?'}" declares both call and deterministic — pick one non-LLM executor.`);
+      }
+      if (step.forEach) {
+        errors.push(`Step "${step.id ?? '?'}" declares both call and forEach — per-item structured calls are not supported yet; use a plain forEach step (or split the list step from the call step).`);
+      }
     }
     if (step.id) {
       if (ids.has(step.id)) duplicates++;

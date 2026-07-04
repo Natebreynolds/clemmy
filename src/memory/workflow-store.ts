@@ -82,6 +82,22 @@ export interface WorkflowStepInput {
    */
   deterministic?: { runner: string };
   /**
+   * STRUCTURED TOOL CALL (CALL-1): a first-class, typed tool invocation the
+   * runner executes DIRECTLY — no LLM turn. Use when the tool and its argument
+   * shape are known (most of a data pipeline, and exactly what a promoted run
+   * captures): the call becomes inspectable, validatable at author time, free
+   * at run time (zero tokens), and impossible to "phantom-complete". A reasoned
+   * tool USE (deciding which tool / shaping ambiguous input) stays a prompt
+   * step. `tool` is a tool slug (v1: a composio slug, executed via
+   * executeComposioTool). `args` values support templating — {{input.x}},
+   * {{steps.<id>.output[.path]}}, {{item[.path]}}, {{date}}; a value that is
+   * EXACTLY one token resolves to the raw upstream value (object/array kept),
+   * an embedded token renders as a string. Serialized to YAML as `call`.
+   * Mutually exclusive with deterministic (both are non-LLM executors) and, in
+   * v1, with forEach (per-item calls land in CALL phase 2).
+   */
+  call?: WorkflowStepCall;
+  /**
    * Per-step tool allowlist. Empty / unset = inherit the workflow's
    * top-level allowed-tools. Used by the runner to filter the tool
    * surface handed to each Agent.run().
@@ -182,6 +198,16 @@ export interface WorkflowStepInput {
 }
 
 export type WorkflowContractType = 'string' | 'number' | 'boolean' | 'object' | 'array';
+
+/** CALL-1: a first-class structured tool invocation (see WorkflowStepInput.call). */
+export interface WorkflowStepCall {
+  /** Tool slug to invoke. v1: a composio slug (executed via executeComposioTool). */
+  tool: string;
+  /** Arguments; string values support {{input.x}} / {{steps.<id>.output[.path]}} /
+   *  {{item[.path]}} / {{date}} templating (a value that is exactly one token
+   *  resolves to the raw upstream value). */
+  args?: Record<string, unknown>;
+}
 
 export interface WorkflowStepInputBinding {
   type?: WorkflowContractType;
@@ -470,6 +496,18 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
         const d = step.deterministic as Record<string, unknown>;
         if (typeof d.runner === 'string') result.deterministic = { runner: d.runner };
       }
+      // CALL-1: structured tool call. Requires a non-empty tool slug; args is an
+      // arbitrary object (templated at run time). A call with no tool is dropped.
+      if (step.call && typeof step.call === 'object' && !Array.isArray(step.call)) {
+        const c = step.call as Record<string, unknown>;
+        const tool = typeof c.tool === 'string' ? c.tool.trim() : '';
+        if (tool) {
+          result.call = {
+            tool,
+            ...(c.args && typeof c.args === 'object' && !Array.isArray(c.args) ? { args: c.args as Record<string, unknown> } : {}),
+          };
+        }
+      }
       const stepAllowed = parseAllowedTools(step.allowedTools);
       if (stepAllowed) result.allowedTools = stepAllowed.map((t) => (typeof t === 'string' ? t : t.name));
       // Accept either `uses_skill` (yaml-idiomatic snake_case, what the
@@ -649,6 +687,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.forEach) out.forEach = s.forEach;
       if (s.forEachNewOnly) out.forEachNewOnly = true;
       if (s.deterministic) out.deterministic = s.deterministic;
+      if (s.call?.tool) out.call = { tool: s.call.tool, ...(s.call.args ? { args: s.call.args } : {}) };
       if (s.allowedTools && s.allowedTools.length > 0) out.allowedTools = s.allowedTools;
       if (s.usesSkill) out.uses_skill = s.usesSkill;
       if (s.requiresApproval) out.requires_approval = true;

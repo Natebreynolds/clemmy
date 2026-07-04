@@ -741,6 +741,65 @@ function renderTemplate(
     });
 }
 
+// ── CALL-1: structured tool-call argument rendering ──────────────────────────
+// A call arg value that is EXACTLY one template token resolves to the RAW
+// upstream value (object/array preserved, so a whole step output can be handed
+// to a tool). An embedded token ("prefix {{input.x}}") renders as a string.
+const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|date)\s*\}\}\s*$/;
+
+function pathGet(value: unknown, dotted: string): unknown {
+  if (!dotted) return value;
+  let cursor = value;
+  for (const part of dotted.split('.')) {
+    if (!cursor || typeof cursor !== 'object') return undefined;
+    cursor = (cursor as Record<string, unknown>)[part];
+  }
+  return cursor;
+}
+
+function resolveCallToken(token: string, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item: unknown): unknown {
+  if (token === 'date') return new Date().toISOString().slice(0, 10);
+  if (token.startsWith('input.')) return inputs[token.slice(6)];
+  if (token === 'item') return item;
+  if (token.startsWith('item.')) return pathGet(item, token.slice(5));
+  const m = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.(.+))?$/.exec(token);
+  if (m) return m[2] ? pathGet(stepOutputs[m[1]], m[2]) : stepOutputs[m[1]];
+  return undefined;
+}
+
+export function renderCallArgValue(val: unknown, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item?: unknown): unknown {
+  if (typeof val === 'string') {
+    const full = CALL_FULL_TOKEN_RE.exec(val);
+    if (full) {
+      const raw = resolveCallToken(full[1], inputs, stepOutputs, item);
+      return raw === undefined ? '' : raw; // preserve object/array; unresolved → ''
+    }
+    return renderTemplate(val, inputs, stepOutputs, item);
+  }
+  if (Array.isArray(val)) return val.map((v) => renderCallArgValue(v, inputs, stepOutputs, item));
+  if (val && typeof val === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(val)) out[k] = renderCallArgValue(v, inputs, stepOutputs, item);
+    return out;
+  }
+  return val; // numbers/booleans/null pass through
+}
+
+export function renderCallArgs(args: Record<string, unknown> | undefined, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item?: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args ?? {})) out[k] = renderCallArgValue(v, inputs, stepOutputs, item);
+  return out;
+}
+
+/** Execute a structured call node directly — zero LLM. v1: composio slug via
+ *  executeComposioTool. Args are rendered against inputs/upstream/(item). */
+async function executeWorkflowCallNode(step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown): Promise<unknown> {
+  const call = step.call!;
+  const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item);
+  const { executeComposioTool } = await import('../integrations/composio/client.js');
+  return executeComposioTool(call.tool, args);
+}
+
 interface DeterministicStepPayload {
   workflow: string;
   workflowSlug: string;
@@ -2799,6 +2858,36 @@ export async function executeStep(
     });
   }
 
+  // 1b. CALL-1 — structured tool call: execute the tool DIRECTLY, no LLM. The
+  //     args are fixed in the contract (templated from inputs/upstream), so the
+  //     call is deterministic and free. Routes through the SAME verification
+  //     chokepoint as every other shape. (v1 handles the no-forEach case;
+  //     validation rejects call+forEach / call+deterministic, so this branch
+  //     only fires for a plain structured call.)
+  if (step.call?.tool && !step.forEach) {
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_started',
+      stepId: step.id,
+      meta: { mode: 'call', tool: step.call.tool },
+    });
+    let callOutput: unknown;
+    try {
+      callOutput = await executeWorkflowCallNode(step, ctx);
+    } catch (err) {
+      appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+        kind: 'step_failed',
+        stepId: step.id,
+        error: err instanceof Error ? err.message : String(err),
+        meta: { mode: 'call', tool: step.call.tool },
+      });
+      throw err;
+    }
+    return finalizeStepOutput(ctx.workflowSlug, ctx.runId, step, callOutput, {
+      mode: 'call',
+      tool: step.call.tool,
+    });
+  }
+
   // 2. forEach — iterate an upstream output with bounded concurrency.
   if (step.forEach) {
     const forEachSource = resolveForEachSource(step.forEach, ctx.stepOutputs);
@@ -3393,8 +3482,21 @@ function parallelStepLabel(steps: WorkflowStepInput[]): string {
  *  guard (don't blind-re-run a step that may have partially sent/written). */
 export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' | 'send' {
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
+  // CALL-1: a structured call has no prose to heuristic on — classify from the
+  // tool slug so a *_send / *_create call is guarded for crash-resume + retry.
+  if (step.call?.tool) return callToolSideEffectClass(step.call.tool);
   if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
   if (stepLooksMutating(step)) return 'write';
+  return 'read';
+}
+
+/** Derive a call node's side-effect class from its tool slug (conservative:
+ *  send/publish/post/email → send; create/update/delete/write/upsert → write;
+ *  else read). Exported for tests. */
+export function callToolSideEffectClass(tool: string): 'read' | 'write' | 'send' {
+  const t = tool.toLowerCase();
+  if (/(?:_|^)(?:send|publish|post|email|dispatch|deliver|tweet|dm|message)(?:_|$)/.test(t)) return 'send';
+  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/.test(t)) return 'write';
   return 'read';
 }
 
