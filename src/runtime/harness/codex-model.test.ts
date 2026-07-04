@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { ModelRequest } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { buildCodexRequestBody, CodexResponsesModel } from './codex-model.js';
+import { harnessRunContextStorage } from './brackets.js';
 import { BoundaryError } from '../boundary-error.js';
 import { buildTransportTimeoutError, detectCodexTransportFailure } from '../codex-dispatcher.js';
 
@@ -40,6 +41,31 @@ function modelRequest(input: ModelRequest['input'] = []): ModelRequest {
     tracing: false,
   } as unknown as ModelRequest;
 }
+
+test('buildCodexRequestBody sets a per-session prompt_cache_key inside a run context, omits it outside', () => {
+  // Outside any harness run context (unit/contract tests) → no key → the wire
+  // shape is byte-identical to before this feature.
+  const outside = buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }]));
+  assert.equal(outside.prompt_cache_key, undefined);
+
+  // Inside a run context → a stable per-session shard key routes the session's
+  // calls to the same cache node so the tool-schema prefix actually hits.
+  const inside = harnessRunContextStorage.run({ sessionId: 'sess-abc' } as never, () =>
+    buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }])),
+  );
+  assert.equal(inside.prompt_cache_key, 'clem:sess-abc');
+
+  // Kill-switch → omitted even inside a context.
+  process.env.CLEMMY_CODEX_CACHE_KEY = 'off';
+  try {
+    const off = harnessRunContextStorage.run({ sessionId: 'sess-abc' } as never, () =>
+      buildCodexRequestBody('gpt-5.5', modelRequest([{ role: 'user', content: 'hi' }])),
+    );
+    assert.equal(off.prompt_cache_key, undefined);
+  } finally {
+    delete process.env.CLEMMY_CODEX_CACHE_KEY;
+  }
+});
 
 test('buildCodexRequestBody drops non-Codex function_call ids from mixed-provider history', () => {
   const body = buildCodexRequestBody('gpt-5.5', modelRequest([

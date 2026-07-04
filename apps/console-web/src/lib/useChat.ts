@@ -38,6 +38,12 @@ function progressLabel(ev: HarnessEvent): string | null {
     // silent attempts and read as "the agent just isn't working".
     case 'stall_retry_attempted': return 'That reply came back malformed — retrying…';
     case 'memory_signals_captured': return 'Learning from this…';
+    // Mid-turn keep-alive fired while the brain reasons BETWEEN tool calls. With
+    // no tool/plan event to relabel, the progress line otherwise freezes on the
+    // last "Got results from X" through a long silent reasoning phase and reads
+    // as stuck (observed: a ~4-min codex reasoning call showed no movement). The
+    // animated ThinkingDots + this label make an active-but-quiet turn legible.
+    case 'heartbeat': return 'Still working…';
     default: return null;
   }
 }

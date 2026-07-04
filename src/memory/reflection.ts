@@ -237,6 +237,15 @@ const SELF_TOOL_DENY_EXACT = new Set<string>([
   'goal_get', 'goal_list', 'goal_status',
   'space_get', 'space_get_runner', 'space_get_view',
   'attempt_record',
+  // Clem's OWN working-state scratchpad (focus/plan) + ephemeral status pollers.
+  // focus_get returns the full plan/focus blob (>800 chars, so it clears the
+  // too_short gate) but is pure self-introspection — reflecting on it burned
+  // 12-27s per call to extract nothing but self-referential noise (measured:
+  // ~8 focus_get reflections/session, every one skipped=low_importance). The
+  // *_status pollers (browser_harness_status) return transient health, not
+  // durable facts. See [[project_workflow_system_audit_0703]].
+  'focus_get', 'focus_set', 'focus_park',
+  'browser_harness_status',
 ]);
 const SELF_TOOL_DENY_PREFIXES = ['memory_', 'background_task', 'execution_'];
 
@@ -1049,13 +1058,62 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
  * any error is swallowed (logged at warn level). NEVER awaited by the
  * caller — the SDK's tool return must not be blocked by reflection.
  */
+// ── Off-loop serialization ────────────────────────────────────────────
+// Reflection runs the fast-tier extractor on the SAME provider token as the
+// active brain. Firing it concurrently after every tool return (the old
+// queueMicrotask path) let a burst of tool calls launch 6+ extractor calls at
+// once, saturating the token and STARVING the user-facing brain loop — measured
+// at 9.3 min of extractor wall-clock in one session, stalling brain steps to
+// 27-37s. Draining reflections through a single-slot FIFO chain caps in-flight
+// extractions at 1, so background learning yields to the live loop instead of
+// competing with it. Best-effort: a bounded queue drops the overflow (memory
+// capture is lossy by design; high-signal facts recur) rather than growing
+// unbounded on a long autonomous run. CLEMMY_REFLECTION_SERIAL=off reverts to
+// the legacy concurrent path.
+const REFLECTION_MAX_PENDING = 32;
+let reflectionPending = 0;
+let reflectionTail: Promise<void> = Promise.resolve();
+
+function reflectionSerialEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_REFLECTION_SERIAL', 'on') || 'on').toLowerCase() !== 'off';
+}
+
+// Exported for tests: number of reflections queued but not yet drained.
+export function _testOnly_reflectionPending(): number {
+  return reflectionPending;
+}
+
+function runScheduled(input: ReflectionInput): void {
+  reflectOnToolReturn(input).catch((err) => {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection: scheduled run errored');
+  });
+}
+
 export function scheduleReflection(input: ReflectionInput): void {
-  // Schedule on next tick so we never share the same microtask as the
-  // calling hook (defensive against unhandled-rejection edge cases).
-  queueMicrotask(() => {
-    reflectOnToolReturn(input).catch((err) => {
+  if (!reflectionSerialEnabled()) {
+    // Legacy path: fire-and-forget on next tick, concurrent. Kept as the
+    // kill-switch fallback so a regression can be reverted without a redeploy.
+    queueMicrotask(() => runScheduled(input));
+    return;
+  }
+  if (reflectionPending >= REFLECTION_MAX_PENDING) {
+    // Backpressure: the drain is falling behind a fast tool loop. Drop rather
+    // than block the caller or grow without bound — reflection is best-effort.
+    logger.debug({ tool: input.tool, pending: reflectionPending }, 'reflection: queue full — dropping (backpressure)');
+    return;
+  }
+  reflectionPending += 1;
+  // Chain onto the tail so at most ONE extractor runs at a time. The inner
+  // reflectOnToolReturn swallows its own errors; the .then keeps the chain
+  // alive regardless. Decrement in finally so a throw can't leak the slot.
+  reflectionTail = reflectionTail.then(async () => {
+    try {
+      await reflectOnToolReturn(input);
+    } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection: scheduled run errored');
-    });
+    } finally {
+      reflectionPending -= 1;
+    }
   });
 }
 
