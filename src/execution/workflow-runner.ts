@@ -98,6 +98,7 @@ import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
 import {
   recallWorkflowPatterns,
   recordSuccessfulWorkflowPattern,
+  recordFailedWorkflowPattern,
   renderWorkflowPatternHint,
 } from '../memory/workflow-pattern-store.js';
 import { compileWorkflowStepsToGraph } from './workflow-graph.js';
@@ -5550,6 +5551,11 @@ async function processOneRunFile(
             logger.warn({ workflow: workflow.name, err: err instanceof Error ? err.message : String(err) }, 'clean-run contract tightening skipped');
           }
         }
+      } else if (needsAttention && !run.targetStepId) {
+        // Pattern quality (learning): this run needed attention — penalize the
+        // workflow's learned pattern so a since-degraded workflow stops being
+        // recalled as a confident hint until it succeeds cleanly again.
+        try { recordFailedWorkflowPattern({ workflow: workflow.data, workflowSlug: workflow.name }); } catch { /* best-effort */ }
       }
       const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
       const escalationBanner = autoHealPaused

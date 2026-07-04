@@ -11,6 +11,8 @@ const {
   listWorkflowPatterns,
   recallWorkflowPatterns,
   recordSuccessfulWorkflowPattern,
+  recordFailedWorkflowPattern,
+  isPatternHealthy,
   renderWorkflowPatternHint,
 } = await import('./workflow-pattern-store.js');
 
@@ -70,4 +72,42 @@ test('records and recalls clean workflow patterns', () => {
 test('misses unrelated workflow intents conservatively', () => {
   const matches = recallWorkflowPatterns('book a restaurant reservation', 2);
   assert.equal(matches.length, 0);
+});
+
+// ─── pattern quality / decay (learning) ──────────────────────────────────────
+
+test('isPatternHealthy: net-positive with latest outcome clean → healthy; degraded → not', () => {
+  const base = { objective: 'o', workflowName: 'w', workflowSlug: 'w', lastRunId: 'r', tools: [], steps: [], body: '', filePath: 'p' };
+  assert.equal(isPatternHealthy({ ...base, successCount: 3, lastSuccessAt: '2026-07-04' } as never), true);
+  // no successes → not healthy
+  assert.equal(isPatternHealthy({ ...base, successCount: 0, lastSuccessAt: '' } as never), false);
+  // fails as often as it succeeds → not healthy
+  assert.equal(isPatternHealthy({ ...base, successCount: 2, failureCount: 2, lastSuccessAt: '2026-07-04' } as never), false);
+  // most recent outcome was a FAILURE → not healthy (even if net-positive)
+  assert.equal(isPatternHealthy({ ...base, successCount: 3, failureCount: 1, lastSuccessAt: '2026-07-01', lastFailureAt: '2026-07-05' } as never), false);
+  // a later success recovers it
+  assert.equal(isPatternHealthy({ ...base, successCount: 4, failureCount: 1, lastSuccessAt: '2026-07-06', lastFailureAt: '2026-07-05' } as never), true);
+});
+
+test('a degraded pattern drops out of recall until it succeeds again', () => {
+  const wf = {
+    name: 'Nightly Lead Sync', description: 'Sync new leads from the CRM into the tracker',
+    enabled: true, trigger: { manual: true }, steps: [{ id: 'sync', prompt: 'sync leads', sideEffect: 'write' }],
+  };
+  recordSuccessfulWorkflowPattern({ workflow: wf as never, workflowSlug: 'nightly-lead-sync', runId: 'r1', finalOutput: 'synced 12 leads' });
+  // recallable while healthy
+  assert.ok(recallWorkflowPatterns('sync new leads from the crm into the tracker', 3).some((m) => m.record.workflowName === 'Nightly Lead Sync'));
+
+  // it now fails → penalized → drops out of recall
+  recordFailedWorkflowPattern({ workflow: wf as never, workflowSlug: 'nightly-lead-sync' });
+  assert.equal(recallWorkflowPatterns('sync new leads from the crm into the tracker', 3).some((m) => m.record.workflowName === 'Nightly Lead Sync'), false);
+
+  // a fresh clean run recovers it (latest outcome clean again)
+  recordSuccessfulWorkflowPattern({ workflow: wf as never, workflowSlug: 'nightly-lead-sync', runId: 'r2', finalOutput: 'synced 9 leads' });
+  assert.ok(recallWorkflowPatterns('sync new leads from the crm into the tracker', 3).some((m) => m.record.workflowName === 'Nightly Lead Sync'));
+});
+
+test('recordFailedWorkflowPattern is a no-op when nothing was learned yet', () => {
+  const wf = { name: 'Never Learned', description: 'a workflow with no learned pattern', enabled: true, trigger: { manual: true }, steps: [] };
+  assert.equal(recordFailedWorkflowPattern({ workflow: wf as never, workflowSlug: 'never-learned' }), null);
 });
