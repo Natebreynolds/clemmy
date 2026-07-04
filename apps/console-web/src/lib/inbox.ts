@@ -1,15 +1,19 @@
 import { apiGet, apiPost } from './api';
+import type { PendingActionApprovalView } from './types';
 
 export interface ApprovalRow {
   approvalId: string;
   sessionId?: string | null;
   subject: string;
+  summary?: string;
+  reason?: string;
   tool?: string | null;
   args?: unknown;
   status: string;
   requestedAt?: string;
   expiresAt?: string;
   kind?: string;
+  pendingAction?: PendingActionApprovalView;
 }
 
 export interface RunRow {

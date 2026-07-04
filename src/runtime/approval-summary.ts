@@ -66,9 +66,11 @@ export function summarizeApprovalAction(approval: PendingApproval): string {
       // or relying on the model to remember to populate preview.
       const subject = pickString(args, ['subject']);
       const reason = pickString(args, ['reason']);
+      const pendingActionId = pickString(args, ['pendingActionId', 'pending_action_id']);
       const explicit = args.preview as ApprovalPreview | undefined | null;
       const preview = explicit ?? autoInferPreview(approval);
       const lines: string[] = [];
+      if (pendingActionId) lines.push(`Queued action: \`${trim(pendingActionId, 80)}\``);
       if (subject) lines.push(trim(subject, 240));
       if (reason) lines.push(`_Why:_ ${trim(reason, 240)}`);
       if (preview) {

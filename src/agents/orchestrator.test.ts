@@ -223,6 +223,13 @@ test('Orchestrator is now the single agent — carries the union of all action t
     // (regression guard: these were registered but omitted from discoveryTools,
     // so the dock self-reported "space_save is not exposed in this run").
     'space_save', 'space_refresh', 'space_get', 'space_edit_view', 'space_list',
+    // Team-agent coordination — same allowlist-omission class as Spaces/workflows.
+    // These are registered local tools; the chat orchestrator must expose them so
+    // "create two agents and delegate" does not fall back to raw files/shell.
+    'team_list', 'team_request', 'create_agent', 'update_agent', 'delegate_task', 'check_delegation',
+    // Pending-action queue — prepare exact approval-bound payloads before asking
+    // once and executing after approval.
+    'pending_action_queue', 'pending_action_list', 'pending_action_get', 'pending_action_record_result',
     // Tasks + goals + executions
     'task_list', 'task_add', 'task_update',
     'goal_get', 'goal_update',
@@ -314,6 +321,7 @@ test('JIT classification guard: every rubric-named built-in is consciously CORE 
     'hold_task_for_later', 'resume_held_task',
     'workspace_config', 'workspace_list', 'workspace_info',
     'goal_update',
+    'create_agent', 'update_agent', 'team_request', 'delegate_task',
   ]);
   const mentioned = new Set<string>();
   for (const m of String(ORCHESTRATOR_INSTRUCTIONS).matchAll(/`([a-z][a-z0-9_]+)(?:\([^`]*)?`/g)) {
@@ -696,6 +704,7 @@ test('request_approval execute carries auto-approval reason when the action was 
       reason: 'User preference',
       destructive: false,
       preview: null,
+      pendingActionId: null,
     },
     { sessionId: sess.id, turn: 1 },
   );
@@ -754,7 +763,7 @@ test('request_approval execute returns an "approved" acknowledgement after resum
   const t = buildRequestApprovalTool();
   const result = await invokeFunctionTool(
     t,
-    { subject: 'deploy to prod', reason: 'staging green', destructive: true, preview: null },
+    { subject: 'deploy to prod', reason: 'staging green', destructive: true, preview: null, pendingActionId: null },
     { sessionId: sess.id, turn: 3 },
   );
   assert.match(result, /Approved: deploy to prod/);
@@ -783,6 +792,7 @@ test('request_approval execute opens a slug-scoped plan scope for Outlook draft 
           },
         ],
       },
+      pendingActionId: null,
     },
     { sessionId: sess.id, turn: 4 },
   );

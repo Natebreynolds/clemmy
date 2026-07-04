@@ -61,10 +61,16 @@ test('defaultClaudeAgentSdkAllowedLocalTools is conservative unless explicitly o
     assert.ok(defaults.includes('memory_search'));
     assert.ok(defaults.includes('memory_remember'));
     assert.ok(defaults.includes('read_file'));
+    assert.ok(defaults.includes('team_list'));
+    assert.ok(defaults.includes('team_pending_requests'));
+    assert.ok(defaults.includes('check_delegation'));
+    assert.ok(defaults.includes('pending_action_list'));
+    assert.ok(defaults.includes('pending_action_get'));
     assert.equal(defaults.includes('run_shell_command'), false);
     assert.equal(defaults.includes('write_file'), false);
     assert.equal(defaults.includes('composio_execute_tool'), false);
     assert.equal(defaults.includes('workflow_create'), false);
+    assert.equal(defaults.includes('create_agent'), false);
     assert.deepEqual(defaults, [...CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS]);
 
     const authoring = defaultClaudeAgentSdkAllowedLocalTools('local_authoring');
@@ -72,9 +78,15 @@ test('defaultClaudeAgentSdkAllowedLocalTools is conservative unless explicitly o
     assert.ok(authoring.includes('workflow_run'));
     assert.ok(authoring.includes('set_model_role'));
     assert.ok(authoring.includes('memory_remember'));
+    assert.ok(authoring.includes('create_agent'));
+    assert.ok(authoring.includes('team_request'));
+    assert.ok(authoring.includes('delegate_task'));
+    assert.ok(authoring.includes('pending_action_queue'));
+    assert.ok(authoring.includes('pending_action_record_result'));
     assert.equal(authoring.includes('run_shell_command'), false);
     assert.equal(authoring.includes('write_file'), false);
     assert.equal(authoring.includes('composio_execute_tool'), false);
+    assert.equal(authoring.includes('delete_agent'), false);
     assert.deepEqual(authoring, [...new Set(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS)]);
 
     process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS = 'ping, memory_search';

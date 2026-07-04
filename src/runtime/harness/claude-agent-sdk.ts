@@ -259,6 +259,11 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'dispatch_background_task',
   'hold_task_for_later',
   'resume_held_task',
+  'team_list',
+  'team_pending_requests',
+  'check_delegation',
+  'pending_action_list',
+  'pending_action_get',
   'skill_list',
   'skill_read',
   'tool_choice_recall',
@@ -318,6 +323,20 @@ export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
   // space_publish exports a static share-ready snapshot into the workspace's
   // own publish/ dir (local write only; the deploy step is separately gated).
   'space_publish',
+  // Durable team-agent coordination is local Clementine state. Keep these in
+  // the full/local-authoring brain profile so Claude can create and hand off
+  // work through the same substrate as Codex/GLM.
+  'team_message',
+  'team_request',
+  'team_reply',
+  'agent_propose',
+  'create_agent',
+  'update_agent',
+  'delegate_task',
+  // Pending-action queue is local state: it prepares an exact payload and asks
+  // once before the separately gated execution tool runs.
+  'pending_action_queue',
+  'pending_action_record_result',
 ] as const;
 
 // Mutating tools exposed through the harness gate chain (gated-mutating-tools.ts)

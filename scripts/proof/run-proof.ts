@@ -25,9 +25,11 @@ import { cronReportBack } from './scenarios/cron-report-back.js';
 import { gatedMutation } from './scenarios/gated-mutation.js';
 import { converseFirst } from './scenarios/converse-first.js';
 import { workspaceBuild } from './scenarios/workspace-build.js';
+import { teamAgentHandoff } from './scenarios/team-agent-handoff.js';
+import { pendingActionGate } from './scenarios/pending-action-gate.js';
 import type { BrainKind, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
-const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst, workspaceBuild];
+const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst, workspaceBuild, teamAgentHandoff, pendingActionGate];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
 function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDef[]; scoreOnly?: string; keep: boolean } {

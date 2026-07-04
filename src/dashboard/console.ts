@@ -20264,7 +20264,10 @@ const CONSOLE_JS = `
           const subj = (ev.data && (ev.data.subject || ev.data.tool)) || 'action';
           const reason = (ev.data && ev.data.reason) || '';
           const apr = ev.data && typeof ev.data.approvalId === 'string' ? ev.data.approvalId : null;
-          setChatTurnApproval(turn, { subject: subj, reason, approvalId: apr }, sessionId, options);
+          const pendingAction = ev.data && ev.data.pendingAction && typeof ev.data.pendingAction === 'object'
+            ? ev.data.pendingAction
+            : null;
+          setChatTurnApproval(turn, { subject: subj, reason, approvalId: apr, pendingAction }, sessionId, options);
           setChatTurnStatus(turn, 'awaiting approval');
           // Voice tells the user it needs approval (parity with chat).
           if (options && options.onPrompt) options.onPrompt({ kind: 'approval', text: reason ? (subj + ': ' + reason) : subj });
@@ -20516,9 +20519,14 @@ const CONSOLE_JS = `
     const body = turn?.querySelector?.('[data-home-chat-turn-text]');
     if (!body) return;
     body.textContent = '';
+    const pendingAction = approval.pendingAction && typeof approval.pendingAction === 'object'
+      ? approval.pendingAction
+      : null;
 
     const title = document.createElement('div');
-    title.textContent = 'Approval required: ' + (approval.subject || 'action');
+    title.textContent = pendingAction
+      ? 'Ready to execute: ' + (pendingAction.title || pendingAction.id || 'queued action')
+      : 'Approval required: ' + (approval.subject || 'action');
     body.appendChild(title);
 
     if (approval.reason) {
@@ -20526,6 +20534,13 @@ const CONSOLE_JS = `
       reason.style.marginTop = '8px';
       reason.textContent = approval.reason;
       body.appendChild(reason);
+    }
+
+    if (pendingAction) {
+      const queued = document.createElement('div');
+      queued.style.marginTop = '8px';
+      queued.innerHTML = renderPendingActionHtml(pendingAction);
+      body.appendChild(queued);
     }
 
     const hint = document.createElement('div');
@@ -20540,7 +20555,7 @@ const CONSOLE_JS = `
 
     const approve = document.createElement('button');
     approve.type = 'button';
-    approve.textContent = 'Approve';
+    approve.textContent = pendingAction ? 'Execute queued action' : 'Approve';
     approve.addEventListener('click', () => {
       resumeHarnessApprovalFromButton(approve, 'approve', approval.approvalId, sessionId, turn, options);
     });
@@ -23605,6 +23620,32 @@ const CONSOLE_JS = `
     ].join('');
   }
 
+  function renderPendingActionHtml(action) {
+    if (!action || typeof action !== 'object') return '';
+    let payload = '';
+    try {
+      payload = JSON.stringify(action.payload, null, 2);
+    } catch {
+      payload = String(action.payload || '');
+    }
+    const meta = [
+      action.toolName ? 'tool: <code>' + escMem(action.toolName) + '</code>' : '',
+      action.targetSummary ? 'target: <strong>' + escMem(action.targetSummary) + '</strong>' : '',
+      action.payloadHash ? 'hash: <code>' + escMem(action.payloadHash) + '</code>' : '',
+    ].filter(Boolean).join(' · ');
+    return [
+      '<div class="approval-preview">',
+      '  <div class="approval-preview-count">READY TO EXECUTE</div>',
+      action.summary ? '  <div>' + escMem(action.summary) + '</div>' : '',
+      meta ? '  <div class="approval-preview-note">' + meta + '</div>' : '',
+      action.preview ? '  <div class="approval-preview-note">preview: ' + escMem(action.preview) + '</div>' : '',
+      action.risk ? '  <div class="approval-preview-note">risk: ' + escMem(action.risk) + '</div>' : '',
+      action.rollback ? '  <div class="approval-preview-note">rollback: ' + escMem(action.rollback) + '</div>' : '',
+      payload ? '  <details class="approval-details"><summary>exact queued payload</summary><pre class="approval-args">' + escMem(payload) + '</pre></details>' : '',
+      '</div>',
+    ].join('');
+  }
+
   async function refreshApprovalsPanel() {
     const listEl = document.querySelector('[data-approvals-list]');
     if (!listEl) return;
@@ -23631,6 +23672,9 @@ const CONSOLE_JS = `
         const reason = a.reason || '';
         const source = a.sourceTitle ? (a.sourceKind ? a.sourceKind + ': ' : '') + a.sourceTitle : '';
         const previewHtml = renderApprovalPreview(a.preview);
+        const pendingAction = a.pendingAction && typeof a.pendingAction === 'object' ? a.pendingAction : null;
+        const pendingActionHtml = renderPendingActionHtml(pendingAction);
+        const approveLabel = pendingAction ? 'EXECUTE' : 'APPROVE';
         const mismatchBanner = fingerprint && fingerprint.result === 'mismatch'
           ? [
               '  <div class="approval-mismatch">',
@@ -23653,6 +23697,7 @@ const CONSOLE_JS = `
           '  </div>',
           mismatchBanner,
           reason ? '  <div class="approval-reason"><span>WHY</span>' + escMem(reason) + '</div>' : '',
+          pendingActionHtml,
           previewHtml,
           '  <div class="approval-meta">tool: <code>' + escMem(a.tool || 'unknown') + '</code>',
           workflow ? ' · workflow: <code>' + escMem(workflow) + '</code>' : '',
@@ -23661,7 +23706,7 @@ const CONSOLE_JS = `
           ' · <span class="approval-kind-pill ' + kind + '">' + (kind === 'runtime' ? 'runtime' : 'tool') + '</span></div>',
           argsRendered ? '  <details class="approval-details"><summary>raw request details</summary><pre class="approval-args">' + escMem(argsRendered) + '</pre></details>' : '',
           '  <div class="approval-actions">',
-          '    <button class="approve" data-approval-action="approve">APPROVE</button>',
+          '    <button class="approve" data-approval-action="approve">' + approveLabel + '</button>',
           '    <button class="reject" data-approval-action="reject">REJECT</button>',
           kind === 'harness' ? '    <button data-approval-action="cancel">CANCEL RUN</button>' : '',
           '  </div>',

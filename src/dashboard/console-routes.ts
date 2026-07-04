@@ -255,6 +255,10 @@ import { debateMode, judgeChoice, fusionStrategy, debateBrainsAvailable, verifyJ
 import { getJudgeMetricsSnapshot } from '../runtime/harness/judge-family.js';
 import { summarizeApprovalAction, extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import {
+  pendingActionApprovalViewFromArgs,
+  type PendingActionApprovalView,
+} from '../runtime/harness/pending-action-view.js';
+import {
   listOperationalEvents,
   isOperationalEventType,
   type ListOperationalEventsOptions,
@@ -1252,6 +1256,7 @@ interface BoardCard {
   /** Slice 2: the draft body + image of a CONTENT approval (a post/email), so it
    *  is reviewed in place in the Approvals card instead of a one-line summary. */
   contentPreview?: ApprovalContentPreview;
+  pendingAction?: PendingActionApprovalView;
   artifactSummary?: BoardArtifactSummary;
   failureSummary?: BoardFailureSummary;
   /** A finished/parked task idle past the stale threshold (background only) — the
@@ -6002,6 +6007,7 @@ export function registerConsoleRoutes(
           reason: approvalReasonFromArgs(r.args ?? undefined),
           preview,
           contentPreview: extractApprovalContentPreview(r.tool, r.args ?? undefined),
+          pendingAction: pendingActionApprovalViewFromArgs(r.args),
           sourceTitle: undefined as string | undefined,
           sourceKind: undefined as string | undefined,
           tool: r.tool,
@@ -6035,6 +6041,7 @@ export function registerConsoleRoutes(
           summary: approvalSummaryFromArgs(args, summarizeApprovalAction(approval)),
           reason: approvalReasonFromArgs(args),
           preview: normalizeApprovalPreview(args?.preview),
+          pendingAction: pendingActionApprovalViewFromArgs(args),
           sourceTitle: task?.title,
           sourceKind: task ? 'background task' : undefined,
           tool: approval.toolName,
@@ -6470,6 +6477,7 @@ export function registerConsoleRoutes(
             ? 'Approve or reject; the workflow runner resumes the parked step.'
             : 'Approve or reject; Clementine resumes the paused run.',
           contentPreview: extractApprovalContentPreview(row.tool, row.args ?? undefined),
+          pendingAction: pendingActionApprovalViewFromArgs(row.args),
           raw: {
             approvalKind: 'harness',
             tool: row.tool,
@@ -6506,6 +6514,7 @@ export function registerConsoleRoutes(
           approvalId: approval.id,
           nextSafeAction: 'Approve or reject; Clementine resumes the paused runtime approval.',
           contentPreview: extractApprovalContentPreview(approval.toolName, args),
+          pendingAction: pendingActionApprovalViewFromArgs(args),
           raw: { approvalKind: 'runtime', tool: approval.toolName, reason: approvalReasonFromArgs(args) },
         });
       }

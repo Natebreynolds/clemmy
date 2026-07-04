@@ -2,6 +2,7 @@ import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sd
 import * as approvalRegistry from './approval-registry.js';
 import { isExpired } from './approval-registry.js';
 import { appendEvent } from './eventlog.js';
+import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
 import { addNotification } from '../notifications.js';
 import { decideToolApproval, needsApprovalFromTaxonomy } from '../../agents/tool-taxonomy.js';
 import { needsApprovalForShellSmart, needsApprovalForWriteFile } from '../../tools/computer-tools.js';
@@ -96,7 +97,13 @@ function surfaceApproval(
     });
   }
   try {
-    appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'approval_requested', data: { tool, subject, args, approvalId } });
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'Clem',
+      type: 'approval_requested',
+      data: { tool, subject, args, pendingAction: pendingActionApprovalViewFromArgs(args), approvalId },
+    });
   } catch {
     /* best-effort: the registry row is the source of truth */
   }

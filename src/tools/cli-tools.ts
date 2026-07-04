@@ -61,9 +61,17 @@ export function registerCliTools(server: McpServer): void {
         const likely = entry.isLikelyCli ? '' : '\n(no --version or --help output — binary exists but did not identify itself as a CLI)';
         return textResult(`1 CLI on $PATH:\n${entry.command} (${entry.path})${v}${help}${likely}`);
       }
+      const cached = readCachedScan();
+      if (!refresh && !cached && !exactFilter) {
+        return textResult([
+          'No cached full CLI scan is available yet, and an unfiltered scan can be slow.',
+          'If you need a specific command-line program, call local_cli_list again with an exact filter such as "gh", "sf", or "aws".',
+          'If the needed capability is already a Clementine built-in tool in your schema, skip CLI discovery and call that tool directly.',
+        ].join('\n'));
+      }
       const scan = refresh
         ? await getOrRefreshScan({ force: true })
-        : (readCachedScan() ?? await getOrRefreshScan());
+        : (cached ?? await getOrRefreshScan());
       const entries = filterClis(scan, filter);
       const saved = getSavedClis();
       const savedMatch = filter ? saved.filter((s) => s.includes(filter.toLowerCase())) : saved;

@@ -33,6 +33,7 @@ const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { CRON_TRIGGERS_DIR, WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { queuePendingAction } = await import('../runtime/harness/pending-actions.js');
 const { appendEvent: appendHarnessEvent, createSession: createHarnessSession } = await import('../runtime/harness/eventlog.js');
 const { listNotifications } = await import('../runtime/notifications.js');
 
@@ -55,7 +56,12 @@ async function boot(authorized = { v: true }) {
   app.use(express.json());
   // The board route uses only isAuthorized + the background-task store; the
   // assistant is touched only by the `promote` action (not exercised here).
-  registerConsoleRoutes(app, () => authorized.v, {} as never, { serveLegacyAtRoot: false });
+  const assistant = {
+    getRuntime: () => ({
+      listPendingApprovals: () => [],
+    }),
+  };
+  registerConsoleRoutes(app, () => authorized.v, assistant as never, { serveLegacyAtRoot: false });
   const server: Server = await new Promise((resolve) => {
     const s = createServer(app);
     s.listen(0, '127.0.0.1', () => resolve(s));
@@ -167,6 +173,62 @@ test('GET /api/console/board surfaces standalone pending approvals as actionable
     assert.equal(card!.primaryAction, 'approve');
     assert.equal(card!.approvalId, approval.approvalId);
     assert.deepEqual(card!.actions, ['approve', 'reject']);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/approvals/list joins queued pending-action payloads', async () => {
+  createHarnessSession({ id: 'sess-pending-action-approval', kind: 'chat', channel: 'desktop' });
+  const payload = {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: { to: 'proof@example.com', subject: 'Ready', body: 'Queued only' },
+  };
+  const action = queuePendingAction({
+    title: 'Send queued proof email',
+    summary: 'Prepared Gmail send; waiting for the final human execute gate.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload,
+    targetSummary: 'proof@example.com',
+    preview: 'Subject: Ready',
+    risk: 'Would send one email.',
+    rollback: 'Cannot unsend.',
+    sessionId: 'sess-pending-action-approval',
+  });
+  const approval = approvalRegistry.register({
+    sessionId: 'sess-pending-action-approval',
+    channel: 'desktop',
+    subject: 'Execute queued proof email?',
+    tool: 'request_approval',
+    args: { pendingActionId: action.id, preview: 'Subject: Ready' },
+  });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/approvals/list`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      approvals: Array<{
+        approvalId: string;
+        pendingAction?: {
+          id: string;
+          title: string;
+          toolName: string;
+          targetSummary: string;
+          payloadHash: string;
+          payload: unknown;
+        };
+      }>;
+    };
+    const row = body.approvals.find((a) => a.approvalId === approval.approvalId);
+    assert.ok(row, 'approval row returned');
+    assert.equal(row!.pendingAction?.id, action.id);
+    assert.equal(row!.pendingAction?.title, 'Send queued proof email');
+    assert.equal(row!.pendingAction?.toolName, 'composio_execute_tool');
+    assert.equal(row!.pendingAction?.targetSummary, 'proof@example.com');
+    assert.equal(row!.pendingAction?.payloadHash, action.payloadHash);
+    assert.deepEqual(row!.pendingAction?.payload, payload);
   } finally {
     await h.close();
   }

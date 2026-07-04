@@ -248,6 +248,9 @@ const requestApprovalParams = z.object({
     .describe(
       'Optional content preview for the approval card. STRONGLY RECOMMENDED for batch actions (send N emails, update N rows). Workflow authors: always pass this when the subject + reason alone do not convey the actual content.',
     ),
+  pendingActionId: z.string()
+    .nullable()
+    .describe('Optional id from pending_action_queue. Use this when the exact action payload is already queued and the user is approving execution of that queued action.'),
 });
 
 /**
@@ -348,6 +351,27 @@ function openRequestApprovalScope(args: RequestApprovalArgs, runContext: unknown
   return allowedComposioSlugs;
 }
 
+async function markPendingActionApprovedFromRequest(args: RequestApprovalArgs): Promise<string> {
+  const pendingActionId = args.pendingActionId?.trim();
+  if (!pendingActionId) return '';
+  try {
+    const { getPendingAction, markPendingActionApprovalResolved } = await import('../runtime/harness/pending-actions.js');
+    markPendingActionApprovalResolved(pendingActionId, 'approved');
+    const record = getPendingAction(pendingActionId);
+    if (!record) {
+      return ` Queued action ${pendingActionId} is approved, but the queue record could not be read; do not reconstruct it from memory.`;
+    }
+    return [
+      ` Queued action ${record.id} is approved.`,
+      `Execute ONLY the exact queued payload for ${record.toolName} (payload hash ${record.payloadHash}); do not reconstruct it from memory.`,
+      `Call pending_action_get if the payload is not already in context, then call pending_action_record_result after execution.`,
+    ].join(' ');
+  } catch {
+    // Approval is authoritative; pending-action status mirroring is best-effort.
+    return '';
+  }
+}
+
 export function buildRequestApprovalTool() {
   return tool({
     name: 'request_approval',
@@ -369,16 +393,19 @@ export function buildRequestApprovalTool() {
     },
     execute: async (args, runContext) => {
       if (isLocalSaveApproval(args)) {
-        return `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.`;
+        const pendingActionText = await markPendingActionApprovedFromRequest(args);
+        return `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.${pendingActionText}`;
       }
       if (isYoloAutoApprovalPolicy()) {
-        return `Auto-approved by YOLO mode: ${args.subject}. Proceed with the action you described.`;
+        const pendingActionText = await markPendingActionApprovedFromRequest(args);
+        return `Auto-approved by YOLO mode: ${args.subject}. Proceed with the action you described.${pendingActionText}`;
       }
+      const pendingActionText = await markPendingActionApprovedFromRequest(args);
       const scopedSlugs = openRequestApprovalScope(args, runContext);
       const scopeText = scopedSlugs.length > 0
         ? ` Approved scope opened for ${scopedSlugs.join(', ')} in this session, so matching concrete tool calls should not ask again.`
         : '';
-      return `Approved: ${args.subject}. Proceed with the action you described.${scopeText}`;
+      return `Approved: ${args.subject}. Proceed with the action you described.${pendingActionText}${scopeText}`;
     },
   });
 }
@@ -1121,6 +1148,27 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // commits a known inline dataset. byName no-ops when spaces off.
       'space_try_runner',
       'space_set_data',
+      // Team-agent coordination — durable local specialists + request/delegation
+      // queues. These tools are registered in the local runtime, but the chat
+      // orchestrator must explicitly carry them on its curated surface; otherwise
+      // team-agent requests degrade into shell/file spelunking.
+      'team_list',
+      'team_message',
+      'team_request',
+      'team_pending_requests',
+      'team_reply',
+      'agent_propose',
+      'create_agent',
+      'update_agent',
+      'delegate_task',
+      'check_delegation',
+      // Pending-action queue — the "ready to execute?" substrate. The model
+      // prepares exact irreversible/external payloads here, asks once, then
+      // executes the queued payload after approval.
+      'pending_action_queue',
+      'pending_action_list',
+      'pending_action_get',
+      'pending_action_record_result',
       // Shell (approval-gated by taxonomy for mutating commands)
       'run_shell_command',
       // Code Mode (Lane C) — programmatic tool calling. byName no-ops to undefined

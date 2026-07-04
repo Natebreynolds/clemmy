@@ -1,10 +1,21 @@
-import { Check, X } from 'lucide-react';
+import { Check, Send, X } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import type { ChatMessage } from '@/lib/useChat';
+
+function PayloadPreview({ value }: { value: unknown }) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  if (!text) return null;
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer text-caption font-semibold text-muted">Exact queued payload</summary>
+      <pre className="mt-1 max-h-44 overflow-auto rounded-md bg-subtle p-2 font-mono text-caption text-muted">{text}</pre>
+    </details>
+  );
+}
 
 function ThinkingDots() {
   return (
@@ -45,6 +56,7 @@ export function ChatBubble({
   }
 
   const thinking = message.status === 'thinking';
+  const pendingAction = message.approval?.pendingAction;
   return (
     <div className="flex gap-3">
       <DogMark size={28} className="mt-0.5 self-start" />
@@ -78,11 +90,27 @@ export function ChatBubble({
           {(message.status === 'awaiting-approval' || message.status === 'awaiting-plan') && (
             <div className="mt-3 rounded-md border border-warning/40 bg-warning-tint p-3">
               <p className="text-small font-semibold text-fg">
-                {message.status === 'awaiting-plan' ? 'Approve this plan to continue?' : `Approve: ${message.approval?.subject ?? 'this action'}`}
+                {message.status === 'awaiting-plan'
+                  ? 'Approve this plan to continue?'
+                  : pendingAction
+                    ? `Ready to execute: ${pendingAction.title}`
+                    : `Approve: ${message.approval?.subject ?? 'this action'}`}
               </p>
+              {pendingAction && (
+                <div className="mt-1 space-y-0.5 text-caption text-muted">
+                  <div>Tool: <span className="font-mono">{pendingAction.toolName}</span></div>
+                  {pendingAction.targetSummary && <div>Target: {pendingAction.targetSummary}</div>}
+                  {pendingAction.preview && <div className="whitespace-pre-wrap">Preview: {pendingAction.preview}</div>}
+                  {pendingAction.payloadHash && <div>Payload hash: <span className="font-mono">{pendingAction.payloadHash}</span></div>}
+                </div>
+              )}
               {message.approval?.reason && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
+              {pendingAction && <PayloadPreview value={pendingAction.payload} />}
               <div className="mt-2.5 flex gap-2">
-                <Button size="sm" onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> Approve</Button>
+                <Button size="sm" onClick={onApprove}>
+                  {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
+                  {pendingAction ? 'Execute queued action' : 'Approve'}
+                </Button>
                 <Button size="sm" variant="secondary" onClick={onReject}><X className="h-4 w-4" aria-hidden /> Not now</Button>
               </div>
             </div>

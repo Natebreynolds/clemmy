@@ -18,6 +18,26 @@ export interface ChatPostResult {
   sinceSeq?: number;
 }
 
+export interface PendingActionApprovalView {
+  id: string;
+  title: string;
+  summary: string;
+  kind: string;
+  status: string;
+  toolName: string;
+  targetSummary: string;
+  preview: string;
+  risk: string;
+  rollback: string;
+  payload: unknown;
+  payloadHash: string;
+  idempotencyKey: string;
+  approvalId: string | null;
+  resultSummary: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** A "Needs you" / "Working now" / "Recent" row from the command center. */
 export interface CommandCenterItem {
   kind?: string;

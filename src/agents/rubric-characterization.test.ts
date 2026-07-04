@@ -31,11 +31,11 @@ const GOLDEN = {
   // 2026-06-28 (Inc A): OFFER BACKGROUND line now routes via the structured
   // `offer_background` tool → background / hold_task_for_later / now (both lanes:
   // HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
-  instructions: { len: 36370, sha16: '9c57dae779c73f50' },
-  native: { len: 35135, sha16: 'f0ba7753baa96a15' },
-  claudeBrain: { len: 4676, sha16: '5ea8acff93c8e07f' },
+  instructions: { len: 36547, sha16: 'aa7d70ea1fc38652' },
+  native: { len: 35312, sha16: 'd5f7444d3490299e' },
+  claudeBrain: { len: 4813, sha16: 'fa006f0bbc934c99' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8489, sha16: 'ec235a5240caaf97' },
+  lean: { len: 8651, sha16: '459c05c40e15f069' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

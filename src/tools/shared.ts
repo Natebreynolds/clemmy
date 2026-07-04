@@ -39,6 +39,7 @@ export const AGENTS_DIR = path.join(SYSTEM_DIR, 'agents');
 export const TEAM_COMMS_LOG = path.join(BASE_DIR, 'logs', 'team-comms.jsonl');
 export const TEAM_REQUESTS_DIR = path.join(BASE_DIR, 'team-requests');
 export const DELEGATIONS_DIR = path.join(BASE_DIR, 'delegations');
+export const PENDING_ACTIONS_DIR = path.join(BASE_DIR, 'pending-actions');
 export const AGENT_STATE_DIR = path.join(BASE_DIR, 'agents-state');
 export const AGENT_INBOX_DIR = path.join(BASE_DIR, 'agents-inbox');
 export { INBOX_DIR };
@@ -154,6 +155,7 @@ export function ensureToolDirectories(): void {
   ensureDir(path.dirname(TEAM_COMMS_LOG));
   ensureDir(TEAM_REQUESTS_DIR);
   ensureDir(DELEGATIONS_DIR);
+  ensureDir(PENDING_ACTIONS_DIR);
   ensureDir(AGENT_STATE_DIR);
   ensureDir(AGENT_INBOX_DIR);
   ensureDir(path.join(BASE_DIR, 'state'));

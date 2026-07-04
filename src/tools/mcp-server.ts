@@ -12,6 +12,7 @@ import { registerGoalTools } from './goal-tools.js';
 import { registerAdminTools } from './admin-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
+import { registerPendingActionTools } from './pending-action-tools.js';
 import { registerAgentRunsTools } from './agent-runs-tools.js';
 import { registerAutonomyActionTools } from './autonomy-action-tools.js';
 import { registerBackgroundTaskTools } from './background-task-tools.js';
@@ -124,6 +125,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerAdminTools(server);
   registerTeamTools(server);
   registerOrchestrationTools(server);
+  registerPendingActionTools(server);
   registerAgentRunsTools(server);
   registerBackgroundTaskTools(server);
   registerWorkerTools(server);

@@ -13,6 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const reg = await import('./approval-registry.js');
+const pending = await import('./pending-actions.js');
 const { createSession, closeEventLog, openEventLog } = await import('./eventlog.js');
 const { addNotification, listNotifications } = await import('../notifications.js');
 
@@ -22,6 +23,7 @@ test.beforeEach(() => {
   // prior tests. The sessions stay (cheap, FK target for the registry).
   const db = openEventLog();
   db.prepare('DELETE FROM pending_approvals').run();
+  rmSync(path.join(TMP_HOME, 'pending-actions'), { recursive: true, force: true });
 });
 
 test.after(() => {
@@ -119,6 +121,31 @@ test('resolve marks matching approval notifications read', () => {
   const notification = listNotifications(20).find((item) => item.id === `approval-${r.approvalId}`);
   assert.equal(notification?.read, true);
   assert.equal(notification?.metadata?.approvalResolution, 'approved');
+});
+
+test('register/resolve mirror pendingActionId status into the pending-action queue', () => {
+  const session = createSession({ kind: 'chat' });
+  const action = pending.queuePendingAction({
+    title: 'Send queued proof',
+    summary: 'Prepared proof email.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    sessionId: session.id,
+  });
+
+  const row = reg.register({
+    sessionId: session.id,
+    subject: 'Send queued proof',
+    tool: 'request_approval',
+    args: { pendingActionId: action.id, destructive: false },
+  });
+  assert.equal(pending.getPendingAction(action.id)?.status, 'approval_requested');
+  assert.equal(pending.getPendingAction(action.id)?.approvalId, row.approvalId);
+
+  const result = reg.resolve(row.approvalId, 'approved', 'unit-test');
+  assert.equal(result.ok, true);
+  assert.equal(pending.getPendingAction(action.id)?.status, 'approved');
 });
 
 test('resolve reports not_found for unknown ids', () => {

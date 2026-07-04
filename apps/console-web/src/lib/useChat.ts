@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { postChat, runHarnessStream, cancelSession, humanHarnessText, type StreamHandle } from './chat';
 import type { ApiError } from './api';
-import type { HarnessEvent } from './types';
+import type { HarnessEvent, PendingActionApprovalView } from './types';
 
 export type MessageStatus =
   | 'thinking' | 'complete' | 'failed' | 'stopped'
@@ -13,7 +13,7 @@ export interface ChatMessage {
   text: string;
   status?: MessageStatus;
   progress?: string;
-  approval?: { subject: string; reason?: string; approvalId?: string | null };
+  approval?: { subject: string; reason?: string; approvalId?: string | null; pendingAction?: PendingActionApprovalView };
   planProposalId?: string;
   attachmentNames?: string[];
 }
@@ -40,6 +40,32 @@ function progressLabel(ev: HarnessEvent): string | null {
     case 'memory_signals_captured': return 'Learning from this…';
     default: return null;
   }
+}
+
+function pendingActionFromEvent(value: unknown): PendingActionApprovalView | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Partial<PendingActionApprovalView>;
+  if (typeof record.id !== 'string' || !record.id) return undefined;
+  if (typeof record.toolName !== 'string' || !record.toolName) return undefined;
+  return {
+    id: record.id,
+    title: typeof record.title === 'string' ? record.title : record.id,
+    summary: typeof record.summary === 'string' ? record.summary : '',
+    kind: typeof record.kind === 'string' ? record.kind : 'other',
+    status: typeof record.status === 'string' ? record.status : 'queued',
+    toolName: record.toolName,
+    targetSummary: typeof record.targetSummary === 'string' ? record.targetSummary : '',
+    preview: typeof record.preview === 'string' ? record.preview : '',
+    risk: typeof record.risk === 'string' ? record.risk : '',
+    rollback: typeof record.rollback === 'string' ? record.rollback : '',
+    payload: record.payload,
+    payloadHash: typeof record.payloadHash === 'string' ? record.payloadHash : '',
+    idempotencyKey: typeof record.idempotencyKey === 'string' ? record.idempotencyKey : '',
+    approvalId: typeof record.approvalId === 'string' ? record.approvalId : null,
+    resultSummary: typeof record.resultSummary === 'string' ? record.resultSummary : null,
+    createdAt: typeof record.createdAt === 'string' ? record.createdAt : '',
+    updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : '',
+  };
 }
 
 export interface UseChatOptions {
@@ -96,6 +122,7 @@ export function useChat(options?: UseChatOptions) {
           subject: String(d.subject ?? d.tool ?? 'this action'),
           reason: typeof d.reason === 'string' ? d.reason : undefined,
           approvalId: typeof d.approvalId === 'string' ? d.approvalId : null,
+          pendingAction: pendingActionFromEvent(d.pendingAction),
         },
       });
     } else {

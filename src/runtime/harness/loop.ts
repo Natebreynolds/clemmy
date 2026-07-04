@@ -63,6 +63,7 @@ import { isOutputGroundingGateEnabled, evaluateOutputGrounding, buildOutputGroun
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
 import { attachEventLogHooks, extractSessionIdFromContext, type RunHooksLike } from './hooks.js';
 import * as approvalRegistry from './approval-registry.js';
+import { pendingActionApprovalViewFromArgs } from './pending-action-view.js';
 import { actionBus } from '../action-bus.js';
 import { addNotification } from '../notifications.js';
 import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../auth-store.js';
@@ -368,6 +369,7 @@ function registerAndEmitApprovals(
         subject,
         args: interruption.args,
         rawArgs: interruption.rawArgs,
+        pendingAction: pendingActionApprovalViewFromArgs(interruption.args),
         approvalId, // null when registry write failed; consumers fall
                     // back to old "single pending approval" routing.
       },

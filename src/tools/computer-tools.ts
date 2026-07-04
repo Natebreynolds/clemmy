@@ -6,7 +6,7 @@ import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import type { RuntimeContextValue } from '../types.js';
-import { getWorkspaceDirs } from './shared.js';
+import { AGENTS_DIR, DELEGATIONS_DIR, PENDING_ACTIONS_DIR, TEAM_COMMS_LOG, TEAM_REQUESTS_DIR, getWorkspaceDirs } from './shared.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
@@ -321,6 +321,27 @@ function workspaceAuthoringNotice(filePath: string): string | null {
     `The Console reads workspaces from ${SPACES_DIR}; ${filePath} is the wrong home for this run and /api/console/spaces/${slug} will still return 404.`,
     `Write the file to ${desired}, then call space_save with view_path under ${SPACES_DIR}.`,
   ].join(' ');
+}
+
+function typedClementineStateWriteNotice(filePath: string): string | null {
+  const targets: Array<{ root: string; tool: string }> = [
+    { root: AGENTS_DIR, tool: 'create_agent or update_agent' },
+    { root: path.join(BASE_DIR, 'Vault', '00-System', 'agents'), tool: 'create_agent or update_agent' },
+    { root: TEAM_REQUESTS_DIR, tool: 'team_request' },
+    { root: DELEGATIONS_DIR, tool: 'delegate_task' },
+    { root: PENDING_ACTIONS_DIR, tool: 'pending_action_queue or pending_action_record_result' },
+  ];
+  for (const target of targets) {
+    const root = path.resolve(target.root);
+    const rel = path.relative(root, filePath);
+    if (rel === '' || (rel && !rel.startsWith('..') && !path.isAbsolute(rel))) {
+      return `Refused raw write to typed Clementine state: ${filePath}. Use ${target.tool} so validation, permissions, and audit logs stay consistent.`;
+    }
+  }
+  if (path.resolve(filePath) === path.resolve(TEAM_COMMS_LOG)) {
+    return `Refused raw write to Clementine team communication log: ${filePath}. Use team_message, team_request, team_reply, or delegate_task so the queue and audit trail stay consistent.`;
+  }
+  return null;
 }
 
 export function resolveAllowedCwd(input?: string): string {
@@ -950,6 +971,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
           'Write generated artifacts under the skill output/, outputs/, runs/, artifacts/, reports/, or tmp/ directory, or update the skill package through the skill install/update path.',
         ].join(' ');
       }
+      const teamNotice = typedClementineStateWriteNotice(filePath);
+      if (teamNotice) return teamNotice;
       const mode = input.mode ?? 'create';
       mkdirSync(path.dirname(filePath), { recursive: true });
       const exists = existsSync(filePath);

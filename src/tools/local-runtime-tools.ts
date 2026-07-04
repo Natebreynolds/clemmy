@@ -24,6 +24,7 @@ import { registerFocusTools } from './focus-tools.js';
 import { registerMcpStatusTools } from './mcp-status-tools.js';
 import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerOrchestrationTools } from './orchestration-tools.js';
+import { registerPendingActionTools } from './pending-action-tools.js';
 import { registerStepResultTool } from './step-result-tool.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
@@ -121,6 +122,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerAdminTools(server);
   registerTeamTools(server);
   registerOrchestrationTools(server);
+  registerPendingActionTools(server);
   registerStepResultTool(server);
 
   // NOTE (2026-06-11 audit): the former `pause_for_user_approval` tool was

@@ -124,7 +124,7 @@ test('all-core surface: nothing to JIT, exposes everything', async () => {
 
 test('TOOL_JIT_CORE includes the acquisition escape-hatch + execution lane', () => {
   // These are load-bearing: dropping them would dead-end common flows.
-  for (const must of ['composio_search_tools', 'composio_execute_tool', 'execution_create', 'memory_recall', 'run_shell_command']) {
+  for (const must of ['composio_search_tools', 'composio_execute_tool', 'execution_create', 'memory_recall', 'run_shell_command', 'pending_action_queue']) {
     assert.ok(TOOL_JIT_CORE.has(must), `${must} must be in the always-loaded core`);
   }
 });
@@ -185,6 +185,37 @@ test('workspace intent pinning also catches natural dashboard requests that omit
     assert.ok(sel.exposed.has('space_save'), 'space_save must survive natural workspace-build wording');
     assert.ok(sel.exposed.has('space_refresh'), 'space_refresh must survive natural workspace-build wording');
     assert.ok(!sel.exposed.has('workflow_create'), 'unrelated JIT-able tools should still drop');
+  });
+});
+
+test('team-agent handoff intents pin durable team tools past a worst-case JIT prune', async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
+    const teamTools = [
+      'team_list',
+      'team_message',
+      'team_request',
+      'team_pending_requests',
+      'team_reply',
+      'agent_propose',
+      'create_agent',
+      'update_agent',
+      'delegate_task',
+      'check_delegation',
+    ];
+    const otherDroppable = ['workflow_create', 'git_status', 'delete_agent'];
+    const tools: JitTool[] = [...CORE_SAMPLE, ...teamTools, ...otherDroppable]
+      .map((name) => ({ name, description: name }));
+    const zero: JitRankFn = async (_q, ts) => new Map(ts.map((t) => [t.name, 0]));
+
+    const sel = await selectToolsForTurn({
+      userInput: 'Create two active team agents, queue a team_request, and delegate the implementation handoff',
+      tools,
+      rankFn: zero,
+    });
+
+    assert.equal(sel.reduced, true, 'the test must still prove JIT reduced unrelated tools');
+    for (const must of teamTools) assert.ok(sel.exposed.has(must), `${must} must survive team-agent intent JIT`);
+    for (const dropped of otherDroppable) assert.ok(!sel.exposed.has(dropped), `${dropped} should still be droppable`);
   });
 });
 

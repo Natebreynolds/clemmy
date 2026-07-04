@@ -33,6 +33,7 @@ import { randomBytes } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 import { markNotificationsReadByApprovalId } from '../notifications.js';
 import { updateToolChoiceOutcomeForIdentifier } from '../../memory/tool-choice-store.js';
+import { linkPendingActionApproval, markPendingActionApprovalResolved } from './pending-actions.js';
 
 /**
  * The tool-choice identifier an approval maps to (Thread 2 — outcome loop).
@@ -156,6 +157,11 @@ function safeParse(json: string): Record<string, unknown> | null {
   }
 }
 
+function pendingActionIdFromArgs(args: Record<string, unknown> | null): string | null {
+  const direct = args?.pendingActionId ?? args?.pending_action_id;
+  return typeof direct === 'string' && direct.trim() ? direct.trim() : null;
+}
+
 /**
  * Generate a short prefixed approval ID. Format: `apr-xy7q` (4 chars
  * base36 hex-ish, distinct enough for the surface display + tight
@@ -206,7 +212,14 @@ export function register(input: RegisterApprovalInput): PendingApprovalRow {
         input.args ? JSON.stringify(input.args) : null,
       );
       const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as ApprovalSqlRow;
-      return rowToPublic(row);
+      const publicRow = rowToPublic(row);
+      try {
+        const pendingActionId = pendingActionIdFromArgs(publicRow.args);
+        if (pendingActionId) linkPendingActionApproval(pendingActionId, publicRow.approvalId);
+      } catch {
+        // Approval registration is the source of truth; pending-action linkage is best-effort.
+      }
+      return publicRow;
     } catch (err) {
       if ((err as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') continue;
       throw err;
@@ -356,6 +369,12 @@ export function resolve(
     }
   }
   const publicRow = rowToPublic(row);
+  try {
+    const pendingActionId = pendingActionIdFromArgs(publicRow.args);
+    if (pendingActionId) markPendingActionApprovalResolved(pendingActionId, resolution, publicRow.approvalId);
+  } catch {
+    // Pending-action status is auxiliary; never break approval resolution.
+  }
   emitResolved(publicRow);
   return { ok: true, row: publicRow };
 }

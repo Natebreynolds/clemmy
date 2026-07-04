@@ -111,6 +111,37 @@ test('decideToolApproval: workspace authoring tools are local bookkeeping and do
   }
 });
 
+test('decideToolApproval: team-agent coordination tools are local bookkeeping and do not ask', () => {
+  setScope('strict');
+  for (const toolName of ['team_message', 'team_request', 'team_reply', 'agent_propose', 'create_agent', 'update_agent', 'delegate_task']) {
+    const decision = decideToolApproval({ toolName });
+    assert.equal(decision.needsApproval, false, toolName);
+    assert.equal(decision.reason, 'read-always-auto', toolName);
+  }
+  for (const toolName of ['team_list', 'team_pending_requests', 'check_delegation']) {
+    const decision = decideToolApproval({ toolName });
+    assert.equal(decision.needsApproval, false, toolName);
+    assert.equal(decision.kind, 'read', toolName);
+  }
+  const deletion = decideToolApproval({ toolName: 'delete_agent' });
+  assert.equal(deletion.needsApproval, true);
+  assert.equal(deletion.kind, 'admin');
+});
+
+test('decideToolApproval: pending-action queue tools are local bookkeeping and inspection', () => {
+  setScope('strict');
+  for (const toolName of ['pending_action_queue', 'pending_action_record_result']) {
+    const decision = decideToolApproval({ toolName });
+    assert.equal(decision.needsApproval, false, toolName);
+    assert.equal(decision.reason, 'read-always-auto', toolName);
+  }
+  for (const toolName of ['pending_action_list', 'pending_action_get']) {
+    const decision = decideToolApproval({ toolName });
+    assert.equal(decision.needsApproval, false, toolName);
+    assert.equal(decision.kind, 'read', toolName);
+  }
+});
+
 test('classifyTool: memory_review_instructions is a READ (the confirm-first gate forces this call — it must not self-park for approval)', () => {
   // Regression for the 2026-06-17 double-approval on an outbound email batch:
   // the confirm-first gate requires the model to call memory_review_instructions

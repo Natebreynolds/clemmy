@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, X, RefreshCw, Mail, Activity as ActivityIcon, BellRing } from 'lucide-react';
+import { Check, X, RefreshCw, Mail, Activity as ActivityIcon, BellRing, Send } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -173,16 +173,25 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
 function ApprovalCard({ row, selected, onSelect, onApprove, onReject }: {
   row: ApprovalRow; selected: boolean; onSelect: () => void; onApprove: () => void; onReject: () => void;
 }) {
+  const queued = row.pendingAction;
   return (
     <div className={cn('rounded-md border px-3.5 py-3 transition-colors',
       selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
       <button type="button" onClick={onSelect} className="flex w-full items-start gap-3 text-left cursor-pointer">
-        <StatusPill tone="warning">Approve</StatusPill>
-        <span className="min-w-0 flex-1 text-body text-fg">{row.subject}</span>
+        <StatusPill tone="warning">{queued ? 'Ready' : 'Approve'}</StatusPill>
+        <span className="min-w-0 flex-1 text-body text-fg">{queued ? queued.title : row.subject}</span>
         <span className="shrink-0 text-caption text-faint">{relativeTime(row.requestedAt)}</span>
       </button>
+      {queued && (
+        <div className="mt-1 truncate text-caption text-muted">
+          {queued.toolName} · {queued.targetSummary || queued.kind} · hash {queued.payloadHash}
+        </div>
+      )}
       <div className="mt-2.5 flex gap-2">
-        <Button size="sm" onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> Approve</Button>
+        <Button size="sm" onClick={onApprove}>
+          {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
+          {queued ? 'Execute' : 'Approve'}
+        </Button>
         <Button size="sm" variant="secondary" onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
       </div>
     </div>
@@ -205,17 +214,42 @@ function Mono({ value }: { value: unknown }) {
 }
 
 function ApprovalDetail({ row, onApprove, onReject }: { row: ApprovalRow; onApprove: () => void; onReject: () => void }) {
+  const queued = row.pendingAction;
   return (
     <div>
-      <h3 className="mb-3 text-h3 text-fg">{row.subject}</h3>
+      <h3 className="mb-3 text-h3 text-fg">{queued ? `Ready to execute: ${queued.title}` : row.subject}</h3>
+      {queued && <PendingActionDetail action={queued} />}
       <Field label="Tool">{row.tool || '—'}</Field>
       {row.sessionId && <Field label="From session">{row.sessionId}</Field>}
       <Field label="Requested">{relativeTime(row.requestedAt) || '—'}</Field>
       <Field label="Details"><Mono value={row.args} /></Field>
       <div className="mt-4 flex gap-2">
-        <Button onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> Approve</Button>
+        <Button onClick={onApprove}>
+          {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
+          {queued ? 'Execute queued action' : 'Approve'}
+        </Button>
         <Button variant="secondary" onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
       </div>
+    </div>
+  );
+}
+
+function PendingActionDetail({ action }: { action: NonNullable<ApprovalRow['pendingAction']> }) {
+  return (
+    <div className="mb-4 border-y border-border py-3">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <StatusPill tone="warning">{action.status}</StatusPill>
+        <span className="text-caption text-faint">{action.kind}</span>
+        <span className="text-caption text-faint">hash <span className="font-mono">{action.payloadHash}</span></span>
+      </div>
+      {action.summary && <Field label="Summary">{action.summary}</Field>}
+      <Field label="Execution tool"><span className="font-mono">{action.toolName}</span></Field>
+      {action.targetSummary && <Field label="Target">{action.targetSummary}</Field>}
+      {action.preview && <Field label="Preview"><span className="whitespace-pre-wrap">{action.preview}</span></Field>}
+      {action.risk && <Field label="Risk">{action.risk}</Field>}
+      {action.rollback && <Field label="Rollback">{action.rollback}</Field>}
+      <Field label="Exact queued payload"><Mono value={action.payload} /></Field>
+      {action.idempotencyKey && <Field label="Idempotency key"><span className="font-mono">{action.idempotencyKey}</span></Field>}
     </div>
   );
 }

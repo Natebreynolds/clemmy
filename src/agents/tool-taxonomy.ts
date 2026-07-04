@@ -158,6 +158,21 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'space_try_runner',
   'space_set_data',
   'space_publish',
+  // Team-agent coordination writes are Clementine-local state: durable agent
+  // definitions, local request/delegation queues, and the local comms log. They
+  // do not contact external services; external sends still gate on their own.
+  'team_message',
+  'team_request',
+  'team_reply',
+  'agent_propose',
+  'create_agent',
+  'update_agent',
+  'delegate_task',
+  // Pending-action queue writes only Clementine-local state. It prepares an exact
+  // external/local payload for later approval; the eventual execution tool still
+  // passes through its own gates.
+  'pending_action_queue',
+  'pending_action_record_result',
 ]);
 
 /**
@@ -231,6 +246,13 @@ const ALWAYS_READ = new Set<string>([
   'local_cli_list',
   'list_files',
   'read_file',
+  // Team-agent inspection tools are pure local reads.
+  'team_list',
+  'team_pending_requests',
+  'check_delegation',
+  // Pending-action inspection is a pure local read.
+  'pending_action_list',
+  'pending_action_get',
   // 2026-05-22: notify_user is a local-only side effect (desktop
   // notification + Discord ping). It does NOT mutate external state.
   // The verb-match pattern below classifies it as 'send' because of

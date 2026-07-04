@@ -192,6 +192,39 @@ test('write_file warns when a workspace file lands in the wrong Clementine home'
   assert.equal(readFileSync(file, 'utf-8'), '<html><body>Wrong home</body></html>\n');
 });
 
+test('write_file refuses raw writes to typed team-agent and pending-action state', async () => {
+  const base = process.env.CLEMENTINE_HOME!;
+  const cases = [
+    {
+      file: path.join(base, 'Vault', '00-System', 'agents', 'proof-builder', 'agent.md'),
+      tool: /create_agent or update_agent/,
+    },
+    {
+      file: path.join(base, 'team-requests', 'manual.json'),
+      tool: /team_request/,
+    },
+    {
+      file: path.join(base, 'delegations', 'proof-builder', 'manual.json'),
+      tool: /delegate_task/,
+    },
+    {
+      file: path.join(base, 'pending-actions', 'manual.json'),
+      tool: /pending_action_queue or pending_action_record_result/,
+    },
+  ];
+  for (const item of cases) {
+    const out = await invokeWrite({ path: item.file, content: '{}', mode: null });
+    assert.match(out, /Refused raw write to typed Clementine state/);
+    assert.match(out, item.tool);
+    assert.equal(existsSync(item.file), false, item.file);
+  }
+
+  const log = path.join(base, 'logs', 'team-comms.jsonl');
+  const out = await invokeWrite({ path: log, content: '{}', mode: null });
+  assert.match(out, /Refused raw write to Clementine team communication log/);
+  assert.equal(existsSync(log), false);
+});
+
 test('installed skill source paths are protected while artifact paths stay writable', () => {
   const skillRoot = path.join(process.env.CLEMENTINE_HOME!, 'skills', 'lunar');
   assert.equal(isProtectedInstalledSkillSourcePath(path.join(skillRoot, 'build.cjs')), true);

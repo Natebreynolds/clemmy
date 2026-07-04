@@ -122,6 +122,8 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   'goal_create', 'goal_update', 'goal_get', 'goal_list', 'goal_stale',
   // PRE-WRITE ritual + self-correcting memory.
   'memory_review_instructions', 'memory_forget',
+  // QUEUED EXECUTION gate — exact payload object before approval/execution.
+  'pending_action_queue', 'pending_action_list', 'pending_action_get', 'pending_action_record_result',
   // MEMORY recall + write (the ever-learning core).
   'memory_recall', 'memory_search', 'memory_read', 'memory_remember',
   // RETRY / continuation correctness (resource-fingerprint + infra-retry rules read these).
@@ -191,6 +193,30 @@ function looksLikeBackgroundDispatchIntent(query: string): boolean {
   return /\bbackground\b/.test(q)
     || /\b(dispatch|queue|park|defer)\b[\s\S]{0,60}\b(task|job|run|work)\b/.test(q)
     || /\b(while i('|a)?m (away|out|gone)|overnight|when it('|i)?s done|report back)\b/.test(q);
+}
+
+const TEAM_AGENT_INTENT_TOOLS: ReadonlySet<string> = new Set([
+  'team_list',
+  'team_message',
+  'team_request',
+  'team_pending_requests',
+  'team_reply',
+  'agent_propose',
+  'create_agent',
+  'update_agent',
+  'delegate_task',
+  'check_delegation',
+]);
+
+function looksLikeTeamAgentIntent(query: string): boolean {
+  const q = query.toLowerCase();
+  return /\bteam[- ]agent(s)?\b/.test(q)
+    || /\bagent handoff\b/.test(q)
+    || /\bhandoff\b[\s\S]{0,80}\bagent(s)?\b/.test(q)
+    || /\b(create|enable|update|make|spin up|set up)\b[\s\S]{0,100}\b(agent|agents|specialist|specialists)\b/.test(q)
+    || /\b(agent|agents|specialist|specialists)\b[\s\S]{0,100}\b(create|enable|update|delegate|handoff|message|request)\b/.test(q)
+    || /\b(delegate|delegation|team_request|team message|can_message|canmessage)\b/.test(q)
+    || /\b(proof-researcher|proof-builder)\b/.test(q);
 }
 
 const DEFAULT_TOP_K = 16;
@@ -331,6 +357,9 @@ export async function selectToolsForTurn(opts: {
       : []),
     ...(looksLikeBackgroundDispatchIntent(query)
       ? opts.tools.filter((t) => BACKGROUND_INTENT_TOOLS.has(t.name) && !TOOL_JIT_CORE.has(t.name)).map((t) => t.name)
+      : []),
+    ...(looksLikeTeamAgentIntent(query)
+      ? opts.tools.filter((t) => TEAM_AGENT_INTENT_TOOLS.has(t.name) && !TOOL_JIT_CORE.has(t.name)).map((t) => t.name)
       : []),
   ];
   const recallSet = new Set(opts.recallPinned ?? []);
