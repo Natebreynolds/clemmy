@@ -3,6 +3,8 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { getMemoryHealthSummary } from './facts.js';
 import { readHygieneAudit } from './hygiene-audit.js';
+import { readFactRecallTrace } from './recall-trace.js';
+import { detectMemoryHealCandidates, listProposedMemoryFixes } from './self-heal.js';
 import { listSkills } from './skill-store.js';
 import { listToolChoices, computeChoiceScore } from './tool-choice-store.js';
 import { listWorkflows } from './workflow-store.js';
@@ -31,6 +33,11 @@ export interface CuratorReport {
     toolChoices: number;
     weakToolChoices: number;
     recentHygieneEvents: number;
+    memorySelfHealProposals: number;
+    pendingMemorySelfHealProposals: number;
+    currentMemorySelfHealCandidates: number;
+    recentFactRecallTraceEntries: number;
+    recentFactRecallDistinctFacts: number;
   };
   findings: CuratorFinding[];
   recommendations: string[];
@@ -53,11 +60,25 @@ export function buildReportOnlyCuratorReport(now = new Date()): CuratorReport {
   const workflows = listWorkflows();
   const choices = listToolChoices();
   const hygiene = readHygieneAudit(20);
+  const healProposals = listProposedMemoryFixes();
+  const currentHealCandidates = detectMemoryHealCandidates({
+    maxCandidates: 20,
+    nowIso: generatedAt,
+    persistProposals: false,
+  });
+  const recallTrace = readFactRecallTrace(200);
 
   const draftSkills = skills.filter((skill) => skill.frontmatter.tier === 'draft');
   const quarantinedSkills = skills.filter((skill) => skill.frontmatter.quarantined === true);
   const disabledWorkflows = workflows.filter((workflow) => workflow.data.enabled === false);
   const weakChoices = choices.filter((record) => computeChoiceScore(record.choice) < 0.4);
+  const pendingHealProposals = healProposals.filter((proposal) => (proposal.status ?? 'pending') === 'pending');
+  const pendingHealIds = new Set(pendingHealProposals.map((proposal) => proposal.id));
+  const newCurrentHealCandidates = currentHealCandidates.filter((candidate) => !pendingHealIds.has(candidate.id));
+  const recalledFactIds = new Set<number>();
+  for (const entry of recallTrace) {
+    for (const fact of entry.facts) recalledFactIds.add(fact.id);
+  }
   const findings: CuratorFinding[] = [];
 
   if (memory.recallHitRate !== null && memory.recallHitRate < 0.25) {
@@ -73,6 +94,32 @@ export function buildReportOnlyCuratorReport(now = new Date()): CuratorReport {
       area: 'memory',
       message: 'Pinned facts are high enough to pressure the prompt budget.',
       count: memory.pinned,
+    });
+  }
+  if (pendingHealProposals.length > 0) {
+    findings.push({
+      severity: 'info',
+      area: 'memory',
+      message: 'Memory self-heal has pending reversible proposals to review or apply.',
+      count: pendingHealProposals.length,
+      names: safeNames(pendingHealProposals.map((proposal) => `${proposal.kind}:${proposal.id}`)),
+    });
+  }
+  if (newCurrentHealCandidates.length > 0) {
+    findings.push({
+      severity: 'info',
+      area: 'memory',
+      message: 'Memory self-heal has current reversible candidates available to preview.',
+      count: newCurrentHealCandidates.length,
+      names: safeNames(newCurrentHealCandidates.map((candidate) => `${candidate.kind}:${candidate.id}`)),
+    });
+  }
+  if (recallTrace.length > 0 && recalledFactIds.size <= Math.max(2, Math.floor(recallTrace.length / 20))) {
+    findings.push({
+      severity: 'info',
+      area: 'memory',
+      message: 'Recent fact recall is concentrated on a small set of facts; inspect for overexposure or missing scoped recall.',
+      count: recalledFactIds.size,
     });
   }
   if (draftSkills.length > 0) {
@@ -132,6 +179,11 @@ export function buildReportOnlyCuratorReport(now = new Date()): CuratorReport {
       toolChoices: choices.length,
       weakToolChoices: weakChoices.length,
       recentHygieneEvents: hygiene.length,
+      memorySelfHealProposals: healProposals.length,
+      pendingMemorySelfHealProposals: pendingHealProposals.length,
+      currentMemorySelfHealCandidates: currentHealCandidates.length,
+      recentFactRecallTraceEntries: recallTrace.length,
+      recentFactRecallDistinctFacts: recalledFactIds.size,
     },
     findings,
     recommendations,

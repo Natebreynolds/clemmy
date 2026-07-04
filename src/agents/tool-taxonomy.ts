@@ -452,6 +452,17 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
     return 'admin';
   }
 
+  // memory_self_heal is mixed-mode: list/dry_run only inspect proposed
+  // reversible fixes; run/apply/revert mutate memory importance/activity via
+  // the audited self-heal path. Missing/unknown action stays conservative.
+  if (name === 'memory_self_heal' || name.endsWith('__memory_self_heal')) {
+    const action = options.args && typeof options.args === 'object'
+      ? (options.args as { action?: unknown }).action
+      : undefined;
+    if (action === 'list' || action === 'dry_run') return 'read';
+    return 'write';
+  }
+
   // Hard admin list — always ask.
   if (ALWAYS_ADMIN.has(name)) return 'admin';
 

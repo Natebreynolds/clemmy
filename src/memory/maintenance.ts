@@ -39,11 +39,11 @@ import { runReportOnlyCurator } from './curator.js';
  *               re-chunks only changed files. Sub-millisecond when nothing
  *               changed; sub-100ms even for moderate change volume.
  *
- *   backfill  — every M ticks (~120s) when OPENAI_API_KEY is set. Embeds
- *               at most BACKFILL_BATCH chunks per pass so the API budget
- *               and event loop both stay sane. A 5k-chunk cold-start vault
- *               takes ~25 passes (~50 minutes) to fully embed — by design,
- *               so we never block the daemon for long.
+ *   backfill  — every M ticks (~120s) when an embedding provider is available.
+ *               Embeds at most BACKFILL_BATCH rows per store per pass so the
+ *               provider budget and event loop both stay sane. A 5k-chunk
+ *               cold-start vault takes ~25 passes (~50 minutes) to fully embed
+ *               — by design, so we never block the daemon for long.
  *
  * Logs are intentionally quiet: only when work actually happened. The
  * dashboard + doctor surface live counts; this module just keeps them
@@ -113,6 +113,7 @@ interface MemoryMaintenanceState {
   lastNightlyFireDay?: string;
   lastSkillUpdateFireDay?: string;
   lastBackupDay?: string;
+  lastMemorySelfHealDay?: string;
   lastMergeDay?: string;
   lastGoalReapDay?: string;
   lastTaskLedgerHygieneDay?: string;
@@ -158,6 +159,12 @@ let skillUpdateCheckInFlight = false;
 const MEMORY_BACKUP_NIGHTLY_HOUR = 4;
 const MEMORY_BACKUP_NIGHTLY_MINUTE = 30; // offset from skill-update's 4:00
 const MEMORY_BACKUP_RETAIN = 7;
+
+// Memory self-heal parity: runs after the nightly DB backup and before the
+// older paraphrase merge. It is bounded, audited, reversible, and kill-switched
+// independently from the report-only curator and approval UI.
+const MEMORY_SELF_HEAL_NIGHTLY_HOUR = 4;
+const MEMORY_SELF_HEAL_NIGHTLY_MINUTE = 35;
 
 // Tier C2b — nightly paraphrase merge (default on; CLEMMY_MERGE_ENABLED=false
 // to disable). Consolidates semantically identical facts with entity-aware
@@ -470,6 +477,28 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         }
       } catch (err) {
         logger.warn({ err }, 'memory.db nightly backup failed');
+      }
+    }
+  }
+
+  // Memory self-heal at 4:35 AM local — AFTER backup, BEFORE merge/curator.
+  // This applies only bounded, reversible memory fixes; any thrown error is
+  // logged and never blocks the rest of maintenance.
+  if (isAtOrAfterDailyTime(now, MEMORY_SELF_HEAL_NIGHTLY_HOUR, MEMORY_SELF_HEAL_NIGHTLY_MINUTE)) {
+    if (maintenanceState.lastMemorySelfHealDay !== today) {
+      maintenanceState.lastMemorySelfHealDay = today;
+      writeMaintenanceState(maintenanceState);
+      try {
+        const { runMemorySelfHeal } = await import('./self-heal.js');
+        const outcome = await runMemorySelfHeal();
+        if (outcome.ran && (outcome.proposed > 0 || outcome.applied > 0 || outcome.skipped.length > 0)) {
+          logger.info(
+            { proposed: outcome.proposed, applied: outcome.applied, skipped: outcome.skipped.length },
+            'memory self-heal nightly job completed',
+          );
+        }
+      } catch (err) {
+        logger.warn({ err }, 'memory self-heal nightly job failed');
       }
     }
   }

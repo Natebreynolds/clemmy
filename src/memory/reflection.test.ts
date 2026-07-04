@@ -46,7 +46,16 @@ const {
   _testOnly_resetAllSessionImportance,
 } = await import('./reflection.js');
 const { rememberFact, getFact, setFactPinned, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
-const { vectorToBuffer } = await import('./embeddings.js');
+const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
+
+function factContentHash(id: number): string {
+  const row = openMemoryDb().prepare('SELECT content_hash FROM consolidated_facts WHERE id = ?').get(id) as { content_hash: string };
+  return row.content_hash;
+}
+
+test.afterEach(() => {
+  _setEmbeddingProviderForTest(undefined);
+});
 
 test('entities: upsert is idempotent + merges aliases', () => {
   resetMemoryDb();
@@ -378,18 +387,26 @@ test('reflectOnToolReturn: a self-tool return is skipped before the extractor (n
 
 test('consolidateActiveFacts (stored embeddings): full-coverage pairwise dedup keeps the higher-scored fact', async () => {
   resetMemoryDb();
+  _setEmbeddingProviderForTest({
+    name: 'test',
+    model: 'test',
+    dim: 4,
+    async embed(texts) {
+      return texts.map(() => new Float32Array(4));
+    },
+  });
   const db = openMemoryDb();
   const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
                             VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
-  const setVec = (id: number, arr: number[], hash: string) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), hash);
+  const setVec = (id: number, arr: number[]) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), factContentHash(id));
 
   // A and B are near-duplicates (identical vector); B has the higher score → A is dropped.
   const a = rememberFact({ kind: 'project', content: 'Quarterly revenue target is 2M.', score: 1.0 });
   const b = rememberFact({ kind: 'project', content: 'The quarterly revenue goal is two million.', score: 1.5 });
   const c = rememberFact({ kind: 'project', content: 'Office relocation planned for spring.', score: 1.0 });
-  setVec(a.id, [1, 0, 0, 0], 'dup-a');
-  setVec(b.id, [1, 0, 0, 0], 'dup-b');
-  setVec(c.id, [0, 1, 0, 0], 'distinct-c');
+  setVec(a.id, [1, 0, 0, 0]);
+  setVec(b.id, [1, 0, 0, 0]);
+  setVec(c.id, [0, 1, 0, 0]);
 
   const res = await consolidateActiveFacts({ useStoredEmbeddings: true, simThreshold: 0.95 });
   assert.ok(res.merged >= 1, 'at least one near-duplicate is folded');
@@ -401,10 +418,18 @@ test('consolidateActiveFacts (stored embeddings): full-coverage pairwise dedup k
 
 test('consolidateActiveFacts (entity guard): never folds two facts about DISTINCT entities even at cosine 1.0', async () => {
   resetMemoryDb();
+  _setEmbeddingProviderForTest({
+    name: 'test',
+    model: 'test',
+    dim: 4,
+    async embed(texts) {
+      return texts.map(() => new Float32Array(4));
+    },
+  });
   const db = openMemoryDb();
   const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
                             VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
-  const setVec = (id: number, arr: number[], hash: string) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), hash);
+  const setVec = (id: number, arr: number[]) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), factContentHash(id));
 
   // The Revill-vs-Aldous data-loss case: two DISTINCT-client facts with identical
   // phrasing (identical vector → cosine 1.0). Without the entity guard the older
@@ -413,8 +438,8 @@ test('consolidateActiveFacts (entity guard): never folds two facts about DISTINC
   // must keep BOTH.
   const revill = rememberFact({ kind: 'project', content: 'Revill Law Firm ranks #3 for PI Birmingham.', score: 1.0 });
   const aldous = rememberFact({ kind: 'project', content: 'Aldous Law ranks #3 for PI Birmingham.', score: 1.0 });
-  setVec(revill.id, [1, 0, 0, 0], 'rank-revill');
-  setVec(aldous.id, [1, 0, 0, 0], 'rank-aldous');
+  setVec(revill.id, [1, 0, 0, 0]);
+  setVec(aldous.id, [1, 0, 0, 0]);
 
   const res = await consolidateActiveFacts({ useStoredEmbeddings: true, simThreshold: 0.95 });
   assert.equal(res.merged, 0, 'distinct-entity facts are NOT folded despite cosine 1.0');

@@ -3,16 +3,15 @@ import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { openMemoryDb } from './db.js';
 
 /**
- * OpenAI-backed embeddings for semantic recall rerank.
+ * Provider-backed embeddings for semantic recall rerank.
  *
  * Design choices:
- * - No new dependency. Embeddings is a single REST call; we use the
- *   built-in `fetch` (Node 20+ already required by this project).
- * - Hard requirement is just `OPENAI_API_KEY`. Without it the entire
- *   embedding path silently degrades to FTS-only — no errors, no
- *   prompts, no UX cliffs for codex_oauth users.
- * - Vectors stored as raw Float32 buffers in SQLite. 1536 dim × 4 bytes
- *   = 6144 bytes per chunk. A 10k-chunk vault is ~60MB on disk, easy.
+ * - OpenAI uses a single REST call via built-in `fetch`; no OpenAI key installs
+ *   can use the lazy local provider when available.
+ * - If no provider is available, the embedding path silently degrades to
+ *   FTS/lexical recall — no errors, no prompts, no UX cliffs.
+ * - Vectors are stored as raw Float32 buffers in SQLite. Provider model/dim are
+ *   stored with every row so runtime only compares vectors from the active space.
  * - Recall does the cosine rerank in-process over the FTS candidate
  *   pool — usually 30–60 vectors — which is microseconds. No ANN
  *   library needed at personal scale.
@@ -295,6 +294,12 @@ function activeProviderSync(): EmbeddingProvider | null {
 
 export function activeEmbeddingModel(): string | null { return activeProviderSync()?.model ?? null; }
 export function activeEmbeddingDim(): number | null { return activeProviderSync()?.dim ?? null; }
+
+function activeEmbeddingSelector(): { model: string; dim: number } | null {
+  const provider = activeProviderSync();
+  if (!provider?.model || !Number.isFinite(provider.dim)) return null;
+  return { model: provider.model, dim: provider.dim };
+}
 
 export function isEmbeddingsEnabled(): boolean {
   // Enabled when a provider resolves. OpenAI is sync (key presence); the local
@@ -610,11 +615,17 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
 export function loadEmbeddingsForChunks(chunkIds: number[]): Map<number, Float32Array> {
   const out = new Map<number, Float32Array>();
   if (chunkIds.length === 0) return out;
+  const active = activeEmbeddingSelector();
+  if (!active) return out;
   const db = openMemoryDb();
   const placeholders = chunkIds.map(() => '?').join(',');
   const rows = db.prepare(
-    `SELECT chunk_id AS id, vector FROM embeddings WHERE chunk_id IN (${placeholders})`
-  ).all(...chunkIds) as { id: number; vector: Buffer }[];
+    `SELECT chunk_id AS id, vector
+     FROM embeddings
+     WHERE chunk_id IN (${placeholders})
+       AND model = ?
+       AND dim = ?`
+  ).all(...chunkIds, active.model, active.dim) as { id: number; vector: Buffer }[];
   for (const row of rows) out.set(row.id, bufferToVector(row.vector));
   return out;
 }
@@ -728,11 +739,19 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
 export function loadFactEmbeddings(factIds: number[]): Map<number, Float32Array> {
   const out = new Map<number, Float32Array>();
   if (factIds.length === 0) return out;
+  const active = activeEmbeddingSelector();
+  if (!active) return out;
   const db = openMemoryDb();
   const placeholders = factIds.map(() => '?').join(',');
   const rows = db.prepare(
-    `SELECT fact_id AS id, vector FROM fact_embeddings WHERE fact_id IN (${placeholders})`
-  ).all(...factIds) as { id: number; vector: Buffer }[];
+    `SELECT fe.fact_id AS id, fe.vector AS vector
+     FROM fact_embeddings fe
+     JOIN consolidated_facts cf ON cf.id = fe.fact_id
+     WHERE fe.fact_id IN (${placeholders})
+       AND fe.model = ?
+       AND fe.dim = ?
+       AND fe.content_hash = cf.content_hash`
+  ).all(...factIds, active.model, active.dim) as { id: number; vector: Buffer }[];
   for (const row of rows) out.set(row.id, bufferToVector(row.vector));
   return out;
 }
@@ -756,6 +775,28 @@ export function readEmbeddingStats(): EmbeddingStats {
     const row = db.prepare(`
       SELECT COUNT(*) AS c, MAX(model) AS model, MAX(dim) AS dim
       FROM embeddings
+    `).get() as { c: number; model: string | null; dim: number | null };
+    stats.count = row.c;
+    stats.model = row.model;
+    stats.dim = row.dim;
+  } catch {
+    // Table may not exist or DB may not be openable in some edge tests.
+  }
+  return stats;
+}
+
+export function readFactEmbeddingStats(): EmbeddingStats {
+  const stats: EmbeddingStats = {
+    enabled: isEmbeddingsEnabled(),
+    count: 0,
+    model: null,
+    dim: null,
+  };
+  try {
+    const db = openMemoryDb();
+    const row = db.prepare(`
+      SELECT COUNT(*) AS c, MAX(model) AS model, MAX(dim) AS dim
+      FROM fact_embeddings
     `).get() as { c: number; model: string | null; dim: number | null };
     stats.count = row.c;
     stats.model = row.model;

@@ -15,6 +15,7 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'memory_pin',
   'memory_restore',
   'memory_review_instructions',
+  'memory_self_heal',
   'memory_embed_backfill',
   'working_memory',
   'note_create',

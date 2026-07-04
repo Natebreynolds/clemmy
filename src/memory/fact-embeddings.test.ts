@@ -110,10 +110,12 @@ test('updateFact content change re-embeds on the next backfill (stale hash)', as
 
   // Change the content → content_hash changes → embedding is now stale.
   updateFact(fact.id, { content: 'Weekly sync moved to a recurring calendar slot.' });
+  assert.equal(loadFactEmbeddings([fact.id]).size, 0, 'stale content-hash fact vector is ignored before re-embed');
 
   const stats = await embedMissingFacts({ maxChunks: 50 });
   assert.equal(stats.candidateChunks, 1, 'stale fact is picked up again');
   assert.equal(stats.embedded, 1);
+  assert.equal(loadFactEmbeddings([fact.id]).size, 1, 'fresh content-hash fact vector is visible after re-embed');
 });
 
 test('loadFactEmbeddings returns stored vectors by id', async () => {

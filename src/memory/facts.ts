@@ -4,6 +4,7 @@ import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } fro
 import { cosine, embedQuery, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+import { appendFactRecallTrace } from './recall-trace.js';
 
 /**
  * Floor for the Stanford recall candidate pool. The pool is pre-filtered by
@@ -1217,6 +1218,16 @@ export function renderFactsForInstructions(
     scoredBlock = clipToLineBoundary(scoredBlock, scoredBudget);
     if (scoredBlock) scoredBlock += '\n_… more facts elided to fit; call memory_search_facts to widen._';
   }
+
+  appendFactRecallTrace({
+    surface: 'facts_for_instructions',
+    objective,
+    mode,
+    facts: [
+      ...(renderPinned ? pinned.filter((fact) => pinnedSection.includes(fact.content)).map((fact) => ({ fact, reason: 'pinned-standing-instruction' })) : []),
+      ...scored.filter((fact) => scoredBlock.includes(fact.content)).map((fact) => ({ fact, reason: objective ? 'scored-stanford-objective' : 'scored-stanford-global' })),
+    ],
+  });
 
   return [pinnedSection, scoredBlock].filter(Boolean).join('\n\n');
 }

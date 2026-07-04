@@ -38,7 +38,7 @@ const {
   clearTurnQueryVector,
   touchFactAccess,
 } = await import('./facts.js');
-const { vectorToBuffer } = await import('./embeddings.js');
+const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -49,9 +49,15 @@ before(() => {
 
 beforeEach(() => {
   resetMemoryDb();
+  _setEmbeddingProviderForTest(undefined);
   // Touch DB so subsequent ops succeed.
   openMemoryDb();
 });
+
+function factContentHash(id: number): string {
+  const row = openMemoryDb().prepare('SELECT content_hash FROM consolidated_facts WHERE id = ?').get(id) as { content_hash: string };
+  return row.content_hash;
+}
 
 test('searchFactsByText: a freshly-remembered fact is the top hit despite a stop-word-heavy query', () => {
   // The fresh-fact recall fix: the per-turn primer searches consolidated_facts
@@ -583,17 +589,25 @@ test('listActiveFacts(stanford): a warm high-importance fact past the updated_at
 
 test('listActiveFacts(stanford): a semantically-relevant fact is promoted by the turn query vector (bonus-only)', () => {
   process.env.CLEMMY_SEMANTIC_RECALL = 'on';
+  _setEmbeddingProviderForTest({
+    name: 'test',
+    model: 'test',
+    dim: 4,
+    async embed(texts) {
+      return texts.map(() => new Float32Array(4));
+    },
+  });
   const db = openMemoryDb();
   const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
                             VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
-  const setVec = (id: number, arr: number[], hash: string) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), hash);
+  const setVec = (id: number, arr: number[]) => embed.run(id, vectorToBuffer(Float32Array.from(arr)), factContentHash(id));
 
   // Relevant but LOW importance → loses on base Stanford score.
   const relevant = rememberFact({ kind: 'user', content: 'Nathan default sending identity is scorpion email.', importance: 3 });
-  setVec(relevant.id, [1, 0, 0, 0], 'h-rel');
+  setVec(relevant.id, [1, 0, 0, 0]);
   // Off-topic but HIGH importance → wins the slot on base score alone.
   const offtopic = rememberFact({ kind: 'project', content: 'Home services plumbing emergency funnel.', importance: 8 });
-  setVec(offtopic.id, [0, 1, 0, 0], 'h-off');
+  setVec(offtopic.id, [0, 1, 0, 0]);
 
   const rankOf = (id: number, facts: { id: number }[]) => facts.findIndex((f) => f.id === id);
 
@@ -609,17 +623,26 @@ test('listActiveFacts(stanford): a semantically-relevant fact is promoted by the
 
   clearTurnQueryVector();
   delete process.env.CLEMMY_SEMANTIC_RECALL;
+  _setEmbeddingProviderForTest(undefined);
 });
 
 test('listActiveFacts(stanford): semantic recall is a no-op when the flag is off', () => {
   process.env.CLEMMY_SEMANTIC_RECALL = 'off';
+  _setEmbeddingProviderForTest({
+    name: 'test',
+    model: 'test',
+    dim: 4,
+    async embed(texts) {
+      return texts.map(() => new Float32Array(4));
+    },
+  });
   const db = openMemoryDb();
   const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
                             VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
   const rel = rememberFact({ kind: 'user', content: 'Low importance but on-topic.', importance: 3 });
-  embed.run(rel.id, vectorToBuffer(Float32Array.from([1, 0, 0, 0])), 'h2-rel');
+  embed.run(rel.id, vectorToBuffer(Float32Array.from([1, 0, 0, 0])), factContentHash(rel.id));
   const off = rememberFact({ kind: 'project', content: 'High importance off-topic.', importance: 8 });
-  embed.run(off.id, vectorToBuffer(Float32Array.from([0, 1, 0, 0])), 'h2-off');
+  embed.run(off.id, vectorToBuffer(Float32Array.from([0, 1, 0, 0])), factContentHash(off.id));
 
   setTurnQueryVector('on-topic query', Float32Array.from([1, 0, 0, 0]));
   const facts = listActiveFacts({ ranking: 'stanford', limit: 5 });
@@ -629,6 +652,7 @@ test('listActiveFacts(stanford): semantic recall is a no-op when the flag is off
 
   clearTurnQueryVector();
   delete process.env.CLEMMY_SEMANTIC_RECALL;
+  _setEmbeddingProviderForTest(undefined);
 });
 
 test('lexicalRelevance: a detailed on-point fact is not demoted by its length (short-fact bias fix)', () => {

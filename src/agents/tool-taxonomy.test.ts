@@ -152,6 +152,29 @@ test('classifyTool: memory_review_instructions is a READ (the confirm-first gate
   assert.equal(classifyTool('memory_review_instructions'), 'read');
 });
 
+test('classifyTool: memory_self_heal is mixed-mode by action', () => {
+  assert.equal(classifyTool('memory_self_heal', { args: { action: 'list' } }), 'read');
+  assert.equal(classifyTool('memory_self_heal', { args: { action: 'dry_run' } }), 'read');
+  assert.equal(classifyTool('memory_self_heal', { args: { action: 'run' } }), 'write');
+  assert.equal(classifyTool('memory_self_heal', { args: { action: 'apply' } }), 'write');
+  assert.equal(classifyTool('memory_self_heal', { args: { action: 'revert' } }), 'write');
+  assert.equal(classifyTool('memory_self_heal'), 'write');
+  assert.equal(classifyTool('mcp__clementine-local__memory_self_heal', { args: { action: 'list' } }), 'read');
+});
+
+test('decideToolApproval: memory_self_heal inspection is read, mutation asks under strict scope', () => {
+  setScope('strict');
+  const list = decideToolApproval({ toolName: 'memory_self_heal', args: { action: 'list' } });
+  assert.equal(list.kind, 'read');
+  assert.equal(list.needsApproval, false);
+  assert.equal(list.reason, 'read-always-auto');
+
+  const run = decideToolApproval({ toolName: 'memory_self_heal', args: { action: 'run' } });
+  assert.equal(run.kind, 'write');
+  assert.equal(run.needsApproval, true);
+  assert.equal(run.reason, 'strict-policy');
+});
+
 test('classifyTool: write prefixes', () => {
   assert.equal(classifyTool('write_file'), 'write');
   assert.equal(classifyTool('remember'), 'write');

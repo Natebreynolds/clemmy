@@ -72,6 +72,7 @@ import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { primeTurnRecallVector, searchFactsByText, touchFactAccess } from '../../memory/facts.js';
+import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
@@ -1086,6 +1087,11 @@ function factsBlockForPrimer(query: string): string {
     // is only ever recalled via this lexical primer stops looking "idle" to
     // decayAndEvictFacts. Best-effort — never break the primer.
     try { for (const f of facts) touchFactAccess(f.id); } catch { /* recency anchor stays slightly stale */ }
+    appendFactRecallTrace({
+      surface: 'turn_memory_primer',
+      query,
+      facts: facts.map((fact) => ({ fact, reason: 'lexical-primer-match' })),
+    });
     const lines = facts.map((f) => `- ${f.content}`);
     return ['[REMEMBERED FACTS — durable, user-stated or curated; treat as known]', ...lines].join('\n');
   } catch {

@@ -211,7 +211,7 @@ test('Orchestrator is now the single agent — carries the union of all action t
     // memory_restore; a missing link dead-ends that path and pushes the model
     // to raw SQL (2026-06-12 regression guard).
     'memory_recall', 'memory_search', 'memory_read', 'memory_remember', 'memory_list_facts',
-    'memory_forget', 'memory_pin', 'memory_restore',
+    'memory_forget', 'memory_pin', 'memory_restore', 'memory_self_heal',
     // Composio (discover + execute)
     'composio_search_tools', 'composio_execute_tool', 'composio_status',
     // Shell + filesystem

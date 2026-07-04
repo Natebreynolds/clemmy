@@ -23,6 +23,7 @@ const { rememberFact } = await import('./facts.js');
 // eslint-disable-next-line import/first
 const {
   embedMissingFacts, isEmbeddingsEnabled, getEmbeddingProvider, activeEmbeddingDim, activeEmbeddingModel,
+  loadEmbeddingsForChunks, loadFactEmbeddings, vectorToBuffer,
   _setEmbeddingProviderForTest,
 } = await import('./embeddings.js');
 
@@ -92,6 +93,38 @@ test('switching providers (model/dim change) re-embeds, then is idempotent', asy
   // Rerun on the same provider → nothing stale.
   const idempotent = await embedMissingFacts({ maxChunks: 50 });
   assert.equal(idempotent.candidateChunks, 0);
+});
+
+test('loadFactEmbeddings only returns vectors from the active provider space', async () => {
+  _setEmbeddingProviderForTest(fakeProvider('openai', 'text-embedding-3-small', 1536));
+  const fact = rememberFact({ kind: 'user', content: 'Fact one alpha.' });
+  await embedMissingFacts({ maxChunks: 50 });
+  assert.equal(loadFactEmbeddings([fact.id]).size, 1);
+
+  _setEmbeddingProviderForTest(fakeProvider('local', 'bge-small', 384));
+  assert.equal(loadFactEmbeddings([fact.id]).size, 0, 'stale prior-provider fact vector is ignored before re-embed');
+
+  await embedMissingFacts({ maxChunks: 50 });
+  assert.equal(loadFactEmbeddings([fact.id]).size, 1, 'active-provider fact vector is visible after re-embed');
+});
+
+test('loadEmbeddingsForChunks only returns vectors from the active provider space', async () => {
+  const db = openMemoryDb();
+  db.prepare(`
+    INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run('/tmp/provider-switch.md', 0, 'Chunk content alpha.', 'Provider switch', 1, 20, 'chunk-hash');
+  const chunkId = (db.prepare('SELECT id FROM vault_chunks LIMIT 1').get() as { id: number }).id;
+  db.prepare(`
+    INSERT INTO embeddings (chunk_id, model, dim, vector, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(chunkId, 'text-embedding-3-small', 1536, vectorToBuffer(new Float32Array(1536)), new Date().toISOString());
+
+  _setEmbeddingProviderForTest(fakeProvider('openai', 'text-embedding-3-small', 1536));
+  assert.equal(loadEmbeddingsForChunks([chunkId]).size, 1);
+
+  _setEmbeddingProviderForTest(fakeProvider('local', 'bge-small', 384));
+  assert.equal(loadEmbeddingsForChunks([chunkId]).size, 0, 'stale prior-provider chunk vector is ignored');
 });
 
 test('CLEMMY_EMBED_PROVIDER=off forces no provider even with one injectable', async () => {

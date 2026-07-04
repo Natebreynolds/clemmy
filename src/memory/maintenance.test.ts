@@ -40,3 +40,9 @@ test('isAtOrAfterDailyTime: top-of-hour jobs (3:00, 4:00)', () => {
   assert.equal(isAtOrAfterDailyTime(at(4, 0), 4, 0), true);
   assert.equal(isAtOrAfterDailyTime(at(3, 59), 4, 0), false);
 });
+
+test('isAtOrAfterDailyTime: memory self-heal slot catches up after 4:35', () => {
+  assert.equal(isAtOrAfterDailyTime(at(4, 34), 4, 35), false);
+  assert.equal(isAtOrAfterDailyTime(at(4, 35), 4, 35), true);
+  assert.equal(isAtOrAfterDailyTime(at(4, 45), 4, 35), true);
+});

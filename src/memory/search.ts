@@ -66,8 +66,8 @@ export interface VaultSearchOptions {
 }
 
 /**
- * Async search. Runs FTS5 then — when OPENAI_API_KEY is configured — does
- * an embedding rerank over the candidate pool with reciprocal rank fusion.
+ * Async search. Runs FTS5 then — when an embedding provider is available —
+ * does an embedding rerank over the candidate pool with reciprocal rank fusion.
  * Silently falls back to FTS-only when embeddings are off or fail.
  *
  * Accepts either a numeric limit (legacy callers, unchanged) or an options

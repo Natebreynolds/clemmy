@@ -1113,6 +1113,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // harness orchestrator actually gets.
       'memory_pin',
       'memory_restore',
+      // Audited memory self-heal control: list/dry-run/run/revert the bounded
+      // proposal loop through the same MCP guard surface instead of falling
+      // back to raw files or sqlite when memory drift needs review.
+      'memory_self_heal',
       // Workspace + files
       'workspace_config',
       'workspace_roots',

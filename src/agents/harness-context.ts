@@ -41,6 +41,7 @@ import { loadProactivityPolicy } from './proactivity-policy.js';
 import { modelParityEnabled, CACHE_BREAK_SENTINEL } from '../runtime/harness/model-wire-registry.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { renderRecentActionsForHarnessHistory } from '../runtime/harness/session-transcript.js';
+import { appendFactRecallTrace } from '../memory/recall-trace.js';
 
 function section(title: string, body: string | undefined | null): string {
   if (!body || !body.trim()) return '';
@@ -384,7 +385,15 @@ export function renderHarnessMemoryContext(opts?: {
   if (recallQuery && queryRecallEnabled()) {
     try {
       const hits = searchFactsByText(recallQuery, QUERY_RECALL_LIMIT);
-      if (hits.length > 0) requestRecall = hits.map((f) => `- ${clipContextLine(String(f.content ?? ''))}`).filter((l) => l.length > 2).join('\n');
+      if (hits.length > 0) {
+        requestRecall = hits.map((f) => `- ${clipContextLine(String(f.content ?? ''))}`).filter((l) => l.length > 2).join('\n');
+        appendFactRecallTrace({
+          surface: 'harness_query_recall',
+          query: recallQuery,
+          sessionId: opts?.sessionId,
+          facts: hits.map((fact) => ({ fact, reason: 'lexical-query-match' })),
+        });
+      }
     } catch { requestRecall = ''; }
   }
 

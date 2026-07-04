@@ -16,7 +16,7 @@ const MAX_LINES = 2000;
 
 export interface HygieneAuditEntry {
   at: string;
-  kind: 'decay' | 'dedup' | 'autoclean' | 'approve-dedup' | 'approve-lift' | 'approve-retire' | 'approve-improve' | 'merge';
+  kind: 'decay' | 'dedup' | 'autoclean' | 'approve-dedup' | 'approve-lift' | 'approve-retire' | 'approve-improve' | 'merge' | 'memory-heal' | 'memory-heal-revert';
   ids: number[];
   detail?: Record<string, unknown>;
 }

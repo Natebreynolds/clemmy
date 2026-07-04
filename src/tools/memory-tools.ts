@@ -3,11 +3,13 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { formatSearchHits, searchVaultAsync } from '../memory/search.js';
 import { recallHybrid } from '../memory/recall.js';
-import { embedMissingChunks, isEmbeddingsEnabled, readEmbeddingStats } from '../memory/embeddings.js';
+import { embedMissingChunks, embedMissingFacts, readEmbeddingStats, readFactEmbeddingStats } from '../memory/embeddings.js';
 import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, reviewStandingInstructions, searchFacts, setFactPinned, touchFactAccess } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { upsertResourcePointer, isSourceMapEnabled } from '../memory/source-map.js';
 import { recallEverything, formatUnifiedRecall } from '../memory/unified-recall.js';
+import { appendFactRecallTrace } from '../memory/recall-trace.js';
+import { applyMemoryFix, detectMemoryHealCandidates, listProposedMemoryFixes, revertMemoryHeal, runMemorySelfHeal, type ProposedMemoryFix } from '../memory/self-heal.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { addNotification } from '../runtime/notifications.js';
@@ -79,10 +81,36 @@ function notifyStandingRuleChange(
 // and ADDed without an LLM resolver call (cost fast-path).
 const REMEMBER_NOVELTY_FAST_PATH_SIM = 0.6;
 
+function formatMemoryFix(fix: ProposedMemoryFix): string {
+  const status = fix.status ?? 'pending';
+  const ids = fix.targetIds.length > 0 ? ` ids=${fix.targetIds.join(',')}` : '';
+  const audit = fix.auditId ? ` audit=${fix.auditId}` : '';
+  const skipped = fix.skipReason ? ` skipped="${fix.skipReason.slice(0, 120)}"` : '';
+  return `- ${fix.id} [${status}] ${fix.kind}${ids}${audit}${skipped}: ${fix.evidence.slice(0, 240)}`;
+}
+
+function formatMemorySelfHealOutcome(outcome: Awaited<ReturnType<typeof runMemorySelfHeal>>): string {
+  if (!outcome.ran) return `Memory self-heal did not run: ${outcome.reason ?? 'unknown reason'}.`;
+  const lines = [
+    `Memory self-heal ${outcome.dryRun ? 'dry run' : 'run'}: proposed ${outcome.proposed}, applied ${outcome.applied}, skipped ${outcome.skipped.length}.`,
+  ];
+  for (const result of outcome.results.slice(0, 20)) {
+    lines.push(`- ${result.ok ? 'ok' : 'skip'} ${result.kind} ${result.fixId}: ${result.message}${result.auditId ? ` audit=${result.auditId}` : ''}`);
+  }
+  if (outcome.results.length > 20) lines.push(`- ... ${outcome.results.length - 20} more result(s) omitted.`);
+  if (outcome.skipped.length > 0) {
+    lines.push('Skipped:');
+    for (const skipped of outcome.skipped.slice(0, 10)) {
+      lines.push(`- ${skipped.id} ${skipped.kind}: ${skipped.reason}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 export function registerMemoryTools(server: McpServer): void {
   server.tool(
     'memory_search',
-    'Search the local Clementine vault for relevant notes and memories. Uses FTS5 and (when OPENAI_API_KEY is set) an embedding rerank.',
+    'Search the local Clementine vault for relevant notes and memories. Uses FTS5 and, when an embedding provider is available, an embedding rerank.',
     { query: z.string().min(1) },
     async ({ query }) => {
       const hits = await searchVaultAsync(query, 8);
@@ -145,7 +173,7 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_recall',
-    'Recall vault chunks. FTS5 narrows the pool; with an OPENAI_API_KEY an embedding rerank reorders via reciprocal rank fusion. Supports limit and pathPrefix filters.',
+    'Recall vault chunks. FTS5 narrows the pool; when an embedding provider is available, an embedding rerank reorders via reciprocal rank fusion. Supports limit and pathPrefix filters.',
     {
       query: z.string().min(1),
       limit: z.number().int().min(1).max(20).optional(),
@@ -162,21 +190,37 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_embed_backfill',
-    'Compute embeddings for vault chunks that don\'t have one yet. Runs in small batches; safe to invoke repeatedly. No-ops when OPENAI_API_KEY is not set.',
+    'Compute embeddings for vault chunks and/or durable facts using the active embedding provider. Runs in small batches; safe to invoke repeatedly. No-ops when no provider is available.',
     {
       maxChunks: z.number().int().min(1).max(2000).optional(),
+      scope: z.enum(['vault', 'facts', 'all']).optional(),
     },
-    async ({ maxChunks }) => {
-      if (!isEmbeddingsEnabled()) {
-        return textResult('Embeddings disabled (OPENAI_API_KEY not set).');
+    async ({ maxChunks, scope }) => {
+      const selectedScope = scope ?? 'all';
+      const max = maxChunks ?? 200;
+      const lines = [`Embedding backfill (${selectedScope}, max ${max} per store):`];
+
+      if (selectedScope === 'vault' || selectedScope === 'all') {
+        const stats = await embedMissingChunks({ maxChunks: max });
+        const embStats = readEmbeddingStats();
+        lines.push(
+          `Vault chunks: embedded ${stats.embedded} / ${stats.candidateChunks} candidates in ${stats.durationMs}ms`,
+          `Vault batches: ${stats.batched}, failures: ${stats.failed}${stats.reason ? `, reason: ${stats.reason}` : ''}`,
+          `Vault total embeddings: ${embStats.count} (${embStats.model ?? '-'}, dim ${embStats.dim ?? '-'})`,
+        );
       }
-      const stats = await embedMissingChunks({ maxChunks: maxChunks ?? 200 });
-      const embStats = readEmbeddingStats();
-      return textResult([
-        `Embedded ${stats.embedded} / ${stats.candidateChunks} candidate chunks in ${stats.durationMs}ms`,
-        `Batches: ${stats.batched}, failures: ${stats.failed}`,
-        `Total embeddings: ${embStats.count} (${embStats.model ?? '-'}, dim ${embStats.dim ?? '-'})`,
-      ].join('\n'));
+
+      if (selectedScope === 'facts' || selectedScope === 'all') {
+        const stats = await embedMissingFacts({ maxChunks: max });
+        const embStats = readFactEmbeddingStats();
+        lines.push(
+          `Facts: embedded ${stats.embedded} / ${stats.candidateChunks} candidates in ${stats.durationMs}ms`,
+          `Fact batches: ${stats.batched}, failures: ${stats.failed}${stats.reason ? `, reason: ${stats.reason}` : ''}`,
+          `Fact total embeddings: ${embStats.count} (${embStats.model ?? '-'}, dim ${embStats.dim ?? '-'})`,
+        );
+      }
+
+      return textResult(lines.join('\n'));
     },
   );
 
@@ -293,6 +337,11 @@ export function registerMemoryTools(server: McpServer): void {
       // ACCESS, so bumping last_accessed_at keeps frequently-recalled facts warm
       // for the Stanford recall score (best-effort, never throws).
       for (const fact of facts) touchFactAccess(fact.id);
+      appendFactRecallTrace({
+        surface: 'memory_search_facts',
+        query,
+        facts: facts.map((fact) => ({ fact, reason: 'agent-tool-semantic-search' })),
+      });
       if (facts.length === 0) return textResult('No relevant facts found.');
       const lines = facts.map((fact) => `- #${fact.id} ${fact.kind}: ${fact.content}`);
       return textResult(lines.join('\n'));
@@ -312,6 +361,15 @@ export function registerMemoryTools(server: McpServer): void {
       const block = formatUnifiedRecall(result, 4000);
       // Reinforce surfaced facts (an agent-facing recall is an access).
       for (const h of result.hits) if (h.type === 'fact') { const id = Number(h.ref); if (Number.isFinite(id)) touchFactAccess(id); }
+      const facts = result.hits
+        .filter((h) => h.type === 'fact')
+        .map((h) => getFact(Number(h.ref)))
+        .filter((fact): fact is ConsolidatedFact => Boolean(fact));
+      appendFactRecallTrace({
+        surface: 'memory_recall_all',
+        query: objective,
+        facts: facts.map((fact) => ({ fact, reason: 'agent-tool-unified-recall' })),
+      });
       return textResult(block);
     },
   );
@@ -393,6 +451,48 @@ export function registerMemoryTools(server: McpServer): void {
         `Standing instructions in play${objective ? ` (vs objective: ${objective.slice(0, 80)})` : ''}:\n${lines.join('\n')}\n\n` +
         'If any look unrelated or wrong for this objective, ask the user before applying — and offer to memory_forget(id) the stale one.',
       );
+    },
+  );
+
+  server.tool(
+    'memory_self_heal',
+    'Inspect or run the audited long-term-memory self-heal loop. Use list/dry_run first to review proposed reversible fixes. run applies bounded fixes; revert restores a prior memory-heal audit id.',
+    {
+      action: z.enum(['list', 'dry_run', 'run', 'apply', 'revert']),
+      fixId: z.string().optional(),
+      auditId: z.string().optional(),
+      maxApply: z.number().int().min(0).max(20).optional(),
+      maxCandidates: z.number().int().min(1).max(100).optional(),
+    },
+    async ({ action, fixId, auditId, maxApply, maxCandidates }) => {
+      try {
+        if (action === 'list') {
+          const detected = detectMemoryHealCandidates({ maxCandidates: maxCandidates ?? 20, persistProposals: false });
+          const stored = listProposedMemoryFixes();
+          const byId = new Map([...detected, ...stored].map((fix) => [fix.id, fix]));
+          const fixes = [...byId.values()].slice(-Math.max(1, maxCandidates ?? 20)).reverse();
+          if (fixes.length === 0) return textResult('No memory self-heal proposals found.');
+          return textResult(`Memory self-heal proposals:\n${fixes.map(formatMemoryFix).join('\n')}`);
+        }
+        if (action === 'dry_run') {
+          const outcome = await runMemorySelfHeal({ dryRun: true, maxApply: maxApply ?? 5, maxCandidates: maxCandidates ?? maxApply ?? 5 });
+          return textResult(formatMemorySelfHealOutcome(outcome));
+        }
+        if (action === 'run') {
+          const outcome = await runMemorySelfHeal({ maxApply: maxApply ?? 5, maxCandidates: maxCandidates ?? maxApply ?? 5 });
+          return textResult(formatMemorySelfHealOutcome(outcome));
+        }
+        if (action === 'apply') {
+          if (!fixId) return textResult('Missing fixId for memory_self_heal action=apply.');
+          const result = await applyMemoryFix(fixId);
+          return textResult(`${result.ok ? 'Applied' : 'Skipped'} ${result.kind} ${result.fixId}: ${result.message}${result.auditId ? ` audit=${result.auditId}` : ''}`);
+        }
+        if (!auditId) return textResult('Missing auditId for memory_self_heal action=revert.');
+        const reverted = revertMemoryHeal(auditId);
+        return textResult(`${reverted.ok ? 'Reverted' : 'Could not revert'} ${auditId}: ${reverted.message}${reverted.ids.length ? ` ids=${reverted.ids.join(',')}` : ''}`);
+      } catch (err) {
+        return textResult(`memory_self_heal failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   );
 }
