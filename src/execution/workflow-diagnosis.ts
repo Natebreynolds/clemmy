@@ -365,6 +365,10 @@ export interface DiagnoseInput {
    *  one of those consumers, the ROOT cause is the empty producer, not the
    *  symptom — so we re-root the diagnosis onto the producer. */
   upstreamEmptyProducers?: Array<{ stepId: string; consumerId: string; shape: string }>;
+  /** RSH-5 (fix memory): a fix that PROVABLY resolved this exact failure
+   *  signature before — folded into the prompt so the Doctor converges on the
+   *  known-good fix instead of re-deriving. */
+  priorFix?: { fixKind: string; fixDescription: string; fixJson?: string };
 }
 
 /**
@@ -519,6 +523,9 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
     step?.prompt ? `The step's current prompt:\n"""\n${step.prompt.slice(0, 4000)}\n"""` : '(step prompt unavailable)',
     blockedSteps.length > 1
       ? `Other steps that also blocked (likely downstream of this one): ${blockedSteps.slice(1).map((b) => b.stepId).join(', ')}`
+      : '',
+    input.priorFix
+      ? `A fix that PROVABLY RESOLVED this exact failure signature on a previous run — strongly prefer it if it still fits the current situation: kind=${input.priorFix.fixKind} — ${input.priorFix.fixDescription}${input.priorFix.fixJson ? `\nPrior fix payload: ${input.priorFix.fixJson.slice(0, 1200)}` : ''}`
       : '',
   ].filter(Boolean).join('\n\n');
 

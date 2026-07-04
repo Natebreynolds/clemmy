@@ -82,6 +82,7 @@ import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.j
 import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold, clearWorkflowFailures } from './workflow-failure-ledger.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
+import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
@@ -4633,6 +4634,21 @@ async function tryAutoHealAndRequeue(args: {
     logger.warn({ runId: run.id }, 'self-heal: applied fix but could not re-queue; surfacing for manual re-run');
     return { attempt, max, stepId: fix.stepId, message: `I auto-applied a fix to step "${fix.stepId}" (${fix.description}), but couldn't re-run automatically — please run the workflow again.` };
   }
+  // RSH-5: remember this fix as PENDING, keyed by the healed re-run. If that run
+  // completes clean the fix is PROMOTED to the confirmed store (it stuck); if it
+  // fails/reverts it's discarded. A confirmed fix sharpens future diagnosis.
+  try {
+    if (requeued.id) {
+      recordPendingFix(requeued.id, {
+        workflowSlug,
+        stepId: fix.stepId,
+        signature: fixSignature(diagnosis.rootCause),
+        fixKind: fix.kind,
+        fixDescription: fix.description,
+        fix: fix as unknown as Record<string, unknown>,
+      });
+    }
+  } catch { /* fix memory is best-effort */ }
   logger.info({ runId: run.id, newRunId: requeued.id, step: fix.stepId, attempt, max }, 'self-heal: applied fix + re-queued a fresh run');
   return {
     attempt,
@@ -5434,6 +5450,16 @@ async function processOneRunFile(
       let diagnosis: WorkflowDiagnosis | null = null;
       let proposedFix: ProposedFix | null = null;
       if (diagnosableBlocks.length > 0 && selfHealEnabled()) {
+        // RSH-5 (fix memory): if a fix PROVABLY resolved this same failure
+        // signature before, hand it to the Doctor as a strong hint.
+        let priorFix: { fixKind: string; fixDescription: string; fixJson?: string } | undefined;
+        try {
+          const root = diagnosableBlocks[0];
+          const remembered = root
+            ? recallConfirmedFix(workflow.name, root.stepId, fixSignature(root.reason))
+            : null;
+          if (remembered) priorFix = { fixKind: remembered.fixKind, fixDescription: remembered.fixDescription, fixJson: JSON.stringify(remembered.fix) };
+        } catch { /* recall is best-effort */ }
         diagnosis = await diagnoseWorkflowBlock({
           workflow: workflow.data,
           blockedSteps: diagnosableBlocks,
@@ -5442,6 +5468,7 @@ async function processOneRunFile(
           // RSH-4: upstream reads that produced nothing but feed a downstream
           // step — so the Doctor can re-root a symptom block onto its real cause.
           upstreamEmptyProducers: detectEmptyDeliverableReads(workflow.data.steps, rawStepOutputs),
+          priorFix,
         });
         if (diagnosis) {
           proposedFix = recordProposedFix(workflow.name, run.id, diagnosis);
@@ -5485,6 +5512,12 @@ async function processOneRunFile(
       // distills into a reusable draft skill. Fire-and-forget; the novelty gate
       // skips routine cron runs internally, so this is a no-op for them.
       if (!needsAttention && !goalRepursuing) {
+        // RSH-5: this run finished CLEAN. If it was itself a healed re-run, the
+        // fix that produced it STUCK — promote the pending fix to the confirmed
+        // store so it sharpens the next diagnosis of the same failure.
+        if ((run.selfHealAttempt ?? 0) > 0) {
+          try { confirmPendingFix(run.id, new Date().toISOString()); } catch { /* best-effort */ }
+        }
         void (async () => {
           try {
             const { distillSkillFromSessions } = await import('../memory/skill-distiller.js');
@@ -5598,6 +5631,8 @@ async function processOneRunFile(
                 { workflow: workflow.name, runId: run.id, backupId: run.selfHealBackupId },
                 'self-heal: healed re-run still failed — auto-reverted the fix to the pre-heal definition',
               );
+              // RSH-5: the fix did NOT stick — forget the unproven pending memory.
+              try { discardPendingFix(run.id); } catch { /* best-effort */ }
             }
           } catch (err) {
             logger.warn({ runId: run.id, err: err instanceof Error ? err.message : String(err) }, 'self-heal auto-revert failed (backup may already be gone)');
