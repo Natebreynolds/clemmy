@@ -619,6 +619,69 @@ test('GET /api/console/workflows exposes needs-attention last-run status', async
   }
 });
 
+test('PATCH /api/console/workflows preserves step contracts when client sends partial step shapes', async () => {
+  const workflowName = 'Patch Metadata Flow';
+  writeWorkflow('patch-metadata-flow', {
+    name: workflowName,
+    description: 'partial patch metadata preservation',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'research',
+        prompt: 'Pull source-grounded metrics.',
+        allowedTools: ['mcp'],
+        usesSkill: 'client-seo-report',
+        sideEffect: 'read',
+        output: {
+          required_keys: ['domain', 'sources'],
+          non_empty: ['domain', 'sources'],
+        },
+      },
+      {
+        id: 'deliver',
+        prompt: 'Send the verified audit.',
+        dependsOn: ['research'],
+        sideEffect: 'send',
+        requiresApproval: true,
+        approvalPreview: 'Send the audit to the client',
+      },
+    ],
+  });
+
+  const h = await boot();
+  try {
+    const patch = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        steps: [
+          { id: 'research', prompt: 'Pull source-grounded metrics with fallback evidence.', dependsOn: [], allowedTools: ['mcp'] },
+          { id: 'deliver', prompt: 'Verify the file and return delivery breadcrumbs.', dependsOn: ['research'] },
+        ],
+      }),
+    });
+    assert.equal(patch.status, 200);
+
+    const res = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { steps: Array<Record<string, unknown>> };
+    const byId = Object.fromEntries(body.steps.map((step) => [step.id, step]));
+    assert.equal(byId.research?.prompt, 'Pull source-grounded metrics with fallback evidence.');
+    assert.deepEqual(byId.research?.output, {
+      required_keys: ['domain', 'sources'],
+      non_empty: ['domain', 'sources'],
+    });
+    assert.equal(byId.research?.sideEffect, 'read');
+    assert.equal(byId.research?.usesSkill, 'client-seo-report');
+    assert.equal(byId.deliver?.sideEffect, 'send');
+    assert.equal(byId.deliver?.requiresApproval, true);
+    assert.equal(byId.deliver?.approvalPreview, 'Send the audit to the client');
+  } finally {
+    await h.close();
+  }
+});
+
 test('GET /api/console/board/run/:slug/:runId/queue returns the workflow sub-task queue', async () => {
   const workflowSlug = 'board-queue-flow';
   const workflowName = 'Board Queue Flow';

@@ -16921,16 +16921,17 @@ const CONSOLE_JS = `
       description: data.description || '',
       enabled: data.enabled !== false,
       triggerSchedule: data.trigger && data.trigger.schedule ? data.trigger.schedule : '',
-      steps: Array.isArray(data.steps) ? data.steps.map((s) => ({
-        id: s.id,
-        prompt: s.prompt,
-        dependsOn: s.dependsOn || [],
-        model: s.model,
-        forEach: s.forEach,
-        deterministic: s.deterministic,
-        allowedTools: s.allowedTools,
-        usesSkill: s.usesSkill || s.uses_skill,
-      })) : [],
+      steps: Array.isArray(data.steps) ? data.steps.map((s) => {
+        const step = { ...s };
+        step.id = s.id;
+        step.prompt = s.prompt;
+        step.dependsOn = Array.isArray(s.dependsOn) ? s.dependsOn.slice() : [];
+        if (Array.isArray(s.allowedTools)) step.allowedTools = s.allowedTools.slice();
+        else if (Array.isArray(s.allowed_tools)) step.allowedTools = s.allowed_tools.slice();
+        if (s.usesSkill || s.uses_skill) step.usesSkill = s.usesSkill || s.uses_skill;
+        if (s.sideEffect || s.side_effect) step.sideEffect = s.sideEffect || s.side_effect;
+        return step;
+      }) : [],
       inputs: data.inputs || {},
       synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
       allowedTools: data.allowedTools || null,

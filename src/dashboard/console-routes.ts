@@ -958,6 +958,19 @@ function validateWorkflowDefinition(data: WorkflowFrontmatter): WorkflowValidati
   return runValidator(data, { knownToolNames });
 }
 
+function mergeWorkflowStepsForPatch(existingSteps: WorkflowDefinition['steps'], incomingSteps: unknown[]): WorkflowDefinition['steps'] {
+  const existingById = new Map<string, WorkflowDefinition['steps'][number]>();
+  for (const step of existingSteps) {
+    if (step && typeof step.id === 'string') existingById.set(step.id, step);
+  }
+  return incomingSteps.map((raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw as WorkflowDefinition['steps'][number];
+    const incoming = raw as Partial<WorkflowDefinition['steps'][number]> & Record<string, unknown>;
+    const prior = typeof incoming.id === 'string' ? existingById.get(incoming.id) : undefined;
+    return (prior ? { ...prior, ...incoming } : { ...incoming }) as WorkflowDefinition['steps'][number];
+  });
+}
+
 interface WorkflowRunRecordSummary {
   id: string;
   workflow: string;
@@ -2519,7 +2532,7 @@ export function registerConsoleRoutes(
     const next: WorkflowDefinition = { ...entry.data };
 
     if (typeof body.description === 'string') next.description = body.description;
-    if (Array.isArray(body.steps)) next.steps = body.steps;
+    if (Array.isArray(body.steps)) next.steps = mergeWorkflowStepsForPatch(entry.data.steps, body.steps);
     if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
     if (body.synthesisPrompt !== undefined) {
       next.synthesis = typeof body.synthesisPrompt === 'string' && body.synthesisPrompt.trim()
