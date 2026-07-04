@@ -13,7 +13,7 @@
 
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,17 +92,28 @@ function extractBinary(archivePath, target, destDir) {
       if (r.status !== 0) throw new Error('unzip failed (needed to extract the windows uv.zip)');
       const exe = findFile(tmp, 'uv.exe');
       if (!exe) throw new Error('uv.exe not found in archive');
-      renameSync(exe, path.join(destDir, 'uv.exe'));
+      moveExtractedFile(exe, path.join(destDir, 'uv.exe'));
     } else {
       const r = spawnSync('tar', ['-xzf', archivePath, '-C', tmp], { stdio: 'inherit' });
       if (r.status !== 0) throw new Error('tar failed');
       const bin = findFile(tmp, 'uv');
       if (!bin) throw new Error('uv binary not found in archive');
-      renameSync(bin, path.join(destDir, 'uv'));
+      moveExtractedFile(bin, path.join(destDir, 'uv'));
       spawnSync('chmod', ['+x', path.join(destDir, 'uv')]);
     }
   } finally {
     rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function moveExtractedFile(src, dest) {
+  rmSync(dest, { force: true });
+  try {
+    renameSync(src, dest);
+  } catch (err) {
+    if (!err || err.code !== 'EXDEV') throw err;
+    copyFileSync(src, dest);
+    rmSync(src, { force: true });
   }
 }
 
