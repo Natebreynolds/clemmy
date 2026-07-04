@@ -43,6 +43,7 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       dependsOn: s.dependsOn,
       forEach: s.forEach,
       deterministic: s.deterministic,
+      call: s.call,
       usesSkill: s.usesSkill,
       allowedTools: s.allowedTools,
       requiresApproval: s.requiresApproval,

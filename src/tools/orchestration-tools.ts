@@ -145,6 +145,7 @@ export function draftToDefinition(name: string, draft: WorkflowDraft): WorkflowD
       forEach: s.forEach,
       allowedTools: s.allowedTools,
       output: s.output,
+      ...(s.call ? { call: s.call } : {}),
       ...(s.requiresApproval ? { requiresApproval: true, approvalPreview: s.approvalPreview } : {}),
     })),
   };

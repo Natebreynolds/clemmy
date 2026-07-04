@@ -21,7 +21,7 @@
  */
 import { listEvents, getToolOutput } from '../runtime/harness/eventlog.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from '../agents/workflow-step-agent.js';
-import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
+import type { WorkflowStepCall, WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 /** One substantive tool invocation pulled from the trace. */
 export interface TraceToolCall {
@@ -52,6 +52,11 @@ export interface WorkflowDraftStep {
   /** Declared output contract. Set on an inferred list step so the engine
    *  hard-verifies it yields a non-empty array before the fan-out runs. */
   output?: WorkflowStepOutputContract;
+  /** CALL-2: a structured tool call captured from the trace — the runner
+   *  executes it directly (no LLM). Set when a SINGLE composio call with a
+   *  known slug + parseable args was observed, so the promoted step reproduces
+   *  the exact invocation deterministically instead of re-asking a model. */
+  call?: WorkflowStepCall;
   /** What was observed in the trace (for transparency + refinement). */
   observed: { tool: string; slug?: string; args: string; calls: number };
 }
@@ -167,6 +172,21 @@ function buildStep(grp: DraftGroup, index: number, usedIds: Set<string>): Workfl
 
   if (head.tool === 'composio_execute_tool' && head.slug) {
     const id = slugifyId(head.slug, index, usedIds);
+    // CALL-2: a SINGLE observed call with parseable args → emit a structured
+    // call node that reproduces the exact invocation with zero model turns.
+    // (calls>1 keeps prose: a call node runs once, so a repeated action stays a
+    // refine-into-forEach hint rather than silently dropping the repeats.)
+    const argObj = calls === 1 ? callArgObject(head.args) : null;
+    if (argObj) {
+      return {
+        id,
+        prompt: '',
+        allowedTools: ['composio_execute_tool'],
+        call: { tool: head.slug, args: argObj },
+        ...gate,
+        observed: { tool: head.tool, slug: head.slug, args: head.args.slice(0, 600), calls },
+      };
+    }
     return {
       id,
       prompt: `Run the ${head.slug} action via composio_execute_tool${argKeySummary(head.args)}${repeated}`,

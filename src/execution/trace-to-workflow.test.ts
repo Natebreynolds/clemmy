@@ -34,14 +34,17 @@ test('composioSlug: extracts the action slug from gateway args', () => {
   assert.equal(composioSlug('run_shell_command', '{"command":"ls"}'), undefined);
 });
 
-test('traceToWorkflowDraft: a composio step locks allowedTools to the slug family + names the slug', () => {
+test('traceToWorkflowDraft: CALL-2 — a single composio call becomes a STRUCTURED call node (not prose)', () => {
   const draft = traceToWorkflowDraft([
-    call('composio_execute_tool', '{"tool":"SALESFORCE_GET_RECORDS","arguments":{"soql":"SELECT ..."}}'),
+    call('composio_execute_tool', '{"tool":"SALESFORCE_GET_RECORDS","arguments":{"soql":"SELECT Id FROM Account"}}'),
   ]);
   assert.equal(draft.steps.length, 1);
-  assert.deepEqual(draft.steps[0].allowedTools, ['composio_execute_tool']);
-  assert.match(draft.steps[0].prompt, /SALESFORCE_GET_RECORDS/);
-  assert.equal(draft.steps[0].observed.slug, 'SALESFORCE_GET_RECORDS');
+  const step = draft.steps[0];
+  // captured as a structured call: exact slug + args reproduced, no prompt
+  assert.deepEqual(step.call, { tool: 'SALESFORCE_GET_RECORDS', args: { soql: 'SELECT Id FROM Account' } });
+  assert.equal(step.prompt, '');
+  assert.deepEqual(step.allowedTools, ['composio_execute_tool']);
+  assert.equal(step.observed.slug, 'SALESFORCE_GET_RECORDS');
 });
 
 test('traceToWorkflowDraft: filters exploration, keeps actions, chains linearly', () => {
