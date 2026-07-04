@@ -24,6 +24,7 @@ import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
 import { applyWorkflowContractUpgrades, proposeWorkflowContractUpgrades, renderWorkflowContractProposalReport } from '../execution/workflow-contract-proposals.js';
+import { syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { listCachedToolkits } from '../integrations/composio/client.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
@@ -92,6 +93,16 @@ export interface AuthoredWorkflowResult {
   gaps: ReturnType<typeof analyzeWorkflowGaps>;
 }
 
+function writeWorkflowAndSyncTriggers(name: string, def: WorkflowDefinition): WorkflowEntry {
+  const entry = writeWorkflow(name, def);
+  try {
+    syncWorkflowTriggerRegistry();
+  } catch {
+    // Best-effort: daemon/webhook paths retry sync, and the workflow write itself succeeded.
+  }
+  return entry;
+}
+
 /**
  * Canonical "author and persist a NEW workflow" core, shared by workflow_create
  * and workflow_from_session so promotion can never drift from the create path.
@@ -110,7 +121,7 @@ export function commitAuthoredWorkflow(def: WorkflowDefinition, dirName: string)
       warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories, gaps: [],
     };
   }
-  writeWorkflow(dirName, prep.def);
+  writeWorkflowAndSyncTriggers(dirName, prep.def);
   return {
     ok: true, errors: [], savedDef: prep.def, repairs: prep.repairs,
     warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories,
@@ -131,7 +142,9 @@ export function draftToDefinition(name: string, draft: WorkflowDraft): WorkflowD
       id: s.id,
       prompt: s.prompt,
       dependsOn: s.dependsOn,
+      forEach: s.forEach,
       allowedTools: s.allowedTools,
+      output: s.output,
       ...(s.requiresApproval ? { requiresApproval: true, approvalPreview: s.approvalPreview } : {}),
     })),
   };
@@ -748,7 +761,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           appliedLines.push(`- ${proposal.workflowName}: NOT applied — repaired definition still has blocking issue(s): ${prep.errors.join('; ')}`);
           continue;
         }
-        writeWorkflow(path.basename(entry.dir), prep.def);
+        writeWorkflowAndSyncTriggers(path.basename(entry.dir), prep.def);
         appliedLines.push(`- ${proposal.workflowName}: ${[...applied.changes, ...prep.repairs].join(' ')}`);
       }
       return textResult(
@@ -782,17 +795,28 @@ export function registerOrchestrationTools(server: McpServer): void {
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
         forEach: z.string().optional(),
+        forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         allowedTools: z.array(z.string()).optional(),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         requiresApproval: z.boolean().optional(),
         approvalPreview: z.string().optional(),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
         sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class. 'read' = gathers data only; 'write' = mutates local/remote state reversibly; 'send' = irreversible outbound (email/publish/post). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends. Declare it — undeclared steps fall back to prose heuristics."),
-        loopUntil: z.object({ maxAttempts: z.number().min(1).max(5).optional() }).optional().describe('Step-level retry-until-contract-passes (plain LLM read steps; write needs loopSafe). Requires an output contract — the contract is the exit condition.'),
+        loopUntil: z.object({
+          maxAttempts: z.number().min(1).max(10).optional(),
+          probe: z.object({ runner: z.string().min(1) }).optional().describe('Deterministic exit probe: a scripts/ helper (like deterministic.runner) run AFTER each attempt.'),
+          until: WorkflowStepOutputContractSchema.optional().describe('Contract the probe output must satisfy for the loop to EXIT — e.g. {"required_keys":["done"],"non_empty":["done"]} for poll-until-complete, or a min_items check for page-until-drained.'),
+        }).optional().describe('Step-level loop. Exit condition = the step\'s own output contract (retry-until-contract-passes, ≤5 attempts), OR probe+until (loop until EXTERNAL STATE satisfies the until contract — poll-until-done / paginate-until-drained, ≤10 attempts). Plain LLM read steps; write needs loopSafe; send never loops.'),
         loopSafe: z.boolean().optional().describe('Author assertion that re-running this WRITE step is idempotent (e.g. an upsert keyed on a stable id). Required for loopUntil on write steps; also allows goal re-pursuit past this step.'),
       })).optional().describe('(Optional) If omitted, I intelligently break down your description into steps. If provided, I still validate and suggest improvements.'),
       trigger_schedule: z.string().optional(),
-      inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not.'),
+      trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Use for "when X happens in another system" asks that can call a webhook.'),
+      trigger_events: z.array(z.object({
+        type: z.string().min(1).describe('System event type to subscribe to (e.g. "crm.lead.created").'),
+        filter: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().describe('Shallow payload match — every entry must equal payload.<key> (dot-paths ok). Omit to fire on every event of this type.'),
+        dedupeKey: z.string().optional().describe('Template rendered against the payload (e.g. "lead-{{payload.id}}"). The same rendered key fires ONCE ever. Omit → dedupe on full payload hash.'),
+      })).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
+      inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
       synthesis_prompt: z.string().optional(),
       allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
       goal: z.object({
@@ -801,7 +825,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
-    async ({ name, description, steps, trigger_schedule, inputs, synthesis_prompt, allowSends, goal }) => {
+    async ({ name, description, steps, trigger_schedule, trigger_webhook_path, trigger_events, inputs, synthesis_prompt, allowSends, goal }) => {
       // INTELLIGENT WORKFLOW CREATION:
       // If steps not provided, analyze the description and generate steps intelligently
       let finalSteps = steps;
@@ -859,7 +883,12 @@ export function registerOrchestrationTools(server: McpServer): void {
         name,
         description,
         enabled: true,
-        trigger: trigger_schedule ? { schedule: trigger_schedule, manual: true } : { manual: true },
+        trigger: {
+          manual: true,
+          ...(trigger_schedule ? { schedule: trigger_schedule } : {}),
+          ...(trigger_webhook_path?.trim() ? { webhookPath: trigger_webhook_path.trim() } : {}),
+          ...(trigger_events && trigger_events.length > 0 ? { events: trigger_events } : {}),
+        },
         steps: finalSteps.map((s) => ({
           id: s.id,
           prompt: s.prompt,
@@ -870,6 +899,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           maxTurns: s.maxTurns,
           useHarness: s.useHarness,
           forEach: s.forEach,
+          forEachNewOnly: s.forEachNewOnly,
           allowedTools: s.allowedTools,
           usesSkill: s.usesSkill,
           requiresApproval: s.requiresApproval,
@@ -1301,7 +1331,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         let enableViaTest = workflowNeedsCreationTest(prep.def);
         if (enableViaTest && missingWorkflowRunInputs(prep.def, enableTestInputs).length > 0) enableViaTest = false;
         if (enableViaTest) {
-          writeWorkflow(entry.name, { ...prep.def, enabled: false });
+          writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
           clearWorkflowFailures(entry.name);
           const queued = queueWorkflowCreationTest(entry.name, enableTestInputs, { originSessionId: getToolOutputContext()?.sessionId });
           return textResult(
@@ -1309,7 +1339,7 @@ export function registerOrchestrationTools(server: McpServer): void {
               + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
           );
         }
-        writeWorkflow(entry.name, { ...prep.def, enabled: true });
+        writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: true });
         // Re-enabling is a deliberate fresh start — clear any chronic-failure
         // streak so auto-heal/escalation resets (#6).
         clearWorkflowFailures(entry.name);
@@ -1318,7 +1348,7 @@ export function registerOrchestrationTools(server: McpServer): void {
             + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
         );
       }
-      writeWorkflow(entry.name, { ...entry.data, enabled });
+      writeWorkflowAndSyncTriggers(entry.name, { ...entry.data, enabled });
       return textResult(`Workflow "${name}" is now disabled.`);
     },
   );
@@ -1340,6 +1370,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
         forEach: z.string().optional(),
+        forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         allowedTools: z.array(z.string()).optional(),
         requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
         approvalPreview: z.string().optional().describe('One-line preview shown on the approval card when requiresApproval is set.'),
@@ -1398,6 +1429,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           maxTurns: s.maxTurns,
           useHarness: s.useHarness,
           forEach: s.forEach,
+          forEachNewOnly: s.forEachNewOnly,
           allowedTools: s.allowedTools,
           requiresApproval: s.requiresApproval,
           approvalPreview: s.approvalPreview,
@@ -1463,11 +1495,11 @@ export function registerOrchestrationTools(server: McpServer): void {
         }
         if (runTest) {
           savedNext.enabled = false;
-          writeWorkflow(entry.name, savedNext);
+          writeWorkflowAndSyncTriggers(entry.name, savedNext);
           reSmoke = queueWorkflowCreationTest(entry.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
         }
       }
-      if (!reSmoke) writeWorkflow(entry.name, savedNext);
+      if (!reSmoke) writeWorkflowAndSyncTriggers(entry.name, savedNext);
       const changed = [
         description !== undefined ? 'description' : '',
         steps ? 'steps' : '',
@@ -1564,7 +1596,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         let runTest = workflowNeedsCreationTest(updated);
         if (runTest && missingWorkflowRunInputs(updated, testInputs).length > 0) runTest = false;
         if (runTest) {
-          writeWorkflow(before.name, { ...updated, enabled: false });
+          writeWorkflowAndSyncTriggers(before.name, { ...updated, enabled: false });
           const queued = queueWorkflowCreationTest(before.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
           reSmokeMsg = `\n\n${queued.message}`;
         }

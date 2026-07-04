@@ -287,6 +287,16 @@ test('reportedBackRunIdsFrom: a delivered HEARTBEAT does not count as report-bac
   assert.ok(!ids.has('run9'), 'a "still running" ping is not the run reporting its outcome');
 });
 
+test('reportedBackRunIdsFrom: a delivered LOUD progress update (T4.1) does not count as report-back', () => {
+  // The new channel-visible "Workflow update:" ping keeps the workflow-heartbeat-
+  // id prefix and metadata.heartbeat exactly so this exclusion holds — a
+  // delivered mid-run update must never mask a lost terminal report.
+  const ids = reportedBackRunIdsFrom([
+    { id: 'workflow-heartbeat-loud-run11-2', deliveredAt: iso(0), deliveredDestinations: ['discord'], metadata: { runId: 'run11', heartbeat: true, progressUpdate: true } },
+  ]);
+  assert.ok(!ids.has('run11'), 'a delivered loud progress update is not the run reporting its outcome');
+});
+
 test('reportedBackRunIdsFrom: a delivered APPROVAL/recovery card does not count as report-back', () => {
   const ids = reportedBackRunIdsFrom([
     { id: 'approval-apr123', deliveredAt: iso(0), metadata: { runId: 'run10' } },

@@ -21,6 +21,7 @@
  */
 import { listEvents, getToolOutput } from '../runtime/harness/eventlog.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from '../agents/workflow-step-agent.js';
+import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 /** One substantive tool invocation pulled from the trace. */
 export interface TraceToolCall {
@@ -44,6 +45,13 @@ export interface WorkflowDraftStep {
    *  gated this action, so the promoted workflow gates it declaratively too. */
   requiresApproval?: boolean;
   approvalPreview?: string;
+  /** Inferred fan-out: this step iterates the output of the named upstream
+   *  list step (canonical `{{steps.<id>.output}}` form). Set when N repeated
+   *  same-slug calls with varying args were promoted into a real forEach. */
+  forEach?: string;
+  /** Declared output contract. Set on an inferred list step so the engine
+   *  hard-verifies it yields a non-empty array before the fan-out runs. */
+  output?: WorkflowStepOutputContract;
   /** What was observed in the trace (for transparency + refinement). */
   observed: { tool: string; slug?: string; args: string; calls: number };
 }
@@ -200,6 +208,109 @@ function buildStep(grp: DraftGroup, index: number, usedIds: Set<string>): Workfl
   };
 }
 
+/** The gateway routing keys — never per-item payload (mirrors argKeySummary). */
+const COMPOSIO_ROUTING_KEYS = ['tool', 'slug', 'action', 'toolSlug', 'tool_slug'];
+
+/** Pull each call's per-invocation argument object (the `arguments` wrapper if
+ *  present, else the top-level minus the gateway routing keys). */
+function callArgObject(args: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(args) as Record<string, unknown>;
+    const inner = (parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments))
+      ? parsed.arguments as Record<string, unknown>
+      : parsed;
+    const clean: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(inner)) {
+      if (COMPOSIO_ROUTING_KEYS.includes(k)) continue;
+      clean[k] = v;
+    }
+    return clean;
+  } catch { return null; }
+}
+
+interface ForEachVariants {
+  /** Per-call variant values, in call order: raw values (one varying key) or
+   *  objects keyed by the varying fields (multiple varying keys). */
+  items: unknown[];
+  /** The argument keys that varied across the calls (sorted, for determinism). */
+  varyingKeys: string[];
+}
+
+/**
+ * Diff a coalesced group's per-call args to recover the iteration variable(s).
+ * Returns null (→ keep the single-step behavior) when the args are unparseable
+ * or IDENTICAL across calls (no real fan-out variable to lift out).
+ */
+function extractForEachVariants(group: TraceToolCall[]): ForEachVariants | null {
+  const inners: Record<string, unknown>[] = [];
+  for (const c of group) {
+    const obj = callArgObject(c.args);
+    if (!obj) return null; // can't diff → don't fabricate a list
+    inners.push(obj);
+  }
+  const keys = new Set<string>();
+  for (const inner of inners) for (const k of Object.keys(inner)) keys.add(k);
+  const varyingKeys = [...keys]
+    .filter((k) => new Set(inners.map((inner) => JSON.stringify(inner[k] ?? null))).size > 1)
+    .sort();
+  if (varyingKeys.length === 0) return null; // identical calls → single step
+  const items = varyingKeys.length === 1
+    ? inners.map((inner) => inner[varyingKeys[0]])
+    : inners.map((inner) => {
+        const obj: Record<string, unknown> = {};
+        for (const k of varyingKeys) obj[k] = inner[k];
+        return obj;
+      });
+  return { items, varyingKeys };
+}
+
+/**
+ * Promote a coalesced group of N≥3 same-slug composio calls into a REAL
+ * forEach fan-out: a list step that returns the observed per-call variants as
+ * an explicit array (author-editable, contract-verified non-empty), and the
+ * work step that runs the action once per {{item}}. Replaces the old
+ * single-step-with-a-prose-hint so the promoted loop actually loops.
+ */
+function buildForEachSteps(
+  grp: DraftGroup,
+  index: number,
+  usedIds: Set<string>,
+  variants: ForEachVariants,
+): WorkflowDraftStep[] {
+  const group = grp.calls;
+  const head = group[0];
+  const slug = head.slug as string;
+  const calls = group.length;
+  const gate = grp.approvalPreview !== undefined
+    ? { requiresApproval: true, approvalPreview: grp.approvalPreview || 'Review before this step runs.' }
+    : {};
+
+  const listId = slugifyId(`${slug}-items`, index, usedIds);
+  const listStep: WorkflowDraftStep = {
+    id: listId,
+    prompt: `Provide the list of items for the ${slug} fan-out below. Return exactly this JSON array (edit/parameterize this list as needed):\n${JSON.stringify(variants.items, null, 2)}`,
+    // Pure literal-return step — no tool family to lock.
+    allowedTools: [],
+    output: { type: 'array', min_items: { '': 1 } },
+    observed: { tool: head.tool, slug, args: head.args.slice(0, 600), calls },
+  };
+
+  const workId = slugifyId(slug, index, usedIds);
+  const itemRef = variants.varyingKeys.length === 1
+    ? '{{item}}'
+    : variants.varyingKeys.map((k) => `${k}={{item.${k}}}`).join(', ');
+  const workStep: WorkflowDraftStep = {
+    id: workId,
+    prompt: `For each item, run the ${slug} action via composio_execute_tool with ${itemRef} (this ran ${calls}× in the session — once per item; fan-out inferred as a forEach over the list above).`,
+    allowedTools: ['composio_execute_tool'],
+    forEach: `{{steps.${listId}.output}}`,
+    dependsOn: [listId],
+    ...gate,
+    observed: { tool: head.tool, slug, args: head.args.slice(0, 600), calls },
+  };
+  return [listStep, workStep];
+}
+
 /**
  * Pure reconstruction: substantive tool calls → a workflow draft. Coalesces
  * consecutive calls to the SAME (tool, slug) into one step, locks each step's
@@ -239,7 +350,24 @@ export function traceToWorkflowDraft(
     }
   }
   const usedIds = new Set<string>();
-  const steps = groups.map((g, i) => buildStep(g, i, usedIds));
+  const steps: WorkflowDraftStep[] = [];
+  let inferredForEachCount = 0;
+  groups.forEach((g, i) => {
+    const head = g.calls[0];
+    // N≥3 same-slug composio calls whose args actually vary → a real forEach.
+    const variants = (g.calls.length >= 3 && head.tool === 'composio_execute_tool' && Boolean(head.slug))
+      ? extractForEachVariants(g.calls)
+      : null;
+    if (variants) {
+      steps.push(...buildForEachSteps(g, i, usedIds, variants));
+      inferredForEachCount += 1;
+    } else {
+      steps.push(buildStep(g, i, usedIds));
+    }
+  });
+  // Linear order + structured handoff: each step depends on the one before it.
+  // For an inferred fan-out the work step sits right after its list step, so
+  // this also wires work.dependsOn = [listStep] (matching its forEach source).
   for (let i = 1; i < steps.length; i++) steps[i].dependsOn = [steps[i - 1].id];
 
   const notes: string[] = [];
@@ -249,6 +377,9 @@ export function traceToWorkflowDraft(
     notes.push('Draft is a skeleton: step prompts are auto-generated from the tools you used — review and sharpen them before saving.');
     notes.push('Inputs are not parameterized yet: the observed values are baked in. Replace run-specific values (URLs, names) with {{input.X}} so the workflow is reusable.');
     notes.push('Steps are chained in run order; if a step actually depends on an earlier step\'s OUTPUT, reference it with {{steps.<id>.output}} (the canonical write path will auto-wire the dependency).');
+    if (inferredForEachCount > 0) {
+      notes.push(`Fan-out inferred: ${inferredForEachCount} repeated action${inferredForEachCount === 1 ? ' was' : 's were'} promoted into a forEach — a list step returns the observed per-call values as an array and the action step iterates it with {{item}}. Review the list step's items (they're baked-in observed values — parameterize with {{input.X}} as needed) and confirm the {{item}} references before enabling.`);
+    }
     if (steps.some((s) => s.requiresApproval)) {
       notes.push('An approval gate from the original run was preserved (requiresApproval on the step that followed it) — keep it so the workflow pauses before that action.');
     }

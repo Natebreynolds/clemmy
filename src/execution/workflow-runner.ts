@@ -21,6 +21,7 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
   listWorkflows,
+  readWorkflow,
   writeWorkflow,
   clampGoalMaxAttempts,
   type WorkflowDefinition,
@@ -62,6 +63,9 @@ import {
   diagnoseWorkflowBlock,
   recordProposedFix,
   applyProposedFix,
+  recordWorkflowEditBackup,
+  revertWorkflowFix,
+  judgeHealCrossFamily,
   renderLegibleOutcome,
   renderSuccessBody,
   selfHealEnabled,
@@ -70,10 +74,12 @@ import {
   type BlockedStep,
 } from './workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
-import { prepareWorkflowForWrite, stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
+import { checkWorkflowForWrite, prepareWorkflowForWrite, stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
+import { recordAndDeriveStableTightenings } from './workflow-contract-evidence-store.js';
 import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
 import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold, clearWorkflowFailures } from './workflow-failure-ledger.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
+import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
@@ -315,6 +321,31 @@ function startWorkflowHeartbeat(
       silent: true,
       metadata: { workflow: workflowName, runId, heartbeat: true, elapsedMin },
     });
+    // T4.1 (desktop↔channel parity): channels used to be COMPLETELY blind
+    // between kickoff and the terminal report — every heartbeat was
+    // dashboard-only. For genuinely long runs, a LOUD but heavily
+    // rate-limited progress update now reaches Discord/Slack: first at
+    // ~15 min, then every ~30 min (every 3rd beat). Deliberate markers:
+    //  - id keeps the `workflow-heartbeat-` prefix and metadata.heartbeat
+    //    stays true, so the watchdog's report-back ground-truth check still
+    //    excludes it (a delivered update must never mask a lost terminal
+    //    report);
+    //  - NOT silent and titled "Workflow update:" so the bot delivery gate
+    //    treats it as a real update, unlike the suppressed heartbeat noise.
+    // Kill-switch CLEMMY_WORKFLOW_LOUD_UPDATES (default on).
+    const loudUpdatesEnabled = (getRuntimeEnv('CLEMMY_WORKFLOW_LOUD_UPDATES', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+    const loudBeat = count === 2 || (count > 2 && (count - 2) % 3 === 0);
+    if (loudUpdatesEnabled && loudBeat) {
+      addNotification({
+        id: `workflow-heartbeat-loud-${runId}-${count}`,
+        kind: 'workflow',
+        title: `Workflow update: ${workflowName}${stepLabel}`,
+        body: `${stepBody}Still working — ${elapsedMin} min in. I'll report the outcome here when it finishes.`,
+        createdAt: new Date().toISOString(),
+        read: false,
+        metadata: { workflow: workflowName, runId, heartbeat: true, progressUpdate: true, elapsedMin },
+      });
+    }
   };
   let interval: ReturnType<typeof setInterval> | undefined;
   const first = setTimeout(() => {
@@ -375,6 +406,10 @@ interface QueuedRunRecord {
    * CLEMENTINE_WORKFLOW_SELF_HEAL_MAX_ATTEMPTS and escalate instead of looping.
    */
   selfHealAttempt?: number;
+  /** T3.2: the reversible backup snapshotted when this run's heal was
+   *  auto-applied. If THIS run (the healed re-run) still fails, the runner
+   *  auto-reverts the fix — a heal that didn't stick must not survive. */
+  selfHealBackupId?: string;
   /**
    * Run-goal lineage (pinned workflow goals): how many goal re-pursuits
    * already happened (absent/0 = the original run), and the prior attempt's
@@ -439,7 +474,7 @@ function workflowRunOriginSessionIds(run: Pick<QueuedRunRecord, 'originSessionId
   return out;
 }
 
-interface ParkedStepRef {
+export interface ParkedStepRef {
   stepId: string;
   /** 'gate' = declarative requiresApproval gate; 'sdk' = per-tool SDK interrupt. */
   kind: 'gate' | 'sdk';
@@ -507,7 +542,7 @@ class WorkflowRunCancelledError extends Error {
  * treating it as a failure. Carries the resume coordinates the reaper
  * scan needs to know which approvals to watch.
  */
-class ParkRunSignal extends Error {
+export class ParkRunSignal extends Error {
   readonly parkedSteps: ParkedStepRef[];
   constructor(parkedSteps: ParkedStepRef[]) {
     super('Workflow run parked on approval.');
@@ -993,7 +1028,7 @@ function applyWorkflowOriginLineage(ctx: Pick<StepExecutionContext, 'originSessi
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract';
+  kind: 'skill_not_executed' | 'target_missed' | 'goal_validation_unavailable' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
   note: string;
 }
 
@@ -1015,6 +1050,11 @@ export function workflowAdvisoryRequiresAttention(
       // A dead judge is not proof the deliverable is bad. It is still delivered
       // loudly as a quality advisory, but it does not count as a workflow
       // failure or trigger chronic-failure accounting by itself.
+      return false;
+    case 'synthesis_degraded':
+      // Every step already completed and verified — only the final prose
+      // rollup fell back to the deterministic step-output format. Substance
+      // is intact; surface it as an advisory, not a failed run.
       return false;
   }
 }
@@ -1352,6 +1392,7 @@ export const workflowRunnerInternalsForTest = {
   renderWorkflowOriginLineageBlock,
   hasCompletedUpstreamMutation: (steps: WorkflowStepInput[], blockedStepId: string, completedStepIds: Set<string>) =>
     hasCompletedUpstreamMutation(steps, blockedStepId, completedStepIds),
+  hasUngatedIrreversibleAction,
   tryAutoHealAndRequeue,
   selfHealAutoMaxAttempts,
   resolveWorkflowStepModel,
@@ -1492,11 +1533,7 @@ async function runStepViaHarness(
       // didn't actually act — surface it as blocked instead of a silent success.
       let sdkOutput = sdkResult.output;
       if (isPhantomStepCompletion(step, sdkResult.toolUses, sdkOutput)) {
-        const cls = stepSideEffectClass(step);
-        sdkOutput = {
-          blocked: true,
-          reason: `Step "${step.id}" is a ${cls} step but completed without calling any tool — the ${cls === 'send' ? 'send' : 'write'} was not actually performed (it returned output instead of acting). Re-run the step or fix it to call its tool.`,
-        };
+        sdkOutput = phantomBlockedOutput(step);
       }
       markWorkflowHarnessSessionTerminal(session, 'completed');
       return {
@@ -1650,6 +1687,18 @@ async function runStepViaHarness(
     // (captured full, unclipped, keyed by session). Taken once.
     const captured = takeStepResult(realSessionId);
 
+    // Phantom-completion guard (#2), orchestrator-lane parity with the SDK
+    // lane above: a send/write step that "completed" while calling ZERO real
+    // tools never performed its action. The SDK lane gets tool evidence from
+    // sdkResult.toolUses; here the equivalent ground truth is the step
+    // session's tool_called events. workflow_step_result / StructuredOutput
+    // are result emission, not action (inert set in isPhantomStepCompletion).
+    const stepToolUses = listHarnessEvents(realSessionId, { types: ['tool_called'] })
+      .map((e) => (typeof e.data?.tool === 'string' ? e.data.tool : ''))
+      .filter((t) => t.length > 0);
+    const guardPhantom = (output: unknown): unknown =>
+      isPhantomStepCompletion(step, stepToolUses, output) ? phantomBlockedOutput(step) : output;
+
     // A step is "done" only when the harness reports `completed`. The
     // awaiting_approval while-loop above guarantees a terminal status here.
     //   - `failed` = a real harness error → always throw (prior behavior).
@@ -1669,14 +1718,14 @@ async function runStepViaHarness(
       );
     }
     if (captured.found) {
-      return { output: captured.value, hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
+      return { output: guardPhantom(captured.value), hadApprovals, approvalIds, usedStructuredResult: true, sessionId: realSessionId, lane: 'harness', route };
     }
     if (result.status !== 'completed') {
       throw new Error(
         `workflow step "${step.id}" did not complete (status: ${result.status}): ${describeStepNonCompletion(result.status, result.error)}`,
       );
     }
-    return { output: prose, hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
+    return { output: guardPhantom(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
   } finally {
     // Belt + suspenders: clear the heartbeat gate in finally so a throw
     // mid-resume doesn't leave the heartbeat permanently suppressed
@@ -1988,7 +2037,10 @@ function forEachItemRetryEnabled(): boolean {
  * Pure + exported for tests.
  */
 export function stepLoopUntilEnabled(step: WorkflowStepInput): boolean {
-  if (!step.loopUntil || !step.output) return false;
+  if (!step.loopUntil) return false;
+  // Exit condition: the step's own output contract, an external probe
+  // (T2.3: deterministic scripts/ helper verified against `until`), or both.
+  if (!step.output && !stepHasLoopProbe(step)) return false;
   if (step.forEach || step.deterministic) return false;
   const cls = stepSideEffectClass(step);
   if (cls === 'send') return false;
@@ -1996,10 +2048,17 @@ export function stepLoopUntilEnabled(step: WorkflowStepInput): boolean {
   return true;
 }
 
-/** Clamped loopUntil attempt ceiling (default 3, range 1–5). */
+/** T2.3: does the step declare a complete external exit probe? */
+export function stepHasLoopProbe(step: WorkflowStepInput): boolean {
+  return Boolean(step.loopUntil?.probe?.runner?.trim() && step.loopUntil.until);
+}
+
+/** Clamped loopUntil attempt ceiling (default 3; contract loops 1–5, probe
+ *  loops 1–10 — polling external state legitimately needs more passes). */
 export function loopUntilMaxAttempts(step: WorkflowStepInput): number {
   const raw = step.loopUntil?.maxAttempts ?? 3;
-  return Math.max(1, Math.min(5, Math.floor(raw)));
+  const ceiling = stepHasLoopProbe(step) ? 10 : 5;
+  return Math.max(1, Math.min(ceiling, Math.floor(raw)));
 }
 
 /** Evidence note appended to a loopUntil retry's prompt so the next attempt
@@ -2210,11 +2269,42 @@ async function runStepVerifiedAttempt(
   // (no loopUntil, no contract, forEach/deterministic, send, unsafe write)
   // run exactly once: byte-identical to the pre-loopUntil behavior.
   if (!stepLoopUntilEnabled(step)) return runOnce(step);
+  // T2.3 (external exit): a declared probe runs AFTER each successful attempt —
+  // a deterministic scripts/ helper whose output is verified against `until`.
+  // Unsatisfied → throw a contract violation so the SAME loop machinery
+  // re-runs the step with the probe's evidence folded into the prompt. This is
+  // what makes "poll until the job reports done" / "page until nothing
+  // unprocessed remains" authorable as typed code instead of prompt hopes.
+  const runAttempt = !stepHasLoopProbe(step)
+    ? runOnce
+    : async (attemptStep: WorkflowStepInput): Promise<unknown> => {
+        const output = await runOnce(attemptStep);
+        const probe = step.loopUntil!.probe!;
+        const probeOutput = await runDeterministicWorkflowStep(probe.runner, {
+          workflow: ctx.workflow.name,
+          workflowSlug: ctx.workflowSlug,
+          runId: ctx.runId,
+          stepId: `${step.id}#probe`,
+          inputs: ctx.inputs,
+          stepOutputs: { ...ctx.stepOutputs, [step.id]: output },
+        });
+        const verdict = verifyStepOutput(step.loopUntil!.until, probeOutput);
+        if (!verdict.ok) {
+          const problems = verdict.problems.map((p) => `loop probe (${probe.runner}): ${p}`);
+          throw new WorkflowContractViolationError(
+            `step "${step.id}" loop probe did not satisfy its until contract: ${problems.join('; ')}`,
+            step.id,
+            problems,
+            'output_contract',
+          );
+        }
+        return output;
+      };
   const recordAttempts = attemptRecordsEnabled();
   // STATE pillar: closure tracks the prior attempt's problems so each record
   // reads as a delta. Only allocated when records are on (flag-off ⇒ no I/O).
   let priorProblems: string[] | undefined;
-  return runWithContractLoop(runOnce, step, {
+  return runWithContractLoop(runAttempt, step, {
     maxAttempts: loopUntilMaxAttempts(step),
     // Only sample when recording — the snapshot reads today's usage NDJSON +
     // the step's harness events, which we must not pay for when the flag is off.
@@ -2594,6 +2684,65 @@ export function findContractViolationStep(
   return null;
 }
 
+/** T3.1: apply clean-run contract tightenings — additive-only, validated,
+ *  backed up. CONSERVATIVE: only requires shape that has been INVARIANT across
+ *  ≥3 clean runs (see workflow-contract-evidence-store), so a tightening can
+ *  never fail a run that looks like the runs it learned from. Kill-switch
+ *  CLEMMY_WORKFLOW_AUTO_TIGHTEN. Exported for tests. Returns applied step ids. */
+export function tightenWorkflowContractsFromCleanRun(
+  workflowSlug: string,
+  def: WorkflowDefinition,
+  stepOutputs: Record<string, unknown>,
+  runId: string,
+): string[] {
+  const tightenings = recordAndDeriveStableTightenings(workflowSlug, def, stepOutputs, new Date().toISOString());
+  if (tightenings.length === 0) return [];
+  const current = readWorkflow(workflowSlug)?.data ?? def;
+  const originalSteps = new Map(def.steps.map((step) => [step.id, step]));
+  const currentSteps = new Map(current.steps.map((step) => [step.id, step]));
+  const applicable = tightenings.filter((tightening) => {
+    const original = originalSteps.get(tightening.stepId);
+    const latest = currentSteps.get(tightening.stepId);
+    if (!original || !latest) return false;
+    if (latest.output && Object.keys(latest.output).length > 0) return false;
+    if ((latest.prompt ?? '') !== (original.prompt ?? '')) return false;
+    if ((latest.forEach ?? '') !== (original.forEach ?? '')) return false;
+    return true;
+  });
+  if (applicable.length === 0) return [];
+  const tightened: WorkflowDefinition = {
+    ...current,
+    steps: current.steps.map((s) => {
+      const t = applicable.find((x) => x.stepId === s.id);
+      return t ? { ...s, output: t.output } : s;
+    }),
+  };
+  const check = checkWorkflowForWrite(tightened);
+  if (!check.ok) {
+    logger.warn({ workflow: workflowSlug, errors: check.errors.slice(0, 3) }, 'clean-run contract tightening did not validate — skipped');
+    return [];
+  }
+  const backup = recordWorkflowEditBackup(
+    workflowSlug,
+    applicable[0].stepId,
+    current,
+    `clean-run contract tightening (run ${runId}): ${applicable.map((t) => `${t.stepId} ← ${t.evidence}`).join('; ')}`,
+  );
+  writeWorkflow(workflowSlug, tightened);
+  for (const t of applicable) {
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'step_advisory',
+      stepId: t.stepId,
+      meta: { reason: 'contract_tightened', evidence: t.evidence, backupId: backup?.id },
+    });
+  }
+  logger.info(
+    { workflow: workflowSlug, steps: applicable.map((t) => t.stepId), backupId: backup?.id },
+    'clean run tightened output contracts (revert with `revert heal <id>` if it proves wrong)',
+  );
+  return applicable.map((t) => t.stepId);
+}
+
 export async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -2666,7 +2815,29 @@ export async function executeStep(
       return [];
     }
 
-    const keyedItems = items.map((item, index) => ({ item, index, key: itemKey(item, index) }));
+    let keyedItems = items.map((item, index) => ({ item, index, key: itemKey(item, index) }));
+    // T2.2 (cross-run watermark): forEachNewOnly skips items ANY prior run of
+    // this workflow already completed — engine-level "only the new ones",
+    // instead of an LLM prompt deciding what's new. The watermark advances
+    // only on item COMPLETION (below), so failed items retry next run.
+    let watermarkSkipped = 0;
+    if (step.forEachNewOnly && !ctx.creationTest) {
+      const seen = readSeenItemKeys(ctx.workflowSlug, step.id);
+      if (seen.size > 0) {
+        const fresh = keyedItems.filter((it) => !seen.has(it.key));
+        watermarkSkipped = keyedItems.length - fresh.length;
+        keyedItems = fresh;
+      }
+      if (keyedItems.length === 0) {
+        appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+          kind: 'step_skipped',
+          stepId: step.id,
+          output: [],
+          meta: { reason: 'forEach-no-new-items', source: step.forEach, seenSkipped: watermarkSkipped },
+        });
+        return [];
+      }
+    }
     const alreadyCompleted = keyedItems.filter((it) => ctx.completedItems.has(it.key));
     const pendingItems = keyedItems.filter((it) => !ctx.completedItems.has(it.key));
 
@@ -2882,7 +3053,25 @@ export async function executeStep(
     for (let offset = 0; offset < pendingItems.length; offset += maxItems) {
       const windowItems = pendingItems.slice(offset, offset + maxItems);
       if (windowItems.length === 0) continue;
-      itemResults.push(...await runPendingWindow(windowItems));
+      const windowResults = await runPendingWindow(windowItems);
+      itemResults.push(...windowResults);
+      // T2.2: advance the cross-run watermark per WINDOW (not at step end) so a
+      // crash mid-fan-out doesn't lose earlier windows' completions. Only
+      // completed items advance — failures retry on the next run.
+      if (step.forEachNewOnly && !ctx.creationTest) {
+        const completedKeys = windowResults
+          .filter((r): r is { ok: true; value: ItemResult } => r.ok)
+          .map((r) => r.value.itemKey);
+        try { markItemsSeen(ctx.workflowSlug, step.id, completedKeys); } catch (err) {
+          logger.warn({ stepId: step.id, err: err instanceof Error ? err.message : String(err) }, 'forEach watermark write failed (items will be re-seen next run)');
+        }
+      }
+    }
+    // Resumed items completed in a prior pass of THIS run — make sure they are
+    // in the watermark too (idempotent; covers a crash between completion and
+    // the original mark).
+    if (step.forEachNewOnly && !ctx.creationTest && alreadyCompleted.length > 0) {
+      try { markItemsSeen(ctx.workflowSlug, step.id, alreadyCompleted.map((it) => it.key)); } catch { /* best-effort */ }
     }
 
     const successes = itemResults.filter((r): r is { ok: true; value: ItemResult } => r.ok);
@@ -3133,6 +3322,46 @@ export function planWorkflowExecutionBatches(
   return batches;
 }
 
+export interface BatchSettlement {
+  completions: Array<{ stepId: string; output: unknown }>;
+  parkedSteps: ParkedStepRef[];
+  failures: Array<{ stepId: string; message: string }>;
+  /** continue = all fulfilled; park = at least one sibling parked (park WINS
+   *  over a sibling failure — see below); fail = failures and no park. */
+  action: 'continue' | 'park' | 'fail';
+}
+
+/** T1.3: merge a parallel batch's settled results into one decision. The rule
+ *  that matters: a parked sibling is work awaiting a HUMAN decision, so a park
+ *  outranks an unrelated sibling's failure — the run parks (failure recorded as
+ *  an advisory) instead of going terminal and cancelling the user's pending
+ *  approval card. The failed step never emitted step_completed, so the pass
+ *  after the park resolves re-runs it; a repeat failure with no park then fails
+ *  the run normally. Completed siblings are always kept (durable in
+ *  events.jsonl either way). Pure + exported for tests. */
+export function decideBatchSettlement(
+  batch: WorkflowStepInput[],
+  settled: PromiseSettledResult<{ step: WorkflowStepInput; output: unknown }>[],
+): BatchSettlement {
+  const completions: BatchSettlement['completions'] = [];
+  const parkedSteps: ParkedStepRef[] = [];
+  const failures: BatchSettlement['failures'] = [];
+  settled.forEach((result, i) => {
+    if (result.status === 'fulfilled') {
+      completions.push({ stepId: result.value.step.id, output: result.value.output });
+    } else if (result.reason instanceof ParkRunSignal) {
+      parkedSteps.push(...result.reason.parkedSteps);
+    } else {
+      failures.push({
+        stepId: batch[i]?.id ?? 'unknown',
+        message: result.reason instanceof Error ? result.reason.message : String(result.reason),
+      });
+    }
+  });
+  const action = parkedSteps.length > 0 ? 'park' : failures.length > 0 ? 'fail' : 'continue';
+  return { completions, parkedSteps, failures, action };
+}
+
 function formatStepOutputs(steps: WorkflowStepInput[], stepOutputs: Record<string, unknown>): string {
   return steps
     .filter((step) => stepOutputs[step.id] !== undefined)
@@ -3180,9 +3409,18 @@ export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' |
  *  - StructuredOutput is schema emission, not an action → ignored;
  *  - an already-{blocked} output is honest → left alone.
  *  Kill-switch CLEMMY_WORKFLOW_PHANTOM_GUARD (default on). */
-const PHANTOM_GUARD_INERT_TOOLS: ReadonlySet<string> = new Set(['StructuredOutput']);
+const PHANTOM_GUARD_INERT_TOOLS: ReadonlySet<string> = new Set(['StructuredOutput', 'workflow_step_result']);
 function phantomGuardEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKFLOW_PHANTOM_GUARD', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+/** The honest replacement output for a phantom completion — shared by the SDK
+ *  and orchestrator lanes so both surface the identical blocked shape. */
+export function phantomBlockedOutput(step: WorkflowStepInput): { blocked: true; reason: string } {
+  const cls = stepSideEffectClass(step);
+  return {
+    blocked: true,
+    reason: `Step "${step.id}" is a ${cls} step but completed without calling any tool — the ${cls === 'send' ? 'send' : 'write'} was not actually performed (it returned output instead of acting). Re-run the step or fix it to call its tool.`,
+  };
 }
 export function isPhantomStepCompletion(step: WorkflowStepInput, toolUses: string[] | undefined, output: unknown): boolean {
   if (!phantomGuardEnabled()) return false;
@@ -3661,38 +3899,30 @@ async function executeWorkflow(
         return { step, output };
       }));
 
-      const errors: string[] = [];
-      const parkedSteps: ParkedStepRef[] = [];
-      for (const result of settled) {
-        if (result.status === 'fulfilled') {
-          stepOutputs[result.value.step.id] = result.value.output;
-          completedStepIds.add(result.value.step.id);
-        } else if (result.reason instanceof ParkRunSignal) {
-          parkedSteps.push(...result.reason.parkedSteps);
-        } else {
-          errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
-        }
+      const decision = decideBatchSettlement(batch, settled);
+      for (const done of decision.completions) {
+        stepOutputs[done.stepId] = done.output;
+        completedStepIds.add(done.stepId);
       }
       throwIfWorkflowRunCancelled(runId);
-      // A genuine error fails the run even if a sibling parked. Before failing,
-      // CLEAN UP any sibling that parked: its approval row + heartbeat flag were
-      // registered, and the run is about to go terminal (error). Cancel those
-      // pending approvals (else the user sees an approval card for a dead run the
-      // reaper can never re-admit) and clear the heartbeat flag.
-      if (errors.length > 0) {
-        if (parkedSteps.length > 0) {
-          for (const id of parkedSteps.flatMap((s) => s.approvalIds)) {
-            try { approvalRegistry.resolve(id, 'cancelled_by_user', 'batch-sibling-failed'); } catch { /* best-effort */ }
-          }
-          clearWorkflowRunPausedForApproval(runId);
+      if (decision.action === 'park') {
+        for (const failure of decision.failures) {
+          appendWorkflowEvent(workflowSlug, runId, {
+            kind: 'step_advisory',
+            stepId: failure.stepId,
+            error: failure.message,
+            meta: { reason: 'batch_sibling_failed_while_parked' },
+          });
+          logger.warn(
+            { runId, stepId: failure.stepId, err: failure.message },
+            'batch step failed while a sibling parked on approval — preserving the park; the failed step re-runs after the approval resolves',
+          );
         }
-        throw new Error(errors.length === 1 ? errors[0] : `Workflow batch failed: ${errors.join('; ')}`);
+        throw new ParkRunSignal(decision.parkedSteps);
       }
-      // No genuine error. If any sibling parked, park the whole run: completed
-      // siblings are already durable in events.jsonl, so resume re-runs only the
-      // parked and not-yet-started steps.
-      if (parkedSteps.length > 0) {
-        throw new ParkRunSignal(parkedSteps);
+      if (decision.action === 'fail') {
+        const messages = decision.failures.map((e) => e.message);
+        throw new Error(messages.length === 1 ? messages[0] : `Workflow batch failed: ${messages.join('; ')}`);
       }
       completedStepIds = new Set(Object.keys(stepOutputs));
     }
@@ -3728,32 +3958,102 @@ async function executeWorkflow(
       model: claudeIsActiveWorkflowBrain() ? getClaudeBrainModel() : defaultForRole('brain'),
       maxTurns: 8,
     };
-    const synthesisResult = await runStepViaHarness(
-      synthesisStep,
-      `${runId}:synthesis`,
-      [
-        'Workflow synthesis pass. Produce the final user-facing result from the completed step outputs.',
-        'Do not start new external research or mutate external systems during synthesis unless the user explicitly asked for that in the workflow synthesis prompt.',
-        '',
-        synthesisPrompt,
-        '',
-        'Step outputs:',
-        '',
-        stepOutputsAsText,
-      ].join('\n'),
-      workflow.name,
-      [],
-      runId,
-      undefined,
-      true, // canPark: synthesis runs outside any batch/forEach
-    );
+    const synthesisMessage = [
+      'Workflow synthesis pass. Produce the final user-facing result from the completed step outputs.',
+      'Do not start new external research or mutate external systems during synthesis unless the user explicitly asked for that in the workflow synthesis prompt.',
+      '',
+      synthesisPrompt,
+      '',
+      'Step outputs:',
+      '',
+      stepOutputsAsText,
+    ].join('\n');
+    // T1.2: synthesis used to be the one LLM call in a run with no transient
+    // retry, no brain fallover, and no fallback — a provider blip at the finish
+    // line failed a run whose every step had already completed and verified.
+    // Protect it like a step (synthesis is read-only prose, so re-runs are
+    // always safe), and on ultimate failure degrade to the deterministic
+    // step-output rollup instead of failing the run.
+    const synthesisAttempt = (attemptStep: WorkflowStepInput): Promise<{ output: unknown }> =>
+      runWithStepRetry(
+        () => runStepViaHarness(
+          attemptStep,
+          `${runId}:synthesis`,
+          synthesisMessage,
+          workflow.name,
+          [],
+          runId,
+          undefined,
+          true, // canPark: synthesis runs outside any batch/forEach
+        ),
+        {
+          budget: transientRetryFloor(),
+          backoffBaseMs: RETRY_BACKOFF_BASE_MS,
+          isRetryable: (err) =>
+            !(err instanceof ParkRunSignal) &&
+            !(err instanceof WorkflowRunCancelledError) &&
+            isTransientStepError(err),
+          onRetry: ({ attempt, budget: b, delayMs, err }) => {
+            appendWorkflowEvent(workflowSlug, runId, {
+              kind: 'step_retry',
+              stepId: '__synthesis__',
+              error: err instanceof Error ? err.message : String(err),
+              meta: { attempt, budget: b, delayMs, reason: 'transient' },
+            });
+          },
+          afterBackoff: () => throwIfWorkflowRunCancelled(runId),
+        },
+      );
+    let synthesisOutput: unknown = null;
+    try {
+      synthesisOutput = (await synthesisAttempt(synthesisStep)).output;
+    } catch (err) {
+      if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
+      let lastErr: unknown = err;
+      // Step-boundary brain fallover, mirroring executeStepVerified. Synthesis
+      // is read-only, so there is no external-write guard to respect.
+      if (workflowBrainFalloverEnabled() && (isTransientStepError(err) || isUnparseableToolCallError(err))) {
+        const currentProvider = resolveProvider(synthesisStep.model ?? MODELS.primary) as BrainProviderClass;
+        for (const target of falloverBrainModelIds(currentProvider)) {
+          appendWorkflowEvent(workflowSlug, runId, {
+            kind: 'step_advisory',
+            stepId: '__synthesis__',
+            meta: { reason: 'brain_fallover', from: currentProvider, to: target.provider, toModel: target.modelId },
+          });
+          try {
+            synthesisOutput = (await synthesisAttempt({ ...synthesisStep, model: target.modelId })).output;
+            lastErr = null;
+            break;
+          } catch (nextErr) {
+            if (nextErr instanceof ParkRunSignal || nextErr instanceof WorkflowRunCancelledError) throw nextErr;
+            lastErr = nextErr;
+            if (!isTransientStepError(nextErr) && !isUnparseableToolCallError(nextErr)) break;
+          }
+        }
+      }
+      if (lastErr != null) {
+        const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+        logger.warn({ runId, err: msg }, 'synthesis pass failed after retry+fallover — degrading to the raw step-output rollup');
+        qualityAdvisories.push({
+          stepId: '__synthesis__',
+          kind: 'synthesis_degraded',
+          note: `Synthesis pass failed (${msg}) — the final report is the raw step-output rollup. All steps completed and verified; only the prose rollup is degraded.`,
+        });
+        appendWorkflowEvent(workflowSlug, runId, {
+          kind: 'step_advisory',
+          stepId: '__synthesis__',
+          error: msg,
+          meta: { reason: 'synthesis_degraded' },
+        });
+      }
+    }
     // Synthesis output is the final user-facing report (a string). The
     // step result is `unknown` now, so coerce: keep strings as-is,
     // JSON-render an (unexpected) structured synthesis result.
-    const synthesisText = typeof synthesisResult.output === 'string'
-      ? synthesisResult.output
-      : synthesisResult.output != null
-        ? JSON.stringify(synthesisResult.output, null, 2)
+    const synthesisText = typeof synthesisOutput === 'string'
+      ? synthesisOutput
+      : synthesisOutput != null
+        ? JSON.stringify(synthesisOutput, null, 2)
         : '';
     finalOutput = synthesisText || formatStepOutputs(workflow.steps, stepOutputs);
     throwIfWorkflowRunCancelled(runId);
@@ -4091,6 +4391,26 @@ function hasCompletedUpstreamMutation(
       || stepLooksLikeIrreversibleSend(s.prompt ?? '')));
 }
 
+function stepRequiresApproval(step: WorkflowStepInput): boolean {
+  return step.requiresApproval === true || (step as { requires_approval?: boolean }).requires_approval === true;
+}
+
+/**
+ * Auto-heal rewrites the workflow prompt and queues a fresh full run. For
+ * workflows that eventually post/send/publish, a model-authored fix must not be
+ * allowed to silently continue into the external action. Let the workflow
+ * self-heal only when that irreversible action is protected by a declarative
+ * approval gate; otherwise surface the fix for human approval instead.
+ */
+function hasUngatedIrreversibleAction(steps: WorkflowStepInput[]): boolean {
+  return steps.some((step) => {
+    const cls = step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send'
+      ? step.sideEffect
+      : stepLooksLikeIrreversibleSend(step.prompt ?? '') ? 'send' : stepLooksMutating(step) ? 'write' : 'read';
+    return cls === 'send' && !stepRequiresApproval(step);
+  });
+}
+
 interface AutoHealOutcome { attempt: number; max: number; stepId: string; message: string; }
 
 /**
@@ -4099,14 +4419,14 @@ interface AutoHealOutcome { attempt: number; max: number; stepId: string; messag
  * suppresses the "apply this fix" offer) or null to fall through to today's
  * escalation (needs-attention + fix offer). Never throws.
  */
-function tryAutoHealAndRequeue(args: {
+async function tryAutoHealAndRequeue(args: {
   run: QueuedRunRecord;
   workflowSlug: string;
   steps: WorkflowStepInput[];
   diagnosis: WorkflowDiagnosis | null;
   proposedFix: ProposedFix | null;
   completedStepIds: Set<string>;
-}): AutoHealOutcome | null {
+}): Promise<AutoHealOutcome | null> {
   const { run, workflowSlug, steps, diagnosis, proposedFix, completedStepIds } = args;
   if (!selfHealEnabled() || !diagnosis || !proposedFix) return null;
   // Cross-fire guard (#6): a workflow that has failed N times in a row is
@@ -4124,6 +4444,13 @@ function tryAutoHealAndRequeue(args: {
   const max = selfHealAutoMaxAttempts();
   const prior = run.selfHealAttempt ?? 0;
   if (max <= 0 || prior >= max) return null; // at cap → escalate (today's offer)
+  if (hasUngatedIrreversibleAction(steps)) {
+    logger.info(
+      { runId: run.id, step: fix.stepId },
+      'self-heal: workflow has an ungated irreversible action — escalating instead of auto re-running after a prompt edit',
+    );
+    return null;
+  }
   if (hasCompletedUpstreamMutation(steps, fix.stepId, completedStepIds)) {
     logger.info(
       { runId: run.id, step: fix.stepId },
@@ -4131,7 +4458,21 @@ function tryAutoHealAndRequeue(args: {
     );
     return null;
   }
-  let applied: { ok: boolean; message: string };
+  // T3.2: never self-grade an auto-mutating action — a judge from a DIFFERENT
+  // provider family re-grades the Doctor's fix before it auto-applies. Veto →
+  // the fix is offered to the human instead (today's escalation). No
+  // different-family judge available → fail-open (bounded + backed-up +
+  // auto-reverted-on-non-stick already protect the blast radius).
+  const stepPrompt = steps.find((s) => s.id === fix.stepId)?.prompt;
+  const healJudge = await judgeHealCrossFamily(diagnosis, stepPrompt);
+  if (healJudge.verdict === 'veto') {
+    logger.info(
+      { runId: run.id, step: fix.stepId, reason: healJudge.reason },
+      'self-heal: cross-family judge vetoed the auto-fix — escalating to the human apply-fix offer',
+    );
+    return null;
+  }
+  let applied: { ok: boolean; message: string; backupId?: string };
   try {
     applied = applyProposedFix(proposedFix.id);
   } catch (err) {
@@ -4144,9 +4485,13 @@ function tryAutoHealAndRequeue(args: {
   }
   const attempt = prior + 1;
   try {
-    appendWorkflowEvent(workflowSlug, run.id, { kind: 'step_retry', stepId: fix.stepId, meta: { selfHeal: true, attempt } });
+    appendWorkflowEvent(workflowSlug, run.id, { kind: 'step_retry', stepId: fix.stepId, meta: { selfHeal: true, attempt, backupId: applied.backupId, judge: healJudge.verdict } });
   } catch { /* heal log is best-effort */ }
-  const requeued = requeueWorkflowFromRun(run.id, { originSessionIds: workflowRunOriginSessionIds(run), selfHealAttempt: attempt });
+  const requeued = requeueWorkflowFromRun(run.id, {
+    originSessionIds: workflowRunOriginSessionIds(run),
+    selfHealAttempt: attempt,
+    selfHealBackupId: applied.backupId,
+  });
   if (requeued.status === 'not_found') {
     // Fix is applied but we couldn't re-queue — report it so it's never silent.
     logger.warn({ runId: run.id }, 'self-heal: applied fix but could not re-queue; surfacing for manual re-run');
@@ -5021,6 +5366,17 @@ async function processOneRunFile(
               finalOutput,
             });
           } catch { /* pattern learning never affects the run */ }
+          // T3.1 (success-path improvement): a clean run's VERIFIED outputs are
+          // ground truth — derive additive output contracts for steps that had
+          // none, so the next run is held to the shape this run proved
+          // achievable. Additive-only (author-declared contracts are never
+          // touched), validated before write, and backed up so `revert heal
+          // <id>` undoes a tightening that proves wrong. Never affects the run.
+          try {
+            tightenWorkflowContractsFromCleanRun(workflow.name, workflow.data, stepOutputs, run.id);
+          } catch (err) {
+            logger.warn({ workflow: workflow.name, err: err instanceof Error ? err.message : String(err) }, 'clean-run contract tightening skipped');
+          }
         }
       }
       const autoHealPaused = needsAttention && shouldStopAutoHeal(workflow.name);
@@ -5083,7 +5439,32 @@ async function processOneRunFile(
       // its own outcome (and re-enters the origin chat via carried origin). We
       // skip the normal needs-attention notification/offer to avoid double-msging.
       if (needsAttention) {
-        const healed = tryAutoHealAndRequeue({
+        // T3.2 (auto-revert): this run IS a healed re-run and it STILL needs
+        // attention — the auto-applied fix didn't stick. Restore the pre-heal
+        // definition instead of leaving a bad rewrite in place (or stacking
+        // another rewrite on top of it), and skip a fresh auto-heal this
+        // cycle; the chronic-failure ledger still counts the failure.
+        let healReverted = false;
+        if ((run.selfHealAttempt ?? 0) > 0 && run.selfHealBackupId) {
+          try {
+            const reverted = revertWorkflowFix(run.selfHealBackupId);
+            healReverted = reverted.ok;
+            if (reverted.ok) {
+              appendWorkflowEvent(workflow.name, run.id, {
+                kind: 'step_advisory',
+                stepId: blockedSteps[0]?.stepId ?? 'run',
+                meta: { reason: 'self_heal_reverted', backupId: run.selfHealBackupId },
+              });
+              logger.info(
+                { workflow: workflow.name, runId: run.id, backupId: run.selfHealBackupId },
+                'self-heal: healed re-run still failed — auto-reverted the fix to the pre-heal definition',
+              );
+            }
+          } catch (err) {
+            logger.warn({ runId: run.id, err: err instanceof Error ? err.message : String(err) }, 'self-heal auto-revert failed (backup may already be gone)');
+          }
+        }
+        const healed = healReverted ? null : await tryAutoHealAndRequeue({
           run,
           workflowSlug: workflow.name,
           steps: workflow.data.steps,

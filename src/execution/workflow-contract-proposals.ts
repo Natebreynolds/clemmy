@@ -1,4 +1,5 @@
 import type {
+  WorkflowAllowedTool,
   WorkflowDefinition,
   WorkflowGoal,
   WorkflowInputDef,
@@ -54,6 +55,49 @@ const LIST_DELIVERABLE_RE =
 const SUMMARY_DELIVERABLE_RE =
   /\b(?:summary|summaries)\b/i;
 
+const LIVE_RESEARCH_RE =
+  /\b(?:research|audit|analy[sz]e|seo|keyword|backlink|serp|lighthouse|competitor|competitive|rank(?:ing)?|crawl|scrape|extract|dataforseo|firecrawl)\b/i;
+const EVIDENCE_DENSE_RE =
+  /\b(?:audit|seo|keyword|backlink|serp|lighthouse|competitor|competitive|dataforseo)\b/i;
+const ARTIFACT_WRITE_RE =
+  /\b(?:build|create|generate|render|write|save|export|compile|assemble)\b[\s\S]{0,80}\b(?:html|pdf|file|report|brief|audit|document|deck|slides?|page|website|site)\b/i;
+const EXTERNAL_TOOL_RE =
+  /^(?:\*|composio|mcp|dataforseo|firecrawl|apify|fetch|web_|browser|run_shell_command|recall_tool_result|tool_output_query)/i;
+const IDENTITY_CONTRACT_KEYS = new Set([
+  'id',
+  'name',
+  'client',
+  'client_name',
+  'company',
+  'domain',
+  'url',
+  'canonical_url',
+  'website',
+  'site',
+  'status',
+  'timestamp',
+  'date',
+]);
+const EVIDENCE_CONTRACT_KEYS = new Set([
+  'sources',
+  'source_errors',
+  'key_findings',
+  'findings',
+  'results',
+  'items',
+  'rows',
+  'records',
+  'metrics',
+  'data',
+  'ranked_keywords',
+  'keywords',
+  'backlinks',
+  'referring_domains',
+  'competitors',
+  'technical_score',
+  'summary',
+]);
+
 const LIST_KEY_HINTS: Array<[string, RegExp]> = [
   ['meetings', /\bmeetings?\b/i],
   ['leads', /\bleads\b/i],
@@ -73,6 +117,110 @@ function snippet(text: string, max = 180): string {
 
 function hasOutputContract(step: WorkflowStepInput): boolean {
   return Boolean(step.output && Object.keys(step.output).length > 0);
+}
+
+function toolName(tool: WorkflowAllowedTool | string): string {
+  return typeof tool === 'string' ? tool : tool.name;
+}
+
+function effectiveToolNames(workflow: WorkflowDefinition, step: WorkflowStepInput): string[] {
+  const local = step.allowedTools?.filter((tool) => tool.trim().length > 0);
+  const raw = local && local.length > 0 ? local : (workflow.allowedTools ?? []);
+  return raw.map(toolName).filter((name) => name.trim().length > 0);
+}
+
+function stepReachesExternalToolSurface(workflow: WorkflowDefinition, step: WorkflowStepInput): boolean {
+  if (step.usesSkill) return true;
+  if (step.forEach) return true;
+  return effectiveToolNames(workflow, step).some((tool) => EXTERNAL_TOOL_RE.test(tool));
+}
+
+function contractEvidenceKeys(contract: WorkflowStepOutputContract | undefined): Set<string> {
+  const keys = new Set<string>();
+  for (const key of contract?.required_keys ?? []) keys.add(key);
+  for (const key of contract?.non_empty ?? []) keys.add(key);
+  for (const key of Object.keys(contract?.min_items ?? {})) keys.add(key);
+  for (const key of contract?.verify?.path_exists ?? []) keys.add(key);
+  for (const key of contract?.verify?.url_present ?? []) keys.add(key);
+  return keys;
+}
+
+function hasEvidenceKey(contract: WorkflowStepOutputContract | undefined): boolean {
+  for (const key of contractEvidenceKeys(contract)) {
+    if (EVIDENCE_CONTRACT_KEYS.has(key)) return true;
+  }
+  return false;
+}
+
+function onlyIdentityKeys(contract: WorkflowStepOutputContract | undefined): boolean {
+  const keys = [...contractEvidenceKeys(contract)].filter((key) => key && key !== '.');
+  return keys.length > 0 && keys.every((key) => IDENTITY_CONTRACT_KEYS.has(key));
+}
+
+export function stepHasWeakLiveResearchContract(
+  workflow: WorkflowDefinition,
+  step: WorkflowStepInput,
+): boolean {
+  if (!hasOutputContract(step)) return false;
+  if (step.deterministic) return false;
+  if ((step.output?.verify?.path_exists?.length ?? 0) > 0) return false;
+  const prompt = step.prompt ?? '';
+  if (!LIVE_RESEARCH_RE.test(prompt)) return false;
+  if (!stepReachesExternalToolSurface(workflow, step)) return false;
+  return onlyIdentityKeys(step.output) || !hasEvidenceKey(step.output);
+}
+
+export function hardenWeakLiveResearchOutputContract(
+  workflow: WorkflowDefinition,
+  step: WorkflowStepInput,
+): WorkflowStepOutputContract | null {
+  if (!stepHasWeakLiveResearchContract(workflow, step)) return null;
+  const current = step.output ?? {};
+  const required = new Set(current.required_keys ?? []);
+  const nonEmpty = new Set(current.non_empty ?? []);
+  const minItems = { ...(current.min_items ?? {}) };
+  const minEvidenceItems = EVIDENCE_DENSE_RE.test(step.prompt ?? '') ? 3 : 1;
+
+  required.add('sources');
+  required.add('key_findings');
+  required.add('source_errors');
+  nonEmpty.add('sources');
+  nonEmpty.add('key_findings');
+  minItems.sources = Math.max(minItems.sources ?? 0, minEvidenceItems);
+  minItems.key_findings = Math.max(minItems.key_findings ?? 0, minEvidenceItems);
+
+  return compactContract({
+    ...current,
+    type: current.type ?? 'object',
+    required_keys: [...required],
+    non_empty: [...nonEmpty],
+    min_items: minItems,
+    description: current.description ?? `Evidence-grade live research output for step "${step.id}".`,
+  });
+}
+
+export function workflowAuthoringAdvisories(workflow: WorkflowDefinition): string[] {
+  const warnings: string[] = [];
+  for (const step of workflow.steps ?? []) {
+    if (stepHasWeakLiveResearchContract(workflow, step)) {
+      const keys = [...contractEvidenceKeys(step.output)].filter(Boolean);
+      warnings.push(
+        `Step "${step.id}" reaches live research tools but its output contract can pass without evidence`
+        + `${keys.length > 0 ? ` (${keys.join(', ')})` : ''}. Require source-backed keys such as sources, key_findings, and source_errors so provider data cannot be discarded.`,
+      );
+    }
+
+    if (
+      !step.deterministic
+      && (step.output?.verify?.path_exists?.length ?? 0) > 0
+      && ARTIFACT_WRITE_RE.test(step.prompt ?? '')
+    ) {
+      warnings.push(
+        `Step "${step.id}" verifies a local artifact path but is still model-written. Prefer a deterministic runner under scripts/ for rendering/writing, and keep the model responsible for structured data only.`,
+      );
+    }
+  }
+  return warnings;
 }
 
 function hasPinnedGoal(workflow: WorkflowDefinition): boolean {

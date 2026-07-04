@@ -44,6 +44,8 @@ export interface WorkflowStepShape {
   tier?: number;
   maxTurns?: number;
   forEach?: string;
+  forEachNewOnly?: boolean;
+  for_each_new_only?: boolean;
   deterministic?: { runner?: string };
   usesSkill?: string;
   uses_skill?: string;
@@ -61,7 +63,13 @@ export interface WorkflowFrontmatter {
   name?: string;
   description?: string;
   enabled?: boolean;
-  trigger?: { schedule?: string; manual?: boolean; timezone?: string };
+  trigger?: {
+    schedule?: string;
+    manual?: boolean;
+    timezone?: string;
+    webhookPath?: string;
+    events?: Array<{ type?: string; filter?: Record<string, unknown>; dedupeKey?: string }>;
+  };
   steps?: WorkflowStepShape[];
   inputs?: Record<string, { type?: string; default?: string; description?: string }>;
   synthesis?: { prompt?: string };
@@ -501,12 +509,20 @@ function stepLooksIntentionalAggregateBatch(step: WorkflowStepShape): boolean {
 }
 
 function checkParallelismHint(step: WorkflowStepShape): string | null {
-  if (step.forEach) return null;
-  if (ROW_BOOKKEEPING_RE.test(step.prompt)) return null;
-  if (!EXPLICIT_PER_ITEM_RE.test(step.prompt) && SOCIAL_POST_BATCH_RE.test(step.prompt)) return null;
-  if (stepLooksIntentionalAggregateBatch(step)) return null;
-  if (!MULTI_ITEM_PROMPT_RE.test(step.prompt) || !SERIAL_WORK_RE.test(step.prompt)) return null;
+  if (!stepLooksMultiItemWithoutForEach(step)) return null;
   return `Step "${step.id}" looks like multi-item work but has no forEach — it will run serially in one context. To parallelize safely, have the upstream step emit an ARRAY and add \`forEach: <upstreamStepId>\` to this step; the runner then fans out per item with bounded concurrency and keeps each item's context lean. (run_worker is not the path — it's unavailable inside a workflow step; forEach is the fan-out primitive.)`;
+}
+
+/** T2.4: the parallelism-hint predicate, exported so auto-repair
+ *  (workflow-enforce.ts) can mechanically FIX the class it detects —
+ *  multi-item prose without a forEach — instead of only warning. */
+export function stepLooksMultiItemWithoutForEach(step: WorkflowStepShape): boolean {
+  if (step.forEach) return false;
+  if (ROW_BOOKKEEPING_RE.test(step.prompt)) return false;
+  if (!EXPLICIT_PER_ITEM_RE.test(step.prompt) && SOCIAL_POST_BATCH_RE.test(step.prompt)) return false;
+  if (stepLooksIntentionalAggregateBatch(step)) return false;
+  if (!MULTI_ITEM_PROMPT_RE.test(step.prompt) || !SERIAL_WORK_RE.test(step.prompt)) return false;
+  return true;
 }
 
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {
@@ -676,6 +692,32 @@ export function validateWorkflowDefinition(
       + 'an unknown timezone silently falls back to the server host time, so the workflow would fire at the wrong hour.',
     );
   }
+  // T2.1: event/webhook trigger shape. A malformed declaration would silently
+  // never fire (the registry sync skips it) — reject it at authoring instead.
+  if (data.trigger?.webhookPath !== undefined) {
+    const hook = typeof data.trigger.webhookPath === 'string' ? data.trigger.webhookPath.trim() : '';
+    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(hook)) {
+      errors.push(
+        `Invalid trigger.webhookPath: "${String(data.trigger.webhookPath)}". Use a URL-safe slug (letters, digits, "-", "_") — `
+        + 'it becomes POST /api/hooks/workflows/<webhookPath>.',
+      );
+    }
+  }
+  for (const [i, ev] of (data.trigger?.events ?? []).entries()) {
+    const type = typeof ev?.type === 'string' ? ev.type.trim() : '';
+    if (!type) {
+      errors.push(`trigger.events[${i}] is missing a non-empty "type" — the event trigger would never fire.`);
+      continue;
+    }
+    if (ev.dedupeKey !== undefined && (typeof ev.dedupeKey !== 'string' || !ev.dedupeKey.trim())) {
+      errors.push(`trigger.events[${i}] ("${type}") has an empty dedupeKey — omit it (payload-hash dedupe) or use a template like "lead-{{payload.id}}".`);
+    }
+    for (const [key, value] of Object.entries(ev.filter ?? {})) {
+      if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) {
+        errors.push(`trigger.events[${i}] ("${type}") filter "${key}" must be a primitive (string/number/boolean) — payload matching is shallow equality.`);
+      }
+    }
+  }
 
   if (!data.description || data.description.trim().length < 8) {
     warnings.push('Description is missing or too short — the agent will have trouble picking the right workflow.');
@@ -708,6 +750,13 @@ export function validateWorkflowDefinition(
     if (Array.isArray(step.orderingOnlyDeps) && step.orderingOnlyDeps.length > 0) {
       warnings.push(
         `Step "${step.id}" uses deprecated orderingOnlyDeps. dependsOn now carries upstream outputs automatically; remove orderingOnlyDeps when you next edit this workflow.`,
+      );
+    }
+
+    const forEachNewOnly = step.forEachNewOnly === true || step.for_each_new_only === true;
+    if (forEachNewOnly && !(typeof step.forEach === 'string' && step.forEach.trim().length > 0)) {
+      errors.push(
+        `Step "${step.id}" sets forEachNewOnly but has no forEach source — add forEach so the runner can apply the cross-run watermark.`,
       );
     }
 

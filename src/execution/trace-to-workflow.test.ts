@@ -59,16 +59,72 @@ test('traceToWorkflowDraft: filters exploration, keeps actions, chains linearly'
   assert.deepEqual(draft.steps[1].allowedTools, ['run_shell_command']);
 });
 
-test('traceToWorkflowDraft: coalesces consecutive same-slug calls into one step + flags forEach', () => {
+test('traceToWorkflowDraft: N>=3 same-slug calls with one varying arg → REAL forEach (list step + iterating work step)', () => {
   const draft = traceToWorkflowDraft([
     call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"a.com"}}'),
     call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"b.com"}}'),
     call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"c.com"}}'),
   ]);
-  assert.equal(draft.steps.length, 1);          // coalesced
+  // Two steps now: an inferred list step + the forEach work step.
+  assert.equal(draft.steps.length, 2);
+  const [list, work] = draft.steps;
+  // List step: literal array of the observed per-call values + array contract.
+  assert.equal(list.forEach, undefined);
+  assert.deepEqual(list.allowedTools, []);
+  assert.deepEqual(list.output, { type: 'array', min_items: { '': 1 } });
+  assert.match(list.prompt, /Return exactly this JSON array/);
+  assert.match(list.prompt, /"a\.com"[\s\S]*"b\.com"[\s\S]*"c\.com"/); // items, in order
+  // Work step: forEach over the list, depends on it, iterates with {{item}}.
+  assert.equal(work.forEach, `{{steps.${list.id}.output}}`);
+  assert.deepEqual(work.dependsOn, [list.id]);
+  assert.deepEqual(work.allowedTools, ['composio_execute_tool']);
+  assert.match(work.prompt, /\{\{item\}\}/);
+  assert.match(work.prompt, /DATAFORSEO_RANKED_KEYWORDS/);
+  assert.match(draft.notes.join(' '), /Fan-out inferred/i);
+});
+
+test('traceToWorkflowDraft: N=2 same-slug calls stay a SINGLE step (below the fan-out threshold)', () => {
+  const draft = traceToWorkflowDraft([
+    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"a.com"}}'),
+    call('composio_execute_tool', '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"b.com"}}'),
+  ]);
+  assert.equal(draft.steps.length, 1);          // coalesced, not fanned out
+  assert.equal(draft.steps[0].observed.calls, 2);
+  assert.equal(draft.steps[0].forEach, undefined);
+  assert.match(draft.steps[0].prompt, /ran 2×/);
+  assert.match(draft.steps[0].prompt, /forEach/); // still the prose refine hint
+});
+
+test('traceToWorkflowDraft: N>=3 with MULTIPLE varying keys → items are objects keyed by the varying fields', () => {
+  const draft = traceToWorkflowDraft([
+    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"a@x.com","subject":"Hi A","body":"same"}}'),
+    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"b@x.com","subject":"Hi B","body":"same"}}'),
+    call('composio_execute_tool', '{"tool":"GMAIL_SEND_EMAIL","arguments":{"to":"c@x.com","subject":"Hi C","body":"same"}}'),
+  ]);
+  assert.equal(draft.steps.length, 2);
+  const [list, work] = draft.steps;
+  // `body` is constant → NOT in the items; `subject` + `to` vary → objects.
+  const items = JSON.parse(list.prompt.slice(list.prompt.indexOf('[')));
+  assert.deepEqual(items, [
+    { subject: 'Hi A', to: 'a@x.com' },
+    { subject: 'Hi B', to: 'b@x.com' },
+    { subject: 'Hi C', to: 'c@x.com' },
+  ]);
+  // Work step references each varying field via {{item.<key>}}.
+  assert.match(work.prompt, /\{\{item\.to\}\}/);
+  assert.match(work.prompt, /\{\{item\.subject\}\}/);
+});
+
+test('traceToWorkflowDraft: N>=3 with IDENTICAL args → single step (no variant to lift into a list)', () => {
+  const draft = traceToWorkflowDraft([
+    call('composio_execute_tool', '{"tool":"SLACK_POST","arguments":{"channel":"#ops","text":"ping"}}'),
+    call('composio_execute_tool', '{"tool":"SLACK_POST","arguments":{"channel":"#ops","text":"ping"}}'),
+    call('composio_execute_tool', '{"tool":"SLACK_POST","arguments":{"channel":"#ops","text":"ping"}}'),
+  ]);
+  assert.equal(draft.steps.length, 1);          // no fan-out inferred
+  assert.equal(draft.steps[0].forEach, undefined);
   assert.equal(draft.steps[0].observed.calls, 3);
-  assert.match(draft.steps[0].prompt, /ran 3×/);
-  assert.match(draft.steps[0].prompt, /forEach/);
+  assert.doesNotMatch(draft.notes.join(' '), /Fan-out inferred/i);
 });
 
 test('traceToWorkflowDraft: unique step ids even for same tool used non-consecutively', () => {

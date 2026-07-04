@@ -41,11 +41,12 @@ import { approveEnabled, retireInternalNoise } from './memory-approve.js';
 import { appendSkillPitfall, listSkills } from '../memory/skill-store.js';
 import { listWorkflowNamesWithRuns, listWorkflowRunIds, readWorkflowEvents } from '../execution/workflow-events.js';
 import { applyStepPromptAddendum } from '../execution/workflow-step-edit.js';
+import { listProposedFixes, type ProposedFix } from '../execution/workflow-diagnosis.js';
 import type { ObservatoryReport } from './observatory.js';
 
 type ToolHealth = ObservatoryReport['toolHealth'][number];
 
-export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact' | 'workflow_step' | 'step_revert' | 'step_efficiency';
+export type ImprovementKind = 'tool_desc' | 'skill_pitfall' | 'retire_fact' | 'workflow_step' | 'step_revert' | 'step_efficiency' | 'doctor_fix';
 export type ProposalStatus = 'pending' | 'approved' | 'applied' | 'dismissed';
 
 /** The keep-if-better verdict on an APPLIED proposal, measured from REAL runs
@@ -124,6 +125,9 @@ export interface ProposerDeps {
    *  Injectable for deterministic tests; defaults to scanning recent workflow
    *  runs on disk. */
   collectStepFailures?: () => StepFailureObservation[];
+  /** Unapplied Workflow Doctor fixes to surface as proposals. Injectable for
+   *  tests; defaults to the on-disk workflow-fixes store. */
+  listDoctorFixes?: () => ProposedFix[];
   /** Timestamp for proposedAt (testability). Defaults to now. */
   nowIso?: string;
 }
@@ -515,6 +519,99 @@ export function buildStepEfficiencyProposals(deps: { collectStepMetrics?: () => 
   return proposalsFromStepMetrics((deps.collectStepMetrics ?? defaultCollectStepMetrics)(), deps.nowIso ?? new Date().toISOString());
 }
 
+// ── doctor_fix: reuse the Workflow Doctor's persisted diagnoses ────────────────
+//
+// The self-heal Doctor (workflow-diagnosis.ts) already diagnoses every blocked /
+// failed run — root cause + a concrete proposed fix — and persists it as a
+// ProposedFix in the `workflow-fixes/` store (via recordProposedFix). Until now
+// the nightly proposer never read those: it re-derived everything from raw
+// step_failed/attempt_record events, so the Doctor's real diagnosis was discarded
+// for learning and a repeated same-day failure produced no proposal. This detector
+// closes that gap deterministically (no LLM at draft time): it surfaces the
+// Doctor's diagnosis into the same human-gated review queue.
+//
+// Applied-fix handling (kept conservative, per design): applyProposedFix deletes
+// the ProposedFix record on a successful apply (it calls dismissProposedFix), and
+// a user `dismiss fix` deletes it too. So listProposedFixes() returns ONLY fixes
+// that were never applied/dismissed — i.e. every record here has no application
+// marker by construction. That is exactly the "include only fixes with no
+// application marker" rule: an already-healed fix simply isn't on disk. (Deriving
+// "the heal didn't stick — reverted or failed again" would require re-recording on
+// revert, which isn't on disk today, so we deliberately don't attempt it.)
+//
+// applyMode is 'manual' (acknowledge-only). The Doctor owns its OWN apply path
+// (`apply fix <id>` → applyProposedFix), and many fix kinds (reconnect_service /
+// adjust_input / manual) can't be auto-applied at all. The proposer's job is to
+// make the signal REVIEWABLE in the nightly queue, not to duplicate the apply
+// mutator — so approving one only acknowledges it (same wall as tool_desc).
+
+/** Only mine Doctor fixes recorded within this window — an old, still-unapplied
+ *  fix has usually been superseded and shouldn't resurface indefinitely. */
+const DOCTOR_FIX_WINDOW_DAYS = 7;
+
+export interface DoctorFixDeps {
+  /** Unapplied ProposedFix records. Injectable for tests; defaults to the
+   *  on-disk workflow-fixes store (which already excludes applied/dismissed). */
+  listDoctorFixes?: () => ProposedFix[];
+  /** Look-back window in days. Defaults to DOCTOR_FIX_WINDOW_DAYS. */
+  windowDays?: number;
+  nowIso?: string;
+}
+
+/**
+ * Pure: turn the Doctor's unapplied ProposedFix records into human-gated
+ * proposals. One proposal per distinct (workflow, step, fix kind) — the newest
+ * fix for that triple wins, and the id is seeded on the triple so re-drafting on
+ * a later tick (or several fixes for the same triple) collapses to ONE stable id
+ * that recordProposals dedups. Records outside the window are ignored.
+ */
+export function proposalsFromDoctorFixes(
+  fixes: ProposedFix[],
+  nowIso: string,
+  windowDays = DOCTOR_FIX_WINDOW_DAYS,
+): ImprovementProposal[] {
+  const nowMs = Date.parse(nowIso);
+  const cutoffMs = Number.isFinite(nowMs) ? nowMs - windowDays * 24 * 60 * 60 * 1000 : -Infinity;
+  // Keep the newest fix per (workflow, step, fix kind).
+  const byKey = new Map<string, ProposedFix>();
+  for (const fix of fixes) {
+    const d = fix?.diagnosis;
+    const kind = d?.fix?.kind;
+    if (!fix?.workflow || !fix?.stepId || !kind) continue;
+    const createdMs = Date.parse(fix.createdAt);
+    if (!Number.isFinite(createdMs) || createdMs < cutoffMs) continue;
+    const key = `${fix.workflow}\n${fix.stepId}\n${kind}`;
+    const prev = byKey.get(key);
+    if (!prev || fix.createdAt > prev.createdAt) byKey.set(key, fix);
+  }
+  const out: ImprovementProposal[] = [];
+  for (const fix of byKey.values()) {
+    const d = fix.diagnosis;
+    const target = `${fix.workflow}::${fix.stepId}`;
+    const rewrite = d.fix.newStepPrompt?.trim();
+    const applyHint = d.fix.kind === 'edit_step' && d.fix.autoApplicable && rewrite
+      ? ` The Doctor drafted a complete replacement prompt; apply it directly with \`apply fix ${fix.id}\` while it's still queued.`
+      : d.fix.kind === 'reconnect_service' && d.fix.service
+        ? ` Needs a human action: reconnect ${d.fix.service}.`
+        : ' Needs a human decision.';
+    out.push(mkProposal({
+      kind: 'doctor_fix',
+      target,
+      applyMode: 'manual',
+      proposedText: `Workflow Doctor diagnosed step "${fix.stepId}" (${d.fix.kind}): ${trimProblem(d.summary, 220)} Root cause: ${trimProblem(d.rootCause, 220)} Proposed fix: ${trimProblem(d.fix.description, 220)}${applyHint}`,
+      rationale: `The Doctor already diagnosed this ${fix.workflow} failure at runtime (${d.confidence} confidence) but the diagnosis was only offered once and never fed back into learning — surfacing it keeps a repeated failure from being silently forgotten.`,
+      evidence: `Doctor fix ${fix.id} recorded ${fix.createdAt} for run ${fix.runId}${rewrite ? ` · proposed rewrite: "${trimProblem(rewrite, 200)}"` : ''}`,
+    }, nowIso, `doctor_fix:${target}:${d.fix.kind}`));
+  }
+  return out;
+}
+
+/** Mine the Doctor's persisted diagnoses → doctor_fix proposals. */
+export function buildDoctorFixProposals(deps: DoctorFixDeps = {}): ImprovementProposal[] {
+  const fixes = (deps.listDoctorFixes ?? (() => { try { return listProposedFixes(); } catch { return []; } }))();
+  return proposalsFromDoctorFixes(fixes, deps.nowIso ?? new Date().toISOString(), deps.windowDays ?? DOCTOR_FIX_WINDOW_DAYS);
+}
+
 // ── persistence ──────────────────────────────────────────────────────────────
 
 function readStore(): ImprovementProposal[] {
@@ -576,9 +673,10 @@ export function listPendingProposals(): ImprovementProposal[] {
 export function proposeFromReport(report: ObservatoryReport, deps: ProposerDeps = {}): { ran: boolean; added: number; total: number } {
   if (!proposerEnabled()) return { ran: false, added: 0, total: 0 };
   try {
-    // Three sources: report-based (tools/skills/memory), run-history contract
-    // failures (workflow_step), and run-history cost/latency outliers
-    // (step_efficiency) — a workflow's own steps improving over time.
+    // Four sources: report-based (tools/skills/memory), run-history contract
+    // failures (workflow_step), run-history cost/latency outliers
+    // (step_efficiency), and the Workflow Doctor's persisted diagnoses
+    // (doctor_fix) — a workflow's own steps improving over time.
     const fresh = [
       ...buildImprovementProposals(report, deps),
       ...buildWorkflowStepProposals({
@@ -586,6 +684,10 @@ export function proposeFromReport(report: ObservatoryReport, deps: ProposerDeps 
         nowIso: deps.nowIso,
       }),
       ...buildStepEfficiencyProposals({ nowIso: deps.nowIso }),
+      ...buildDoctorFixProposals({
+        listDoctorFixes: deps.listDoctorFixes,
+        nowIso: deps.nowIso,
+      }),
     ];
     const { added, total } = recordProposals(fresh);
     // Keep-if-better: refresh outcome verdicts on previously-applied fixes from

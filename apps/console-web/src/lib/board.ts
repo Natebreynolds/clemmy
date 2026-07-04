@@ -279,9 +279,10 @@ export async function runBoardAction(card: BoardCard, intent: BoardButtonIntent)
     if (card.sourceKind === 'run' && intent === 'cancel') {
       return await apiPost<{ ok: boolean; reason?: string }>(`/api/console/board/run/${encodeURIComponent(card.id)}/cancel`);
     }
-    if (card.sourceKind === 'workflow' && intent === 'cancel' && card.raw.workflowName && card.raw.runId) {
+    if (card.sourceKind === 'workflow' && intent === 'cancel' && card.raw.runId) {
+      const workflowName = card.raw.workflowSlug || card.raw.workflowName || card.title;
       return await apiPost<{ ok: boolean; reason?: string }>(
-        `/api/console/workflows/${encodeURIComponent(card.raw.workflowName)}/runs/${encodeURIComponent(card.raw.runId)}/cancel`,
+        `/api/console/workflows/${encodeURIComponent(workflowName)}/runs/${encodeURIComponent(card.raw.runId)}/cancel`,
         { reason: 'Cancelled from the Tasks board.' },
       );
     }

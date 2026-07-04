@@ -20,6 +20,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const {
   stepLoopUntilEnabled,
+  stepHasLoopProbe,
   loopUntilMaxAttempts,
   runWithContractLoop,
   renderLoopRetryEvidence,
@@ -86,6 +87,61 @@ test('loopUntilMaxAttempts: default 3, clamped to 1–5', () => {
   assert.equal(loopUntilMaxAttempts(step({ loopUntil: { maxAttempts: 5 } })), 5);
   assert.equal(loopUntilMaxAttempts(step({ loopUntil: { maxAttempts: 99 } })), 5);
   assert.equal(loopUntilMaxAttempts(step({ loopUntil: { maxAttempts: 0 } })), 1);
+});
+
+// ─── T2.3: external exit probe ───────────────────────────────────────────────
+
+const PROBE_LOOP = { probe: { runner: 'check-export-status.ts' }, until: { required_keys: ['done'], non_empty: ['done'] } };
+
+test('stepHasLoopProbe: complete probe+until only', () => {
+  assert.equal(stepHasLoopProbe(step({ loopUntil: PROBE_LOOP })), true);
+  assert.equal(stepHasLoopProbe(step({ loopUntil: { probe: { runner: 'x.ts' } } })), false);
+  assert.equal(stepHasLoopProbe(step({ loopUntil: { until: { required_keys: ['done'] } } })), false);
+  assert.equal(stepHasLoopProbe(step()), false);
+});
+
+test('stepLoopUntilEnabled: a probe exit qualifies WITHOUT an own-output contract; side-effect law still applies', () => {
+  assert.equal(stepLoopUntilEnabled(step({ output: undefined, loopUntil: PROBE_LOOP })), true);
+  assert.equal(stepLoopUntilEnabled(step({ output: undefined, loopUntil: PROBE_LOOP, sideEffect: 'send' })), false);
+  assert.equal(stepLoopUntilEnabled(step({ output: undefined, loopUntil: PROBE_LOOP, sideEffect: 'write' })), false);
+  assert.equal(stepLoopUntilEnabled(step({ output: undefined, loopUntil: PROBE_LOOP, sideEffect: 'write', loopSafe: true })), true);
+  assert.equal(stepLoopUntilEnabled(step({ output: undefined, loopUntil: PROBE_LOOP, forEach: 'items' })), false);
+});
+
+test('loopUntilMaxAttempts: probe loops clamp to 1–10 (polling needs more passes)', () => {
+  assert.equal(loopUntilMaxAttempts(step({ loopUntil: { ...PROBE_LOOP, maxAttempts: 8 } })), 8);
+  assert.equal(loopUntilMaxAttempts(step({ loopUntil: { ...PROBE_LOOP, maxAttempts: 99 } })), 10);
+  assert.equal(loopUntilMaxAttempts(step({ loopUntil: PROBE_LOOP })), 3);
+});
+
+test('checkLoopUntilAuthoring: probe+until is a valid exit; half-declared probe is refused', () => {
+  const base: WorkflowDefinition = {
+    name: 'poll-export', description: 'x', enabled: true, trigger: { manual: true },
+    steps: [step({ output: undefined, loopUntil: PROBE_LOOP })],
+  };
+  assert.deepEqual(checkLoopUntilAuthoring(base), []);
+
+  const half: WorkflowDefinition = {
+    ...base,
+    steps: [step({ output: undefined, loopUntil: { probe: { runner: 'x.ts' } } })],
+  };
+  const errors = checkLoopUntilAuthoring(half);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /incomplete loop_until probe/);
+});
+
+test('loopUntil probe/until round-trips through the SKILL.md store', () => {
+  const def: WorkflowDefinition = {
+    name: 'poll-rt', description: 'probe round trip', enabled: false, trigger: { manual: true },
+    steps: [step({ output: undefined, loopUntil: { maxAttempts: 8, ...PROBE_LOOP } })],
+  };
+  writeWorkflow('poll-rt', def);
+  const read = readWorkflow('poll-rt');
+  assert.ok(read);
+  const lu = read!.data.steps[0].loopUntil!;
+  assert.equal(lu.maxAttempts, 8);
+  assert.deepEqual(lu.probe, { runner: 'check-export-status.ts' });
+  assert.deepEqual(lu.until, { required_keys: ['done'], non_empty: ['done'] });
 });
 
 // ─── the loop harness ────────────────────────────────────────────────────────

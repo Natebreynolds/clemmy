@@ -43,6 +43,7 @@ const {
   reapResolvedParkedRuns,
   executeStep,
   findContractViolationStep,
+  tightenWorkflowContractsFromCleanRun,
   describeStepNonCompletion,
   processWorkflowRuns,
   workflowAdvisoryRequiresAttention,
@@ -57,6 +58,9 @@ const {
   shouldHaltResumeForSideEffect,
   stepSideEffectClass,
   isPhantomStepCompletion,
+  phantomBlockedOutput,
+  decideBatchSettlement,
+  ParkRunSignal,
   finalizeStepOutput,
   inferredOutputContractAdvisory,
   sendAlreadyClaimed,
@@ -69,6 +73,7 @@ const {
 } = await import('./workflow-runner.js');
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
+const { clearStepWatermark, readSeenItemKeys } = await import('./workflow-watermark-store.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { resetEventLog, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
@@ -409,6 +414,9 @@ test('workflowAdvisoryRequiresAttention: confident quality misses are not clean 
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'ungrounded_output' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'inferred_output_contract' }), true);
   assert.equal(workflowAdvisoryRequiresAttention({ kind: 'goal_validation_unavailable' }), false);
+  // T1.2: a degraded synthesis rollup is a presentation loss, not a failed run —
+  // every step already completed and verified.
+  assert.equal(workflowAdvisoryRequiresAttention({ kind: 'synthesis_degraded' }), false);
 });
 
 test('workflowReportLaneForOutcome: non-review advisories stay on done lane', () => {
@@ -1188,6 +1196,63 @@ test('forEach resolves {{steps.x.output.path}} sources at runtime', async () => 
   }
 });
 
+test('forEachNewOnly watermarks completed items and retries failed items on the next run', async () => {
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  const workflowSlug = 'foreach-watermark-test';
+  const stepId = 'blast';
+  clearStepWatermark(workflowSlug, stepId);
+  try {
+    let failB = true;
+    const respond = async (req: { message?: string }) => {
+      const message = String(req.message ?? '');
+      if (failB && message.includes('Item: b')) throw new Error('temporary b failure');
+      const item = message.match(/Item: ([^\n]+)/)?.[1] ?? 'unknown';
+      return { text: `done-${item}` };
+    };
+    const mkCtx = (runId: string) => ({
+      workflow: { name: 'New Only Fanout Test', steps: [] },
+      workflowSlug,
+      runId,
+      inputs: {},
+      stepOutputs: { pull: ['a', 'b', 'c'] },
+      assistant: { respond },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1]);
+    const step = {
+      id: stepId,
+      prompt: 'Process the item.',
+      forEach: 'pull',
+      forEachNewOnly: true,
+      useHarness: false,
+    } as unknown as Parameters<typeof executeStep>[0];
+
+    const first = await executeStep(step, mkCtx('fw-1')) as Array<{ itemKey: string; output: unknown }>;
+    assert.deepEqual(first.map((item) => item.itemKey), ['a', 'c'], 'failed item is absent from completed aggregate');
+    assert.deepEqual([...readSeenItemKeys(workflowSlug, stepId)].sort(), ['a', 'c'], 'only completed items advance the watermark');
+
+    failB = false;
+    const second = await executeStep(step, mkCtx('fw-2')) as Array<{ itemKey: string; output: unknown }>;
+    assert.deepEqual(second.map((item) => item.itemKey), ['b'], 'next run processes only the previously failed item');
+    assert.deepEqual(
+      readWorkflowEvents(workflowSlug, 'fw-2').filter((e) => e.kind === 'item_started').map((e) => e.itemKey),
+      ['b'],
+      'watermarked items are not started again',
+    );
+    assert.deepEqual([...readSeenItemKeys(workflowSlug, stepId)].sort(), ['a', 'b', 'c']);
+  } finally {
+    clearStepWatermark(workflowSlug, stepId);
+    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
+    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
+    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
+    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+  }
+});
+
 test('forEach batching resumes after already-completed items and drains remaining pending items', async () => {
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
@@ -1774,7 +1839,10 @@ function freshRunsFor(wf: string, origId: string): Array<Record<string, unknown>
     .filter((r) => r.workflow === wf);
 }
 
-test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run carrying attempt+1', () => {
+test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run carrying attempt+1', async () => {
+  // T3.2: the cross-family veto judge would attempt a live model call here —
+  // disable it (kill-switch) so the heal proceeds on the fail-open path.
+  process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
   const wf = 'heal-below-cap';
   writeHealWorkflow(wf, [{ id: 'find', prompt: 'Query Salesforce for prospects somehow.' }]);
   const origId = `${wf}-run`;
@@ -1783,7 +1851,7 @@ test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run
     JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed', originSessionId: 'sess-h' }), 'utf-8');
   const fix = recordProposedFix(wf, origId, editStepDiagnosis('find'));
 
-  const out = workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+  const out = await workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
     run: { id: origId, workflow: wf, originSessionId: 'sess-h', selfHealAttempt: 0 },
     workflowSlug: wf,
     steps: [{ id: 'find', prompt: 'Query Salesforce for prospects somehow.' }] as never,
@@ -1797,9 +1865,13 @@ test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run
   assert.equal(fresh.length, 1, 'one fresh re-run queued');
   assert.equal(fresh[0].selfHealAttempt, 1, 'carries the bumped attempt counter');
   assert.equal(fresh[0].originSessionId, 'sess-h', 'carries origin so the re-run re-enters chat');
+  // T3.2: the healed re-run carries the reversible backup id so a non-stick
+  // heal auto-reverts.
+  assert.equal(typeof (fresh[0] as { selfHealBackupId?: string }).selfHealBackupId, 'string', 'carries the heal backup id');
+  delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
 });
 
-test('self-heal: at the attempt cap → escalates (no auto re-run)', () => {
+test('self-heal: at the attempt cap → escalates (no auto re-run)', async () => {
   const wf = 'heal-at-cap';
   writeHealWorkflow(wf, [{ id: 'find', prompt: 'Query Salesforce for prospects somehow.' }]);
   const origId = `${wf}-run`;
@@ -1809,7 +1881,7 @@ test('self-heal: at the attempt cap → escalates (no auto re-run)', () => {
   const fix = recordProposedFix(wf, origId, editStepDiagnosis('find'));
   const max = workflowRunnerInternalsForTest.selfHealAutoMaxAttempts();
 
-  const out = workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+  const out = await workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
     run: { id: origId, workflow: wf, selfHealAttempt: max },
     workflowSlug: wf,
     steps: [{ id: 'find', prompt: 'x' }] as never,
@@ -1836,7 +1908,7 @@ test('self-heal: a completed UPSTREAM mutating step blocks auto re-run (no doubl
   );
 });
 
-test('self-heal: a non-edit_step (reconnect) fix is never auto-applied', () => {
+test('self-heal: a non-edit_step (reconnect) fix is never auto-applied', async () => {
   const wf = 'heal-reconnect';
   writeHealWorkflow(wf, [{ id: 'find', prompt: 'x' }]);
   const origId = `${wf}-run`;
@@ -1844,7 +1916,7 @@ test('self-heal: a non-edit_step (reconnect) fix is never auto-applied', () => {
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
     JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed' }), 'utf-8');
   const fix = recordProposedFix(wf, origId, editStepDiagnosis('find', false, 'reconnect_service'));
-  const out = workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+  const out = await workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
     run: { id: origId, workflow: wf, selfHealAttempt: 0 },
     workflowSlug: wf,
     steps: [{ id: 'find', prompt: 'x' }] as never,
@@ -1867,6 +1939,53 @@ test('self-heal: a completed upstream IRREVERSIBLE-SEND step (unmarked) blocks a
   const reads = [{ id: 'read', prompt: 'Read the prospect list from the sheet.' }, { id: 'find', prompt: 'x' }];
   assert.equal(
     workflowRunnerInternalsForTest.hasCompletedUpstreamMutation(reads as never, 'find', new Set(['read', 'find'])),
+    false,
+  );
+});
+
+test('self-heal: an ungated future post/send step blocks auto re-run after a prompt edit', async () => {
+  const wf = 'heal-ungated-post';
+  writeHealWorkflow(wf, [
+    { id: 'research', prompt: 'Research the topic.' },
+    { id: 'post', prompt: 'Post the approved Instagram caption to Instagram.' },
+  ]);
+  const origId = `${wf}-run`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed', originSessionId: 'sess-post' }), 'utf-8');
+  const fix = recordProposedFix(wf, origId, editStepDiagnosis('research'));
+
+  const steps = [
+    { id: 'research', prompt: 'Research the topic.' },
+    { id: 'post', prompt: 'Post the approved Instagram caption to Instagram.' },
+  ] as never;
+  assert.equal(workflowRunnerInternalsForTest.hasUngatedIrreversibleAction(steps), true);
+
+  const out = await workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+    run: { id: origId, workflow: wf, originSessionId: 'sess-post', selfHealAttempt: 0 },
+    workflowSlug: wf,
+    steps,
+    diagnosis: editStepDiagnosis('research') as never,
+    proposedFix: fix,
+    completedStepIds: new Set(['research']),
+  });
+
+  assert.equal(out, null, 'ungated future post escalates instead of auto-requeueing');
+  assert.equal(freshRunsFor(wf, origId).length, 0, 'no fresh run queued');
+});
+
+test('self-heal: an approval-gated future post/send step may auto-heal because execution will park', () => {
+  assert.equal(
+    workflowRunnerInternalsForTest.hasUngatedIrreversibleAction([
+      { id: 'research', prompt: 'Research the topic.' },
+      { id: 'post', prompt: 'Post the approved Instagram caption to Instagram.', requiresApproval: true },
+    ] as never),
+    false,
+  );
+  assert.equal(
+    workflowRunnerInternalsForTest.hasUngatedIrreversibleAction([
+      { id: 'post', prompt: 'Prepare a caption for review.', sideEffect: 'send', requiresApproval: true },
+    ] as never),
     false,
   );
 });
@@ -2205,4 +2324,105 @@ test('isPhantomStepCompletion: kill-switch off → never flags', () => {
   process.env.CLEMMY_WORKFLOW_PHANTOM_GUARD = 'off';
   assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, [], {}), false);
   delete process.env.CLEMMY_WORKFLOW_PHANTOM_GUARD;
+});
+
+test('isPhantomStepCompletion: workflow_step_result is result emission, not action (orchestrator-lane parity)', () => {
+  // phantom: the step emitted its structured result but never called an acting tool
+  assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, ['workflow_step_result'], { ok: true }), true);
+  assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, ['StructuredOutput', 'workflow_step_result'], {}), true);
+  // NOT phantom: emitted the result AND actually acted
+  assert.equal(isPhantomStepCompletion({ id: 'notify', sideEffect: 'send' }, ['workflow_step_result', 'mcp__clementine-local__notify_user'], {}), false);
+});
+
+test('decideBatchSettlement: park OUTRANKS a sibling failure (T1.3 — the approval survives)', () => {
+  const stepA = { id: 'a', prompt: 'read stuff' };
+  const stepB = { id: 'b', prompt: 'send stuff', sideEffect: 'send' as const };
+  const stepC = { id: 'c', prompt: 'also read' };
+  const park = new ParkRunSignal([{ stepId: 'b', kind: 'gate' as const, approvalIds: ['apr-1'] }]);
+  const decision = decideBatchSettlement(
+    [stepA, stepB, stepC],
+    [
+      { status: 'fulfilled', value: { step: stepA, output: { ok: true } } },
+      { status: 'rejected', reason: park },
+      { status: 'rejected', reason: new Error('provider blew up') },
+    ],
+  );
+  // park wins over the sibling failure — the run parks instead of dying
+  assert.equal(decision.action, 'park');
+  assert.deepEqual(decision.parkedSteps, [{ stepId: 'b', kind: 'gate', approvalIds: ['apr-1'] }]);
+  // the failure is preserved for the advisory (not swallowed)
+  assert.deepEqual(decision.failures, [{ stepId: 'c', message: 'provider blew up' }]);
+  // the completed sibling is kept
+  assert.deepEqual(decision.completions, [{ stepId: 'a', output: { ok: true } }]);
+});
+
+test('decideBatchSettlement: failures with no park → fail; all fulfilled → continue', () => {
+  const stepA = { id: 'a', prompt: 'x' };
+  const stepB = { id: 'b', prompt: 'y' };
+  const failed = decideBatchSettlement(
+    [stepA, stepB],
+    [
+      { status: 'fulfilled', value: { step: stepA, output: 'done' } },
+      { status: 'rejected', reason: new Error('boom') },
+    ],
+  );
+  assert.equal(failed.action, 'fail');
+  assert.deepEqual(failed.failures, [{ stepId: 'b', message: 'boom' }]);
+  assert.deepEqual(failed.completions, [{ stepId: 'a', output: 'done' }]);
+
+  const clean = decideBatchSettlement(
+    [stepA],
+    [{ status: 'fulfilled', value: { step: stepA, output: 1 } }],
+  );
+  assert.equal(clean.action, 'continue');
+  assert.equal(clean.failures.length, 0);
+  assert.equal(clean.parkedSteps.length, 0);
+});
+
+test('tightenWorkflowContractsFromCleanRun applies to current workflow without clobbering newer edits', async () => {
+  const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
+  const slug = 'clean-tighten-current';
+  const runStartDef = {
+    name: 'Clean Tighten Current',
+    description: 'Original run-start definition',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'same', prompt: 'Gather current data.' },
+      { id: 'changed', prompt: 'Gather old data.' },
+    ],
+  };
+  writeWorkflow(slug, {
+    ...runStartDef,
+    description: 'User-edited definition while the run was active',
+    steps: [
+      { id: 'same', prompt: 'Gather current data.' },
+      { id: 'changed', prompt: 'User changed this step while run was active.' },
+    ],
+  });
+
+  // T3.1 conservative: tightening requires ≥3 invariant clean runs. Prime two,
+  // which must NOT tighten yet, then the third applies.
+  const outputs = { same: [{ id: 'A' }], changed: [{ id: 'B' }] };
+  assert.deepEqual(tightenWorkflowContractsFromCleanRun(slug, runStartDef, outputs, 'run-1'), []);
+  assert.deepEqual(tightenWorkflowContractsFromCleanRun(slug, runStartDef, outputs, 'run-2'), []);
+  const applied = tightenWorkflowContractsFromCleanRun(slug, runStartDef, outputs, 'run-3');
+
+  assert.deepEqual(applied, ['same']);
+  const saved = readWorkflow(slug)!.data;
+  // the user's concurrent edit to `changed` is preserved, and only `same` (whose
+  // prompt was unchanged) is tightened — the anti-clobber guard still holds.
+  assert.equal(saved.description, 'User-edited definition while the run was active');
+  assert.equal(saved.steps.find((s) => s.id === 'same')?.output?.type, 'array');
+  assert.equal(saved.steps.find((s) => s.id === 'changed')?.output, undefined);
+  assert.equal(saved.steps.find((s) => s.id === 'changed')?.prompt, 'User changed this step while run was active.');
+});
+
+test('phantomBlockedOutput: blocked shape names the step and its side-effect class', () => {
+  const send = phantomBlockedOutput({ id: 'notify', sideEffect: 'send', prompt: '' });
+  assert.equal(send.blocked, true);
+  assert.match(send.reason, /"notify".*send step.*without calling any tool/s);
+  const write = phantomBlockedOutput({ id: 'save', sideEffect: 'write', prompt: '' });
+  assert.match(write.reason, /write step/);
+  assert.match(write.reason, /write was not actually performed/);
 });

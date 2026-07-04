@@ -1,8 +1,12 @@
 import type { WorkflowDefinition, WorkflowInputDef } from '../memory/workflow-store.js';
-import { validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
+import { stepLooksMultiItemWithoutForEach, validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
-import { proposeWorkflowContractUpgrades } from './workflow-contract-proposals.js';
+import {
+  hardenWeakLiveResearchOutputContract,
+  proposeWorkflowContractUpgrades,
+  workflowAuthoringAdvisories,
+} from './workflow-contract-proposals.js';
 import { textMentionsDeliverable } from './workflow-deliverable-hints.js';
 
 /**
@@ -246,9 +250,21 @@ export function checkLoopUntilAuthoring(def: WorkflowDefinition): string[] {
   const errors: string[] = [];
   for (const step of def.steps ?? []) {
     if (!step.loopUntil) continue;
-    if (!step.output || Object.keys(step.output).length === 0) {
+    // T2.3: a half-declared probe (probe without until, or until without
+    // probe) would silently never gate the loop — refuse at authoring. Checked
+    // FIRST so a probe-only declaration gets this specific message, not the
+    // generic no-exit-condition one.
+    if (Boolean(step.loopUntil.probe) !== Boolean(step.loopUntil.until)) {
       errors.push(
-        `Step "${step.id}" declares loop_until but no output contract — the contract is the loop's exit condition. Declare an "output" block (non_empty / min_items / required_keys / verify) or remove loop_until.`,
+        `Step "${step.id}" declares an incomplete loop_until probe — probe and until go together: the probe runs after each attempt and its output must satisfy the until contract for the loop to exit.`,
+      );
+      continue;
+    }
+    const hasProbeExit = Boolean(step.loopUntil.probe?.runner?.trim() && step.loopUntil.until);
+    const hasContractExit = Boolean(step.output && Object.keys(step.output).length > 0);
+    if (!hasContractExit && !hasProbeExit) {
+      errors.push(
+        `Step "${step.id}" declares loop_until but no output contract / exit condition — declare an "output" block (the contract is the exit), or probe + until (loop_until: { probe: { runner: "<scripts helper>" }, until: {...} }) to loop until external state satisfies the until contract. Or remove loop_until.`,
       );
       continue;
     }
@@ -501,6 +517,27 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
   let contractChanged = false;
   let goalChanged = false;
   let repairedGoal = def.goal;
+  // T2.4: multi-item prose without forEach is the single most common
+  // loop-authoring defect — the step saves, runs serially in one context, and
+  // silently drops the tail of the list. When exactly ONE upstream dependency
+  // declares an array-ish output (type 'array' or a min_items contract), the
+  // fan-out is mechanically derivable: wire forEach to that upstream.
+  // Ambiguous cases (zero or multiple array upstreams) keep today's warning.
+  for (const step of steps) {
+    if (step.forEach || step.deterministic) continue;
+    if (!step.prompt || !stepLooksMultiItemWithoutForEach({ id: step.id, prompt: step.prompt, forEach: step.forEach, output: step.output as Record<string, unknown> | undefined })) continue;
+    const arrayUpstreams = (step.dependsOn ?? []).filter((depId) => {
+      const dep = steps.find((s) => s.id === depId);
+      const out = dep?.output;
+      return Boolean(out && (out.type === 'array' || (out.min_items && Object.keys(out.min_items).length > 0)));
+    });
+    if (arrayUpstreams.length !== 1) continue;
+    step.forEach = arrayUpstreams[0];
+    repairs.push(
+      `Added forEach: "${arrayUpstreams[0]}" to step "${step.id}" — its prompt is multi-item work, and "${arrayUpstreams[0]}" produces the array; the runner now fans out per item (bounded concurrency, per-item resume) instead of running the whole list serially in one context.`,
+    );
+  }
+
   const proposalBase: WorkflowDefinition = {
     ...def,
     steps,
@@ -515,6 +552,13 @@ export function autoRepairWorkflowDefinition(def: WorkflowDefinition): WorkflowA
     step.output = proposal.output;
     contractChanged = true;
     repairs.push(`Added output contract to step "${step.id}" (${proposal.reasons.join('; ')}).`);
+  }
+  for (const step of steps) {
+    const hardened = hardenWeakLiveResearchOutputContract(proposalBase, step);
+    if (!hardened) continue;
+    step.output = hardened;
+    contractChanged = true;
+    repairs.push(`Hardened live research output contract for step "${step.id}" with source-backed evidence keys.`);
   }
   const synthesisLooksDeliverable = textMentionsDeliverable(def.synthesis?.prompt ?? '');
   if (
@@ -556,7 +600,7 @@ export function checkWorkflowForWrite(def: WorkflowDefinition): WorkflowWriteChe
   const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkGoalAuthoring(def), ...checkDependencyBinding(def)];
   // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
   const runnabilityWarnings = checkRunnabilityConstraints(def);
-  const warnings = [...result.warnings, ...runnabilityWarnings];
+  const warnings = [...result.warnings, ...runnabilityWarnings, ...workflowAuthoringAdvisories(def)];
   return { ok: errors.length === 0, errors, warnings };
 }
 

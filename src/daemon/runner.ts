@@ -29,6 +29,7 @@ import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
+import { syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
 import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
@@ -1412,6 +1413,13 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // Match workflows with trigger.schedule against the wall clock and
     // enqueue runs. processWorkflowRuns (below) then drains the queue.
     await processWorkflowSchedules();
+    // T2.1: keep the trigger registry in sync with each enabled workflow's
+    // declared event/webhook triggers so fireWorkflowSystemEvent / the
+    // /api/hooks/workflows route can match them. Cheap (no-op upserts are
+    // skipped) and best-effort.
+    try { syncWorkflowTriggerRegistry(); } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'syncWorkflowTriggerRegistry tick failed');
+    }
     // Workspaces: silently refresh any scheduled data sources (no LLM).
     // Flag-gated (CLEMENTINE_SPACES, default off) — no-op when disabled.
     if (isSpacesEnabled()) {

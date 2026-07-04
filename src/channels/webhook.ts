@@ -34,6 +34,7 @@ import {
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
+import { fireWorkflowWebhook, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
 import { isSpacesEnabled } from '../spaces/store.js';
@@ -630,6 +631,28 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
     });
+  });
+
+  // T2.1 — event-driven workflow recurrence over HTTP. An external service
+  // POSTs here (Bearer WEBHOOK_SECRET or ?token=), and every enabled workflow
+  // whose trigger.webhookPath matches :hookPath is queued through the standard
+  // run queue — dedupe-key-once via the trigger registry, same-inputs dedupe
+  // via queueWorkflowRun. 404 when nothing subscribes to the path.
+  app.post('/api/hooks/workflows/:hookPath', requireAuth, (req, res) => {
+    const hookPath = String(req.params.hookPath ?? '');
+    let results;
+    try {
+      syncWorkflowTriggerRegistry(); // a hook may land before the next daemon tick
+      results = fireWorkflowWebhook(hookPath, req.body ?? {});
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    if (results.length === 0) {
+      res.status(404).json({ error: `No enabled workflow subscribes to webhook path "${hookPath}".` });
+      return;
+    }
+    res.json({ ok: true, results });
   });
 
   app.get('/api/daemon/status', requireAuth, (_req, res) => {

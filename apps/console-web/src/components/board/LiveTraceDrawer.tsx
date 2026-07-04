@@ -17,6 +17,7 @@ import { usePoll } from '@/lib/poll';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
+import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
 import {
   cardTone,
   getBackgroundTaskDetail,
@@ -209,6 +210,11 @@ export function LiveTraceDrawer({
 
   const isWorkflow = card.sourceKind === 'workflow';
   const isBackground = card.sourceKind === 'background';
+
+  useEffect(() => {
+    setCurrent(card.progressHint || '');
+  }, [card.id, card.progressHint]);
+
   const backgroundDetail = usePoll(
     ['background-task-detail', card.id],
     () => getBackgroundTaskDetail(card.id),
@@ -304,12 +310,14 @@ export function LiveTraceDrawer({
 
   // Run-events poll for workflow cards.
   useEffect(() => {
-    if (!isWorkflow || !card.raw.workflowName || !card.raw.runId) return;
+    setRawWorkflow([]);
+    const workflowRef = card.raw.workflowSlug || card.raw.workflowName;
+    if (!isWorkflow || !workflowRef || !card.raw.runId) return;
     let alive = true;
     let since = '';
     const tick = async () => {
       try {
-        const url = `/api/console/workflows/${encodeURIComponent(card.raw.workflowName!)}/runs/${encodeURIComponent(card.raw.runId!)}/events${since ? `?since=${encodeURIComponent(since)}` : ''}`;
+        const url = `/api/console/workflows/${encodeURIComponent(workflowRef)}/runs/${encodeURIComponent(card.raw.runId!)}/events${since ? `?since=${encodeURIComponent(since)}` : ''}`;
         const data = await apiGet<{ events: Array<Record<string, unknown>> }>(url);
         if (!alive) return;
         const fresh = data.events ?? [];
@@ -327,7 +335,7 @@ export function LiveTraceDrawer({
     void tick();
     const timer = setInterval(tick, 2000);
     return () => { alive = false; clearInterval(timer); };
-  }, [isWorkflow, card.raw.workflowName, card.raw.runId]);
+  }, [isWorkflow, card.raw.workflowName, card.raw.workflowSlug, card.raw.runId]);
 
   const rows: TraceRow[] = isWorkflow
     ? rawWorkflow.flatMap((ev, i) => {
@@ -540,7 +548,12 @@ export function LiveTraceDrawer({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {!showRaw ? (
-            rows.length === 0 ? (
+            isWorkflow ? (
+              // Workflow runs get the structured, step-grouped detail (timeline +
+              // attempts + advisories + summary + per-step tokens) — the flat
+              // milestone list above can't express a finished run's depth.
+              <WorkflowRunDetail events={rawWorkflow} />
+            ) : rows.length === 0 ? (
               <p className="text-body text-faint">No milestones yet — the trace streams in as the agent works.</p>
             ) : (
               <ol className="space-y-2.5">

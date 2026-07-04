@@ -31,13 +31,17 @@ const {
   proposalsFromStepFailures,
   buildWorkflowStepProposals,
   splitWorkflowStepTarget,
+  proposalsFromDoctorFixes,
+  buildDoctorFixProposals,
 } = await import('./improvement-proposer.js');
 const { writeDistilledSkill, loadSkill } = await import('../memory/skill-store.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 const { revertStepEdit, listStepEditBackups } = await import('../execution/workflow-step-edit.js');
+const { recordProposedFix, applyProposedFix } = await import('../execution/workflow-diagnosis.js');
 import type { ObservatoryReport } from './observatory.js';
 import type { StepFailureObservation } from './improvement-proposer.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
+import type { ProposedFix, WorkflowDiagnosis } from '../execution/workflow-diagnosis.js';
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -494,4 +498,115 @@ test('proposalsFromStepMetrics: a step 3x+ its sibling median (above floors, 3+ 
 
   // A single-step workflow (no siblings) → silence.
   assert.equal(proposalsFromStepMetrics(observations.filter((o) => o.stepId === 'heavy_step'), NOW).length, 0);
+});
+
+// ── doctor_fix: reuse the Workflow Doctor's persisted diagnoses (T3.3) ─────────
+
+function diagnosis(stepId: string, kind: WorkflowDiagnosis['fix']['kind'] = 'edit_step'): WorkflowDiagnosis {
+  return {
+    summary: 'The step blocked instead of finishing.',
+    rootCause: 'The step named a Composio tool that no longer exists.',
+    fix: {
+      kind,
+      stepId,
+      description: 'Rewrite the step to use the correct tool slug.',
+      newStepPrompt: kind === 'edit_step' ? `Scrape the directory and return rows (step ${stepId}).` : null,
+      service: kind === 'reconnect_service' ? 'Google Drive' : null,
+      autoApplicable: kind === 'edit_step',
+    },
+    confidence: 'high',
+  };
+}
+
+function proposedFix(workflow: string, stepId: string, createdAt: string, kind: WorkflowDiagnosis['fix']['kind'] = 'edit_step'): ProposedFix {
+  return { id: `fix-${workflow}-${stepId}`, workflow, runId: 'run-x', stepId, diagnosis: diagnosis(stepId, kind), createdAt };
+}
+
+test('proposalsFromDoctorFixes: an unapplied Doctor fix drafts a doctor_fix proposal', () => {
+  const out = proposalsFromDoctorFixes([proposedFix('wf', 'scrape', NOW)], NOW);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, 'doctor_fix');
+  assert.equal(out[0].applyMode, 'manual', 'never auto-applies — the Doctor owns its own apply path');
+  assert.equal(out[0].target, 'wf::scrape');
+  assert.match(out[0].proposedText, /Workflow Doctor diagnosed step "scrape"/);
+  assert.match(out[0].proposedText, /Composio tool that no longer exists/);
+  assert.match(out[0].proposedText, /apply fix fix-wf-scrape/);
+});
+
+test('proposalsFromDoctorFixes: id is stable per (workflow, step, fix kind) — dedupes on a second tick', () => {
+  const a = proposalsFromDoctorFixes([proposedFix('wf', 'scrape', NOW)], NOW)[0];
+  // A later tick with a newer record for the SAME triple → same id (recordProposals dedups).
+  const b = proposalsFromDoctorFixes([proposedFix('wf', 'scrape', '2026-06-24T00:00:00.000Z')], '2026-06-24T12:00:00.000Z')[0];
+  assert.equal(a.id, b.id, 'same (workflow, step, fix kind) keeps one stable id');
+});
+
+test('proposalsFromDoctorFixes: one proposal per distinct (workflow, step, fix kind), newest wins', () => {
+  const out = proposalsFromDoctorFixes([
+    proposedFix('wf', 'scrape', '2026-06-22T00:00:00.000Z'),
+    proposedFix('wf', 'scrape', '2026-06-23T00:00:00.000Z'), // newer, same triple → collapses
+    proposedFix('wf', 'scrape', NOW, 'reconnect_service'),   // different fix kind → its own proposal
+    proposedFix('wf', 'send', NOW),                          // different step → its own proposal
+  ], NOW);
+  assert.equal(out.length, 3);
+  const targets = out.map((p) => `${p.target}:${p.evidence.includes('reconnect') ? 'reconnect' : 'edit'}`);
+  assert.ok(out.every((p) => p.kind === 'doctor_fix'));
+  assert.equal(out.filter((p) => p.target === 'wf::scrape').length, 2, 'two fix kinds for the same step → two proposals');
+  assert.equal(out.filter((p) => p.target === 'wf::send').length, 1);
+  void targets;
+});
+
+test('proposalsFromDoctorFixes: records older than the window are ignored', () => {
+  const old = proposedFix('wf', 'scrape', '2026-06-01T00:00:00.000Z'); // 22 days before NOW (2026-06-23)
+  const recent = proposedFix('wf2', 'fetch', '2026-06-20T00:00:00.000Z'); // 3 days before NOW
+  const out = proposalsFromDoctorFixes([old, recent], NOW); // default 7-day window
+  assert.equal(out.length, 1);
+  assert.equal(out[0].target, 'wf2::fetch');
+});
+
+test('buildDoctorFixProposals: an APPLIED Doctor fix is skipped (only the unapplied one remains)', () => {
+  rmSync(`${TEST_HOME}/state/workflow-fixes`, { recursive: true, force: true });
+  delete process.env.CLEMMY_MEMORY_APPROVE;
+
+  // A real workflow the applicable fix targets, so applyProposedFix can write + dismiss it.
+  const appliedWf = 'doc::applied';
+  writeWorkflow(appliedWf, {
+    name: 'applied wf', description: 'applied wf', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'scrape', prompt: 'Scrape the directory and return rows.', sideEffect: 'read' }],
+  });
+  // Record two Doctor fixes; apply one (which deletes its record via dismissProposedFix).
+  const toApply = recordProposedFix(appliedWf, 'run-applied', diagnosis('scrape', 'edit_step'));
+  recordProposedFix('doc::pending', 'run-pending', diagnosis('fetch', 'edit_step'));
+  const res = applyProposedFix(toApply.id);
+  assert.equal(res.ok, true, res.message);
+
+  // Default source reads the on-disk store, which now excludes the applied fix.
+  const out = buildDoctorFixProposals({ nowIso: NOW, windowDays: 3650 });
+  assert.equal(out.length, 1, JSON.stringify(out.map((p) => p.target)));
+  assert.equal(out[0].target, 'doc::pending::fetch');
+});
+
+test('proposeFromReport: an unapplied Doctor fix drafts exactly once, deduped on the second tick', () => {
+  rmSync(`${TEST_HOME}/state/autoresearch`, { recursive: true, force: true });
+  process.env.CLEMMY_IMPROVEMENT_PROPOSER = 'on';
+  try {
+    const deps = {
+      listSkills: NO_SKILLS,
+      countRetirableNoise: NO_NOISE,
+      listDoctorFixes: () => [proposedFix('wf', 'scrape', NOW)],
+      nowIso: NOW,
+    };
+    const first = proposeFromReport(report([]), deps);
+    assert.equal(first.ran, true);
+    assert.equal(first.added, 1);
+    const [pending] = listPendingProposals();
+    assert.equal(pending.kind, 'doctor_fix');
+    assert.equal(pending.target, 'wf::scrape');
+
+    // Second tick, same unapplied fix → no new draft.
+    const second = proposeFromReport(report([]), deps);
+    assert.equal(second.added, 0, 'same Doctor fix does not re-draft');
+    assert.equal(listPendingProposals().filter((p) => p.kind === 'doctor_fix').length, 1);
+  } finally {
+    delete process.env.CLEMMY_IMPROVEMENT_PROPOSER;
+  }
 });

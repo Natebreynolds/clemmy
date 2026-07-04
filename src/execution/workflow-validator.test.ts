@@ -198,6 +198,43 @@ test('resolved {{steps.X.output}} reference → ok', () => {
   );
 });
 
+test('forEachNewOnly without forEach → error', () => {
+  const result = validateWorkflowDefinition({
+    name: 'new-only-orphan',
+    description: 'Invalid new-only workflow with no fan-out source',
+    steps: [
+      { id: 'send', prompt: 'Send each new lead.', forEachNewOnly: true },
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('forEachNewOnly') && e.includes('no forEach source')),
+    `expected forEachNewOnly/forEach error, got: ${JSON.stringify(result.errors)}`,
+  );
+  assert.equal(result.errors.filter((e) => e.includes('forEachNewOnly')).length, 1);
+});
+
+test('for_each_new_only with a valid forEach dependency → ok', () => {
+  const result = validateWorkflowDefinition({
+    name: 'new-only-good',
+    description: 'Valid new-only workflow with an upstream list dependency',
+    steps: [
+      { id: 'pull', prompt: 'Pull latest leads.' },
+      {
+        id: 'send',
+        prompt: 'Send each new lead.',
+        dependsOn: ['pull'],
+        forEach: 'pull',
+        for_each_new_only: true,
+      },
+    ],
+  });
+  assert.ok(
+    !result.errors.some((e) => e.includes('forEachNewOnly') || e.includes('for_each_new_only')),
+    `unexpected new-only error: ${JSON.stringify(result.errors)}`,
+  );
+});
+
 test('orderingOnlyDeps is deprecated warning, not error', () => {
   const result = validateWorkflowDefinition({
     name: 'legacy-ordering',

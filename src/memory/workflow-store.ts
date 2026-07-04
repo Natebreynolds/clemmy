@@ -66,6 +66,14 @@ export interface WorkflowStepInput {
    */
   forEach?: string;
   /**
+   * T2.2 (cross-run watermark): "for each NEW item" — skip items whose stable
+   * key (id/key/slug, else the string item) was already processed by ANY prior
+   * run of this workflow. The watermark advances only when an item COMPLETES,
+   * so failed items retry on the next run. Kills the LLM-decides-what's-new
+   * prompt pattern for recurring feeds (new leads, new emails, new rows).
+   */
+  forEachNewOnly?: boolean;
+  /**
    * Skip the LLM entirely — call a named helper from scripts/ instead.
    * Use for repeatable transforms (database writes, formatted exports)
    * that don't need reasoning. Matches the Anthropic Skills scripts/
@@ -149,9 +157,22 @@ export interface WorkflowStepInput {
    * `send` step NEVER loops — re-running a send is re-sending. v1 applies to
    * plain LLM steps only (not forEach / deterministic). Requires an `output`
    * contract — that contract IS the loop's exit condition.
-   * Serialized to YAML as `loop_until: { max_attempts }`.
+   *
+   * T2.3 (external exit): alternatively (or additionally) declare `probe` +
+   * `until`: after each attempt a deterministic scripts/ helper runs and its
+   * output is verified against the `until` contract — the step loops until
+   * the PROBED WORLD-STATE satisfies it ("poll until the export job reports
+   * done", "page until nothing unprocessed remains"). Probe loops clamp to
+   * 10 attempts (contract-only loops stay 1–5).
+   * Serialized to YAML as `loop_until: { max_attempts, probe, until }`.
    */
-  loopUntil?: { maxAttempts?: number };
+  loopUntil?: {
+    maxAttempts?: number;
+    /** Deterministic exit probe — a scripts/ helper, like `deterministic.runner`. */
+    probe?: { runner: string };
+    /** Contract the probe's output must satisfy for the loop to EXIT. */
+    until?: WorkflowStepOutputContract;
+  };
   /**
    * Author's explicit assertion that re-running this WRITE step is safe
    * (idempotent — e.g. an upsert keyed on a stable id). Required for
@@ -217,6 +238,24 @@ export interface WorkflowTrigger {
    *  interpreted in. Omitted → the daemon host's local time (byte-identical to
    *  legacy behavior). Set so "daily 8am" means the OWNER's 8am, not the host's. */
   timezone?: string;
+  /** T2.1 (event-driven recurrence): fire this workflow when an HTTP POST hits
+   *  /api/hooks/workflows/<webhookPath> (token-gated). URL-safe slug. */
+  webhookPath?: string;
+  /** T2.1: fire this workflow when a matching internal system event is emitted
+   *  via fireWorkflowSystemEvent (composio trigger, watcher, another workflow). */
+  events?: WorkflowEventTrigger[];
+}
+
+export interface WorkflowEventTrigger {
+  /** Event type to subscribe to (e.g. "email.received", "composio.gmail.new_message"). */
+  type: string;
+  /** Shallow payload match: every entry must equal payload.<key> (dot-paths ok).
+   *  Omitted → every event of this type fires the workflow. */
+  filter?: Record<string, string | number | boolean>;
+  /** Dedupe-key template rendered against the payload (e.g.
+   *  "lead-{{payload.id}}"). Same rendered key → the event fires ONCE, ever.
+   *  Omitted → dedupe on the full payload hash. */
+  dedupeKey?: string;
 }
 
 export interface WorkflowInputDef {
@@ -424,6 +463,9 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       if (typeof step.maxTurns === 'number') result.maxTurns = step.maxTurns;
       if (typeof step.useHarness === 'boolean') result.useHarness = step.useHarness;
       if (typeof step.forEach === 'string') result.forEach = step.forEach;
+      if (step.forEachNewOnly === true || (step as Record<string, unknown>).for_each_new_only === true) {
+        result.forEachNewOnly = true;
+      }
       if (step.deterministic && typeof step.deterministic === 'object') {
         const d = step.deterministic as Record<string, unknown>;
         if (typeof d.runner === 'string') result.deterministic = { runner: d.runner };
@@ -472,15 +514,31 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
         result.retryBudget = Math.min(10, Math.floor(rawRetry));
       }
       // loopUntil / loop_until (goal-contract Phase 2). Accept snake_case or
-      // camelCase; clamp maxAttempts to 1..5 so a malformed value can't spin.
+      // camelCase; clamp maxAttempts so a malformed value can't spin — 1..5
+      // for contract loops, 1..10 when a probe exit is declared (T2.3).
       const rawLoop = (step as Record<string, unknown>).loop_until ?? step.loopUntil;
       if (rawLoop && typeof rawLoop === 'object' && !Array.isArray(rawLoop)) {
         const lu = rawLoop as Record<string, unknown>;
         const rawMax = typeof lu.max_attempts === 'number' ? lu.max_attempts
           : typeof lu.maxAttempts === 'number' ? lu.maxAttempts : undefined;
-        result.loopUntil = rawMax !== undefined && Number.isFinite(rawMax)
-          ? { maxAttempts: Math.max(1, Math.min(5, Math.floor(rawMax))) }
-          : {};
+        // T2.3 external exit probe: probe.runner (scripts/ helper) + until contract.
+        const rawProbe = lu.probe as Record<string, unknown> | undefined;
+        const probeRunner = rawProbe && typeof rawProbe === 'object' && typeof rawProbe.runner === 'string' && rawProbe.runner.trim()
+          ? rawProbe.runner.trim()
+          : undefined;
+        const rawUntil = lu.until;
+        const until = rawUntil && typeof rawUntil === 'object' && !Array.isArray(rawUntil)
+          ? rawUntil as WorkflowStepOutputContract
+          : undefined;
+        const hasProbe = Boolean(probeRunner && until);
+        const ceiling = hasProbe ? 10 : 5;
+        result.loopUntil = {
+          ...(rawMax !== undefined && Number.isFinite(rawMax)
+            ? { maxAttempts: Math.max(1, Math.min(ceiling, Math.floor(rawMax))) }
+            : {}),
+          ...(probeRunner ? { probe: { runner: probeRunner } } : {}),
+          ...(until ? { until } : {}),
+        };
       } else if (rawLoop === true) {
         result.loopUntil = {};
       }
@@ -589,6 +647,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.tier !== undefined) out.tier = s.tier;
       if (s.maxTurns !== undefined) out.maxTurns = s.maxTurns;
       if (s.forEach) out.forEach = s.forEach;
+      if (s.forEachNewOnly) out.forEachNewOnly = true;
       if (s.deterministic) out.deterministic = s.deterministic;
       if (s.allowedTools && s.allowedTools.length > 0) out.allowedTools = s.allowedTools;
       if (s.usesSkill) out.uses_skill = s.usesSkill;
@@ -604,9 +663,11 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       // Dropping a declared 'read' on rewrite would resurrect that trap.
       if (s.sideEffect) out.side_effect = s.sideEffect;
       if (s.loopUntil) {
-        out.loop_until = s.loopUntil.maxAttempts !== undefined
-          ? { max_attempts: s.loopUntil.maxAttempts }
-          : {};
+        out.loop_until = {
+          ...(s.loopUntil.maxAttempts !== undefined ? { max_attempts: s.loopUntil.maxAttempts } : {}),
+          ...(s.loopUntil.probe ? { probe: s.loopUntil.probe } : {}),
+          ...(s.loopUntil.until ? { until: s.loopUntil.until } : {}),
+        };
       }
       if (s.loopSafe) out.loop_safe = true;
       return out;

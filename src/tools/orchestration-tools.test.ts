@@ -15,6 +15,7 @@ import type { ToolChoiceRecord } from '../memory/tool-choice-store.js';
 const { registerOrchestrationTools, renderAuthoringAdvisories, bindStepsToToolChoices, draftToDefinition, commitAuthoredWorkflow, bindDiscussedToolkitsIntoSteps, autoTagStepsWithModelRoleIntents } = await import('./orchestration-tools.js');
 const { traceToWorkflowDraft } = await import('../execution/trace-to-workflow.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
+const { fireWorkflowSystemEvent } = await import('../execution/workflow-trigger-engine.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 
@@ -164,6 +165,21 @@ test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it'
   const entry = readWorkflow('audit-wf');
   assert.ok(entry, 'workflow persisted');
   assert.deepEqual(entry!.data.inputs, { url: { type: 'string', description: 'Site to audit' } });
+});
+
+test('workflow_create syncs event triggers immediately after saving', async () => {
+  const result = await workflowCreate()({
+    name: 'instant-event-wf',
+    description: 'Run immediately when a test event arrives.',
+    trigger_events: [{ type: 'clem.test.instant', dedupeKey: 'event-{{payload.id}}' }],
+    steps: [{ id: 'handle', prompt: 'Handle the event.' }],
+  });
+  assert.match(resultText(result), /Created workflow "instant-event-wf"/);
+
+  const fired = fireWorkflowSystemEvent('clem.test.instant', { id: 'I-1' })
+    .filter((r) => r.workflowName === 'instant-event-wf');
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].status, 'queued');
 });
 
 test('workflow_create persists a step OUTPUT contract (declarable verification unlock)', async () => {
@@ -639,6 +655,21 @@ test('draftToDefinition + commitAuthoredWorkflow: a promoted draft authors + val
   assert.equal(built.ok, true, built.errors.join('; '));
   assert.equal(built.savedDef.enabled, false);
   assert.equal(readWorkflow('zz-promote-test')!.data.steps.length, 2);
+});
+
+test('draftToDefinition preserves inferred forEach loops and list output contracts', () => {
+  const draft = traceToWorkflowDraft([
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"a.com"}}', callId: 'a' },
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"b.com"}}', callId: 'b' },
+    { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"c.com"}}', callId: 'c' },
+  ]);
+  const def = draftToDefinition('Fanout Draft', draft);
+
+  assert.equal(def.steps.length, 2);
+  assert.equal(def.steps[0].output?.type, 'array');
+  assert.deepEqual(def.steps[0].output?.min_items, { '': 1 });
+  assert.equal(def.steps[1].forEach, `{{steps.${def.steps[0].id}.output}}`);
+  assert.deepEqual(def.steps[1].dependsOn, [def.steps[0].id]);
 });
 
 // ─── chat-aware toolkit binding (the scorpion-facebook-trends fix) ──────────

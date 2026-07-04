@@ -117,6 +117,51 @@ test('step intent round-trips through write→read for intent-routed workers', (
   assert.equal(ship?.intent, undefined);
 });
 
+test('forEachNewOnly round-trips through write→read for recurring fan-out workflows', () => {
+  writeWorkflow('new-only-rt', {
+    name: 'new-only-rt',
+    description: 'new-only fan-out round-trip',
+    enabled: true,
+    trigger: { schedule: '0 8 * * *', manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Pull the latest leads.' },
+      { id: 'send', prompt: 'Send each new lead.', dependsOn: ['pull'], forEach: 'pull', forEachNewOnly: true },
+    ],
+  });
+  const wf = readWorkflow('new-only-rt');
+  const send = wf!.data.steps.find((s) => s.id === 'send');
+  assert.equal(send?.forEach, 'pull');
+  assert.equal(send?.forEachNewOnly, true);
+});
+
+test('hand-authored snake_case for_each_new_only is parsed', () => {
+  const dir = path.join(WORKFLOWS_DIR, 'new-only-snake');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'SKILL.md'),
+    [
+      '---',
+      'name: new-only-snake',
+      'description: snake-case new-only fanout',
+      'enabled: true',
+      'steps:',
+      '  - id: send',
+      '    forEach: pull',
+      '    for_each_new_only: true',
+      '---',
+      '',
+      '## step: send',
+      '',
+      'Send it.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  const send = readWorkflow('new-only-snake')!.data.steps.find((s) => s.id === 'send');
+  assert.equal(send?.forEach, 'pull');
+  assert.equal(send?.forEachNewOnly, true);
+});
+
 test('output.verify (verifiable handles) round-trips', () => {
   writeWorkflow('verify-rt', {
     name: 'verify-rt', description: 'verify round-trip', enabled: true, trigger: { manual: true },

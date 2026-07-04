@@ -5,6 +5,7 @@ import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import {
   proposeWorkflowContractUpgrades,
   renderWorkflowContractProposalReport,
+  workflowAuthoringAdvisories,
 } from './workflow-contract-proposals.js';
 
 function wf(overrides: Partial<WorkflowDefinition>): WorkflowDefinition {
@@ -117,4 +118,65 @@ test('renders a reviewable non-mutating proposal report', () => {
   assert.match(report, /Suggested pinned goal/);
   assert.match(report, /Step "deploy"/);
   assert.match(report, /url_present: \["url"\]/);
+});
+
+test('advises when live research has an identity-only output contract', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    steps: [
+      {
+        id: 'research',
+        prompt: 'Research the SEO audit with DataForSEO keywords, backlinks, SERP, and Lighthouse evidence.',
+        allowedTools: ['mcp__dataforseo_labs_google_ranked_keywords'],
+        output: { type: 'object', required_keys: ['domain', 'client'] },
+      },
+    ],
+  }));
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /research/);
+  assert.match(warnings[0], /sources/);
+  assert.match(warnings[0], /key_findings/);
+});
+
+test('does not advise when live research already requires evidence keys', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    steps: [
+      {
+        id: 'research',
+        prompt: 'Research the SEO audit with DataForSEO keywords, backlinks, SERP, and Lighthouse evidence.',
+        allowedTools: ['mcp__dataforseo_labs_google_ranked_keywords'],
+        output: {
+          type: 'object',
+          required_keys: ['domain', 'client', 'sources', 'key_findings', 'source_errors'],
+          non_empty: ['sources', 'key_findings'],
+          min_items: { sources: 3, key_findings: 3 },
+        },
+      },
+    ],
+  }));
+
+  assert.deepEqual(warnings, []);
+});
+
+test('advises when a verified artifact step is model-written instead of deterministic', () => {
+  const warnings = workflowAuthoringAdvisories(wf({
+    steps: [
+      {
+        id: 'build_html',
+        prompt: 'Build the HTML audit report and save the local file.',
+        allowedTools: ['write_file'],
+        output: { type: 'object', required_keys: ['path'], verify: { path_exists: ['path'] } },
+      },
+      {
+        id: 'deterministic_build',
+        prompt: 'Build the HTML audit report and save the local file.',
+        deterministic: { runner: 'render-audit.mjs' },
+        output: { type: 'object', required_keys: ['path'], verify: { path_exists: ['path'] } },
+      },
+    ],
+  }));
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /build_html/);
+  assert.match(warnings[0], /deterministic runner/);
 });

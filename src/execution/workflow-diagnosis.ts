@@ -388,6 +388,63 @@ function diagnoseRuntimeToolSurfaceBlock(input: DiagnoseInput): WorkflowDiagnosi
   };
 }
 
+/** T3.2 — cross-family veto on an AUTO-applied heal ("judge ≠ brain family;
+ *  never self-grade"). The Doctor's `autoApplicable` verdict is produced by
+ *  the same fast model that wrote the rewrite; before the runner auto-applies
+ *  it, a judge from a DIFFERENT provider family re-grades the fix. Verdicts:
+ *   - 'approve'      → auto-apply proceeds
+ *   - 'veto'         → escalate to the human `apply fix` offer instead
+ *   - 'unavailable'  → no different-family judge reachable (or judge timeout /
+ *                      error) → fail-open to today's behavior; auto-heal is
+ *                      already bounded, backed up, and (new) auto-reverted on
+ *                      a re-run that doesn't stick.
+ *  Human-approved `apply fix` is NOT judged — the human is the judge. */
+const HealVetoSchema = z.object({
+  approve: z.boolean(),
+  reason: z.string(),
+});
+
+export async function judgeHealCrossFamily(
+  diagnosis: WorkflowDiagnosis,
+  stepPrompt: string | undefined,
+): Promise<{ verdict: 'approve' | 'veto' | 'unavailable'; reason?: string }> {
+  try {
+    const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+    const { resolveProvider } = await import('../runtime/harness/model-wire-registry.js');
+    const { judgeCrossFamilyEnabled, withJudgeTimeout } = await import('../runtime/harness/judge-family.js');
+    if (!judgeCrossFamilyEnabled()) return { verdict: 'unavailable', reason: 'cross-family judging disabled' };
+    const judge = resolveRoleModel('judge');
+    const doctorProvider = resolveProvider(MODELS.fast);
+    if (!judge?.modelId || String(judge.provider) === String(doctorProvider)) {
+      return { verdict: 'unavailable', reason: 'no different-family judge bound' };
+    }
+    const agent = new Agent({
+      name: 'HealVetoJudge',
+      instructions: [
+        'You are a strict reviewer of an AUTOMATED fix about to be applied to a production workflow without a human in the loop.',
+        'Approve ONLY when the rewritten step prompt plausibly addresses the diagnosed root cause AND does not weaken the step (dropping its deliverable, loosening its scope, or introducing a new external action).',
+        'When uncertain, REJECT — a rejected fix is offered to the human instead of lost.',
+      ].join('\n'),
+      model: judge.modelId,
+      modelSettings: { reasoning: { effort: 'low' } },
+      outputType: normalizeZodForCodexStrict(HealVetoSchema) as typeof HealVetoSchema,
+      tools: [],
+    });
+    const prompt = [
+      `Diagnosed root cause: ${diagnosis.rootCause}`,
+      `Proposed fix (${diagnosis.fix.kind}): ${diagnosis.fix.description}`,
+      stepPrompt ? `Current step prompt:\n"""\n${stepPrompt.slice(0, 3000)}\n"""` : '',
+      diagnosis.fix.newStepPrompt ? `Rewritten step prompt:\n"""\n${diagnosis.fix.newStepPrompt.slice(0, 3000)}\n"""` : '',
+    ].filter(Boolean).join('\n\n');
+    const result = await withJudgeTimeout(run(agent, prompt));
+    const out = result?.finalOutput as z.infer<typeof HealVetoSchema> | undefined;
+    if (!out) return { verdict: 'unavailable', reason: 'judge timeout' };
+    return out.approve ? { verdict: 'approve', reason: out.reason } : { verdict: 'veto', reason: out.reason };
+  } catch (err) {
+    return { verdict: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<WorkflowDiagnosis | null> {
   const primary = input.blockedSteps[0];
   if (!primary) return null;
@@ -494,6 +551,18 @@ export interface FixBackup {
   priorDefinition: WorkflowDefinition;
   description: string;
   createdAt: string;
+}
+
+/** T3.1: the same backup+revert discipline for OTHER auto-edits (success-path
+ *  contract tightening). Exported thin wrapper so callers outside the Doctor
+ *  get `revert heal <id>` reversibility without duplicating path logic. */
+export function recordWorkflowEditBackup(
+  workflow: string,
+  stepId: string,
+  priorDefinition: WorkflowDefinition,
+  description: string,
+): FixBackup | null {
+  return recordFixBackup(workflow, stepId, priorDefinition, description);
 }
 
 /** Snapshot the prior definition before a fix is written. Best-effort

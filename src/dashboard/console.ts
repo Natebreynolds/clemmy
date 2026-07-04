@@ -565,6 +565,7 @@ export function renderConsoleHtml(token: string): string {
               <span>WORKFLOWS</span>
               <span class="wf-list-actions">
                 <button type="button" class="wf-home-btn" data-wf-home title="Workflow home">HOME</button>
+                <button type="button" class="wf-home-btn" data-wf-board title="Task board — live runs by status">BOARD</button>
                 <button type="button" class="wf-home-btn" data-wf-import-open title="Import a workflow from a folder or Git repo">IMPORT</button>
                 <span class="wf-new-btn" data-wf-new role="button" tabindex="0" title="Create new workflow" onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW</span>
               </span>
@@ -7162,6 +7163,235 @@ body {
   padding: 1px 4px;
   font-size: 10px;
   font-family: var(--mono);
+}
+
+/* Recent-run rows open the read-only inspector on click. */
+.wf-run-open { cursor: pointer; }
+.wf-run-open:hover { background: var(--bg-2); }
+
+/* Past-run inspector (T4.2) */
+.wf-insp-modal { width: min(760px, 96vw); }
+.wf-insp-loading { padding: 24px 16px; color: var(--fg-3); font-size: 11px; }
+.wf-insp-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-3);
+  flex-wrap: wrap;
+}
+.wf-insp-meta-wf { color: var(--accent); letter-spacing: 0.08em; }
+.wf-insp-summary {
+  margin: 12px 16px 0;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  padding: 10px 12px;
+  font-size: 11px;
+}
+.wf-insp-summary.ok { border-left-color: var(--accent-2); }
+.wf-insp-summary.attn { border-left-color: var(--accent-warn); }
+.wf-insp-summary-badge {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.wf-insp-summary.ok .wf-insp-summary-badge { color: var(--accent-2); }
+.wf-insp-summary.attn .wf-insp-summary-badge { color: var(--accent-warn); }
+.wf-insp-summary-because { color: var(--fg); }
+.wf-insp-summary-artifacts { color: var(--fg-3); margin-top: 6px; font-family: var(--mono); font-size: 10px; }
+.wf-insp-steps { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 10px; }
+.wf-insp-empty { color: var(--fg-mute); font-size: 11px; padding: 8px 0; }
+.wf-insp-step {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  padding: 8px 10px;
+}
+.wf-insp-step.status-done { border-left-color: var(--accent-2); }
+.wf-insp-step.status-failed { border-left-color: var(--accent-fail); }
+.wf-insp-step.status-running { border-left-color: var(--accent-3); }
+.wf-insp-step.status-skipped { border-left-color: var(--fg-mute); }
+.wf-insp-step.status-queued { border-left-color: var(--line); }
+.wf-insp-step .step-status,
+.wf-bq-step .step-status {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+  text-transform: uppercase;
+}
+.wf-insp-step .step-status.status-running,
+.wf-bq-step .step-status.status-running { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-insp-step .step-status.status-done,
+.wf-bq-step .step-status.status-done { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-insp-step .step-status.status-failed,
+.wf-bq-step .step-status.status-failed { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-insp-step .step-status.status-skipped,
+.wf-bq-step .step-status.status-skipped { color: var(--fg-mute); border-color: var(--fg-mute); }
+.wf-insp-step .step-status.status-queued,
+.wf-bq-step .step-status.status-queued { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-insp-step-head { display: flex; align-items: center; gap: 8px; }
+.wf-insp-step-id { font-family: var(--mono); font-size: 11px; color: var(--fg-2); }
+.wf-insp-step-dur { font-family: var(--mono); font-size: 10px; color: var(--fg-3); margin-left: auto; }
+.wf-insp-step-retries { font-family: var(--mono); font-size: 9px; color: var(--accent-warn); }
+.wf-insp-items { font-family: var(--mono); font-size: 10px; color: var(--fg-3); margin-top: 6px; }
+.wf-insp-items-fail { color: var(--accent-fail); }
+.wf-insp-skip { font-size: 10px; color: var(--fg-mute); margin-top: 6px; }
+.wf-insp-error {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: color-mix(in srgb, var(--accent-fail) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-fail) 40%, transparent);
+  color: var(--accent-fail);
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.wf-insp-out { margin-top: 8px; font-size: 10px; }
+.wf-insp-out summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  color: var(--fg-3);
+  list-style: revert;
+}
+.wf-insp-out summary:hover { color: var(--fg); }
+.wf-insp-out pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-2);
+}
+.wf-insp-step-cost { font-family: var(--mono); font-size: 10px; color: var(--accent-3); }
+.wf-insp-advisories { margin-top: 8px; border-top: 1px dotted var(--line); padding-top: 6px; }
+.wf-insp-advisory {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0 4px 8px;
+  border-left: 2px solid var(--accent-warn);
+  margin-bottom: 5px;
+}
+.wf-insp-advisory-reason {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--accent-warn);
+  text-transform: uppercase;
+}
+.wf-insp-advisory-note { font-size: 10px; color: var(--fg-3); }
+.wf-insp-attempts { margin-top: 8px; border-top: 1px dotted var(--line); padding-top: 6px; }
+.wf-insp-attempts-head { font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute); margin-bottom: 6px; }
+.wf-insp-attempt { border-left: 2px solid var(--line); padding: 4px 0 4px 8px; margin-bottom: 6px; }
+.wf-insp-attempt-head { display: flex; gap: 10px; align-items: baseline; }
+.wf-insp-attempt-idx { font-family: var(--mono); font-size: 10px; color: var(--accent-warn); }
+.wf-insp-attempt-metrics { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
+.wf-insp-attempt-change { font-size: 10px; color: var(--fg-2); margin-top: 3px; }
+.wf-insp-problems { margin: 4px 0 0; padding-left: 16px; }
+.wf-insp-problems li { font-size: 10px; color: var(--fg-3); }
+
+/* Board cockpit (T4.3) */
+.wf-board { display: flex; flex-direction: column; height: 100%; overflow: hidden; padding: 14px; }
+.wf-board-cols {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(180px, 1fr));
+  gap: 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1;
+  min-height: 0;
+}
+.wf-board-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.wf-board-col-head {
+  padding: 8px 10px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--fg-3);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.wf-board-col-count { color: var(--fg-mute); font-family: var(--mono); }
+.wf-board-col-body { padding: 8px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.wf-board-empty { color: var(--fg-mute); font-size: 11px; text-align: center; padding: 6px 0; }
+.wf-board-card {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  padding: 8px;
+  font-size: 11px;
+}
+.wf-board-card-open { cursor: pointer; }
+.wf-board-card-open:hover { border-color: var(--accent); }
+.wf-board-card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+.wf-board-card-kind {
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+}
+.wf-board-card-kind.kind-workflow { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-board-card-kind.kind-background { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-board-card-kind.kind-approval { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-board-card-age { font-family: var(--mono); font-size: 9px; color: var(--fg-mute); }
+.wf-board-card-title { color: var(--fg); font-weight: 600; line-height: 1.3; }
+.wf-board-card-step { color: var(--fg-3); font-size: 10px; margin-top: 4px; line-height: 1.3; }
+/* Sub-task queue drawer */
+.wf-bq {
+  border: 1px solid var(--accent-3);
+  background: var(--bg-1);
+  margin-bottom: 12px;
+}
+.wf-bq-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--accent-3);
+}
+.wf-bq-empty { padding: 12px; color: var(--fg-mute); font-size: 11px; }
+.wf-bq-steps { padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; }
+.wf-bq-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dotted var(--line);
+  font-size: 11px;
+}
+.wf-bq-step:last-child { border-bottom: 0; }
+.wf-bq-step.is-next { background: color-mix(in srgb, var(--accent-3) 8%, transparent); }
+.wf-bq-step-title { font-family: var(--mono); color: var(--fg-2); }
+.wf-bq-kind { font-size: 9px; color: var(--accent-3); letter-spacing: 0.08em; }
+.wf-bq-items { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
+.wf-bq-next {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  padding: 1px 5px;
+  border: 1px solid var(--accent-3);
+  color: var(--accent-3);
 }
 
 .wf-edit-body {
@@ -15636,6 +15866,14 @@ const CONSOLE_JS = `
   let wfHomeData = null;
   let wfMode = 'home';
   let wfHomePollTimer = null;
+  // Task board (cockpit) state. A single 2s timer refreshes the columns while
+  // the board is open; when a running workflow card is expanded, the same tick
+  // also re-fetches that run's per-step queue so the drawer stays live without a
+  // second timer fighting the board re-render.
+  let wfBoardData = null;
+  let wfBoardPollTimer = null;
+  let wfBoardQueueKey = null;      // "<slug> <runId>" of the card whose queue drawer is open
+  let wfBoardQueueData = null;     // last queue payload for the open drawer
   let wfChatHistory = [];
   let wfChatBusy = false;
   // Set of step indices currently in edit mode. Cleared on workflow
@@ -15756,6 +15994,46 @@ const CONSOLE_JS = `
       if (target.closest('[data-wf-home]')) {
         event.preventDefault();
         showWorkflowHome({ refresh: true });
+        return;
+      }
+      if (target.closest('[data-wf-board]')) {
+        event.preventDefault();
+        showWorkflowBoard({ refresh: true });
+        return;
+      }
+      if (target.closest('[data-wf-board-queue-close]')) {
+        event.preventDefault();
+        wfBoardQueueKey = null;
+        wfBoardQueueData = null;
+        if (wfBoardData) renderWorkflowBoard(wfBoardData, { preserveScroll: true });
+        return;
+      }
+      const boardQueue = target.closest('[data-wf-board-queue]');
+      if (boardQueue) {
+        event.preventDefault();
+        const key = boardQueue.getAttribute('data-wf-board-queue');
+        if (key) {
+          wfBoardQueueKey = key;
+          wfBoardQueueData = null;
+          if (wfBoardData) renderWorkflowBoard(wfBoardData, { preserveScroll: true });
+          fetchBoardQueue(key).then((q) => {
+            if (wfMode === 'board' && wfBoardQueueKey === key) {
+              wfBoardQueueData = q;
+              if (wfBoardData) renderWorkflowBoard(wfBoardData, { preserveScroll: true });
+            }
+          });
+        }
+        return;
+      }
+      // Open the read-only inspector for a past/live run. The CANCEL button
+      // lives inside the row and has its own direct binding — skip when the
+      // click landed on it so cancelling doesn't also open the inspector.
+      const runOpen = target.closest('[data-wf-run-open]');
+      if (runOpen && !target.closest('[data-wf-run-cancel]')) {
+        event.preventDefault();
+        const runId = runOpen.getAttribute('data-wf-run-open');
+        const runWorkflow = runOpen.getAttribute('data-wf-run-workflow') || wfSelectedName;
+        if (runId && runWorkflow) openRunInspector(runWorkflow, runId);
         return;
       }
       const createAction = target.closest('[data-wf-create-action]');
@@ -16203,6 +16481,7 @@ const CONSOLE_JS = `
       '    </div>',
       '    <div class="wf-home-head-actions">',
       '      <button type="button" class="wf-empty-btn" data-wf-home>REFRESH</button>',
+      '      <button type="button" class="wf-empty-btn" data-wf-board>BOARD</button>',
       '      <button type="button" class="wf-empty-btn primary" data-wf-new onclick="window.__clementineStartNewWorkflow && window.__clementineStartNewWorkflow();">＋ NEW WORKFLOW</button>',
       '    </div>',
       '  </div>',
@@ -16332,6 +16611,7 @@ const CONSOLE_JS = `
     wfChatHistory = [];
     wfEditingStepIndices.clear();
     stopWorkflowHomePolling();
+    stopWorkflowBoardPolling();
     stopActiveRunPolling();
     if (wf.list) Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
     resetWorkflowArchitectIntro();
@@ -16421,6 +16701,7 @@ const CONSOLE_JS = `
     wfChatHistory = [];
     wfEditingStepIndices.clear();
     stopActiveRunPolling();
+    stopWorkflowBoardPolling();
     if (wf.list) Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
     resetWorkflowArchitectIntro();
     syncArchitectChatChips();
@@ -16517,6 +16798,7 @@ const CONSOLE_JS = `
     if (!name || !wf.list) return;
     wfMode = 'editor';
     stopWorkflowHomePolling();
+    stopWorkflowBoardPolling();
     wfSelectedName = name;
     wfIsNew = false;
     cronSelectedName = null;
@@ -17088,6 +17370,479 @@ const CONSOLE_JS = `
         }
       });
     });
+  }
+
+  // ── Past-run inspector (T4.2) ───────────────────────────────────────────
+  // Read-only replay of one workflow run's durable event log into a step
+  // timeline + attempts + run summary. Reuses the same events endpoint the live
+  // poll tails, but with no since= param so it gets the full log.
+
+  function fmtDurationMs(ms) {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n < 0) return '';
+    if (n < 1000) return n + 'ms';
+    const secs = n / 1000;
+    if (secs < 60) return (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + 's';
+    const mins = Math.floor(secs / 60);
+    const rem = Math.round(secs - mins * 60);
+    return mins + 'm ' + rem + 's';
+  }
+
+  function inspOneLine(text) {
+    const flat = String(text == null ? '' : text).replace(new RegExp('\\s+', 'g'), ' ').trim();
+    return flat.length > 140 ? flat.slice(0, 140) + '…' : (flat || '(empty)');
+  }
+
+  function buildRunInspectorModel(events) {
+    const order = [];
+    const byStep = {};
+    let summary = null;
+    let runStatus = 'unknown';
+    let runStartedAt = '';
+    let runFinishedAt = '';
+    const ensure = (stepId) => {
+      if (!byStep[stepId]) {
+        byStep[stepId] = {
+          stepId: stepId,
+          status: 'pending',
+          startedAt: '', finishedAt: '',
+          output: '', error: '', skippedReason: '',
+          attempts: [],
+          advisories: [],
+          itemsStarted: 0, itemsCompleted: 0, itemsFailed: 0,
+          retries: 0,
+          tokens: null, costUsd: null,
+        };
+        order.push(stepId);
+      }
+      return byStep[stepId];
+    };
+    for (const ev of (events || [])) {
+      const k = ev && ev.kind;
+      if (k === 'run_started') { runStartedAt = ev.t; if (runStatus === 'unknown') runStatus = 'running'; continue; }
+      if (k === 'run_completed') { runFinishedAt = ev.t; runStatus = 'completed'; continue; }
+      if (k === 'run_failed') { runFinishedAt = ev.t; runStatus = 'failed'; continue; }
+      if (k === 'run_cancelled') { runFinishedAt = ev.t; runStatus = 'cancelled'; continue; }
+      if (k === 'run_summary') { summary = ev.meta || {}; continue; }
+      if (!ev || !ev.stepId) continue;
+      const s = ensure(ev.stepId);
+      if (k === 'step_started') { s.status = 'running'; s.startedAt = ev.t; }
+      else if (k === 'step_completed') {
+        s.status = 'done'; s.finishedAt = ev.t;
+        s.output = typeof ev.output === 'string' ? ev.output : (ev.output != null ? JSON.stringify(ev.output, null, 2) : '');
+        // Per-step tokens/cost aren't always recorded; surface them when the
+        // completion event carries them so no data is invented.
+        if (ev.meta && ev.meta.tokens != null && Number.isFinite(Number(ev.meta.tokens))) s.tokens = Number(ev.meta.tokens);
+        if (ev.meta && ev.meta.costUsd != null && Number.isFinite(Number(ev.meta.costUsd))) s.costUsd = Number(ev.meta.costUsd);
+      }
+      else if (k === 'step_failed') { s.status = 'failed'; s.finishedAt = ev.t; s.error = ev.error || ''; }
+      else if (k === 'step_skipped') { s.status = 'skipped'; s.finishedAt = ev.t; s.skippedReason = (ev.meta && ev.meta.reason) || ''; }
+      else if (k === 'step_retry' || k === 'step_loop_retry') { s.retries += 1; }
+      else if (k === 'attempt_record' && ev.attempt) { s.attempts.push(ev.attempt); }
+      else if (k === 'step_advisory') {
+        const meta = ev.meta || {};
+        s.advisories.push({ reason: meta.reason || 'advisory', note: meta.note || '' });
+        // Attempt-metric tokens (per retried attempt) also give a fallback
+        // per-step token count when a completion event omits it.
+        if (s.tokens == null && meta.tokens != null && Number.isFinite(Number(meta.tokens))) s.tokens = Number(meta.tokens);
+      }
+      else if (k === 'item_started') { s.itemsStarted += 1; }
+      else if (k === 'item_completed') { s.itemsCompleted += 1; }
+      else if (k === 'item_failed') { s.itemsFailed += 1; }
+    }
+    return {
+      steps: order.map((id) => byStep[id]),
+      summary: summary,
+      runStatus: runStatus,
+      runStartedAt: runStartedAt,
+      runFinishedAt: runFinishedAt,
+    };
+  }
+
+  function renderInspectorAttempts(attempts) {
+    if (!attempts || attempts.length === 0) return '';
+    return [
+      '<div class="wf-insp-attempts">',
+      '  <div class="wf-insp-attempts-head">ATTEMPTS</div>',
+      attempts.map((a) => {
+        const metrics = a.metrics || {};
+        const bits = [
+          Number.isFinite(Number(metrics.durationMs)) ? fmtDurationMs(metrics.durationMs) : '',
+          Number.isFinite(Number(metrics.tokens)) ? (metrics.tokens + ' tok') : '',
+          Number.isFinite(Number(metrics.toolCalls)) ? (metrics.toolCalls + ' tools') : '',
+        ].filter(Boolean).join(' · ');
+        const problems = Array.isArray(a.failedProblems) && a.failedProblems.length
+          ? '<ul class="wf-insp-problems">' + a.failedProblems.slice(0, 6).map((p) => '<li>' + escMem(p) + '</li>').join('') + '</ul>'
+          : '';
+        return [
+          '<div class="wf-insp-attempt">',
+          '  <div class="wf-insp-attempt-head">',
+          '    <span class="wf-insp-attempt-idx">#' + escMem(a.attemptIndex) + (a.maxAttempts ? ' / ' + escMem(a.maxAttempts) : '') + '</span>',
+          bits ? '    <span class="wf-insp-attempt-metrics">' + escMem(bits) + '</span>' : '',
+          '  </div>',
+          a.changeSummary ? '  <div class="wf-insp-attempt-change">' + escMem(a.changeSummary) + '</div>' : '',
+          problems,
+          '</div>',
+        ].join('');
+      }).join(''),
+      '</div>',
+    ].join('');
+  }
+
+  function renderInspectorAdvisories(advisories) {
+    if (!advisories || advisories.length === 0) return '';
+    return [
+      '<div class="wf-insp-advisories">',
+      '  <div class="wf-insp-attempts-head">JUDGE / QUALITY VERDICTS</div>',
+      advisories.map((a) => [
+        '<div class="wf-insp-advisory">',
+        '  <span class="wf-insp-advisory-reason">' + escMem(String(a.reason).replace(new RegExp('_', 'g'), ' ')) + '</span>',
+        a.note ? '  <span class="wf-insp-advisory-note">' + escMem(a.note) + '</span>' : '',
+        '</div>',
+      ].join('')).join(''),
+      '</div>',
+    ].join('');
+  }
+
+  // Best-effort per-step token count: prefer the completion meta, else sum the
+  // per-attempt metric samples (a step that never retried has neither).
+  function inspStepTokens(s) {
+    if (s.tokens != null) return s.tokens;
+    let sum = 0; let seen = false;
+    for (const a of (s.attempts || [])) {
+      const t = a.metrics && a.metrics.tokens;
+      if (Number.isFinite(Number(t))) { sum += Number(t); seen = true; }
+    }
+    return seen ? sum : null;
+  }
+
+  function renderInspectorSummary(summary) {
+    if (!summary) return '';
+    const artifacts = summary.artifacts || {};
+    const counts = Array.isArray(artifacts.counts) ? artifacts.counts : [];
+    const files = Array.isArray(artifacts.files) ? artifacts.files : [];
+    const urls = Array.isArray(artifacts.urls) ? artifacts.urls : [];
+    const produced = counts.concat(files).concat(urls);
+    return [
+      '<div class="wf-insp-summary ' + (summary.needsAttention ? 'attn' : 'ok') + '">',
+      '  <div class="wf-insp-summary-badge">' + (summary.needsAttention ? 'NEEDS ATTENTION' : 'COMPLETED') + '</div>',
+      summary.because ? '  <div class="wf-insp-summary-because">' + escMem(summary.because) + '</div>' : '',
+      produced.length
+        ? '  <div class="wf-insp-summary-artifacts">📦 ' + produced.slice(0, 12).map((p) => escMem(String(p))).join(' · ') + '</div>'
+        : '',
+      '</div>',
+    ].join('');
+  }
+
+  function renderRunInspectorBody(model, workflowName, runId) {
+    const stepRows = model.steps.length
+      ? model.steps.map((s) => {
+        const dur = (s.startedAt && s.finishedAt)
+          ? fmtDurationMs(new Date(s.finishedAt).getTime() - new Date(s.startedAt).getTime())
+          : '';
+        const statusClass = s.status === 'done' ? 'status-done'
+          : s.status === 'failed' ? 'status-failed'
+          : s.status === 'running' ? 'status-running'
+          : s.status === 'skipped' ? 'status-skipped' : 'status-queued';
+        const itemLine = (s.itemsStarted > 0 || s.itemsFailed > 0)
+          ? '<div class="wf-insp-items">items: ' + escMem(s.itemsCompleted) + '/' + escMem(s.itemsStarted) + ' done'
+            + (s.itemsFailed > 0 ? ' · <span class="wf-insp-items-fail">' + escMem(s.itemsFailed) + ' failed</span>' : '') + '</div>'
+          : '';
+        const outputBlock = s.output
+          ? [
+            '<details class="wf-insp-out">',
+            '  <summary>' + escMem(inspOneLine(s.output)) + '</summary>',
+            '  <pre>' + escMem(s.output) + '</pre>',
+            '</details>',
+          ].join('')
+          : '';
+        const errorBlock = s.error ? '<div class="wf-insp-error">' + escMem(s.error) + '</div>' : '';
+        const skipBlock = s.status === 'skipped' && s.skippedReason
+          ? '<div class="wf-insp-skip">skipped: ' + escMem(s.skippedReason) + '</div>' : '';
+        const tokens = inspStepTokens(s);
+        const costBits = [
+          tokens != null ? (tokens + ' tok') : '',
+          s.costUsd != null ? ('$' + s.costUsd.toFixed(s.costUsd < 1 ? 3 : 2)) : '',
+        ].filter(Boolean).join(' · ');
+        return [
+          '<div class="wf-insp-step ' + statusClass + '">',
+          '  <div class="wf-insp-step-head">',
+          '    <span class="step-status ' + statusClass + '">' + escMem(s.status.toUpperCase()) + '</span>',
+          '    <span class="wf-insp-step-id">' + escMem(s.stepId) + '</span>',
+          dur ? '    <span class="wf-insp-step-dur">' + escMem(dur) + '</span>' : '',
+          costBits ? '    <span class="wf-insp-step-cost">' + escMem(costBits) + '</span>' : '',
+          s.retries > 0 ? '    <span class="wf-insp-step-retries">' + escMem(s.retries) + ' retr' + (s.retries === 1 ? 'y' : 'ies') + '</span>' : '',
+          '  </div>',
+          itemLine,
+          skipBlock,
+          errorBlock,
+          outputBlock,
+          renderInspectorAdvisories(s.advisories),
+          renderInspectorAttempts(s.attempts),
+          '</div>',
+        ].join('');
+      }).join('')
+      : '<div class="wf-insp-empty">— no step events recorded for this run —</div>';
+    const overallDur = (model.runStartedAt && model.runFinishedAt)
+      ? fmtDurationMs(new Date(model.runFinishedAt).getTime() - new Date(model.runStartedAt).getTime())
+      : '';
+    return [
+      '<div class="wf-run-modal wf-insp-modal" role="dialog" aria-modal="true">',
+      '  <div class="wf-run-modal-head">',
+      '    <span>RUN INSPECTOR · ' + escMem(String(model.runStatus).toUpperCase()) + '</span>',
+      '    <button class="wf-run-modal-close" data-close>✕</button>',
+      '  </div>',
+      '  <div class="wf-insp-meta">',
+      '    <span class="wf-insp-meta-wf">' + escMem(workflowName) + '</span>',
+      '    <span class="wf-insp-meta-id">' + escMem(runId) + '</span>',
+      overallDur ? '    <span class="wf-insp-meta-dur">' + escMem(overallDur) + '</span>' : '',
+      '  </div>',
+      renderInspectorSummary(model.summary),
+      '  <div class="wf-insp-steps">' + stepRows + '</div>',
+      '</div>',
+    ].join('');
+  }
+
+  async function openRunInspector(workflowName, runId) {
+    const overlay = document.createElement('div');
+    overlay.className = 'wf-run-modal-backdrop';
+    overlay.innerHTML = [
+      '<div class="wf-run-modal wf-insp-modal" role="dialog" aria-modal="true">',
+      '  <div class="wf-run-modal-head">',
+      '    <span>RUN INSPECTOR</span>',
+      '    <button class="wf-run-modal-close" data-close>✕</button>',
+      '  </div>',
+      '  <div class="wf-insp-loading">Loading run events…</div>',
+      '</div>',
+    ].join('');
+    document.body.appendChild(overlay);
+    const cleanup = () => {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') cleanup(); };
+    document.addEventListener('keydown', onKey);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay || (e.target instanceof HTMLElement && e.target.closest('[data-close]'))) cleanup();
+    });
+    try {
+      const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(workflowName)
+        + '/runs/' + encodeURIComponent(runId) + '/events');
+      const model = buildRunInspectorModel(Array.isArray(data.events) ? data.events : []);
+      overlay.innerHTML = renderRunInspectorBody(model, workflowName, runId);
+    } catch (err) {
+      overlay.innerHTML = [
+        '<div class="wf-run-modal wf-insp-modal" role="dialog" aria-modal="true">',
+        '  <div class="wf-run-modal-head">',
+        '    <span>RUN INSPECTOR</span>',
+        '    <button class="wf-run-modal-close" data-close>✕</button>',
+        '  </div>',
+        '  <div class="wf-insp-error">Could not load run events: ' + escMem((err && err.message) || err) + '</div>',
+        '</div>',
+      ].join('');
+    }
+  }
+
+  // ── Board cockpit (T4.3) ────────────────────────────────────────────────
+  // A Kanban of every live/terminal unit of work (from /api/console/board),
+  // grouped by status. Clicking a live workflow card expands its real per-step
+  // queue (from the /queue endpoint); clicking a finished workflow run opens the
+  // read-only Run Inspector above.
+
+  const WF_BOARD_COLUMNS = [
+    { id: 'queued', label: 'QUEUED' },
+    { id: 'running', label: 'RUNNING' },
+    { id: 'needs_you', label: 'PARKED · NEEDS YOU' },
+    { id: 'completed', label: 'COMPLETED' },
+    { id: 'failed', label: 'FAILED' },
+  ];
+
+  function boardCardIsFailed(card) {
+    if (card.failureSummary) return true;
+    if (card.raw && card.raw.error) return true;
+    const s = String(card.status || '').toLowerCase();
+    return s.indexOf('fail') !== -1 || s.indexOf('error') !== -1 || s === 'aborted';
+  }
+
+  function boardCardColumn(card) {
+    if (card.column === 'queued') return 'queued';
+    if (card.column === 'running') return 'running';
+    if (card.column === 'needs_you') return 'needs_you';
+    return boardCardIsFailed(card) ? 'failed' : 'completed';
+  }
+
+  function boardCardWorkflowRef(card) {
+    const raw = card.raw || {};
+    const slug = raw.workflowSlug || raw.workflowName;
+    const runId = raw.runId;
+    if (slug && runId) return { slug: slug, runId: runId };
+    return null;
+  }
+
+  function stopWorkflowBoardPolling() {
+    if (wfBoardPollTimer) { clearInterval(wfBoardPollTimer); wfBoardPollTimer = null; }
+    wfBoardQueueKey = null;
+    wfBoardQueueData = null;
+  }
+
+  function scheduleWorkflowBoardPolling() {
+    if (wfBoardPollTimer) return;
+    wfBoardPollTimer = setInterval(() => {
+      if (wfMode !== 'board') { stopWorkflowBoardPolling(); return; }
+      loadWorkflowBoard({ silent: true });
+    }, 2000);
+  }
+
+  function showWorkflowBoard(opts) {
+    wfMode = 'board';
+    wfDraft = null;
+    wfSelectedName = null;
+    wfIsNew = false;
+    cronSelectedName = null;
+    wfChatHistory = [];
+    wfEditingStepIndices.clear();
+    stopWorkflowHomePolling();
+    stopActiveRunPolling();
+    wfBoardQueueKey = null;
+    wfBoardQueueData = null;
+    if (wf.list) Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
+    resetWorkflowArchitectIntro();
+    syncArchitectChatChips();
+    loadWorkflowBoard({ refresh: !(opts && opts.refresh === false) });
+  }
+
+  async function loadWorkflowBoard(opts) {
+    if (!wf.editor) return;
+    if (!(opts && opts.silent)) {
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">↻</div><div class="wf-empty-text">Loading task board…</div></div>';
+    }
+    try {
+      const [board, queue] = await Promise.all([
+        fetchJSON('/api/console/board'),
+        wfBoardQueueKey ? fetchBoardQueue(wfBoardQueueKey) : Promise.resolve(null),
+      ]);
+      if (wfMode !== 'board') return;
+      wfBoardData = board;
+      if (wfBoardQueueKey) wfBoardQueueData = queue;
+      renderWorkflowBoard(board, { preserveScroll: !!(opts && opts.silent) });
+      scheduleWorkflowBoardPolling();
+    } catch (err) {
+      if (wfMode !== 'board') return;
+      wf.editor.innerHTML = '<div class="wf-empty"><div class="wf-empty-mark">!</div><div class="wf-empty-text">' + escMem((err && err.message) || err) + '</div></div>';
+    }
+  }
+
+  async function fetchBoardQueue(key) {
+    const sep = key.indexOf(' ');
+    if (sep === -1) return null;
+    const slug = key.slice(0, sep);
+    const runId = key.slice(sep + 1);
+    try {
+      return await fetchJSON('/api/console/board/run/' + encodeURIComponent(slug)
+        + '/' + encodeURIComponent(runId) + '/queue');
+    } catch {
+      return null;
+    }
+  }
+
+  function renderBoardQueueDrawer() {
+    if (!wfBoardQueueKey) return '';
+    const q = wfBoardQueueData;
+    const sep = wfBoardQueueKey.indexOf(' ');
+    const runId = sep === -1 ? wfBoardQueueKey : wfBoardQueueKey.slice(sep + 1);
+    const head = [
+      '<div class="wf-bq-head">',
+      '  <span>SUB-TASK QUEUE · ' + escMem(runId) + (q && q.totalCount ? ' · ' + escMem(q.doneCount || 0) + '/' + escMem(q.totalCount) : '') + '</span>',
+      '  <button type="button" class="wf-run-modal-close" data-wf-board-queue-close>✕</button>',
+      '</div>',
+    ].join('');
+    if (!q || !Array.isArray(q.steps) || q.steps.length === 0) {
+      return '<div class="wf-bq">' + head + '<div class="wf-bq-empty">— queue unavailable —</div></div>';
+    }
+    const rows = q.steps.map((st) => {
+      const statusClass = st.status === 'done' ? 'status-done'
+        : st.status === 'failed' ? 'status-failed'
+        : st.status === 'running' ? 'status-running'
+        : st.status === 'blocked' ? 'status-skipped' : 'status-queued';
+      const items = (typeof st.itemsTotal === 'number' && st.itemsTotal > 0)
+        ? '<span class="wf-bq-items">' + escMem(st.itemsDone || 0) + '/' + escMem(st.itemsTotal)
+          + (st.itemsFailed ? ' · ' + escMem(st.itemsFailed) + ' failed' : '') + '</span>'
+        : '';
+      return [
+        '<div class="wf-bq-step ' + (st.isNext ? 'is-next' : '') + '">',
+        '  <span class="step-status ' + statusClass + '">' + escMem(String(st.status).toUpperCase()) + '</span>',
+        '  <span class="wf-bq-step-title">' + escMem(st.title || st.stepId) + '</span>',
+        st.kind === 'forEach' ? '  <span class="wf-bq-kind">forEach</span>' : '',
+        items,
+        st.isNext ? '  <span class="wf-bq-next">NEXT</span>' : '',
+        '</div>',
+      ].join('');
+    }).join('');
+    return '<div class="wf-bq">' + head + '<div class="wf-bq-steps">' + rows + '</div></div>';
+  }
+
+  function renderWorkflowBoard(data, opts) {
+    if (!wf.editor) return;
+    const previousScroll = opts && opts.preserveScroll
+      ? ((wf.editor.querySelector('.wf-board-cols') && wf.editor.querySelector('.wf-board-cols').scrollTop) || 0)
+      : 0;
+    const cards = Array.isArray(data && data.cards) ? data.cards : [];
+    const byColumn = { queued: [], running: [], needs_you: [], completed: [], failed: [] };
+    for (const card of cards) byColumn[boardCardColumn(card)].push(card);
+    const columnsHtml = WF_BOARD_COLUMNS.map((col) => {
+      const list = byColumn[col.id] || [];
+      const cardsHtml = list.length
+        ? list.map((card) => {
+          const ref = boardCardWorkflowRef(card);
+          const isLive = col.id === 'queued' || col.id === 'running' || col.id === 'needs_you';
+          // Live workflow cards → expand the per-step queue. Terminal workflow
+          // runs → open the read-only Run Inspector (Feature A) for the full log.
+          const open = ref
+            ? (isLive
+              ? ' data-wf-board-queue="' + escMem(ref.slug + ' ' + ref.runId) + '"'
+              : ' data-wf-run-open="' + escMem(ref.runId) + '" data-wf-run-workflow="' + escMem(ref.slug) + '"')
+            : '';
+          const clickable = ref ? ' wf-board-card-open' : '';
+          const elapsed = fmtCronAgo(card.updatedAt);
+          const step = card.progressHint || card.status || '';
+          return [
+            '<div class="wf-board-card' + clickable + '"' + open + ' title="' + escMem(ref ? 'Open run detail' : (card.title || '')) + '">',
+            '  <div class="wf-board-card-top">',
+            '    <span class="wf-board-card-kind kind-' + escMem(card.sourceKind || 'run') + '">' + escMem(String(card.sourceKind || 'run').toUpperCase()) + '</span>',
+            '    <span class="wf-board-card-age">' + escMem(elapsed) + '</span>',
+            '  </div>',
+            '  <div class="wf-board-card-title">' + escMem(card.title || '(untitled)') + '</div>',
+            step ? '  <div class="wf-board-card-step">' + escMem(String(step).slice(0, 140)) + '</div>' : '',
+            '</div>',
+          ].join('');
+        }).join('')
+        : '<div class="wf-board-empty">—</div>';
+      return [
+        '<div class="wf-board-col" data-board-col="' + escMem(col.id) + '">',
+        '  <div class="wf-board-col-head">' + escMem(col.label) + ' <span class="wf-board-col-count">' + list.length + '</span></div>',
+        '  <div class="wf-board-col-body">' + cardsHtml + '</div>',
+        '</div>',
+      ].join('');
+    }).join('');
+    wf.editor.innerHTML = [
+      '<div class="wf-board">',
+      '  <div class="wf-home-head">',
+      '    <div><h2>Task board</h2><p>Every live and recent run, grouped by status. Click a running workflow to see its sub-task queue.</p></div>',
+      '    <div class="wf-home-head-actions">',
+      '      <button type="button" class="wf-empty-btn" data-wf-board>REFRESH</button>',
+      '      <button type="button" class="wf-empty-btn" data-wf-home>← HOME</button>',
+      '    </div>',
+      '  </div>',
+      renderBoardQueueDrawer(),
+      '  <div class="wf-board-cols">' + columnsHtml + '</div>',
+      '</div>',
+    ].join('');
+    if (opts && opts.preserveScroll) {
+      requestAnimationFrame(() => {
+        const el = wf.editor && wf.editor.querySelector('.wf-board-cols');
+        if (el) el.scrollTop = previousScroll;
+      });
+    }
   }
 
   const SCHED_DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -17870,7 +18625,7 @@ const CONSOLE_JS = `
              const canCancel = status === 'queued' || status === 'running';
              const inputs = workflowRunInputsLabel(r);
              return [
-               '<li class="wf-run">',
+               '<li class="wf-run wf-run-open" data-wf-run-open="' + escMem(r.id) + '" data-wf-run-workflow="' + escMem(wfSelectedName) + '" title="Inspect this run">',
                '  <span class="wf-run-status status-' + escMem(status) + '">' + escMem(status.toUpperCase()) + '</span>',
                '  <span class="wf-run-id">' + escMem(r.id) + '</span>',
                '  <span class="wf-run-time">' + escMem(workflowRunTimeLabel(r)) + '</span>',

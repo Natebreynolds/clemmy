@@ -125,6 +125,10 @@ export interface QueueWorkflowRunOptions {
   /** Self-heal lineage: how many times this run has already been auto-healed +
    *  re-queued. Carried run→run so the runner can bound auto-heal attempts. */
   selfHealAttempt?: number;
+  /** T3.2: the reversible backup snapshotted when the heal was auto-applied.
+   *  Carried into the healed re-run so the runner can AUTO-REVERT the fix if
+   *  the re-run still fails (a heal that didn't stick must not survive). */
+  selfHealBackupId?: string;
   /** Run-goal lineage: how many goal re-pursuits already happened (0 = the
    *  original run). Carried run→run so the runner can bound re-pursuits. */
   goalAttempt?: number;
@@ -193,6 +197,7 @@ export function queueWorkflowRun(
       ...(origin ? { originSessionId: origin } : {}),
       ...(origins.length > 1 ? { originSessionIds: origins } : {}),
       ...(selfHealAttempt ? { selfHealAttempt } : {}),
+      ...(selfHealAttempt && opts?.selfHealBackupId?.trim() ? { selfHealBackupId: opts.selfHealBackupId.trim() } : {}),
       ...(goalAttempt ? { goalAttempt } : {}),
       ...(goalFeedback ? { goalFeedback } : {}),
       ...(retryFailedItems ? retryFailedItems : {}),
@@ -326,6 +331,7 @@ export function requeueWorkflowFromRun(
     originSessionId: originSessionIds[0],
     originSessionIds,
     selfHealAttempt: opts.selfHealAttempt,
+    selfHealBackupId: opts.selfHealBackupId,
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,
     excludeRunId: originalRunId,

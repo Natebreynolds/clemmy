@@ -151,6 +151,39 @@ test('autoRepair: {{steps.X.output}} with a subpath still wires the dependsOn', 
   assert.deepEqual(repaired.steps[1].dependsOn, ['fetch']);
 });
 
+test('autoRepair T2.4: multi-item prose with ONE array upstream gets forEach wired mechanically', () => {
+  const def = wf({
+    steps: [
+      { id: 'gather', prompt: 'gather the prospect list', output: { type: 'array', min_items: { '': 1 } } },
+      { id: 'work', prompt: 'For each of the 25 prospects, scrape their site and draft a summary one by one.', dependsOn: ['gather'] },
+    ],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.equal(repaired.steps[1].forEach, 'gather');
+  assert.match(repairs.join(' '), /Added forEach: "gather"/);
+});
+
+test('autoRepair T2.4: ambiguous (zero or multiple array upstreams) leaves the step alone', () => {
+  // zero array upstreams — the dependency has no array-ish contract
+  const zero = wf({
+    steps: [
+      { id: 'gather', prompt: 'gather the prospect list' },
+      { id: 'work', prompt: 'For each of the 25 prospects, scrape their site and draft a summary one by one.', dependsOn: ['gather'] },
+    ],
+  });
+  assert.equal(autoRepairWorkflowDefinition(zero).def.steps[1].forEach, undefined);
+
+  // multiple array upstreams — can't pick mechanically
+  const multi = wf({
+    steps: [
+      { id: 'a', prompt: 'list a', output: { type: 'array' } },
+      { id: 'b', prompt: 'list b', output: { type: 'array' } },
+      { id: 'work', prompt: 'For each of the 25 prospects, scrape their site and draft a summary one by one.', dependsOn: ['a', 'b'] },
+    ],
+  });
+  assert.equal(autoRepairWorkflowDefinition(multi).def.steps[2].forEach, undefined);
+});
+
 test('autoRepair: forEach over a non-dependency wires the dependsOn', () => {
   const def = wf({
     steps: [
@@ -291,6 +324,32 @@ test('autoRepair: never overrides explicit output contracts or pinned goals', ()
   assert.equal(repaired.steps[0].output, explicitOutput);
   assert.equal(repaired.goal, explicitGoal);
   assert.equal(repairs.some((repair) => /Added output contract|Pinned a workflow goal/.test(repair)), false);
+});
+
+test('autoRepair: hardens weak live-research contracts with evidence keys', () => {
+  const def = wf({
+    steps: [
+      {
+        id: 'research',
+        prompt: 'Research the SEO audit with DataForSEO keywords, backlinks, SERP, and Lighthouse evidence.',
+        allowedTools: ['mcp__dataforseo_labs_google_ranked_keywords'],
+        output: { type: 'object', required_keys: ['domain', 'client'] },
+      },
+    ],
+  });
+
+  const before = checkWorkflowForWrite(def);
+  assert.ok(before.warnings.some((w) => /live research tools/.test(w)), before.warnings.join('\n'));
+
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  const output = repaired.steps[0].output;
+
+  assert.ok(repairs.some((repair) => /Hardened live research output contract/.test(repair)));
+  assert.deepEqual(output?.required_keys?.sort(), ['client', 'domain', 'key_findings', 'source_errors', 'sources']);
+  assert.deepEqual(output?.non_empty?.sort(), ['key_findings', 'sources']);
+  assert.equal(output?.min_items?.sources, 3);
+  assert.equal(output?.min_items?.key_findings, 3);
+  assert.equal(checkWorkflowForWrite(repaired).warnings.some((w) => /live research tools/.test(w)), false);
 });
 
 test('checkWorkflowForWrite: synthesis participates in validation', () => {

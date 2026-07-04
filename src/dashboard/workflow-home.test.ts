@@ -47,3 +47,25 @@ test('workflow dashboard inline scripts compile and expose the home controls', (
     new vm.Script(script, { filename: `console-inline-${index}.js` });
   });
 });
+
+test('workflow dashboard exposes the run inspector + board cockpit controls', () => {
+  const html = renderConsoleHtml('test-token');
+  // Board entry point + view.
+  assert.match(html, /data-wf-board/);
+  assert.match(html, /Task board/);
+  // The board consumes the never-before-fetched board + queue endpoints.
+  assert.match(html, /\/api\/console\/board/);
+  assert.match(html, /\/board\/run\//);
+  // Run inspector open hook + its functions (proves the past-run event replay
+  // path exists; the compile assertion above proves the script parses).
+  assert.match(html, /data-wf-run-open/);
+  assert.match(html, /openRunInspector/);
+  assert.match(html, /buildRunInspectorModel/);
+  // Inspector renders attempt records, judge/quality verdicts (step_advisory),
+  // run summary, and per-step tokens — the full T4.2 event set.
+  assert.match(html, /attempt_record/);
+  assert.match(html, /step_advisory/);
+  assert.match(html, /renderInspectorAdvisories/);
+  assert.match(html, /run_summary/);
+  assert.match(html, /inspStepTokens/);
+});
