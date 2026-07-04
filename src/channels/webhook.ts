@@ -202,6 +202,16 @@ function requireMobileSurfaceForMobileHost(
   res.status(404).type('text/plain').send('Not found');
 }
 
+async function autoStartMobileTunnelIfConfigured(): Promise<void> {
+  const access = readMobileAccess();
+  if (!access.autoStart || !access.tunnel || access.tunnel.mode === 'quick') return;
+  const { startTunnel } = await import('../integrations/mobile-access.js');
+  const result = await startTunnel();
+  if (!result.ok) {
+    logger.warn({ error: result.error }, 'Mobile custom-domain tunnel auto-start failed');
+  }
+}
+
 function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEventRow[]): string {
   // Both callers pass events newest-first (desc), so the MOST RECENT terminal
   // event must win — e.g. a run that requested approval and then completed is
@@ -1961,5 +1971,8 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     server.on('error', (error) => {
       reject(error);
     });
+  });
+  void autoStartMobileTunnelIfConfigured().catch((err) => {
+    logger.warn({ err }, 'Mobile custom-domain tunnel auto-start failed');
   });
 }

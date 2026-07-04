@@ -26,6 +26,7 @@ const { createMobileRouter, MOBILE_SESSION_COOKIE } = await import('./mobile-rou
 const { setPin } = await import('../runtime/mobile-pin.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
 const { appendEvent, createSession: createHarnessSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 
 interface Harness {
   url: string;
@@ -71,6 +72,19 @@ function extractCookie(setCookie: string | string[] | null | undefined): string 
     }
   }
   return undefined;
+}
+
+async function loginMobile(h: Harness, label = 'Test phone'): Promise<string> {
+  await setPin('TestPin1!', { stateDir: h.stateDir });
+  const login = await fetch(`${h.url}/m/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pin: 'TestPin1!', deviceLabel: label }),
+  });
+  assert.equal(login.status, 200);
+  const cookie = extractCookie(login.headers.get('set-cookie'));
+  assert.ok(cookie, 'login should issue a session cookie');
+  return cookie;
 }
 
 test('login fails with PIN_NOT_CONFIGURED before any PIN is set', async () => {
@@ -172,6 +186,92 @@ test('QR pairing creates a session without manual PIN and is one-time use', asyn
     assert.equal(reused.status, 401);
     const reusedBody = await reused.json() as { error: string };
     assert.equal(reusedBody.error, 'INVALID_PAIRING_CODE');
+  } finally { await h.close(); }
+});
+
+test('mobile approvals list and approve use /m API without console auth', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Approval phone');
+    const session = createHarnessSession({
+      id: `mobile-approval-${Date.now().toString(36)}`,
+      kind: 'chat',
+      channel: 'mobile',
+      title: 'Mobile approval test',
+    });
+    const approval = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'mobile',
+      subject: 'Run test command?',
+      tool: 'run_shell_command',
+      args: { command: 'echo ok' },
+    });
+
+    const list = await fetch(`${h.url}/m/api/approvals`, { headers: { cookie } });
+    assert.equal(list.status, 200);
+    const listBody = await list.json() as { approvals: Array<{ approvalId: string; subject: string }>; count: number };
+    assert.equal(listBody.count >= 1, true);
+    assert.ok(listBody.approvals.some((row) => row.approvalId === approval.approvalId && row.subject === 'Run test command?'));
+
+    const approved = await fetch(`${h.url}/m/api/approvals/${approval.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(approved.status, 200);
+    const approvedBody = await approved.json() as { ok: boolean; approval: { resolution: string } };
+    assert.equal(approvedBody.ok, true);
+    assert.equal(approvedBody.approval.resolution, 'approved');
+
+    const reused = await fetch(`${h.url}/m/api/approvals/${approval.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(reused.status, 409);
+  } finally { await h.close(); }
+});
+
+test('mobile approvals reject and expire correctly', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Approval phone');
+    const rejectSession = createHarnessSession({
+      id: `mobile-reject-${Date.now().toString(36)}`,
+      kind: 'chat',
+      channel: 'mobile',
+    });
+    const rejected = approvalRegistry.register({
+      sessionId: rejectSession.id,
+      subject: 'Reject me?',
+      tool: 'run_shell_command',
+      args: { command: 'echo no' },
+    });
+    const reject = await fetch(`${h.url}/m/api/approvals/${rejected.approvalId}/reject`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(reject.status, 200);
+    const rejectBody = await reject.json() as { approval: { resolution: string } };
+    assert.equal(rejectBody.approval.resolution, 'rejected');
+
+    const expiredSession = createHarnessSession({
+      id: `mobile-expired-${Date.now().toString(36)}`,
+      kind: 'chat',
+      channel: 'mobile',
+    });
+    const expired = approvalRegistry.register({
+      sessionId: expiredSession.id,
+      subject: 'Expired?',
+      tool: 'run_shell_command',
+      args: { command: 'echo old' },
+      ttlMs: -1000,
+    });
+    const expire = await fetch(`${h.url}/m/api/approvals/${expired.approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(expire.status, 410);
+    const expireBody = await expire.json() as { approval: { resolution: string } };
+    assert.equal(expireBody.approval.resolution, 'expired');
   } finally { await h.close(); }
 });
 

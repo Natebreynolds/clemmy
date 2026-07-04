@@ -51,6 +51,7 @@ import {
   listEvents as harnessListEvents,
   listSessions as harnessListSessions,
   getLatestEventSeq as harnessLatestEventSeq,
+  appendEvent as appendHarnessEvent,
   type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
@@ -70,6 +71,11 @@ import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectP
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { processBackgroundTasks } from '../execution/background-tasks.js';
 import type { AssistantRouteDiagnostics } from '../types.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { HarnessSession } from '../runtime/harness/session.js';
+import { buildOrchestratorAgent } from '../agents/orchestrator.js';
+import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
+import { runConversationFromResume } from '../runtime/harness/loop.js';
 
 export const MOBILE_SESSION_COOKIE = 'clem_mobile_session';
 const COOKIE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -229,6 +235,36 @@ function serializePlanProposalForMobile(proposal: PlanProposal): {
     risks: proposal.plan.risks,
     needsUserInput: proposal.plan.needsUserInput,
     appliedInstructions: proposal.plan.appliedInstructions,
+  };
+}
+
+function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
+  kind: 'harness';
+  approvalId: string;
+  sessionId: string;
+  channel: string | null;
+  channelId: string | null;
+  requestedAt: string;
+  expiresAt: string;
+  subject: string;
+  tool: string | null;
+  args: Record<string, unknown> | null;
+  status: approvalRegistry.PendingApprovalStatus;
+  resolution: approvalRegistry.ApprovalResolution | null;
+} {
+  return {
+    kind: 'harness',
+    approvalId: row.approvalId,
+    sessionId: row.sessionId,
+    channel: row.channel,
+    channelId: row.channelId,
+    requestedAt: row.requestedAt,
+    expiresAt: row.expiresAt,
+    subject: row.subject,
+    tool: row.tool,
+    args: row.args,
+    status: row.status,
+    resolution: row.resolution,
   };
 }
 
@@ -714,6 +750,142 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
     res.json({ proposal: serializePlanProposalForMobile(result) });
+  });
+
+  // ─── Tool approvals ─────────────────────────────────────────────
+  //
+  // Keep mobile on the /m surface. The public mobile hostname deliberately
+  // hides /api/console/*, so approval actions cannot depend on desktop routes.
+
+  router.get('/api/approvals', requireMobileSession, (_req, res) => {
+    try {
+      const approvals = approvalRegistry.listPending({ status: 'pending' })
+        .filter((row) => !approvalRegistry.isExpired(row))
+        .map(serializeApprovalForMobile);
+      res.json({ approvals, count: approvals.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  async function resolveMobileApproval(
+    res: express.Response,
+    id: string,
+    decision: 'approve' | 'reject',
+  ): Promise<void> {
+    const existing = approvalRegistry.get(id);
+    if (!existing) {
+      res.status(404).json({ error: 'approval not found' });
+      return;
+    }
+    if (existing.status !== 'pending') {
+      res.status(409).json({ error: 'approval already resolved', approval: serializeApprovalForMobile(existing) });
+      return;
+    }
+    if (approvalRegistry.isExpired(existing)) {
+      const expired = approvalRegistry.resolve(id, 'expired', 'mobile-inbox');
+      res.status(410).json({
+        error: 'approval expired',
+        approval: expired.row ? serializeApprovalForMobile(expired.row) : serializeApprovalForMobile(existing),
+      });
+      return;
+    }
+
+    const auditResolution: approvalRegistry.ApprovalResolution = decision === 'reject' ? 'rejected' : 'approved';
+    const sessionRowForKind = harnessGetSession(existing.sessionId);
+    const harnessSession = HarnessSession.load(existing.sessionId);
+    const shouldResume = sessionRowForKind?.kind !== 'workflow' && !!harnessSession?.loadInterruptState();
+    if (!shouldResume) {
+      const result = approvalRegistry.resolve(id, auditResolution, 'mobile-inbox');
+      if (!result.ok || !result.row) {
+        res.status(409).json({ error: result.reason ?? 'could not resolve approval', approval: result.row });
+        return;
+      }
+      res.json({
+        ok: true,
+        approval: serializeApprovalForMobile(result.row),
+        status: sessionRowForKind?.kind === 'workflow' ? 'resolved-workflow-runner-resumes' : 'resolved-stale',
+      });
+      return;
+    }
+
+    const auth = await configureHarnessRuntime();
+    if (!auth.ok) {
+      res.status(412).json({ error: auth.reason });
+      return;
+    }
+
+    const sessionId = existing.sessionId;
+    const result = approvalRegistry.resolve(id, auditResolution, 'mobile-inbox');
+    if (!result.ok || !result.row) {
+      res.status(409).json({ error: result.reason ?? 'could not resolve approval', approval: result.row });
+      return;
+    }
+
+    res.status(202).json({
+      ok: true,
+      approval: serializeApprovalForMobile(result.row),
+      sessionId,
+      status: 'resuming',
+    });
+
+    setImmediate(async () => {
+      try {
+        const agent = await buildOrchestratorAgent({ sessionId });
+        const MAX_STICKY_RESUMES = 5;
+        let resumeIter = 0;
+        while (resumeIter < MAX_STICKY_RESUMES) {
+          resumeIter += 1;
+          await runConversationFromResume({
+            agent,
+            sessionId,
+            decision,
+            resolver: 'mobile-inbox',
+          });
+          const pending = approvalRegistry.listPending({ sessionId, status: 'pending' });
+          if (pending.length === 0) break;
+          for (const row of pending) {
+            approvalRegistry.resolve(row.approvalId, auditResolution, 'mobile-inbox');
+          }
+        }
+        if (resumeIter === MAX_STICKY_RESUMES) {
+          appendHarnessEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'run_failed',
+            data: {
+              error: `Sticky-resume safety cap (${MAX_STICKY_RESUMES}) reached — agent kept creating new approvals every turn`,
+              stage: 'mobile_sticky_resume_cap',
+              resumeIter,
+            },
+          });
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          appendHarnessEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'run_failed',
+            data: { error: message, stage: 'mobile_approval_resume' },
+          });
+        } catch {
+          /* best effort */
+        }
+      }
+    });
+  }
+
+  router.post('/api/approvals/:id/approve', requireMobileSession, async (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    await resolveMobileApproval(res, id, 'approve');
+  });
+
+  router.post('/api/approvals/:id/reject', requireMobileSession, async (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    await resolveMobileApproval(res, id, 'reject');
   });
 
   // ─── Web Push ───────────────────────────────────────────────────

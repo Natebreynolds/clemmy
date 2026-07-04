@@ -233,6 +233,20 @@ export const setCredential = (name: string, value: string) =>
 
 export const startQuickTunnel = () =>
   apiPost<{ ok: boolean; url?: string; error?: string }>('/api/console/mobile-access/quick/start');
+export const installMobileCloudflared = () =>
+  apiPost<{ job: { id: string; status: string } }>('/api/console/mobile-access/install');
+export const startMobileCloudflareLogin = () =>
+  apiPost<{ login: Record<string, unknown> }>('/api/console/mobile-access/login');
+export const cancelMobileCloudflareLogin = () =>
+  apiPost<{ ok: boolean }>('/api/console/mobile-access/login/cancel');
+export const configureMobileTunnel = (input: { tunnelName: string; hostname: string }) =>
+  apiPost<{ ok: boolean; state: Record<string, unknown> }>('/api/console/mobile-access/configure', input);
+export const startMobileTunnel = () =>
+  apiPost<{ ok: boolean; error?: string }>('/api/console/mobile-access/tunnel/start');
+export const stopMobileTunnel = () =>
+  apiPost<{ ok: boolean }>('/api/console/mobile-access/tunnel/stop');
+export const confirmMobileCloudflareAccess = () =>
+  apiPost<{ ok: boolean; cloudflareAccess: Record<string, unknown> | null }>('/api/console/mobile-access/access-ack', { enabled: true });
 export const setMobilePin = (pin: string) =>
   apiPost<{ ok: boolean }>('/api/console/mobile-access/pin', { pin });
 export const revokeAllMobileSessions = () =>

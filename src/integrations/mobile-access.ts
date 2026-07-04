@@ -37,6 +37,7 @@ import {
 } from '../runtime/cloudflared.js';
 import {
   readMobileAccess,
+  setMobileAccessAccessAck,
   setMobileAccessAutoStart,
   setMobileAccessBinary,
   setMobileAccessStatus,
@@ -226,9 +227,11 @@ export async function configureTunnel(input: ConfigureInput): Promise<MobileAcce
       id: tunnel!.id,
       name: tunnel!.name,
       hostname: input.hostname,
+      mode: 'named',
       credentialsFile: tunnel!.credentialsFile ?? current.tunnel?.credentialsFile,
     },
     status: 'configuring',
+    cloudflareAccess: current.cloudflareAccess?.hostname === input.hostname ? current.cloudflareAccess : undefined,
   }));
 }
 
@@ -236,6 +239,7 @@ export async function configureTunnel(input: ConfigureInput): Promise<MobileAcce
 
 let currentSupervisor: CloudflaredSupervisor | null = null;
 let lastSupervisorEvents: CloudflaredEvent[] = [];
+let tunnelRuntimeOverrideForTests: TunnelRuntime | null = null;
 
 const EVENT_RING_SIZE = 50;
 
@@ -249,6 +253,7 @@ export interface TunnelRuntime {
 let startedAt: string | undefined;
 
 export function getTunnelRuntime(): TunnelRuntime {
+  if (tunnelRuntimeOverrideForTests) return tunnelRuntimeOverrideForTests;
   return {
     running: Boolean(currentSupervisor?.isRunning()),
     connected: Boolean(currentSupervisor?.isConnected()),
@@ -262,8 +267,16 @@ export async function startTunnel(): Promise<{ ok: boolean; error?: string }> {
     return { ok: true };
   }
   const record = readMobileAccess();
-  if (!record.binary?.path) return { ok: false, error: 'cloudflared binary not detected' };
-  if (!record.tunnel?.id) return { ok: false, error: 'no tunnel configured' };
+  if (!record.binary?.path) {
+    const error = 'cloudflared binary not detected';
+    await setMobileAccessStatus('error', error).catch(() => undefined);
+    return { ok: false, error };
+  }
+  if (!record.tunnel?.id || record.tunnel.mode === 'quick') {
+    const error = 'no custom-domain tunnel configured';
+    await setMobileAccessStatus('error', error).catch(() => undefined);
+    return { ok: false, error };
+  }
   const localUrl = `http://${WEBHOOK_HOST === '0.0.0.0' ? '127.0.0.1' : WEBHOOK_HOST}:${WEBHOOK_PORT}`;
   lastSupervisorEvents = [];
   const supervisor = new CloudflaredSupervisor({
@@ -280,12 +293,22 @@ export async function startTunnel(): Promise<{ ok: boolean; error?: string }> {
         void setMobileAccessStatus('running').catch(() => undefined);
       } else if (event.type === 'exit') {
         void setMobileAccessStatus('inactive').catch(() => undefined);
+      } else if (event.type === 'restart-skipped') {
+        void setMobileAccessStatus('error', event.reason).catch(() => undefined);
       }
     },
   });
   currentSupervisor = supervisor;
   startedAt = new Date().toISOString();
-  await supervisor.start();
+  try {
+    await supervisor.start();
+  } catch (err) {
+    currentSupervisor = null;
+    startedAt = undefined;
+    const error = err instanceof Error ? err.message : String(err);
+    await setMobileAccessStatus('error', error).catch(() => undefined);
+    return { ok: false, error };
+  }
   await setMobileAccessAutoStart(true).catch(() => undefined);
   return { ok: true };
 }
@@ -402,25 +425,104 @@ export async function rotatePin(pin: string): Promise<{ revokedSessions: number;
 
 // ─── QR code ────────────────────────────────────────────────────────
 
-function mobileBaseUrl(hostname?: string): { targetUrl: string; targetMode: 'public' | 'local-preview' } {
-  const cleanHost = hostname?.trim();
-  if (cleanHost) {
-    return { targetUrl: `https://${cleanHost}/m/`, targetMode: 'public' };
+export type MobileAccessTargetMode = 'local-preview' | 'quick' | 'custom-domain';
+
+export interface MobileAccessTarget {
+  url: string;
+  mode: MobileAccessTargetMode;
+  qrReady: boolean;
+  qrBlockedReason?: string;
+}
+
+export class MobileQrNotReadyError extends Error {
+  readonly code = 'MOBILE_QR_NOT_READY';
+
+  constructor(readonly target: MobileAccessTarget) {
+    super(target.qrBlockedReason ?? 'Mobile QR is not ready');
   }
-  return { targetUrl: `http://127.0.0.1:${WEBHOOK_PORT}/m/`, targetMode: 'local-preview' };
+}
+
+function baseUrlForHostname(hostname: string): string {
+  return `https://${hostname}/m/`;
+}
+
+function legacyTargetMode(target: MobileAccessTarget): 'public' | 'local-preview' {
+  return target.mode === 'local-preview' ? 'local-preview' : 'public';
+}
+
+export function mobileAccessTarget(
+  input: {
+    record?: MobileAccessRecord;
+    runtime?: TunnelRuntime;
+    hostnameOverride?: string;
+  } = {},
+): MobileAccessTarget {
+  const record = input.record ?? readMobileAccess();
+  const runtime = input.runtime ?? getTunnelRuntime();
+  const cleanOverride = input.hostnameOverride?.trim();
+  const tunnel = record.tunnel;
+  const host = cleanOverride || tunnel?.hostname?.trim() || '';
+
+  if (host) {
+    const mode: MobileAccessTargetMode = !cleanOverride && tunnel?.mode === 'quick' ? 'quick' : 'custom-domain';
+    if (mode === 'quick') {
+      const connected = runtime.running && runtime.connected;
+      return {
+        url: baseUrlForHostname(host),
+        mode,
+        qrReady: connected,
+        qrBlockedReason: connected
+          ? undefined
+          : 'Start the temporary mobile link and wait for Cloudflare to finish connecting before scanning the QR.',
+      };
+    }
+
+    const access = record.cloudflareAccess;
+    const accessConfirmed = Boolean(
+      access?.enabled
+      && access.acknowledged
+      && access.hostname.trim().toLowerCase() === host.toLowerCase(),
+    );
+    const running = runtime.running;
+    const connected = runtime.running && runtime.connected;
+    let qrBlockedReason: string | undefined;
+    if (!accessConfirmed) {
+      qrBlockedReason = 'Confirm Cloudflare Access for this hostname before scanning the QR.';
+    } else if (!running) {
+      qrBlockedReason = 'Start the custom-domain tunnel before scanning the QR.';
+    } else if (!connected) {
+      qrBlockedReason = 'Wait for the custom-domain tunnel to finish connecting before scanning the QR.';
+    }
+    return {
+      url: baseUrlForHostname(host),
+      mode,
+      qrReady: accessConfirmed && connected,
+      qrBlockedReason,
+    };
+  }
+
+  return {
+    url: `http://127.0.0.1:${WEBHOOK_PORT}/m/`,
+    mode: 'local-preview',
+    qrReady: false,
+    qrBlockedReason: 'This Mac is only exposing mobile at 127.0.0.1, which a phone cannot reach. Configure a Cloudflare hostname or start a temporary mobile link.',
+  };
 }
 
 export async function generateQrSvg(hostname?: string): Promise<{
   svg: string;
   targetUrl: string;
   targetMode: 'public' | 'local-preview';
+  target: MobileAccessTarget;
   expiresAt: string;
 }> {
   const record = readMobileAccess();
-  const host = hostname ?? record.tunnel?.hostname;
-  const base = mobileBaseUrl(host);
-  const pairing = await createMobilePairingCode({ targetUrl: base.targetUrl });
-  const pairUrl = new URL(base.targetUrl);
+  const target = mobileAccessTarget({ record, hostnameOverride: hostname });
+  if (!target.qrReady) {
+    throw new MobileQrNotReadyError(target);
+  }
+  const pairing = await createMobilePairingCode({ targetUrl: target.url });
+  const pairUrl = new URL(target.url);
   pairUrl.searchParams.set('pair', pairing.token);
   const svg = await QRCode.toString(pairUrl.toString(), {
     type: 'svg',
@@ -431,7 +533,8 @@ export async function generateQrSvg(hostname?: string): Promise<{
   return {
     svg,
     targetUrl: pairUrl.toString(),
-    targetMode: base.targetMode,
+    targetMode: legacyTargetMode(target),
+    target: { ...target, url: pairUrl.toString() },
     expiresAt: pairing.expiresAt,
   };
 }
@@ -447,6 +550,7 @@ export interface MobileAccessStatusPayload {
   tunnel: TunnelRuntime;
   install: { recent: InstallJob[] };
   webhookBound: { host: string; port: number };
+  target: MobileAccessTarget;
   targetUrl?: string;
   targetMode?: 'public' | 'local-preview';
 }
@@ -477,7 +581,7 @@ export async function getMobileAccessStatusPayload(): Promise<MobileAccessStatus
     expiresAt: row.expiresAt,
     pushSubscribed: row.pushSubscribed ?? false,
   }));
-  const target = mobileBaseUrl(stateAfter.tunnel?.hostname);
+  const target = mobileAccessTarget({ record: stateAfter });
   return {
     detect,
     state: stateAfter,
@@ -487,18 +591,28 @@ export async function getMobileAccessStatusPayload(): Promise<MobileAccessStatus
     tunnel: getTunnelRuntime(),
     install: { recent: listInstallJobs() },
     webhookBound: { host: WEBHOOK_HOST, port: WEBHOOK_PORT },
-    targetUrl: target.targetUrl,
-    targetMode: target.targetMode,
+    target,
+    targetUrl: target.url,
+    targetMode: legacyTargetMode(target),
   };
+}
+
+export async function acknowledgeCloudflareAccess(enabled: boolean): Promise<MobileAccessRecord> {
+  return setMobileAccessAccessAck({ enabled });
 }
 
 /** Re-export for tests so they can drive supervisor lifecycle. */
 export function _resetMobileAccessForTests(): void {
   currentSupervisor = null;
   lastSupervisorEvents = [];
+  tunnelRuntimeOverrideForTests = null;
   currentLogin = null;
   installJobs.clear();
   startedAt = undefined;
+}
+
+export function _setTunnelRuntimeForTests(runtime: TunnelRuntime | null): void {
+  tunnelRuntimeOverrideForTests = runtime;
 }
 
 /** Convenience: name + label of the status enum values, for the UI. */

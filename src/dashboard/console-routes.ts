@@ -89,6 +89,7 @@ import {
   generateQrSvg as mobileGenerateQrSvg,
   getInstallJob as getMobileInstallJob,
   getMobileAccessStatusPayload,
+  MobileQrNotReadyError,
   rotatePin as mobileRotatePin,
   startInstallJob as startMobileInstallJob,
   startLogin as startMobileLogin,
@@ -3837,6 +3838,14 @@ export function registerConsoleRoutes(
       res.setHeader('X-Pairing-Expires-At', result.expiresAt);
       res.send(result.svg);
     } catch (err) {
+      if (err instanceof MobileQrNotReadyError) {
+        res.status(409).json({
+          error: err.message,
+          code: err.code,
+          target: err.target,
+        });
+        return;
+      }
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
