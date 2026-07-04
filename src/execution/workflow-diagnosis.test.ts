@@ -30,6 +30,8 @@ const {
   applyProposedFix,
   fixIsAutoApplicable,
   sanitizeOutputContract,
+  sanitizeStepInputs,
+  sanitizeAllowedTools,
   revertWorkflowFix,
   listFixBackups,
   detectSelfReportedFailure,
@@ -329,6 +331,80 @@ test('fixIsAutoApplicable: edit_contract needs a sanitizable contract; edit_step
   assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_contract', newStepPrompt: null, newOutputContractJson: 'garbage', autoApplicable: true }), false);
   // reconnect/manual never auto-apply
   assert.equal(fixIsAutoApplicable({ ...base, kind: 'reconnect_service', newStepPrompt: null, newOutputContractJson: null, autoApplicable: true }), false);
+});
+
+// ─── RSH-3: edit_input + edit_binding ────────────────────────────────────────
+
+test('sanitizeStepInputs: keeps valid bindings, drops garbage, rejects unusable', () => {
+  assert.deepEqual(sanitizeStepInputs('{"url":{"from":"input.url"},"limit":{"default":50}}'),
+    { url: { from: 'input.url' }, limit: { default: 50 } });
+  // a binding with neither `from` nor `default` resolves to nothing → dropped
+  assert.deepEqual(sanitizeStepInputs('{"good":{"from":"steps.x.output"},"empty":{"description":"noop"}}'),
+    { good: { from: 'steps.x.output' } });
+  // unknown fields stripped, type validated
+  assert.deepEqual(sanitizeStepInputs('{"n":{"from":"input.n","type":"number","bogus":1,"required":true}}'),
+    { n: { from: 'input.n', type: 'number', required: true } });
+  assert.equal(sanitizeStepInputs('not json'), null);
+  assert.equal(sanitizeStepInputs('{}'), null);
+  assert.equal(sanitizeStepInputs('[1,2]'), null);
+  assert.equal(sanitizeStepInputs(null), null);
+});
+
+test('sanitizeAllowedTools: keeps non-empty strings, dedupes, rejects non-array', () => {
+  assert.deepEqual(sanitizeAllowedTools('["a","b","a",""," c "]'), ['a', 'b', 'c']);
+  assert.equal(sanitizeAllowedTools('"a"'), null);
+  assert.equal(sanitizeAllowedTools('[]'), null);
+  assert.equal(sanitizeAllowedTools('nope'), null);
+});
+
+test('fixIsAutoApplicable: edit_input needs a usable binding; edit_binding needs a usable tool list', () => {
+  const base = { stepId: 's', description: 'd', newStepPrompt: null, newOutputContractJson: null, service: null, autoApplicable: true };
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_input', newInputsJson: '{"url":{"from":"input.url"}}', newAllowedToolsJson: null }), true);
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_input', newInputsJson: '{}', newAllowedToolsJson: null }), false);
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_binding', newInputsJson: null, newAllowedToolsJson: '["composio_gmail_search"]' }), true);
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_binding', newInputsJson: null, newAllowedToolsJson: '[]' }), false);
+});
+
+test('applyProposedFix: an edit_input fix merges corrected bindings onto the step, backed up + revertible', () => {
+  writeWorkflow('input-wf', {
+    name: 'input-wf', description: 'i', enabled: true, trigger: { manual: true },
+    inputs: { url: { type: 'string' } },
+    steps: [{ id: 'fetch', prompt: 'fetch {{input.url}}', inputs: { url: { from: 'input.wrongname' } } }],
+  } as never);
+  const fix = recordProposedFix('input-wf', 'run-i', {
+    summary: 's', rootCause: 'binding pointed at a missing input',
+    fix: {
+      kind: 'edit_input' as const, stepId: 'fetch', description: 'bind url from input.url',
+      newStepPrompt: null, newOutputContractJson: null, newInputsJson: '{"url":{"from":"input.url"}}',
+      newAllowedToolsJson: null, service: null, autoApplicable: true,
+    },
+    confidence: 'high' as const,
+  });
+  const applied = applyProposedFix(fix.id);
+  assert.equal(applied.ok, true, applied.message);
+  assert.deepEqual(readWorkflow('input-wf')!.data.steps[0].inputs, { url: { from: 'input.url' } });
+  const reverted = revertWorkflowFix(applied.backupId!);
+  assert.equal(reverted.ok, true);
+  assert.deepEqual(readWorkflow('input-wf')!.data.steps[0].inputs, { url: { from: 'input.wrongname' } });
+});
+
+test('applyProposedFix: an edit_binding fix corrects the step allowed-tools surface', () => {
+  writeWorkflow('binding-wf', {
+    name: 'binding-wf', description: 'b', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'act', prompt: 'search then send', allowedTools: ['composio_gmail_send'] }],
+  } as never);
+  const fix = recordProposedFix('binding-wf', 'run-b', {
+    summary: 's', rootCause: 'the search tool was not in the surface',
+    fix: {
+      kind: 'edit_binding' as const, stepId: 'act', description: 'add the search tool',
+      newStepPrompt: null, newOutputContractJson: null, newInputsJson: null,
+      newAllowedToolsJson: '["composio_gmail_search","composio_gmail_send"]', service: null, autoApplicable: true,
+    },
+    confidence: 'high' as const,
+  });
+  const applied = applyProposedFix(fix.id);
+  assert.equal(applied.ok, true, applied.message);
+  assert.deepEqual(readWorkflow('binding-wf')!.data.steps[0].allowedTools, ['composio_gmail_search', 'composio_gmail_send']);
 });
 
 test('applyProposedFix: an edit_contract fix replaces the step output contract, backed up + revertible', () => {

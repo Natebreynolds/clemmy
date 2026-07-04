@@ -1834,6 +1834,28 @@ function editContractDiagnosis(stepId: string, contractJson: string, autoApplica
       description: 'Loosen the output contract to match the real data shape.',
       newStepPrompt: null,
       newOutputContractJson: contractJson,
+      newInputsJson: null,
+      newAllowedToolsJson: null,
+      service: null,
+      autoApplicable,
+    },
+    confidence: 'high' as const,
+  };
+}
+
+/** RSH-3: an edit_input fix — corrects a step's typed input binding. */
+function editInputDiagnosis(stepId: string, inputsJson: string, autoApplicable = true) {
+  return {
+    summary: 'The step could not resolve a required input.',
+    rootCause: 'The input binding pointed at a source that does not exist.',
+    fix: {
+      kind: 'edit_input' as const,
+      stepId,
+      description: 'Rebind the input to the correct source.',
+      newStepPrompt: null,
+      newOutputContractJson: null,
+      newInputsJson: inputsJson,
+      newAllowedToolsJson: null,
       service: null,
       autoApplicable,
     },
@@ -1919,6 +1941,39 @@ test('self-heal RSH-1: an edit_contract fix auto-applies (loosens the contract) 
   // the workflow's contract was loosened on disk
   assert.deepEqual(entry.readWorkflow(wf)!.data.steps[0].output, { type: 'object', required_keys: ['name', 'email'] });
   // and a fresh re-run was queued carrying the backup id for auto-revert
+  const fresh = freshRunsFor(wf, origId) as Array<{ selfHealBackupId?: string }>;
+  assert.equal(fresh.length, 1);
+  assert.equal(typeof fresh[0].selfHealBackupId, 'string');
+  delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
+});
+
+test('self-heal RSH-3: an edit_input fix auto-applies (rebinds the input) + re-queues', async () => {
+  process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
+  const wf = 'heal-input';
+  writeHealWorkflow(wf, [{ id: 'fetch', prompt: 'Fetch {{input.url}} and return it.' }]);
+  const entry = (await import('../memory/workflow-store.js'));
+  const cur = entry.readWorkflow(wf)!.data;
+  entry.writeWorkflow(wf, {
+    ...cur, inputs: { url: { type: 'string' } },
+    steps: [{ ...cur.steps[0], inputs: { url: { from: 'input.wrongname' } } }],
+  });
+  const origId = `${wf}-run`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: wf, inputs: { url: 'https://x.co' }, status: 'completed', originSessionId: 'sess-i' }), 'utf-8');
+  const diag = editInputDiagnosis('fetch', '{"url":{"from":"input.url"}}');
+  const fix = recordProposedFix(wf, origId, diag as never);
+
+  const out = await workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+    run: { id: origId, workflow: wf, originSessionId: 'sess-i', selfHealAttempt: 0 },
+    workflowSlug: wf,
+    steps: [{ id: 'fetch', prompt: 'Fetch {{input.url}} and return it.' }] as never,
+    diagnosis: diag as never,
+    proposedFix: fix,
+    completedStepIds: new Set(['fetch']),
+  });
+  assert.ok(out, 'input heal fired');
+  assert.deepEqual(entry.readWorkflow(wf)!.data.steps[0].inputs, { url: { from: 'input.url' } });
   const fresh = freshRunsFor(wf, origId) as Array<{ selfHealBackupId?: string }>;
   assert.equal(fresh.length, 1);
   assert.equal(typeof fresh[0].selfHealBackupId, 'string');
