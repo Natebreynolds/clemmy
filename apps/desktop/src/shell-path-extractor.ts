@@ -119,6 +119,9 @@ function spawnShellForPath(shell: 'zsh' | 'bash'): Promise<string> {
  */
 export async function extractShellPath(): Promise<ShellPathResult> {
   const started = Date.now();
+  if (process.platform === 'win32') {
+    return { path: null, shell: null, durationMs: Date.now() - started, failureReason: 'no_shell' };
+  }
   let lastFailureReason: ShellPathResult['failureReason'] = 'no_shell';
   let lastShell: ShellPathResult['shell'] = null;
   for (const shell of ['zsh', 'bash'] as const) {

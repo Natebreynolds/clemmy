@@ -39,7 +39,10 @@ export function readCache(now: number = Date.now()): ShellPathCacheEntry | null 
   try {
     const raw = readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw) as Partial<ShellPathCacheEntry>;
-    if (typeof parsed.path !== 'string' || !parsed.path.includes('/')) return null;
+    if (
+      typeof parsed.path !== 'string'
+      || (!parsed.path.includes('/') && !parsed.path.includes('\\') && !parsed.path.includes(path.delimiter))
+    ) return null;
     if (typeof parsed.extractedAt !== 'string') return null;
     const extractedTs = Date.parse(parsed.extractedAt);
     if (!Number.isFinite(extractedTs)) return null;
@@ -80,12 +83,12 @@ export function mergePaths(...sources: Array<string | null | undefined>): string
   const out: string[] = [];
   for (const src of sources) {
     if (!src) continue;
-    for (const dir of src.split(':')) {
+    for (const dir of src.split(path.delimiter)) {
       if (!dir) continue;
       if (seen.has(dir)) continue;
       seen.add(dir);
       out.push(dir);
     }
   }
-  return out.join(':');
+  return out.join(path.delimiter);
 }

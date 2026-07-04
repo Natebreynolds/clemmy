@@ -460,6 +460,24 @@ export function parseWorkflowRunInputsJson(raw: string | null | undefined): Reco
   return parsed as Record<string, string>;
 }
 
+function workflowDefaultRunInputs(def: WorkflowDefinition): Record<string, string> {
+  return Object.fromEntries(Object.entries(def.inputs ?? {}).map(([k, m]) => [k, m.default ?? '']));
+}
+
+function workflowSmokeInputs(def: WorkflowDefinition, provided: Record<string, string>): Record<string, string> {
+  return normalizeWorkflowRunInputs({
+    ...workflowDefaultRunInputs(def),
+    ...provided,
+  });
+}
+
+function renderMissingSmokeInputs(name: string, missing: string[]): string {
+  const quoted = missing.map((key) => `\`${key}\``).join(', ');
+  const jsonHint = missing.map((key) => `"${key}": "<value>"`).join(', ');
+  return `Verification did not start because the smoke test is missing ${quoted}. `
+    + `The workflow stayed DISABLED so it cannot run blind. Provide \`test_inputs\` like {${jsonHint}} and enable/update again.`;
+}
+
 /**
  * Parse the workflow_create/_update `inputs` SCHEMA field — a JSON string
  * mapping input names to per-input metadata {type?, default?, description?}.
@@ -788,7 +806,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       description: z.string().min(1),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().min(1).describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
+        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         model: z.string().optional(),
         intent: z.string().optional().describe('Optional free-form model-routing category for this step, e.g. "design". If a worker model is bound for that category, this step routes there unless model is explicitly set.'),
@@ -800,7 +818,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
-        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic and (v1) forEach.'),
+        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
         allowedTools: z.array(z.string()).optional(),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         requiresApproval: z.boolean().optional(),
@@ -822,6 +840,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         dedupeKey: z.string().optional().describe('Template rendered against the payload (e.g. "lead-{{payload.id}}"). The same rendered key fires ONCE ever. Omit → dedupe on full payload hash.'),
       })).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
+      test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the authoring smoke test, e.g. {"url":"https://example.com"}. Use when an external read step needs inputs that are not defaulted in `inputs`; otherwise the workflow stays disabled until it can be verified.'),
       synthesis_prompt: z.string().optional(),
       allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
       goal: z.object({
@@ -830,7 +849,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
-    async ({ name, description, steps, trigger_schedule, trigger_webhook_path, trigger_events, inputs, synthesis_prompt, allowSends, goal }) => {
+    async ({ name, description, steps, trigger_schedule, trigger_webhook_path, trigger_events, inputs, test_inputs, synthesis_prompt, allowSends, goal }) => {
       // INTELLIGENT WORKFLOW CREATION:
       // If steps not provided, analyze the description and generate steps intelligently
       let finalSteps = steps;
@@ -867,6 +886,12 @@ export function registerOrchestrationTools(server: McpServer): void {
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
+      let providedSmokeInputs: Record<string, string>;
+      try {
+        providedSmokeInputs = parseWorkflowRunInputsJson(test_inputs);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
       const ids = new Set(finalSteps.map((step) => step.id));
       if (ids.size !== finalSteps.length) return textResult('Duplicate workflow step IDs found.');
       for (const step of finalSteps) {
@@ -896,7 +921,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         },
         steps: finalSteps.map((s) => ({
           id: s.id,
-          prompt: s.prompt,
+          prompt: s.prompt ?? '',
           dependsOn: s.dependsOn,
           model: s.model,
           intent: s.intent,
@@ -932,19 +957,12 @@ export function registerOrchestrationTools(server: McpServer): void {
       // stays disabled with a one-line fix if a read step returns nothing. This
       // is what stops a doomed workflow (scorpion: scrape step bound no tool,
       // improvised raw HTTP, returned empty, reported success) from being saved
-      // live + untested. Pure-LLM / all-mutating / un-testable-without-inputs
-      // workflows skip the gate and enable directly (nothing real to validate).
-      const testInputs = normalizeWorkflowRunInputs(
-        Object.fromEntries(Object.entries(inputsSchema).map(([k, m]) => [k, m.default ?? ''])),
-      );
-      let runCreationTest = workflowNeedsCreationTest(def);
-      if (runCreationTest && missingWorkflowRunInputs(def, testInputs).length > 0) {
-        // Can't run a meaningful test without required inputs (no defaults) —
-        // don't trap the workflow disabled; enable it and flag that the first
-        // run will be its real test.
-        runCreationTest = false;
-      }
-      if (runCreationTest) def.enabled = false;
+      // live + untested. Pure-LLM / all-mutating workflows skip the gate
+      // (nothing real to validate). External-read workflows with missing smoke
+      // inputs stay disabled until `test_inputs` or input defaults can bind
+      // a real creation test.
+      const preWriteNeedsCreationTest = workflowNeedsCreationTest(def);
+      if (preWriteNeedsCreationTest) def.enabled = false;
       // Author through the canonical core (bind → auto-repair + validate →
       // persist → gap-test). Auto-repair saves a runnable workflow in one shot
       // instead of bouncing the author into a token-burning re-author loop;
@@ -956,11 +974,27 @@ export function registerOrchestrationTools(server: McpServer): void {
           `Workflow "${name}" was NOT created — fix these first:\n- ${created.errors.join('\n- ')}`,
         );
       }
+      const needsCreationTest = workflowNeedsCreationTest(created.savedDef);
+      if (needsCreationTest && created.savedDef.enabled) {
+        created.savedDef.enabled = false;
+        writeWorkflowAndSyncTriggers(dirName, created.savedDef);
+      }
       const createBindReport = [...chatBind.boundNotes, ...created.boundNotes].length > 0
         ? `\n\n${[...chatBind.boundNotes, ...created.boundNotes].join('\n')}` : '';
       const advisoryTail = `${renderAuthoringAdvisories([...created.repairs, ...created.warnings, ...created.advisories])}`
         + `${renderWorkflowGapQuestions(created.gaps)}`;
-      if (runCreationTest) {
+      if (needsCreationTest) {
+        const testInputs = workflowSmokeInputs(created.savedDef, providedSmokeInputs);
+        const missingSmokeInputs = missingWorkflowRunInputs(created.savedDef, testInputs);
+        if (missingSmokeInputs.length > 0) {
+          return textResult(
+            `${analysisReport}`
+            + `Created workflow "${name}" (saved DISABLED pending verification). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+            + `${appendDataSources(created.savedDef)}`
+            + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+            + `${renderMissingSmokeInputs(name, missingSmokeInputs)}${advisoryTail}`,
+          );
+        }
         const queued = queueWorkflowCreationTest(name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
         return textResult(
           `${analysisReport}`
@@ -1312,8 +1346,17 @@ export function registerOrchestrationTools(server: McpServer): void {
     {
       name: z.string().min(1),
       enabled: z.boolean(),
+      test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the verification run when enabling a workflow with external read steps, e.g. {"url":"https://example.com"}.'),
     },
-    async ({ name, enabled }) => {
+    async ({ name, enabled, test_inputs }) => {
+      let providedSmokeInputs: Record<string, string> = {};
+      if (enabled) {
+        try {
+          providedSmokeInputs = parseWorkflowRunInputsJson(test_inputs);
+        } catch (error) {
+          return textResult(error instanceof Error ? error.message : String(error));
+        }
+      }
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
       // A workflow whose data can't flow can't be ENABLED (disabling is
@@ -1329,16 +1372,19 @@ export function registerOrchestrationTools(server: McpServer): void {
         }
         // Verify-by-running (2026-06-11): enabling means "set to run" — when
         // the workflow has testable read steps, run the creation test now and
-        // let the PASS enable it, instead of trusting the config. Same input
-        // policy as create: no test without bindable inputs (enable directly).
-        const enableTestInputs = normalizeWorkflowRunInputs(
-          Object.fromEntries(Object.entries(prep.def.inputs ?? {}).map(([k, m]) => [k, m.default ?? ''])),
-        );
+        // let the PASS enable it, instead of trusting the config. Same strict
+        // input policy as create: no bindable smoke inputs means stay disabled.
         let enableViaTest = workflowNeedsCreationTest(prep.def);
-        if (enableViaTest && missingWorkflowRunInputs(prep.def, enableTestInputs).length > 0) enableViaTest = false;
         if (enableViaTest) {
+          const enableTestInputs = workflowSmokeInputs(prep.def, providedSmokeInputs);
+          const missingSmokeInputs = missingWorkflowRunInputs(prep.def, enableTestInputs);
           writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
           clearWorkflowFailures(entry.name);
+          if (missingSmokeInputs.length > 0) {
+            return textResult(
+              `Workflow "${name}" was NOT enabled. ${renderMissingSmokeInputs(name, missingSmokeInputs)}`,
+            );
+          }
           const queued = queueWorkflowCreationTest(entry.name, enableTestInputs, { originSessionId: getToolOutputContext()?.sessionId });
           return textResult(
             `Verifying "${name}" before it goes live — ${queued.message}`
@@ -1368,7 +1414,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       description: z.string().optional(),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().min(1).describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach.'),
+        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         model: z.string().optional(),
         intent: z.string().optional().describe('Optional free-form model-routing category for this step, e.g. "design". If a worker model is bound for that category, this step routes there unless model is explicitly set.'),
@@ -1380,7 +1426,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
-        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic and (v1) forEach.'),
+        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
         allowedTools: z.array(z.string()).optional(),
         requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
         approvalPreview: z.string().optional().describe('One-line preview shown on the approval card when requiresApproval is set.'),
@@ -1393,6 +1439,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
+      test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the re-verification smoke test when this update changes an enabled workflow, e.g. {"url":"https://example.com"}.'),
       synthesis_prompt: z.string().optional(),
       allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
       goal: z.object({
@@ -1402,10 +1449,16 @@ export function registerOrchestrationTools(server: McpServer): void {
       }).optional().describe('PINNED RUN GOAL (run-to-completion) — see workflow_create. Pass to set/replace; use clear_goal to remove.'),
       clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
     },
-    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, synthesis_prompt, allowSends, goal, clear_goal }) => {
+    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, test_inputs, synthesis_prompt, allowSends, goal, clear_goal }) => {
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
+      let providedSmokeInputs: Record<string, string>;
+      try {
+        providedSmokeInputs = parseWorkflowRunInputsJson(test_inputs);
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
@@ -1431,7 +1484,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (steps) {
         next.steps = steps.map((s) => ({
           id: s.id,
-          prompt: s.prompt,
+          prompt: s.prompt ?? '',
           dependsOn: s.dependsOn,
           model: s.model,
           intent: s.intent,
@@ -1495,19 +1548,15 @@ export function registerOrchestrationTools(server: McpServer): void {
       // "I read the config". Schedule/description-only edits never re-test.
       let reSmoke: { message: string } | null = null;
       if (entry.data.enabled && workflowExecutionSurfaceChanged(entry.data, savedNext)) {
-        const testInputs = normalizeWorkflowRunInputs(
-          Object.fromEntries(Object.entries(savedNext.inputs ?? {}).map(([k, m]) => [k, m.default ?? ''])),
-        );
         let runTest = workflowNeedsCreationTest(savedNext);
-        if (runTest && missingWorkflowRunInputs(savedNext, testInputs).length > 0) {
-          // Required inputs with no defaults — a test can't bind them. Keep it
-          // enabled; the next real run is its test (same policy as create).
-          runTest = false;
-        }
         if (runTest) {
+          const testInputs = workflowSmokeInputs(savedNext, providedSmokeInputs);
+          const missingSmokeInputs = missingWorkflowRunInputs(savedNext, testInputs);
           savedNext.enabled = false;
           writeWorkflowAndSyncTriggers(entry.name, savedNext);
-          reSmoke = queueWorkflowCreationTest(entry.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
+          reSmoke = missingSmokeInputs.length > 0
+            ? { message: renderMissingSmokeInputs(entry.name, missingSmokeInputs) }
+            : queueWorkflowCreationTest(entry.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
         }
       }
       if (!reSmoke) writeWorkflowAndSyncTriggers(entry.name, savedNext);
@@ -1601,15 +1650,14 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updated = listWorkflowFiles().find((w) => w.data.name === before.name)?.data;
       let reSmokeMsg = '';
       if (updated && before.enabled && workflowExecutionSurfaceChanged(before, updated)) {
-        const testInputs = normalizeWorkflowRunInputs(
-          Object.fromEntries(Object.entries(updated.inputs ?? {}).map(([k, m]) => [k, m.default ?? ''])),
-        );
         let runTest = workflowNeedsCreationTest(updated);
-        if (runTest && missingWorkflowRunInputs(updated, testInputs).length > 0) runTest = false;
         if (runTest) {
+          const testInputs = workflowSmokeInputs(updated, {});
+          const missingSmokeInputs = missingWorkflowRunInputs(updated, testInputs);
           writeWorkflowAndSyncTriggers(before.name, { ...updated, enabled: false });
-          const queued = queueWorkflowCreationTest(before.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
-          reSmokeMsg = `\n\n${queued.message}`;
+          reSmokeMsg = missingSmokeInputs.length > 0
+            ? `\n\n${renderMissingSmokeInputs(before.name, missingSmokeInputs)}`
+            : `\n\n${queueWorkflowCreationTest(before.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId }).message}`;
         }
       }
       addNotification({

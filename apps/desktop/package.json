@@ -6,17 +6,18 @@
   "main": "dist/main.js",
   "type": "module",
   "scripts": {
-    "build": "tsc -p . && tsc -p tsconfig.preload.json && mv dist/preload.js dist/preload.cjs",
+    "build": "tsc -p . && tsc -p tsconfig.preload.json && node scripts/rename-preload.mjs",
     "typecheck": "tsc -p . --noEmit",
     "dev": "tsx src/main.ts",
     "start": "electron .",
     "build:daemon": "cd ../.. && npm run build",
     "build:mobile-web": "cd ../mobile-web && npm run build",
     "build:console-web": "cd ../console-web && npm run build",
-    "rebuild-daemon-natives": "cd ../.. && ./apps/desktop/node_modules/.bin/electron-rebuild --version $(node -p \"require('./apps/desktop/node_modules/electron/package.json').version\") --module-dir . --types prod --force --only better-sqlite3",
+    "rebuild-daemon-natives": "node scripts/rebuild-daemon-natives.mjs",
     "restore-node-natives": "cd ../.. && npm rebuild better-sqlite3",
     "package:mac": "./scripts/release-mac-dual-arch.sh",
     "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false ./scripts/release-mac-dual-arch.sh",
+    "package:win": "node scripts/release-windows.mjs",
     "package:dist": "npm run build && npm run build:daemon && npm run build:mobile-web && npm run build:console-web && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
     "release": "./scripts/release-mac-dual-arch.sh"
   },
@@ -174,6 +175,15 @@
     },
     "win": {
       "icon": "build/icon.ico",
+      "extraResources": [
+        {
+          "from": "../../vendor/uv/x86_64-pc-windows-msvc",
+          "to": "daemon/vendor/uv/x86_64-pc-windows-msvc",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ],
       "target": [
         "nsis"
       ]

@@ -52,6 +52,12 @@ function workflowUpdate(): ToolHandler {
   return handler;
 }
 
+function workflowSetEnabled(): ToolHandler {
+  const handler = handlers.get('workflow_set_enabled');
+  assert.ok(handler, 'workflow_set_enabled registered');
+  return handler;
+}
+
 function workflowContractProposals(): ToolHandler {
   const handler = handlers.get('workflow_contract_proposals');
   assert.ok(handler, 'workflow_contract_proposals registered');
@@ -191,6 +197,99 @@ test('workflow_create persists a step OUTPUT contract (declarable verification u
   });
   assert.match(resultText(result), /Created workflow "contract-wf"/);
   assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, contract);
+});
+
+test('workflow_create accepts a call-only read step and queues a creation test', async () => {
+  const result = await workflowCreate()({
+    name: 'call-grounded-wf',
+    description: 'List contacts from HubSpot.',
+    steps: [{ id: 'list_contacts', call: { tool: 'composio_hubspot_list_contacts', args: {} } }],
+  });
+  const text = resultText(result);
+  assert.match(text, /Created workflow "call-grounded-wf" \(saved DISABLED while I test it\)/);
+  assert.match(text, /creation test/i);
+
+  const saved = readWorkflow('call-grounded-wf')!.data;
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.steps[0].prompt, '');
+  assert.equal(saved.steps[0].call?.tool, 'composio_hubspot_list_contacts');
+
+  const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
+  assert.equal(files.length, 1);
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, files[0]), 'utf-8')) as {
+    workflow: string;
+    status: string;
+  };
+  assert.equal(run.workflow, 'call-grounded-wf');
+  assert.equal(run.status, 'creation_test');
+});
+
+test('workflow_create keeps external-read workflows disabled when smoke inputs are missing', async () => {
+  const result = await workflowCreate()({
+    name: 'missing-smoke-input-wf',
+    description: 'Scrape a supplied URL with Apify.',
+    inputs: JSON.stringify({ url: { type: 'string', description: 'URL to scrape' } }),
+    steps: [{ id: 'scrape', prompt: 'Scrape {{input.url}} with Apify.', allowedTools: ['composio_apify_*'] }],
+  });
+  const text = resultText(result);
+  assert.match(text, /saved DISABLED pending verification/);
+  assert.match(text, /missing `url`/);
+  assert.match(text, /cannot run blind/);
+
+  const saved = readWorkflow('missing-smoke-input-wf')!.data;
+  assert.equal(saved.enabled, false);
+  assert.throws(() => readdirSync(WORKFLOW_RUNS_DIR), /ENOENT/);
+});
+
+test('workflow_create uses test_inputs to queue an external-read creation test without default inputs', async () => {
+  const result = await workflowCreate()({
+    name: 'provided-smoke-input-wf',
+    description: 'Fetch a supplied URL with Apify.',
+    inputs: JSON.stringify({ url: { type: 'string', description: 'URL to fetch' } }),
+    test_inputs: JSON.stringify({ url: 'https://example.com' }),
+    steps: [{ id: 'fetch', prompt: 'Fetch {{input.url}} with Apify.', allowedTools: ['composio_apify_*'] }],
+  });
+  const text = resultText(result);
+  assert.match(text, /saved DISABLED while I test it/);
+  assert.match(text, /creation test/i);
+
+  const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
+  assert.equal(files.length, 1);
+  const run = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, files[0]), 'utf-8')) as {
+    workflow: string;
+    status: string;
+    inputs: Record<string, string>;
+  };
+  assert.equal(run.workflow, 'provided-smoke-input-wf');
+  assert.equal(run.status, 'creation_test');
+  assert.equal(run.inputs.url, 'https://example.com');
+});
+
+test('workflow_set_enabled requires smoke inputs before approving external-read workflows', async () => {
+  writeWorkflow('enable-smoke-input-wf', {
+    name: 'enable-smoke-input-wf',
+    description: 'Fetch a supplied URL with Apify.',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: { url: { type: 'string', description: 'URL to fetch' } },
+    steps: [{ id: 'fetch', prompt: 'Fetch {{input.url}} with Apify.', allowedTools: ['composio_apify_*'] }],
+  } as never);
+
+  const missing = await workflowSetEnabled()({ name: 'enable-smoke-input-wf', enabled: true });
+  assert.match(resultText(missing), /was NOT enabled/);
+  assert.match(resultText(missing), /missing `url`/);
+  assert.equal(readWorkflow('enable-smoke-input-wf')!.data.enabled, false);
+  assert.throws(() => readdirSync(WORKFLOW_RUNS_DIR), /ENOENT/);
+
+  const queued = await workflowSetEnabled()({
+    name: 'enable-smoke-input-wf',
+    enabled: true,
+    test_inputs: JSON.stringify({ url: 'https://example.com' }),
+  });
+  assert.match(resultText(queued), /Verifying "enable-smoke-input-wf" before it goes live/);
+  assert.match(resultText(queued), /creation test/i);
+  assert.equal(readWorkflow('enable-smoke-input-wf')!.data.enabled, false);
+  assert.equal(readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).length, 1);
 });
 
 test('workflow_contract_proposals reports upgrades without mutating workflow files', async () => {

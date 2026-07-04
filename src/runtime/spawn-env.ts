@@ -20,7 +20,6 @@ import os from 'node:os';
  * binary wins for a name already reachable.
  */
 export function augmentPath(existing: string | undefined): string {
-  const sep = ':';
   const candidates: string[] = [];
   try {
     const dir = path.dirname(process.execPath);
@@ -34,21 +33,36 @@ export function augmentPath(existing: string | undefined): string {
   // them (idempotent, widen-only).
   try {
     const home = os.homedir();
-    if (home) candidates.push(path.join(home, '.local', 'bin'));
+    if (home) {
+      if (process.platform === 'win32') {
+        candidates.push(path.join(home, 'scoop', 'shims'));
+      } else {
+        candidates.push(path.join(home, '.local', 'bin'));
+      }
+    }
   } catch {
     /* homedir unavailable is fine */
   }
-  candidates.push(
-    '/opt/homebrew/bin',
-    '/opt/homebrew/sbin',
-    '/usr/local/bin',
-    '/usr/local/sbin',
-    '/usr/bin',
-    '/bin',
-    '/usr/sbin',
-    '/sbin',
-  );
-  const existingParts = (existing ?? '').split(sep).filter(Boolean);
+
+  if (process.platform === 'win32') {
+    if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, 'npm'));
+    if (process.env.LOCALAPPDATA) candidates.push(path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps'));
+    if (process.env.ProgramData) candidates.push(path.join(process.env.ProgramData, 'chocolatey', 'bin'));
+    if (process.env.SCOOP) candidates.push(path.join(process.env.SCOOP, 'shims'));
+  } else {
+    candidates.push(
+      '/opt/homebrew/bin',
+      '/opt/homebrew/sbin',
+      '/usr/local/bin',
+      '/usr/local/sbin',
+      '/usr/bin',
+      '/bin',
+      '/usr/sbin',
+      '/sbin',
+    );
+  }
+
+  const existingParts = (existing ?? '').split(path.delimiter).filter(Boolean);
   const seen = new Set(existingParts);
   const prepend: string[] = [];
   for (const dir of candidates) {
@@ -56,7 +70,7 @@ export function augmentPath(existing: string | undefined): string {
     seen.add(dir);
     prepend.push(dir);
   }
-  return [...prepend, ...existingParts].join(sep);
+  return [...prepend, ...existingParts].join(path.delimiter);
 }
 
 /**
@@ -71,6 +85,15 @@ export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<strin
       env[key] = value;
     }
   }
-  env.PATH = augmentPath(env.PATH);
+  const pathKey = process.platform === 'win32'
+    ? Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'Path'
+    : 'PATH';
+  const currentPath = env[pathKey] ?? env.PATH;
+  if (process.platform === 'win32') {
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === 'path' && key !== pathKey) delete env[key];
+    }
+  }
+  env[pathKey] = augmentPath(currentPath);
   return { ...env, ...extra };
 }

@@ -432,6 +432,9 @@ test('stepLooksMutating: a send/write step is mutating; a pure read step is not'
   assert.equal(stepLooksMutating({ prompt: 'do anything', requiresApproval: true }), true);
   assert.equal(stepLooksMutating({ prompt: 'scrape the Facebook page posts with Apify' }), false);
   assert.equal(stepLooksMutating({ prompt: 'fetch the latest SERP rankings' }), false);
+  assert.equal(stepLooksMutating({ call: { tool: 'composio_gmail_send_email' } }), true);
+  assert.equal(stepLooksMutating({ call: { tool: 'composio_airtable_create_record' } }), true);
+  assert.equal(stepLooksMutating({ call: { tool: 'composio_hubspot_list_contacts' } }), false);
 });
 
 test('stepIsTestableRead: read step with an external tool surface is testable', () => {
@@ -442,6 +445,8 @@ test('stepIsTestableRead: read step with an external tool surface is testable', 
   );
   // forEach over upstream data counts as reaching external data.
   assert.equal(stepIsTestableRead({ prompt: 'process each item', forEach: '{{steps.a.output}}', allowedTools: ['*'] }), true);
+  // A structured read call is a real connection/tool surface even without a prose read verb.
+  assert.equal(stepIsTestableRead({ call: { tool: 'composio_hubspot_list_contacts' } }), true);
 });
 
 test('stepIsTestableRead: a mutating step is NOT testable (it gets previewed, not run)', () => {
@@ -449,6 +454,8 @@ test('stepIsTestableRead: a mutating step is NOT testable (it gets previewed, no
     stepIsTestableRead({ prompt: 'create records in Airtable for each prospect', allowedTools: ['composio_*'] }),
     false,
   );
+  assert.equal(stepIsTestableRead({ call: { tool: 'composio_gmail_send_email' } }), false);
+  assert.equal(stepIsTestableRead({ call: { tool: 'composio_airtable_create_record' } }), false);
 });
 
 test('stepIsTestableRead: a pure-LLM read step (no external tools) is NOT worth a creation test', () => {
@@ -471,6 +478,20 @@ test('workflowNeedsCreationTest: true when any step is a testable read, false ot
   assert.equal(
     workflowNeedsCreationTest(wf({
       steps: [{ id: 'a', prompt: 'send the daily reminder email', requiresApproval: true }],
+    })),
+    false,
+  );
+  // Structured read calls are grounded by the same creation-test gate.
+  assert.equal(
+    workflowNeedsCreationTest(wf({
+      steps: [{ id: 'list', prompt: '', call: { tool: 'composio_hubspot_list_contacts', args: {} } }],
+    })),
+    true,
+  );
+  // Structured mutating calls are never executed during authoring tests.
+  assert.equal(
+    workflowNeedsCreationTest(wf({
+      steps: [{ id: 'send', prompt: '', call: { tool: 'composio_gmail_send_email', args: {} } }],
     })),
     false,
   );

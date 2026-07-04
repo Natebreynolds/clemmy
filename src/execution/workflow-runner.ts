@@ -2863,9 +2863,9 @@ export async function executeStep(
   // 1b. CALL-1 — structured tool call: execute the tool DIRECTLY, no LLM. The
   //     args are fixed in the contract (templated from inputs/upstream), so the
   //     call is deterministic and free. Routes through the SAME verification
-  //     chokepoint as every other shape. (v1 handles the no-forEach case;
-  //     validation rejects call+forEach / call+deterministic, so this branch
-  //     only fires for a plain structured call.)
+  //     chokepoint as every other shape. The forEach branch below handles
+  //     read-class call fan-out; validation still rejects call+deterministic and
+  //     send/write-class call fan-out.
   if (step.call?.tool && !step.forEach) {
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_started',

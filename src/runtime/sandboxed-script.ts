@@ -19,6 +19,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { augmentPath } from './spawn-env.js';
 
@@ -29,9 +30,14 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
  *  a minimal-PATH Finder-launched .app still finds python3/bash. */
 export function resolveOnPath(bin: string, augmentedPath: string): string | null {
   if (path.isAbsolute(bin)) return existsSync(bin) ? bin : null;
-  for (const dir of augmentedPath.split(':').filter(Boolean)) {
-    const candidate = path.join(dir, bin);
-    try { accessSync(candidate, fsConstants.X_OK); return candidate; } catch { /* next */ }
+  const extensions = process.platform === 'win32' && !path.extname(bin)
+    ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
+    : [''];
+  for (const dir of augmentedPath.split(path.delimiter).filter(Boolean)) {
+    for (const ext of extensions) {
+      const candidate = path.join(dir, `${bin}${ext}`);
+      try { accessSync(candidate, fsConstants.X_OK); return candidate; } catch { /* next */ }
+    }
   }
   return null;
 }
@@ -61,10 +67,17 @@ export function interpreterFor(
     return { command: process.execPath, args: [tsx, target], isElectron: true };
   }
   if (ext === '.py') {
-    return { command: resolveOnPath('python3', augmentedPath) ?? 'python3', args: [target], isElectron: false };
+    const command = process.platform === 'win32'
+      ? resolveOnPath('python3', augmentedPath) ?? resolveOnPath('python', augmentedPath) ?? resolveOnPath('py', augmentedPath) ?? 'py'
+      : resolveOnPath('python3', augmentedPath) ?? 'python3';
+    const launcher = path.basename(command).toLowerCase();
+    return { command, args: launcher === 'py' || launcher === 'py.exe' ? ['-3', target] : [target], isElectron: false };
   }
   if (ext === '.sh' || ext === '.bash') {
-    return { command: resolveOnPath('bash', augmentedPath) ?? '/bin/bash', args: [target], isElectron: false };
+    const bash = resolveOnPath('bash', augmentedPath);
+    if (bash) return { command: bash, args: [target], isElectron: false };
+    if (process.platform !== 'win32') return { command: '/bin/bash', args: [target], isElectron: false };
+    return null;
   }
   try {
     if ((statSync(target).mode & 0o111) !== 0) return { command: target, args: [], isElectron: false };
@@ -81,14 +94,20 @@ export function interpreterFor(
  * top (the caller's surface-specific vars + the ELECTRON_RUN_AS_NODE flag).
  */
 export function scrubbedChildEnv(extra: Record<string, string> = {}): Record<string, string> {
-  const home = process.env.HOME ?? '';
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir() ?? '';
+  const tmp = process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? os.tmpdir();
+  const inheritedPath = process.env.PATH ?? process.env.Path;
   const base: Record<string, string> = {
-    PATH: augmentPath(process.env.PATH),
+    PATH: augmentPath(inheritedPath),
     HOME: home,
-    TMPDIR: process.env.TMPDIR ?? '/tmp',
-    SHELL: process.env.SHELL ?? '/bin/bash',
-    USER: process.env.USER ?? process.env.LOGNAME ?? '',
-    LOGNAME: process.env.LOGNAME ?? process.env.USER ?? '',
+    TMPDIR: tmp,
+    TEMP: process.env.TEMP ?? tmp,
+    TMP: process.env.TMP ?? tmp,
+    SHELL: process.env.SHELL ?? process.env.ComSpec ?? (process.platform === 'win32' ? 'cmd.exe' : '/bin/bash'),
+    USER: process.env.USER ?? process.env.USERNAME ?? process.env.LOGNAME ?? '',
+    USERNAME: process.env.USERNAME ?? process.env.USER ?? '',
+    LOGNAME: process.env.LOGNAME ?? process.env.USER ?? process.env.USERNAME ?? '',
+    USERPROFILE: process.env.USERPROFILE ?? home,
     LANG: process.env.LANG ?? 'en_US.UTF-8',
     LC_ALL: process.env.LC_ALL ?? 'en_US.UTF-8',
     PYTHONIOENCODING: 'utf-8',
@@ -97,6 +116,9 @@ export function scrubbedChildEnv(extra: Record<string, string> = {}): Record<str
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? (home ? path.join(home, '.config') : ''),
     XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? (home ? path.join(home, '.cache') : ''),
     XDG_DATA_HOME: process.env.XDG_DATA_HOME ?? (home ? path.join(home, '.local', 'share') : ''),
+    APPDATA: process.env.APPDATA ?? '',
+    LOCALAPPDATA: process.env.LOCALAPPDATA ?? '',
+    ComSpec: process.env.ComSpec ?? '',
     CLEMENTINE_HOME: process.env.CLEMENTINE_HOME ?? '',
   };
   return { ...base, ...extra };

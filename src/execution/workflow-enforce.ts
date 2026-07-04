@@ -96,6 +96,14 @@ export function stepLooksLikeIrreversibleSend(prompt: string): boolean {
   return IRREVERSIBLE_SEND_RE.test(p) || PUBLISH_RE.test(p);
 }
 
+function structuredCallSideEffectClass(call: { tool?: string } | undefined): 'read' | 'write' | 'send' {
+  const t = (call?.tool ?? '').toLowerCase();
+  if (!t) return 'read';
+  if (/(?:_|^)(?:send|publish|post|email|dispatch|deliver|tweet|dm|message)(?:_|$)/.test(t)) return 'send';
+  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/.test(t)) return 'write';
+  return 'read';
+}
+
 // A step that WRITES to the outside world (creates/updates/deletes a record,
 // sheet, file, event, message) — broader than a pure send. Used by the
 // creation-time test to PREVIEW (not execute) anything mutating, so a test run
@@ -110,8 +118,9 @@ const EXTERNAL_WRITE_RE =
  * irreversible send, or a write-verb-near-external-noun all count; a pure
  * read/fetch/query step does not.
  */
-export function stepLooksMutating(step: { prompt?: string; requiresApproval?: boolean; requires_approval?: boolean }): boolean {
+export function stepLooksMutating(step: { prompt?: string; requiresApproval?: boolean; requires_approval?: boolean; call?: { tool?: string } }): boolean {
   if (step.requiresApproval === true || step.requires_approval === true) return true;
+  if (structuredCallSideEffectClass(step.call) !== 'read') return true;
   const p = step.prompt ?? '';
   return stepLooksLikeIrreversibleSend(p) || EXTERNAL_WRITE_RE.test(p);
 }
@@ -124,7 +133,8 @@ const READ_INTENT_RE =
 // A step's tool surface reaches OUTSIDE the model (so it can actually return real
 // data — or silently nothing). Used to decide whether a creation test is worth
 // running. A pure-LLM step (no external tools) has nothing real to validate.
-function stepReachesExternalTools(step: { allowedTools?: string[]; usesSkill?: string; forEach?: string }): boolean {
+function stepReachesExternalTools(step: { allowedTools?: string[]; usesSkill?: string; forEach?: string; call?: { tool?: string } }): boolean {
+  if (step.call?.tool) return true;
   if (step.usesSkill) return true;
   if (step.forEach) return true;
   const tools = step.allowedTools ?? [];
@@ -142,10 +152,11 @@ function stepReachesExternalTools(step: { allowedTools?: string[]; usesSkill?: s
  * enabled directly instead of test-gated.
  */
 export function stepIsTestableRead(
-  step: { prompt?: string; requiresApproval?: boolean; requires_approval?: boolean; allowedTools?: string[]; usesSkill?: string; forEach?: string },
+  step: { prompt?: string; requiresApproval?: boolean; requires_approval?: boolean; allowedTools?: string[]; usesSkill?: string; forEach?: string; call?: { tool?: string } },
 ): boolean {
   if (stepLooksMutating(step)) return false;
   if (!stepReachesExternalTools(step)) return false;
+  if (step.call?.tool && structuredCallSideEffectClass(step.call) === 'read') return true;
   return READ_INTENT_RE.test(step.prompt ?? '') || (step.allowedTools ?? []).length > 0 || !!step.usesSkill || !!step.forEach;
 }
 

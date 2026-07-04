@@ -205,15 +205,24 @@ export class DaemonSupervisor {
     // found" even though sf was on their shell PATH — the daemon's
     // PATH had no /usr/local/bin. Insurance: add common user-tool dirs
     // unconditionally. Idempotent — duplicates in PATH are harmless.
-    const COMMON_USER_BIN_DIRS = [
-      '/opt/homebrew/bin',     // Apple Silicon Homebrew
-      '/opt/homebrew/sbin',
-      '/usr/local/bin',        // Intel Mac Homebrew + npm globals
-      '/usr/local/sbin',
-      `${process.env.HOME ?? ''}/.cargo/bin`,    // Rust toolchain
-      `${process.env.HOME ?? ''}/.local/bin`,    // pipx, generic user installs
-      `${process.env.HOME ?? ''}/go/bin`,        // Go binaries
-    ].filter((p) => p && !p.endsWith('/'));
+    const home = os.homedir();
+    const COMMON_USER_BIN_DIRS = process.platform === 'win32'
+      ? [
+        process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : '',
+        process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps') : '',
+        process.env.ProgramData ? path.join(process.env.ProgramData, 'chocolatey', 'bin') : '',
+        process.env.SCOOP ? path.join(process.env.SCOOP, 'shims') : '',
+        home ? path.join(home, 'scoop', 'shims') : '',
+      ]
+      : [
+        '/opt/homebrew/bin',     // Apple Silicon Homebrew
+        '/opt/homebrew/sbin',
+        '/usr/local/bin',        // Intel Mac Homebrew + npm globals
+        '/usr/local/sbin',
+        `${home}/.cargo/bin`,    // Rust toolchain
+        `${home}/.local/bin`,    // pipx, generic user installs
+        `${home}/go/bin`,        // Go binaries
+      ];
 
     // v0.5.21 Phase 2.5 — merge in the user's shell PATH so version
     // managers (nvm, asdf, mise, volta, fnm, rbenv, pyenv, sdkman)
@@ -224,13 +233,14 @@ export class DaemonSupervisor {
     // in background and write a new cache when it changes. Daemon
     // picks up the refreshed PATH at the next restart (no IPC).
     const cachedShellPath = readShellPathCache()?.path ?? null;
+    const inheritedPath = process.env.PATH ?? process.env.Path ?? '';
     const augmentedPath = mergePaths(
-      COMMON_USER_BIN_DIRS.join(':'),
+      COMMON_USER_BIN_DIRS.filter(Boolean).join(path.delimiter),
       cachedShellPath,
-      process.env.PATH ?? '',
+      inheritedPath,
     );
     // Kick off the async re-extraction; logging only — never blocks.
-    extractShellPath()
+    if (process.platform !== 'win32') extractShellPath()
       .then((result) => {
         if (!result.path) {
           this.emit({
@@ -282,7 +292,6 @@ export class DaemonSupervisor {
       ...dotenvBaseline,
       ...process.env,
       ...this.opts.envOverrides,
-      PATH: augmentedPath,
       WEBHOOK_ENABLED: 'true',
       WEBHOOK_PORT: String(this.chosenPort),
       WEBHOOK_HOST,
@@ -303,6 +312,15 @@ export class DaemonSupervisor {
     if (runAsNode) {
       env.ELECTRON_RUN_AS_NODE = '1';
     }
+    const pathEnvKey = process.platform === 'win32'
+      ? Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'Path'
+      : 'PATH';
+    if (process.platform === 'win32') {
+      for (const key of Object.keys(env)) {
+        if (key.toLowerCase() === 'path' && key !== pathEnvKey) delete env[key];
+      }
+    }
+    env[pathEnvKey] = augmentedPath;
 
     this.child = spawn(command, args, {
       cwd: this.opts.daemonProjectRoot,

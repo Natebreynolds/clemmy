@@ -71,7 +71,7 @@ function frontmatter(steps: unknown[]) {
   return { name: 'w', description: 'd', enabled: true, trigger: { manual: true }, steps } as never;
 }
 
-test('validation: a call step needs no prompt but needs a tool; rejects call+deterministic and call+forEach', () => {
+test('validation: a call step needs no prompt, allows read fan-out, and blocks unsafe call combinations', () => {
   // valid: a call step with no prompt
   const ok = validateWorkflowDefinition(frontmatter([{ id: 'fetch', call: { tool: 'composio_http_get', args: { url: '{{input.url}}' } } }]));
   assert.equal(ok.errors.some((e) => /no substantive prompt/.test(e)), false, 'call step should not require a prompt');

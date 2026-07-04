@@ -93,8 +93,9 @@ export interface WorkflowStepInput {
    * {{steps.<id>.output[.path]}}, {{item[.path]}}, {{date}}; a value that is
    * EXACTLY one token resolves to the raw upstream value (object/array kept),
    * an embedded token renders as a string. Serialized to YAML as `call`.
-   * Mutually exclusive with deterministic (both are non-LLM executors) and, in
-   * v1, with forEach (per-item calls land in CALL phase 2).
+   * Mutually exclusive with deterministic (both are non-LLM executors). May
+   * combine with forEach for READ-class calls; send/write call fan-out stays
+   * blocked until per-call idempotency tracking is live-tested.
    */
   call?: WorkflowStepCall;
   /**

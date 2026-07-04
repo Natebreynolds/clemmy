@@ -154,3 +154,77 @@ jobs:
             release/Clementine-*-mac.zip.blockmap \
             release/latest-mac.yml \
             --clobber
+
+  release-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install daemon deps
+        run: npm ci
+
+      - name: Install desktop deps
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Install mobile-web deps
+        working-directory: apps/mobile-web
+        run: npm ci
+
+      - name: Install console-web deps
+        working-directory: apps/console-web
+        run: npm ci
+
+      - name: Sync daemon version from the pushed tag
+        shell: bash
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
+      - name: Sync app version from the pushed tag
+        working-directory: apps/desktop
+        shell: bash
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
+      - name: Build Windows installer
+        working-directory: apps/desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: set these repository secrets to ship a signed Windows
+          # installer. When absent, electron-builder produces an unsigned
+          # internal/testable NSIS build.
+          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+        run: npm run package:win
+
+      - name: Upload Windows artifacts to GitHub Release
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Desktop releases must run from a semver tag like v0.4.23, not '$tag'."
+            exit 1
+          fi
+          shopt -s nullglob
+          assets=(release/*.exe release/*.exe.blockmap release/latest.yml)
+          if (( ${#assets[@]} == 0 )); then
+            echo "::error::No Windows release assets found in apps/desktop/release"
+            ls -la release || true
+            exit 1
+          fi
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" "${assets[@]}" --clobber
