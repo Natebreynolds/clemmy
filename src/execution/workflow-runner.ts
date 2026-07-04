@@ -63,6 +63,8 @@ import {
   diagnoseWorkflowBlock,
   recordProposedFix,
   applyProposedFix,
+  fixIsAutoApplicable,
+  sanitizeOutputContract,
   recordWorkflowEditBackup,
   revertWorkflowFix,
   judgeHealCrossFamily,
@@ -4426,8 +4428,11 @@ async function tryAutoHealAndRequeue(args: {
   diagnosis: WorkflowDiagnosis | null;
   proposedFix: ProposedFix | null;
   completedStepIds: Set<string>;
+  /** RSH-2: the just-completed run's RAW structured step outputs — lets the
+   *  probe check a candidate contract fix against real data before re-running. */
+  rawStepOutputs?: Record<string, unknown>;
 }): Promise<AutoHealOutcome | null> {
-  const { run, workflowSlug, steps, diagnosis, proposedFix, completedStepIds } = args;
+  const { run, workflowSlug, steps, diagnosis, proposedFix, completedStepIds, rawStepOutputs } = args;
   if (!selfHealEnabled() || !diagnosis || !proposedFix) return null;
   // Cross-fire guard (#6): a workflow that has failed N times in a row is
   // clearly stuck — stop re-running the WHOLE thing to auto-heal (the
@@ -4440,7 +4445,11 @@ async function tryAutoHealAndRequeue(args: {
     return null;
   }
   const fix = diagnosis.fix;
-  if (fix.kind !== 'edit_step' || !fix.autoApplicable || !fix.newStepPrompt) return null; // only safe prompt rewrites
+  // RSH-1: auto-apply the safe, structured fix kinds — a prompt rewrite
+  // (edit_step) or an output-contract correction (edit_contract). Both are
+  // re-validated + backed up + cross-family-judged + re-run-gated below;
+  // everything else (reconnect/adjust_input/manual) still escalates to the human.
+  if (!fixIsAutoApplicable(fix)) return null;
   const max = selfHealAutoMaxAttempts();
   const prior = run.selfHealAttempt ?? 0;
   if (max <= 0 || prior >= max) return null; // at cap → escalate (today's offer)
@@ -4457,6 +4466,31 @@ async function tryAutoHealAndRequeue(args: {
       'self-heal: an upstream mutating step already completed — escalating instead of auto re-running (avoids double side effects)',
     );
     return null;
+  }
+  // RSH-2 (probe-before-re-run): a contract fix claims the step's real data
+  // should satisfy a loosened contract. We already HAVE that data (this run's
+  // raw output). Verify it in-process — FREE, deterministic, zero model calls —
+  // before applying the fix or paying for a full re-run. If even the data we
+  // have fails the "fixed" contract, the fix is doomed: escalate to the human
+  // now instead of applying + re-running into the same failure. Runs before the
+  // model judge so a doomed fix skips that call too. Only gates edit_contract;
+  // an edit_step probe needs re-execution (a later phase). Output unavailable →
+  // skip the probe (the re-run + auto-revert remain the safety net).
+  if (fix.kind === 'edit_contract' && rawStepOutputs && fix.stepId in rawStepOutputs) {
+    const newContract = sanitizeOutputContract(fix.newOutputContractJson);
+    const verdict = newContract ? verifyStepOutput(newContract, rawStepOutputs[fix.stepId]) : { ok: false, problems: ['unparseable contract'] };
+    if (!verdict.ok) {
+      appendWorkflowEvent(workflowSlug, run.id, {
+        kind: 'step_advisory',
+        stepId: fix.stepId,
+        meta: { reason: 'heal_probe_failed', fixKind: 'edit_contract', problems: verdict.problems.slice(0, 4) },
+      });
+      logger.info(
+        { runId: run.id, step: fix.stepId, problems: verdict.problems.slice(0, 3) },
+        'self-heal: probe rejected the contract fix — the real output still fails the proposed contract, escalating without a re-run',
+      );
+      return null;
+    }
   }
   // T3.2: never self-grade an auto-mutating action — a judge from a DIFFERENT
   // provider family re-grades the Doctor's fix before it auto-applies. Veto →
@@ -5471,6 +5505,7 @@ async function processOneRunFile(
           diagnosis,
           proposedFix,
           completedStepIds: new Set(resume.completedSteps.keys()),
+          rawStepOutputs, // RSH-2: probe a contract fix against real output before re-running
         });
         if (healed) {
           addNotification({

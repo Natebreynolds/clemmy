@@ -32,7 +32,7 @@ import pino from 'pino';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { STATE_DIR } from '../memory/db.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
-import { readWorkflow, writeWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
+import { readWorkflow, writeWorkflow, type WorkflowDefinition, type WorkflowStepInput, type WorkflowStepOutputContract } from '../memory/workflow-store.js';
 import { checkWorkflowForWrite } from './workflow-enforce.js';
 
 const logger = pino({ name: 'clementine-next.workflow-diagnosis' });
@@ -317,18 +317,19 @@ export function detectBlockedSteps(
 
 // ─── 2. Diagnose ─────────────────────────────────────────────────────
 
-const FIX_KINDS = ['edit_step', 'reconnect_service', 'adjust_input', 'manual'] as const;
+const FIX_KINDS = ['edit_step', 'edit_contract', 'reconnect_service', 'adjust_input', 'manual'] as const;
 
 export const WorkflowDiagnosisSchema = z.object({
   summary: z.string().describe('One or two plain-English sentences: what happened, no jargon, no JSON.'),
-  rootCause: z.string().describe('Why the step blocked — the specific cause (wrong tool/query, expired connection, missing input, ambiguous instruction).'),
+  rootCause: z.string().describe('Why the step blocked — the specific cause (wrong tool/query, expired connection, missing input, ambiguous instruction, an output contract that does not match the real data).'),
   fix: z.object({
-    kind: z.enum(FIX_KINDS).describe('edit_step = rewrite the step prompt; reconnect_service = a connection needs reauth (cannot auto-fix); adjust_input = a run input is missing/wrong; manual = needs human judgment.'),
+    kind: z.enum(FIX_KINDS).describe('edit_step = rewrite the step prompt; edit_contract = the step produced valid data but its declared output contract is WRONG (too strict / requires a shape the real data legitimately varies on); reconnect_service = a connection needs reauth (cannot auto-fix); adjust_input = a run input is missing/wrong; manual = needs human judgment.'),
     stepId: z.string().describe('The step the fix targets.'),
     description: z.string().describe('Plain-English description of the proposed fix, suitable to show the user.'),
     newStepPrompt: z.string().nullable().describe('For kind=edit_step ONLY: the COMPLETE replacement prompt for the step, fixing the root cause (e.g. correct the Composio tool/query, name the explicit access method like the local `sf` CLI, clarify the missing input). null otherwise.'),
+    newOutputContractJson: z.string().nullable().describe('For kind=edit_contract ONLY: a JSON object string of the CORRECTED output contract, e.g. {"type":"object","required_keys":["name","email"]} or {"type":"array","min_items":{"":1}}. Keys: type, required_keys, non_empty, min_items, verify. Only LOOSEN a contract that false-fails legitimate data (remove a key the data legitimately lacks; lower a min_items), or add a check that catches a garbage pass. null otherwise.'),
     service: z.string().nullable().describe('For kind=reconnect_service: the service that needs reauthorization (e.g. "Google Drive", "Outlook"). null otherwise.'),
-    autoApplicable: z.boolean().describe('true ONLY when kind=edit_step AND newStepPrompt is a safe, complete drop-in replacement that preserves the step\'s intent. false for anything needing human action (reconnect/manual/adjust_input).'),
+    autoApplicable: z.boolean().describe('true ONLY when kind=edit_step (newStepPrompt is a safe drop-in) OR kind=edit_contract (newOutputContractJson corrects a genuine contract/data mismatch). false for anything needing human action (reconnect/manual/adjust_input).'),
   }),
   confidence: z.enum(['high', 'medium', 'low']),
 });
@@ -344,7 +345,8 @@ const DOCTOR_INSTRUCTIONS = [
   '- If the failure says a Clementine/local MCP tool itself was not exposed or did not exist (for example run_shell_command, notify_user, write_file, local_cli_list/probe), this is a runtime/tool-lane issue, NOT a provider credential problem. kind=manual, autoApplicable=false. Do not propose reconnecting Salesforce/Outlook/Composio unless the observed error is an auth/401/403/expired-connection error from that provider.',
   '- A connection/auth error (ComposioToolExecutionError about auth, expired/invalid connection, 401/403): kind=reconnect_service, service=<the service>. Do NOT pretend an edit fixes an auth problem. autoApplicable=false.',
   '- A required run input was missing/empty: kind=adjust_input. autoApplicable=false.',
-  '- The step RAN but its output FAILED its declared output contract — wrong type, a missing required key, or a verify.url_present/path_exists handle that was empty or fake (e.g. it claimed "produced a brief" but returned no real URL/file): kind=edit_step. Rewrite the step prompt to EXPLICITLY produce the declared shape — name the required keys it must return, and instruct it to return the REAL artifact (the actual created URL / saved file path), not a summary or a bare claim. The newStepPrompt MUST keep the same declared output contract. autoApplicable=true.',
+  '- The step RAN but its output FAILED its declared output contract because the step did NOT actually produce the deliverable — it claimed "produced a brief" but returned no real URL/file, or returned a summary instead of the artifact: kind=edit_step. Rewrite the step prompt to EXPLICITLY produce the declared shape and return the REAL artifact (the actual created URL / saved file path), not a bare claim. The newStepPrompt MUST keep the same declared output contract. autoApplicable=true.',
+  '- The step RAN and produced VALID, real data, but its declared output contract is itself WRONG — it requires a key the real data legitimately does not always carry (e.g. requires "phone" but this record has none), demands a min_items count higher than a legitimate result (7 items when 7 is a real, complete answer), or fixes a type/shape the data never actually matches: kind=edit_contract. Provide newOutputContractJson = the CORRECTED contract (loosen only what false-fails legitimate data). Do NOT loosen a contract to hide a genuinely empty or garbage output — that is a real failure, not a contract bug. When in doubt between edit_step and edit_contract, prefer edit_step (fix the work, not the check). autoApplicable=true.',
   '- Genuinely needs human judgment: kind=manual. autoApplicable=false.',
   'When kind=edit_step, newStepPrompt MUST be the COMPLETE replacement prompt for that step (not a diff), preserving the original intent and output contract, fixing only what caused the block. Set autoApplicable=true only then.',
   'Set confidence honestly. If the reason is vague, say so and prefer a conservative fix.',
@@ -381,6 +383,7 @@ function diagnoseRuntimeToolSurfaceBlock(input: DiagnoseInput): WorkflowDiagnosi
       stepId: primary.stepId,
       description: `Fix the workflow runtime so the full gated workflow-step lane advertises ${toolList}; do not reconnect or switch services unless the workflow intentionally changes its data source.`,
       newStepPrompt: null,
+      newOutputContractJson: null,
       service: null,
       autoApplicable: false,
     },
@@ -422,7 +425,8 @@ export async function judgeHealCrossFamily(
       name: 'HealVetoJudge',
       instructions: [
         'You are a strict reviewer of an AUTOMATED fix about to be applied to a production workflow without a human in the loop.',
-        'Approve ONLY when the rewritten step prompt plausibly addresses the diagnosed root cause AND does not weaken the step (dropping its deliverable, loosening its scope, or introducing a new external action).',
+        'For a step-prompt rewrite: approve ONLY when it plausibly addresses the diagnosed root cause AND does not weaken the step (dropping its deliverable, loosening its scope, or introducing a new external action).',
+        'For an output-contract change: approve ONLY when the new contract still verifies the step\'s real deliverable and the change reflects LEGITIMATE data variation (a key the data genuinely does not always carry, a count that was set too high) — NOT a loosening that would hide a genuinely empty or garbage output. A contract change that removes the only check catching bad data must be REJECTED.',
         'When uncertain, REJECT — a rejected fix is offered to the human instead of lost.',
       ].join('\n'),
       model: judge.modelId,
@@ -435,6 +439,7 @@ export async function judgeHealCrossFamily(
       `Proposed fix (${diagnosis.fix.kind}): ${diagnosis.fix.description}`,
       stepPrompt ? `Current step prompt:\n"""\n${stepPrompt.slice(0, 3000)}\n"""` : '',
       diagnosis.fix.newStepPrompt ? `Rewritten step prompt:\n"""\n${diagnosis.fix.newStepPrompt.slice(0, 3000)}\n"""` : '',
+      diagnosis.fix.newOutputContractJson ? `Proposed new output contract: ${diagnosis.fix.newOutputContractJson.slice(0, 1500)}` : '',
     ].filter(Boolean).join('\n\n');
     const result = await withJudgeTimeout(run(agent, prompt));
     const out = result?.finalOutput as z.infer<typeof HealVetoSchema> | undefined;
@@ -620,18 +625,71 @@ export interface ApplyResult {
   backupId?: string;
 }
 
+/** Auto-applicable fix kinds and the field each requires. edit_contract (RSH-1)
+ *  is the safest widening — it changes the step's output CONTRACT (validation),
+ *  not its behavior. Everything else still needs human action. */
+export function fixIsAutoApplicable(fix: WorkflowDiagnosis['fix']): boolean {
+  if (!fix.autoApplicable) return false;
+  if (fix.kind === 'edit_step') return Boolean(fix.newStepPrompt);
+  if (fix.kind === 'edit_contract') return Boolean(fix.newOutputContractJson && sanitizeOutputContract(fix.newOutputContractJson));
+  return false;
+}
+
+const CONTRACT_TYPES = new Set(['string', 'number', 'boolean', 'object', 'array']);
+
+/** Parse + sanitize a model-authored output contract JSON string. Accepts ONLY
+ *  the known WorkflowStepOutputContract keys with correct value types; drops
+ *  anything else. Returns null when the string is not a usable contract — so a
+ *  malformed model output can never be written to a workflow. Pure + exported
+ *  for tests. */
+export function sanitizeOutputContract(json: string | null | undefined): WorkflowStepOutputContract | null {
+  if (!json || typeof json !== 'string') return null;
+  let raw: unknown;
+  try { raw = JSON.parse(json); } catch { return null; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const out: WorkflowStepOutputContract = {};
+  if (typeof r.type === 'string' && CONTRACT_TYPES.has(r.type)) out.type = r.type as WorkflowStepOutputContract['type'];
+  if (Array.isArray(r.required_keys)) {
+    const keys = r.required_keys.filter((k): k is string => typeof k === 'string' && k.length > 0);
+    if (keys.length) out.required_keys = keys;
+  }
+  if (Array.isArray(r.non_empty)) {
+    const paths = r.non_empty.filter((k): k is string => typeof k === 'string');
+    if (paths.length) out.non_empty = paths;
+  }
+  if (r.min_items && typeof r.min_items === 'object' && !Array.isArray(r.min_items)) {
+    const mi: Record<string, number> = {};
+    for (const [k, v] of Object.entries(r.min_items as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0) mi[k] = Math.floor(v);
+    }
+    if (Object.keys(mi).length) out.min_items = mi;
+  }
+  if (r.verify && typeof r.verify === 'object' && !Array.isArray(r.verify)) {
+    const v = r.verify as Record<string, unknown>;
+    const verify: NonNullable<WorkflowStepOutputContract['verify']> = {};
+    if (Array.isArray(v.path_exists)) verify.path_exists = v.path_exists.filter((x): x is string => typeof x === 'string');
+    if (Array.isArray(v.url_present)) verify.url_present = v.url_present.filter((x): x is string => typeof x === 'string');
+    if (verify.path_exists?.length || verify.url_present?.length) out.verify = verify;
+  }
+  // A contract with no actual constraints is not a meaningful fix.
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 /**
- * Apply a proposed fix to its workflow. ONLY for kind=edit_step with a
- * complete newStepPrompt; everything else returns ok:false with guidance
- * (auth/reconnect/manual fixes need human action). The edited workflow is
- * re-validated through checkWorkflowForWrite before it is written, so a
- * fix can never write a workflow that would fail the gate.
+ * Apply a proposed fix to its workflow. Handles the auto-applicable kinds —
+ * edit_step (rewrite the step prompt) and edit_contract (correct the step's
+ * output contract); everything else returns ok:false with guidance (auth /
+ * reconnect / manual fixes need human action). The edited workflow is
+ * re-validated through checkWorkflowForWrite before it is written, so a fix
+ * can never write a workflow that would fail the gate, and the prior
+ * definition is snapshotted first so a bad heal is reversible.
  */
 export function applyProposedFix(id: string): ApplyResult {
   const fix = loadProposedFix(id);
   if (!fix) return { ok: false, message: `No proposed fix found with id "${id}".` };
   const d = fix.diagnosis;
-  if (d.fix.kind !== 'edit_step' || !d.fix.autoApplicable || !d.fix.newStepPrompt) {
+  if (!fixIsAutoApplicable(d.fix)) {
     return {
       ok: false,
       message: `This fix can't be applied automatically (${d.fix.kind}). ${d.fix.description}`,
@@ -643,9 +701,14 @@ export function applyProposedFix(id: string): ApplyResult {
   const idx = def.steps.findIndex((s) => s.id === fix.stepId);
   if (idx < 0) return { ok: false, message: `Step "${fix.stepId}" not found in "${fix.workflow}".` };
 
+  const editStep = (s: WorkflowStepInput): WorkflowStepInput => {
+    if (d.fix.kind === 'edit_step') return { ...s, prompt: d.fix.newStepPrompt as string };
+    // edit_contract: replace the output contract (sanitized above via fixIsAutoApplicable).
+    return { ...s, output: sanitizeOutputContract(d.fix.newOutputContractJson) as WorkflowStepOutputContract };
+  };
   const updated: WorkflowDefinition = {
     ...def,
-    steps: def.steps.map((s, i) => (i === idx ? { ...s, prompt: d.fix.newStepPrompt as string } : s)),
+    steps: def.steps.map((s, i) => (i === idx ? editStep(s) : s)),
   };
   const check = checkWorkflowForWrite(updated);
   if (!check.ok) {
@@ -655,7 +718,7 @@ export function applyProposedFix(id: string): ApplyResult {
   const backup = recordFixBackup(fix.workflow, fix.stepId, def, d.fix.description);
   writeWorkflow(fix.workflow, updated);
   dismissProposedFix(id);
-  logger.info({ workflow: fix.workflow, step: fix.stepId, fixId: id, backupId: backup?.id }, 'self-heal: applied workflow fix');
+  logger.info({ workflow: fix.workflow, step: fix.stepId, fixId: id, kind: d.fix.kind, backupId: backup?.id }, 'self-heal: applied workflow fix');
   const revertHint = backup ? ` If it doesn't help, revert with \`revert heal ${backup.id}\`.` : '';
   return {
     ok: true,

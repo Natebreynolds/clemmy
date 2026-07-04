@@ -28,6 +28,8 @@ const {
   listProposedFixes,
   dismissProposedFix,
   applyProposedFix,
+  fixIsAutoApplicable,
+  sanitizeOutputContract,
   revertWorkflowFix,
   listFixBackups,
   detectSelfReportedFailure,
@@ -206,7 +208,7 @@ test('renderLegibleOutcome: blocked + auto-applicable diagnosis offers the fix c
     diagnosis: {
       summary: 'The tracker sheet could not be found.',
       rootCause: 'The Drive query syntax was wrong.',
-      fix: { kind: 'edit_step', stepId: 'find_or_create_tracker', description: 'Use the correct Drive search.', newStepPrompt: 'NEW PROMPT', service: null, autoApplicable: true },
+      fix: { kind: 'edit_step', stepId: 'find_or_create_tracker', description: 'Use the correct Drive search.', newStepPrompt: 'NEW PROMPT', newOutputContractJson: null, service: null, autoApplicable: true },
       confidence: 'high',
     },
     fixId: 'fix-abc123',
@@ -247,7 +249,7 @@ test('diagnoseWorkflowBlock classifies missing local MCP tools as runtime/manual
 test('recordProposedFix → load → list → dismiss round-trips', () => {
   const diagnosis = {
     summary: 's', rootCause: 'r',
-    fix: { kind: 'edit_step' as const, stepId: 'main', description: 'd', newStepPrompt: 'P', service: null, autoApplicable: true },
+    fix: { kind: 'edit_step' as const, stepId: 'main', description: 'd', newStepPrompt: 'P', newOutputContractJson: null, service: null, autoApplicable: true },
     confidence: 'high' as const,
   };
   const fix = recordProposedFix('wf', 'run-1', diagnosis);
@@ -263,7 +265,7 @@ test('applyProposedFix refuses unknown id and non-auto-applicable fixes', () => 
 
   const reconnect = recordProposedFix('wf', 'run-2', {
     summary: 's', rootCause: 'r',
-    fix: { kind: 'reconnect_service' as const, stepId: 'main', description: 'Reconnect Google Drive.', newStepPrompt: null, service: 'Google Drive', autoApplicable: false },
+    fix: { kind: 'reconnect_service' as const, stepId: 'main', description: 'Reconnect Google Drive.', newStepPrompt: null, newOutputContractJson: null, service: 'Google Drive', autoApplicable: false },
     confidence: 'high' as const,
   });
   const res = applyProposedFix(reconnect.id);
@@ -280,7 +282,7 @@ test('applyProposedFix snapshots a backup, and revertWorkflowFix restores the pr
   } as never);
   const fix = recordProposedFix('revert-wf', 'run-r', {
     summary: 's', rootCause: 'r',
-    fix: { kind: 'edit_step' as const, stepId: 'main', description: 'rewrite it', newStepPrompt: 'REWRITTEN step prompt', service: null, autoApplicable: true },
+    fix: { kind: 'edit_step' as const, stepId: 'main', description: 'rewrite it', newStepPrompt: 'REWRITTEN step prompt', newOutputContractJson: null, service: null, autoApplicable: true },
     confidence: 'high' as const,
   });
   const applied = applyProposedFix(fix.id);
@@ -299,4 +301,58 @@ test('applyProposedFix snapshots a backup, and revertWorkflowFix restores the pr
 
 test('revertWorkflowFix on an unknown id fails cleanly', () => {
   assert.equal(revertWorkflowFix('heal-nope').ok, false);
+});
+
+// ─── RSH-1: edit_contract auto-apply ─────────────────────────────────────────
+
+test('sanitizeOutputContract: keeps known keys, drops garbage, rejects unusable', () => {
+  assert.deepEqual(sanitizeOutputContract('{"type":"object","required_keys":["name","email"]}'),
+    { type: 'object', required_keys: ['name', 'email'] });
+  assert.deepEqual(sanitizeOutputContract('{"type":"array","min_items":{"":1}}'),
+    { type: 'array', min_items: { '': 1 } });
+  // unknown keys + bad value types are stripped
+  assert.deepEqual(sanitizeOutputContract('{"type":"object","required_keys":["a",5],"bogus":true,"min_items":{"x":"nope"}}'),
+    { type: 'object', required_keys: ['a'] });
+  // not usable → null (never written to a workflow)
+  assert.equal(sanitizeOutputContract('not json'), null);
+  assert.equal(sanitizeOutputContract('{}'), null);
+  assert.equal(sanitizeOutputContract('[1,2,3]'), null);
+  assert.equal(sanitizeOutputContract(null), null);
+});
+
+test('fixIsAutoApplicable: edit_contract needs a sanitizable contract; edit_step needs a prompt', () => {
+  const base = { stepId: 's', description: 'd', service: null };
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_contract', newStepPrompt: null, newOutputContractJson: '{"type":"object","required_keys":["x"]}', autoApplicable: true }), true);
+  // autoApplicable=false always blocks
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_contract', newStepPrompt: null, newOutputContractJson: '{"type":"object","required_keys":["x"]}', autoApplicable: false }), false);
+  // garbage contract → not auto-applicable even if the model claims it is
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_contract', newStepPrompt: null, newOutputContractJson: 'garbage', autoApplicable: true }), false);
+  // reconnect/manual never auto-apply
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'reconnect_service', newStepPrompt: null, newOutputContractJson: null, autoApplicable: true }), false);
+});
+
+test('applyProposedFix: an edit_contract fix replaces the step output contract, backed up + revertible', () => {
+  writeWorkflow('contract-wf', {
+    name: 'contract-wf', description: 'c', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'gather', prompt: 'gather leads', output: { type: 'object', required_keys: ['name', 'email', 'phone'] } }],
+  } as never);
+  // the too-strict contract required `phone`; loosen it to what the data always has
+  const fix = recordProposedFix('contract-wf', 'run-c', {
+    summary: 's', rootCause: 'contract required phone which records legitimately omit',
+    fix: {
+      kind: 'edit_contract' as const, stepId: 'gather', description: 'drop phone from required_keys',
+      newStepPrompt: null, newOutputContractJson: '{"type":"object","required_keys":["name","email"]}',
+      service: null, autoApplicable: true,
+    },
+    confidence: 'high' as const,
+  });
+  const applied = applyProposedFix(fix.id);
+  assert.equal(applied.ok, true, applied.message);
+  assert.ok(applied.backupId);
+  assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, { type: 'object', required_keys: ['name', 'email'] });
+
+  // revert restores the original (stricter) contract
+  const reverted = revertWorkflowFix(applied.backupId!);
+  assert.equal(reverted.ok, true, reverted.message);
+  assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, { type: 'object', required_keys: ['name', 'email', 'phone'] });
 });

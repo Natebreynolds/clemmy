@@ -511,6 +511,7 @@ function diagnosis(stepId: string, kind: WorkflowDiagnosis['fix']['kind'] = 'edi
       stepId,
       description: 'Rewrite the step to use the correct tool slug.',
       newStepPrompt: kind === 'edit_step' ? `Scrape the directory and return rows (step ${stepId}).` : null,
+      newOutputContractJson: null,
       service: kind === 'reconnect_service' ? 'Google Drive' : null,
       autoApplicable: kind === 'edit_step',
     },

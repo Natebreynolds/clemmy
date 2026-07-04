@@ -1815,7 +1815,26 @@ function editStepDiagnosis(stepId: string, autoApplicable = true, kind: 'edit_st
       stepId,
       description: 'Bind the step to the proven sf CLI.',
       newStepPrompt: kind === 'edit_step' ? `Query Salesforce. Use this exact, proven command: \`sf data query --json --query "SELECT Id FROM Account"\` via run_shell_command.` : null,
+      newOutputContractJson: null,
       service: kind === 'reconnect_service' ? 'Salesforce' : null,
+      autoApplicable,
+    },
+    confidence: 'high' as const,
+  };
+}
+
+/** RSH-1: an edit_contract fix — corrects a too-strict output contract. */
+function editContractDiagnosis(stepId: string, contractJson: string, autoApplicable = true) {
+  return {
+    summary: 'The step produced valid data but its contract was too strict.',
+    rootCause: 'The declared output contract required a key the real data legitimately omits.',
+    fix: {
+      kind: 'edit_contract' as const,
+      stepId,
+      description: 'Loosen the output contract to match the real data shape.',
+      newStepPrompt: null,
+      newOutputContractJson: contractJson,
+      service: null,
       autoApplicable,
     },
     confidence: 'high' as const,
@@ -1868,6 +1887,74 @@ test('self-heal: below cap → applies the edit_step fix + re-queues a fresh run
   // T3.2: the healed re-run carries the reversible backup id so a non-stick
   // heal auto-reverts.
   assert.equal(typeof (fresh[0] as { selfHealBackupId?: string }).selfHealBackupId, 'string', 'carries the heal backup id');
+  delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
+});
+
+test('self-heal RSH-1: an edit_contract fix auto-applies (loosens the contract) + re-queues', async () => {
+  process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
+  const wf = 'heal-contract';
+  writeHealWorkflow(wf, [{ id: 'gather', prompt: 'Gather leads and return them.' }]);
+  // give the step a too-strict contract, then heal it
+  const entry = (await import('../memory/workflow-store.js'));
+  const cur = entry.readWorkflow(wf)!.data;
+  entry.writeWorkflow(wf, { ...cur, steps: [{ ...cur.steps[0], output: { type: 'object', required_keys: ['name', 'email', 'phone'] } }] });
+  const origId = `${wf}-run`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed', originSessionId: 'sess-c' }), 'utf-8');
+  const diag = editContractDiagnosis('gather', '{"type":"object","required_keys":["name","email"]}');
+  const fix = recordProposedFix(wf, origId, diag as never);
+
+  const out = await workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+    run: { id: origId, workflow: wf, originSessionId: 'sess-c', selfHealAttempt: 0 },
+    workflowSlug: wf,
+    steps: [{ id: 'gather', prompt: 'Gather leads and return them.' }] as never,
+    diagnosis: diag as never,
+    proposedFix: fix,
+    completedStepIds: new Set(['gather']),
+    // RSH-2: the real output satisfies the loosened contract → probe passes.
+    rawStepOutputs: { gather: { name: 'Ada', email: 'ada@x.co' } },
+  });
+  assert.ok(out, 'contract heal fired');
+  // the workflow's contract was loosened on disk
+  assert.deepEqual(entry.readWorkflow(wf)!.data.steps[0].output, { type: 'object', required_keys: ['name', 'email'] });
+  // and a fresh re-run was queued carrying the backup id for auto-revert
+  const fresh = freshRunsFor(wf, origId) as Array<{ selfHealBackupId?: string }>;
+  assert.equal(fresh.length, 1);
+  assert.equal(typeof fresh[0].selfHealBackupId, 'string');
+  delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
+});
+
+test('self-heal RSH-2: probe blocks a doomed contract fix (real output still fails it) — no apply, no re-run', async () => {
+  process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
+  const wf = 'heal-probe-block';
+  writeHealWorkflow(wf, [{ id: 'gather', prompt: 'Gather leads.' }]);
+  const entry = (await import('../memory/workflow-store.js'));
+  const cur = entry.readWorkflow(wf)!.data;
+  const strict = { type: 'object' as const, required_keys: ['name', 'email', 'phone'] };
+  entry.writeWorkflow(wf, { ...cur, steps: [{ ...cur.steps[0], output: strict }] });
+  const origId = `${wf}-run`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${origId}.json`),
+    JSON.stringify({ id: origId, workflow: wf, inputs: {}, status: 'completed' }), 'utf-8');
+  // the Doctor proposes requiring [name,email] — but the REAL output only has name,
+  // so even the data we have would fail the "fixed" contract → probe must reject.
+  const diag = editContractDiagnosis('gather', '{"type":"object","required_keys":["name","email"]}');
+  const fix = recordProposedFix(wf, origId, diag as never);
+
+  const out = await workflowRunnerInternalsForTest.tryAutoHealAndRequeue({
+    run: { id: origId, workflow: wf, selfHealAttempt: 0 },
+    workflowSlug: wf,
+    steps: [{ id: 'gather', prompt: 'Gather leads.' }] as never,
+    diagnosis: diag as never,
+    proposedFix: fix,
+    completedStepIds: new Set(['gather']),
+    rawStepOutputs: { gather: { name: 'Ada' } }, // missing email → fails the proposed contract
+  });
+  assert.equal(out, null, 'doomed contract fix → escalate, do not auto-heal');
+  // the workflow contract is UNTOUCHED (fix never applied) and no re-run queued
+  assert.deepEqual(entry.readWorkflow(wf)!.data.steps[0].output, strict);
+  assert.equal(freshRunsFor(wf, origId).length, 0, 'no wasted re-run');
   delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
 });
 
