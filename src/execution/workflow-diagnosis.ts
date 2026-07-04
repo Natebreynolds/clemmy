@@ -360,6 +360,37 @@ export interface DiagnoseInput {
   workflow: WorkflowDefinition;
   blockedSteps: BlockedStep[];
   toolErrors?: string[];
+  /** RSH-4: upstream READ steps that produced NO data yet feed a downstream
+   *  step (from detectEmptyDeliverableReads). When the first blocked step is
+   *  one of those consumers, the ROOT cause is the empty producer, not the
+   *  symptom — so we re-root the diagnosis onto the producer. */
+  upstreamEmptyProducers?: Array<{ stepId: string; consumerId: string; shape: string }>;
+}
+
+/**
+ * RSH-4 (multi-step chain diagnosis): the Doctor diagnoses blockedSteps[0], but
+ * a step often blocks only because an UPSTREAM step produced empty/no data
+ * (the silent-nothing chain). When the first blocked step is a known consumer
+ * of an empty producer — and that producer isn't already in the blocked list —
+ * prepend the producer as the real root so the fix targets the cause, not the
+ * symptom. Pure + exported for tests.
+ */
+export function prependRootCauseBlock(
+  blockedSteps: BlockedStep[],
+  emptyProducers: Array<{ stepId: string; consumerId: string; shape: string }>,
+): BlockedStep[] {
+  const first = blockedSteps[0];
+  if (!first) return blockedSteps;
+  const already = new Set(blockedSteps.map((b) => b.stepId));
+  // find the empty producer whose consumer IS the current root blocked step
+  const producer = emptyProducers.find((e) => e.consumerId === first.stepId && !already.has(e.stepId));
+  if (!producer) return blockedSteps;
+  const rootBlock: BlockedStep = {
+    stepId: producer.stepId,
+    reason: `Step "${producer.stepId}" produced empty output (${producer.shape}), which starved downstream step "${first.stepId}" — that step then blocked because it had no data to work with. The ROOT cause is likely here (e.g. a query that returned nothing, an expired connection, a wrong filter), not in "${first.stepId}".`,
+    kind: 'blocked',
+  };
+  return [rootBlock, ...blockedSteps];
 }
 
 function diagnoseRuntimeToolSurfaceBlock(input: DiagnoseInput): WorkflowDiagnosis | null {
@@ -459,9 +490,12 @@ export async function judgeHealCrossFamily(
 }
 
 export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<WorkflowDiagnosis | null> {
-  const primary = input.blockedSteps[0];
+  // RSH-4: re-root onto an upstream empty producer when the first blocked step
+  // only inherited its failure.
+  const blockedSteps = prependRootCauseBlock(input.blockedSteps, input.upstreamEmptyProducers ?? []);
+  const primary = blockedSteps[0];
   if (!primary) return null;
-  const runtimeDiagnosis = diagnoseRuntimeToolSurfaceBlock(input);
+  const runtimeDiagnosis = diagnoseRuntimeToolSurfaceBlock({ ...input, blockedSteps });
   if (runtimeDiagnosis) return runtimeDiagnosis;
   const step = input.workflow.steps.find((s) => s.id === primary.stepId);
   const agent = new Agent({
@@ -483,8 +517,8 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
       ? `Actual tool errors observed during the step:\n${input.toolErrors.slice(0, 5).join('\n')}`
       : '',
     step?.prompt ? `The step's current prompt:\n"""\n${step.prompt.slice(0, 4000)}\n"""` : '(step prompt unavailable)',
-    input.blockedSteps.length > 1
-      ? `Other steps that also blocked (likely downstream of this one): ${input.blockedSteps.slice(1).map((b) => b.stepId).join(', ')}`
+    blockedSteps.length > 1
+      ? `Other steps that also blocked (likely downstream of this one): ${blockedSteps.slice(1).map((b) => b.stepId).join(', ')}`
       : '',
   ].filter(Boolean).join('\n\n');
 

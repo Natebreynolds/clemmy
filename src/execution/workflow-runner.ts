@@ -5439,6 +5439,9 @@ async function processOneRunFile(
           blockedSteps: diagnosableBlocks,
           // The step's blocked reason usually carries the real tool error.
           toolErrors: diagnosableBlocks.map((b) => b.reason),
+          // RSH-4: upstream reads that produced nothing but feed a downstream
+          // step — so the Doctor can re-root a symptom block onto its real cause.
+          upstreamEmptyProducers: detectEmptyDeliverableReads(workflow.data.steps, rawStepOutputs),
         });
         if (diagnosis) {
           proposedFix = recordProposedFix(workflow.name, run.id, diagnosis);

@@ -38,6 +38,7 @@ const {
   deepSelfReportedFailure,
   detectProseSelfReportedFailure,
   diagnoseWorkflowBlock,
+  prependRootCauseBlock,
 } = mod;
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 
@@ -303,6 +304,29 @@ test('applyProposedFix snapshots a backup, and revertWorkflowFix restores the pr
 
 test('revertWorkflowFix on an unknown id fails cleanly', () => {
   assert.equal(revertWorkflowFix('heal-nope').ok, false);
+});
+
+// ─── RSH-4: multi-step chain diagnosis ───────────────────────────────────────
+
+test('prependRootCauseBlock: re-roots onto an upstream empty producer of the blocked step', () => {
+  // step "draft" blocked, but it consumes "gather" which produced NOTHING → root is gather
+  const blocked = [{ stepId: 'draft', reason: 'no leads to draft', kind: 'blocked' as const }];
+  const empties = [{ stepId: 'gather', consumerId: 'draft', shape: 'empty array' }];
+  const rerooted = prependRootCauseBlock(blocked, empties);
+  assert.equal(rerooted[0].stepId, 'gather', 'the empty producer becomes the root');
+  assert.match(rerooted[0].reason, /produced empty output.*starved.*draft/s);
+  assert.equal(rerooted[1].stepId, 'draft', 'the symptom is kept downstream');
+});
+
+test('prependRootCauseBlock: no-op when the block is not a consumer of an empty producer, or the producer already blocked', () => {
+  const blocked = [{ stepId: 'draft', reason: 'x', kind: 'blocked' as const }];
+  // empty producer feeds a DIFFERENT step → no re-root
+  assert.deepEqual(prependRootCauseBlock(blocked, [{ stepId: 'g', consumerId: 'other', shape: 's' }]), blocked);
+  // no empties at all → unchanged
+  assert.deepEqual(prependRootCauseBlock(blocked, []), blocked);
+  // producer already in the blocked list → don't duplicate it
+  const withProducer = [{ stepId: 'draft', reason: 'x', kind: 'blocked' as const }, { stepId: 'gather', reason: 'y', kind: 'blocked' as const }];
+  assert.deepEqual(prependRootCauseBlock(withProducer, [{ stepId: 'gather', consumerId: 'draft', shape: 's' }]), withProducer);
 });
 
 // ─── RSH-1: edit_contract auto-apply ─────────────────────────────────────────
