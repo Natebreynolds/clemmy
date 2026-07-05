@@ -270,6 +270,21 @@ export function offloadContextValue(args: {
   return { path: rel, summary, bytes };
 }
 
+/** Persist / read the checker agent's latest report for a run (shown in the
+ *  window). Typed as unknown to avoid a cycle with the checker module. */
+export function writeWorkspaceCheckerReport(workflowName: string, runId: string, report: unknown): void {
+  ensureRunWorkspace(workflowName, runId);
+  writeFileSync(path.join(runWorkspaceDir(workflowName, runId), 'checker.json'), JSON.stringify(report, null, 2), 'utf-8');
+}
+
+export function readWorkspaceCheckerReport(workflowName: string, runId: string): unknown | null {
+  try {
+    return JSON.parse(readFileSync(path.join(runWorkspaceDir(workflowName, runId), 'checker.json'), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
 /** Total bytes currently offloaded to the workspace (for the visual window). */
 export function workspaceArtifactBytes(workflowName: string, runId: string): number {
   const dir = artifactsDir(workflowName, runId);

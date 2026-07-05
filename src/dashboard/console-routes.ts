@@ -93,7 +93,8 @@ import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js'
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import { simulateWorkflowDryRun } from '../execution/workflow-dry-run-simulation.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
-import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes } from '../execution/workflow-run-workspace.js';
+import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes, readWorkspaceCheckerReport, writeWorkspaceCheckerReport } from '../execution/workflow-run-workspace.js';
+import { checkRunAgainstGoal } from '../execution/workflow-run-checker.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
 import {
   applyWorkflowVisualContractFixes,
@@ -4075,7 +4076,31 @@ export function registerConsoleRoutes(
       goal,
       artifacts,
       totalBytes: workspaceArtifactBytes(entry.name, req.params.runId),
+      checker: readWorkspaceCheckerReport(entry.name, req.params.runId),
     });
+  });
+
+  // Run the CHECKER agent: a second agent reads the shared workspace (goal +
+  // every step's work product) and judges it against the goal's criteria, then
+  // persists the verdict so the window shows it. This is "agents checking each
+  // other's work". Uses the real cross-family judge (default deps).
+  app.post('/api/console/workflows/:name/runs/:runId/check', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    try {
+      const report = await checkRunAgainstGoal({
+        workflowName: entry.name,
+        runId: req.params.runId,
+        objective: entry.data.goal?.objective?.trim() || entry.data.description?.trim() || `Deliver "${entry.data.name}"`,
+        successCriteria: entry.data.goal?.successCriteria,
+        checkedAt: new Date().toISOString(),
+      });
+      writeWorkspaceCheckerReport(entry.name, req.params.runId, report);
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.get('/api/console/workflows/:name/runs/:runId/failed-items', (req, res) => {

@@ -6168,6 +6168,12 @@ body {
 .wf-workspace { margin-top: 8px; }
 .wf-workspace .wf-ws-size { color: var(--fg-mute); font-size: 10px; font-family: var(--mono); }
 .wf-workspace strong { color: var(--fg); }
+.wf-check-btn {
+  background: var(--bg-2); border: 1px solid var(--line); color: var(--fg-2);
+  font: 10px var(--mono); letter-spacing: 0.1em; padding: 6px 12px; cursor: pointer;
+}
+.wf-check-btn:hover { border-color: var(--accent); color: var(--fg); }
+.wf-check-btn:disabled { opacity: 0.55; cursor: default; }
 .wf-exec-grid span,
 .wf-exec-row span {
   display: block; margin-bottom: 4px; font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute);
@@ -16827,12 +16833,37 @@ const CONSOLE_JS = `
     const kb = (n) => (Number(n) / 1024).toFixed(1) + 'KB';
     const rows = artifacts.map((a) => '<p><strong>' + escMem(String(a.agent || '')) + '</strong> '
       + '<span class="wf-ws-size">' + escMem(kb(a.bytes)) + '</span> — ' + escMem(String(a.summary || '')) + '</p>').join('');
+    const checker = data.checker;
+    const unmet = checker && Array.isArray(checker.perCriterion) ? checker.perCriterion.filter((c) => !c.pass) : [];
+    const checkerHtml = checker
+      ? '  <div class="wf-exec-row' + (checker.pass ? '' : ' warn') + '"><span>CHECKER</span><p>'
+        + (checker.pass ? '✅ ' : '⚠️ ') + escMem(String(checker.summary || '')) + '</p>'
+        + unmet.map((c) => '<p>✗ ' + escMem(String(c.criterion)) + (c.detail ? ' — ' + escMem(String(c.detail)) : '') + '</p>').join('')
+        + '</div>'
+      : '';
     el.innerHTML = [
       '<section class="wf-exec-plan wf-workspace">',
       '  <div class="wf-exec-head"><strong>WORKSPACE</strong><span>' + escMem(String(artifacts.length) + ' work products · ' + kb(data.totalBytes || 0)) + '</span></div>',
       '  <div class="wf-exec-row"><span>WHAT EACH STEP PRODUCED</span>' + rows + '</div>',
+      checkerHtml,
+      '  <div class="wf-exec-row"><button type="button" class="wf-check-btn" data-wf-check-run>◉ CHECK WORK AGAINST GOAL</button></div>',
       '</section>',
     ].join('');
+    const btn = el.querySelector('[data-wf-check-run]');
+    if (btn) btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = '◉ CHECKING…';
+      try {
+        const token = new URLSearchParams(location.search).get('token');
+        const q = token ? ('?token=' + encodeURIComponent(token)) : '';
+        await fetch('/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+          + '/runs/' + encodeURIComponent(data.runId) + '/check' + q, { method: 'POST' });
+        const ws = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+          + '/runs/' + encodeURIComponent(data.runId) + '/workspace');
+        renderWorkflowRunWorkspace(ws);
+      } catch (_) {
+        btn.disabled = false; btn.textContent = '◉ CHECK WORK AGAINST GOAL';
+      }
+    };
   }
 
   // Live-run cockpit — the SAME execution-wave layout as the dry-run card, but
