@@ -36,6 +36,7 @@ import {
   expireGoal,
 } from '../agents/plan-proposals.js';
 import { loadSkill } from '../memory/skill-store.js';
+import { anchorRunGoal } from './workflow-run-workspace.js';
 import {
   appendWorkflowEvent,
   computeResumeState,
@@ -3992,6 +3993,16 @@ async function executeWorkflow(
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
+
+  // Anchor the shared run workspace on this run's goal — the objective + learned
+  // success criteria every step/agent references, and the file the checker agent
+  // and the live window read. Best-effort; a workspace hiccup never blocks a run.
+  try {
+    anchorRunGoal(workflowSlug, runId, {
+      objective: workflow.goal?.objective?.trim() || workflow.description?.trim() || `Deliver "${workflow.name}"`,
+      successCriteria: workflow.goal?.successCriteria,
+    });
+  } catch { /* best-effort */ }
 
   // Wave 3 P0-3: crash-resume idempotency guard. A step that started but never
   // completed (crash / daemon restart) and performs an external side effect

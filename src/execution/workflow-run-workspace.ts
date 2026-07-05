@@ -207,6 +207,39 @@ function safeStringify(value: unknown): string {
   }
 }
 
+export function runWorkspaceOffloadEnabled(): boolean {
+  return (process.env.CLEMMY_RUN_WORKSPACE_OFFLOAD ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+/**
+ * Offload a large cross-step CONTEXT value to the shared workspace under a
+ * DETERMINISTIC per-key path, so every downstream step that depends on the same
+ * upstream output points at ONE artifact (no duplicate blobs) and can read the
+ * exact full value with read_file instead of a lossy inline preview. Idempotent:
+ * writes the file + manifest entry once per (run, key).
+ */
+export function offloadContextValue(args: {
+  workflowName: string;
+  runId: string;
+  key: string;
+  value: unknown;
+  nowIso: string;
+}): { path: string; summary: string; bytes: number } {
+  const rel = path.join('artifacts', `context-${safeSegment(args.key, 'value')}.json`);
+  const abs = path.join(runWorkspaceDir(args.workflowName, args.runId), rel);
+  const serialized = safeStringify(args.value);
+  const bytes = Buffer.byteLength(serialized, 'utf-8');
+  const summary = summarizeToolOutput(args.value);
+  if (!existsSync(abs)) {
+    ensureRunWorkspace(args.workflowName, args.runId);
+    writeFileSync(abs, serialized, 'utf-8');
+    recordArtifact(args.workflowName, args.runId, {
+      path: rel, tool: 'step-context', agent: args.key, bytes, summary, producedAt: args.nowIso,
+    });
+  }
+  return { path: rel, summary, bytes };
+}
+
 /** Total bytes currently offloaded to the workspace (for the visual window). */
 export function workspaceArtifactBytes(workflowName: string, runId: string): number {
   const dir = artifactsDir(workflowName, runId);
