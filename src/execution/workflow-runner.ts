@@ -36,7 +36,8 @@ import {
   expireGoal,
 } from '../agents/plan-proposals.js';
 import { loadSkill } from '../memory/skill-store.js';
-import { anchorRunGoal, recordStepOutput } from './workflow-run-workspace.js';
+import { anchorRunGoal, recordStepOutput, writeWorkspaceCheckerReport } from './workflow-run-workspace.js';
+import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import {
   appendWorkflowEvent,
   computeResumeState,
@@ -5485,6 +5486,15 @@ async function processOneRunFile(
           evidenceText: buildGoalEvidenceText(finalOutput, stepOutputs),
         });
         goalFeedbackNext = renderGoalFeedback(goalVerdict);
+        // Auto-checker: reuse the verdict just computed (no second judge call)
+        // and persist it to the shared workspace so the run window ALWAYS shows
+        // the checker's read on this run — no click needed. Best-effort.
+        try {
+          writeWorkspaceCheckerReport(
+            workflow.name, run.id,
+            checkerReportFromVerdict(run.id, goalVerdict, Object.keys(stepOutputs), new Date().toISOString()),
+          );
+        } catch { /* best-effort — checker persistence never affects the run */ }
         // Contract row (plan-proposals, origin kind 'workflow'): the pinned
         // goal's external home — attempt lineage + per-criterion evidence
         // accumulate across re-pursuit runs, visible to /goal status. Pure

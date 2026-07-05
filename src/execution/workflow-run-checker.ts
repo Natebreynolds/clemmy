@@ -14,7 +14,7 @@
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { validateGoal, type GoalCriterionVerdict, type ValidateGoalDeps } from './goal-validate.js';
+import { validateGoal, type GoalCriterionVerdict, type GoalValidationResult, type ValidateGoalDeps } from './goal-validate.js';
 import { readRunGoal, readWorkspaceManifest, runWorkspaceDir, type WorkspaceArtifact } from './workflow-run-workspace.js';
 
 /** How much of each step's work product the checker reads as evidence — a
@@ -108,6 +108,30 @@ function renderCheckerSummary(pass: boolean, met: number, total: number, steps: 
   return pass
     ? `Checker: work meets the goal — ${bar} ${across}.`
     : `Checker: work does NOT yet meet the goal — ${bar} ${across}.`;
+}
+
+/**
+ * Build a checker report from a goal verdict the runner ALREADY computed at
+ * completion — so the auto-check on run completion reuses that verdict instead
+ * of paying for a second judge call. `evidenceSteps` are the completed step ids.
+ */
+export function checkerReportFromVerdict(
+  runId: string,
+  verdict: GoalValidationResult,
+  evidenceSteps: string[],
+  checkedAt: string,
+): CheckerReport {
+  const metCount = verdict.perCriterion.filter((c) => c.pass).length;
+  return {
+    runId,
+    pass: verdict.pass,
+    perCriterion: verdict.perCriterion,
+    metCount,
+    unmetCount: verdict.perCriterion.length - metCount,
+    evidenceSteps,
+    checkedAt,
+    summary: renderCheckerSummary(verdict.pass, metCount, verdict.perCriterion.length, evidenceSteps.length),
+  };
 }
 
 /** Human-readable checker report for chat / the run window. */

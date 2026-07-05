@@ -12,7 +12,7 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 const { anchorRunGoal, recordStepOutput } = await import('./workflow-run-workspace.js');
-const { buildWorkspaceEvidence, checkRunAgainstGoal, renderCheckerReport } = await import('./workflow-run-checker.js');
+const { buildWorkspaceEvidence, checkRunAgainstGoal, renderCheckerReport, checkerReportFromVerdict } = await import('./workflow-run-checker.js');
 
 test.after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
 
@@ -73,6 +73,22 @@ test('a run with no work products yet is not-yet-verifiable, never a false pass'
   assert.equal(report.pass, false);
   assert.equal(report.evidenceSteps.length, 0);
   assert.match(report.summary, /nothing to verify/);
+});
+
+test('checkerReportFromVerdict reuses a completion verdict without a second judge call', () => {
+  const verdict = {
+    pass: false,
+    perCriterion: [
+      { criterion: 'Must mention the prospect company', pass: true, method: 'judge' as const },
+      { criterion: 'Must not be too generic', pass: false, method: 'judge' as const, detail: 'reads generic' },
+    ],
+  };
+  const report = checkerReportFromVerdict('r7', verdict, ['pull', 'draft'], NOW);
+  assert.equal(report.pass, false);
+  assert.equal(report.metCount, 1);
+  assert.equal(report.unmetCount, 1);
+  assert.deepEqual(report.evidenceSteps, ['pull', 'draft']);
+  assert.match(report.summary, /1\/2 criteria met across 2 step work-products/);
 });
 
 test('renderCheckerReport lists unmet criteria for a flagged run', async () => {
