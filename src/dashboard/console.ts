@@ -6148,6 +6148,22 @@ body {
 }
 .wf-exec-row { margin-top: 8px; }
 .wf-exec-row.warn { border-left: 2px solid var(--accent-warn); }
+.wf-cockpit-card:empty { display: none; }
+.wf-cockpit { margin-top: 8px; }
+.wf-cockpit-wave {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;
+  padding-left: 10px; border-left: 2px solid var(--line);
+}
+.wf-cockpit-step {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 3px;
+  padding: 3px 8px; font: 11px var(--mono); color: var(--fg-2);
+}
+.wf-cockpit-step .wf-cockpit-metric { color: var(--fg-mute); font-size: 10px; }
+.wf-cockpit-step.status-running { border-color: var(--accent); color: var(--fg); }
+.wf-cockpit-step.status-done { border-color: var(--accent-ok, #3ba55d); }
+.wf-cockpit-step.status-failed { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-cockpit-step.status-skipped { opacity: 0.55; }
 .wf-exec-grid span,
 .wf-exec-row span {
   display: block; margin-bottom: 4px; font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute);
@@ -16796,6 +16812,50 @@ const CONSOLE_JS = `
     return status + (when ? ' · ' + fmtCronAgo(when) : '') + (run.id ? ' · ' + run.id : '');
   }
 
+  // Live-run cockpit — the SAME execution-wave layout as the dry-run card, but
+  // lit with real per-step status from the run-overlay poll. The dry-run's
+  // "📤 will send" becomes "✓ / ⟳ / ✗" on the identical picture, so preview and
+  // execution read as one continuous view. Filled by renderWorkflowRunCockpit()
+  // on each overlay apply; empty (hidden) when no run is selected.
+  function renderWorkflowRunCockpit() {
+    const el = document.querySelector('[data-wf-cockpit]');
+    if (!el) return;
+    const rows = wfGraphOverlayByStep ? Object.keys(wfGraphOverlayByStep).map((k) => wfGraphOverlayByStep[k]) : [];
+    if (!rows.length) { el.innerHTML = ''; return; }
+    const s = wfGraphOverlaySummary || {};
+    const icon = { running: '⟳', done: '✓', failed: '✗', skipped: '⊝', pending: '·' };
+    const byWave = {};
+    rows.forEach((r) => {
+      const w = Number.isFinite(Number(r.readyRound)) ? Number(r.readyRound) : 0;
+      (byWave[w] = byWave[w] || []).push(r);
+    });
+    const waveKeys = Object.keys(byWave).map(Number).sort((a, b) => a - b);
+    const metric = (r) => {
+      const bits = [];
+      if (Number(r.retries) > 0) bits.push('↻' + r.retries);
+      if (Number(r.toolCalls) > 0) bits.push('⚙' + r.toolCalls);
+      if (Number(r.itemsStarted) > 0) bits.push(String(r.itemsCompleted || 0) + '/' + String(r.itemsStarted) + ' items' + (Number(r.itemsFailed) > 0 ? ' ✗' + r.itemsFailed : ''));
+      if (Number(r.externalWrites) > 0) bits.push('📤' + r.externalWrites);
+      if (Number(r.durationMs) > 0) bits.push(fmtDurationMs(r.durationMs));
+      return bits.length ? ' <span class="wf-cockpit-metric">' + escMem(bits.join(' · ')) + '</span>' : '';
+    };
+    const chip = (r) => '<span class="wf-cockpit-step status-' + escMem(String(r.status || 'pending')) + '">'
+      + (icon[r.status] || '·') + ' ' + escMem(r.stepId) + metric(r) + '</span>';
+    const head = [
+      String(Number(s.doneSteps) || 0) + '/' + String(Number(s.totalSteps) || rows.length) + ' done',
+      Number(s.runningSteps) > 0 ? String(s.runningSteps) + ' running' : '',
+      Number(s.failedSteps) > 0 ? String(s.failedSteps) + ' failed' : '',
+    ].filter(Boolean).join(' · ');
+    el.innerHTML = [
+      '<section class="wf-exec-plan wf-cockpit' + (Number(s.failedSteps) > 0 ? ' warn' : '') + '">',
+      '  <div class="wf-exec-head"><strong>LIVE RUN</strong><span>' + escMem(head) + '</span></div>',
+      waveKeys.map((w) => '  <div class="wf-cockpit-wave">'
+        + byWave[w].sort((a, b) => Number(a.laneIndex || 0) - Number(b.laneIndex || 0)).map(chip).join('')
+        + '</div>').join(''),
+      '</section>',
+    ].join('');
+  }
+
   function renderWorkflowProofCard(proof) {
     if (!proof) return '';
     const stateClass = workflowLifecycleClass(proof);
@@ -18999,6 +19059,7 @@ const CONSOLE_JS = `
     wfGraphOverlayRecoveryLineage = [];
 	    wfGraphOverlayRunId = '';
 	    updateWorkflowGraphOverlaySummary();
+    renderWorkflowRunCockpit();
     if (!wfGraphCy) return;
     try {
       wfClearRecoveryLineageGraph();
@@ -19127,6 +19188,7 @@ const CONSOLE_JS = `
         wfRenderRecoveryLineageGraph();
       } catch (_) { /* ignore */ }
     }
+    renderWorkflowRunCockpit();
     const fallback = document.querySelectorAll('[data-wf-graph-step]');
     fallback.forEach((li) => {
       const row = wfGraphOverlayByStep[li.getAttribute('data-wf-graph-step') || ''];
@@ -19465,6 +19527,7 @@ const CONSOLE_JS = `
       renderWorkflowProofCard(d.proof),
       renderWorkflowExecutionPlanCard(d.executionPlan),
       renderWorkflowDryRunCard(d.dryRunSimulation),
+      '<div class="wf-cockpit-card" data-wf-cockpit></div>',
       d.summary ? '<div class="wf-visual-summary pe-md">' + renderTinyMarkdown(d.summary) + '</div>' : '',
       '  <div class="wf-visual-head"><span>FLOW</span><span class="wf-visual-run-summary" data-wf-graph-overlay-summary></span><span class="wf-visual-legend">READ/WRITE/SEND · CALL/DETERMINISTIC/MODEL · 🔁 loop · 🔒 approval · 🧩 skill</span></div>',
       '  <div class="wf-graph" data-wf-graph><div class="wf-graph-empty">— rendering flow —</div></div>',
