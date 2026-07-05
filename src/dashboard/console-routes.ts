@@ -93,6 +93,7 @@ import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js'
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import { simulateWorkflowDryRun } from '../execution/workflow-dry-run-simulation.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
+import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes } from '../execution/workflow-run-workspace.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
 import {
   applyWorkflowVisualContractFixes,
@@ -4054,6 +4055,27 @@ export function registerConsoleRoutes(
     const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     res.json({ criteria: workflowQualityCriteria(entry.data), objective: entry.data.goal?.objective ?? null });
+  });
+
+  // The live "check in on your employees" window: the run's shared workspace —
+  // its goal anchor + every step's persisted work product (the manifest). Reads
+  // straight off disk; no run needs to be in memory.
+  app.get('/api/console/workflows/:name/runs/:runId/workspace', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const goal = readRunGoal(entry.name, req.params.runId);
+    // Collapse to the latest artifact per producer, so a re-pursued step shows
+    // its newest work rather than every historical write.
+    const byAgent = new Map<string, import('../execution/workflow-run-workspace.js').WorkspaceArtifact>();
+    for (const a of readWorkspaceManifest(entry.name, req.params.runId)) byAgent.set(`${a.agent}:${a.tool}`, a);
+    const artifacts = Array.from(byAgent.values());
+    res.json({
+      runId: req.params.runId,
+      goal,
+      artifacts,
+      totalBytes: workspaceArtifactBytes(entry.name, req.params.runId),
+    });
   });
 
   app.get('/api/console/workflows/:name/runs/:runId/failed-items', (req, res) => {

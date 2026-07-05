@@ -6164,6 +6164,10 @@ body {
 .wf-cockpit-step.status-done { border-color: var(--accent-ok, #3ba55d); }
 .wf-cockpit-step.status-failed { border-color: var(--accent-fail); color: var(--accent-fail); }
 .wf-cockpit-step.status-skipped { opacity: 0.55; }
+.wf-workspace-card:empty { display: none; }
+.wf-workspace { margin-top: 8px; }
+.wf-workspace .wf-ws-size { color: var(--fg-mute); font-size: 10px; font-family: var(--mono); }
+.wf-workspace strong { color: var(--fg); }
 .wf-exec-grid span,
 .wf-exec-row span {
   display: block; margin-bottom: 4px; font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute);
@@ -16812,6 +16816,25 @@ const CONSOLE_JS = `
     return status + (when ? ' · ' + fmtCronAgo(when) : '') + (run.id ? ' · ' + run.id : '');
   }
 
+  // The workspace window — "check in on your employees": each step's persisted
+  // work product (from the run's shared workspace manifest). Filled when a run
+  // is selected; empty (hidden) otherwise.
+  function renderWorkflowRunWorkspace(data) {
+    const el = document.querySelector('[data-wf-workspace]');
+    if (!el) return;
+    const artifacts = data && Array.isArray(data.artifacts) ? data.artifacts : [];
+    if (!artifacts.length) { el.innerHTML = ''; return; }
+    const kb = (n) => (Number(n) / 1024).toFixed(1) + 'KB';
+    const rows = artifacts.map((a) => '<p><strong>' + escMem(String(a.agent || '')) + '</strong> '
+      + '<span class="wf-ws-size">' + escMem(kb(a.bytes)) + '</span> — ' + escMem(String(a.summary || '')) + '</p>').join('');
+    el.innerHTML = [
+      '<section class="wf-exec-plan wf-workspace">',
+      '  <div class="wf-exec-head"><strong>WORKSPACE</strong><span>' + escMem(String(artifacts.length) + ' work products · ' + kb(data.totalBytes || 0)) + '</span></div>',
+      '  <div class="wf-exec-row"><span>WHAT EACH STEP PRODUCED</span>' + rows + '</div>',
+      '</section>',
+    ].join('');
+  }
+
   // Live-run cockpit — the SAME execution-wave layout as the dry-run card, but
   // lit with real per-step status from the run-overlay poll. The dry-run's
   // "📤 will send" becomes "✓ / ⟳ / ✗" on the identical picture, so preview and
@@ -19063,6 +19086,7 @@ const CONSOLE_JS = `
 	    wfGraphOverlayRunId = '';
 	    updateWorkflowGraphOverlaySummary();
     renderWorkflowRunCockpit();
+    renderWorkflowRunWorkspace(null);
     if (!wfGraphCy) return;
     try {
       wfClearRecoveryLineageGraph();
@@ -19219,6 +19243,11 @@ const CONSOLE_JS = `
         + '/runs/' + encodeURIComponent(runId) + '/graph-overlay');
       if (seq !== wfGraphOverlaySeq) return;
       applyWorkflowGraphOverlay(data);
+      try {
+        const ws = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+          + '/runs/' + encodeURIComponent(runId) + '/workspace');
+        if (seq === wfGraphOverlaySeq) renderWorkflowRunWorkspace(ws);
+      } catch (_) { /* workspace window is best-effort */ }
     } catch (_) {
       // Overlay is diagnostic. The run list / editor remain usable if this read fails.
     }
@@ -19531,6 +19560,7 @@ const CONSOLE_JS = `
       renderWorkflowExecutionPlanCard(d.executionPlan),
       renderWorkflowDryRunCard(d.dryRunSimulation),
       '<div class="wf-cockpit-card" data-wf-cockpit></div>',
+      '<div class="wf-workspace-card" data-wf-workspace></div>',
       d.summary ? '<div class="wf-visual-summary pe-md">' + renderTinyMarkdown(d.summary) + '</div>' : '',
       '  <div class="wf-visual-head"><span>FLOW</span><span class="wf-visual-run-summary" data-wf-graph-overlay-summary></span><span class="wf-visual-legend">READ/WRITE/SEND · CALL/DETERMINISTIC/MODEL · 🔁 loop · 🔒 approval · 🧩 skill</span></div>',
       '  <div class="wf-graph" data-wf-graph><div class="wf-graph-empty">— rendering flow —</div></div>',

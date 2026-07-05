@@ -36,7 +36,7 @@ import {
   expireGoal,
 } from '../agents/plan-proposals.js';
 import { loadSkill } from '../memory/skill-store.js';
-import { anchorRunGoal } from './workflow-run-workspace.js';
+import { anchorRunGoal, recordStepOutput } from './workflow-run-workspace.js';
 import {
   appendWorkflowEvent,
   computeResumeState,
@@ -2658,6 +2658,12 @@ export function finalizeStepOutput(
     output: bound,
     ...(meta ? { meta } : {}),
   });
+  // Persist the step's work product to the shared run workspace so the manifest
+  // is a complete, inspectable record of the run — what the live window shows
+  // and a checker agent reads. Best-effort: never blocks a completed step.
+  try {
+    recordStepOutput({ workflowName: workflowSlug, runId, stepId: step.id, output: bound, nowIso: new Date().toISOString() });
+  } catch { /* best-effort */ }
   return bound;
 }
 

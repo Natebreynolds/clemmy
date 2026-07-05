@@ -19,6 +19,7 @@ const {
   readWorkspaceManifest,
   summarizeToolOutput,
   runWorkspaceDir,
+  recordStepOutput,
 } = await import('./workflow-run-workspace.js');
 
 test.after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
@@ -76,6 +77,19 @@ test('multiple agents accumulate into one shared, ordered manifest', () => {
   const manifest = readWorkspaceManifest(wf, run);
   assert.deepEqual(manifest.map((m) => `${m.agent}:${m.tool}`), ['pull:keywords', 'competitors:competitor_scan']);
   assert.deepEqual(manifest.map((m) => m.path), ['artifacts/keywords-1.json', 'artifacts/competitor_scan-2.json']);
+});
+
+test('recordStepOutput persists every step as an inspectable work product', () => {
+  const wf = 'brief-wf', run = 'run6';
+  recordStepOutput({ workflowName: wf, runId: run, stepId: 'pull', output: { prospects: [1, 2, 3] }, nowIso: NOW });
+  recordStepOutput({ workflowName: wf, runId: run, stepId: 'draft', output: 'a tailored email body', nowIso: NOW });
+  const manifest = readWorkspaceManifest(wf, run).filter((m) => m.tool === 'step-output');
+  assert.deepEqual(manifest.map((m) => m.agent), ['pull', 'draft']);
+  assert.deepEqual(manifest.map((m) => m.path), ['artifacts/step-pull.json', 'artifacts/step-draft.json']);
+  assert.match(manifest[0].summary, /"prospects" has 3 items/);
+  // The file holds the full work product.
+  const full = readFileSync(path.join(runWorkspaceDir(wf, run), 'artifacts/step-pull.json'), 'utf-8');
+  assert.match(full, /prospects/);
 });
 
 test('summarizeToolOutput describes shape without dumping content', () => {

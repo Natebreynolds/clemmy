@@ -207,6 +207,36 @@ function safeStringify(value: unknown): string {
   }
 }
 
+/**
+ * Persist a completed step's output as a durable workspace artifact — the
+ * "work product" of that step. ALWAYS writes the file + a manifest entry (even
+ * small outputs), so the manifest is a complete, inspectable record of the run
+ * that the live window and a checker agent read. Overwrites the file on
+ * re-pursuit (latest work wins); the manifest keeps the history.
+ */
+export function recordStepOutput(args: {
+  workflowName: string;
+  runId: string;
+  stepId: string;
+  output: unknown;
+  nowIso: string;
+}): WorkspaceArtifact {
+  ensureRunWorkspace(args.workflowName, args.runId);
+  const rel = path.join('artifacts', `step-${safeSegment(args.stepId, 'step')}.json`);
+  const serialized = safeStringify(args.output);
+  const entry: WorkspaceArtifact = {
+    path: rel,
+    tool: 'step-output',
+    agent: args.stepId,
+    bytes: Buffer.byteLength(serialized, 'utf-8'),
+    summary: summarizeToolOutput(args.output),
+    producedAt: args.nowIso,
+  };
+  writeFileSync(path.join(runWorkspaceDir(args.workflowName, args.runId), rel), serialized, 'utf-8');
+  recordArtifact(args.workflowName, args.runId, entry);
+  return entry;
+}
+
 export function runWorkspaceOffloadEnabled(): boolean {
   return (process.env.CLEMMY_RUN_WORKSPACE_OFFLOAD ?? 'on').trim().toLowerCase() !== 'off';
 }
