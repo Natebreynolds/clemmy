@@ -42,6 +42,7 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       prompt: s.prompt,
       dependsOn: s.dependsOn,
       forEach: s.forEach,
+      forEachNewOnly: s.forEachNewOnly,
       deterministic: s.deterministic,
       call: s.call,
       usesSkill: s.usesSkill,
@@ -50,6 +51,8 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       sideEffect: s.sideEffect,
       inputs: s.inputs as Record<string, unknown> | undefined,
       output: s.output as Record<string, unknown> | undefined,
+      loopUntil: s.loopUntil,
+      loopSafe: s.loopSafe,
     })),
   };
 }
@@ -123,6 +126,37 @@ export function stepLooksMutating(step: { prompt?: string; requiresApproval?: bo
   if (structuredCallSideEffectClass(step.call) !== 'read') return true;
   const p = step.prompt ?? '';
   return stepLooksLikeIrreversibleSend(p) || EXTERNAL_WRITE_RE.test(p);
+}
+
+export type StepSideEffectClass = 'read' | 'write' | 'send' | 'unknown';
+
+/**
+ * Canonical step side-effect classifier. ONE source of truth shared by the
+ * crash-resume/retry gate (runner `stepSideEffectClass`), the dashboard flow
+ * graph, and the proof card so all three agree on what a step DOES.
+ *
+ * Order matters: an explicit `sideEffect` wins; then a structured `call` is
+ * classified from its tool slug FIRST — a `*_send`/`*_post` call is a `send`
+ * even with empty prose (the class the UI copies used to collapse to `write`);
+ * then prose heuristics; then any external tool/skill/forEach surface is at
+ * least a `read`. Only a step with no signal at all is `unknown`.
+ */
+export function classifyStepSideEffect(step: {
+  prompt?: string;
+  sideEffect?: string;
+  requiresApproval?: boolean;
+  requires_approval?: boolean;
+  allowedTools?: string[];
+  usesSkill?: string;
+  forEach?: string;
+  call?: { tool?: string };
+}): StepSideEffectClass {
+  if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
+  if (step.call?.tool) return structuredCallSideEffectClass(step.call);
+  if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
+  if (stepLooksMutating(step)) return 'write';
+  if ((step.allowedTools?.length ?? 0) > 0 || step.usesSkill || step.forEach) return 'read';
+  return 'unknown';
 }
 
 // Read/gather intent in a step's prose — the verbs whose job is to PULL external
@@ -217,21 +251,27 @@ function executionSurfaceProjection(def: WorkflowDefinition): string {
     steps: (def.steps ?? []).map((s) => ({
       id: s.id,
       prompt: s.prompt,
+      project: s.project ?? null,
       dependsOn: s.dependsOn ?? [],
       forEach: s.forEach ?? null,
+      forEachNewOnly: s.forEachNewOnly ?? false,
       deterministic: s.deterministic ?? null,
+      call: s.call ?? null,
       allowedTools: s.allowedTools ?? [],
       usesSkill: s.usesSkill ?? null,
       inputs: s.inputs ?? null,
       output: s.output ?? null,
       requiresApproval: s.requiresApproval ?? false,
       model: s.model ?? null,
+      intent: s.intent ?? null,
+      tier: s.tier ?? null,
       useHarness: s.useHarness ?? null,
       maxTurns: s.maxTurns ?? null,
       loopUntil: s.loopUntil ?? null,
       loopSafe: s.loopSafe ?? false,
       sideEffect: s.sideEffect ?? null,
     })),
+    project: def.project ?? null,
     allowedTools: def.allowedTools ?? null,
     inputs: def.inputs ?? null,
     synthesis: def.synthesis ?? null,

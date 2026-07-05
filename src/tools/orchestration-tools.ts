@@ -8,15 +8,13 @@ import {
   CRON_FILE,
 } from '../memory/vault.js';
 import {
-  deleteWorkflow,
   listWorkflows,
   readWorkflow,
-  writeWorkflow,
   type WorkflowDefinition,
   type WorkflowEntry,
   type WorkflowStepInput,
 } from '../memory/workflow-store.js';
-import { workflowExecutionSurfaceChanged, prepareWorkflowForWrite, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
+import { workflowExecutionSurfaceChanged, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron, deriveStepDataSources, renderWorkflowDataSources } from '../execution/workflow-describe.js';
 import { applyStepPromptEdit, revertStepEdit } from '../execution/workflow-step-edit.js';
 import { validateCronExpression, getNextRun } from '../shared/cron.js';
@@ -24,10 +22,27 @@ import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
 import { applyWorkflowContractUpgrades, proposeWorkflowContractUpgrades, renderWorkflowContractProposalReport } from '../execution/workflow-contract-proposals.js';
-import { syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { listCachedToolkits } from '../integrations/composio/client.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
+import {
+  applyWorkflowTriggerPatch,
+  buildWorkflowTrigger,
+  deleteWorkflowAndSyncTriggers,
+  normalizeWorkflowSteps,
+  prepareWorkflowCreateForWrite,
+  prepareWorkflowEnableForWrite,
+  prepareWorkflowUpdateForWrite,
+  prepareWorkflowVerification,
+  renderMissingSmokeInputs,
+  renderReadinessHold,
+  validateWorkflowStepGraph,
+  workflowUpdateNeedsVerification,
+  workflowSlugFromName,
+  workflowSmokeInputs,
+  writeWorkflowAndSyncTriggers,
+  type WorkflowModelPortabilityPreference,
+} from '../execution/workflow-authoring.js';
 import {
   CRON_PROGRESS_DIR,
   CRON_RUNS_DIR,
@@ -45,6 +60,11 @@ import {
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
 } from '../execution/workflow-inputs.js';
+import {
+  buildWorkflowExecutionPlanWithReadiness,
+  renderWorkflowVisualContract,
+} from '../execution/workflow-run-readiness.js';
+import type { WorkflowExecutionPlan } from '../dashboard/workflow-execution-plan.js';
 import { listFinalFailedItems } from '../execution/workflow-events.js';
 import { queueWorkflowRun, queueWorkflowCreationTest, requeueWorkflowFailedItemsFromRun } from './workflow-run-queue.js';
 import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
@@ -65,6 +85,10 @@ import { matchToolChoicesForStep, slugifyIntent, type StepToolChoiceMatch, type 
 import { analyzeWorkflowIntent, type WorkflowBuilderIntent } from '../execution/workflow-builder-analysis.js';
 import { synthesizeWorkflowDefinition, renderAnalysisForApproval } from '../execution/workflow-builder-synthesis.js';
 import { readDurableBindings, type RoleBinding } from '../runtime/harness/model-roles.js';
+import {
+  applyWorkflowVisualContractFixes,
+  type WorkflowVisualContractFixKind,
+} from '../execution/workflow-visual-contract-fixes.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -86,21 +110,12 @@ export interface AuthoredWorkflowResult {
   ok: boolean;
   errors: string[];
   savedDef: WorkflowDefinition;
+  executionPlan: WorkflowExecutionPlan;
   repairs: string[];
   warnings: string[];
   boundNotes: string[];
   advisories: string[];
   gaps: ReturnType<typeof analyzeWorkflowGaps>;
-}
-
-function writeWorkflowAndSyncTriggers(name: string, def: WorkflowDefinition): WorkflowEntry {
-  const entry = writeWorkflow(name, def);
-  try {
-    syncWorkflowTriggerRegistry();
-  } catch {
-    // Best-effort: daemon/webhook paths retry sync, and the workflow write itself succeeded.
-  }
-  return entry;
 }
 
 /**
@@ -111,21 +126,26 @@ function writeWorkflowAndSyncTriggers(name: string, def: WorkflowDefinition): Wo
  * own response text. (This is the F4 consolidation, justified now that a second
  * real consumer — promotion — needs the exact same author behavior.)
  */
-export function commitAuthoredWorkflow(def: WorkflowDefinition, dirName: string): AuthoredWorkflowResult {
+export function commitAuthoredWorkflow(
+  def: WorkflowDefinition,
+  dirName: string,
+  opts: { modelPortability?: WorkflowModelPortabilityPreference } = {},
+): AuthoredWorkflowResult {
   const routeNotes = autoTagStepsWithModelRoleIntents(def.steps);
   const bind = bindStepsToToolChoices(def.steps);
-  const prep = prepareWorkflowForWrite(def);
-  if (!prep.ok) {
+  const prep = prepareWorkflowCreateForWrite(def, { modelPortability: opts.modelPortability });
+  const executionPlan = buildWorkflowExecutionPlanWithReadiness(prep.def, dirName);
+  if (prep.errors.length > 0) {
     return {
-      ok: false, errors: prep.errors, savedDef: prep.def, repairs: prep.repairs,
+      ok: false, errors: prep.errors, savedDef: prep.def, executionPlan, repairs: prep.repairs,
       warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories, gaps: [],
     };
   }
   writeWorkflowAndSyncTriggers(dirName, prep.def);
   return {
-    ok: true, errors: [], savedDef: prep.def, repairs: prep.repairs,
+    ok: true, errors: [], savedDef: prep.def, executionPlan, repairs: prep.repairs,
     warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories,
-    gaps: analyzeWorkflowGaps(prep.def),
+    gaps: prep.gaps,
   };
 }
 
@@ -151,9 +171,122 @@ export function draftToDefinition(name: string, draft: WorkflowDraft): WorkflowD
   };
 }
 
+export interface PromotedSessionWorkflowResult {
+  ok: boolean;
+  status:
+    | 'created'
+    | 'no_session'
+    | 'session_not_found'
+    | 'invalid_name'
+    | 'duplicate'
+    | 'empty'
+    | 'invalid_workflow';
+  message: string;
+  sessionId?: string;
+  name?: string;
+  slug?: string;
+  draft?: WorkflowDraft;
+  savedDef?: WorkflowDefinition;
+  built?: AuthoredWorkflowResult;
+  promoteBindNotes?: string[];
+  preflight?: ReturnType<typeof preflightWorkflow>;
+  errors?: string[];
+}
+
+export function promoteWorkflowFromSession(input: {
+  name: string;
+  sessionId?: string | null;
+}): PromotedSessionWorkflowResult {
+  const name = input.name.trim();
+  const sid = input.sessionId?.trim() || getToolOutputContext()?.sessionId;
+  if (!sid) {
+    return {
+      ok: false,
+      status: 'no_session',
+      message: 'I can\'t tell which chat to turn into a workflow (no session context). Run this from the chat where you did the work.',
+    };
+  }
+  if (!getSession(sid)) {
+    return {
+      ok: false,
+      status: 'session_not_found',
+      sessionId: sid,
+      message: `I couldn't find a chat session to promote${input.sessionId ? ` (no session "${input.sessionId}")` : ''}. Run this from the chat where you did the work.`,
+    };
+  }
+  if (!/[a-zA-Z0-9]/.test(name)) {
+    return {
+      ok: false,
+      status: 'invalid_name',
+      sessionId: sid,
+      message: 'Please give the workflow a name with at least one letter or number.',
+    };
+  }
+  const dirName = workflowSlugFromName(name);
+  if (readWorkflow(dirName)) {
+    return {
+      ok: false,
+      status: 'duplicate',
+      sessionId: sid,
+      name,
+      slug: dirName,
+      message: `A workflow named "${name}" already exists — pick a different name, or update it with workflow_update.`,
+    };
+  }
+  const draft = draftWorkflowFromSession(sid);
+  if (draft.steps.length === 0) {
+    return {
+      ok: false,
+      status: 'empty',
+      sessionId: sid,
+      name,
+      slug: dirName,
+      draft,
+      message: `There's nothing to turn into a workflow yet: ${draft.notes[0] ?? 'no actions found in this chat.'}`,
+    };
+  }
+  const def = draftToDefinition(name, draft);
+  // Same chat-aware binding as workflow_create: commit a toolkit the chat
+  // discussed (e.g. Apify) into the step that names it before persisting.
+  const promoteBind = bindChatDiscussedToolkits(def.steps, sid);
+  const built = commitAuthoredWorkflow(def, dirName);
+  if (!built.ok) {
+    return {
+      ok: false,
+      status: 'invalid_workflow',
+      sessionId: sid,
+      name,
+      slug: dirName,
+      draft,
+      built,
+      promoteBindNotes: promoteBind.boundNotes,
+      errors: built.errors,
+      message: `I couldn't build "${name}" from this chat — these need fixing first:\n- ${built.errors.join('\n- ')}`,
+    };
+  }
+  return {
+    ok: true,
+    status: 'created',
+    sessionId: sid,
+    name,
+    slug: dirName,
+    draft,
+    savedDef: built.savedDef,
+    built,
+    promoteBindNotes: promoteBind.boundNotes,
+    preflight: preflightWorkflow(built.savedDef),
+    message: `Built a draft workflow "${name}" from this chat — saved DISABLED so you can review before it runs.`,
+  };
+}
+
 export function renderAuthoringAdvisories(warnings: string[] | undefined): string {
   if (!warnings || warnings.length === 0) return '';
   return `\n\nHeads up (advisory — the workflow was saved):\n- ${warnings.join('\n- ')}`;
+}
+
+function appendVisualContract(plan: WorkflowExecutionPlan | undefined): string {
+  const block = renderWorkflowVisualContract(plan);
+  return block ? `\n\n${block}` : '';
 }
 
 /** Author-time data-source review block (trailing-padded for the response body),
@@ -460,24 +593,6 @@ export function parseWorkflowRunInputsJson(raw: string | null | undefined): Reco
   return parsed as Record<string, string>;
 }
 
-function workflowDefaultRunInputs(def: WorkflowDefinition): Record<string, string> {
-  return Object.fromEntries(Object.entries(def.inputs ?? {}).map(([k, m]) => [k, m.default ?? '']));
-}
-
-function workflowSmokeInputs(def: WorkflowDefinition, provided: Record<string, string>): Record<string, string> {
-  return normalizeWorkflowRunInputs({
-    ...workflowDefaultRunInputs(def),
-    ...provided,
-  });
-}
-
-function renderMissingSmokeInputs(name: string, missing: string[]): string {
-  const quoted = missing.map((key) => `\`${key}\``).join(', ');
-  const jsonHint = missing.map((key) => `"${key}": "<value>"`).join(', ');
-  return `Verification did not start because the smoke test is missing ${quoted}. `
-    + `The workflow stayed DISABLED so it cannot run blind. Provide \`test_inputs\` like {${jsonHint}} and enable/update again.`;
-}
-
 /**
  * Parse the workflow_create/_update `inputs` SCHEMA field — a JSON string
  * mapping input names to per-input metadata {type?, default?, description?}.
@@ -532,6 +647,38 @@ const WorkflowStepOutputContractSchema = z.object({
 
 const STEP_OUTPUT_CONTRACT_DESC =
   'OPTIONAL output contract — what this step PRODUCES. When declared, the engine verifies the step output against it BEFORE recording completion; a violation fails the step loudly (reports back) instead of feeding bad data to the next step. Declare it on any step whose output a later step depends on, and ALWAYS on the step that produces the final deliverable (e.g. a created sheet/file/URL), so the result is verified, not just claimed. Omit it for free-form/conversational steps.';
+
+const WorkflowLoopUntilSchema = z.object({
+  maxAttempts: z.number().min(1).max(10).optional(),
+  probe: z.object({ runner: z.string().min(1) }).optional()
+    .describe('Deterministic exit probe: a scripts/ helper (like deterministic.runner) run AFTER each attempt.'),
+  until: WorkflowStepOutputContractSchema.optional()
+    .describe('Contract the probe output must satisfy for the loop to EXIT — e.g. {"required_keys":["done"],"non_empty":["done"]} for poll-until-complete, or a min_items check for page-until-drained.'),
+});
+
+const WorkflowTriggerEventSchema = z.object({
+  type: z.string().min(1).describe('System event type to subscribe to (e.g. "crm.lead.created").'),
+  filter: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional()
+    .describe('Shallow payload match — every entry must equal payload.<key> (dot-paths ok). Omit to fire on every event of this type.'),
+  dedupeKey: z.string().optional()
+    .describe('Template rendered against the payload (e.g. "lead-{{payload.id}}"). The same rendered key fires ONCE ever. Omit → dedupe on full payload hash.'),
+});
+
+const WORKFLOW_VISUAL_CONTRACT_FIX_KINDS = [
+  'fix_graph_structure',
+  'increase_concurrency',
+  'make_fanout_resumable',
+  'add_judge_gate',
+  'confirm_tool_connection',
+  'install_skill',
+  'add_workflow_script',
+  'select_local_project',
+  'make_models_portable',
+] as const satisfies readonly WorkflowVisualContractFixKind[];
+const WorkflowVisualContractFixKindSchema = z.enum(WORKFLOW_VISUAL_CONTRACT_FIX_KINDS);
+
+const LOOP_UNTIL_DESC =
+  'Step-level loop. Exit condition = the step\'s own output contract (retry-until-contract-passes, ≤5 attempts), OR probe+until (loop until EXTERNAL STATE satisfies the until contract — poll-until-done / paginate-until-drained, ≤10 attempts). Plain LLM read steps; write needs loopSafe; send never loops.';
 
 interface CronJobRecord {
   name: string;
@@ -775,8 +922,8 @@ export function registerOrchestrationTools(server: McpServer): void {
           appliedLines.push(`- ${proposal.workflowName}: no metadata changes needed.`);
           continue;
         }
-        const prep = prepareWorkflowForWrite(applied.def);
-        if (!prep.ok) {
+        const prep = prepareWorkflowUpdateForWrite(entry.data, applied.def);
+        if (prep.status === 'invalid') {
           appliedLines.push(`- ${proposal.workflowName}: NOT applied — repaired definition still has blocking issue(s): ${prep.errors.join('; ')}`);
           continue;
         }
@@ -787,6 +934,102 @@ export function registerOrchestrationTools(server: McpServer): void {
         `${report}\n\nApplied workflow contract upgrades:\n${appliedLines.length ? appliedLines.join('\n') : '- No matching upgrades to apply.'}`,
         { maxChars: 40_000 },
       );
+    },
+  );
+
+  server.tool(
+    'workflow_apply_contract_fixes',
+    'Apply safe, machine-readable fixes from a workflow visual contract. This is the repair path after workflow_create/update reports "Recommended contract fixes". It automatically handles metadata-only fixes like portable model routing and judge/output-contract gates, and reports manual-only fixes for missing skills, scripts, projects, graph edits, or account/tool connections. It never invents missing files/accounts.',
+    {
+      name: z.string().min(1).describe('Workflow name. Fuzzy names are resolved the same way workflow_get resolves them.'),
+      fixes: z.array(WorkflowVisualContractFixKindSchema).optional()
+        .describe('Specific visual-contract remediation kind(s) to apply. Omit to apply every currently visible safe fix and report the manual-only fixes.'),
+      step_ids: z.array(z.string().min(1)).optional()
+        .describe('Optional step filter. Use when applying a visual-contract fix to only the affected graph node(s).'),
+      assume_stable_item_keys: z.boolean().optional()
+        .describe('Only for make_fanout_resumable: true means each fan-out item has a stable id/key/slug, so write fan-out may be marked forEachNewOnly. Send fan-out is still not auto-fixed.'),
+      dry_run: z.boolean().optional().describe('Preview changes without writing. Default false.'),
+    },
+    async ({ name, fixes, step_ids, assume_stable_item_keys, dry_run }) => {
+      const all = listWorkflowFiles();
+      let entry = all.find((w) => w.data.name === name);
+      if (!entry) {
+        const resolution = resolveWorkflowName(
+          name,
+          all.map((e) => ({ name: e.data.name, slug: path.basename(e.dir) })),
+        );
+        if (resolution.kind === 'exact' || resolution.kind === 'fuzzy') {
+          entry = all.find((w) => workflowNamesEqual(w.data.name, resolution.name));
+        } else if (resolution.kind === 'ambiguous') {
+          return textResult(
+            `"${name}" could mean: ${resolution.candidates.map((c) => `"${c}"`).join(', ')}. Ask the user which one, then call workflow_apply_contract_fixes with that exact name.`,
+          );
+        }
+      }
+      if (!entry) {
+        const names = all.map((w) => `"${w.data.name}"`).join(', ');
+        return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
+      }
+
+      const fixed = applyWorkflowVisualContractFixes(entry.data, entry.name, {
+        fixes,
+        stepIds: step_ids,
+        assumeStableItemKeys: assume_stable_item_keys === true,
+      });
+      let finalDef = fixed.def;
+      let persisted = false;
+      let prepRepairs: string[] = [];
+      let readinessHold = '';
+      if (fixed.changes.length > 0) {
+        const prep = prepareWorkflowUpdateForWrite(entry.data, fixed.def);
+        if (prep.status === 'invalid') {
+          return textResult(
+            `Workflow "${entry.data.name}" contract fixes were NOT applied — the repaired definition still has blocking issue(s):\n- ${prep.errors.join('\n- ')}`
+              + `\n\n${renderWorkflowVisualContract(fixed.beforePlan)}`,
+            { maxChars: 40_000 },
+          );
+        }
+        finalDef = prep.def;
+        prepRepairs = prep.repairs;
+        if (prep.status === 'readiness_gaps') readinessHold = renderReadinessHold(entry.data.name);
+        if (dry_run !== true) {
+          writeWorkflowAndSyncTriggers(entry.name, finalDef);
+          persisted = true;
+          addNotification({
+            id: `workflow-contract-fixes-${entry.name}-${Date.now()}`,
+            kind: 'workflow',
+            title: `Workflow contract fixed: ${entry.data.name}`,
+            body: `Applied ${fixed.changes.length} visual-contract fix${fixed.changes.length === 1 ? '' : 'es'}.`,
+            createdAt: new Date().toISOString(),
+            read: false,
+            silent: true,
+            metadata: {
+              source: 'workflow_apply_contract_fixes',
+              workflowName: entry.data.name,
+              changed: fixed.changes,
+            },
+          });
+        }
+      }
+      const finalPlan = buildWorkflowExecutionPlanWithReadiness(finalDef, entry.name);
+      const lines = [
+        dry_run === true
+          ? `Workflow "${entry.data.name}" visual contract fix preview (no files changed).`
+          : persisted
+            ? `Workflow "${entry.data.name}" visual contract fixes applied.`
+            : `Workflow "${entry.data.name}" has no automatic visual contract fixes to apply.`,
+      ];
+      const allChanges = [...fixed.changes, ...prepRepairs];
+      if (allChanges.length > 0) {
+        lines.push('', dry_run === true ? 'Would apply:' : 'Applied:', ...allChanges.map((change) => `- ${change}`));
+      }
+      if (fixed.skipped.length > 0) {
+        lines.push('', 'Manual / not automatic:', ...fixed.skipped.map((skip) => `- ${skip}`));
+      }
+      if (readinessHold) lines.push('', readinessHold);
+      const contract = renderWorkflowVisualContract(finalPlan);
+      if (contract) lines.push('', contract);
+      return textResult(lines.join('\n'), { maxChars: 40_000 });
     },
   );
 
@@ -806,7 +1049,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       description: z.string().min(1),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
+        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}, the local project with {{project.path}} / {{project.name}}, and iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
+        project: z.string().optional().describe('Local workspace/project name or path this step requires. Omit to inherit the workflow-level project. Readiness preflight blocks the run if the project is not available locally.'),
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         model: z.string().optional(),
         intent: z.string().optional().describe('Optional free-form model-routing category for this step, e.g. "design". If a worker model is bound for that category, this step routes there unless model is explicitly set.'),
@@ -817,7 +1061,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
-          args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
+          args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
         }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
         allowedTools: z.array(z.string()).optional(),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
@@ -825,23 +1069,17 @@ export function registerOrchestrationTools(server: McpServer): void {
         approvalPreview: z.string().optional(),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
         sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class. 'read' = gathers data only; 'write' = mutates local/remote state reversibly; 'send' = irreversible outbound (email/publish/post). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends. Declare it — undeclared steps fall back to prose heuristics."),
-        loopUntil: z.object({
-          maxAttempts: z.number().min(1).max(10).optional(),
-          probe: z.object({ runner: z.string().min(1) }).optional().describe('Deterministic exit probe: a scripts/ helper (like deterministic.runner) run AFTER each attempt.'),
-          until: WorkflowStepOutputContractSchema.optional().describe('Contract the probe output must satisfy for the loop to EXIT — e.g. {"required_keys":["done"],"non_empty":["done"]} for poll-until-complete, or a min_items check for page-until-drained.'),
-        }).optional().describe('Step-level loop. Exit condition = the step\'s own output contract (retry-until-contract-passes, ≤5 attempts), OR probe+until (loop until EXTERNAL STATE satisfies the until contract — poll-until-done / paginate-until-drained, ≤10 attempts). Plain LLM read steps; write needs loopSafe; send never loops.'),
+        loopUntil: WorkflowLoopUntilSchema.optional().describe(LOOP_UNTIL_DESC),
         loopSafe: z.boolean().optional().describe('Author assertion that re-running this WRITE step is idempotent (e.g. an upsert keyed on a stable id). Required for loopUntil on write steps; also allows goal re-pursuit past this step.'),
       })).optional().describe('(Optional) If omitted, I intelligently break down your description into steps. If provided, I still validate and suggest improvements.'),
+      project: z.string().optional().describe('Default local workspace/project name or path for this workflow. Use when steps operate in a specific repo or local project; step-level project overrides it.'),
       trigger_schedule: z.string().optional(),
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Use for "when X happens in another system" asks that can call a webhook.'),
-      trigger_events: z.array(z.object({
-        type: z.string().min(1).describe('System event type to subscribe to (e.g. "crm.lead.created").'),
-        filter: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().describe('Shallow payload match — every entry must equal payload.<key> (dot-paths ok). Omit to fire on every event of this type.'),
-        dedupeKey: z.string().optional().describe('Template rendered against the payload (e.g. "lead-{{payload.id}}"). The same rendered key fires ONCE ever. Omit → dedupe on full payload hash.'),
-      })).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
+      trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the authoring smoke test, e.g. {"url":"https://example.com"}. Use when an external read step needs inputs that are not defaulted in `inputs`; otherwise the workflow stays disabled until it can be verified.'),
       synthesis_prompt: z.string().optional(),
+      portable_models: z.boolean().optional().describe('Set true when the workflow should run on any available model/provider. This removes exact per-step model pins and keeps intent/default routing instead. Omit/false to preserve intentional model pins.'),
       allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
       goal: z.object({
         objective: z.string().min(4).describe('What a completed run must achieve — judged externally at run completion.'),
@@ -849,7 +1087,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
-    async ({ name, description, steps, trigger_schedule, trigger_webhook_path, trigger_events, inputs, test_inputs, synthesis_prompt, allowSends, goal }) => {
+    async ({ name, description, steps, project, trigger_schedule, trigger_webhook_path, trigger_events, inputs, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
       // INTELLIGENT WORKFLOW CREATION:
       // If steps not provided, analyze the description and generate steps intelligently
       let finalSteps = steps;
@@ -892,54 +1130,28 @@ export function registerOrchestrationTools(server: McpServer): void {
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
-      const ids = new Set(finalSteps.map((step) => step.id));
-      if (ids.size !== finalSteps.length) return textResult('Duplicate workflow step IDs found.');
-      for (const step of finalSteps) {
-        for (const dep of step.dependsOn ?? []) {
-          if (!ids.has(dep)) return textResult(`Step "${step.id}" depends on unknown step "${dep}".`);
-        }
-      }
-      if (trigger_schedule && !validateCronExpression(trigger_schedule)) {
-        return textResult(`Invalid cron expression: "${trigger_schedule}"`);
-      }
+      const stepGraphError = validateWorkflowStepGraph(finalSteps);
+      if (stepGraphError) return textResult(stepGraphError);
+      const triggerResult = buildWorkflowTrigger({
+        schedule: trigger_schedule,
+        webhookPath: trigger_webhook_path,
+        events: trigger_events,
+      });
+      if (!triggerResult.ok) return textResult(triggerResult.error);
 
       if (!/[a-zA-Z0-9]/.test(name)) {
         return textResult('Please give the workflow a name with at least one letter or number.');
       }
-      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().replace(/^-+|-+$/g, '');
+      const dirName = workflowSlugFromName(name);
       if (readWorkflow(dirName)) return textResult(`Workflow "${name}" already exists.`);
 
       const def: WorkflowDefinition = {
         name,
         description,
+        ...(typeof project === 'string' && project.trim() ? { project: project.trim() } : {}),
         enabled: true,
-        trigger: {
-          manual: true,
-          ...(trigger_schedule ? { schedule: trigger_schedule } : {}),
-          ...(trigger_webhook_path?.trim() ? { webhookPath: trigger_webhook_path.trim() } : {}),
-          ...(trigger_events && trigger_events.length > 0 ? { events: trigger_events } : {}),
-        },
-        steps: finalSteps.map((s) => ({
-          id: s.id,
-          prompt: s.prompt ?? '',
-          dependsOn: s.dependsOn,
-          model: s.model,
-          intent: s.intent,
-          tier: s.tier,
-          maxTurns: s.maxTurns,
-          useHarness: s.useHarness,
-          forEach: s.forEach,
-          forEachNewOnly: s.forEachNewOnly,
-          call: s.call,
-          allowedTools: s.allowedTools,
-          usesSkill: s.usesSkill,
-          requiresApproval: s.requiresApproval,
-          approvalPreview: s.approvalPreview,
-          output: s.output,
-          sideEffect: s.sideEffect,
-          loopUntil: s.loopUntil,
-          loopSafe: s.loopSafe,
-        })),
+        trigger: triggerResult.trigger,
+        steps: normalizeWorkflowSteps(finalSteps),
         ...(allowSends !== undefined ? { allowSends } : {}),
         ...(goal ? { goal: { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts } } : {}),
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
@@ -968,7 +1180,9 @@ export function registerOrchestrationTools(server: McpServer): void {
       // instead of bouncing the author into a token-burning re-author loop;
       // refuse only if the repaired workflow still can't flow. Shared with
       // workflow_from_session so promotion can't drift from this path.
-      const created = commitAuthoredWorkflow(def, dirName);
+      const created = commitAuthoredWorkflow(def, dirName, {
+        modelPortability: portable_models ? 'portable' : 'preserve',
+      });
       if (!created.ok) {
         return textResult(
           `Workflow "${name}" was NOT created — fix these first:\n- ${created.errors.join('\n- ')}`,
@@ -983,6 +1197,20 @@ export function registerOrchestrationTools(server: McpServer): void {
         ? `\n\n${[...chatBind.boundNotes, ...created.boundNotes].join('\n')}` : '';
       const advisoryTail = `${renderAuthoringAdvisories([...created.repairs, ...created.warnings, ...created.advisories])}`
         + `${renderWorkflowGapQuestions(created.gaps)}`;
+      if (created.gaps.length > 0) {
+        if (created.savedDef.enabled) {
+          created.savedDef.enabled = false;
+          writeWorkflowAndSyncTriggers(dirName, created.savedDef);
+        }
+        return textResult(
+          `${analysisReport}`
+          + `Created workflow "${name}" (saved DISABLED pending readiness answers). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+          + `${appendDataSources(created.savedDef)}`
+          + `${appendVisualContract(created.executionPlan)}`
+          + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+          + `${renderReadinessHold(name)}${advisoryTail}`,
+        );
+      }
       if (needsCreationTest) {
         const testInputs = workflowSmokeInputs(created.savedDef, providedSmokeInputs);
         const missingSmokeInputs = missingWorkflowRunInputs(created.savedDef, testInputs);
@@ -991,7 +1219,8 @@ export function registerOrchestrationTools(server: McpServer): void {
             `${analysisReport}`
             + `Created workflow "${name}" (saved DISABLED pending verification). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
             + `${appendDataSources(created.savedDef)}`
-            + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+            + `${appendVisualContract(created.executionPlan)}`
+            + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
             + `${renderMissingSmokeInputs(name, missingSmokeInputs)}${advisoryTail}`,
           );
         }
@@ -1000,7 +1229,8 @@ export function registerOrchestrationTools(server: McpServer): void {
           `${analysisReport}`
           + `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `${appendDataSources(created.savedDef)}`
-          + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
+          + `${appendVisualContract(created.executionPlan)}`
+          + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
           + `${queued.message}${advisoryTail}`,
         );
       }
@@ -1008,7 +1238,8 @@ export function registerOrchestrationTools(server: McpServer): void {
         `${analysisReport}`
         + `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
         + `${appendDataSources(created.savedDef)}`
-        + `Saved to workflows/${dirName}/SKILL.md.${createBindReport}`
+        + `${appendVisualContract(created.executionPlan)}`
+        + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}`
         + `${advisoryTail}`,
       );
     },
@@ -1022,39 +1253,18 @@ export function registerOrchestrationTools(server: McpServer): void {
       sessionId: z.string().optional().describe('Defaults to the CURRENT chat session. Only pass this to promote a different session.'),
     },
     async ({ name, sessionId }) => {
-      const sid = sessionId || getToolOutputContext()?.sessionId;
-      if (!sid) {
-        return textResult('I can\'t tell which chat to turn into a workflow (no session context). Run this from the chat where you did the work.');
-      }
-      if (!getSession(sid)) {
-        return textResult(`I couldn't find a chat session to promote${sessionId ? ` (no session "${sessionId}")` : ''}. Run this from the chat where you did the work.`);
-      }
-      if (!/[a-zA-Z0-9]/.test(name)) {
-        return textResult('Please give the workflow a name with at least one letter or number.');
-      }
-      const dirName = name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().replace(/^-+|-+$/g, '');
-      if (readWorkflow(dirName)) {
-        return textResult(`A workflow named "${name}" already exists — pick a different name, or update it with workflow_update.`);
-      }
-      const draft = draftWorkflowFromSession(sid);
-      if (draft.steps.length === 0) {
-        return textResult(`There's nothing to turn into a workflow yet: ${draft.notes[0] ?? 'no actions found in this chat.'}`);
-      }
-      const def = draftToDefinition(name, draft);
-      // Same chat-aware binding as workflow_create: commit a toolkit the chat
-      // discussed (e.g. Apify) into the step that names it before persisting.
-      const promoteBind = bindChatDiscussedToolkits(def.steps, sid);
-      const built = commitAuthoredWorkflow(def, dirName);
-      if (!built.ok) {
-        return textResult(`I couldn't build "${name}" from this chat — these need fixing first:\n- ${built.errors.join('\n- ')}`);
-      }
+      const promoted = promoteWorkflowFromSession({ name, sessionId });
+      if (!promoted.ok) return textResult(promoted.message);
+      const draft = promoted.draft as WorkflowDraft;
+      const built = promoted.built as AuthoredWorkflowResult;
       const n = draft.toolCallCount;
-      const preflight = preflightWorkflow(built.savedDef);
-      const promoteBindReport = promoteBind.boundNotes.length > 0 ? `\n\n${promoteBind.boundNotes.join('\n')}` : '';
+      const preflight = promoted.preflight ?? preflightWorkflow(built.savedDef);
+      const promoteBindReport = (promoted.promoteBindNotes?.length ?? 0) > 0 ? `\n\n${promoted.promoteBindNotes?.join('\n')}` : '';
       return textResult(
         `Built a draft workflow "${name}" from this chat — saved DISABLED so you can review before it runs.\n\n`
           + describeWorkflowPlainEnglish(built.savedDef)
           + `\n\n${appendDataSources(built.savedDef)}`.trimEnd()
+          + appendVisualContract(built.executionPlan)
           + promoteBindReport
           + `\n\n${preflight.ok ? '✅' : '⚠️'} ${preflight.summary}`
           + `\n\nReconstructed from ${n} action${n === 1 ? '' : 's'} you took. Before enabling:\n- ${draft.notes.join('\n- ')}`
@@ -1247,6 +1457,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       // renderViewForRead. The "<n>\t" prefix is NOT part of the prompt text.
       const renderStepForRead = (stp: typeof w.steps[number]): string => {
         const deps = stp.dependsOn && stp.dependsOn.length > 0 ? ` (depends on: ${stp.dependsOn.join(', ')})` : '';
+        const project = stp.project ? ` project=${stp.project}` : w.project ? ` project=${w.project}` : '';
         const model = stp.model ? ` model=${stp.model}` : '';
         const forEach = stp.forEach ? ` forEach=${stp.forEach}` : '';
         const det = stp.deterministic ? ` deterministic=${stp.deterministic.runner}` : '';
@@ -1285,7 +1496,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         const promptLines = (stp.prompt ?? '').split('\n');
         const pwidth = String(promptLines.length).length;
         const numbered = promptLines.map((l, i) => `      ${String(i + 1).padStart(pwidth)}\t${l}`).join('\n');
-        return [`  ${stp.id}${deps}${model}${forEach}${det}`, sourcesLine, runnerLine, '    prompt:', numbered].filter(Boolean).join('\n');
+        return [`  ${stp.id}${deps}${project}${model}${forEach}${det}`, sourcesLine, runnerLine, '    prompt:', numbered].filter(Boolean).join('\n');
       };
       // step=<id> targeting: when a workflow is large, read just one step in full.
       if (step) {
@@ -1329,6 +1540,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         '— technical detail —',
         `File: ${path.relative(path.dirname(entry.dir), entry.filePath)}`,
         w.whenToUse ? `When to use: ${w.whenToUse}` : '',
+        w.project ? `Project: ${w.project}` : '',
         `Trigger: ${trigger}`,
         `Allowed tools: ${allowed}`,
         `Steps (${w.steps.length}) — each shows its DATA sources + FULL prompt; the "<n>\\t" prefix is the line number, NOT part of the prompt (copy a VERBATIM snippet into workflow_edit_step):`,
@@ -1364,34 +1576,40 @@ export function registerOrchestrationTools(server: McpServer): void {
       // enabling an older workflow with a dangling reference fixes it in
       // place instead of refusing.
       if (enabled) {
-        const prep = prepareWorkflowForWrite({ ...entry.data, enabled: true });
-        if (!prep.ok) {
+        const prep = prepareWorkflowEnableForWrite(entry.data);
+        if (prep.status === 'invalid') {
           return textResult(
             `Workflow "${name}" was NOT enabled — fix these first:\n- ${prep.errors.join('\n- ')}`,
+          );
+        }
+        if (prep.status === 'readiness_gaps') {
+          writeWorkflowAndSyncTriggers(entry.name, prep.def);
+          return textResult(
+            `Workflow "${name}" was NOT enabled. ${renderReadinessHold(name)}`
+              + `${renderWorkflowGapQuestions(prep.gaps)}`
+              + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
           );
         }
         // Verify-by-running (2026-06-11): enabling means "set to run" — when
         // the workflow has testable read steps, run the creation test now and
         // let the PASS enable it, instead of trusting the config. Same strict
         // input policy as create: no bindable smoke inputs means stay disabled.
-        let enableViaTest = workflowNeedsCreationTest(prep.def);
-        if (enableViaTest) {
-          const enableTestInputs = workflowSmokeInputs(prep.def, providedSmokeInputs);
-          const missingSmokeInputs = missingWorkflowRunInputs(prep.def, enableTestInputs);
+        const enableVerification = prepareWorkflowVerification(prep.def, providedSmokeInputs);
+        if (enableVerification.needsTest) {
           writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
           clearWorkflowFailures(entry.name);
-          if (missingSmokeInputs.length > 0) {
+          if (enableVerification.missing.length > 0) {
             return textResult(
-              `Workflow "${name}" was NOT enabled. ${renderMissingSmokeInputs(name, missingSmokeInputs)}`,
+              `Workflow "${name}" was NOT enabled. ${renderMissingSmokeInputs(name, enableVerification.missing)}`,
             );
           }
-          const queued = queueWorkflowCreationTest(entry.name, enableTestInputs, { originSessionId: getToolOutputContext()?.sessionId });
+          const queued = queueWorkflowCreationTest(entry.name, enableVerification.inputs, { originSessionId: getToolOutputContext()?.sessionId });
           return textResult(
             `Verifying "${name}" before it goes live — ${queued.message}`
               + (prep.repairs.length ? `\n\nAuto-wired on enable:\n- ${prep.repairs.join('\n- ')}` : ''),
           );
         }
-        writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: true });
+        writeWorkflowAndSyncTriggers(entry.name, prep.def);
         // Re-enabling is a deliberate fresh start — clear any chronic-failure
         // streak so auto-heal/escalation resets (#6).
         clearWorkflowFailures(entry.name);
@@ -1414,7 +1632,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       description: z.string().optional(),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}; iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
+        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}, the local project with {{project.path}} / {{project.name}}, and iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
+        project: z.string().optional().describe('Local workspace/project name or path this step requires. Omit to inherit the workflow-level project.'),
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         model: z.string().optional(),
         intent: z.string().optional().describe('Optional free-form model-routing category for this step, e.g. "design". If a worker model is bound for that category, this step routes there unless model is explicitly set.'),
@@ -1425,7 +1644,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
-          args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
+          args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
         }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
         allowedTools: z.array(z.string()).optional(),
         requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
@@ -1433,14 +1652,21 @@ export function registerOrchestrationTools(server: McpServer): void {
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
         sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class ('read' | 'write' | 'send'). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends."),
-        loopUntil: z.object({ maxAttempts: z.number().min(1).max(5).optional() }).optional().describe('Step-level retry-until-contract-passes (plain LLM read steps; write needs loopSafe). Requires an output contract.'),
+        loopUntil: WorkflowLoopUntilSchema.optional().describe(LOOP_UNTIL_DESC),
         loopSafe: z.boolean().optional().describe('Author assertion that re-running this WRITE step is idempotent. Required for loopUntil on write steps; also allows goal re-pursuit past this step.'),
       })).optional(),
+      project: z.string().optional().describe('Set or clear the workflow-level default local workspace/project. Empty string clears it.'),
+      clear_project: z.boolean().optional().describe('Pass true to remove the workflow-level default local project.'),
       trigger_schedule: z.string().optional(),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
+      trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Pass an empty string or clear_trigger_webhook_path=true to remove it.'),
+      clear_trigger_webhook_path: z.boolean().optional().describe('Pass true to remove an existing webhook trigger path.'),
+      trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('Replace the workflow event subscriptions. Pass [] or clear_trigger_events=true to remove existing event triggers.'),
+      clear_trigger_events: z.boolean().optional().describe('Pass true to remove existing internal event trigger subscriptions.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the re-verification smoke test when this update changes an enabled workflow, e.g. {"url":"https://example.com"}.'),
       synthesis_prompt: z.string().optional(),
+      portable_models: z.boolean().optional().describe('Set true when this update should make the workflow portable across model providers by removing exact per-step model pins. Omit/false to preserve intentional model pins.'),
       allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
       goal: z.object({
         objective: z.string().min(4).describe('What a completed run must achieve — judged externally at run completion.'),
@@ -1449,7 +1675,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       }).optional().describe('PINNED RUN GOAL (run-to-completion) — see workflow_create. Pass to set/replace; use clear_goal to remove.'),
       clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
     },
-    async ({ name, description, steps, trigger_schedule, clear_trigger_schedule, inputs, test_inputs, synthesis_prompt, allowSends, goal, clear_goal }) => {
+    async ({ name, description, steps, project, clear_project, trigger_schedule, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
@@ -1467,43 +1693,19 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!entry) return textResult(`Workflow "${name}" not found.`);
 
       if (steps) {
-        const ids = new Set(steps.map((s) => s.id));
-        if (ids.size !== steps.length) return textResult('Duplicate workflow step IDs in update.');
-        for (const step of steps) {
-          for (const dep of step.dependsOn ?? []) {
-            if (!ids.has(dep)) return textResult(`Step "${step.id}" depends on unknown step "${dep}".`);
-          }
-        }
-      }
-      if (trigger_schedule && !validateCronExpression(trigger_schedule)) {
-        return textResult(`Invalid cron expression: "${trigger_schedule}"`);
+        const stepGraphError = validateWorkflowStepGraph(steps);
+        if (stepGraphError) return textResult(stepGraphError.replace('found.', 'in update.'));
       }
 
       const next: WorkflowDefinition = { ...entry.data };
       if (description !== undefined) next.description = description;
-      if (steps) {
-        next.steps = steps.map((s) => ({
-          id: s.id,
-          prompt: s.prompt ?? '',
-          dependsOn: s.dependsOn,
-          model: s.model,
-          intent: s.intent,
-          tier: s.tier,
-          maxTurns: s.maxTurns,
-          useHarness: s.useHarness,
-          forEach: s.forEach,
-          forEachNewOnly: s.forEachNewOnly,
-          call: s.call,
-          allowedTools: s.allowedTools,
-          requiresApproval: s.requiresApproval,
-          approvalPreview: s.approvalPreview,
-          usesSkill: s.usesSkill,
-          output: s.output,
-          sideEffect: s.sideEffect,
-          loopUntil: s.loopUntil,
-          loopSafe: s.loopSafe,
-        }));
+      if (clear_project) delete next.project;
+      else if (project !== undefined) {
+        const trimmedProject = project.trim();
+        if (trimmedProject) next.project = trimmedProject;
+        else delete next.project;
       }
+      if (steps) next.steps = normalizeWorkflowSteps(steps);
       // Tight authoring: bind any newly-provided steps to proven tool-choices.
       const updateRouteNotes = steps ? autoTagStepsWithModelRoleIntents(next.steps) : [];
       const updateBind = steps ? bindStepsToToolChoices(next.steps) : { boundNotes: [], advisories: [] };
@@ -1516,18 +1718,23 @@ export function registerOrchestrationTools(server: McpServer): void {
         next.goal = { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts };
       }
 
-      const currentTrigger = next.trigger ?? { manual: true };
-      if (clear_trigger_schedule) {
-        const { schedule: _drop, ...rest } = currentTrigger;
-        next.trigger = { ...rest, manual: true };
-      } else if (trigger_schedule !== undefined) {
-        next.trigger = { ...currentTrigger, schedule: trigger_schedule, manual: currentTrigger.manual ?? true };
-      }
+      const triggerPatch = applyWorkflowTriggerPatch(next.trigger, {
+        triggerSchedule: trigger_schedule,
+        clearTriggerSchedule: clear_trigger_schedule,
+        triggerWebhookPath: trigger_webhook_path,
+        clearTriggerWebhookPath: clear_trigger_webhook_path,
+        triggerEvents: trigger_events,
+        clearTriggerEvents: clear_trigger_events,
+      });
+      if (!triggerPatch.ok) return textResult(triggerPatch.error);
+      if (triggerPatch.changed) next.trigger = triggerPatch.trigger;
 
       // Auto-repair the fixable binding gaps before persisting so an edit
       // that left a dangling {{steps.X.output}} / forEach / {{input.X}}
       // saves runnable.
-      const updatePrep = prepareWorkflowForWrite(next);
+      const updatePrep = prepareWorkflowUpdateForWrite(entry.data, next, {
+        modelPortability: portable_models ? 'portable' : 'preserve',
+      });
       const savedNext = updatePrep.def;
       // P0-4: an ENABLED workflow must be valid — it runs on schedule. Auto-repair
       // fixes mechanical gaps, but non-repairable defects (cycles, ungated sends,
@@ -1535,10 +1742,13 @@ export function registerOrchestrationTools(server: McpServer): void {
       // computed validation then discarded it; gate it like every other seam
       // (create / dashboard PATCH / set_enabled / schedule). A DISABLED draft may
       // still save invalid so the user can keep iterating.
-      if (savedNext.enabled && !updatePrep.ok) {
+      if (updatePrep.status === 'invalid') {
         return textResult(
           `Workflow "${entry.name}" was NOT updated — it's enabled and these must be fixed first (or disable it to keep iterating):\n- ${updatePrep.errors.join('\n- ')}`,
         );
+      }
+      if (updatePrep.status === 'readiness_gaps') {
+        writeWorkflowAndSyncTriggers(entry.name, savedNext);
       }
       // Re-smoke on edit (2026-06-11): an edit that changes what an ENABLED
       // workflow EXECUTES is re-verified the same way a new workflow is —
@@ -1547,25 +1757,26 @@ export function registerOrchestrationTools(server: McpServer): void {
       // fail. "It's set and working" must mean "I watched it run", never
       // "I read the config". Schedule/description-only edits never re-test.
       let reSmoke: { message: string } | null = null;
-      if (entry.data.enabled && workflowExecutionSurfaceChanged(entry.data, savedNext)) {
-        let runTest = workflowNeedsCreationTest(savedNext);
-        if (runTest) {
-          const testInputs = workflowSmokeInputs(savedNext, providedSmokeInputs);
-          const missingSmokeInputs = missingWorkflowRunInputs(savedNext, testInputs);
+      if (updatePrep.status !== 'readiness_gaps' && workflowUpdateNeedsVerification(entry.data, savedNext)) {
+        const updateVerification = prepareWorkflowVerification(savedNext, providedSmokeInputs);
+        if (updateVerification.needsTest) {
           savedNext.enabled = false;
           writeWorkflowAndSyncTriggers(entry.name, savedNext);
-          reSmoke = missingSmokeInputs.length > 0
-            ? { message: renderMissingSmokeInputs(entry.name, missingSmokeInputs) }
-            : queueWorkflowCreationTest(entry.name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
+          reSmoke = updateVerification.missing.length > 0
+            ? { message: renderMissingSmokeInputs(entry.name, updateVerification.missing) }
+            : queueWorkflowCreationTest(entry.name, updateVerification.inputs, { originSessionId: getToolOutputContext()?.sessionId });
         }
       }
-      if (!reSmoke) writeWorkflowAndSyncTriggers(entry.name, savedNext);
+      if (!reSmoke && updatePrep.status !== 'readiness_gaps') writeWorkflowAndSyncTriggers(entry.name, savedNext);
       const changed = [
         description !== undefined ? 'description' : '',
         steps ? 'steps' : '',
         inputsProvided ? 'inputs' : '',
         synthesis_prompt !== undefined ? 'synthesis' : '',
+        portable_models ? 'model portability' : '',
         trigger_schedule !== undefined || clear_trigger_schedule ? 'schedule' : '',
+        trigger_webhook_path !== undefined || clear_trigger_webhook_path ? 'webhook trigger' : '',
+        trigger_events !== undefined || clear_trigger_events ? 'event triggers' : '',
       ].filter(Boolean);
       addNotification({
         id: `workflow-update-${entry.name}-${Date.now()}`,
@@ -1595,10 +1806,14 @@ export function registerOrchestrationTools(server: McpServer): void {
       ]);
       // Re-run the gap test on the edited workflow so remaining gaps stay
       // visible until the author actually closes them.
-      const updateGaps = renderWorkflowGapQuestions(analyzeWorkflowGaps(savedNext));
+      const updateGaps = renderWorkflowGapQuestions(updatePrep.status === 'readiness_gaps' ? updatePrep.gaps : analyzeWorkflowGaps(savedNext));
+      const updateExecutionPlan = buildWorkflowExecutionPlanWithReadiness(savedNext, entry.name);
+      const updateContractReport = appendVisualContract(updateExecutionPlan);
       return textResult(
         `Workflow "${name}" updated. Here's what it does now:\n\n${describeWorkflowPlainEnglish(savedNext)}\n\n`
           + `${appendDataSources(savedNext)}`
+          + `${updateContractReport}${updateContractReport ? '\n\n' : ''}`
+          + `${updatePrep.status === 'readiness_gaps' ? `${renderReadinessHold(name)}\n\n` : ''}`
           + `${reSmoke ? `${reSmoke.message}\n\n` : ''}`
           + `${updateBindReport}${updateAdvisories}${updateGaps}`.trim(),
       );
@@ -1754,7 +1969,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!confirm) return textResult('Refusing to delete: pass confirm=true.');
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
-      const ok = deleteWorkflow(entry.name);
+      const ok = deleteWorkflowAndSyncTriggers(entry.name);
       if (!ok) return textResult(`Workflow "${name}" delete failed (file system error).`);
       return textResult(`Workflow "${name}" deleted.`);
     },
@@ -1832,7 +2047,15 @@ export function registerOrchestrationTools(server: McpServer): void {
     async ({ run_id, step_id }) => {
       const queued = requeueWorkflowFailedItemsFromRun(run_id, {
         stepId: step_id,
+        source: 'chat',
         originSessionId: getToolOutputContext()?.sessionId,
+        recoveryIntent: {
+          kind: 'failed_items',
+          sourceRunId: run_id,
+          sourceStepId: step_id,
+          requestedFrom: 'chat',
+          reason: 'workflow_rerun_failed_items tool request',
+        },
       });
       if (queued.status === 'queued') {
         return textResult(

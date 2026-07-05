@@ -47,6 +47,19 @@ const CADENCE_RE =
 const FOREACH_HINT_RE =
   /\b(?:for each|each of|one per|per\s+(?:prospect|lead|item|row|client|account|company|firm|record|contact)|every\s+[a-z]+s\b|all\s+(?:the\s+)?[a-z]+s\b)\b/i;
 
+// Visual/reference deliverables are different from ordinary reports: a prompt
+// that says "match this HTML/page" is not a durable implementation. The actual
+// template must be kept as a workflow reference, deterministic renderer, or
+// skill; otherwise a later run can legally produce a generic page that still
+// satisfies a shallow file_exists contract.
+const VISUAL_DELIVERABLE_RE =
+  /\b(?:build|create|generate|write|produce|render|design|redesign|assemble)\b[\s\S]{0,80}\b(?:html|web\s?page|website|site|landing\s?page|proposal\s?page|audit\s?(?:site|page|html)|single-file\s+html)\b/i;
+const VISUAL_REFERENCE_RE = [
+  /\b(?:reference|provided|attached|source|existing|template|sample)\b[\s\S]{0,40}\b(?:html|page|site|design|template|mockup|screenshot)\b/i,
+  /\b(?:match|model(?:ed)?\s+after|based\s+on|clone|copy|replicate|mirror|use)\b[\s\S]{0,80}\b(?:html|page|site|design|template|mockup|screenshot|https?:\/\/)/i,
+  /\bhttps?:\/\/\S+\b[\s\S]{0,80}\b(?:quality\s+bar|reference|match|proposal|design|style)\b/i,
+];
+
 // Wave 3 P1-9: a step that PULLS a list of items from a source. When something
 // downstream depends on that list, an empty pull silently feeds nothing forward
 // (the SF→Airtable "{prospects: []}" class) — so ask whether zero is valid.
@@ -60,6 +73,24 @@ function looksLikeDeliverableProducer(prompt: string): boolean {
 
 function looksLikeDataSource(prompt: string): boolean {
   return DATA_SOURCE_RE.test(prompt ?? '');
+}
+
+function looksLikeReferenceBackedVisualStep(prompt: string, workflowText: string): boolean {
+  const p = prompt ?? '';
+  if (!VISUAL_DELIVERABLE_RE.test(p)) return false;
+  return VISUAL_REFERENCE_RE.some((re) => re.test(p) || re.test(workflowText));
+}
+
+function hasDurableVisualImplementation(step: WorkflowDefinition['steps'][number], workflowText: string): boolean {
+  if (step.deterministic?.runner) return true;
+  if (step.usesSkill?.trim()) return true;
+  const text = `${workflowText}\n${step.prompt ?? ''}`;
+  // Accept explicit workflow-local implementation/reference paths. This is
+  // deliberately narrow: a bare external URL or "the attached HTML" is not
+  // durable once the authoring conversation is gone.
+  return /\b(?:references|scripts)\//i.test(text)
+    || /\bworkflow\s+(?:references|scripts)\b/i.test(text)
+    || /\b(?:read|load|copy)\b[\s\S]{0,80}\b(?:references|scripts)\//i.test(text);
 }
 
 function hasOutputContract(step: WorkflowDefinition['steps'][number]): boolean {
@@ -155,6 +186,25 @@ export function analyzeWorkflowGaps(def: WorkflowDefinition): WorkflowGap[] {
       severity: 'clarify',
       question: 'This reads like recurring work, but no schedule is set — should I schedule it (what time + timezone), or keep it manual-only?',
       why: 'A workflow meant to run "every morning" that has no schedule will simply never fire on its own.',
+    });
+  }
+
+  // 5b: visual deliverables that cite a reference HTML/page/design but do not
+  // have a durable renderer/reference. This is the "reference HTML collapsed
+  // into prompt prose" class: the workflow can create an HTML file that passes
+  // shallow verification while ignoring the supplied design.
+  const workflowText = [
+    def.description ?? '',
+    def.description_body ?? '',
+  ].join('\n');
+  for (const step of steps) {
+    if (!looksLikeReferenceBackedVisualStep(step.prompt ?? '', workflowText)) continue;
+    if (hasDurableVisualImplementation(step, workflowText)) continue;
+    gaps.push({
+      severity: 'clarify',
+      stepId: step.id,
+      question: `Step "${step.id}" promises an HTML/page from a reference design, but the workflow only has prose instructions — should I store the supplied HTML/CSS under this workflow's references/ and wire a deterministic renderer or usesSkill step before calling it ready?`,
+      why: 'Without a durable reference/renderer, a later run can satisfy "file exists" while producing a generic page that ignores the supplied design.',
     });
   }
 

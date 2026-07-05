@@ -58,6 +58,18 @@ export interface WorkflowStepShape {
   /** Typed step contract (P0). Keys = declared input names. */
   inputs?: Record<string, unknown>;
   output?: Record<string, unknown>;
+  loopUntil?: {
+    maxAttempts?: number;
+    probe?: { runner?: string };
+    until?: unknown;
+  };
+  loopSafe?: boolean;
+  loop_until?: {
+    max_attempts?: number;
+    probe?: { runner?: string };
+    until?: unknown;
+  };
+  loop_safe?: boolean;
 }
 
 export interface WorkflowFrontmatter {
@@ -317,7 +329,7 @@ function checkStepOutputReferences(
 // surface that at author/validate time. (P1 = report-only; P2 wires
 // validation into create/enable so a broken workflow can't be enabled.)
 
-const KNOWN_TOKEN = /^(?:date|input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?)$/;
+const KNOWN_TOKEN = /^(?:date|input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.(?:requested|source|name|path|type))$/;
 const INPUT_TOKEN_RE = /\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g;
 
 function checkMalformedTokens(subject: string, prompt: string): string[] {

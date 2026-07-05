@@ -23,6 +23,7 @@ import os from 'node:os';
 // Set BASE_DIR to a temp dir BEFORE importing modules that resolve it.
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'clementine-runner-test-'));
 process.env.CLEMENTINE_HOME = tmp;
+process.env.CLEMENTINE_WORKFLOW_CONCURRENCY = '5';
 
 const skillsDir = path.join(tmp, 'skills');
 mkdirSync(path.join(skillsDir, 'test-skill'), { recursive: true });
@@ -276,6 +277,59 @@ test('fresh workflow run records a sanitized graph snapshot event', async () => 
   assert.deepEqual(graph?.nodes?.map((node) => node.id), ['pull', 'summarize']);
   assert.equal(graph?.nodes?.some((node) => Object.hasOwn(node, 'prompt')), false);
   assert.ok(graph?.edges?.some((edge) => edge.source === 'pull' && edge.target === 'summarize' && edge.type === 'dependency'));
+});
+
+test('fresh workflow run records ready batch metadata for parallel scheduler lanes', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const slug = 'parallel-ready-runner';
+  const workflowName = 'Parallel Ready Runner';
+  const runId = `parallel-ready-${Date.now()}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Records node readiness for parallel scheduler lanes.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: Array.from({ length: 6 }, (_, index) => ({
+      id: `root_${index + 1}`,
+      prompt: `Root ${index + 1}`,
+      deterministic: { runner: 'emit.mjs' },
+      sideEffect: 'read' as const,
+    })),
+  });
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'emit.mjs'),
+    'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
+    'utf-8',
+  );
+
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'queued',
+    inputs: {},
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  await processWorkflowRuns({} as never);
+
+  const ready = readWorkflowEvents(slug, runId).filter((event) => event.kind === 'workflow_node_ready');
+  const roundOne = ready.filter((event) => event.meta?.round === 1);
+  assert.equal(roundOne.length, 6);
+  assert.equal(roundOne.filter((event) => event.meta?.scheduled === true).length, 5);
+  assert.equal(roundOne.filter((event) => event.meta?.deferredByConcurrency === true).length, 1);
+  assert.equal(roundOne.every((event) => event.meta?.readyWidth === 6), true);
+  assert.equal(roundOne.every((event) => event.meta?.concurrencyCap === 5), true);
+  const deferredStep = roundOne.find((event) => event.meta?.deferredByConcurrency === true)?.stepId;
+  assert.ok(deferredStep);
+  assert.ok(ready.some((event) =>
+    event.stepId === deferredStep
+    && event.meta?.round === 2
+    && event.meta?.scheduled === true
+    && event.meta?.deferredByConcurrency === false,
+  ));
 });
 
 test('reapResolvedParkedRuns re-admits on a rejected approval too (run fails loudly, never stuck)', () => {

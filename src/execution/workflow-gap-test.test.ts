@@ -171,6 +171,49 @@ test('P1-9 does NOT flag a list-pull with no downstream consumer', () => {
   assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'pull' && /ZERO items/i.test(g.question)));
 });
 
+test('flags reference-backed HTML producer with no durable renderer or reference asset', () => {
+  const def = wf({
+    description_body: 'Use https://amador.example/proposal as the quality bar and reference design.',
+    steps: [
+      {
+        id: 'produce',
+        prompt: 'Build a single-file HTML audit site modeled after the reference page and write index.html.',
+        output: { type: 'object', verify: { path_exists: ['file_path'] } },
+      },
+    ],
+  });
+  const gaps = analyzeWorkflowGaps(def);
+  assert.ok(gaps.some((g) => g.stepId === 'produce' && /reference design/i.test(g.question)));
+});
+
+test('does NOT flag reference-backed HTML producer when deterministic renderer is declared', () => {
+  const def = wf({
+    steps: [
+      {
+        id: 'produce',
+        prompt: 'Build a single-file HTML audit site modeled after the reference page.',
+        deterministic: { runner: 'scripts/render-audit.mjs' },
+        output: { type: 'object', verify: { path_exists: ['file_path'] } },
+      },
+    ],
+  });
+  assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'produce' && /reference design/i.test(g.question)));
+});
+
+test('does NOT flag reference-backed HTML producer when workflow-local references are explicit', () => {
+  const def = wf({
+    description_body: 'Reference HTML is stored in references/amador.html.',
+    steps: [
+      {
+        id: 'produce',
+        prompt: 'Build a proposal page based on the reference HTML in references/amador.html.',
+        output: { type: 'object', verify: { path_exists: ['file_path'] } },
+      },
+    ],
+  });
+  assert.ok(!analyzeWorkflowGaps(def).some((g) => g.stepId === 'produce' && /reference design/i.test(g.question)));
+});
+
 test('caps the number of gaps', () => {
   const def = wf({
     description: 'Every morning do this.',

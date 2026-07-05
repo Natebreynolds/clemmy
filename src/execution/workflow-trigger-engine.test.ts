@@ -97,6 +97,26 @@ test('filter mismatch → filtered, no run; unsubscribed event type → no resul
   assert.deepEqual(fireWorkflowSystemEvent('nobody.subscribes', { x: 1 }), []);
 });
 
+test('system_event fire reports readiness_blocked when required capabilities are missing', () => {
+  writeWorkflow('on-readiness-block', [
+    'trigger:',
+    '  events:',
+    '    - type: crm.readiness.block',
+    'steps:',
+    '  - id: merge',
+    '    prompt: Merge evidence.',
+    '    deterministic:',
+    '      runner: missing.py',
+  ]);
+  syncWorkflowTriggerRegistry();
+
+  const fired = fireWorkflowSystemEvent('crm.readiness.block', { id: 'B-1' });
+  const row = fired.find((r) => r.workflowName === 'on-readiness-block');
+  assert.equal(row?.status, 'readiness_blocked');
+  assert.match(row?.message ?? '', /missing\.py/);
+  assert.equal(queuedRuns().filter((r) => r.workflow === 'on-readiness-block').length, 0);
+});
+
 test('sync preserves multiple filters for the same workflow event type', () => {
   writeWorkflow('on-regional-lead', [
     'trigger:',

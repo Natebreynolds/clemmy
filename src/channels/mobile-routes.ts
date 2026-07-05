@@ -60,13 +60,14 @@ import { ClementineGateway } from '../gateway/router.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { lookupIdempotent, rememberIdempotent } from '../runtime/idempotency.js';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { recallHybrid } from '../memory/recall.js';
 import { listActiveFacts } from '../memory/facts.js';
 type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { readWorkflowEvents } from '../execution/workflow-events.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { processBackgroundTasks } from '../execution/background-tasks.js';
@@ -1215,22 +1216,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
     try {
-      mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
-      const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
-      const payload = {
-        id,
-        workflow: entry.data.name,
-        inputs: {},
-        status: 'queued',
-        createdAt: new Date().toISOString(),
-        source: 'mobile',
-      };
-      writeFileSync(
-        path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
-        JSON.stringify(payload, null, 2),
-        'utf-8',
-      );
-      res.json({ ok: true, runId: id, status: 'queued' });
+      const queued = queueWorkflowRun(entry.data.name, {}, { source: 'mobile', dedupe: false });
+      res.json({ ok: true, runId: queued.id, status: 'queued' });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

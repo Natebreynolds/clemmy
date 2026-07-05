@@ -21,6 +21,7 @@ import {
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
 import { emitWorkflowChange } from '../memory/workflow-change-bus.js';
+import { syncWorkflowTriggersBestEffort } from '../execution/workflow-write.js';
 
 export type WorkflowImportStatus = 'queued' | 'cloning' | 'discovering' | 'installing' | 'succeeded' | 'failed';
 
@@ -240,6 +241,8 @@ export function importWorkflowFrameworkFromDirectory(
     emitWorkflowChange({ name: candidate.name, op: existing ? 'updated' : 'created' });
     installed.push({ name: candidate.name, pathInSource: candidate.pathInSource, filePath: installedEntry.filePath });
   }
+
+  if (installed.length > 0) syncWorkflowTriggersBestEffort();
 
   return { discovered, installed, skipped };
 }

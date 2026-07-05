@@ -302,6 +302,33 @@ test('applyProposedFix snapshots a backup, and revertWorkflowFix restores the pr
   assert.equal(revertWorkflowFix(applied.backupId!).ok, false);
 });
 
+test('applyProposedFix saves enabled workflows disabled when a fix introduces readiness gaps', () => {
+  writeWorkflow('diagnosis-readiness-wf', {
+    name: 'diagnosis-readiness-wf', description: 'readiness regression', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'main', prompt: 'Summarize the prospect list.' }],
+  } as never);
+  const fix = recordProposedFix('diagnosis-readiness-wf', 'run-gap', {
+    summary: 's', rootCause: 'r',
+    fix: {
+      kind: 'edit_step' as const,
+      stepId: 'main',
+      description: 'rewrite into an external send step',
+      newStepPrompt: 'Send the emails to the outside prospect list.',
+      newOutputContractJson: null,
+      service: null,
+      autoApplicable: true,
+    },
+    confidence: 'high' as const,
+  });
+
+  const applied = applyProposedFix(fix.id);
+  assert.equal(applied.ok, true, applied.message);
+  assert.match(applied.message, /stayed DISABLED/i);
+  const saved = readWorkflow('diagnosis-readiness-wf')!.data;
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.steps[0].prompt, 'Send the emails to the outside prospect list.');
+});
+
 test('revertWorkflowFix on an unknown id fails cleanly', () => {
   assert.equal(revertWorkflowFix('heal-nope').ok, false);
 });

@@ -32,8 +32,9 @@ import pino from 'pino';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { STATE_DIR } from '../memory/db.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
-import { readWorkflow, writeWorkflow, type WorkflowDefinition, type WorkflowStepInput, type WorkflowStepInputBinding, type WorkflowStepOutputContract } from '../memory/workflow-store.js';
-import { checkWorkflowForWrite } from './workflow-enforce.js';
+import { readWorkflow, type WorkflowDefinition, type WorkflowStepInput, type WorkflowStepInputBinding, type WorkflowStepOutputContract } from '../memory/workflow-store.js';
+import { prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
+import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
 
 const logger = pino({ name: 'clementine-next.workflow-diagnosis' });
 
@@ -658,7 +659,7 @@ export function revertWorkflowFix(id: string): ApplyResult {
   try { backup = JSON.parse(fs.readFileSync(file, 'utf8')) as FixBackup; }
   catch { return { ok: false, message: `Heal backup "${id}" is unreadable.` }; }
   if (!readWorkflow(backup.workflow)) return { ok: false, message: `Workflow "${backup.workflow}" no longer exists.` };
-  writeWorkflow(backup.workflow, backup.priorDefinition);
+  writeWorkflowAndSyncTriggers(backup.workflow, backup.priorDefinition);
   try { fs.unlinkSync(file); } catch { /* best-effort */ }
   logger.info({ workflow: backup.workflow, step: backup.stepId, healId: id }, 'self-heal: reverted workflow fix');
   return { ok: true, message: `Reverted "${backup.workflow}" to the version before the auto-fix on step "${backup.stepId}".` };
@@ -812,19 +813,20 @@ export function applyProposedFix(id: string): ApplyResult {
     ...def,
     steps: def.steps.map((s, i) => (i === idx ? editStep(s) : s)),
   };
-  const check = checkWorkflowForWrite(updated);
-  if (!check.ok) {
-    return { ok: false, message: `The proposed fix would fail workflow validation; not applied.`, errors: check.errors };
+  const prepared = prepareWorkflowUpdateForWrite(def, updated, { allowInvalidDisabled: false });
+  if (prepared.status === 'invalid') {
+    return { ok: false, message: `The proposed fix would fail workflow validation; not applied.`, errors: prepared.errors };
   }
   // Snapshot the PRIOR definition first so a bad heal is reversible (#7).
   const backup = recordFixBackup(fix.workflow, fix.stepId, def, d.fix.description);
-  writeWorkflow(fix.workflow, updated);
+  writeWorkflowAndSyncTriggers(fix.workflow, prepared.def);
   dismissProposedFix(id);
   logger.info({ workflow: fix.workflow, step: fix.stepId, fixId: id, kind: d.fix.kind, backupId: backup?.id }, 'self-heal: applied workflow fix');
   const revertHint = backup ? ` If it doesn't help, revert with \`revert heal ${backup.id}\`.` : '';
+  const readinessHint = prepared.status === 'readiness_gaps' ? ` ${renderReadinessHold(fix.workflow)}` : '';
   return {
     ok: true,
-    message: `Applied the fix to "${fix.workflow}" · step "${fix.stepId}". Re-run the workflow when ready.${revertHint}`,
+    message: `Applied the fix to "${fix.workflow}" · step "${fix.stepId}". Re-run the workflow when ready.${readinessHint}${revertHint}`,
     backupId: backup?.id,
   };
 }

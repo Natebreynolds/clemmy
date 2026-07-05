@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { RunRequest, RunResult } from '../types.js';
@@ -17,6 +17,9 @@ const {
   processExecutionController,
   _setExecutionCompletionJudgeForTests,
 } = await import('./controller.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { WORKFLOWS_DIR } = await import('../memory/vault.js');
+const { writeWorkflow } = await import('../memory/workflow-store.js');
 
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
@@ -27,6 +30,8 @@ test.after(() => {
 test.beforeEach(() => {
   mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
   writeFileSync(EXECUTIONS_FILE, '[]', 'utf-8');
+  rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+  rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
   _setExecutionCompletionJudgeForTests(null);
 });
 
@@ -115,6 +120,55 @@ test('controller mark_completed closes the execution when the completion judge p
   assert.equal(updated?.status, 'completed');
   assert.equal(updated?.blocker, undefined);
   assert.match(updated?.lastAssistantSummary ?? '', /msg_123/);
+});
+
+test('controller queue_workflow writes through the shared workflow queue', async () => {
+  writeWorkflow('controller-follow-up', {
+    name: 'controller-follow-up',
+    description: 'Run the controller follow-up.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'run', prompt: 'Run the follow-up for {{input.url}}.' }],
+  });
+  const execution = createExecution({
+    title: 'Run the controller workflow',
+    objective: 'Queue the follow-up workflow with the supplied website.',
+  });
+  const { assistant } = assistantWithResponses([
+    JSON.stringify({
+      summary: 'Queued the follow-up workflow.',
+      actions: [{
+        type: 'queue_workflow',
+        workflow: 'controller-follow-up',
+        inputs: { website: ' https://example.com/controller ' },
+      }],
+    }),
+    JSON.stringify({
+      summary: 'Workflow queued; waiting for the run to finish.',
+      status: 'active',
+      nextReviewMinutes: 30,
+    }),
+  ]);
+
+  await processExecutionController(assistant as never);
+
+  const updated = new ExecutionStore().get(execution.id);
+  assert.equal(updated?.workflowBindings?.length, 1);
+  const binding = updated!.workflowBindings![0];
+  assert.equal(binding.workflow, 'controller-follow-up');
+  assert.equal(binding.status, 'queued');
+
+  const records = readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((file) => file.endsWith('.json'))
+    .map((file) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>)
+    .filter((record) => record.workflow === 'controller-follow-up');
+  assert.equal(records.length, 1);
+  assert.equal(records[0].id, binding.runId);
+  assert.equal(records[0].source, 'execution-controller');
+  assert.deepEqual(records[0].inputs, {
+    website: 'https://example.com/controller',
+    url: 'https://example.com/controller',
+  });
 });
 
 test('synthesis-driven completed status is rejected when judge validation fails', async () => {

@@ -35,6 +35,9 @@ import { emitWorkflowChange } from './workflow-change-bus.js';
 export interface WorkflowStepInput {
   id: string;
   prompt: string;
+  /** Local workspace/project this step expects to operate in. A workflow-level
+   *  `project` is inherited when this is omitted. Serialized as `project`. */
+  project?: string;
   dependsOn?: string[];
   /** Deprecated compatibility field from the older ordering-only dependency
    *  model. dependsOn now carries upstream outputs into STEP CONTEXT
@@ -331,6 +334,9 @@ export interface WorkflowDefinition {
   name: string;
   /** One-line summary used by the agent's tool-discovery surface. */
   description: string;
+  /** Default local workspace/project required by the workflow. Steps may
+   *  override with their own `project`. */
+  project?: string;
   /** False = workflow exists but won't fire on its own. */
   enabled: boolean;
   /** When the agent should pick this workflow off the shelf. Free-form. */
@@ -482,6 +488,12 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
         ? bodyPrompt
         : String(step.prompt ?? '');
       const result: WorkflowStepInput = { id, prompt };
+      const stepProject = typeof step.project === 'string'
+        ? step.project.trim()
+        : typeof (step as Record<string, unknown>).workspace_project === 'string'
+          ? String((step as Record<string, unknown>).workspace_project).trim()
+          : '';
+      if (stepProject) result.project = stepProject;
       if (Array.isArray(step.dependsOn)) result.dependsOn = step.dependsOn.map(String);
       if (Array.isArray(step.orderingOnlyDeps)) result.orderingOnlyDeps = step.orderingOnlyDeps.map(String);
       if (typeof step.model === 'string') result.model = step.model;
@@ -590,6 +602,7 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
     return {
       name: String(data.name ?? inferredName),
       description: String(data.description ?? ''),
+      project: typeof data.project === 'string' && data.project.trim() ? data.project.trim() : undefined,
       enabled: data.enabled !== false,
       whenToUse: typeof data.when_to_use === 'string' ? data.when_to_use : typeof data.whenToUse === 'string' ? data.whenToUse : undefined,
       trigger: typeof data.trigger === 'object' && data.trigger ? data.trigger as WorkflowTrigger : { manual: true },
@@ -671,6 +684,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
     enabled: def.enabled,
   };
   if (def.whenToUse) frontmatter.when_to_use = def.whenToUse;
+  if (def.project) frontmatter.project = def.project;
   if (def.allowedTools && def.allowedTools.length > 0) frontmatter.allowed_tools = def.allowedTools;
   if (def.trigger) frontmatter.trigger = def.trigger;
   // Steps go in frontmatter for typed config (id, deps, model, forEach,
@@ -680,6 +694,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   if (def.steps.length > 0) {
     frontmatter.steps = def.steps.map((s) => {
       const out: Record<string, unknown> = { id: s.id };
+      if (s.project) out.project = s.project;
       if (s.dependsOn && s.dependsOn.length > 0) out.dependsOn = s.dependsOn;
       if (s.model) out.model = s.model;
       if (s.intent) out.intent = s.intent;

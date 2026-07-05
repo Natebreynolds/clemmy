@@ -15,6 +15,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const { applyStepPromptAddendum, applyStepPromptEdit, revertStepEdit, listStepEditBackups } = await import('./workflow-step-edit.js');
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
+const { fireWorkflowSystemEvent, closeWorkflowTriggerDbForTest } = await import('./workflow-trigger-engine.js');
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
 const NOW = '2026-06-24T12:00:00.000Z';
@@ -30,6 +31,7 @@ function def(): WorkflowDefinition {
 }
 
 before(() => {
+  closeWorkflowTriggerDbForTest();
   rmSync(TEST_HOME, { recursive: true, force: true });
   mkdirSync(TEST_HOME, { recursive: true });
   writeWorkflow('edit-wf', def());
@@ -128,4 +130,42 @@ test('replaces ALL occurrences and reports the count', () => {
   assert.equal(r.ok, true);
   assert.match(r.message, /3 occurrences/);
   assert.equal(readWorkflow('src-wf')!.data.steps[0].prompt, 'Salesforce here. Salesforce there. Two Salesforce mentions.');
+});
+
+test('step edits sync event triggers after writing the workflow', () => {
+  writeWorkflow('event-edit-wf', {
+    name: 'event-edit-wf',
+    description: 'event edit test',
+    enabled: true,
+    trigger: { manual: true, events: [{ type: 'stepedit.lead.created', dedupeKey: 'lead-{{payload.id}}' }] },
+    steps: [{ id: 'handle', prompt: 'Handle the lead.', sideEffect: 'read' }],
+  });
+
+  const edited = applyStepPromptAddendum('event-edit-wf', 'handle', 'Include the lead id.', { nowIso: NOW });
+  assert.equal(edited.ok, true);
+  const fired = fireWorkflowSystemEvent('stepedit.lead.created', { id: 'L-1' })
+    .filter((result) => result.workflowName === 'event-edit-wf');
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].status, 'queued');
+});
+
+test('step edits that introduce readiness gaps save the workflow disabled', () => {
+  writeWorkflow('gap-edit-wf', {
+    name: 'gap-edit-wf',
+    description: 'gap edit test',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'draft', prompt: 'Draft a short internal note.', sideEffect: 'read' }],
+  });
+
+  const edited = applyStepPromptEdit(
+    'gap-edit-wf',
+    'draft',
+    'Draft a short internal note.',
+    'Send the emails to the outside prospect list.',
+    { nowIso: NOW },
+  );
+  assert.equal(edited.ok, true, edited.message);
+  assert.match(edited.message, /stayed DISABLED/);
+  assert.equal(readWorkflow('gap-edit-wf')!.data.enabled, false);
 });
