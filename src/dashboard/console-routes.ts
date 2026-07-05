@@ -92,6 +92,7 @@ import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadI
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import { simulateWorkflowDryRun } from '../execution/workflow-dry-run-simulation.js';
+import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
 import {
   applyWorkflowVisualContractFixes,
@@ -4023,6 +4024,36 @@ export function registerConsoleRoutes(
       return;
     }
     res.json({ queued: queued.status !== 'duplicate', duplicate: queued.status === 'duplicate', dryRun, id: queued.id, targetStepId });
+  });
+
+  // Ever-learning quality contract: turn "this run was wrong because X" into
+  // durable, checkable success criteria the completion judge holds every FUTURE
+  // run to. This is how output-quality trust compounds — the same mistake never
+  // silently recurs once you've named it.
+  app.post('/api/console/workflows/:name/quality-feedback', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const feedback = typeof req.body?.feedback === 'string' ? req.body.feedback.trim() : '';
+    if (!feedback) { res.status(400).json({ error: 'feedback is required' }); return; }
+    const result = applyLearnedQualityCriteria(entry.data, feedback);
+    if (result.changed) writeWorkflowAndSyncTriggers(entry.name, result.def);
+    res.json({
+      changed: result.changed,
+      added: result.added,
+      criteria: result.criteria,
+      message: result.changed
+        ? `Learned ${result.added.length} new quality ${result.added.length === 1 ? 'criterion' : 'criteria'} — every future run of "${entry.data.name}" is now judged against ${result.criteria.length} criteria.`
+        : `No new criteria — "${entry.data.name}" already holds runs to that bar.`,
+    });
+  });
+
+  app.get('/api/console/workflows/:name/quality-contract', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    res.json({ criteria: workflowQualityCriteria(entry.data), objective: entry.data.goal?.objective ?? null });
   });
 
   app.get('/api/console/workflows/:name/runs/:runId/failed-items', (req, res) => {

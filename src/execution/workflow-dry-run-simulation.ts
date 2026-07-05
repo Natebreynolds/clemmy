@@ -21,6 +21,7 @@ import { shortStepLabel } from './workflow-describe.js';
 import { classifyStepSideEffect, type StepSideEffectClass } from './workflow-enforce.js';
 import { preflightWorkflow } from './workflow-preflight.js';
 import { checkWorkflowRunReadiness } from './workflow-run-readiness.js';
+import { workflowQualityCriteria } from './workflow-quality-contract.js';
 import type {
   WorkflowExecutionPlan,
   WorkflowExecutionVisualContract,
@@ -65,6 +66,8 @@ export interface WorkflowDryRunSimulation {
   readiness: { blockers: WorkflowToolReadinessItem[]; warnings: WorkflowToolReadinessItem[] };
   contract: WorkflowExecutionVisualContract;
   contractAdvisories: string[];
+  /** The learned quality bar every run is judged against (goal.successCriteria). */
+  qualityCriteria: string[];
   missingInputs: string[];
   blockingReasons: string[];
   plan: WorkflowExecutionPlan;
@@ -212,6 +215,7 @@ export function simulateWorkflowDryRun(
     readiness: { blockers: readiness.blockers, warnings: readiness.warnings },
     contract,
     contractAdvisories,
+    qualityCriteria: workflowQualityCriteria(def),
     missingInputs: preflight.missingInputs,
     blockingReasons,
     plan,
@@ -269,6 +273,9 @@ export function renderWorkflowDryRunSimulation(sim: WorkflowDryRunSimulation): s
   }
   if (sim.effects.approvals.length > 0) {
     lines.push(`Gated on approval: ${sim.effects.approvals.join(', ')}.`, '');
+  }
+  if (sim.qualityCriteria.length > 0) {
+    lines.push(`Quality bar (judged every run): ${sim.qualityCriteria.length} learned criteria`, ...sim.qualityCriteria.slice(0, 6).map((c) => `  ✓ ${c}`), '');
   }
 
   lines.push('Execution waves:');

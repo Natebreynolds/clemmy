@@ -17089,6 +17089,7 @@ const CONSOLE_JS = `
     const chip = (id) => (stepById[id] ? (icon[stepById[id].effect] || '•') : '•') + ' ' + escMem(id);
     const blockers = Array.isArray(sim.blockingReasons) ? sim.blockingReasons : [];
     const advisories = Array.isArray(sim.contractAdvisories) ? sim.contractAdvisories : [];
+    const quality = Array.isArray(sim.qualityCriteria) ? sim.qualityCriteria : [];
     const warnings = (sim.readiness && Array.isArray(sim.readiness.warnings)) ? sim.readiness.warnings : [];
     return [
       '<section class="wf-exec-plan wf-dryrun' + (verdict === 'blocked' ? ' warn' : '') + '">',
@@ -17102,6 +17103,8 @@ const CONSOLE_JS = `
         ? '  <div class="wf-exec-row"><span>SIDE EFFECTS</span><p>👁️ Reads only — no external writes or sends.</p></div>' : '',
       approvals.length
         ? '  <div class="wf-exec-row"><span>APPROVAL GATES</span><p>' + escMem(approvals.join(' · ')) + '</p></div>' : '',
+      quality.length
+        ? '  <div class="wf-exec-row"><span>QUALITY BAR</span>' + quality.slice(0, 8).map((c) => '<p>✓ ' + escMem(c) + '</p>').join('') + '</div>' : '',
       waves.length
         ? '  <div class="wf-exec-row"><span>EXECUTION WAVES</span>' + waves.map((w) => '<p>' + escMem(String((Number(w.index) || 0) + 1)) + (w.parallel ? ' ∥ ' : '. ') + (Array.isArray(w.stepIds) ? w.stepIds.map(chip).join('   ') : '') + '</p>').join('') + '</div>' : '',
       blockers.length
