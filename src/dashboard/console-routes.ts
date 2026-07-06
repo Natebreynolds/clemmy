@@ -3575,7 +3575,7 @@ export function registerConsoleRoutes(
         });
         return;
       }
-      const queued = queueWorkflowCreationTest(slug, createVerification.inputs);
+      const queued = queueWorkflowCreationTest(name, createVerification.inputs);
       res.status(202).json({
         created: true,
         name,

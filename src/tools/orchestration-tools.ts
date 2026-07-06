@@ -1156,6 +1156,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       })).optional().describe('(Optional) If omitted, I intelligently break down your description into steps. If provided, I still validate and suggest improvements.'),
       project: z.string().optional().describe('Default local workspace/project name or path for this workflow. Use when steps operate in a specific repo or local project; step-level project overrides it.'),
       trigger_schedule: z.string().optional(),
+      trigger_timezone: z.string().optional().describe('IANA timezone for trigger_schedule, e.g. "America/Los_Angeles". Use this whenever the user says a local time so 8 AM means their 8 AM, not the server host time.'),
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Use for "when X happens in another system" asks that can call a webhook.'),
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
@@ -1170,7 +1171,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
-    async ({ name, description, steps, project, trigger_schedule, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
+    async ({ name, description, steps, project, trigger_schedule, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
       // INTELLIGENT WORKFLOW CREATION:
       // If steps not provided, analyze the description and generate steps intelligently
       let finalSteps = steps;
@@ -1223,6 +1224,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (stepGraphError) return textResult(stepGraphError);
       const triggerResult = buildWorkflowTrigger({
         schedule: trigger_schedule,
+        timezone: trigger_timezone,
         webhookPath: trigger_webhook_path,
         events: trigger_events,
       });
@@ -1857,6 +1859,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       project: z.string().optional().describe('Set or clear the workflow-level default local workspace/project. Empty string clears it.'),
       clear_project: z.boolean().optional().describe('Pass true to remove the workflow-level default local project.'),
       trigger_schedule: z.string().optional(),
+      trigger_timezone: z.string().optional().describe('IANA timezone for trigger_schedule, e.g. "America/Los_Angeles". Pass when changing scheduled local-time workflows.'),
       clear_trigger_schedule: z.boolean().optional().describe('Pass true to remove an existing schedule (e.g. switch back to manual-only).'),
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Pass an empty string or clear_trigger_webhook_path=true to remove it.'),
       clear_trigger_webhook_path: z.boolean().optional().describe('Pass true to remove an existing webhook trigger path.'),
@@ -1876,7 +1879,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       }).optional().describe('PINNED RUN GOAL (run-to-completion) — see workflow_create. Pass to set/replace; use clear_goal to remove.'),
       clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
     },
-    async ({ name, description, steps, project, clear_project, trigger_schedule, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
+    async ({ name, description, steps, project, clear_project, trigger_schedule, trigger_timezone, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
@@ -1931,6 +1934,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       const triggerPatch = applyWorkflowTriggerPatch(next.trigger, {
         triggerSchedule: trigger_schedule,
         clearTriggerSchedule: clear_trigger_schedule,
+        timezone: trigger_timezone,
         triggerWebhookPath: trigger_webhook_path,
         clearTriggerWebhookPath: clear_trigger_webhook_path,
         triggerEvents: trigger_events,

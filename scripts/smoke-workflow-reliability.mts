@@ -106,7 +106,7 @@ const bRaw = {
   enabled: true,
   trigger: { manual: true },
   steps: [
-    { id: 'list', prompt: 'produce a list of leads', useHarness: false },
+    { id: 'list', prompt: 'produce a list of leads', output: { type: 'array', min_items: { '': 1 } }, useHarness: false },
     { id: 'each', prompt: 'process {{item.lead}}', forEach: 'list', useHarness: false }, // dep auto-wired
   ],
 } as Parameters<typeof prepareWorkflowForWrite>[0];

@@ -121,7 +121,9 @@ const EXTERNAL_WRITE_RE =
  * irreversible send, or a write-verb-near-external-noun all count; a pure
  * read/fetch/query step does not.
  */
-export function stepLooksMutating(step: { prompt?: string; requiresApproval?: boolean; requires_approval?: boolean; call?: { tool?: string } }): boolean {
+export function stepLooksMutating(step: { prompt?: string; sideEffect?: string; requiresApproval?: boolean; requires_approval?: boolean; call?: { tool?: string } }): boolean {
+  if (step.sideEffect === 'read') return false;
+  if (step.sideEffect === 'write' || step.sideEffect === 'send') return true;
   if (step.requiresApproval === true || step.requires_approval === true) return true;
   if (structuredCallSideEffectClass(step.call) !== 'read') return true;
   const p = step.prompt ?? '';

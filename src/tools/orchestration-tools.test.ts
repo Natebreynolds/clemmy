@@ -376,6 +376,61 @@ test('workflow_create accepts a call-only read step and queues a creation test',
   assert.equal(run.status, 'creation_test');
 });
 
+test('workflow_create tolerates model-emitted null optionals on authored steps', async () => {
+  const soql = 'SELECT Id, Name, StageName, Amount, CloseDate FROM Opportunity WHERE IsClosed = false ORDER BY CloseDate ASC LIMIT 50';
+  const result = await workflowCreate()({
+    name: 'Monday Salesforce Opportunity Report',
+    description: 'Every Monday at 8 AM PT, read open Salesforce opportunities and produce a report.',
+    trigger_schedule: '0 8 * * 1',
+    trigger_timezone: 'America/Los_Angeles',
+    steps: [
+      {
+        id: 'pull_open_opportunities',
+        prompt: null,
+        project: null,
+        dependsOn: null,
+        model: null,
+        intent: null,
+        maxTurns: null,
+        forEach: null,
+        call: { tool: 'SALESFORCE_RUN_SOQL_QUERY', args: { query: soql } },
+        deterministic: null,
+        allowedTools: ['composio_execute_tool'],
+        sideEffect: 'read',
+        requiresApproval: false,
+        approvalPreview: null,
+        inputs: null,
+        output: { type: 'object', required_keys: ['records'] },
+      },
+      {
+        id: 'summarize_opportunity_report',
+        prompt: 'Summarize total pipeline, overdue close dates, next-step gaps, largest opportunities, stage mix, owner mix, and recommended follow-up priorities.',
+        dependsOn: ['pull_open_opportunities'],
+        call: null,
+        deterministic: null,
+        allowedTools: [],
+        sideEffect: 'read',
+        requiresApproval: false,
+        approvalPreview: null,
+        output: { type: 'object', required_keys: ['summary', 'priorities'] },
+      },
+    ],
+    synthesis_prompt: 'Return the final Salesforce opportunity report for the workflow activity/results view.',
+  });
+  const text = resultText(result);
+  assert.match(text, /Created workflow "Monday Salesforce Opportunity Report"/);
+  assert.doesNotMatch(text, /declares call but no tool/);
+
+  const saved = readWorkflow('monday-salesforce-opportunity-report')!.data;
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.trigger.schedule, '0 8 * * 1');
+  assert.equal(saved.trigger.timezone, 'America/Los_Angeles');
+  assert.equal(saved.steps[0].prompt, '');
+  assert.deepEqual(saved.steps[0].call?.args, { query: soql });
+  assert.equal(saved.steps[1].call, undefined);
+  assert.equal(saved.steps[1].allowedTools, undefined);
+});
+
 test('workflow_create keeps external-read workflows disabled when smoke inputs are missing', async () => {
   const result = await workflowCreate()({
     name: 'missing-smoke-input-wf',

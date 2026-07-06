@@ -1533,7 +1533,7 @@ test('POST /api/console/workflows queues verification for external-read creates 
       status: string;
       inputs: Record<string, string>;
     };
-    assert.equal(run.workflow, workflowSlug);
+    assert.equal(run.workflow, workflowName);
     assert.equal(run.status, 'creation_test');
     assert.equal(run.inputs.url, 'https://example.com/create');
   } finally {

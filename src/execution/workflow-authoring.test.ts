@@ -111,6 +111,61 @@ test('shared step normalization and graph validation preserve execution fields',
   assert.match(validateWorkflowStepGraph(steps) ?? '', /depends on unknown step "pull"/);
 });
 
+test('shared step normalization treats model-emitted null optionals as absent', () => {
+  const steps = normalizeWorkflowSteps([
+    {
+      id: 'pull_open_opportunities',
+      prompt: null,
+      project: null,
+      dependsOn: null,
+      call: {
+        tool: 'SALESFORCE_RUN_SOQL_QUERY',
+        args: {
+          query: 'SELECT Id, Name FROM Opportunity WHERE IsClosed = false LIMIT 50',
+        },
+      },
+      deterministic: null,
+      allowedTools: ['composio_execute_tool'],
+      sideEffect: 'read',
+      requiresApproval: false,
+      inputs: null,
+      output: { type: 'object', required_keys: ['records'] },
+    },
+    {
+      id: 'summarize_opportunity_report',
+      prompt: 'Summarize the Salesforce opportunity report.',
+      dependsOn: ['pull_open_opportunities'],
+      call: null,
+      deterministic: null,
+      allowedTools: [],
+      sideEffect: 'read',
+      requiresApproval: false,
+      output: { type: 'object', required_keys: ['summary'] },
+    },
+  ] as unknown as Parameters<typeof normalizeWorkflowSteps>[0]);
+
+  assert.equal(steps[0].prompt, '');
+  assert.deepEqual(steps[0].call?.args, {
+    query: 'SELECT Id, Name FROM Opportunity WHERE IsClosed = false LIMIT 50',
+  });
+  assert.equal(steps[0].deterministic, undefined);
+  assert.equal(steps[0].inputs, undefined);
+  assert.equal(steps[1].call, undefined);
+  assert.equal(steps[1].deterministic, undefined);
+  assert.equal(steps[1].allowedTools, undefined);
+  assert.equal(validateWorkflowStepGraph(steps), null);
+
+  const prepared = prepareWorkflowCreateForWrite({
+    name: 'Monday Salesforce Opportunity Report',
+    description: 'Read-only Salesforce opportunity report.',
+    enabled: true,
+    trigger: { manual: true, schedule: '0 8 * * 1', timezone: 'America/Los_Angeles' },
+    steps,
+  });
+  assert.notEqual(prepared.status, 'invalid');
+  assert.deepEqual(prepared.errors, []);
+});
+
 test('prepareWorkflowCreateForWrite codifies eligible mechanical steps through the shared path', () => {
   const prepared = prepareWorkflowCreateForWrite({
     name: 'codify-create-wf',

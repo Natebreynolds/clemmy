@@ -462,6 +462,8 @@ test('prepareWorkflowForWrite: a genuinely broken workflow still fails after rep
 test('stepLooksMutating: a send/write step is mutating; a pure read step is not', () => {
   assert.equal(stepLooksMutating({ prompt: 'send the report email to the owner' }), true);
   assert.equal(stepLooksMutating({ prompt: 'create a new record in the Airtable table' }), true);
+  assert.equal(stepLooksMutating({ prompt: 'create a Salesforce opportunity report', sideEffect: 'read' }), false);
+  assert.equal(stepLooksMutating({ prompt: 'summarize opportunities', sideEffect: 'write' }), true);
   assert.equal(stepLooksMutating({ prompt: 'do anything', requiresApproval: true }), true);
   assert.equal(stepLooksMutating({ prompt: 'scrape the Facebook page posts with Apify' }), false);
   assert.equal(stepLooksMutating({ prompt: 'fetch the latest SERP rankings' }), false);

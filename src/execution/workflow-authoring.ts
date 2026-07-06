@@ -130,34 +130,63 @@ export function workflowUpdateNeedsVerification(before: WorkflowDefinition, afte
   return before.enabled === true && workflowExecutionSurfaceChanged(before, after);
 }
 
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function optionalStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const list = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  return list.length > 0 ? list : undefined;
+}
+
+function optionalObject<T>(value: unknown): T | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as T : undefined;
+}
+
+function optionalSideEffect(value: unknown): WorkflowStepInput['sideEffect'] | undefined {
+  return value === 'read' || value === 'write' || value === 'send' ? value : undefined;
+}
+
 export function normalizeWorkflowSteps(steps: Array<Partial<WorkflowStepInput> & { id: string }>): WorkflowStepInput[] {
-  return steps.map((s) => ({
-    id: s.id,
-    prompt: s.prompt ?? '',
-    project: s.project,
-    dependsOn: s.dependsOn,
-    orderingOnlyDeps: s.orderingOnlyDeps,
-    model: s.model,
-    intent: s.intent,
-    tier: s.tier,
-    maxTurns: s.maxTurns,
-    useHarness: s.useHarness,
-    forEach: s.forEach,
-    forEachNewOnly: s.forEachNewOnly,
-    deterministic: s.deterministic,
-    call: s.call,
-    codifiedFrom: normalizeCodifiedFrom(s),
-    allowedTools: s.allowedTools,
-    sideEffect: s.sideEffect,
-    usesSkill: s.usesSkill,
-    requiresApproval: s.requiresApproval,
-    approvalPreview: s.approvalPreview,
-    inputs: s.inputs,
-    output: s.output,
-    retryBudget: s.retryBudget,
-    loopUntil: s.loopUntil,
-    loopSafe: s.loopSafe,
-  }));
+  return steps.map((raw) => {
+    const s = raw as Partial<WorkflowStepInput> & Record<string, unknown>;
+    return {
+      id: typeof s.id === 'string' ? s.id : String(s.id ?? ''),
+      prompt: typeof s.prompt === 'string' ? s.prompt : '',
+      project: optionalString(s.project),
+      dependsOn: optionalStringList(s.dependsOn),
+      orderingOnlyDeps: optionalStringList(s.orderingOnlyDeps),
+      model: optionalString(s.model),
+      intent: optionalString(s.intent),
+      tier: optionalNumber(s.tier),
+      maxTurns: optionalNumber(s.maxTurns),
+      useHarness: optionalBoolean(s.useHarness),
+      forEach: optionalString(s.forEach),
+      forEachNewOnly: optionalBoolean(s.forEachNewOnly),
+      deterministic: optionalObject<WorkflowStepInput['deterministic']>(s.deterministic),
+      call: optionalObject<WorkflowStepInput['call']>(s.call),
+      codifiedFrom: normalizeCodifiedFrom(s),
+      allowedTools: optionalStringList(s.allowedTools),
+      sideEffect: optionalSideEffect(s.sideEffect),
+      usesSkill: optionalString(s.usesSkill),
+      requiresApproval: optionalBoolean(s.requiresApproval),
+      approvalPreview: optionalString(s.approvalPreview),
+      inputs: optionalObject<WorkflowStepInput['inputs']>(s.inputs),
+      output: optionalObject<WorkflowStepInput['output']>(s.output),
+      retryBudget: optionalNumber(s.retryBudget),
+      loopUntil: optionalObject<WorkflowStepInput['loopUntil']>(s.loopUntil),
+      loopSafe: optionalBoolean(s.loopSafe),
+    };
+  });
 }
 
 function normalizeCodifiedFrom(step: Partial<WorkflowStepInput> & Record<string, unknown>): WorkflowStepInput['codifiedFrom'] | undefined {
