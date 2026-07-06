@@ -247,11 +247,25 @@ function toolJitBudgetTokens(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_TOOL_JIT_BUDGET_TOKENS', '') || '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_JIT_BUDGET_TOKENS;
 }
-/** Cheap, conservative token estimate (chars/4) of a toolset's definitions. */
+/** Approximate share of a tool DEFINITION's tokens that name+description alone
+ *  captures. The parameter JSON-schema (types, enums, per-field descriptions)
+ *  dominates real wire size but isn't carried on JitTool, so name+desc undercounts
+ *  by ~3-4× — which is why built-in JIT pruning had NEVER fired (the estimate
+ *  never crossed the 24K budget even on a large multi-MCP surface). Calibrate so
+ *  the budget reflects real size. Conservative default (3.0, not 4.0) so a normal
+ *  built-in surface still stays under budget — only genuinely huge surfaces prune,
+ *  and CORE is never dropped regardless. Tunable via CLEMMY_TOOL_JIT_SCHEMA_FACTOR. */
+function toolSchemaCalibrationFactor(): number {
+  const raw = Number.parseFloat(getRuntimeEnv('CLEMMY_TOOL_JIT_SCHEMA_FACTOR', '') || '');
+  return Number.isFinite(raw) && raw > 0 ? raw : 3.0;
+}
+
+/** Calibrated token estimate of a toolset's DEFINITIONS (name + description +
+ *  the uncarried parameter-schema, approximated by the calibration factor). */
 function estimateToolsetTokens(tools: JitTool[]): number {
   let chars = 0;
   for (const t of tools) chars += t.name.length + 1 + (t.description ?? '').length;
-  return Math.ceil(chars / 4);
+  return Math.ceil((chars / 4) * toolSchemaCalibrationFactor());
 }
 
 export interface JitTool {

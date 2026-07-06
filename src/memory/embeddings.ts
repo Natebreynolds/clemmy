@@ -44,7 +44,13 @@ const MAX_INPUT_CHARS = 16_000;
 // Per-call timeout for the embeddings fetch. Tighter than undici's
 // default (10s) so the daemon doesn't hang for a full 10s on a stale
 // Cloudflare IP — chat/recall fall back to FTS-only on timeout.
-const FETCH_TIMEOUT_MS = 6_000;
+// 10s (was 6s): the 6s ceiling tripped on slow-but-healthy calls, the #1 real
+// recall degradation (156 timeouts / 32 breaker-opens in 14d). Override via
+// CLEMMY_EMBED_TIMEOUT_MS.
+const FETCH_TIMEOUT_MS = (() => {
+  const raw = Number.parseInt(process.env.CLEMMY_EMBED_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
+})();
 
 // Circuit breaker for the long-running daemon's pool-poisoning
 // failure mode. After ~hours of uptime, undici keeps stale Cloudflare
@@ -122,7 +128,10 @@ function recordFailure(err: unknown): void {
   // threshold so a single blip doesn't drop recall to FTS.
   const shouldOpen = cooldownUntilMs === 0 && (terminal || consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD);
   if (shouldOpen) {
-    const ms = cooldownForClass(cls);
+    // ±12% jitter so many daemons/callers don't re-probe in lockstep (thundering
+    // herd on the embedding endpoint the moment a cooldown lapses).
+    const base = cooldownForClass(cls);
+    const ms = Math.round(base * (0.88 + Math.random() * 0.24));
     cooldownUntilMs = Date.now() + ms;
     const line = `embeddings circuit breaker open (${cls}) — recall on FTS-only for ~${Math.round(ms / 60_000)}m`;
     if (terminal) {
@@ -388,29 +397,47 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
   // times out at undici's 10s connect timeout. Opting out of the pool
   // means every embedding call does a fresh DNS lookup + TCP connect.
   // That's a few-ms tax per call but avoids the multi-hour outage.
-  const response = await fetch('https://api.openai.com/v1/embeddings', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: safeInputs,
-    }),
-    keepalive: false,
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+  const attempt = async (): Promise<Float32Array[]> => {
+    const response = await fetch('https://api.openai.com/v1/embeddings', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: EMBEDDING_MODEL,
+        input: safeInputs,
+      }),
+      keepalive: false,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`Embeddings API ${response.status}: ${body.slice(0, 400)}`);
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Embeddings API ${response.status}: ${body.slice(0, 400)}`);
+    }
+
+    const json = await response.json() as EmbeddingsApiResponse;
+    // Sort by `index` defensively; the API returns in order but we don't rely on it.
+    const sorted = [...json.data].sort((a, b) => a.index - b.index);
+    return sorted.map((row) => Float32Array.from(row.embedding));
+  };
+
+  try {
+    return await attempt();
+  } catch (err) {
+    // One retry on a TRANSIENT blip (timeout / network / 5xx) before it counts
+    // toward the breaker — a single slow call must not drop recall to FTS for
+    // minutes. Terminal (auth/quota) and rate-limit errors are NOT retried
+    // (retrying won't help and just drip-spends). Kill-switch =off.
+    const cls = classifyEmbedError(err);
+    if (cls !== 'auth' && cls !== 'quota' && cls !== 'rate_limit'
+      && (process.env.CLEMMY_EMBED_RETRY ?? 'on').toLowerCase() !== 'off') {
+      await new Promise((r) => setTimeout(r, 300));
+      return await attempt();
+    }
+    throw err;
   }
-
-  const json = await response.json() as EmbeddingsApiResponse;
-  // Sort by `index` defensively; the API returns in order but we don't rely on it.
-  const sorted = [...json.data].sort((a, b) => a.index - b.index);
-  return sorted.map((row) => Float32Array.from(row.embedding));
 }
 
 /**

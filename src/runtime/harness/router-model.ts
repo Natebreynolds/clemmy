@@ -43,7 +43,12 @@ function brainFalloverEnabled(): boolean {
  *  default 75s) so a hung provider falls over to the next brain instead of dead-ending. */
 function brainFalloverFirstByteMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS', '') || '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+  // 90s (was 60s): high-effort gpt-5.x reasoning turns can take 90-120s to their
+  // first token, and every real session-correlated fallover observed (07-06 audit)
+  // was this exact case — a slow-but-HEALTHY turn abandoned mid-reasoning, not a
+  // genuine hang. 90s still catches a truly silent provider well before the loop's
+  // stall watchdog. Tunable via CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS.
+  return Number.isFinite(raw) && raw > 0 ? raw : 90_000;
 }
 
 export class RouterModelProvider implements ModelProvider {

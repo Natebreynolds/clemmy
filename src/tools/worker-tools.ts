@@ -202,6 +202,16 @@ export function registerWorkerTools(server: McpServer): void {
               return runCrossProviderWorker(input, workerModel, sessionId);
             })();
         const ok = !/^\s*ERROR:/i.test(result.text ?? '');
+        // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the
+        // hooks.ts worker_capped emit only fires in the nested lane — so the
+        // respawn guard was DEAD in this default-on lane (the non-converging
+        // cap-loop it exists to stop could recur). Emit it directly here so a
+        // re-spawn of THIS capped item is refused (workerItemAlreadyCapped).
+        if (!ok && /MaxTurnsExceeded|hit its turn cap/i.test(result.text ?? '')) {
+          try {
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_capped', data: { item: input.item } });
+          } catch { /* telemetry is best-effort */ }
+        }
         recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel);
         recordModelRouteOutcome({
           decisionId: routeDecisionId,
