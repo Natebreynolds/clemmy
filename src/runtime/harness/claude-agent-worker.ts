@@ -100,6 +100,12 @@ export async function runClaudeAgentSdkWorker(
     modelId,
     systemAppend: renderClaudeAgentWorkerSystemAppend(input, agentic),
     allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(agentic ? 'worker' : 'read_only'),
+    // Scope the worker's NATIVE external MCP surface to THIS item's need. Without a
+    // scope input, resolveMcpToolScope defaults to allowAll → every external MCP
+    // child (DataForSEO etc.) cold-starts on each worker AND its full tool schemas
+    // bloat the worker's input context. objective + the parent-resolved tool slugs
+    // are the sharpest signal (resolvedTools names exact slugs; "none needed" ⇒ {}).
+    nativeMcpScopeInput: `${input.objective} ${input.resolvedTools}`.trim(),
     agentic,
     maxTurns: resolvedMaxTurns,
   });

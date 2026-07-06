@@ -179,7 +179,8 @@ export function createConfiguredMcpServers(): MCPServer {
  */
 let cachedShim: MCPServer | null = null;
 let cachedExternalShim: MCPServer | null = null;
-let cachedScopedExternalBaseShims: Map<string, MCPServer> = new Map();
+// (Scoped shims no longer own a separate base — they wrap the shared all-external
+//  base shim, so there are no per-scope base children to track or close.)
 let cachedScopedExternalShims: Map<string, MCPServer> = new Map();
 // Fail-open shim is a cheap cap-only view over cachedExternalShim (the all-
 // external base), so it owns no child processes — clearing the base is enough.
@@ -319,14 +320,15 @@ export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
   const cached = cachedScopedExternalShims.get(key);
   if (cached) return cached;
 
-  const base = createMcpNamespaceShim({
-    servers: buildRawMcpServers({
-      excludeLocal: true,
-      allowedServerSlugs: scope.allowedServerSlugs,
-    }),
-  });
+  // Reuse the ONE daemon-lifetime all-external base (the same child processes the
+  // prewarm and every other scope share) and narrow it with the scope filter —
+  // `toolMatchesScope` drops any tool whose server isn't in allowedServerSlugs, so
+  // the model sees an identical surface. Previously this branch spawned a SEPARATE
+  // base child per distinct scope key (a fresh DataForSEO/etc. process for every
+  // new intent), which is why one server cold-booted several times per turn and
+  // leaked children across a session. This mirrors getOrCreateFailOpenExternalShim.
+  const base = ensureAllExternalBaseShim();
   const scoped = createScopedExternalShim(base, scope);
-  cachedScopedExternalBaseShims.set(key, base);
   cachedScopedExternalShims.set(key, scoped);
   return scoped;
 }
@@ -393,13 +395,11 @@ export async function invalidateConfiguredMcpServers(): Promise<void> {
   const targets = [
     cachedShim,
     cachedExternalShim,
-    ...cachedScopedExternalBaseShims.values(),
   ].filter((s): s is MCPServer => s !== null);
   cachedShim = null;
   cachedExternalShim = null;
   cachedFailOpenExternalShim = null;
   cachedFailOpenKey = '';
-  cachedScopedExternalBaseShims = new Map();
   cachedScopedExternalShims = new Map();
   await Promise.all(
     targets.map((s) => (typeof s.close === 'function' ? s.close().catch(() => undefined) : undefined)),

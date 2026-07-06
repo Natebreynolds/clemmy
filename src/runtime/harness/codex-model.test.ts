@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelRequest } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { buildCodexRequestBody, CodexResponsesModel } from './codex-model.js';
+import { buildCodexRequestBody, splitCodexInstructions, CodexResponsesModel } from './codex-model.js';
+import { INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { BoundaryError } from '../boundary-error.js';
 import { buildTransportTimeoutError, detectCodexTransportFailure } from '../codex-dispatcher.js';
@@ -64,6 +65,48 @@ test('buildCodexRequestBody sets a per-session prompt_cache_key inside a run con
     assert.equal(off.prompt_cache_key, undefined);
   } finally {
     delete process.env.CLEMMY_CODEX_CACHE_KEY;
+  }
+});
+
+function requestWithInstructions(systemInstructions: string, input: ModelRequest['input'] = [{ role: 'user', content: 'hi' }]): ModelRequest {
+  return { ...modelRequest(input), systemInstructions } as unknown as ModelRequest;
+}
+
+test('splitCodexInstructions splits role (stable) from dynamic ctx on the sentinel; no sentinel → all instructions', () => {
+  const raw = `ROLE_RUBRIC${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`;
+  assert.deepEqual(splitCodexInstructions(raw), { instructions: 'ROLE_RUBRIC', trailingContext: 'DYNAMIC_CTX' });
+  assert.deepEqual(splitCodexInstructions('just role, no sentinel'), { instructions: 'just role, no sentinel', trailingContext: '' });
+});
+
+test('Codex wire (default): instructions is the STABLE role only; dynamic ctx re-homed as a trailing input system message', () => {
+  const body = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE_RUBRIC${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`));
+  // instructions must NOT contain the per-turn ctx (so instructions+tools caches).
+  assert.equal(body.instructions, 'ROLE_RUBRIC');
+  assert.ok(!String(body.instructions).includes('DYNAMIC_CTX'), 'dynamic ctx must not sit in instructions');
+  // the ctx is preserved — re-homed as the LAST input item (after tools), role=system.
+  const last = (body.input as Array<Record<string, unknown>>).at(-1);
+  assert.deepEqual(last, { role: 'system', content: 'DYNAMIC_CTX' });
+});
+
+test('Codex wire cache stability: two turns with the SAME role+tools but DIFFERENT ctx yield an IDENTICAL instructions prefix', () => {
+  const a = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE${INSTRUCTION_CACHE_DELIM}ctx turn A: focus=alpha`));
+  const b = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE${INSTRUCTION_CACHE_DELIM}ctx turn B: focus=bravo`));
+  // The cacheable prefix (instructions) is byte-identical across turns even though
+  // the per-turn ctx changed — this is what lets OpenAI's prefix cache hit the tool block.
+  assert.equal(a.instructions, b.instructions);
+  assert.equal(a.instructions, 'ROLE');
+});
+
+test('Codex wire kill-switch (CLEMMY_CODEX_STABLE_INSTRUCTIONS=off) → legacy dynamic-first, no trailing ctx', () => {
+  process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS = 'off';
+  try {
+    const body = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE_RUBRIC${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`));
+    // Legacy order: dynamic ctx FIRST, role last, single string; nothing appended to input.
+    assert.equal(body.instructions, 'DYNAMIC_CTX\n\n---\n\nROLE_RUBRIC');
+    const last = (body.input as Array<Record<string, unknown>>).at(-1);
+    assert.deepEqual(last, { role: 'user', content: 'hi' }, 'no ctx re-homed into input under the kill-switch');
+  } finally {
+    delete process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS;
   }
 });
 

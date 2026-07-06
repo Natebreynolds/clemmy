@@ -34,10 +34,27 @@ const API_KEY_PREFIX = 'sk-ant-api03';
 // over the keychain when present.
 const CLAUDE_VAULT_FILE = path.join(BASE_DIR, 'state', 'claude-auth.json');
 
+/** A Clementine-owned vault refresh token the server has rejected with a
+ *  permanent `invalid_grant` (revoked / rotated away / not found). Retrying it on
+ *  every request only burns a doomed network round-trip and spams the log — the
+ *  grant is dead until the user re-authenticates. Keyed by the token STRING so a
+ *  re-auth (which writes a NEW token via saveClaudeTokens) auto-recovers with no
+ *  restart. NULL means "no known-dead grant". */
+let deadVaultRefreshToken: string | null = null;
+
+/** Dedupe the "falling back to the Claude Code subscription token" WARN: it fired
+ *  on EVERY request while the vault grant was down. Log once per distinct reason;
+ *  reset on re-auth so a future degradation logs again. */
+let loggedFallbackReason: string | null = null;
+
 /** Persist our own Claude tokens (from the in-app login or a refresh). 0600. */
 export function saveClaudeTokens(tokens: ClaudeTokenSet): void {
   mkdirSync(path.dirname(CLAUDE_VAULT_FILE), { recursive: true });
   writeFileSync(CLAUDE_VAULT_FILE, JSON.stringify(tokens, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  // A freshly-written grant supersedes any prior dead/degraded state — clear the
+  // markers so the next request re-attempts refresh and re-arms fallback logging.
+  deadVaultRefreshToken = null;
+  loggedFallbackReason = null;
   try { chmodSync(CLAUDE_VAULT_FILE, 0o600); } catch { /* best-effort */ }
 }
 
@@ -187,11 +204,31 @@ function tryClaudeCodeFallback(reason: string): string | null {
   if (!cli) return null;
   try {
     const token = assertSubscriptionToken(cli);
-    logger.warn({ reason }, 'Using Claude Code subscription token because Clementine Claude vault token is unavailable');
+    if (loggedFallbackReason !== reason) {
+      logger.warn({ reason }, 'Using Claude Code subscription token because Clementine Claude vault token is unavailable');
+      loggedFallbackReason = reason;
+    }
     return token;
   } catch {
     return null;
   }
+}
+
+/** A 400 `invalid_grant` means the refresh token is PERMANENTLY dead (revoked /
+ *  rotated away / not found) — retrying it will never succeed. Distinct from a
+ *  transient timeout or 5xx, which SHOULD keep retrying. */
+function isPermanentGrantFailure(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /invalid_grant/i.test(msg) || /refresh failed \(4\d\d\)/i.test(msg);
+}
+
+/** True once the vault refresh token has been rejected as `invalid_grant` and not
+ *  yet replaced by a re-auth — surfaced for auth-status UI ("re-authenticate
+ *  Claude"). Cheap: reads the vault file only, no network. */
+export function claudeVaultRefreshDead(): boolean {
+  if (!deadVaultRefreshToken) return false;
+  const t = getVaultClaudeTokens();
+  return !!t?.refreshToken && t.refreshToken === deadVaultRefreshToken;
 }
 
 /** Async loader that refreshes OUR vault token before expiry (rotating the
@@ -208,20 +245,41 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
     tokens.accessToken?.startsWith(OAT_PREFIX) &&
     tokens.expiresAt && tokens.expiresAt <= Date.now() + REFRESH_BEFORE_MS
   ) {
-    try {
-      const refreshed = await refreshClaudeTokensImpl(tokens.refreshToken);
-      saveClaudeTokens({
-        accessToken: refreshed.accessToken,
-        refreshToken: refreshed.refreshToken ?? tokens.refreshToken, // persist the ROTATED token
-        expiresAt: refreshed.expiresAt,
-        scopes: refreshed.scopes ?? tokens.scopes,
-      });
-      tokens = getStoredClaudeTokens();
-      logger.info('Claude subscription token refreshed');
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Claude token refresh failed');
-      const fallback = tryClaudeCodeFallback('vault_refresh_failed');
+    const refreshToken = tokens.refreshToken; // narrowed non-empty by the guard above
+    if (refreshToken === deadVaultRefreshToken) {
+      // Grant already rejected as invalid_grant — skip the doomed network refresh
+      // and go straight to fallback. Recovers automatically once a re-auth writes
+      // a new token (saveClaudeTokens clears deadVaultRefreshToken).
+      const fallback = tryClaudeCodeFallback('vault_refresh_dead');
       if (fallback) return fallback;
+    } else {
+      try {
+        const refreshed = await refreshClaudeTokensImpl(refreshToken);
+        saveClaudeTokens({
+          accessToken: refreshed.accessToken,
+          refreshToken: refreshed.refreshToken ?? refreshToken, // persist the ROTATED token
+          expiresAt: refreshed.expiresAt,
+          scopes: refreshed.scopes ?? tokens.scopes,
+        });
+        tokens = getStoredClaudeTokens();
+        logger.info('Claude subscription token refreshed');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isPermanentGrantFailure(err)) {
+          // Mark the grant dead so we stop re-attempting it every request. Log
+          // ONCE, loudly, with the fix — not once per call.
+          deadVaultRefreshToken = refreshToken;
+          logger.warn(
+            { err: msg },
+            'Clementine Claude vault grant is dead (invalid_grant) — re-authenticate Claude from Settings. Using the Claude Code subscription token meanwhile; this grant will not be retried until re-auth.',
+          );
+        } else {
+          // Transient (timeout / 5xx / network) — keep retrying on the next call.
+          logger.warn({ err: msg }, 'Claude token refresh failed (transient) — will retry');
+        }
+        const fallback = tryClaudeCodeFallback('vault_refresh_failed');
+        if (fallback) return fallback;
+      }
     }
   }
   try {
@@ -279,6 +337,11 @@ export const __test__ = {
   },
   setRefreshClaudeTokensForTests(fn: ((refreshToken: string) => Promise<ClaudeTokenSet>) | null): void {
     refreshClaudeTokensImpl = fn ?? refreshClaudeTokens;
+  },
+  /** Reset module-level degraded-auth markers between tests. */
+  resetDegradedStateForTests(): void {
+    deadVaultRefreshToken = null;
+    loggedFallbackReason = null;
   },
 };
 

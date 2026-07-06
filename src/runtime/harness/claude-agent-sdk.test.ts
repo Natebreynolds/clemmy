@@ -1173,6 +1173,35 @@ test('buildScopedNativeMcpServers: an SEO turn attaches the native dataforseo MC
   }
 });
 
+test('buildScopedNativeMcpServers: an EMPTY scope attaches NO external servers (no allowAll over-attach)', async () => {
+  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
+  const mcpDir = path.join(TMP_HOME, 'mcp');
+  mkdirSync(mcpDir, { recursive: true });
+  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
+    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
+    supabase: { type: 'stdio', command: 'npx', args: ['supabase-mcp'], description: 'db', enabled: true },
+  }), 'utf-8');
+  invalidateMcpServerDiscoveryCache();
+
+  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
+  try {
+    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; // default on
+    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
+    // The regression this guards: an unscoped native-lane call (run_worker /
+    // workflow-step used to pass nothing) must NOT fall through to allowAll and
+    // cold-start every external MCP child. Empty, whitespace, and undefined all
+    // yield {} — a concrete scope still attaches its server (asserted above).
+    assert.deepEqual(buildScopedNativeMcpServers(''), {}, 'empty string ⇒ no external servers');
+    assert.deepEqual(buildScopedNativeMcpServers('   '), {}, 'whitespace ⇒ no external servers');
+    assert.deepEqual(buildScopedNativeMcpServers(undefined), {}, 'undefined ⇒ no external servers');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
+    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
+    invalidateMcpServerDiscoveryCache();
+  }
+});
+
 test('runClaudeAgentSdk surfaces SDK compaction signals + context-window health (A1)', async () => {
   const eventlog = await import('./eventlog.js');
   const session = eventlog.createSession({ kind: 'chat' });

@@ -55,7 +55,7 @@ import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthE
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
-import { restoreLegacyInstructionOrder } from './model-wire-registry.js';
+import { restoreLegacyInstructionOrder, stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 import { recordCodexRateLimit } from './rate-limit-store.js';
 import pino from 'pino';
 
@@ -978,19 +978,59 @@ function codexPromptCacheKey(): string | undefined {
   return sessionId ? `clem:${sessionId}` : undefined;
 }
 
+/** When ON (default), keep the Codex `instructions` STABLE — the role rubric only —
+ *  and re-home the per-turn DYNAMIC memory context after the tools block (as a
+ *  trailing input system message). OpenAI's automatic cache is a single longest
+ *  common prefix over `instructions + tools + input`; the legacy dynamic-first wire
+ *  led with per-turn-changing context, so the prefix diverged BEFORE the large tool
+ *  schema block and re-billed it nearly every turn (~26% hit rate, measured — the
+ *  dominant cost driver). Keeping instructions stable makes `instructions + tools`
+ *  a cacheable prefix. OFF restores the legacy dynamic-first single-string wire
+ *  (byte-identical to pre-parity) for a clean rollback. */
+function codexStableInstructionsEnabled(): boolean {
+  return !/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_CODEX_STABLE_INSTRUCTIONS', 'on') || 'on').trim());
+}
+
+/** Split the assembler's `${role}${DELIM}${ctx}` into the STABLE role prefix (kept
+ *  in `instructions`) and the DYNAMIC ctx (re-homed after tools, in input). No
+ *  sentinel (e.g. a sub-agent prompt that didn't pass through the assembler) → the
+ *  whole string is stable instructions, ctx empty. Exported for the contract test. */
+export function splitCodexInstructions(raw: string | undefined | null): { instructions: string; trailingContext: string } {
+  const s = raw ?? '';
+  const idx = s.indexOf(INSTRUCTION_CACHE_DELIM);
+  if (idx < 0) return { instructions: stripCacheBreakSentinel(s), trailingContext: '' };
+  return {
+    instructions: s.slice(0, idx),
+    trailingContext: s.slice(idx + INSTRUCTION_CACHE_DELIM.length),
+  };
+}
+
 // Exported so contract tests can assert the wire shape without
 // having to mock fetch + OAuth + SSE for every assertion.
 export function buildCodexRequestBody(modelId: string, request: ModelRequest): CodexRequestBody {
   const tools = serializeTools(request.tools, request.handoffs);
+  const input = serializeInput(request.input);
+  let instructions: string;
+  if (codexStableInstructionsEnabled()) {
+    // Stable-prefix wire: role rubric stays in `instructions`; the per-turn memory
+    // ctx moves to a trailing input system message (after tools) so `instructions +
+    // tools` caches. Placed at the input tail where the [AGENT CONTEXT PACKET]
+    // already lives — the model still sees it, it just no longer busts the prefix.
+    const split = splitCodexInstructions(request.systemInstructions);
+    instructions = split.instructions || 'You are a helpful assistant.';
+    if (split.trailingContext.trim()) {
+      input.push({ role: 'system', content: split.trailingContext.trim() });
+    }
+  } else {
+    // Legacy dynamic-first wire (kill-switch) — byte-identical to pre-parity.
+    instructions = restoreLegacyInstructionOrder(request.systemInstructions) || 'You are a helpful assistant.';
+  }
   const body: CodexRequestBody = {
     model: resolveCodexModel(modelId),
-    // Restore the legacy (dynamic-first) instruction order — Codex's wire is
-    // BYTE-IDENTICAL to pre-parity regardless of the flag (caching is automatic
-    // server-side here, so the stable-first reorder is a Claude-only concern).
-    instructions: restoreLegacyInstructionOrder(request.systemInstructions) || 'You are a helpful assistant.',
+    instructions,
     store: false,
     stream: true,
-    input: serializeInput(request.input),
+    input,
     tools,
     tool_choice: normalizeToolChoice(request.modelSettings?.toolChoice, tools.length > 0),
     include: ['reasoning.encrypted_content'],

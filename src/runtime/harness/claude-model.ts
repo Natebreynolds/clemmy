@@ -265,17 +265,57 @@ export function buildClaudeSystemBlocks(
   return { blocks, systemCached };
 }
 
-/** Mutate the request body in place: identity-first cached system blocks, and —
- *  when the system prefix wasn't cached (no sentinel / empty stable, e.g. a
- *  sub-agent prompt) — a cache breakpoint on the (stable) tools array instead. */
+/** Cache the shared conversation transcript (`messages`) too, not just system+tools.
+ *  The system/tools breakpoints cache the prefix UP TO messages; the transcript
+ *  itself (which all fusion sub-calls — draft A, draft B, judge — re-send identically
+ *  within a turn, and which the next turn re-sends as a growing prefix) was billed
+ *  fresh every call. Breakpointing the last transcript message lets draft B + the
+ *  judge read draft A's cached transcript and the next turn read this turn's — the
+ *  fix for the fusion re-send (the sonnet-5 ~362K/turn aggregate). Kill-switch
+ *  CLEMMY_CLAUDE_CACHE_TRANSCRIPT=off. */
+function claudeTranscriptCachingEnabled(): boolean {
+  return !/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_CLAUDE_CACHE_TRANSCRIPT', 'on') || 'on').trim());
+}
+
+/** Put a cache breakpoint on the last content block of a message. String content is
+ *  wrapped into a single cacheable text block (valid Anthropic shape); a block array
+ *  gets the breakpoint on its last object block. No-op on an unexpected shape. */
+function breakpointLastMessage(msg: Record<string, unknown>): void {
+  const content = msg.content;
+  if (typeof content === 'string') {
+    msg.content = [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }];
+    return;
+  }
+  if (Array.isArray(content) && content.length > 0) {
+    const last = content[content.length - 1];
+    if (last && typeof last === 'object') (last as Record<string, unknown>).cache_control = { type: 'ephemeral' };
+  }
+}
+
+/** Mutate the request body in place: identity-first cached system blocks; a cache
+ *  breakpoint on the (stable) tools array when the system prefix wasn't cached (no
+ *  sentinel / empty stable, e.g. a sub-agent prompt); and — additively — a
+ *  breakpoint on the transcript so the shared conversation caches (Gap #1). */
 function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapability): void {
   const tools = Array.isArray(parsed.tools) ? (parsed.tools as Array<Record<string, unknown>>) : [];
   const toolsTokens = tools.length > 0 ? estimateTokens(JSON.stringify(tools)) : 0;
   const { blocks, systemCached } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens);
   parsed.system = blocks;
+  // breakpoint tally — Anthropic allows at most 4 cache_control markers per request.
+  let breakpoints = systemCached ? 1 : 0;
   if (!systemCached && cap.supportsPromptCache && tools.length > 0 && toolsTokens >= cap.cacheMinTokens) {
     const last = tools[tools.length - 1];
-    if (last && typeof last === 'object') last.cache_control = { type: 'ephemeral' };
+    if (last && typeof last === 'object') { last.cache_control = { type: 'ephemeral' }; breakpoints += 1; }
+  }
+  // Gap #1 — transcript caching. Only when it's big enough to be worth a breakpoint
+  // and we have budget. Caches tools+system+transcript-so-far; the next turn / the
+  // sibling fusion sub-calls read it instead of re-billing.
+  if (claudeTranscriptCachingEnabled() && cap.supportsPromptCache && breakpoints < 4) {
+    const messages = Array.isArray(parsed.messages) ? (parsed.messages as Array<Record<string, unknown>>) : [];
+    if (messages.length > 0 && estimateTokens(JSON.stringify(messages)) >= cap.cacheMinTokens) {
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg && typeof lastMsg === 'object') breakpointLastMessage(lastMsg);
+    }
   }
 }
 

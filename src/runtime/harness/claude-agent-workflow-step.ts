@@ -215,6 +215,12 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step, fullLane }),
     allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only'),
     requiredLocalMcpTools: requiredLocalMcpToolsForWorkflowStep(args.step, fullLane),
+    // Scope the step's NATIVE external MCP surface to what the step actually names
+    // (mirrors the chat brain's request.message scoping). Without this the step
+    // defaulted to allowAll → every external MCP child cold-started per step and
+    // its tool schemas bloated the step's input context. Spreads into the
+    // auto-continue call below too, so the continuation keeps the same scope.
+    nativeMcpScopeInput: args.prompt,
     agentic: fullLane,
     maxTurns: maxTurns(args.step, fullLane),
     outputSchema: claudeWorkflowStepOutputSchema(),

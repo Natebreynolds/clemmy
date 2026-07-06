@@ -510,10 +510,19 @@ function toClaudeSdkMcpConfig(s: ManagedMcpServer): McpServerConfig | null {
  */
 export function buildScopedNativeMcpServers(scopeInput?: string): Record<string, McpServerConfig> {
   if (!claudeSdkNativeMcpEnabled()) return {};
+  // Empty/absent scope ⇒ we don't know what THIS query needs. For the SDK native
+  // lane attach ZERO external servers rather than inheriting resolveMcpToolScope's
+  // allowAll default — allowAll cold-starts EVERY external MCP child per query and
+  // injects all their tool schemas into the input context (the run_worker /
+  // workflow-step over-attach). Callers that need servers pass a concrete scope
+  // (brain: request.message; worker: objective+tools; step: prompt). Scoped to
+  // this function only — the shared resolveMcpToolScope default is untouched, and
+  // the LOCAL in-process clementine server is spread separately (unaffected).
+  if (!scopeInput || !scopeInput.trim()) return {};
   try {
     const all = discoverMcpServers().filter((s) => s.enabled);
     if (all.length === 0) return {};
-    const scope = resolveMcpToolScope({ userInput: scopeInput ?? '', pinnedCalendarLabels: pinnedCalendarRuleLabels() });
+    const scope = resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
     if (scope.allowAll === false && (scope.allowedServerSlugs ?? []).length === 0) return {};
     const out: Record<string, McpServerConfig> = {};
     for (const s of all) {
