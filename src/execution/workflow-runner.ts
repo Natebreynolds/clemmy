@@ -2657,7 +2657,10 @@ export function finalizeStepOutput(
     kind: 'step_completed',
     stepId: step.id,
     output: bound,
-    ...(meta ? { meta } : {}),
+    // Tag a blocked-but-finalized step so telemetry emits workflow_node_blocked
+    // instead of workflow_node_completed — a block is NOT a success (it was
+    // counting as one, overstating reliability on the engine's central concept).
+    ...(meta || isBlockedOutput ? { meta: { ...(meta ?? {}), ...(isBlockedOutput ? { blocked: true } : {}) } } : {}),
   });
   // Persist the step's work product to the shared run workspace so the manifest
   // is a complete, inspectable record of the run — what the live window shows

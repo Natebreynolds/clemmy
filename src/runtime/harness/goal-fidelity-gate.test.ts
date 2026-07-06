@@ -244,6 +244,41 @@ test('evaluateGoalFidelity: byte-identical opening across distinct firms (skill 
   }
 });
 
+test('evaluateGoalFidelity: judge OUTAGE during a uniform send-BURST fails CLOSED (park for approval), but a solo send fails OPEN', async () => {
+  resetEventLog();
+  _resetGoalFidelityStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  seedGoal(sess.id, 'Email each firm a personalized outreach note referencing our per-firm SEO research.');
+  seedSkill(sess.id, 'scorpion-outbound', 'Research each firm before writing; never reuse a generic opening across firms.');
+  // Two prior byte-identical sends to DISTINCT firms → a burst is in flight.
+  seedSend(sess.id, SEND, 'a@firm-a.com', GENERIC_OPENING);
+  seedSend(sess.id, SEND, 'b@firm-b.com', GENERIC_OPENING);
+  // The judge is DOWN (throws) — the exact condition of the 45-email runaway.
+  _setGoalFidelityJudgeForTests(async () => { throw new Error('judge unavailable (overloaded)'); });
+  try {
+    const burst = await evaluateGoalFidelity(sess.id, 'composio_execute_tool', sendArgs(SEND, 'c@firm-c.com', GENERIC_OPENING));
+    assert.equal(burst.action, 'block', 'judge down + burst → fail CLOSED, do not send unchecked');
+    assert.equal(burst.blockKind, 'present_for_approval', 'park for approval, not a counted failure');
+    assert.equal(burst.failureCount, undefined, 'a judge outage is not a fidelity violation to escalate');
+  } finally {
+    _setGoalFidelityJudgeForTests(null);
+  }
+
+  // Kill-switch honored: a solo send (no priors) with the judge down still fails OPEN — the gate must never wedge a legitimate one-off.
+  resetEventLog();
+  _resetGoalFidelityStateForTests();
+  const solo = createSession({ kind: 'chat' });
+  seedGoal(solo.id, 'Send a note to my contact.');
+  seedSkill(solo.id, 'scorpion-outbound', 'Research the firm before writing.');
+  _setGoalFidelityJudgeForTests(async () => { throw new Error('judge unavailable'); });
+  try {
+    const oneOff = await evaluateGoalFidelity(solo.id, 'composio_execute_tool', sendArgs(SEND, 'only@firm.com', GENERIC_OPENING));
+    assert.equal(oneOff.action, 'allow', 'no burst → judge outage still fails open (no wedge on one-offs)');
+  } finally {
+    _setGoalFidelityJudgeForTests(null);
+  }
+});
+
 test('evaluateGoalFidelity: a draft-only-skill block is present_for_approval — blocks WITHOUT counting a failure (no escalation)', async () => {
   resetEventLog();
   _resetGoalFidelityStateForTests();

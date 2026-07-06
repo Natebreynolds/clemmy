@@ -736,6 +736,20 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
   ) {
     return decision;
   }
+  // A same-mut-tool HALT — a MUTATING runaway across DISTINCT arg sets (the
+  // 45-emails-to-45-distinct-addresses class) — enforces even in the default
+  // mode, exactly like the exact-args mutating block above. Distinct-args mass
+  // mutation is at least as dangerous as identical repeats, and until 2026-07-06
+  // it demoted to warn-only, so a real 45-send runaway went out unchecked.
+  // Kill-switch CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE=off restores warn-only.
+  if (
+    decision.action === 'halt'
+    && decision.rule === 'same_mut_tool_repeat'
+    && decision.mutating === true // EXPLICIT slug-classified write only — never the composio gateway name-fallback (a looping read must not enforce)
+    && sameMutHaltEnforcedInWarn()
+  ) {
+    return decision;
+  }
   // Everything else (read loops, and same-tool/different-args signals that
   // may be legitimate varied/batch work) stays demoted to warn in the
   // default mode; strict mode enforces them.
@@ -743,6 +757,13 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
     return { ...decision, action: 'warn' };
   }
   return decision;
+}
+
+/** A MUTATING-tool runaway halt (same_mut_tool_repeat, distinct args) enforces
+ *  even in the default warn mode. Default on — the safety fix for the 45-email
+ *  runaway. =off restores the prior warn-only behavior. */
+function sameMutHaltEnforcedInWarn(): boolean {
+  return (process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE ?? 'on').toLowerCase() !== 'off';
 }
 
 // NOTE: A `maybeTruncateToolReturn` helper used to live here. Removed
