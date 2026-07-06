@@ -555,6 +555,19 @@ export function buildAllowOnlyToolsPermission(allowedTools: string[]): CanUseToo
   };
 }
 
+/** Coarse, cheap bucket for a tool error string so tool_call_failed rows are
+ *  groupable in telemetry (auth / timeout / rate-limit / not-found / other). */
+function coarseToolErrorClass(msg: string): string {
+  const m = msg.toLowerCase();
+  if (/\b(401|403|unauthor|invalid_grant|expired|reauth|not authenticat|forbidden)\b/.test(m)) return 'auth';
+  if (/\b(timeout|timed out|etimedout|deadline)\b/.test(m)) return 'timeout';
+  if (/\b(429|rate.?limit|overloaded|quota)\b/.test(m)) return 'rate_limited';
+  if (/\b(404|not found|no such|missing|does not exist)\b/.test(m)) return 'not_found';
+  if (/\b(econnreset|econnrefused|network|socket|fetch failed|transport)\b/.test(m)) return 'network';
+  if (/\b(400|invalid|validation|schema|bad request|malformed)\b/.test(m)) return 'validation';
+  return 'other';
+}
+
 /** Emit a canonical operational tool-call event for the Claude SDK lane (chat +
  *  workflow step). Derives the workflow run/node from a "workflow:<runId>:<stepId>"
  *  session id so workflow-step tool calls link to their run. Fail-open. */
@@ -1339,7 +1352,16 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         toolUses.push(...extractAssistantToolUses(message));
         for (const tr of extractToolResults(message)) {
           const source = toolById.get(tr.callId);
-          emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name);
+          // On failure, carry the cause into telemetry — SDK-lane failures were
+          // emitted with no error detail (151/172 tool_call_failed rows had no
+          // cause), making the reliability signal unusable.
+          const failExtra = tr.isError
+            ? (() => {
+                const msg = String(typeof tr.output === 'string' ? tr.output : JSON.stringify(tr.output ?? '')).slice(0, 600);
+                return { error: msg, error_class: coarseToolErrorClass(msg) };
+              })()
+            : {};
+          emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name, failExtra);
           // A3 recall contract: park every result under the SDK's OWN tool_use id
           // (toolu_…) — the id the continuation ledger hands out. Without this,
           // outputs live only under harness-generated mcp-<uuid> ids (and only
