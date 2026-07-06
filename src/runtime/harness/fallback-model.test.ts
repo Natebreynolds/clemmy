@@ -166,3 +166,20 @@ test('firstByteTimeoutMs: a brain that answers quickly is NOT falsely failed ove
   assert.equal(nextCalls, 0, 'a prompt brain is never failed over');
   assert.ok((out as any[]).some((e) => e.delta === 'fast reply'));
 });
+
+test('isFalloverError: a brain AUTH failure is recoverable → fall over to a valid brain (not terminal)', () => {
+  // ClaudeAuthError (expired subscription) and reauth-worded errors → fallover.
+  class ClaudeAuthError extends Error { constructor(m: string) { super(m); this.name = 'ClaudeAuthError'; } }
+  assert.equal(isFalloverError(new ClaudeAuthError('Claude subscription token has expired')), true);
+  assert.equal(isFalloverError(new Error('Claude token refresh failed (400): invalid_grant')), true);
+  assert.equal(isFalloverError(new Error('HTTP 401 Unauthorized')), true);
+  // A plain bad-request / validation error is NOT an auth fallover.
+  assert.equal(isFalloverError(new Error('400 invalid schema for field x')), false);
+  // Kill-switch restores terminal behavior.
+  process.env.CLEMMY_AUTH_FALLOVER = 'off';
+  try {
+    assert.equal(isFalloverError(new ClaudeAuthError('token expired')), false, 'kill-switch → auth is terminal again');
+  } finally {
+    delete process.env.CLEMMY_AUTH_FALLOVER;
+  }
+});
