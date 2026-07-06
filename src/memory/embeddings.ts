@@ -45,12 +45,13 @@ const MAX_INPUT_CHARS = 16_000;
 // default (10s) so the daemon doesn't hang for a full 10s on a stale
 // Cloudflare IP — chat/recall fall back to FTS-only on timeout.
 // 10s (was 6s): the 6s ceiling tripped on slow-but-healthy calls, the #1 real
-// recall degradation (156 timeouts / 32 breaker-opens in 14d). Override via
-// CLEMMY_EMBED_TIMEOUT_MS.
-const FETCH_TIMEOUT_MS = (() => {
-  const raw = Number.parseInt(process.env.CLEMMY_EMBED_TIMEOUT_MS ?? '', 10);
+// recall degradation (156 timeouts / 32 breaker-opens in 14d). Read per-call via
+// getRuntimeEnv (not a module const / raw process.env) so a .env-file drop of
+// CLEMMY_EMBED_TIMEOUT_MS reverts it LIVE like every other daemon flag.
+function fetchTimeoutMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_EMBED_TIMEOUT_MS', '') || '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
-})();
+}
 
 // Circuit breaker for the long-running daemon's pool-poisoning
 // failure mode. After ~hours of uptime, undici keeps stale Cloudflare
@@ -409,7 +410,7 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
         input: safeInputs,
       }),
       keepalive: false,
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(fetchTimeoutMs()),
     });
 
     if (!response.ok) {
@@ -432,7 +433,7 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
     // (retrying won't help and just drip-spends). Kill-switch =off.
     const cls = classifyEmbedError(err);
     if (cls !== 'auth' && cls !== 'quota' && cls !== 'rate_limit'
-      && (process.env.CLEMMY_EMBED_RETRY ?? 'on').toLowerCase() !== 'off') {
+      && (getRuntimeEnv('CLEMMY_EMBED_RETRY', 'on') || 'on').toLowerCase() !== 'off') {
       await new Promise((r) => setTimeout(r, 300));
       return await attempt();
     }

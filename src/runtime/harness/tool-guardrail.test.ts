@@ -509,10 +509,11 @@ test('applyMode: warn mode still demotes non-exact-args block/halt to warn', () 
   assert.equal(applyMode(variedHalt, 'warn').action, 'warn');
 });
 
-test('applyMode: a MUTATING same-mut-tool HALT (distinct-args send runaway) ENFORCES even in warn mode', () => {
-  // The 45-emails-to-distinct-addresses class: real production halts carry an
-  // explicit mutating:true (classified by the inner slug), so they now hard-stop
-  // in the default mode instead of demoting to warn-only.
+test('applyMode: a MUTATING same-mut-tool HALT enforces ONLY when opted in (default off pending classifier reconciliation)', () => {
+  // The 45-emails-to-distinct-addresses class carries explicit mutating:true. The
+  // enforce is OPT-IN (default off) because the guardrail's composio mutating
+  // classifier is broader than the authoritative write classifier — see the
+  // sameMutHaltEnforcedInWarn() note (adversarial review 07-06).
   const sendRunaway = {
     action: 'halt' as const,
     signature: 'sig',
@@ -522,10 +523,11 @@ test('applyMode: a MUTATING same-mut-tool HALT (distinct-args send runaway) ENFO
     count: 8,
     mutating: true,
   };
-  assert.equal(applyMode(sendRunaway, 'warn').action, 'halt', 'a real send runaway enforces');
-  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'off';
+  // Default (unset) → demotes to warn (no false-halt on read-only DataForSEO/Firecrawl batches).
+  assert.equal(applyMode(sendRunaway, 'warn').action, 'warn', 'default off → warn-only');
+  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'on';
   try {
-    assert.equal(applyMode(sendRunaway, 'warn').action, 'warn', 'kill-switch restores warn-only');
+    assert.equal(applyMode(sendRunaway, 'warn').action, 'halt', 'opt-in enforces the runaway halt');
   } finally {
     delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
   }

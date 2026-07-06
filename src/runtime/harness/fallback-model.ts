@@ -115,7 +115,7 @@ export function isAuthRecoverableError(err: unknown): boolean {
   if (err instanceof Error && err.name === 'ClaudeAuthError') return true;
   const msg = err instanceof Error ? err.message : String(err ?? '');
   return /\b(401|403)\b/.test(msg)
-    || /invalid_grant|refresh token not found or invalid|token (?:expired|is invalid)|expired (?:token|credential|subscription)|re-?authenticat|unauthorized|forbidden|not authenticated/i.test(msg);
+    || /invalid_grant|refresh token not found or invalid|token (?:is invalid)|expired (?:token|credential|subscription)|(?:token|credential|subscription|session)s? (?:has |have )?expired|re-?authenticat|unauthorized|forbidden|not authenticated/i.test(msg);
 }
 
 function authFalloverEnabled(): boolean {

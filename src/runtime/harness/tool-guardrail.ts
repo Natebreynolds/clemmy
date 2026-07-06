@@ -760,10 +760,18 @@ export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = rea
 }
 
 /** A MUTATING-tool runaway halt (same_mut_tool_repeat, distinct args) enforces
- *  even in the default warn mode. Default on — the safety fix for the 45-email
- *  runaway. =off restores the prior warn-only behavior. */
+ *  even in the default warn mode. DEFAULT OFF pending reconciliation: the
+ *  guardrail's composio mutating-classifier (composioSlugIsMutating) is BROADER
+ *  than the authoritative isMutatingExternalWrite() — it flags read-only
+ *  DataForSEO *_TASK_POST / FIRECRAWL_BATCH_* as mutating, and the sqlite
+ *  rehydrate seeds distinct-mutation counts by NAME (folding composio READS in).
+ *  Enforcing by default would refuse legitimate read-only SEO/scrape fan-outs and
+ *  mis-halt the first composio write after a restart (adversarial review 07-06).
+ *  The 45-email runaway is still caught by the goal-fidelity fail-closed gate;
+ *  this belt-and-suspenders stays OPT-IN until the classifier + rehydrate agree.
+ *  Set CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE=on to enable. */
 function sameMutHaltEnforcedInWarn(): boolean {
-  return (process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE ?? 'on').toLowerCase() !== 'off';
+  return (process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE ?? 'off').toLowerCase() === 'on';
 }
 
 // NOTE: A `maybeTruncateToolReturn` helper used to live here. Removed
