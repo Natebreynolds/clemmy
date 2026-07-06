@@ -2,6 +2,8 @@ import {
   type WorkflowDefinition,
   type WorkflowEventTrigger,
   type WorkflowInputDef,
+  type WorkflowResourceBinding,
+  type WorkflowResourceKind,
   type WorkflowStepInput,
   type WorkflowTrigger,
 } from '../memory/workflow-store.js';
@@ -17,6 +19,7 @@ import {
 } from './workflow-gap-test.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { codifyMechanicalSteps } from './workflow-codify.js';
 export {
   deleteWorkflowAndSyncTriggers,
   syncWorkflowTriggersBestEffort,
@@ -57,6 +60,7 @@ export interface WorkflowPreparedWrite {
   repairs: string[];
   warnings: string[];
   gaps: WorkflowGap[];
+  codifyNotes: string[];
 }
 
 export interface WorkflowVerificationPrep {
@@ -68,6 +72,7 @@ export interface WorkflowVerificationPrep {
 interface WorkflowPrepareForWriteOptions {
   allowInvalidDisabled?: boolean;
   modelPortability?: WorkflowModelPortabilityPreference;
+  codifyMechanicalSteps?: boolean;
 }
 
 export function workflowSlugFromName(name: string): string {
@@ -141,6 +146,7 @@ export function normalizeWorkflowSteps(steps: Array<Partial<WorkflowStepInput> &
     forEachNewOnly: s.forEachNewOnly,
     deterministic: s.deterministic,
     call: s.call,
+    codifiedFrom: normalizeCodifiedFrom(s),
     allowedTools: s.allowedTools,
     sideEffect: s.sideEffect,
     usesSkill: s.usesSkill,
@@ -152,6 +158,18 @@ export function normalizeWorkflowSteps(steps: Array<Partial<WorkflowStepInput> &
     loopUntil: s.loopUntil,
     loopSafe: s.loopSafe,
   }));
+}
+
+function normalizeCodifiedFrom(step: Partial<WorkflowStepInput> & Record<string, unknown>): WorkflowStepInput['codifiedFrom'] | undefined {
+  const raw = (step.codifiedFrom ?? step.codified_from) as Record<string, unknown> | undefined;
+  if (!raw || typeof raw !== 'object' || typeof raw.prompt !== 'string' || !raw.prompt.trim()) return undefined;
+  const allowedTools = Array.isArray(raw.allowedTools)
+    ? raw.allowedTools.filter((tool): tool is string => typeof tool === 'string' && tool.trim().length > 0)
+    : undefined;
+  return {
+    prompt: raw.prompt,
+    ...(allowedTools && allowedTools.length > 0 ? { allowedTools } : {}),
+  };
 }
 
 export function validateWorkflowStepGraph(steps: Array<Pick<WorkflowStepInput, 'id' | 'dependsOn'>>): string | null {
@@ -305,7 +323,7 @@ function preparedFromWrite(
   status: WorkflowPrepareStatus,
   def: WorkflowDefinition,
   gaps: WorkflowGap[] = [],
-  extra: { repairs?: string[]; warnings?: string[] } = {},
+  extra: { repairs?: string[]; warnings?: string[]; codifyNotes?: string[] } = {},
 ): WorkflowPreparedWrite {
   return {
     status,
@@ -314,7 +332,30 @@ function preparedFromWrite(
     repairs: [...(extra.repairs ?? []), ...prep.repairs],
     warnings: [...(extra.warnings ?? []), ...prep.warnings],
     gaps,
+    codifyNotes: extra.codifyNotes ?? [],
   };
+}
+
+function copyWorkflowForCompilation(def: WorkflowDefinition): WorkflowDefinition {
+  return {
+    ...def,
+    steps: def.steps.map((step) => ({
+      ...step,
+      dependsOn: step.dependsOn ? [...step.dependsOn] : undefined,
+      orderingOnlyDeps: step.orderingOnlyDeps ? [...step.orderingOnlyDeps] : undefined,
+      allowedTools: step.allowedTools ? [...step.allowedTools] : undefined,
+      codifiedFrom: step.codifiedFrom
+        ? { prompt: step.codifiedFrom.prompt, ...(step.codifiedFrom.allowedTools ? { allowedTools: [...step.codifiedFrom.allowedTools] } : {}) }
+        : undefined,
+    })),
+  };
+}
+
+function compileWorkflowForWrite(def: WorkflowDefinition, enabled = true): { def: WorkflowDefinition; codifyNotes: string[] } {
+  if (!enabled) return { def, codifyNotes: [] };
+  const compiled = copyWorkflowForCompilation(def);
+  const codify = codifyMechanicalSteps(compiled.steps);
+  return { def: compiled, codifyNotes: codify.notes };
 }
 
 export function prepareWorkflowCreateForWrite(
@@ -322,11 +363,13 @@ export function prepareWorkflowCreateForWrite(
   opts: Pick<WorkflowPrepareForWriteOptions, 'modelPortability'> = {},
 ): WorkflowPreparedWrite {
   const portability = normalizeWorkflowModelPortability(def, opts.modelPortability);
-  const prep = prepareWorkflowForWrite(portability.def);
-  if (portability.def.enabled && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], portability);
+  const compiled = compileWorkflowForWrite(portability.def);
+  const prep = prepareWorkflowForWrite(compiled.def);
+  const extra = { ...portability, codifyNotes: compiled.codifyNotes };
+  if (compiled.def.enabled && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], extra);
   const gaps = analyzeWorkflowGaps(prep.def);
   const defToWrite = gaps.length > 0 ? { ...prep.def, enabled: false } : prep.def;
-  return preparedFromWrite(prep, gaps.length > 0 ? 'readiness_gaps' : 'ready', defToWrite, gaps, portability);
+  return preparedFromWrite(prep, gaps.length > 0 ? 'readiness_gaps' : 'ready', defToWrite, gaps, extra);
 }
 
 export function prepareWorkflowUpdateForWrite(
@@ -335,16 +378,18 @@ export function prepareWorkflowUpdateForWrite(
   opts: WorkflowPrepareForWriteOptions = {},
 ): WorkflowPreparedWrite {
   const portability = normalizeWorkflowModelPortability(next, opts.modelPortability);
-  const prep = prepareWorkflowForWrite(portability.def);
+  const compiled = compileWorkflowForWrite(portability.def, opts.codifyMechanicalSteps === true);
+  const prep = prepareWorkflowForWrite(compiled.def);
+  const extra = { ...portability, codifyNotes: compiled.codifyNotes };
   const allowInvalidDisabled = opts.allowInvalidDisabled ?? true;
-  if ((!allowInvalidDisabled || prep.def.enabled) && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], portability);
+  if ((!allowInvalidDisabled || prep.def.enabled) && !prep.ok) return preparedFromWrite(prep, 'invalid', prep.def, [], extra);
   if (prep.def.enabled) {
     const gaps = analyzeWorkflowGaps(prep.def);
     if (gaps.length > 0) {
-      return preparedFromWrite(prep, 'readiness_gaps', { ...prep.def, enabled: false }, gaps, portability);
+      return preparedFromWrite(prep, 'readiness_gaps', { ...prep.def, enabled: false }, gaps, extra);
     }
   }
-  return preparedFromWrite(prep, 'ready', prep.def, [], portability);
+  return preparedFromWrite(prep, 'ready', prep.def, [], extra);
 }
 
 export function prepareWorkflowEnableForWrite(def: WorkflowDefinition): WorkflowPreparedWrite {
@@ -358,4 +403,69 @@ export function prepareWorkflowEnableForWrite(def: WorkflowDefinition): Workflow
 export function normalizeWorkflowInputs(input: unknown): Record<string, WorkflowInputDef> | undefined {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
   return input as Record<string, WorkflowInputDef>;
+}
+
+const WORKFLOW_RESOURCE_KINDS = new Set<WorkflowResourceKind>([
+  'account',
+  'sheet',
+  'document',
+  'folder',
+  'channel',
+  'campaign',
+  'analytics_property',
+  'database',
+  'table',
+  'repository',
+  'calendar',
+  'email_account',
+  'webhook',
+  'api',
+  'cli',
+  'project',
+  'other',
+]);
+
+function resourceString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function resourceObject(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+export function normalizeWorkflowResources(input: unknown): Record<string, WorkflowResourceBinding> | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const out: Record<string, WorkflowResourceBinding> = {};
+  for (const [rawId, value] of Object.entries(input as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const rec = value as Record<string, unknown>;
+    const id = resourceString(rec.id) ?? rawId.trim();
+    if (!id) continue;
+    const rawKind = resourceString(rec.kind) ?? 'other';
+    const kind = WORKFLOW_RESOURCE_KINDS.has(rawKind as WorkflowResourceKind)
+      ? rawKind as WorkflowResourceKind
+      : 'other';
+    out[id] = {
+      id,
+      kind,
+      ...(resourceString(rec.label) ? { label: resourceString(rec.label) } : {}),
+      ...(resourceString(rec.description) ? { description: resourceString(rec.description) } : {}),
+      ...(resourceString(rec.toolkit) ? { toolkit: resourceString(rec.toolkit) } : {}),
+      ...(resourceString(rec.tool) ? { tool: resourceString(rec.tool) } : {}),
+      ...(resourceString(rec.cli) ? { cli: resourceString(rec.cli) } : {}),
+      ...(resourceString(rec.mcpServer ?? rec.mcp_server) ? { mcpServer: resourceString(rec.mcpServer ?? rec.mcp_server) } : {}),
+      ...(resourceString(rec.connectionId ?? rec.connection_id) ? { connectionId: resourceString(rec.connectionId ?? rec.connection_id) } : {}),
+      ...(resourceString(rec.account) ? { account: resourceString(rec.account) } : {}),
+      ...(resourceString(rec.resourceId ?? rec.resource_id) ? { resourceId: resourceString(rec.resourceId ?? rec.resource_id) } : {}),
+      ...(resourceString(rec.url) ? { url: resourceString(rec.url) } : {}),
+      ...(resourceString(rec.name) ? { name: resourceString(rec.name) } : {}),
+      ...(resourceObject(rec.scope) ? { scope: resourceObject(rec.scope) } : {}),
+      ...(resourceObject(rec.cursor) ? { cursor: resourceObject(rec.cursor) } : {}),
+      ...(resourceObject(rec.trigger) ? { trigger: resourceObject(rec.trigger) } : {}),
+      ...(typeof rec.required === 'boolean' ? { required: rec.required } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }

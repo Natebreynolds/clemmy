@@ -154,6 +154,7 @@ export function registerWorkerTools(server: McpServer): void {
       }
       // P6 concurrency cap: at most K workers in flight per session; excess queue.
       // worker_queued fires only when this worker actually has to wait for a slot.
+      const workerProvider = resolveProvider(workerModel);
       const release = await acquireWorkerSlot(sessionId, (info) => {
         try {
           recordOperationalEvent({
@@ -164,7 +165,7 @@ export function registerWorkerTools(server: McpServer): void {
             payload: { item: input.item, lane: 'sdk_brain', ...info },
           });
         } catch { /* telemetry is best-effort */ }
-      });
+      }, { modelId: workerModel, provider: workerProvider });
       // worker_spawned: a slot was acquired and the worker is about to run.
       try {
         recordOperationalEvent({
@@ -172,7 +173,7 @@ export function registerWorkerTools(server: McpServer): void {
           type: 'worker_spawned',
           sessionId,
           actor: 'run_worker',
-          payload: { item: input.item, model: workerModel, lane: 'sdk_brain', transport },
+          payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'sdk_brain', transport },
         });
       } catch { /* telemetry is best-effort */ }
       // Route-outcome capture (adaptive routing evidence): one decision+outcome
@@ -184,7 +185,7 @@ export function registerWorkerTools(server: McpServer): void {
         role: 'worker',
         intent: input.intent || undefined,
         resolvedModel: workerModel,
-        provider: resolveProvider(workerModel),
+        provider: workerProvider,
         source: 'default',
         reason: { lane: 'sdk_brain', item: input.item },
       });

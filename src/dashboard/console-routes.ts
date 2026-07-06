@@ -74,6 +74,7 @@ import {
   buildWorkflowTrigger,
   deleteWorkflowAndSyncTriggers,
   normalizeWorkflowInputs,
+  normalizeWorkflowResources,
   normalizeWorkflowSteps,
   prepareWorkflowCreateForWrite,
   prepareWorkflowEnableForWrite,
@@ -91,7 +92,8 @@ import {
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
-import { simulateWorkflowDryRun } from '../execution/workflow-dry-run-simulation.js';
+import { certifyWorkflow, type WorkflowCertification } from '../execution/workflow-certification.js';
+import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
 import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes, readWorkspaceCheckerReport, writeWorkspaceCheckerReport } from '../execution/workflow-run-workspace.js';
 import { checkRunAgainstGoal } from '../execution/workflow-run-checker.js';
@@ -390,10 +392,23 @@ function toolEventsDir(): string {
 interface WorkflowStepShape {
   id: string;
   prompt: string;
+  project?: string;
   dependsOn?: string[];
   model?: string;
+  intent?: string;
   tier?: number;
   maxTurns?: number;
+  forEach?: string;
+  forEachNewOnly?: boolean;
+  deterministic?: { runner: string };
+  call?: { tool: string; args?: Record<string, unknown> };
+  allowedTools?: string[];
+  usesSkill?: string;
+  sideEffect?: 'read' | 'write' | 'send';
+  requiresApproval?: boolean;
+  approvalPreview?: string;
+  inputs?: Record<string, unknown>;
+  output?: Record<string, unknown>;
 }
 interface WorkflowFrontmatter {
   name?: string;
@@ -402,6 +417,7 @@ interface WorkflowFrontmatter {
   trigger?: { schedule?: string; manual?: boolean };
   steps?: WorkflowStepShape[];
   inputs?: Record<string, { type?: string; default?: string; description?: string }>;
+  resources?: Record<string, unknown>;
   synthesis?: { prompt?: string };
   goal?: {
     objective?: string;
@@ -673,20 +689,85 @@ function workflowRunSummary(workflowSlug: string, runId: string): {
   };
 }
 
-function workflowExecutionPlanFor(def: WorkflowDefinition, workflowSlug?: string) {
-  return buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, {
+function workflowExecutionPlanOptions() {
+  return {
     stepConcurrency: positiveEnvInt('CLEMENTINE_WORKFLOW_CONCURRENCY', 5),
     runConcurrency: positiveEnvInt('CLEMENTINE_WORKFLOW_RUN_CONCURRENCY', 1),
     forEachBatchSize: positiveEnvInt('CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS', 200),
+  };
+}
+
+function workflowExecutionPlanFor(def: WorkflowDefinition, workflowSlug?: string) {
+  return buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, workflowExecutionPlanOptions());
+}
+
+function workflowCertificationFor(def: WorkflowDefinition, workflowSlug: string) {
+  return certifyWorkflow(def, {
+    workflowSlug,
+    planOptions: workflowExecutionPlanOptions(),
   });
 }
 
+function workflowCertificationSummary(cert: WorkflowCertification) {
+  const dryRun = cert.dryRun;
+  const codeSteps = dryRun.steps.filter((s) => s.executor === 'call' || s.executor === 'deterministic').length;
+  const llmSteps = dryRun.steps.filter((s) => s.executor === 'model' || s.executor === 'skill').length;
+  return {
+    workflow: cert.workflow,
+    enabled: cert.enabled,
+    state: cert.state,
+    executionMode: cert.executionMode,
+    label: cert.label,
+    summary: cert.summary,
+    canRun: cert.canRun,
+    canEnableDirectly: cert.canEnableDirectly,
+    canQueueCreationTest: cert.canQueueCreationTest,
+    needsCreationTest: cert.needsCreationTest,
+    missingRunInputs: cert.missingRunInputs,
+    missingTestInputs: cert.missingTestInputs,
+    resourceGaps: cert.resourceGaps.slice(0, 5),
+    resourceGapCount: cert.resourceGaps.length,
+    readinessGapCount: cert.readinessGaps.length,
+    blockerCount: cert.blockingReasons.length,
+    contractAdvisoryCount: cert.contractAdvisories.length,
+    nextActions: cert.nextActions,
+    dryRun: {
+      verdict: dryRun.verdict,
+      runnable: dryRun.runnable,
+      summary: dryRun.summary,
+      waveCount: dryRun.waves.length,
+      parallelWaveCount: dryRun.waves.filter((wave) => wave.parallel).length,
+      criticalPathLength: dryRun.criticalPath.length,
+      // Execution economics — the "why Clem, not Claude Code" signal. `code`
+      // steps (direct tool calls + deterministic scripts) run token-free every
+      // run; `llm` steps (model reasoning + skill execution) are where the
+      // once-authored reasoning cost lives. A cheap workflow is mostly code.
+      stepCount: dryRun.steps.length,
+      codeSteps,
+      llmSteps,
+      effectCounts: {
+        sends: dryRun.effects.sends.length,
+        writes: dryRun.effects.writes.length,
+        readSteps: dryRun.effects.readSteps,
+        approvals: dryRun.effects.approvals.length,
+      },
+      toolsTouched: dryRun.effects.toolsTouched.slice(0, 8),
+    },
+  };
+}
+
+function workflowCertificationSummaryFor(def: WorkflowDefinition, workflowSlug: string) {
+  return workflowCertificationSummary(workflowCertificationFor(def, workflowSlug));
+}
+
 function workflowConsoleStatePayload(def: WorkflowDefinition, workflowSlug: string) {
-  const executionPlan = workflowExecutionPlanFor(def, workflowSlug);
+  const certification = workflowCertificationFor(def, workflowSlug);
+  const executionPlan = certification.dryRun.plan;
   const proof = buildWorkflowProof(def, readWorkflowRunRecords(), [workflowSlug]);
   return {
     name: def.name,
     enabled: def.enabled,
+    certification,
     readinessGaps: workflowReadinessGapPayload(def),
     proof,
     executionPlan,
@@ -697,6 +778,7 @@ function workflowConsoleStatePayload(def: WorkflowDefinition, workflowSlug: stri
     }),
     steps: def.steps,
     goal: def.goal ?? null,
+    resources: def.resources ?? {},
     inputs: def.inputs ?? {},
     synthesis: def.synthesis ?? null,
     project: def.project ?? null,
@@ -3131,6 +3213,7 @@ export function registerConsoleRoutes(
           const lastRunFailedItems = lastRun ? listFinalFailedItems(entry.name, lastRun.id) : [];
           const lastRunFailedItemStepIds = Array.from(new Set(lastRunFailedItems.map((item) => item.stepId)));
           const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
+          const certification = workflowCertificationFor(entry.data, entry.name);
           return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
@@ -3141,6 +3224,7 @@ export function registerConsoleRoutes(
           stepCount: entry.data.steps.length,
           trigger: entry.data.trigger,
           steps: entry.data.steps,
+          resources: entry.data.resources ?? {},
           inputs: entry.data.inputs ?? {},
           synthesis: entry.data.synthesis ?? null,
           goal: entry.data.goal ?? null,
@@ -3153,7 +3237,8 @@ export function registerConsoleRoutes(
           lastRunFailedItemStepIds,
           lastRunAt: lastRun ? (lastRun.finishedAt ?? lastRun.startedAt ?? lastRun.createdAt) : null,
           proof,
-          executionPlan: workflowExecutionPlanFor(entry.data, entry.name),
+          certification: workflowCertificationSummary(certification),
+          executionPlan: certification.dryRun.plan,
           };
         });
       res.json({ workflows: items });
@@ -3216,6 +3301,7 @@ export function registerConsoleRoutes(
         const runs = runRecords.filter((run) => run.workflow === entry.data.name || run.workflow === entry.name);
         const activeRun = activeRuns.find((run) => run.workflowName === entry.data.name || run.workflowSlug === entry.name) ?? null;
         const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
+        const certification = workflowCertificationSummaryFor(entry.data, entry.name);
         return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
@@ -3223,11 +3309,13 @@ export function registerConsoleRoutes(
           enabled: entry.data.enabled,
           triggerSchedule: entry.data.trigger.schedule ?? null,
           stepCount: entry.data.steps.length,
+          resourceCount: Object.keys(entry.data.resources ?? {}).length,
           inputCount: Object.keys(entry.data.inputs ?? {}).length,
           hasSynthesis: !!entry.data.synthesis?.prompt,
           activeRun,
           lastRun: runs[0] ?? null,
           proof,
+          certification,
         };
       });
 
@@ -3342,6 +3430,7 @@ export function registerConsoleRoutes(
       const savedDef = promoted.savedDef as WorkflowDefinition;
       const slug = promoted.slug ?? workflowSlugFromName(savedDef.name);
       const proof = buildWorkflowProof(savedDef, readWorkflowRunRecords(), [slug]);
+      const certification = workflowCertificationFor(savedDef, slug);
       res.status(201).json({
         created: true,
         name: savedDef.name,
@@ -3362,56 +3451,66 @@ export function registerConsoleRoutes(
         gaps: promoted.built?.gaps ?? [],
         preflight: promoted.preflight ?? null,
         proof,
-        executionPlan: workflowExecutionPlanFor(savedDef, slug),
+        certification: workflowCertificationSummary(certification),
+        executionPlan: certification.dryRun.plan,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
-  app.get('/api/console/workflows/:name', (req, res) => {
+  app.get('/api/console/workflows/:name', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    // Accept lookup either by display name (data.name) or by directory
-    // slug. Most callers use the display name (round-tripped from the
-    // workflows list), but the Architect agent may pass the slug.
-    const target = req.params.name;
-    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    const proof = buildWorkflowProof(entry.data, readWorkflowRunRecords(), [entry.name]);
-    const executionPlan = workflowExecutionPlanFor(entry.data, entry.name);
-    res.json({
-      name: entry.data.name,
-      file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
-      description: entry.data.description,
-      project: entry.data.project ?? null,
-      enabled: entry.data.enabled,
-      trigger: entry.data.trigger,
-      steps: entry.data.steps,
-      inputs: entry.data.inputs ?? {},
-      synthesis: entry.data.synthesis ?? null,
-      goal: entry.data.goal ?? null,
-      allowedTools: entry.data.allowedTools ?? null,
-      whenToUse: entry.data.whenToUse ?? null,
-      // Plain-English / printable rendering for the UI — "what this does, when
-      // it runs, what it needs/produces, where it pauses" — so the dashboard
-      // can show a readable summary instead of only raw step fields.
-      summary: describeWorkflowPlainEnglish(entry.data),
-      proof,
-      // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
-      // visual workflow view. Built server-side from the pure, unit-tested
-      // buildWorkflowGraph so the browser just hands it to Cytoscape.
-      graph: buildWorkflowGraph(entry.data.steps, {
-        readinessItems: executionPlan.toolReadiness.items,
-        workflowProject: entry.data.project,
+    try {
+      // Accept lookup either by display name (data.name) or by directory
+      // slug. Most callers use the display name (round-tripped from the
+      // workflows list), but the Architect agent may pass the slug.
+      const target = req.params.name;
+      const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+      const proof = buildWorkflowProof(entry.data, readWorkflowRunRecords(), [entry.name]);
+      const certification = workflowCertificationFor(entry.data, entry.name);
+      const executionPlan = certification.dryRun.plan;
+      const resourceBinding = await buildWorkflowResourceBindingReportFromRuntime(entry.data);
+      res.json({
+        name: entry.data.name,
+        file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
+        description: entry.data.description,
+        project: entry.data.project ?? null,
+        enabled: entry.data.enabled,
+        trigger: entry.data.trigger,
+        steps: entry.data.steps,
+        resources: entry.data.resources ?? {},
+        resourceBinding,
+        inputs: entry.data.inputs ?? {},
+        synthesis: entry.data.synthesis ?? null,
+        goal: entry.data.goal ?? null,
+        allowedTools: entry.data.allowedTools ?? null,
+        whenToUse: entry.data.whenToUse ?? null,
+        // Plain-English / printable rendering for the UI — "what this does, when
+        // it runs, what it needs/produces, where it pauses" — so the dashboard
+        // can show a readable summary instead of only raw step fields.
+        summary: describeWorkflowPlainEnglish(entry.data),
+        proof,
+        certification,
+        // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
+        // visual workflow view. Built server-side from the pure, unit-tested
+        // buildWorkflowGraph so the browser just hands it to Cytoscape.
+        graph: buildWorkflowGraph(entry.data.steps, {
+          readinessItems: executionPlan.toolReadiness.items,
+          workflowProject: entry.data.project,
+          executionPlan,
+        }),
         executionPlan,
-      }),
-      executionPlan,
-      // Provable dry-run preview: a side-effect-free trace of what this workflow
-      // WOULD do (execution waves + every external write/send it would perform)
-      // with no inputs supplied, so the UI can show "here is exactly what this
-      // will touch and send" before anyone runs it.
-      dryRunSimulation: simulateWorkflowDryRun(entry.data, { workflowSlug: entry.name }),
-    });
+        // Provable dry-run preview: a side-effect-free trace of what this workflow
+        // WOULD do (execution waves + every external write/send it would perform)
+        // with no inputs supplied, so the UI can show "here is exactly what this
+        // will touch and send" before anyone runs it.
+        dryRunSimulation: certification.dryRun,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/console/workflows', (req, res) => {
@@ -3434,6 +3533,7 @@ export function registerConsoleRoutes(
     const synthesis = typeof body.synthesisPrompt === 'string' && body.synthesisPrompt.trim()
       ? { prompt: body.synthesisPrompt.trim() } : undefined;
     const inputs = normalizeWorkflowInputs(body.inputs);
+    const resources = normalizeWorkflowResources(body.resources);
     const goal = workflowGoalFromDashboardBody(body.goal);
 
     const def: WorkflowDefinition = {
@@ -3443,6 +3543,7 @@ export function registerConsoleRoutes(
       enabled: body.enabled !== false,
       trigger: triggerResult.trigger,
       steps,
+      resources: resources && Object.keys(resources).length > 0 ? resources : undefined,
       inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
       synthesis,
       goal,
@@ -3530,6 +3631,12 @@ export function registerConsoleRoutes(
     }
     const inputs = normalizeWorkflowInputs(body.inputs);
     if (inputs) next.inputs = inputs;
+    if (body.clearResources === true || body.clear_resources === true) {
+      delete next.resources;
+    } else if (body.resources !== undefined) {
+      const resources = normalizeWorkflowResources(body.resources);
+      next.resources = resources && Object.keys(resources).length > 0 ? resources : undefined;
+    }
     if (Array.isArray(body.steps)) {
       const stepGraphError = validateWorkflowStepGraph(next.steps);
       if (stepGraphError) { res.status(400).json({ error: stepGraphError }); return; }
@@ -3552,6 +3659,7 @@ export function registerConsoleRoutes(
     // re-validation).
     const patchPrep = prepareWorkflowUpdateForWrite(entry.data, next, {
       modelPortability: workflowModelPortabilityFromUnknown(body),
+      codifyMechanicalSteps: Array.isArray(body.steps),
     });
     if (patchPrep.status === 'invalid') {
       res.status(400).json({ error: 'workflow failed validation', errors: patchPrep.errors }); return;
@@ -3915,8 +4023,9 @@ export function registerConsoleRoutes(
       description: entry.data.description,
       enabled: entry.data.enabled,
       trigger: entry.data.trigger,
-      steps: entry.data.steps,
+      steps: entry.data.steps as unknown as WorkflowStepShape[],
       inputs: entry.data.inputs,
+      resources: entry.data.resources,
       synthesis: entry.data.synthesis,
       goal: entry.data.goal,
     };
@@ -3976,6 +4085,18 @@ export function registerConsoleRoutes(
     }
 
     const normalizedInputs = normalizeWorkflowRunInputs(inputs as Record<string, string>);
+    if (!dryRun) {
+      const certification = workflowCertificationFor(entry.data, entry.name);
+      if (certification.resourceGaps.length > 0) {
+        res.status(409).json({
+          error: 'workflow resource bindings incomplete',
+          message: certification.summary,
+          resourceGaps: certification.resourceGaps,
+          certification: workflowCertificationSummary(certification),
+        });
+        return;
+      }
+    }
     if (dryRun) {
       const queued = queueWorkflowDryRun(entry.data.name, normalizedInputs, {
         source: 'console',
@@ -4342,7 +4463,9 @@ export function registerConsoleRoutes(
 
     const prompt = [
       'You are the Clementine Workflow Architect — a focused sub-mode that helps the user design and edit multi-step workflows.',
-      'Each workflow has: name, description, trigger (manual or cron schedule), steps (id + prompt + optional dependsOn + optional allowed_tools + optional uses_skill), inputs, optional synthesis prompt.',
+      'Each workflow has: name, description, trigger, steps, workflow inputs, durable resources, optional goal, and optional synthesis prompt.',
+      'Step shape: { id, prompt?, dependsOn?, allowed_tools?, call?, inputs?, output?, sideEffect?, forEach?, uses_skill?, requiresApproval?, approvalPreview? }.',
+      'Use workflow inputs for per-run values. Use durable resources for fixed sheets/accounts/folders/channels/campaigns/repos/CLIs that the workflow should remember between runs.',
       'Be terse. No preamble. Lead with the answer. One short paragraph of prose at most.',
       '',
       'IMPORTANT — proposing changes:',
@@ -4350,16 +4473,20 @@ export function registerConsoleRoutes(
       '• If you are proposing ANY change to the draft, your reply MUST end with a single fenced ```json code block containing an object with shape { ops: [...], summary: "..." }.',
       '• Each op is one of:',
       '    { "type": "set_field",    "path": "name" | "description" | "triggerSchedule" | "enabled", "value": <value> }',
-      '    { "type": "add_step",     "step": { "id": "<id>", "prompt": "<text>", "dependsOn": ["<id>", ...], "allowed_tools": ["<tool>", ...], "uses_skill"?: "<skill-name>" } }',
-      '    { "type": "update_step",  "id": "<existing-id>", "patch": { "prompt"?: "...", "dependsOn"?: [...], "allowed_tools"?: [...], "uses_skill"?: "<skill-name> | null" } }',
+      '    { "type": "add_step",     "step": { "id": "<id>", "prompt"?: "<text>", "dependsOn"?: ["<id>", ...], "allowed_tools"?: ["<tool>", ...], "call"?: {"tool":"<direct-tool-slug>","args":{}}, "inputs"?: {"arg":{"from":"input.key"}}, "output"?: {"type":"object","required_keys":["..."]}, "sideEffect"?: "read|write|send", "uses_skill"?: "<skill-name>", "requiresApproval"?: true, "approvalPreview"?: "<text>" } }',
+      '    { "type": "update_step",  "id": "<existing-id>", "patch": { "prompt"?: "...", "dependsOn"?: [...], "allowed_tools"?: [...], "call"?: {...} | null, "inputs"?: {...} | null, "output"?: {...} | null, "sideEffect"?: "read|write|send" | null, "uses_skill"?: "<skill-name> | null", "requiresApproval"?: true | false, "approvalPreview"?: "<text> | null" } }',
       '    { "type": "remove_step",  "id": "<existing-id>" }',
       '    { "type": "reorder_step", "id": "<existing-id>", "after": "<other-id> | null (null = move to first)" }',
       '    { "type": "rename_step",  "id": "<existing-id>", "newId": "<new-id>" }',
       '    { "type": "add_input",    "key": "<key>", "value": "<default-or-empty>" }',
       '    { "type": "remove_input", "key": "<key>" }',
+      '    { "type": "add_resource", "key": "<id>", "value": { "kind": "sheet|account|folder|channel|campaign|repository|cli|api|other", "label"?: "<name>", "toolkit"?: "<toolkit>", "resourceId"?: "<id>", "url"?: "<url>", "name"?: "<name>", "required"?: true } }',
+      '    { "type": "remove_resource", "key": "<id>" }',
       '    { "type": "set_synthesis","value": "<prompt-text> | null (null clears it)" }',
       '• Keep ops minimal. Use update_step (with only the fields you actually change) instead of remove + add.',
-      '• When proposing a step that calls a tool, populate allowed_tools with the minimum set needed (e.g. ["composio_gmail_send_email"]).',
+      '• For known exact tool calls, prefer `call` with templated args. For mechanical single-tool prompt steps, set one direct `allowed_tools` slug plus step `inputs` and `output` so the compiler can codify it.',
+      '• When the exact direct call is not known, populate allowed_tools with the minimum runtime surface needed (e.g. ["composio_execute_tool"]) and keep the step as an adaptive prompt step.',
+      '• Declare sideEffect on every external step: read, write, or send. Set requiresApproval on irreversible sends/publishes unless the user explicitly wants autonomous sends.',
       '• When an installed skill already captures the expertise a step needs, set uses_skill instead of re-prompting that expertise inline. The runner injects the skill body automatically.',
       '• If you have nothing to propose (pure question, validation, advice), omit the JSON block entirely.',
       '',

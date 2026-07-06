@@ -418,6 +418,29 @@ function declaredRunnerHealth(record: SpaceRecord): SpaceRunnerHealth[] {
   return out;
 }
 
+function readDataMeta(record: SpaceRecord): Record<string, unknown> {
+  try {
+    const raw = JSON.parse(readFileSync(resolveInSpace(record.id, 'data.json'), 'utf-8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const meta = (raw as Record<string, unknown>)._meta;
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return {};
+    return meta as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function sourceFailureFromMeta(meta: Record<string, unknown>, sourceId: string): { error?: string; refreshedAt?: string } | null {
+  const entry = meta[sourceId];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const rec = entry as Record<string, unknown>;
+  if (rec.ok !== false) return null;
+  return {
+    error: typeof rec.error === 'string' && rec.error.trim() ? rec.error.trim() : undefined,
+    refreshedAt: typeof rec.refreshedAt === 'string' && rec.refreshedAt.trim() ? rec.refreshedAt.trim() : undefined,
+  };
+}
+
 export function buildSpaceHealthSnapshot(
   record: SpaceRecord,
   opts: { now?: number; staleAfterMs?: number } = {},
@@ -450,6 +473,15 @@ export function buildSpaceHealthSnapshot(
     } else if (!runner.present) {
       issues.push(`${label} "${runner.id}" declares data/${runner.runner}, but the file is missing`);
     }
+  }
+
+  const dataMeta = readDataMeta(record);
+  for (const source of record.dataSources) {
+    const failure = sourceFailureFromMeta(dataMeta, source.id);
+    if (!failure) continue;
+    const when = failure.refreshedAt ? ` at ${failure.refreshedAt}` : '';
+    const why = failure.error ? `: ${failure.error}` : '';
+    issues.push(`data source "${source.id}" last refresh failed${when}${why}`);
   }
 
   let freshness: SpaceHealthSnapshot['freshness'];

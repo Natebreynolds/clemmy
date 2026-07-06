@@ -6,6 +6,39 @@
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
 import type { WorkflowBuilderAnalysis, SuggestedStep } from './workflow-builder-analysis.js';
 
+const ROOT_INPUT_STEP_RE = /\b(?:research|fetch|search|query|gather|scrape|audit|monitor|track|list|retrieve|pull|get)\b/i;
+
+function suggestedStepInputFields(
+  step: SuggestedStep,
+  analysis: WorkflowBuilderAnalysis,
+  upstreamSteps: SuggestedStep[],
+): string[] {
+  if (step.inputFields && step.inputFields.length > 0) {
+    return Array.from(new Set(step.inputFields.map((field) => field.trim()).filter(Boolean)));
+  }
+  if (upstreamSteps.length > 0) return [];
+  const workflowInputs = Object.keys(analysis.suggestedInputs ?? {});
+  if (workflowInputs.length === 0) return [];
+  const text = `${step.id} ${step.title} ${step.intent} ${step.description}`;
+  return ROOT_INPUT_STEP_RE.test(text) ? workflowInputs : [];
+}
+
+function buildStepInputBindings(
+  fields: string[],
+  analysis: WorkflowBuilderAnalysis,
+): WorkflowStepInput['inputs'] | undefined {
+  const out: WorkflowStepInput['inputs'] = {};
+  for (const field of fields) {
+    const meta = analysis.suggestedInputs[field];
+    out[field] = {
+      from: `input.${field}`,
+      ...(meta?.type ? { type: meta.type } : {}),
+      ...(meta?.description ? { description: meta.description } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /**
  * Generate a detailed prompt for a workflow step based on its intent and context.
  */
@@ -13,13 +46,14 @@ function generateStepPrompt(
   step: SuggestedStep,
   analysis: WorkflowBuilderAnalysis,
   upstreamSteps: SuggestedStep[],
+  inputFields = step.inputFields ?? [],
 ): string {
   const inputFromUpstream = upstreamSteps.length > 0
     ? `\n\nData from previous steps:\n${upstreamSteps.map(s => `- {{steps.${s.id}.output}}`).join('\n')}`
     : '';
 
-  const dataFlow = step.inputFields && step.inputFields.length > 0
-    ? `\n\nRequired inputs: ${step.inputFields.join(', ')}`
+  const dataFlow = inputFields.length > 0
+    ? `\n\nRequired inputs: ${inputFields.join(', ')}`
     : '';
 
   // Build a contextual prompt based on the step's intent
@@ -48,7 +82,8 @@ function suggestedToWorkflowStep(
   allSteps: SuggestedStep[],
 ): WorkflowStepInput {
   const upstreamSteps = allSteps.filter(s => step.dependsOn?.includes(s.id));
-  const prompt = generateStepPrompt(step, analysis, upstreamSteps);
+  const inputFields = suggestedStepInputFields(step, analysis, upstreamSteps);
+  const prompt = generateStepPrompt(step, analysis, upstreamSteps, inputFields);
 
   const output = step.expectedOutputType
     ? {
@@ -63,6 +98,7 @@ function suggestedToWorkflowStep(
     dependsOn: step.dependsOn,
     intent: step.intent,
     allowedTools: step.suggestedTools.length > 0 ? step.suggestedTools : ['composio_execute_tool'],
+    inputs: buildStepInputBindings(inputFields, analysis),
     output,
   };
 }

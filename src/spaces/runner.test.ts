@@ -169,6 +169,26 @@ test('refreshSpaceData serializes same-space refreshes so concurrent sources do 
   runner._resetSpaceRefreshQueuesForTest();
 });
 
+test('refreshSpaceData does not advance lastRefreshedAt when every source fails', async () => {
+  const slug = 'refresh-failed-stamp';
+  const oldSuccess = '2026-06-01T00:00:00.000Z';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Refresh Failed Stamp',
+    dataSources: [{ id: 'bad', runner: 'bad.mjs' }],
+  });
+  store.spaceStore.update(slug, { lastRefreshedAt: oldSuccess });
+  writeRunner(slug, 'bad.mjs', `process.stderr.write('source broke'); process.exit(2);`);
+
+  const res = await runner.refreshSpaceData(slug);
+
+  assert.equal(res[0].ok, false);
+  assert.equal(store.spaceStore.get(slug)?.lastRefreshedAt, oldSuccess);
+  const data = dataStore.readData(slug) as Record<string, unknown>;
+  assert.equal(((data._meta as Record<string, { ok?: boolean }>).bad).ok, false);
+  runner._resetSpaceRefreshQueuesForTest();
+});
+
 test('runner that prints nothing (exit 0) → "produced no output"', async () => {
   const slug = 'no-output';
   writeRunner(slug, 'r.mjs', `process.exit(0);`);

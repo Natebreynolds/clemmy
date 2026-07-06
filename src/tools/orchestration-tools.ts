@@ -12,6 +12,7 @@ import {
   readWorkflow,
   type WorkflowDefinition,
   type WorkflowEntry,
+  type WorkflowResourceBinding,
   type WorkflowStepInput,
 } from '../memory/workflow-store.js';
 import { workflowExecutionSurfaceChanged, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
@@ -29,6 +30,7 @@ import {
   applyWorkflowTriggerPatch,
   buildWorkflowTrigger,
   deleteWorkflowAndSyncTriggers,
+  normalizeWorkflowResources,
   normalizeWorkflowSteps,
   prepareWorkflowCreateForWrite,
   prepareWorkflowEnableForWrite,
@@ -89,6 +91,15 @@ import {
   applyWorkflowVisualContractFixes,
   type WorkflowVisualContractFixKind,
 } from '../execution/workflow-visual-contract-fixes.js';
+import {
+  certifyWorkflow,
+  renderWorkflowCertification,
+  type WorkflowCertification,
+} from '../execution/workflow-certification.js';
+import {
+  buildWorkflowResourceBindingReportFromRuntime,
+  renderWorkflowResourceBindingReport,
+} from '../execution/workflow-resource-binding.js';
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -138,13 +149,13 @@ export function commitAuthoredWorkflow(
   if (prep.errors.length > 0) {
     return {
       ok: false, errors: prep.errors, savedDef: prep.def, executionPlan, repairs: prep.repairs,
-      warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories, gaps: [],
+      warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes, ...prep.codifyNotes], advisories: bind.advisories, gaps: [],
     };
   }
   writeWorkflowAndSyncTriggers(dirName, prep.def);
   return {
     ok: true, errors: [], savedDef: prep.def, executionPlan, repairs: prep.repairs,
-    warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes], advisories: bind.advisories,
+    warnings: prep.warnings, boundNotes: [...routeNotes, ...bind.boundNotes, ...prep.codifyNotes], advisories: bind.advisories,
     gaps: prep.gaps,
   };
 }
@@ -287,6 +298,28 @@ export function renderAuthoringAdvisories(warnings: string[] | undefined): strin
 function appendVisualContract(plan: WorkflowExecutionPlan | undefined): string {
   const block = renderWorkflowVisualContract(plan);
   return block ? `\n\n${block}` : '';
+}
+
+function renderWorkflowCertificationCommandHint(cert: WorkflowCertification): string {
+  const quotedName = JSON.stringify(cert.workflow);
+  switch (cert.state) {
+    case 'needs_resource_binding':
+      return `Next command: workflow_update name=${quotedName} resources='{"resource_id":{"kind":"sheet","toolkit":"googlesheets","resourceId":"<id or url>"}}'`;
+    case 'needs_creation_inputs':
+      return `Next command: workflow_certify name=${quotedName} test_inputs='{"${cert.missingTestInputs[0] ?? 'input'}":"<non-secret test value>"}'`;
+    case 'needs_creation_test':
+      return `Next command: workflow_set_enabled name=${quotedName} enabled=true test_inputs='<same test_inputs>'`;
+    case 'ready_to_enable':
+      return `Next command: workflow_set_enabled name=${quotedName} enabled=true`;
+    case 'needs_run_inputs':
+      return `Next command: workflow_run name=${quotedName} inputs='{"${cert.missingRunInputs[0] ?? 'input'}":"<value>"}'`;
+    case 'ready_to_run':
+      return `Next command: workflow_run name=${quotedName} inputs='<run inputs if any>'`;
+    case 'needs_info':
+      return `Next command: workflow_update name=${quotedName} ...`;
+    case 'blocked':
+      return `Next command: fix the listed blockers, then rerun workflow_certify name=${quotedName}`;
+  }
 }
 
 /** Author-time data-source review block (trailing-padded for the response body),
@@ -618,6 +651,30 @@ export function parseWorkflowInputsSchemaJson(
 }
 
 /**
+ * Parse workflow_create/_update `resources` — durable source/account/object
+ * bindings, not per-run inputs. Keep this a JSON string for the same function
+ * calling reliability reason as `inputs`.
+ */
+export function parseWorkflowResourcesJson(
+  raw: string | null | undefined,
+): Record<string, WorkflowResourceBinding> {
+  if (raw === null || raw === undefined) return {};
+  const trimmed = raw.trim();
+  if (trimmed === '') return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error(`Invalid workflow resources JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('Workflow resources must be a JSON object mapping resource ids to {kind, toolkit?, resourceId?/url?/name?, ...}.');
+  }
+  const resources = normalizeWorkflowResources(parsed);
+  return resources ?? {};
+}
+
+/**
  * Step OUTPUT contract (WorkflowStepOutputContract). Shared by workflow_create
  * + workflow_update so authors can DECLARE what a step produces. Optional, by
  * design: a step with no `output` is unverified — byte-identical to before
@@ -644,6 +701,25 @@ const WorkflowStepOutputContractSchema = z.object({
     .describe('Concrete-handle checks — confirm the named output values are REAL (a file that exists, a non-empty URL), so "produced a brief" cannot pass when the file/URL does not actually exist.'),
   description: z.string().optional().describe('One-line note on what this step produces.'),
 });
+
+const WorkflowStepInputBindingSchema = z.object({
+  type: z.enum(['string', 'number', 'boolean', 'object', 'array']).optional()
+    .describe('Expected value type for this step argument.'),
+  required: z.boolean().optional()
+    .describe('Defaults to true unless a default is supplied.'),
+  from: z.string().optional()
+    .describe('Binding source: input.<key>, steps.<id>.output[.path], item[.path], project.path, project.name, or date. Omit to bind from workflow input with the same name.'),
+  default: z.unknown().optional()
+    .describe('Literal fallback value when the source is absent.'),
+  description: z.string().optional()
+    .describe('One-line note on why the step needs this argument.'),
+});
+
+const STEP_INPUT_CONTRACT_DESC =
+  'OPTIONAL step input/argument contract — what this step NEEDS before it runs. '
+  + 'Keys are the step argument names; each value can bind from input.<key>, steps.<id>.output[.path], item[.path], project.path, project.name, or date. '
+  + 'Declare this on mechanical single-tool steps with output contracts so the authoring compiler can convert them into direct `call` nodes safely. '
+  + 'Example: {"target":{"from":"input.domain","type":"string"}}.';
 
 const STEP_OUTPUT_CONTRACT_DESC =
   'OPTIONAL output contract — what this step PRODUCES. When declared, the engine verifies the step output against it BEFORE recording completion; a violation fails the step loudly (reports back) instead of feeding bad data to the next step. Declare it on any step whose output a later step depends on, and ALWAYS on the step that produces the final deliverable (e.g. a created sheet/file/URL), so the result is verified, not just claimed. Omit it for free-form/conversational steps.';
@@ -1040,6 +1116,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       + "ADVANCED MODE: Provide step-by-step definitions with full prompts, dependencies, and tool choices for complete control. I still validate and suggest improvements. "
       + "AUTHORING MODEL: Workflows are AUTONOMOUS BY DEFAULT — they run end-to-end on your one-time consent (enabling), WITHOUT pausing for per-step approval, unless you set `requiresApproval: true` on irreversible actions (sends, publishes). "
       + "Each step does ONE job; outputs flow to dependent steps automatically via `dependsOn`. Steps with the same dependsOn run in parallel. Use forEach for per-item fan-out. "
+      + "DECLARE STEP INPUTS on mechanical tool steps: `inputs` maps argument names to sources like input.domain or steps.fetch.output.rows. If the exact tool + args are known, prefer `call`; otherwise a single direct allowedTools slug + inputs + output lets the compiler codify it safely. "
       + "DECLARE OUTPUT CONTRACTS on any step whose output a later step depends on (type, required_keys, verify.path_exists). The engine verifies before continuing, preventing hollow results from feeding downstream. "
       + "DECLARE sideEffect on every step ('read' | 'write' | 'send') — it drives the safety law: send steps never auto-retry, crash-resume halts on interrupted writes/sends. "
       + "PINNED GOAL: declare `goal` to make the workflow run-to-completion — every completed run is validated EXTERNALLY against the goal's success criteria; an unmet goal automatically re-runs the workflow with the validation feedback (bounded by max_attempts, never after an irreversible step executed), and an exhausted goal parks loudly for the user. "
@@ -1063,10 +1140,15 @@ export function registerOrchestrationTools(server: McpServer): void {
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
         }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
+        deterministic: z.object({
+          runner: z.string().min(1).describe('Relative script path inside the workflow\'s scripts/ dir, e.g. "fetch-keywords.js". Extensions: .js/.mjs/.cjs/.ts/.py/.sh or a shebang executable.'),
+          source: z.string().optional().describe('The script\'s SOURCE CODE. When provided, I write it to scripts/<runner> at save time so the step runs immediately — this is how you WRITE CODE for a mechanical step. The script must print ONE JSON document to stdout. Reference inputs/upstream via argv or env you set in the step. Omit only to reuse a script already in scripts/.'),
+        }).optional().describe('DETERMINISTIC SCRIPT step — the agent writes CODE that runs in a sandbox with NO LLM turn (token-free, fast, repeatable every run). Use for mechanical work with a known procedure: shell/CLI, HTTP/API, or data transforms that do not need reasoning. Mutually exclusive with call and prompt.'),
         allowedTools: z.array(z.string()).optional(),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         requiresApproval: z.boolean().optional(),
         approvalPreview: z.string().optional(),
+        inputs: z.record(z.string(), WorkflowStepInputBindingSchema).optional().describe(STEP_INPUT_CONTRACT_DESC),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
         sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class. 'read' = gathers data only; 'write' = mutates local/remote state reversibly; 'send' = irreversible outbound (email/publish/post). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends. Declare it — undeclared steps fall back to prose heuristics."),
         loopUntil: WorkflowLoopUntilSchema.optional().describe(LOOP_UNTIL_DESC),
@@ -1077,6 +1159,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       trigger_webhook_path: z.string().optional().describe('URL-safe slug: the workflow fires when an external service POSTs to /api/hooks/workflows/<path> (token-gated). Use for "when X happens in another system" asks that can call a webhook.'),
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('EVENT-DRIVEN recurrence: the workflow fires when a matching internal system event is emitted (composio trigger, watcher, another workflow). Prefer this over cron polling for "when a new X arrives" asks.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. A JSON string fills reliably under strict-mode function-calling where an open map does not. Event/webhook payload fields auto-bind to declared inputs of the same name; an input named "payload" receives the whole event JSON.'),
+      resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"lead_sheet":{"kind":"sheet","toolkit":"googlesheets","resourceId":"<spreadsheet id>","name":"Leads"}}. Use for fixed accounts, sheets, folders, campaigns, channels, repos, CLIs, and API endpoints that the workflow should remember between runs; do NOT put these in run inputs.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the authoring smoke test, e.g. {"url":"https://example.com"}. Use when an external read step needs inputs that are not defaulted in `inputs`; otherwise the workflow stays disabled until it can be verified.'),
       synthesis_prompt: z.string().optional(),
       portable_models: z.boolean().optional().describe('Set true when the workflow should run on any available model/provider. This removes exact per-step model pins and keeps intent/default routing instead. Omit/false to preserve intentional model pins.'),
@@ -1087,7 +1170,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
-    async ({ name, description, steps, project, trigger_schedule, trigger_webhook_path, trigger_events, inputs, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
+    async ({ name, description, steps, project, trigger_schedule, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
       // INTELLIGENT WORKFLOW CREATION:
       // If steps not provided, analyze the description and generate steps intelligently
       let finalSteps = steps;
@@ -1124,6 +1207,12 @@ export function registerOrchestrationTools(server: McpServer): void {
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
+      let resourceBindings: Record<string, WorkflowResourceBinding>;
+      try {
+        resourceBindings = parseWorkflowResourcesJson(resources);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
       let providedSmokeInputs: Record<string, string>;
       try {
         providedSmokeInputs = parseWorkflowRunInputsJson(test_inputs);
@@ -1154,6 +1243,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         steps: normalizeWorkflowSteps(finalSteps),
         ...(allowSends !== undefined ? { allowSends } : {}),
         ...(goal ? { goal: { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts } } : {}),
+        resources: Object.keys(resourceBindings).length > 0 ? resourceBindings : undefined,
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
@@ -1275,6 +1365,87 @@ export function registerOrchestrationTools(server: McpServer): void {
   );
 
   server.tool(
+    'workflow_certify',
+    'One-door workflow certification. Use this before enabling or running a workflow: it composes readiness gaps, dry-run effects, creation-test requirements, missing inputs, visual-contract advisories, and the exact next command. Read-only; it never queues or enables by itself.',
+    {
+      name: z.string().min(1).describe('Workflow name. Fuzzy names are resolved the same way workflow_get resolves them.'),
+      inputs: z.string().optional().describe('JSON object of run inputs to test whether workflow_run can queue now, e.g. {"url":"https://example.com"}.'),
+      test_inputs: z.string().optional().describe('JSON object of concrete non-secret creation-test inputs, e.g. {"url":"https://example.com"}.'),
+    },
+    async ({ name, inputs, test_inputs }) => {
+      let runInputs: Record<string, string>;
+      let testInputs: Record<string, string>;
+      try {
+        runInputs = parseWorkflowRunInputsJson(inputs);
+        testInputs = parseWorkflowRunInputsJson(test_inputs);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
+
+      const all = listWorkflowFiles();
+      let entry = all.find((w) => w.data.name === name);
+      if (!entry) {
+        const resolution = resolveWorkflowName(
+          name,
+          all.map((e) => ({ name: e.data.name, slug: path.basename(e.dir) })),
+        );
+        if (resolution.kind === 'exact' || resolution.kind === 'fuzzy') {
+          entry = all.find((w) => workflowNamesEqual(w.data.name, resolution.name));
+        } else if (resolution.kind === 'ambiguous') {
+          return textResult(
+            `"${name}" could mean: ${resolution.candidates.map((c) => `"${c}"`).join(', ')}. Ask the user which one, then call workflow_certify with that exact name.`,
+          );
+        }
+      }
+      if (!entry) {
+        const names = all.map((w) => `"${w.data.name}"`).join(', ');
+        return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
+      }
+
+      const cert = certifyWorkflow(entry.data, {
+        workflowSlug: entry.name,
+        runInputs,
+        testInputs,
+      });
+      return textResult(
+        `${renderWorkflowCertification(cert)}\n\n${renderWorkflowCertificationCommandHint(cert)}`,
+        { maxChars: 40_000 },
+      );
+    },
+  );
+
+  server.tool(
+    'workflow_resource_proposals',
+    'Inspect durable workflow resources and propose concrete bindings from connected Composio accounts, local CLIs, URL/project bindings, and cached capability inventory. Use after workflow_certify reports NEEDS RESOURCE BINDING, or before enabling a no-input recurring workflow that should remember sheets/accounts/folders/channels/campaigns across runs.',
+    {
+      name: z.string().min(1).describe('Workflow name. Fuzzy names are resolved the same way workflow_get resolves them.'),
+    },
+    async ({ name }) => {
+      const all = listWorkflowFiles();
+      let entry = all.find((w) => w.data.name === name);
+      if (!entry) {
+        const resolution = resolveWorkflowName(
+          name,
+          all.map((e) => ({ name: e.data.name, slug: path.basename(e.dir) })),
+        );
+        if (resolution.kind === 'exact' || resolution.kind === 'fuzzy') {
+          entry = all.find((w) => workflowNamesEqual(w.data.name, resolution.name));
+        } else if (resolution.kind === 'ambiguous') {
+          return textResult(
+            `"${name}" could mean: ${resolution.candidates.map((c) => `"${c}"`).join(', ')}. Ask the user which one, then call workflow_resource_proposals with that exact name.`,
+          );
+        }
+      }
+      if (!entry) {
+        const names = all.map((w) => `"${w.data.name}"`).join(', ');
+        return textResult(`Workflow "${name}" not found.${names ? ` Saved workflows: ${names}.` : ''}`);
+      }
+      const report = await buildWorkflowResourceBindingReportFromRuntime(entry.data);
+      return textResult(renderWorkflowResourceBindingReport(report), { maxChars: 40_000 });
+    },
+  );
+
+  server.tool(
     'workflow_run',
     'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon and reports its outcome back to this chat automatically on completion; you do not wait or poll. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing. '
       + 'You may pass the user\'s loose name (e.g. "prospecting flow"): if it is not an exact match the tool returns the CLOSEST workflow (or asks which of several) so you can confirm with the user — "Just to confirm, did you want me to kick off your <X> workflow? I\'ll report back once it\'s done." — then call again with that exact name. Only an exact name runs straight through.',
@@ -1380,6 +1551,16 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(error instanceof Error ? error.message : String(error));
       }
       const normalizedInputs = normalizeWorkflowRunInputs(parsedInputs);
+      const runCertification = certifyWorkflow(workflow.data, {
+        workflowSlug: workflow.name,
+        runInputs: normalizedInputs,
+      });
+      if (runCertification.resourceGaps.length > 0) {
+        return textResult(
+          `${renderWorkflowCertification(runCertification)}\n\n${renderWorkflowCertificationCommandHint(runCertification)}`,
+          { maxChars: 40_000 },
+        );
+      }
       const missing = missingWorkflowRunInputs(workflow.data, normalizedInputs);
       if (missing.length > 0) {
         // Ask-then-resume: in a chat context, surface a pending-inputs proposal
@@ -1527,6 +1708,16 @@ export function registerOrchestrationTools(server: McpServer): void {
       const inputsBlock = w.inputs && Object.keys(w.inputs).length > 0
         ? Object.entries(w.inputs).map(([k, meta]) => `  - ${k}: ${meta.type ?? 'string'}${meta.default !== undefined ? ` (default: ${meta.default})` : ''}${meta.description ? ` — ${meta.description}` : ''}`).join('\n')
         : '  (none)';
+      const resourcesBlock = w.resources && Object.keys(w.resources).length > 0
+        ? Object.values(w.resources).map((resource) => {
+          const surface = resource.toolkit ?? resource.tool ?? resource.cli ?? resource.mcpServer ?? '(unbound surface)';
+          const selector = resource.resourceId ?? resource.url ?? resource.name ?? resource.account ?? resource.connectionId
+            ?? (resource.scope ? JSON.stringify(resource.scope) : '(unbound selector)');
+          const label = resource.label ? ` — ${resource.label}` : '';
+          const required = resource.required === false ? ' (optional)' : '';
+          return `  - ${resource.id}: ${resource.kind}${label} via ${surface} -> ${selector}${required}`;
+        }).join('\n')
+        : '  (none)';
       const trigger = w.trigger.schedule ? `schedule: ${w.trigger.schedule}` : (w.trigger.manual ? 'manual only' : 'manual');
       const allowed = w.allowedTools && w.allowedTools.length > 0
         ? w.allowedTools.map((t) => (typeof t === 'string' ? t : `${t.name}${t.approval === 'required' ? ' (approval)' : ''}`)).join(', ')
@@ -1543,6 +1734,8 @@ export function registerOrchestrationTools(server: McpServer): void {
         w.project ? `Project: ${w.project}` : '',
         `Trigger: ${trigger}`,
         `Allowed tools: ${allowed}`,
+        `Resources:`,
+        resourcesBlock,
         `Steps (${w.steps.length}) — each shows its DATA sources + FULL prompt; the "<n>\\t" prefix is the line number, NOT part of the prompt (copy a VERBATIM snippet into workflow_edit_step):`,
         stepsBlock,
         `Inputs:`,
@@ -1626,7 +1819,8 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_update',
     'Modify an existing workflow: update description, trigger schedule, steps, inputs, or synthesis. Pass only the fields you want to change — others are preserved. Step IDs and dependencies are re-validated. '
-      + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT.',
+      + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. '
+      + 'For mechanical tool steps, declare `inputs` argument bindings plus `output`, or use `call` directly when the exact tool and args are known.',
     {
       name: z.string().min(1),
       description: z.string().optional(),
@@ -1646,10 +1840,15 @@ export function registerOrchestrationTools(server: McpServer): void {
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
         }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
+        deterministic: z.object({
+          runner: z.string().min(1).describe('Relative script path inside the workflow\'s scripts/ dir, e.g. "fetch-keywords.js". Extensions: .js/.mjs/.cjs/.ts/.py/.sh or a shebang executable.'),
+          source: z.string().optional().describe('The script\'s SOURCE CODE. When provided, I write it to scripts/<runner> at save time so the step runs immediately — this is how you WRITE CODE for a mechanical step. The script must print ONE JSON document to stdout. Reference inputs/upstream via argv or env you set in the step. Omit only to reuse a script already in scripts/.'),
+        }).optional().describe('DETERMINISTIC SCRIPT step — the agent writes CODE that runs in a sandbox with NO LLM turn (token-free, fast, repeatable every run). Use for mechanical work with a known procedure: shell/CLI, HTTP/API, or data transforms that do not need reasoning. Mutually exclusive with call and prompt.'),
         allowedTools: z.array(z.string()).optional(),
         requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
         approvalPreview: z.string().optional().describe('One-line preview shown on the approval card when requiresApproval is set.'),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
+        inputs: z.record(z.string(), WorkflowStepInputBindingSchema).optional().describe(STEP_INPUT_CONTRACT_DESC),
         output: WorkflowStepOutputContractSchema.optional().describe(STEP_OUTPUT_CONTRACT_DESC),
         sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class ('read' | 'write' | 'send'). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends."),
         loopUntil: WorkflowLoopUntilSchema.optional().describe(LOOP_UNTIL_DESC),
@@ -1664,6 +1863,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       trigger_events: z.array(WorkflowTriggerEventSchema).optional().describe('Replace the workflow event subscriptions. Pass [] or clear_trigger_events=true to remove existing event triggers.'),
       clear_trigger_events: z.boolean().optional().describe('Pass true to remove existing internal event trigger subscriptions.'),
       inputs: z.string().optional().describe('JSON object mapping input NAMES to {type?, default?, description?}, e.g. {"url":{"type":"string","description":"Site to audit"}}. Pass only to change the input schema; omit to preserve it.'),
+      resources: z.string().optional().describe('JSON object mapping durable resource IDs to bindings, e.g. {"ads_account":{"kind":"account","toolkit":"googleads","account":"123-456-7890"}}. Pass only to replace resource bindings; omit to preserve them.'),
+      clear_resources: z.boolean().optional().describe('Pass true to remove all workflow resource bindings.'),
       test_inputs: z.string().optional().describe('JSON object with concrete non-secret inputs for the re-verification smoke test when this update changes an enabled workflow, e.g. {"url":"https://example.com"}.'),
       synthesis_prompt: z.string().optional(),
       portable_models: z.boolean().optional().describe('Set true when this update should make the workflow portable across model providers by removing exact per-step model pins. Omit/false to preserve intentional model pins.'),
@@ -1675,10 +1876,16 @@ export function registerOrchestrationTools(server: McpServer): void {
       }).optional().describe('PINNED RUN GOAL (run-to-completion) — see workflow_create. Pass to set/replace; use clear_goal to remove.'),
       clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
     },
-    async ({ name, description, steps, project, clear_project, trigger_schedule, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
+    async ({ name, description, steps, project, clear_project, trigger_schedule, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
         inputsSchema = parseWorkflowInputsSchemaJson(inputs);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
+      let resourceBindings: Record<string, WorkflowResourceBinding>;
+      try {
+        resourceBindings = parseWorkflowResourcesJson(resources);
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
@@ -1689,6 +1896,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(error instanceof Error ? error.message : String(error));
       }
       const inputsProvided = Object.keys(inputsSchema).length > 0;
+      const resourcesProvided = resources !== undefined;
       const entry = listWorkflowFiles().find((w) => w.data.name === name);
       if (!entry) return textResult(`Workflow "${name}" not found.`);
 
@@ -1710,6 +1918,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updateRouteNotes = steps ? autoTagStepsWithModelRoleIntents(next.steps) : [];
       const updateBind = steps ? bindStepsToToolChoices(next.steps) : { boundNotes: [], advisories: [] };
       if (inputsProvided) next.inputs = inputsSchema;
+      if (clear_resources) delete next.resources;
+      else if (resourcesProvided) next.resources = Object.keys(resourceBindings).length > 0 ? resourceBindings : undefined;
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
       if (allowSends !== undefined) next.allowSends = allowSends;
       if (clear_goal) {
@@ -1734,6 +1944,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       // saves runnable.
       const updatePrep = prepareWorkflowUpdateForWrite(entry.data, next, {
         modelPortability: portable_models ? 'portable' : 'preserve',
+        codifyMechanicalSteps: Boolean(steps),
       });
       const savedNext = updatePrep.def;
       // P0-4: an ENABLED workflow must be valid — it runs on schedule. Auto-repair
@@ -1772,6 +1983,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         description !== undefined ? 'description' : '',
         steps ? 'steps' : '',
         inputsProvided ? 'inputs' : '',
+        resourcesProvided || clear_resources ? 'resources' : '',
         synthesis_prompt !== undefined ? 'synthesis' : '',
         portable_models ? 'model portability' : '',
         trigger_schedule !== undefined || clear_trigger_schedule ? 'schedule' : '',
@@ -1797,7 +2009,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       // Non-blocking authoring advisories (output-contract / forEach hints).
       // Update has never gated on validation; keep it that way — surface the
       // hints so the author can sharpen the workflow without blocking the save.
-      const updateBindNotes = [...updateRouteNotes, ...updateBind.boundNotes];
+      const updateBindNotes = [...updateRouteNotes, ...updateBind.boundNotes, ...updatePrep.codifyNotes];
       const updateBindReport = updateBindNotes.length > 0 ? `\n\n${updateBindNotes.join('\n')}` : '';
       const updateAdvisories = renderAuthoringAdvisories([
         ...updatePrep.repairs,

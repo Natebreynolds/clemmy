@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { WORKFLOWS_DIR } from './vault.js';
@@ -82,8 +82,16 @@ export interface WorkflowStepInput {
    * that don't need reasoning. Matches the Anthropic Skills scripts/
    * convention; OpenAI Skills + Agents SDK blog post calls this "tiny
    * CLIs that print deterministic stdout."
+   *
+   * `runner` is a relative script path inside the workflow's own scripts/
+   * dir. `source` is the script's SOURCE CODE at AUTHORING time: when
+   * present, writeWorkflow materializes it to `scripts/<runner>` and strips
+   * it from the persisted frontmatter (the on-disk step stays `{ runner }`,
+   * which is all the runtime reads). This is how the agent "writes code" for
+   * a mechanical step so a freshly-authored deterministic step can run
+   * immediately instead of pointing at a script that does not exist yet.
    */
-  deterministic?: { runner: string };
+  deterministic?: { runner: string; source?: string };
   /**
    * STRUCTURED TOOL CALL (CALL-1): a first-class, typed tool invocation the
    * runner executes DIRECTLY — no LLM turn. Use when the tool and its argument
@@ -101,6 +109,14 @@ export interface WorkflowStepInput {
    * blocked until per-call idempotency tracking is live-tested.
    */
   call?: WorkflowStepCall;
+  /**
+   * Set by codify-on-author when a mechanical LLM step was auto-converted to a
+   * `call` step. Preserves the original prompt/allowedTools so self-heal can
+   * "un-codify" (restore the model step) if the coded call trips its output
+   * contract or the goal checker. Transient authoring metadata — never a per-run
+   * input. Serialized as `codified_from`.
+   */
+  codifiedFrom?: { prompt: string; allowedTools?: string[] };
   /**
    * Per-step tool allowlist. Empty / unset = inherit the workflow's
    * top-level allowed-tools. Used by the runner to filter the tool
@@ -329,6 +345,54 @@ export type WorkflowAllowedTool =
   | string
   | { name: string; approval?: 'auto' | 'required' };
 
+export type WorkflowResourceKind =
+  | 'account'
+  | 'sheet'
+  | 'document'
+  | 'folder'
+  | 'channel'
+  | 'campaign'
+  | 'analytics_property'
+  | 'database'
+  | 'table'
+  | 'repository'
+  | 'calendar'
+  | 'email_account'
+  | 'webhook'
+  | 'api'
+  | 'cli'
+  | 'project'
+  | 'other';
+
+/**
+ * Durable source/account/object binding. These are NOT run inputs: a workflow
+ * should bind a Google Sheet, Ads account, Slack channel, CRM pipeline, Drive
+ * folder, CLI command, etc. once, then run unattended against that binding.
+ */
+export interface WorkflowResourceBinding {
+  /** Stable local id used by prompts/steps, e.g. "lead_sheet" or "ads_account". */
+  id: string;
+  kind: WorkflowResourceKind;
+  label?: string;
+  description?: string;
+  /** Connector/tool surface that owns the resource, e.g. googlesheets, googleads, sf. */
+  toolkit?: string;
+  tool?: string;
+  cli?: string;
+  mcpServer?: string;
+  /** Optional account/connection selector. Avoid secrets; store references only. */
+  connectionId?: string;
+  account?: string;
+  /** Bound object selector: spreadsheet id, folder id, campaign id, repo slug, etc. */
+  resourceId?: string;
+  url?: string;
+  name?: string;
+  scope?: Record<string, unknown>;
+  cursor?: Record<string, unknown>;
+  trigger?: Record<string, unknown>;
+  required?: boolean;
+}
+
 export interface WorkflowDefinition {
   /** kebab-case identifier. Must match the directory name. */
   name: string;
@@ -344,6 +408,8 @@ export interface WorkflowDefinition {
   trigger: WorkflowTrigger;
   /** Tool surface this workflow may reach for. Filtered into Agent.run() per step. */
   allowedTools?: WorkflowAllowedTool[];
+  /** Bound external/local resources used by the workflow. Not per-run inputs. */
+  resources?: Record<string, WorkflowResourceBinding>;
   steps: WorkflowStepInput[];
   inputs?: Record<string, WorkflowInputDef>;
   synthesis?: WorkflowSynthesis;
@@ -406,6 +472,71 @@ function parseAllowedTools(raw: unknown): WorkflowAllowedTool[] | undefined {
     }
   }
   return out.length > 0 ? out : undefined;
+}
+
+const WORKFLOW_RESOURCE_KINDS = new Set<WorkflowResourceKind>([
+  'account',
+  'sheet',
+  'document',
+  'folder',
+  'channel',
+  'campaign',
+  'analytics_property',
+  'database',
+  'table',
+  'repository',
+  'calendar',
+  'email_account',
+  'webhook',
+  'api',
+  'cli',
+  'project',
+  'other',
+]);
+
+function cleanResourceString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function cleanResourceObject(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function parseWorkflowResources(raw: unknown): Record<string, WorkflowResourceBinding> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, WorkflowResourceBinding> = {};
+  for (const [rawId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const rec = value as Record<string, unknown>;
+    const id = cleanResourceString(rec.id) ?? rawId.trim();
+    if (!id) continue;
+    const rawKind = cleanResourceString(rec.kind) ?? 'other';
+    const kind = WORKFLOW_RESOURCE_KINDS.has(rawKind as WorkflowResourceKind)
+      ? rawKind as WorkflowResourceKind
+      : 'other';
+    out[id] = {
+      id,
+      kind,
+      ...(cleanResourceString(rec.label) ? { label: cleanResourceString(rec.label) } : {}),
+      ...(cleanResourceString(rec.description) ? { description: cleanResourceString(rec.description) } : {}),
+      ...(cleanResourceString(rec.toolkit) ? { toolkit: cleanResourceString(rec.toolkit) } : {}),
+      ...(cleanResourceString(rec.tool) ? { tool: cleanResourceString(rec.tool) } : {}),
+      ...(cleanResourceString(rec.cli) ? { cli: cleanResourceString(rec.cli) } : {}),
+      ...(cleanResourceString(rec.mcpServer ?? rec.mcp_server) ? { mcpServer: cleanResourceString(rec.mcpServer ?? rec.mcp_server) } : {}),
+      ...(cleanResourceString(rec.connectionId ?? rec.connection_id) ? { connectionId: cleanResourceString(rec.connectionId ?? rec.connection_id) } : {}),
+      ...(cleanResourceString(rec.account) ? { account: cleanResourceString(rec.account) } : {}),
+      ...(cleanResourceString(rec.resourceId ?? rec.resource_id) ? { resourceId: cleanResourceString(rec.resourceId ?? rec.resource_id) } : {}),
+      ...(cleanResourceString(rec.url) ? { url: cleanResourceString(rec.url) } : {}),
+      ...(cleanResourceString(rec.name) ? { name: cleanResourceString(rec.name) } : {}),
+      ...(cleanResourceObject(rec.scope) ? { scope: cleanResourceObject(rec.scope) } : {}),
+      ...(cleanResourceObject(rec.cursor) ? { cursor: cleanResourceObject(rec.cursor) } : {}),
+      ...(cleanResourceObject(rec.trigger) ? { trigger: cleanResourceObject(rec.trigger) } : {}),
+      ...(typeof rec.required === 'boolean' ? { required: rec.required } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -521,6 +652,15 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
           };
         }
       }
+      // codify-on-author reversibility marker (accept snake_case or camelCase).
+      const codifiedFromRaw = (step.codified_from ?? step.codifiedFrom) as Record<string, unknown> | undefined;
+      if (codifiedFromRaw && typeof codifiedFromRaw.prompt === 'string') {
+        const ct = parseAllowedTools(codifiedFromRaw.allowedTools);
+        result.codifiedFrom = {
+          prompt: codifiedFromRaw.prompt,
+          ...(ct ? { allowedTools: ct.map((t) => (typeof t === 'string' ? t : t.name)) } : {}),
+        };
+      }
       const stepAllowed = parseAllowedTools(step.allowedTools);
       if (stepAllowed) result.allowedTools = stepAllowed.map((t) => (typeof t === 'string' ? t : t.name));
       // Accept either `uses_skill` (yaml-idiomatic snake_case, what the
@@ -607,6 +747,7 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       whenToUse: typeof data.when_to_use === 'string' ? data.when_to_use : typeof data.whenToUse === 'string' ? data.whenToUse : undefined,
       trigger: typeof data.trigger === 'object' && data.trigger ? data.trigger as WorkflowTrigger : { manual: true },
       allowedTools: parseAllowedTools(data.allowed_tools ?? data.allowedTools),
+      resources: parseWorkflowResources(data.resources),
       steps,
       inputs: typeof data.inputs === 'object' && data.inputs ? data.inputs as WorkflowDefinition['inputs'] : undefined,
       synthesis: typeof data.synthesis === 'object' && data.synthesis ? data.synthesis as WorkflowSynthesis : undefined,
@@ -676,6 +817,36 @@ export function migrateLegacyWorkflowsOnce(): string[] {
  * are written to the body under `## step: <id>` anchors so they're
  * human-editable as prose. Frontmatter holds typed config only.
  */
+/**
+ * Materialize an authored deterministic step's inline `source` into the
+ * workflow's scripts/ dir so a freshly-created `deterministic.runner` step can
+ * execute immediately instead of pointing at a script that does not exist yet.
+ * Enforces the SAME containment rule the runtime runner uses (relative path, no
+ * '..', stays inside scripts/); the sandbox owns execution safety — this only
+ * writes the file the author already declared. See resolveDeterministicRunner.
+ */
+function materializeWorkflowStepScript(dirPath: string, runner: string, source: string): void {
+  const raw = runner.trim();
+  if (!raw || /\s/.test(raw)) {
+    throw new Error(`deterministic runner must be a single script path under scripts/: "${runner}"`);
+  }
+  if (path.isAbsolute(raw) || raw.split(/[\\/]/).includes('..')) {
+    throw new Error(`deterministic runner must stay inside the workflow scripts/ dir: "${runner}"`);
+  }
+  const scriptsDir = path.resolve(dirPath, 'scripts');
+  const rel = raw.startsWith('scripts/') || raw.startsWith('scripts\\') ? raw : path.join('scripts', raw);
+  const target = path.resolve(dirPath, rel);
+  if (target !== scriptsDir && !target.startsWith(`${scriptsDir}${path.sep}`)) {
+    throw new Error(`deterministic runner resolved outside scripts/: "${runner}"`);
+  }
+  mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+  // +x for shebang/executable runners; harmless for interpreted (.js/.py/.sh
+  // launch via their interpreter). Best-effort — a read-only FS shouldn't fail
+  // the whole workflow write.
+  try { chmodSync(target, 0o755); } catch { /* best-effort */ }
+}
+
 function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   if (!existsSync(dirPath)) mkdirSync(dirPath, { recursive: true });
   const frontmatter: Record<string, unknown> = {
@@ -686,6 +857,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   if (def.whenToUse) frontmatter.when_to_use = def.whenToUse;
   if (def.project) frontmatter.project = def.project;
   if (def.allowedTools && def.allowedTools.length > 0) frontmatter.allowed_tools = def.allowedTools;
+  if (def.resources && Object.keys(def.resources).length > 0) frontmatter.resources = def.resources;
   if (def.trigger) frontmatter.trigger = def.trigger;
   // Steps go in frontmatter for typed config (id, deps, model, forEach,
   // deterministic, allowedTools) but the PROMPT lives in the body so
@@ -702,8 +874,20 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.maxTurns !== undefined) out.maxTurns = s.maxTurns;
       if (s.forEach) out.forEach = s.forEach;
       if (s.forEachNewOnly) out.forEachNewOnly = true;
-      if (s.deterministic) out.deterministic = s.deterministic;
+      if (s.deterministic) {
+        // Authoring may carry the script's inline `source`. Materialize it into
+        // scripts/<runner> so a freshly-authored deterministic step can run, and
+        // persist only { runner } — the runtime never reads inline source.
+        const { runner, source } = s.deterministic;
+        if (typeof source === 'string' && source.trim().length > 0) {
+          materializeWorkflowStepScript(dirPath, runner, source);
+        }
+        out.deterministic = { runner };
+      }
       if (s.call?.tool) out.call = { tool: s.call.tool, ...(s.call.args ? { args: s.call.args } : {}) };
+      if (s.codifiedFrom?.prompt) {
+        out.codified_from = { prompt: s.codifiedFrom.prompt, ...(s.codifiedFrom.allowedTools ? { allowedTools: s.codifiedFrom.allowedTools } : {}) };
+      }
       if (s.allowedTools && s.allowedTools.length > 0) out.allowedTools = s.allowedTools;
       if (s.usesSkill) out.uses_skill = s.usesSkill;
       if (s.requiresApproval) out.requires_approval = true;

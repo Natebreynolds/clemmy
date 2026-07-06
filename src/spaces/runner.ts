@@ -196,9 +196,10 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
 
   current._meta = meta;
   const write = writeData(slug, current);
-  if (write.ok) spaceStore.update(slug, { lastRefreshedAt: new Date().toISOString() });
+  const okCount = results.filter((r) => r.ok).length;
+  if (write.ok && okCount > 0) spaceStore.update(slug, { lastRefreshedAt: new Date().toISOString() });
   for (const r of results) r.write = write;
-  const failedCount = results.filter((r) => !r.ok).length;
+  const failedCount = results.length - okCount;
   recordOperationalEvent({
     source: 'workspace',
     type: failedCount > 0 ? 'workspace_data_refresh_failed' : 'workspace_data_refresh_completed',

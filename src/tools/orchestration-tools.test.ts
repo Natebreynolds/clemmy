@@ -3,7 +3,7 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -23,9 +23,11 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }> };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
 
 const handlers = new Map<string, ToolHandler>();
+const schemas = new Map<string, Record<string, { parse?: (value: unknown) => unknown }>>();
 registerOrchestrationTools({
   tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
     handlers.set(name, handler);
+    schemas.set(name, _schema as Record<string, { parse?: (value: unknown) => unknown }>);
   },
 } as never);
 
@@ -52,6 +54,12 @@ function workflowUpdate(): ToolHandler {
   return handler;
 }
 
+function workflowGet(): ToolHandler {
+  const handler = handlers.get('workflow_get');
+  assert.ok(handler, 'workflow_get registered');
+  return handler;
+}
+
 function workflowApplyContractFixes(): ToolHandler {
   const handler = handlers.get('workflow_apply_contract_fixes');
   assert.ok(handler, 'workflow_apply_contract_fixes registered');
@@ -64,6 +72,18 @@ function workflowSetEnabled(): ToolHandler {
   return handler;
 }
 
+function workflowCertify(): ToolHandler {
+  const handler = handlers.get('workflow_certify');
+  assert.ok(handler, 'workflow_certify registered');
+  return handler;
+}
+
+function workflowResourceProposals(): ToolHandler {
+  const handler = handlers.get('workflow_resource_proposals');
+  assert.ok(handler, 'workflow_resource_proposals registered');
+  return handler;
+}
+
 function workflowContractProposals(): ToolHandler {
   const handler = handlers.get('workflow_contract_proposals');
   assert.ok(handler, 'workflow_contract_proposals registered');
@@ -72,6 +92,12 @@ function workflowContractProposals(): ToolHandler {
 
 function resultText(result: ToolResult): string {
   return result.content.map((item) => item.text).join('\n');
+}
+
+function workflowRunFiles(): string[] {
+  return existsSync(WORKFLOW_RUNS_DIR)
+    ? readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))
+    : [];
 }
 
 function withEnv(over: Record<string, string | undefined>, fn: () => Promise<void> | void): Promise<void> | void {
@@ -177,6 +203,126 @@ test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it'
   const entry = readWorkflow('audit-wf');
   assert.ok(entry, 'workflow persisted');
   assert.deepEqual(entry!.data.inputs, { url: { type: 'string', description: 'Site to audit' } });
+});
+
+test('workflow_create/update tool schemas accept step input contracts for codification', () => {
+  const step = {
+    id: 'pull',
+    prompt: 'Fetch the domain rank overview.',
+    allowedTools: ['dataforseo_domain_rank_overview'],
+    inputs: { target: { from: 'input.domain', type: 'string' } },
+    output: { type: 'object', required_keys: ['metrics'] },
+    sideEffect: 'read',
+  };
+
+  const createSchema = schemas.get('workflow_create');
+  const updateSchema = schemas.get('workflow_update');
+  assert.ok(createSchema?.steps?.parse, 'workflow_create steps schema registered');
+  assert.ok(updateSchema?.steps?.parse, 'workflow_update steps schema registered');
+  assert.doesNotThrow(() => createSchema.steps.parse([step]));
+  assert.doesNotThrow(() => updateSchema.steps.parse([step]));
+});
+
+test('workflow_create saves authored step input contracts as direct call nodes when codifiable', async () => {
+  const result = await workflowCreate()({
+    name: 'codified-create-flow',
+    description: 'Pull domain rank metrics with a direct tool call.',
+    steps: [{
+      id: 'pull',
+      prompt: 'Fetch the domain rank overview.',
+      allowedTools: ['dataforseo_domain_rank_overview'],
+      inputs: { target: { from: 'input.domain', type: 'string' } },
+      output: { type: 'object', required_keys: ['metrics'] },
+      sideEffect: 'read',
+    }],
+    inputs: JSON.stringify({ domain: { type: 'string', description: 'Target domain' } }),
+  });
+
+  assert.match(resultText(result), /Created workflow "codified-create-flow"/);
+  const saved = readWorkflow('codified-create-flow')!.data.steps[0];
+  assert.equal(saved.call?.tool, 'dataforseo_domain_rank_overview');
+  assert.deepEqual(saved.call?.args, { target: '{{input.domain}}' });
+  assert.equal(saved.codifiedFrom?.prompt, 'Fetch the domain rank overview.');
+});
+
+test('workflow_create accepts durable resources separately from run inputs and workflow_get surfaces them', async () => {
+  const resources = {
+    lead_sheet: {
+      kind: 'sheet',
+      label: 'Lead sheet',
+      toolkit: 'googlesheets',
+      resourceId: 'sheet-123',
+      name: 'Daily leads',
+    },
+  };
+  const result = await workflowCreate()({
+    name: 'resource-wf',
+    description: 'Summarize a bound lead sheet.',
+    steps: [{ id: 'summarize', prompt: 'Summarize the bound lead sheet.', sideEffect: 'read' }],
+    resources: JSON.stringify(resources),
+  });
+  assert.match(resultText(result), /Created workflow "resource-wf"/);
+
+  const entry = readWorkflow('resource-wf');
+  assert.ok(entry, 'workflow persisted');
+  assert.equal(entry!.data.resources?.lead_sheet.resourceId, 'sheet-123');
+  assert.equal(entry!.data.resources?.lead_sheet.toolkit, 'googlesheets');
+  assert.equal(entry!.data.inputs, undefined);
+
+  const text = resultText(await workflowGet()({ name: 'resource-wf' }));
+  assert.match(text, /Resources:/);
+  assert.match(text, /lead_sheet: sheet/);
+  assert.match(text, /googlesheets -> sheet-123/);
+  assert.match(text, /Inputs:\n  \(none\)/);
+});
+
+test('workflow_run rejects incomplete required resource bindings without queueing', async () => {
+  writeWorkflow('resource-gap-wf', {
+    name: 'resource-gap-wf',
+    description: 'Summarize a bound lead sheet.',
+    enabled: true,
+    trigger: { manual: true },
+    resources: {
+      lead_sheet: {
+        id: 'lead_sheet',
+        kind: 'sheet',
+        label: 'Lead sheet',
+        toolkit: 'googlesheets',
+      },
+    },
+    steps: [{ id: 'summarize', prompt: 'Summarize the bound lead sheet.', sideEffect: 'read' }],
+  });
+
+  const text = resultText(await workflowRun()({ name: 'resource-gap-wf', inputs: '{}' }));
+
+  assert.match(text, /Workflow certification: NEEDS RESOURCE BINDING/);
+  assert.match(text, /Lead sheet: bind a concrete spreadsheet/);
+  assert.match(text, /Next command: workflow_update name="resource-gap-wf" resources=/);
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
+test('workflow_resource_proposals reports binding next actions for durable resources', async () => {
+  writeWorkflow('resource-proposal-wf', {
+    name: 'resource-proposal-wf',
+    description: 'Summarize a lead sheet.',
+    enabled: false,
+    trigger: { manual: true },
+    resources: {
+      lead_sheet: {
+        id: 'lead_sheet',
+        kind: 'sheet',
+        label: 'Lead sheet',
+      },
+    },
+    steps: [{ id: 'summarize', prompt: 'Summarize the bound lead sheet.', sideEffect: 'read' }],
+  });
+
+  const text = resultText(await workflowResourceProposals()({ name: 'resource-proposal-wf' }));
+
+  assert.match(text, /Workflow resource binding: resource-proposal-wf/);
+  assert.match(text, /Lead sheet \(sheet\) — needs_surface/);
+  assert.match(text, /Recommended: Google Sheets/);
+  assert.match(text, /Next: workflow_update name=<workflow> resources=/);
 });
 
 test('workflow_create syncs event triggers immediately after saving', async () => {
@@ -695,6 +841,69 @@ test('workflow lifecycle routes create/update/enable/run through shared workflow
   );
 });
 
+test('workflow_certify gives one-door next action for creation-test input gaps', async () => {
+  writeWorkflow('certify-inputs-wf', {
+    name: 'certify-inputs-wf',
+    description: 'Inspect a website.',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: { url: { type: 'string', description: 'URL to inspect' } },
+    steps: [{ id: 'fetch', prompt: 'Fetch the website data for {{input.url}}.', allowedTools: ['web_search'] }],
+  });
+
+  const result = await workflowCertify()({ name: 'certify-inputs-wf' });
+  const text = resultText(result);
+
+  assert.match(text, /Workflow certification: NEEDS CREATION INPUTS/);
+  assert.match(text, /Missing creation-test inputs:\n- url/);
+  assert.match(text, /Next command: workflow_certify name="certify-inputs-wf" test_inputs=/);
+  assert.equal(readWorkflow('certify-inputs-wf')!.data.enabled, false);
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
+test('workflow_certify points creation-test-ready drafts at workflow_set_enabled', async () => {
+  writeWorkflow('certify-test-wf', {
+    name: 'certify-test-wf',
+    description: 'Inspect a website.',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: { url: { type: 'string', description: 'URL to inspect' } },
+    steps: [{ id: 'fetch', prompt: 'Fetch the website data for {{input.url}}.', allowedTools: ['web_search'] }],
+  });
+
+  const result = await workflowCertify()({
+    name: 'certify-test-wf',
+    test_inputs: JSON.stringify({ url: 'https://example.com' }),
+  });
+  const text = resultText(result);
+
+  assert.match(text, /Workflow certification: NEEDS CREATION TEST/);
+  assert.match(text, /Can start creation test: yes/);
+  assert.match(text, /Next command: workflow_set_enabled name="certify-test-wf" enabled=true test_inputs=/);
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
+test('workflow_certify points live workflows with inputs at workflow_run', async () => {
+  writeWorkflow('certify-run-wf', {
+    name: 'certify-run-wf',
+    description: 'Draft lead note.',
+    enabled: true,
+    trigger: { manual: true },
+    inputs: { leadId: { type: 'string', description: 'Lead id' } },
+    steps: [{ id: 'draft', prompt: 'Draft an internal note for {{input.leadId}}.' }],
+  });
+
+  const result = await workflowCertify()({
+    name: 'certify-run-wf',
+    inputs: JSON.stringify({ leadId: 'L-1' }),
+  });
+  const text = resultText(result);
+
+  assert.match(text, /Workflow certification: READY TO RUN/);
+  assert.match(text, /Can run now: yes/);
+  assert.match(text, /Next command: workflow_run name="certify-run-wf"/);
+});
+
 test('workflow_update can add an output contract to an existing step', async () => {
   await workflowCreate()({
     name: 'upc-wf',
@@ -1146,12 +1355,6 @@ test('bindDiscussedToolkitsIntoSteps: idempotent (a second pass does not double-
 });
 
 // ─── Wave 1.3: workflow_get surfaces a deterministic step's RUNNER provenance ──
-
-function workflowGet(): ToolHandler {
-  const handler = handlers.get('workflow_get');
-  assert.ok(handler, 'workflow_get registered');
-  return handler;
-}
 
 test('workflow_get reads a deterministic step\'s runner SOURCE and surfaces what it reaches (Salesforce, not guessed)', async () => {
   resetState();

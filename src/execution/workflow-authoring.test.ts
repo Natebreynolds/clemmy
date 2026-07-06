@@ -99,14 +99,64 @@ test('shared step normalization and graph validation preserve execution fields',
     forEach: 'pull',
     forEachNewOnly: true,
     call: { tool: 'GMAIL_SEND_EMAIL', args: { to: '{{item.email}}' } },
+    codifiedFrom: { prompt: 'Send adaptively.', allowedTools: ['GMAIL_SEND_EMAIL'] },
     loopUntil: { maxAttempts: 2, probe: { runner: 'check-send.mjs' }, until: { type: 'object', required_keys: ['done'] } },
     loopSafe: true,
   }]);
   assert.equal(steps[0].prompt, '');
   assert.equal(steps[0].project, 'clementine-next');
   assert.deepEqual(steps[0].call, { tool: 'GMAIL_SEND_EMAIL', args: { to: '{{item.email}}' } });
+  assert.deepEqual(steps[0].codifiedFrom, { prompt: 'Send adaptively.', allowedTools: ['GMAIL_SEND_EMAIL'] });
   assert.equal(steps[0].forEachNewOnly, true);
   assert.match(validateWorkflowStepGraph(steps) ?? '', /depends on unknown step "pull"/);
+});
+
+test('prepareWorkflowCreateForWrite codifies eligible mechanical steps through the shared path', () => {
+  const prepared = prepareWorkflowCreateForWrite({
+    name: 'codify-create-wf',
+    description: 'Codify create test.',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: { domain: { type: 'string' } },
+    steps: [{
+      id: 'pull',
+      prompt: 'Fetch the domain rank overview.',
+      allowedTools: ['dataforseo_domain_rank_overview'],
+      inputs: { target: { from: 'input.domain' } },
+      output: { type: 'object', required_keys: ['metrics'] },
+      sideEffect: 'read',
+    }],
+  });
+  assert.equal(prepared.def.steps[0].call?.tool, 'dataforseo_domain_rank_overview');
+  assert.deepEqual(prepared.def.steps[0].call?.args, { target: '{{input.domain}}' });
+  assert.equal(prepared.def.steps[0].codifiedFrom?.prompt, 'Fetch the domain rank overview.');
+  assert.equal(prepared.codifyNotes.length, 1);
+});
+
+test('prepareWorkflowUpdateForWrite codifies edited steps only when requested', () => {
+  const before = {
+    name: 'codify-update-wf',
+    description: 'Codify update test.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{ id: 'draft', prompt: 'Draft.' }],
+  };
+  const next = {
+    ...before,
+    inputs: { id: { type: 'string' as const } },
+    steps: [{
+      id: 'fetch',
+      prompt: 'Get the report.',
+      allowedTools: ['reporter_fetch'],
+      inputs: { id: { from: 'input.id' } },
+      output: { type: 'object' as const },
+      sideEffect: 'read' as const,
+    }],
+  };
+  assert.equal(prepareWorkflowUpdateForWrite(before, next).def.steps[0].call, undefined);
+  const prepared = prepareWorkflowUpdateForWrite(before, next, { codifyMechanicalSteps: true });
+  assert.equal(prepared.def.steps[0].call?.tool, 'reporter_fetch');
+  assert.equal(prepared.codifyNotes.length, 1);
 });
 
 test('portable model normalization strips exact pins but preserves intent/default routing', () => {

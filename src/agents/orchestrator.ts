@@ -23,6 +23,7 @@ import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
+import { detectMultiItemIntent } from '../runtime/harness/context-packet.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import type { Tool } from '@openai/agents';
@@ -693,6 +694,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const codeModeMandate = codeModeMandateDirective({
     mcpServersInScope: mcpToolScope.allowedServerSlugs?.length ?? 0,
     allowAllMcp: !!mcpToolScope.allowAll,
+    fanoutPreferred: options.allowToolJit === true
+      && typeof options.userInput === 'string'
+      && detectMultiItemIntent(options.userInput).isMultiItem,
   });
   if (options.sessionId) {
     try {
@@ -792,6 +796,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const input = params as WorkerToolInput;
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
+      const workerModel = route.model ?? resolveRoleModel('worker').modelId;
+      const workerProvider = resolveProvider(workerModel);
       // P6: throttle concurrent worker fan-out per session so N parallel run_worker
       // calls can't open N provider calls at once and storm a rate limit. Bounds BOTH
       // worker lanes (this wraps before the route branch). Released in the finally.
@@ -807,7 +813,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             payload: { item: input.item, lane: 'orchestrator', ...info },
           });
         } catch { /* telemetry is best-effort */ }
-      });
+      }, { modelId: workerModel, provider: workerProvider });
       try {
       try {
         recordOperationalEvent({
@@ -815,12 +821,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           type: 'worker_spawned',
           sessionId: sessionId ?? undefined,
           actor: 'run_worker',
-          payload: { item: input.item, model: route.model ?? resolveRoleModel('worker').modelId, lane: 'orchestrator' },
+          payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'orchestrator' },
         });
       } catch { /* telemetry is best-effort */ }
       const turn = extractTurn(runContext);
       const toolCallId = details?.toolCall?.callId ?? null;
-      const workerModel = route.model ?? resolveRoleModel('worker').modelId;
       const appendWorkerRoute = (data: Record<string, unknown>) => {
         if (!sessionId) return;
         try {

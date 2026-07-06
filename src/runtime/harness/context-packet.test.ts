@@ -105,9 +105,17 @@ test('detectMultiItemIntent uses size-aware boundaries (soft < 8, imperative >= 
   const small = detectMultiItemIntent('Draft outreach emails for these 4 prospects.');
   assert.equal(small.isMultiItem, true);
   assert.equal(small.itemCount, 4);
+  assert.equal(small.explicitParallelRequest, false);
   const large = detectMultiItemIntent('Draft outreach emails for these 12 prospects.');
   assert.equal(large.isMultiItem, true);
   assert.equal(large.itemCount, 12);
+});
+
+test('detectMultiItemIntent marks explicit parallel/same-shape requests', () => {
+  const r = detectMultiItemIntent('For each of these 5 firms, parallelize the same-shape SEO snapshot work.');
+  assert.equal(r.isMultiItem, true);
+  assert.equal(r.itemCount, 5);
+  assert.equal(r.explicitParallelRequest, true);
 });
 
 test('detectMultiItemIntent FIRES despite an incidental aggregate verb when per-item work is present (live 2026-06-02 regression)', () => {
@@ -228,6 +236,20 @@ test('packet uses the SOFT hint for 3<=N<8 (no imperative, no workflow clause)',
   assert.match(packet.text, /parallel waves of up to 4/);
   assert.ok(!/Do NOT serialize/.test(packet.text), 'small-N must not be imperative');
   assert.ok(!/save it as a forEach workflow/.test(packet.text), 'small-N must not offer a workflow');
+});
+
+test('packet makes small-N fan-out imperative when the user explicitly asks for parallel same-shape work', () => {
+  const packet = buildAgentContextPacket(
+    'For EACH of these 5 fictional firms, produce the same-shape SEO snapshot and parallelize it.',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'sess-chat-explicit-parallel' },
+  );
+  assert.equal(packet.multiItem.offered, true);
+  assert.equal(packet.multiItem.itemCount, 5);
+  assert.match(packet.text, /Fan-out directive: this turn names 5 independent same-shape/);
+  assert.match(packet.text, /Do NOT serialize/);
+  assert.match(packet.text, /do not collapse this into one aggregate program or one inline batch/);
+  assert.ok(!/save it as a forEach workflow/.test(packet.text), 'explicit small-N fan-out does not imply workflow offer');
 });
 
 test('packet blocks fan-out directive when coordination policy is in repair mode', () => {

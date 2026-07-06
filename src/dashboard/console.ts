@@ -17745,6 +17745,7 @@ const CONSOLE_JS = `
         return step;
       }) : [],
       inputs: data.inputs || {},
+      resources: data.resources || {},
       synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
       goal: data.goal || null,
       allowedTools: data.allowedTools || null,
@@ -17797,6 +17798,7 @@ const CONSOLE_JS = `
         },
       ],
       inputs: { topic: '' },
+      resources: {},
       synthesisPrompt: 'Return the draft from the previous step, formatted clearly. No preamble.',
       goal: null,
       graph: null,
@@ -18485,6 +18487,7 @@ const CONSOLE_JS = `
       project: body.project || '',
       steps: Array.isArray(body.steps) ? body.steps : wfDraft.steps,
       inputs: body.inputs || wfDraft.inputs || {},
+      resources: body.resources || wfDraft.resources || {},
       synthesisPrompt: body.synthesis && body.synthesis.prompt ? body.synthesis.prompt : wfDraft.synthesisPrompt,
       goal: body.goal || null,
       proof: body.proof || wfDraft.proof || null,
@@ -21206,9 +21209,10 @@ const CONSOLE_JS = `
             enabled: wfDraft.enabled,
 	            triggerSchedule: wfDraft.triggerSchedule || undefined,
 	            steps: wfDraft.steps,
-	            synthesisPrompt: wfDraft.synthesisPrompt || undefined,
+            synthesisPrompt: wfDraft.synthesisPrompt || undefined,
             goal: goalPayload || undefined,
 	            inputs: wfDraft.inputs,
+            resources: wfDraft.resources || undefined,
 	          }),
 	        });
         if (!r.ok) {
@@ -21232,6 +21236,7 @@ const CONSOLE_JS = `
             goal: goalPayload || undefined,
             clearGoal: !goalPayload,
 	            inputs: wfDraft.inputs,
+            resources: wfDraft.resources || undefined,
 	          }),
 	        });
         if (!r.ok) {
@@ -21810,7 +21815,77 @@ const CONSOLE_JS = `
     const warnings = [];
     const base = currentDraft || {
       name: 'new-workflow', description: '', project: '', enabled: false,
-      triggerSchedule: '', steps: [], inputs: {}, synthesisPrompt: '', goal: null,
+      triggerSchedule: '', steps: [], inputs: {}, resources: {}, synthesisPrompt: '', goal: null,
+    };
+    const cloneValue = (value) => {
+      if (value === undefined) return undefined;
+      if (value === null) return null;
+      try { return JSON.parse(JSON.stringify(value)); } catch (_) { return value; }
+    };
+    const objectOrNull = (value) => value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    const stringOrNull = (value) => typeof value === 'string' ? value.trim() : null;
+    const copyStringField = (target, source, outKey, keys, allowClear) => {
+      for (const key of keys) {
+        if (!(key in source)) continue;
+        const value = source[key];
+        if ((value === null || value === '') && allowClear) delete target[outKey];
+        else {
+          const text = stringOrNull(value);
+          if (text) target[outKey] = text;
+        }
+        return;
+      }
+    };
+    const copyBooleanField = (target, source, outKey, keys, allowClear) => {
+      for (const key of keys) {
+        if (!(key in source)) continue;
+        const value = source[key];
+        if (typeof value === 'boolean') target[outKey] = value;
+        else if (value === null && allowClear) delete target[outKey];
+        return;
+      }
+    };
+    const copyObjectField = (target, source, outKey, keys, allowClear) => {
+      for (const key of keys) {
+        if (!(key in source)) continue;
+        const value = source[key];
+        if (value === null && allowClear) delete target[outKey];
+        else if (objectOrNull(value)) target[outKey] = cloneValue(value);
+        return;
+      }
+    };
+    const applyRichStepFields = (target, source, allowClear) => {
+      if (!source || typeof source !== 'object') return;
+      const allowedTools = Array.isArray(source.allowed_tools) ? source.allowed_tools
+        : Array.isArray(source.allowedTools) ? source.allowedTools : null;
+      if (allowedTools) {
+        target.allowedTools = allowedTools.filter((tool) => typeof tool === 'string' && tool.trim()).map((tool) => tool.trim());
+      } else if (allowClear && ('allowed_tools' in source || 'allowedTools' in source) && (source.allowed_tools === null || source.allowedTools === null)) {
+        delete target.allowedTools;
+      }
+      copyStringField(target, source, 'project', ['project'], allowClear);
+      copyStringField(target, source, 'model', ['model'], allowClear);
+      copyStringField(target, source, 'intent', ['intent'], allowClear);
+      copyStringField(target, source, 'forEach', ['forEach', 'for_each'], allowClear);
+      copyStringField(target, source, 'usesSkill', ['usesSkill', 'uses_skill'], allowClear);
+      copyStringField(target, source, 'approvalPreview', ['approvalPreview', 'approval_preview'], allowClear);
+      if ('sideEffect' in source || 'side_effect' in source) {
+        const raw = source.sideEffect !== undefined ? source.sideEffect : source.side_effect;
+        if (raw === null && allowClear) delete target.sideEffect;
+        else if (raw === 'read' || raw === 'write' || raw === 'send') target.sideEffect = raw;
+      }
+      if (typeof source.tier === 'number') target.tier = source.tier;
+      else if (source.tier === null && allowClear) delete target.tier;
+      if (typeof source.maxTurns === 'number') target.maxTurns = source.maxTurns;
+      else if (source.maxTurns === null && allowClear) delete target.maxTurns;
+      copyBooleanField(target, source, 'forEachNewOnly', ['forEachNewOnly', 'for_each_new_only'], allowClear);
+      copyBooleanField(target, source, 'requiresApproval', ['requiresApproval', 'requires_approval'], allowClear);
+      copyBooleanField(target, source, 'loopSafe', ['loopSafe', 'loop_safe'], allowClear);
+      copyObjectField(target, source, 'call', ['call'], allowClear);
+      copyObjectField(target, source, 'deterministic', ['deterministic'], allowClear);
+      copyObjectField(target, source, 'inputs', ['inputs'], allowClear);
+      copyObjectField(target, source, 'output', ['output'], allowClear);
+      copyObjectField(target, source, 'loopUntil', ['loopUntil', 'loop_until'], allowClear);
     };
     // Deep-ish clone — steps + inputs are the parts that get mutated.
     const draft = {
@@ -21819,8 +21894,14 @@ const CONSOLE_JS = `
         ...s,
         dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn.slice() : [],
         allowedTools: Array.isArray(s.allowedTools) ? s.allowedTools.slice() : s.allowedTools,
+        call: cloneValue(s.call),
+        deterministic: cloneValue(s.deterministic),
+        inputs: cloneValue(s.inputs),
+        output: cloneValue(s.output),
+        loopUntil: cloneValue(s.loopUntil),
       })),
       inputs: { ...(base.inputs || {}) },
+      resources: cloneValue(base.resources || {}),
     };
     const findStepIndex = (id) => draft.steps.findIndex((s) => s.id === id);
     const SET_FIELD_PATHS = { name: 1, description: 1, project: 1, triggerSchedule: 1, enabled: 1, whenToUse: 1 };
@@ -21843,17 +21924,15 @@ const CONSOLE_JS = `
           // Same snake/camel tolerance for uses_skill.
           const usesSkill = typeof step.uses_skill === 'string' ? step.uses_skill.trim()
             : typeof step.usesSkill === 'string' ? step.usesSkill.trim() : '';
-          draft.steps.push({
+          const nextStep = {
             id: step.id,
             prompt: typeof step.prompt === 'string' ? step.prompt : '',
-            ...(step.project ? { project: step.project } : {}),
             dependsOn: Array.isArray(step.dependsOn) ? step.dependsOn.slice() : [],
-            ...(step.model ? { model: step.model } : {}),
-            ...(step.forEach ? { forEach: step.forEach } : {}),
-            ...(step.deterministic ? { deterministic: step.deterministic } : {}),
             ...(allowedTools ? { allowedTools } : {}),
             ...(usesSkill ? { usesSkill } : {}),
-          });
+          };
+          applyRichStepFields(nextStep, step, false);
+          draft.steps.push(nextStep);
           break;
         }
         case 'update_step': {
@@ -21877,6 +21956,7 @@ const CONSOLE_JS = `
             if (next === null || next === '') delete draft.steps[idx].usesSkill;
             else if (typeof next === 'string') draft.steps[idx].usesSkill = next.trim();
           }
+          applyRichStepFields(draft.steps[idx], patch, true);
           break;
         }
         case 'remove_step': {
@@ -21929,6 +22009,19 @@ const CONSOLE_JS = `
         case 'remove_input': {
           if (typeof op.key !== 'string') { warnings.push('remove_input: invalid key'); break; }
           delete draft.inputs[op.key];
+          break;
+        }
+        case 'add_resource': {
+          if (typeof op.key !== 'string' || !op.key.trim()) { warnings.push('add_resource: invalid key'); break; }
+          const value = objectOrNull(op.value);
+          if (!value) { warnings.push('add_resource: invalid value for ' + op.key); break; }
+          if (!draft.resources || typeof draft.resources !== 'object') draft.resources = {};
+          draft.resources[op.key] = { id: op.key, ...cloneValue(value) };
+          break;
+        }
+        case 'remove_resource': {
+          if (typeof op.key !== 'string') { warnings.push('remove_resource: invalid key'); break; }
+          if (draft.resources && typeof draft.resources === 'object') delete draft.resources[op.key];
           break;
         }
         case 'set_synthesis': {

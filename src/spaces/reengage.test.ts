@@ -16,6 +16,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-reengage-
 const store = await import('./store.js');
 const data = await import('./data-store.js');
 const { reengageSpace, spaceSessionId } = await import('./reengage.js');
+const { SessionStore } = await import('../memory/session-store.js');
 
 test('not found → 404; archived → 423', async () => {
   assert.equal((await reengageSpace('nope-nope', { trigger: 'ask' })).status, 404);
@@ -41,6 +42,24 @@ test("a configured 'threshold' trigger wakes (reengaged:true, session = space-<s
   const out = await reengageSpace(slug, { trigger: 'threshold', message: 'idle 14d' });
   assert.equal(out.body.reengaged, true);
   assert.equal(out.body.sessionId, spaceSessionId(slug));
+});
+
+test('wake guidance uses workspace runner tools, not stale write_file-first repair wording', async () => {
+  const slug = 'rg-runner-guidance';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Runner Guidance',
+    dataSources: [{ id: 'deals', runner: 'pull.mjs' }],
+    reengage: { triggers: ['threshold'], guidance: 'fix stale data' },
+  });
+
+  await reengageSpace(slug, { trigger: 'threshold', message: 'data changed' });
+
+  const turns = new SessionStore().get(spaceSessionId(slug)).turns;
+  const text = turns.find((turn) => typeof turn.text === 'string' && turn.text.includes(`[workspace ${slug}:threshold-data changed`))?.text ?? '';
+  assert.match(text, /space_get_runner\('rg-runner-guidance'\)/);
+  assert.match(text, /space_edit_runner\('rg-runner-guidance'/);
+  assert.doesNotMatch(text, /edit the data runner with write_file/i);
 });
 
 test("'ask' always wakes even with no configured triggers", async () => {

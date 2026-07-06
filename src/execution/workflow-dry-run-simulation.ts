@@ -19,11 +19,13 @@
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
 import { shortStepLabel } from './workflow-describe.js';
 import { classifyStepSideEffect, type StepSideEffectClass } from './workflow-enforce.js';
+import { stepExecutor } from './workflow-execution-mode.js';
 import { preflightWorkflow } from './workflow-preflight.js';
 import { checkWorkflowRunReadiness } from './workflow-run-readiness.js';
 import { workflowQualityCriteria } from './workflow-quality-contract.js';
 import type {
   WorkflowExecutionPlan,
+  WorkflowExecutionPlanOptions,
   WorkflowExecutionVisualContract,
   WorkflowToolReadinessItem,
 } from '../dashboard/workflow-execution-plan.js';
@@ -73,16 +75,12 @@ export interface WorkflowDryRunSimulation {
   plan: WorkflowExecutionPlan;
 }
 
+export type WorkflowDryRunPlanOptions = Omit<WorkflowExecutionPlanOptions, 'workflowAllowedTools' | 'readiness'>;
+
 export interface SimulateWorkflowDryRunOptions {
   workflowSlug?: string;
   inputs?: Record<string, string>;
-}
-
-function executorFor(step: WorkflowStepInput): WorkflowDryRunExecutor {
-  if (step.call?.tool) return 'call';
-  if (step.deterministic?.runner) return 'deterministic';
-  if (step.usesSkill) return 'skill';
-  return 'model';
+  planOptions?: WorkflowDryRunPlanOptions;
 }
 
 function effectFor(sideEffect: StepSideEffectClass): WorkflowDryRunEffect {
@@ -138,7 +136,7 @@ export function simulateWorkflowDryRun(
 
   // One call gives us the built plan (waves, fanout, gates, tool surface,
   // visual contract) AND the readiness blocker/warning partition.
-  const readiness = checkWorkflowRunReadiness(def, options.workflowSlug, {});
+  const readiness = checkWorkflowRunReadiness(def, options.workflowSlug, options.planOptions ?? {});
   const plan = readiness.plan;
   const preflight = preflightWorkflow(def, options.inputs ?? {});
 
@@ -161,7 +159,7 @@ export function simulateWorkflowDryRun(
       stepId: step.id,
       label: shortStepLabel(step.prompt || step.id),
       wave: waveByStep.get(step.id) ?? 0,
-      executor: executorFor(step),
+      executor: stepExecutor(step),
       sideEffect,
       effect: effectFor(sideEffect),
       touches,
