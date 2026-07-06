@@ -233,7 +233,9 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     // step must not halt just because it hit the per-query turn cap while still making
     // tool progress. Bounded by count + wall-clock; a continuation error keeps the prior
     // partial (which then blocks honestly below).
-    if (result.limitHit && workflowStepAutoContinueEnabled()) {
+    if (result.limitHit && !result.selfStopped && workflowStepAutoContinueEnabled()) {
+      // !selfStopped: never auto-continue an anti-thrash loop-stop (re-running it
+      // just re-loops — the exact thrash the ceiling exists to prevent).
       const autoStart = Date.now();
       let autos = 0;
       while (

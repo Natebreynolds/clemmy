@@ -1119,7 +1119,9 @@ export async function respondViaClaudeAgentSdkBrain(
     // (persistSession:false) tracks progress in its own reply, so we hand that back
     // and tell it to finish the REST without redoing. Bounded by count + total
     // wall-clock; the per-query tool-ceiling/wall-clock stay the hard backstops.
-    if (result.limitHit && sdkAutoContinueEnabled()) {
+    if (result.limitHit && !result.selfStopped && sdkAutoContinueEnabled()) {
+      // !selfStopped: an anti-thrash loop-stop must not auto-continue (re-running
+      // it just re-loops — restores the guard the 33-shell-call incident added).
       const autoStart = Date.now();
       let autoContinues = 0;
       // Re-inject any SKILL bodies loaded this run into the continuation. The stateless

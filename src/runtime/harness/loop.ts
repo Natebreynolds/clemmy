@@ -4868,6 +4868,26 @@ function handleRunError(
     bumpTurnNumber(sessionId, turn);
     return { sessionId, turn, status: 'limit_exceeded', error: err.message };
   }
+  // The OpenAI/Codex Agents Runner throws MaxTurnsExceededError when a turn hits
+  // its maxTurns budget. That escaped to the generic terminal run_failed below —
+  // a dead-end that strands the session with no recourse. Treat it as a graceful
+  // CAP (like ToolCallsLimitExceeded and the Claude-SDK limitHit path): a soft
+  // limit_exceeded the caller can offer "continue" on. Match the class by name
+  // AND the wrapped message (the SDK re-wraps thrown errors). Kill-switch =off.
+  const maxTurnsHit =
+    (err instanceof Error && err.name === 'MaxTurnsExceededError')
+    || (err instanceof Error && /max turns \(\d+\) exceeded|maximum number of turns/i.test(err.message));
+  if (maxTurnsHit && (getRuntimeEnv('CLEMMY_MAX_TURNS_CONTINUE', 'on') ?? 'on').toLowerCase() !== 'off') {
+    safeAppend({ sessionId, turn, role: 'system', type: 'guardrail_tripped', data: { kind: 'max_turns' } });
+    session.markStatus('failed');
+    bumpTurnNumber(sessionId, turn);
+    return {
+      sessionId,
+      turn,
+      status: 'limit_exceeded',
+      error: 'Reached the per-turn step budget before finishing — say "continue" to pick up where it left off.',
+    };
+  }
   // A mutating tool was called with byte-identical args past the escalate
   // threshold — an unrecoverable loop. End the turn cleanly instead of
   // letting the model spin (the 84×/3-min workflow_run hang). The SDK

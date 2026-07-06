@@ -177,7 +177,7 @@ function sdkWallClockMs(): number {
 // work, only the permission decision). It is subtracted from the wall clock so a
 // long confirm-first approval can't self-abort the turn the moment the user
 // approves — honoring "approve once, then run to completion".
-interface ToolCeilingState { total: number; mutating: number; stopped: string | null; pausedMs: number }
+interface ToolCeilingState { total: number; mutating: number; stopped: string | null; stoppedKind: 'loop' | 'wallclock' | null; pausedMs: number }
 
 /** Wrap a base `canUseTool` to (1) ALWAYS meter approval-wait time into
  *  state.pausedMs (so the wall clock excludes it), and (2) when `countCeiling`,
@@ -202,6 +202,7 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
       if (state.mutating > mutCeiling || state.total > totalCeiling) {
         const why = state.mutating > mutCeiling ? `${state.mutating} actions` : `${state.total} tool calls`;
         state.stopped = `I stopped myself after ${why} without finishing — that looked like a loop, so I held off rather than keep going and risk repeating an action. Tell me how you'd like to proceed and I'll pick it back up.`;
+        state.stoppedKind = 'loop'; // anti-thrash: auto-continue must NOT re-run this (it just loops again)
         return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
       }
     }
@@ -798,6 +799,11 @@ export interface ClaudeAgentSdkRunResult {
    *  rather than finishing. The caller surfaces a graceful "say continue" instead
    *  of a hard error — parity with the harness loop's auto-continue-on-limit. */
   limitHit?: boolean;
+  /** True ONLY for the anti-thrash tool-ceiling self-stop (looked-like-a-loop).
+   *  Distinct from a benign wall-clock/max-turns limitHit so auto-continue loops
+   *  can EXCLUDE it — re-running a loop-stop just loops again (the 33-shell-call /
+   *  3-duplicate-email incident the ceiling exists to stop). */
+  selfStopped?: boolean;
   /** Typed stop reason for non-successful-but-non-error terminal states. */
   stoppedReason?: RunStoppedReason;
   /** A3 recall ledger: every tool call this run with its callId, so an
@@ -1134,7 +1140,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const pathToClaudeCodeExecutable = resolveClaudeCliPath() ?? undefined;
   // Anti-thrash bounding (Phase 2): a per-turn call ceiling that INTERRUPTS the
   // SDK turn, shared with the run loop so a self-stop reads as a graceful limit.
-  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, pausedMs: 0 };
+  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, stoppedKind: null, pausedMs: 0 };
   // Agentic: the async approval gate (read/local fast-allow, everything else
   // → decideToolApproval → register/surface/await). permissionMode 'default'
   // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.
@@ -1273,6 +1279,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ceilingState.total = 0;
     ceilingState.mutating = 0;
     ceilingState.stopped = null;
+    ceilingState.stoppedKind = null;
     ceilingState.pausedMs = 0;
     const startedAt = Date.now();
     const toolById = new Map<string, { name: string; input: unknown }>();
@@ -1310,6 +1317,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // take many minutes — never self-aborts the turn the instant they approve.
         if (wallClockMs > 0 && ceilingState.stopped === null && Date.now() - startedAt - ceilingState.pausedMs > wallClockMs) {
           ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
+          ceilingState.stoppedKind = 'wallclock';
           try { await stream?.interrupt?.(); } catch { /* best-effort; finally closes */ }
           break;
         }
@@ -1474,6 +1482,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       usage: result?.usage,
       modelUsage: result?.modelUsage,
       limitHit: true,
+      selfStopped: String(ceilingState.stoppedKind) === 'loop', // cast: the 'loop' set-site is a closure alias TS can't flow-narrow
     };
   }
 
