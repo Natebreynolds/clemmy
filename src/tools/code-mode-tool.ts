@@ -50,6 +50,15 @@ export function codeModeWritesEnabled(): boolean {
  *  DELETE-WHEN-VALIDATED: once telemetry shows the mandate lifts the
  *  run_tool_program rate on mandate-fired turns without false-firing on non-data
  *  turns, fold it in unconditionally. Kill-switch: CLEMMY_CODE_MODE_MANDATE=off. */
+/** Kill-switch for the code-mode irreversible-send guard (default ON). */
+export function codeModeSendGuardEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CODE_MODE_SEND_GUARD', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+/** Mutating-call count per PROGRAM RUN, keyed by the run's counter identity
+ *  (one ToolCallsCounter spans one program). WeakMap → no cleanup needed. */
+const programMutationCounts = new WeakMap<ToolCallsCounter, number>();
+
 export function codeModeMandateEnabled(): boolean {
   if (!codeModeEnabled()) return false;
   return (getRuntimeEnv('CLEMMY_CODE_MODE_MANDATE', 'on') || 'on').trim().toLowerCase() !== 'off';
@@ -84,9 +93,9 @@ export function codeModeMandateDirective(opts: {
   // only sharpens the rule with the concrete count, it no longer gates it.
   const rule = [
     `BATCH-SHAPE RULE — external data-fetch tools are in scope this turn (${fetchTools}). Pick the lane by the SHAPE of the work:`,
-    '(a) 3+ same-shape items whose tool arguments you can FULLY MATERIALIZE right now (send N drafted emails, update N records with known values, pull N known lookups) → `run_batch` ONE plan: certified once, then executed deterministically with zero model calls between items — the fastest and most auditable lane;',
+    '(a) 3+ same-shape items whose tool arguments you can FULLY MATERIALIZE right now (send N drafted emails, update N records with known values, pull N known lookups) → `run_batch` ONE plan: certified once, then executed deterministically with zero model calls between items — the fastest and most auditable lane. ANY batch of external SENDS/WRITES MUST use run_batch — never loop sends yourself and never put sends in run_tool_program (it is capped at 60s and will lose a partial batch).',
     '(b) 3+ independent items that each need their own REASONING/discovery (research each firm, judge each doc) → FAN OUT: `run_worker` once PER ITEM, in parallel, each with a complete job packet — do NOT grind the items one-by-one in your own context;',
-    '(c) several DIFFERENT fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result;',
+    '(c) several DIFFERENT read-only fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result. run_tool_program is READ-ONLY aggregation and 60s-capped — no sends/writes inside it;',
     '(d) a SINGLE read → call the tool directly.',
   ].join(' ');
   if (opts.fanoutPreferred && opts.multiItem) {
@@ -173,6 +182,48 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
   if (!isCodeModeToolAllowed(method)) {
     const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
     throw new Error(`code-mode: tool "${method}" is not available — ${why}`);
+  }
+  // HARD GUARD (2026-07-07): an IRREVERSIBLE external SEND (OUTLOOK_SEND_EMAIL,
+  // *_PUBLISH, …) must NEVER run inside a code-mode program. Code mode has a 60s
+  // wall-clock kill; a loop of N gated+judged sends cannot finish inside it, so
+  // the program dies mid-batch — possibly after sending SOME — and the result is
+  // lost, stranding the run in a re-verification loop (live 2026-07-07: 10
+  // first-touch emails, run_tool_program timed out at 60s, 0 confirmed sent).
+  // Sends belong in run_batch: one certification, a deterministic per-item loop
+  // with its OWN per-item budget, honest ledger, and resumability. Refuse here so
+  // the model is redirected BEFORE it burns 60s, not after.
+  if (codeModeSendGuardEnabled()) {
+    try {
+      const { classifyExternalWrite } = await import('../runtime/harness/confirm-first-gate.js');
+      const shape = classifyExternalWrite(method, args);
+      if (shape.mutating && shape.irreversible) {
+        throw new Error(
+          `code-mode: refusing an irreversible external send (${shape.shapeKey ?? method}) inside run_tool_program — `
+          + 'code programs are capped at 60s and would lose or partially-complete a batch of sends. '
+          + 'Use run_batch for sends: propose ONE plan (tool composio_execute_tool, sideEffect "send", one item per recipient with fully-baked args), it certifies once, queues ONE approval, then executes deterministically with per-item gating and an honest ledger.',
+        );
+      }
+      // Escalation guard (same class, reversible writes): a program LOOPING
+      // mutations dies at the 60s cap mid-batch just like sends — the writes
+      // that landed before the kill are lost to the model. Allow the first
+      // couple (legit single-write programs), refuse the third with the same
+      // redirect. Counted per PROGRAM RUN via its counter identity.
+      if (shape.mutating && counter) {
+        const soFar = (programMutationCounts.get(counter) ?? 0) + 1;
+        programMutationCounts.set(counter, soFar);
+        if (soFar > 2) {
+          throw new Error(
+            `code-mode: refusing the ${soFar}rd/th mutating call (${shape.shapeKey ?? method}) in ONE program — `
+            + 'a mutation loop cannot finish inside the 60s program cap and dies mid-batch, losing track of completed writes. '
+            + 'Use run_batch: one plan, one item per record, certified once, executed deterministically with a per-item ledger.',
+          );
+        }
+      }
+    } catch (err) {
+      // A genuine guard trip (our Errors above) propagates; a classifier import/
+      // parse failure must NOT block the call (fail-open to legacy behavior).
+      if (err instanceof Error && err.message.startsWith('code-mode: refusing')) throw err;
+    }
   }
   const callId = `codemode-${randomUUID()}`;
   // Observability: emit tool_called/tool_returned for each in-program call so the
@@ -282,6 +333,7 @@ export function codeModeDescription(): string {
       : 'Local writes are off, but MCP reads work; a destructive MCP tool is still blocked by its approval gate.',
     'Example: `const [a,b] = await Promise.all([clem["dataforseo__serp_organic_live_advanced"]({...}), clem["dataforseo__serp_organic_live_advanced"]({...})]); return { aTop: a.items?.[0], bTop: b.items?.[0] };`',
     'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Bounded time + tool-call budget.',
+    'HARD LIMIT: this program is killed at 60 seconds and is for READ-ONLY aggregation. NEVER loop irreversible external SENDS/writes (email send, publish) inside it — a batch of gated sends cannot finish in 60s, so it dies mid-batch and loses track of what was sent. For ANY batch of sends/writes use `run_batch` instead (it certifies once, then runs a deterministic per-item loop with its own budget and an honest ledger). An irreversible send attempted here is refused.',
   ].join(' ');
 }
 

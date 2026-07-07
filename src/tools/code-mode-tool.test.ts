@@ -34,6 +34,34 @@ test('dispatchCodeModeTool refuses a mutating tool when writes are OFF (kill-swi
   }
 });
 
+test('dispatchCodeModeTool refuses an irreversible SEND even with writes ON — routes to run_batch', async () => {
+  // 2026-07-07: a run_tool_program looping 10 OUTLOOK_SEND_EMAIL calls hit the
+  // 60s code-mode cap and died mid-batch with 0 confirmed sent. Sends must be
+  // refused here so the model is redirected to run_batch BEFORE burning 60s.
+  const prev = process.env.CLEMMY_CODE_MODE_WRITES;
+  process.env.CLEMMY_CODE_MODE_WRITES = 'on';
+  try {
+    await assert.rejects(
+      () => dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{"to":"a@b.com"}' }, 'sess'),
+      /run_batch/,
+      'an irreversible send inside code mode must be refused and point at run_batch',
+    );
+    // A non-irreversible write (update) is NOT blocked by the send guard for the
+    // first two calls, but a MUTATION LOOP is: the 3rd mutating call in one
+    // program run (same counter) is refused with the run_batch redirect —
+    // reversible-write batches die at the 60s cap exactly like sends.
+    const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+    const programCounter = new ToolCallsCounter(100);
+    const guardRejected = (p: Promise<unknown>) =>
+      p.then(() => false, (e: unknown) => e instanceof Error && /run_batch/.test(e.message) && /code-mode: refusing/.test(e.message));
+    assert.equal(await guardRejected(dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: '{"r":1}' }, 'sess', programCounter)), false, '1st reversible write passes the guard');
+    assert.equal(await guardRejected(dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: '{"r":2}' }, 'sess', programCounter)), false, '2nd reversible write passes the guard');
+    assert.equal(await guardRejected(dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: '{"r":3}' }, 'sess', programCounter)), true, '3rd mutating call in one program is refused → run_batch');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prev;
+  }
+});
+
 test('isMcpNamespacedTool: true for <server>__<tool>, false for local tool names', () => {
   assert.equal(isMcpNamespacedTool('dataforseo__serp_organic_live_advanced'), true);
   assert.equal(isMcpNamespacedTool('supabase__query'), true);
