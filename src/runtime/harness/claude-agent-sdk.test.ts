@@ -11,6 +11,7 @@ import type { Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 const mod = await import('./claude-agent-sdk.js');
 const usageLog = await import('../usage-log.js');
+const eventlog = await import('./eventlog.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
   CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
@@ -643,16 +644,22 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
   setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages(streamWithToolReturn(), {})) as any);
   const reflected: Array<{ sessionId: string; callId: string; tool: string | null; output: string }> = [];
   setClaudeAgentSdkReflectionForTest(((input: any) => { reflected.push(input); }) as any);
+  const sess = eventlog.createSession({ id: 'clem-sess-1', kind: 'chat' });
 
-  await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: 'clem-sess-1', agentic: true });
+  await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: sess.id, agentic: true });
 
   assert.equal(reflected.length, 1);
-  assert.equal(reflected[0].sessionId, 'clem-sess-1');
+  assert.equal(reflected[0].sessionId, sess.id);
   assert.equal(reflected[0].callId, 'toolu_42');
   // The MCP-namespaced Composio wrapper is unwrapped to the real action slug
   // for source-trust parity with the Codex RunHooks path.
   assert.equal(reflected[0].tool, 'SALESFORCE_QUERY');
   assert.match(reflected[0].output, /Acme Corp has 3 open opportunities/);
+
+  const returned = eventlog.listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(returned.length, 1);
+  assert.equal(returned[0].data.callId, 'toolu_42');
+  assert.equal(returned[0].data.tool, 'composio_execute_tool');
 });
 
 test('learning-OUT is skipped without a session id and when kill-switched off', async () => {

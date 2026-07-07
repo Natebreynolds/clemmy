@@ -10,7 +10,7 @@ process.env.CLEMMY_APPROVAL_POLL_MS = '15'; // fast poll for the test
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { createSession } = await import('./eventlog.js');
+const { createSession, listEvents } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const { buildGatedToolPermission } = await import('./claude-agent-approval.js');
 
@@ -34,6 +34,17 @@ test('gated permission: read/local tools fast-allow, no approval registered', as
   assert.equal(res.behavior, 'allow');
   assert.deepEqual(res.updatedInput, { query: 'x' }, 'the CLI control protocol requires updatedInput on EVERY allow');
   assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 0, 'a read never registers an approval');
+});
+
+test('gated permission: tool_called event carries the SDK toolUseID for UI correlation', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const perm = buildGatedToolPermission(sess.id, ['memory_read']) as unknown as Perm;
+  await perm('mcp__clementine-local__memory_read', { query: 'x' }, { signal: new AbortController().signal, toolUseID: 'toolu_visible_1' });
+
+  const events = listEvents(sess.id, { types: ['tool_called'] });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.tool, 'memory_read');
+  assert.equal(events[0].data.callId, 'toolu_visible_1');
 });
 
 test('gated permission: auto-approved mutating tool (no human needed) also carries updatedInput', async () => {

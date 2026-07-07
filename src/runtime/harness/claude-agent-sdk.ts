@@ -1426,7 +1426,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                 turn: 0,
                 role: 'Clem',
                 type: 'tool_returned',
-                data: { tool: source ? mcpToolTail(source.name) : undefined, ok: !tr.isError },
+                data: { tool: source ? mcpToolTail(source.name) : undefined, callId: tr.callId, ok: !tr.isError },
               });
             } catch { /* progress only */ }
           }
