@@ -54,6 +54,14 @@ export function isOutputGroundingGateEnabled(): boolean {
   return raw !== 'off' && raw !== 'false' && raw !== '0';
 }
 
+/** When the residual-figure judge is unavailable, surface still-ungrounded
+ *  figures as ADVISORY instead of silently passing them (fail-open). Default on.
+ *  =off restores the prior silent allow. Advisory only — never blocks. */
+export function groundingFailToAdvisoryEnabled(): boolean {
+  if (!isOutputGroundingGateEnabled()) return false;
+  return (getRuntimeEnv('CLEMMY_GROUNDING_FAIL_TO_ADVISORY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Numeric-claim extraction (pure, deterministic — no LLM)
 // ─────────────────────────────────────────────────────────────────
@@ -427,6 +435,20 @@ export async function evaluateOutputGrounding(
   try {
     verdict = await (judgeOverride ?? runOutputGroundingJudge)(residual, sources);
   } catch {
+    // Judge OUTAGE with residual figures that did NOT deterministically clear:
+    // don't SILENTLY pass them (the fail-open that let ungrounded/fabricated
+    // figures through, 07-06 audit) — surface them as ADVISORY (inform, never
+    // BLOCK: they may be legit derived numbers the judge would have traced). A
+    // deterministic-verification fallback for a down LLM judge, mirroring the
+    // 'unverifiable' path. Kill-switch restores the prior silent fail-open.
+    if (groundingFailToAdvisoryEnabled()) {
+      return {
+        action: 'advisory',
+        reason: 'output-grounding judge unavailable — these figures could not be verified against captured sources; double-check before relying on them',
+        figures: residual.map((r) => r.raw).slice(0, 4),
+        sourceCallIds,
+      };
+    }
     return { action: 'allow', reason: 'output-grounding judge unavailable — fail open', figures: [], sourceCallIds };
   }
   if (verdict.verdict === 'grounded') {
