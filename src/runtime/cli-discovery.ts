@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { BASE_DIR } from '../config.js';
@@ -310,6 +310,22 @@ const SYSTEM_BINARIES_THAT_LAUNCH_GUI_OR_INSTALLER = new Set<string>([
   'unpack200',
 ]);
 
+// MDM / device-management ENFORCEMENT tools — not developer CLIs, and probing
+// them (even `--version`) opens their docs in a browser or triggers an
+// update/restart action. Checked by NAME, path-independent (unlike the
+// GUI-installer set, which is /usr/bin-scoped), because these ship to varied
+// locations (/usr/local/bin, /Library/Management, MDM payload dirs). Live
+// 2026-07-07: `super` (S.U.P.E.R.MAN) opened github.com/Macjutsu/super/wiki on
+// every CLI probe. Complements the /Library/Management path guard.
+const MANAGEMENT_ENFORCEMENT_TOOLS = new Set<string>([
+  'super',
+  'nudge',
+  'installomator',
+  'jamf',
+  'jamfhelper',
+  'mdmclient',
+]);
+
 const DEVELOPER_TOOL_BACKING_DIRS = [
   '/Library/Developer/CommandLineTools/usr/bin',
   '/Applications/Xcode.app/Contents/Developer/usr/bin',
@@ -363,6 +379,28 @@ export function _resetCltDetectionCache(): void {
 }
 
 export function resolveSafeCliProbe(command: string, resolved: string): SafeCliProbe {
+  // STRUCTURAL GUARD (2026-07-07): a binary that RESOLVES into an MDM /
+  // device-management / system-library location is an IT-deployed enforcement
+  // tool, NOT a developer CLI — probing it (even `--version`) can open its
+  // docs in the browser or trigger a management action. Live: `super`
+  // (S.U.P.E.R.MAN software-update enforcement) at /usr/local/bin/super →
+  // /Library/Management/super/super opened github.com/Macjutsu/super/wiki on
+  // every probe. Follow the symlink target, not just the launch path, so a
+  // /usr/local/bin shim into /Library/Management is still caught.
+  const realTarget = ((): string => {
+    try { return realpathSync(resolved); } catch { return resolved; }
+  })();
+  if (MANAGEMENT_ENFORCEMENT_TOOLS.has(command)
+      || /^\/Library\/(Management|Application Support\/(JAMF|Addigy|Kandji|Mosyle)|PrivilegedHelperTools)\//i.test(realTarget)
+      || /^\/Library\/Management\//i.test(resolved)) {
+    return {
+      skipped: true,
+      command,
+      path: resolved,
+      reason: 'Skipped an MDM/device-management binary (IT-deployed enforcement tool, not a developer CLI) to avoid opening its docs in a browser or triggering a management action.',
+    };
+  }
+
   // STRUCTURAL GUARD: when no Xcode/CLT is installed, every binary at
   // `/usr/bin/*` that isn't already known to the system is a potential
   // CLT shim. Invoking ANY of them — git, cmpdylib, wish, future
