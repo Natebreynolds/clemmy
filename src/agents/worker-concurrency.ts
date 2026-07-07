@@ -46,7 +46,9 @@ const DEFAULT_GLOBAL_MAX_CONCURRENCY = 12;
 // stays well under the native 6/12 for smaller quota pools. Still opt-up AND
 // opt-down via CLEMMY_WORKER_MAX_CONCURRENCY_BYO[_GLOBAL] for a tiny endpoint.
 const DEFAULT_BYO_MAX_CONCURRENCY = 3;
-const DEFAULT_BYO_GLOBAL_MAX_CONCURRENCY = 4;
+// Global 6 = two concurrent BYO sessions can each run their full 3 (4 would let one
+// session monopolize 3 of 4, throttling a second session to 1 — a fairness regression).
+const DEFAULT_BYO_GLOBAL_MAX_CONCURRENCY = 6;
 
 type WorkerProviderClass = 'codex' | 'claude' | 'byo';
 

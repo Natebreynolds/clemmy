@@ -955,6 +955,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               gap: verdict.gap,
               targets: verdict.targets,
               failureCount: verdict.failureCount ?? 1,
+              blockKind: verdict.blockKind, // carry present_for_approval (burst fail-closed park) — was dropped → mis-rendered as generic 'other' retry
             });
           }
         } catch (err) {

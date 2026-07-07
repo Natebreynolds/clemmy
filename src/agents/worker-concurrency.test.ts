@@ -198,7 +198,7 @@ test('BYO workers parallelize up to the default cap (3/session) then queue — c
       .then((r) => { fourthAcquired = true; return r; });
     await Promise.resolve();
     assert.equal(fourthAcquired, false, 'the 4th BYO worker waits behind the default cap');
-    assert.deepEqual(queued[0], { queueDepth: 1, perSessionCap: 3, globalCap: 4, provider: 'byo' });
+    assert.deepEqual(queued[0], { queueDepth: 1, perSessionCap: 3, globalCap: 6, provider: 'byo' });
     r1();
     const r4 = await p4;
     assert.equal(fourthAcquired, true, 'freeing a slot hands it to the waiter');

@@ -1156,6 +1156,7 @@ export async function respondViaClaudeAgentSdkBrain(
       };
       while (
         result.limitHit
+        && !result.selfStopped // a continuation that anti-thrash loop-STOPPED must NOT be re-run (would re-loop)
         && result.toolUses.length > 0
         && autoContinues < maxSdkAutoContinues()
         && (Date.now() - autoStart) < sdkAutoContinueWallMs()

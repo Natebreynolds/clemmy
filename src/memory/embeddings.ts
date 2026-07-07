@@ -80,6 +80,16 @@ export function classifyEmbedError(err: unknown): EmbedErrorClass {
   return 'transient';
 }
 
+/** Worth ONE retry before counting toward the breaker: a genuinely TRANSIENT blip
+ *  (timeout / network / 5xx). NOT a persistent CLIENT error (400 oversized-input,
+ *  404 bad-model) — those fail identically on retry and just double the synchronous
+ *  JIT/recall latency — nor terminal (auth/quota) / rate-limit (429). Pure/testable. */
+export function embedErrorIsRetryable(err: unknown): boolean {
+  if (classifyEmbedError(err) !== 'transient') return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return !/\b4\d\d\b/.test(msg); // any 4xx that slipped into 'transient' (≠429) won't recover
+}
+
 function cooldownForClass(cls: EmbedErrorClass): number {
   switch (cls) {
     case 'quota':
@@ -427,12 +437,13 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
   try {
     return await attempt();
   } catch (err) {
-    // One retry on a TRANSIENT blip (timeout / network / 5xx) before it counts
-    // toward the breaker — a single slow call must not drop recall to FTS for
-    // minutes. Terminal (auth/quota) and rate-limit errors are NOT retried
-    // (retrying won't help and just drip-spends). Kill-switch =off.
-    const cls = classifyEmbedError(err);
-    if (cls !== 'auth' && cls !== 'quota' && cls !== 'rate_limit'
+    // One retry on a genuinely TRANSIENT blip (timeout / network / 5xx) before it
+    // counts toward the breaker — a single slow call must not drop recall to FTS
+    // for minutes. NOT retried: terminal (auth/quota), rate-limit (429), AND a
+    // persistent CLIENT error (400 oversized-input / 404 bad-model) — those fail
+    // identically on retry and just DOUBLE the synchronous JIT/recall latency on
+    // this pre-turn path (07-06 ship-review finding). Kill-switch =off.
+    if (embedErrorIsRetryable(err)
       && (getRuntimeEnv('CLEMMY_EMBED_RETRY', 'on') || 'on').toLowerCase() !== 'off') {
       await new Promise((r) => setTimeout(r, 300));
       return await attempt();

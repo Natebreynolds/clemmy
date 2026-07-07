@@ -240,6 +240,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
       let autos = 0;
       while (
         result.limitHit
+        && !result.selfStopped // a continuation that anti-thrash loop-STOPPED must NOT be re-run
         && result.toolUses.length > 0
         && autos < maxWorkflowStepAutoContinues()
         && (Date.now() - autoStart) < workflowStepAutoContinueWallMs()
@@ -307,8 +308,13 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   // the runner's self-heal / retry handles it honestly, rather than reporting the
   // partial text as a finished result (or hard-failing the whole workflow run).
   if (result.limitHit) {
+    // Honest reason: an anti-thrash loop-stop is NOT a plain budget exhaustion —
+    // say so, so the runner's self-heal sees the real cause (was hardcoded generic).
+    const reason = result.selfStopped
+      ? 'Claude stopped this step early: it began repeating actions that looked like a loop (anti-thrash safeguard) before finishing.'
+      : 'Claude reached the workflow-step turn budget before finishing this step.';
     return {
-      output: { blocked: true, reason: 'Claude reached the workflow-step turn budget before finishing this step.' },
+      output: { blocked: true, reason },
       sdkSessionId: result.sessionId,
       model: result.model,
       toolUses: result.toolUses,

@@ -104,6 +104,37 @@ test('runClaudeAgentSdkWorkflowStep builds a schema-bound SDK call and returns s
   assert.deepEqual(captured.outputSchema.required, ['status', 'output']);
 });
 
+test('auto-continue HALTS when a continuation anti-thrash loop-stops (no thrash cascade) + reports the honest reason', async () => {
+  let calls = 0;
+  setClaudeAgentSdkWorkflowStepRunForTest(async () => {
+    calls += 1;
+    // Call 1: budget stop, NOT a loop (selfStopped=false) → the loop is entered.
+    // Call 2 (first continuation): anti-thrash LOOP-stop (selfStopped=true) → must HALT,
+    // not cascade to the cap (before the fix the while ignored selfStopped and ran 4×).
+    const selfStopped = calls >= 2;
+    return {
+      text: 'partial progress',
+      sessionId: 'sdk-workflow-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: [`mcp__clementine-local__t${calls}`],
+      usage: { input_tokens: 1, output_tokens: 1 },
+      limitHit: true,
+      selfStopped,
+    } as any;
+  });
+
+  const result = await runClaudeAgentSdkWorkflowStep({
+    step,
+    workflowName: 'Report Workflow',
+    prompt: 'Workflow: Report Workflow\nStep: design_report\n\nDesign the report.',
+    modelId: 'claude-sonnet-4-6',
+  });
+
+  assert.equal(calls, 2, 'initial run + ONE continuation that loop-stopped, then HALT — no cascade to the cap');
+  assert.equal((result.output as any).blocked, true, 'a loop-stopped step blocks (self-heal handles it)');
+  assert.match((result.output as any).reason, /loop/i, 'the honest anti-thrash reason is surfaced, not the generic budget message');
+});
+
 test('renderClaudeAgentWorkflowStepSystemAppend full lane permits gated execution tools (no read-only boundary)', () => {
   const prompt = renderClaudeAgentWorkflowStepSystemAppend({ workflowName: 'Report Workflow', step, fullLane: true });
   assert.doesNotMatch(prompt, /READ-ONLY\/local-context/);
