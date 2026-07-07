@@ -1,5 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
+import { recordSubagentRun, providerClassForModel } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
 import { workerItemAlreadyCapped } from '../agents/worker-respawn-guard.js';
@@ -219,6 +220,29 @@ export function registerWorkerTools(server: McpServer): void {
           latencyMs: Date.now() - routeStartedAt,
           toolSuccess: ok,
         });
+        // Subagent-runs visibility spine: WHO ran (provider+model+role), WHAT they
+        // did (task + persisted work-product), OUTCOME — attributed to the workflow
+        // run when spawned in a step, else the session. This ONE choke-point covers
+        // all three lanes (Claude / Codex / GLM-BYO). Fail-open.
+        try {
+          const ctx = getToolOutputContext();
+          const capped = !ok && /MaxTurnsExceeded|hit its turn cap/i.test(result.text ?? '');
+          recordSubagentRun({
+            id: `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
+            parentRunId: ctx?.workflowRunId || sessionId,
+            parentKind: ctx?.workflowRunId ? 'workflow' : 'session',
+            workflowName: ctx?.workflowName,
+            stepId: ctx?.stepId,
+            role: input.intent || undefined,
+            provider: route.claudeLane ? 'claude' : providerClassForModel(result.model ?? workerModel),
+            model: result.model ?? workerModel,
+            task: input.item,
+            status: capped ? 'capped' : ok ? 'ok' : 'error',
+            output: result.text ?? '',
+            startedAt: new Date(routeStartedAt).toISOString(),
+            finishedAt: new Date().toISOString(),
+          });
+        } catch { /* visibility trace is best-effort */ }
         return textResult(result.text);
       } catch (err) {
         recordResult(false, firstLine(err), workerModel);
