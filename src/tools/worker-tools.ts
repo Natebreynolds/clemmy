@@ -190,6 +190,12 @@ export function registerWorkerTools(server: McpServer): void {
         source: 'default',
         reason: { lane: 'sdk_brain', item: input.item },
       });
+      // Live-visibility: announce the agent STARTING (the chat/board render it as a
+      // running specialist immediately, not only when worker_result lands). Cheap,
+      // fail-open. provider/role let the UI badge it (Claude/Codex/GLM + specialty).
+      try {
+        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
+      } catch { /* telemetry is best-effort */ }
       try {
         // Claude worker role → Claude Agent SDK lane; non-Claude → the SAME
         // cross-provider @openai/agents Worker the orchestrator lane fans out

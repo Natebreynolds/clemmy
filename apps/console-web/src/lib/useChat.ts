@@ -7,12 +7,25 @@ export type MessageStatus =
   | 'thinking' | 'complete' | 'failed' | 'stopped'
   | 'awaiting-approval' | 'awaiting-reply' | 'awaiting-plan';
 
+/** One live step in a turn's activity strip — a tool call or a spawned agent. */
+export interface ActivityItem {
+  id: string;
+  kind: 'tool' | 'agent';
+  label: string;
+  detail?: string;
+  provider?: 'claude' | 'codex' | 'glm' | 'unknown';
+  status: 'running' | 'done' | 'failed';
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
   status?: MessageStatus;
   progress?: string;
+  /** Live, accumulated tool calls + spawned agents for THIS turn — the premium
+   *  "watch the team work" strip (vs. a single rolling label). */
+  activity?: ActivityItem[];
   approval?: { subject: string; reason?: string; approvalId?: string | null; pendingAction?: PendingActionApprovalView };
   planProposalId?: string;
   attachmentNames?: string[];
@@ -20,6 +33,52 @@ export interface ChatMessage {
 
 let idSeq = 0;
 const nextId = () => `m${++idSeq}-${performance.now().toFixed(0)}`;
+const EMPTY_ACTIVITY: ActivityItem[] = [];
+
+function providerFromModel(model: string): ActivityItem['provider'] {
+  const id = model.toLowerCase();
+  if (/claude|sonnet|opus|haiku|fable|anthropic/.test(id)) return 'claude';
+  if (/glm|zhipu|zai/.test(id)) return 'glm';
+  if (/gpt|^o[134]|codex|openai/.test(id)) return 'codex';
+  return 'unknown';
+}
+
+/** Fold one harness event into the turn's activity list. Returns the SAME array
+ *  reference when nothing changed (so the caller can skip a re-render). Tools are
+ *  correlated called→returned by name; agents (run_worker) keyed by item. */
+function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
+  const d = (ev.data ?? {}) as Record<string, unknown>;
+  const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
+  const item = typeof d.item === 'string' ? d.item : '';
+  const model = typeof d.model === 'string' ? d.model : '';
+  const toolLabel = tool.replace(/^mcp__[^_]+__/, '').replace(/_/g, ' ');
+  switch (ev.type) {
+    case 'tool_called':
+      if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
+      return [...prev, { id: `t${prev.length}-${tool}`, kind: 'tool', label: toolLabel, status: 'running' }];
+    case 'tool_returned': {
+      for (let i = prev.length - 1; i >= 0; i--) {
+        if (prev[i].kind === 'tool' && prev[i].status === 'running' && prev[i].label === toolLabel) {
+          return prev.map((a, j) => (j === i ? { ...a, status: 'done' } : a));
+        }
+      }
+      return prev;
+    }
+    case 'worker_started': {
+      if (!item) return prev;
+      const role = typeof d.role === 'string' ? d.role : '';
+      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFromModel(model), status: 'running' }];
+    }
+    case 'worker_result':
+      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}`
+        ? { ...a, status: d.ok === false ? 'failed' : 'done', ...(model ? { detail: model, provider: providerFromModel(model) } : {}) }
+        : a));
+    case 'worker_capped':
+      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed' } : a));
+    default:
+      return prev;
+  }
+}
 
 /** A short, human label for an intermediate event (the "working on…" line). */
 function progressLabel(ev: HarnessEvent): string | null {
@@ -133,7 +192,14 @@ export function useChat(options?: UseChatOptions) {
       });
     } else {
       const label = progressLabel(ev);
-      if (label) patch(assistantId, { progress: label });
+      setMessages((prev) => prev.map((m) => {
+        if (m.id !== assistantId) return m;
+        const cur = m.activity ?? EMPTY_ACTIVITY;
+        const activity = reduceActivity(cur, ev);
+        const changed = activity !== cur;
+        if (!changed && !label) return m;
+        return { ...m, ...(changed ? { activity } : {}), ...(label ? { progress: label } : {}) };
+      }));
     }
   }, [patch]);
 

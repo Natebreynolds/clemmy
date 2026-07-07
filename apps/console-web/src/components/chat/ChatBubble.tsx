@@ -2,6 +2,7 @@ import { Check, Send, X } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
+import { TurnActivity } from '@/components/chat/TurnActivity';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import type { ChatMessage } from '@/lib/useChat';
@@ -80,11 +81,18 @@ export function ChatBubble({
             </p>
           )}
 
-          {thinking && message.text && message.progress && (
-            <div className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">
-              <ThinkingDots />
-              <span>{message.progress}</span>
-            </div>
+          {/* Premium activity strip: live tool calls + parallel agents (Claude/Codex/
+              GLM) with status — shown while working AND kept (collapsed) after. Falls
+              back to the single rolling line only before any activity has arrived. */}
+          {message.activity && message.activity.length > 0 ? (
+            <TurnActivity items={message.activity} live={thinking} />
+          ) : (
+            thinking && message.text && message.progress && (
+              <div className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint">
+                <ThinkingDots />
+                <span>{message.progress}</span>
+              </div>
+            )
           )}
 
           {(message.status === 'awaiting-approval' || message.status === 'awaiting-plan') && (

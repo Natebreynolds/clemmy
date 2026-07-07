@@ -167,6 +167,9 @@ export const EVENT_TYPES = [
   // the only signal of worker turn-cap hits — used to recalibrate
   // CLEMMY_WORKER_MAX_TURNS from real data.
   'worker_capped',
+  // A fan-out worker STARTING — lets the chat/board render the specialist as
+  // running the moment it spawns (not only when worker_result lands).
+  'worker_started',
   // NON-halting record that, in YOLO, an approval-shaped ask_user_question was
   // auto-resolved (standing approval) and the run proceeded instead of pausing.
   // Distinct from awaiting_user_input precisely so it does NOT halt the loop.
