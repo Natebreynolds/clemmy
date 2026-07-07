@@ -155,6 +155,13 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   // the message text won't always semantically match. No-op when off (JIT only
   // keeps tools that are in the surface).
   'run_tool_program',
+  // BATCH — the deterministic same-shape-N executor. Same class as run_worker/
+  // run_tool_program: an execution PRIMITIVE the model reaches for on any turn
+  // with 3+ bakeable items, NOT something the message keywords name (live
+  // 2026-07-07: a fresh chat had run_batch pruned off the surface and the model
+  // reported it "not exposed", falling back to run_tool_program). CORE is the
+  // reliable fix.
+  'run_batch',
 ]);
 
 /**

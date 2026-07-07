@@ -28,7 +28,11 @@ const textResult = (text: string) => ({ content: [{ type: 'text' as const, text 
 
 const BatchItemSchema = z.object({
   id: z.string().min(1).max(120).describe('Stable per-item id the ledger reports on (e.g. the recipient domain or record id).'),
-  args: z.record(z.string(), z.unknown()).describe('FULLY materialized tool arguments for this item. Nothing is resolved later — what you write here is exactly what executes.'),
+  // A JSON STRING (not an open object) — the same shape composio_execute_tool
+  // uses. An open z.record does not survive Codex strict-mode structured output
+  // (it serializes to {}), which silently emptied every item's args and looped
+  // the model on a duplicate-empty-args rejection (live 2026-07-07).
+  args: z.string().min(2).describe('This item\'s FULLY materialized tool arguments as a JSON object STRING, e.g. {"keywords":["executive coaching"],"location_name":"United States"}. Nothing is resolved later — exactly what you write here executes.'),
 });
 
 export function registerBatchTools(server: McpServer): void {
@@ -60,17 +64,28 @@ export function registerBatchTools(server: McpServer): void {
       try {
         if (action === 'propose') {
           if (!rawPlan) return textResult('run_batch propose needs a plan.');
+          // Parse each item's JSON-string args into an object up front, with a
+          // precise per-item error so a malformed item is fixable, not a loop.
+          const parsedItems: Array<{ id: string; args: Record<string, unknown> }> = [];
+          const parseErrors: string[] = [];
+          for (const it of rawPlan.items) {
+            let obj: unknown;
+            try { obj = JSON.parse(it.args); } catch { parseErrors.push(`item "${it.id}": args is not valid JSON`); continue; }
+            if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { parseErrors.push(`item "${it.id}": args must be a JSON object`); continue; }
+            parsedItems.push({ id: it.id, args: obj as Record<string, unknown> });
+          }
+          if (parseErrors.length > 0) return textResult(`Plan items have malformed args — fix and re-propose:\n${parseErrors.map((e) => `- ${e}`).join('\n')}`);
           const plan: BatchPlan = {
             tool: rawPlan.tool.trim(),
             composioSlug: rawPlan.composioSlug ?? undefined,
             sideEffect: rawPlan.sideEffect,
             objective: rawPlan.objective,
-            items: rawPlan.items,
+            items: parsedItems,
             concurrency: rawPlan.concurrency ?? undefined,
             haltAfterConsecutiveFailures: rawPlan.haltAfterConsecutiveFailures ?? undefined,
           };
           const errors = validateBatchPlan(plan);
-          if (errors.length > 0) return textResult(`Plan invalid — fix and re-propose:\n${errors.map((e) => `- ${e}`).join('\n')}`);
+          if (errors.length > 0) return textResult(`Plan invalid — DO NOT re-propose the identical plan; change what the errors name first:\n${errors.map((e) => `- ${e}`).join('\n')}`);
           const cert = await certifyBatchPlan(plan);
           if (!cert.allow) {
             return textResult(

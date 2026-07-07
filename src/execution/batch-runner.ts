@@ -124,6 +124,10 @@ export function validateBatchPlan(plan: BatchPlan): string[] {
       else seenIds.add(item.id);
       if (!item || typeof item.args !== 'object' || item.args === null || Array.isArray(item.args)) {
         errors.push(`items[${index}].args must be an object of fully-materialized arguments`);
+      } else if (Object.keys(item.args).length === 0) {
+        // The most common model mistake: putting the value in `id` and leaving
+        // args empty. Name it precisely so it's a one-shot fix, not a loop.
+        errors.push(`items[${index}] ("${item.id ?? ''}") has EMPTY args — put this item's real tool arguments in args (the id is only a label), e.g. {"keywords":["${item.id ?? 'value'}"], …}`);
       } else {
         const sig = JSON.stringify(item.args);
         if (seenArgs.has(sig)) errors.push(`items[${index}] duplicates another item's exact args — a batch must not repeat identical calls`);

@@ -306,6 +306,15 @@ test('MANDATED ⊆ CORE: every mandated tool is in the always-loaded core', () =
   }
 });
 
+test('execution primitives are mandated CORE — never pruned off the surface', () => {
+  // 2026-07-07: run_batch shipped registered but NOT mandated, so a fresh chat
+  // JIT-pruned it and the model reported it "not exposed". Execution primitives
+  // are reached by intent, not message keywords — they MUST survive any JIT.
+  for (const primitive of ['run_worker', 'run_tool_program', 'run_batch']) {
+    assert.ok(TOOL_JIT_MANDATED.has(primitive), `${primitive} must be a mandated execution primitive`);
+  }
+});
+
 test('Claude SDK brain: the agentic profile execution tools survive a worst-case JIT (strand-protection)', async () => {
   // jit-claude-3: the Claude SDK brain reduces its tool surface to CORE + top-K of the
   // AGENTIC profile. Even when NOTHING ranks (zero-score), the execution tools the

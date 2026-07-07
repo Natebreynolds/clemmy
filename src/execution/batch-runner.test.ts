@@ -48,6 +48,12 @@ test('validateBatchPlan: catches the shapes that must never execute', () => {
   assert.ok(validateBatchPlan(dupArgs as never).some((e) => /duplicates another item/.test(e)), 'identical args across items rejected');
   const dupIds = { ...base, items: [{ id: 'a', args: { path: '/tmp/x' } }, { id: 'a', args: { path: '/tmp/y' } }] };
   assert.ok(validateBatchPlan(dupIds as never).some((e) => /duplicate item id/.test(e)));
+  // The loop-causing mistake (2026-07-07): value in id, args left empty. Must
+  // get a precise "EMPTY args" message, not the confusing "duplicate" one.
+  const emptyArgs = { ...base, items: [{ id: 'executive coaching', args: {} }, { id: 'business coaching', args: {} }] };
+  const emptyErrs = validateBatchPlan(emptyArgs as never);
+  assert.ok(emptyErrs.some((e) => /EMPTY args/.test(e)), 'empty args must be named precisely');
+  assert.ok(!emptyErrs.some((e) => /duplicates another/.test(e)), 'empty-args message must win over the duplicate check');
 });
 
 test('runBatchPlan: read batch executes every item, ledger honest, zero model involvement', async () => {

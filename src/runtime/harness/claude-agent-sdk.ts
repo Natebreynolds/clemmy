@@ -375,6 +375,10 @@ export const CLAUDE_AGENT_SDK_FULL_TOOLS = [
   // brain parallelize N independent items instead of processing them sequentially and
   // blowing its per-query turn budget.
   'run_worker',
+  // Deterministic same-shape-N executor — BRAIN ONLY, same rationale as run_worker
+  // (a worker handles ONE item; it never batches). Reason-once/certify-once/execute-
+  // N-deterministically for baked-arg batches (send N emails, update N records).
+  'run_batch',
 ] as const;
 
 /** Scoped agentic surface for a Claude WORKER (one parent-planned item). The

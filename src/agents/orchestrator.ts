@@ -1297,6 +1297,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // Without this the curated surface omitted it and the model self-reported
       // "run_tool_program is not in my tool surface" even with the flag on.
       'run_tool_program',
+      // Deterministic batch executor. SAME omission class as run_tool_program
+      // above: registered in getLocalRuntimeTools but absent from this curated
+      // discovery allowlist, so it never reached the agent and the model
+      // reported run_batch "not exposed" and tunneled through code mode instead
+      // (live 2026-07-07). Mandated CORE keeps it through JIT once it's here.
+      'run_batch',
       // Tasks (writes)
       'task_add',
       'task_update',
