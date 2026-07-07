@@ -1,5 +1,6 @@
 import type { WorkflowStepInput } from '../../memory/workflow-store.js';
 import { getRuntimeEnv } from '../../config.js';
+import { recordSubagentRun, providerClassForModel } from '../../agents/subagent-runs.js';
 import {
   ClaudeAgentSdkToolSurfaceError,
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -212,6 +213,34 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   fullLane?: boolean;
 }): Promise<ClaudeAgentSdkWorkflowStepResult> {
   const fullLane = Boolean(args.fullLane);
+  // Subagent visibility: a workflow STEP (and each forEach item — this runs per
+  // item) IS a specialized agent. Workflow steps run the 'worker' tool profile,
+  // which deliberately EXCLUDES run_worker, so the run_worker choke-point never
+  // sees them — record the step here so the Agents panel populates for workflows.
+  // Fail-open. (Codex/BYO-lane steps that don't take the SDK path are a follow-up.)
+  const stepStartedMs = Date.now();
+  const recordStepAgent = (output: unknown, status: 'ok' | 'error' | 'capped', model?: string): void => {
+    try {
+      const parentRunId = args.runId || args.sessionId;
+      if (!parentRunId) return;
+      const resolvedModel = model ?? args.modelId;
+      recordSubagentRun({
+        id: `step-${args.step.id}-${stepStartedMs}`,
+        parentRunId,
+        parentKind: args.runId ? 'workflow' : 'session',
+        workflowName: args.workflowName,
+        stepId: args.step.id,
+        role: (args.step as { intent?: string }).intent || args.step.id,
+        provider: providerClassForModel(resolvedModel),
+        model: resolvedModel,
+        task: args.step.id,
+        status,
+        output: typeof output === 'string' ? output : JSON.stringify(output ?? ''),
+        startedAt: new Date(stepStartedMs).toISOString(),
+        finishedAt: new Date().toISOString(),
+      });
+    } catch { /* visibility trace is best-effort */ }
+  };
   const stepRunOptions = {
     modelId: args.modelId,
     sessionId: args.sessionId,
@@ -319,6 +348,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     const reason = result.selfStopped
       ? 'Claude stopped this step early: it began repeating actions that looked like a loop (anti-thrash safeguard) before finishing.'
       : 'Claude reached the workflow-step turn budget before finishing this step.';
+    recordStepAgent(reason, 'capped', result.model);
     return {
       output: { blocked: true, reason },
       sdkSessionId: result.sessionId,
@@ -330,6 +360,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     };
   }
   const normalized = normalizeWorkflowStepOutput(result);
+  recordStepAgent(normalized.output, 'ok', result.model);
   return {
     output: normalized.output,
     sdkSessionId: result.sessionId,
