@@ -4759,8 +4759,21 @@ export function isCodexAuthRevoked(err: unknown, message: string): boolean {
   // and retried it, so reaching here with a marker-less 401 means a transient
   // failure — classify it 'model' so it falls through to normal retryable-error
   // handling instead of permanently bricking auth on a one-off blip.
-  if (isCodexAuthDead()) return true;
+  //
+  // The DEAD latch is a fact about CODEX auth, not about this error: while it
+  // is set, every brain's every failure reaches here, and an unconditional
+  // short-circuit rebrands unrelated errors (a BYO Together 402, a GLM 5xx) as
+  // "Codex sign-in expired" — terminal, real cause masked (observed live
+  // 2026-07-07: GLM run hard-failed with the Codex re-auth message while the
+  // actual error was a Together credit-limit 402). Only let the latch decide
+  // when the error itself is auth-shaped; anything else falls through to
+  // normal classification and stays recoverable.
   const status = (err as { status?: number } | null)?.status;
+  const authShaped =
+    status === 401
+    || status === 403
+    || /codex|token_revoked|invalid_grant|refresh_token|oauth/i.test(message);
+  if (isCodexAuthDead() && authShaped) return true;
   return classifyCodexAuthError({ message, status, source: 'model' }) === 'terminal';
 }
 
