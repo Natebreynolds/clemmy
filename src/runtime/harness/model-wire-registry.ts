@@ -227,7 +227,9 @@ const REGISTRY: RegistryRow[] = [
   },
   // ---- Codex (codex_responses) ----------------------------------------------
   {
-    idMatch: /gpt-5|^o[0-9]/i,
+    // ^gpt-[0-9] (not gpt-5) so a FUTURE gpt-6/gpt-7 routes to Codex instead of
+    // silently falling through to the BYO backend; ^codex covers codex-* ids.
+    idMatch: /^gpt-[0-9]|^o[0-9]|^codex/i,
     cap: {
       family: 'gpt-5', apiShape: 'codex_responses',
       contextWindow: 272_000, maxOutput: 128_000, supportsEffort: true,
