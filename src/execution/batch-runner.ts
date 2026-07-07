@@ -140,10 +140,14 @@ export function validateBatchPlan(plan: BatchPlan): string[] {
 
 // ─── Certification judge (ONE model call for the whole plan) ────────────────
 
+// NO length caps on judge text: a verbose-but-valid verdict must never be
+// rejected on cosmetics (live 2026-07-07: sonnet's reason overflowed a .max(400)
+// → schema invalid → "judge unavailable" → send plan failed CLOSED five times).
+// Lengths are clamped in code after parse; the schema only pins the SHAPE.
 const BatchVerdictSchema = z.object({
   allow: z.boolean(),
-  reason: z.string().max(400),
-  concerns: z.array(z.string().max(200)).max(8).nullable().optional(),
+  reason: z.string(),
+  concerns: z.array(z.string()).nullable().optional(),
 });
 
 export interface BatchCertification {
@@ -162,7 +166,7 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
     `SAMPLED PAYLOADS (${sample.length} of ${plan.items.length}):`,
     JSON.stringify(sample, null, 1).slice(0, 12_000),
   ].join('\n');
-  try {
+  const runJudgeOnce = async (): Promise<BatchCertification> => {
     const agent = new Agent<unknown, typeof BatchVerdictSchema>({
       name: 'Batch Plan Judge',
       model: resolveRoleModel('judge').modelId,
@@ -170,6 +174,7 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
         'You certify a BATCH PLAN before deterministic execution: one tool, N pre-baked payloads, executed with no further review.',
         'ALLOW only when the sampled payloads actually accomplish the stated objective and nothing in them looks misdirected: wrong recipients/targets for the objective, placeholder or template-variable text left in ({{name}}, TODO, lorem), payloads inconsistent with each other, or a scope wider than the objective states.',
         'You are the ONLY review these payloads get — when unsure on a write/send plan, set allow=false and say why.',
+        'Keep reason to 1–2 sentences and each concern to one line.',
       ].join(' '),
       outputType: normalizeZodForCodexStrict(BatchVerdictSchema) as typeof BatchVerdictSchema,
     });
@@ -177,7 +182,24 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
     const result = await runner.run(agent, input);
     const final = (result as { finalOutput?: z.infer<typeof BatchVerdictSchema> }).finalOutput;
     if (!final || typeof final.allow !== 'boolean') throw new Error('judge returned no verdict');
-    return { allow: final.allow, reason: final.reason ?? '', concerns: (final.concerns ?? []).filter((c): c is string => typeof c === 'string'), judged: true };
+    // Clamp in code — length is presentation, never validity.
+    return {
+      allow: final.allow,
+      reason: (final.reason ?? '').slice(0, 400),
+      concerns: (final.concerns ?? []).filter((c): c is string => typeof c === 'string').slice(0, 8).map((c) => c.slice(0, 200)),
+      judged: true,
+    };
+  };
+  try {
+    try {
+      return await runJudgeOnce();
+    } catch (firstErr) {
+      // ONE retry before any fail-closed: a schema/transport blip on a single
+      // call must not park an entire approved batch (live 2026-07-07: five
+      // consecutive verdict-shape rejections parked 5 emails).
+      logger.warn({ err: firstErr instanceof Error ? firstErr.message : String(firstErr) }, 'batch certify judge attempt 1 failed — retrying once');
+      return await runJudgeOnce();
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Fail-CLOSED for irreversible plans, advisory for reads (Wave 0 semantics).
