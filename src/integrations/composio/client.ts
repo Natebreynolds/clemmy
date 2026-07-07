@@ -424,12 +424,56 @@ function composioCliOptions(): { apiKey?: string; userId?: string } {
   };
 }
 
-export async function getComposioRuntimeStatus(): Promise<ReturnType<typeof getComposioCredentialStatus> & {
+async function getComposioRuntimeStatusLive(): Promise<ReturnType<typeof getComposioCredentialStatus> & {
   cli: ComposioCliStatus;
 }> {
   const credentials = getComposioCredentialStatus();
   const cli = await getComposioCliStatus(composioCliOptions());
   return { ...credentials, cli };
+}
+
+// ─── Dashboard read caches (stale-while-revalidate) ─────────────────────────
+// The Connect screen fetches status + the toolkit snapshot on EVERY mount and
+// re-polls every 20–30s; both did live upstream work per request (~4.3s each,
+// measured live 2026-07-07) so clicking into Connect sat on a blank pane.
+// SWR semantics: fresh → serve cached; stale → serve cached AND refresh in
+// the background; cold → await one deduped live fetch. Mutations (api-key
+// save, authorize, disconnect, explicit refresh) bust both entries so the UI
+// never shows a connection state older than the user's own last action.
+interface SwrEntry<T> { value: T | null; fetchedAt: number; inflight: Promise<T> | null }
+
+function swrFetch<T>(entry: SwrEntry<T>, ttlMs: number, live: () => Promise<T>): Promise<T> {
+  const age = Date.now() - entry.fetchedAt;
+  const refresh = (): Promise<T> => {
+    entry.inflight ??= live().then(
+      (value) => { entry.value = value; entry.fetchedAt = Date.now(); entry.inflight = null; return value; },
+      (err: unknown) => { entry.inflight = null; throw err; },
+    );
+    return entry.inflight;
+  };
+  if (entry.value !== null && age < ttlMs) return Promise.resolve(entry.value);
+  if (entry.value !== null) {
+    void refresh().catch(() => { /* stale value stays served; next poll retries */ });
+    return Promise.resolve(entry.value);
+  }
+  return refresh();
+}
+
+const COMPOSIO_STATUS_TTL_MS = 45_000;
+const COMPOSIO_SNAPSHOT_TTL_MS = 60_000;
+const statusSwr: SwrEntry<Awaited<ReturnType<typeof getComposioRuntimeStatusLive>>> = { value: null, fetchedAt: 0, inflight: null };
+const snapshotSwr: SwrEntry<ComposioDashboardSnapshot> = { value: null, fetchedAt: 0, inflight: null };
+
+/** Bust the dashboard read caches after any connection-state mutation. */
+export function bustComposioDashboardCaches(): void {
+  statusSwr.value = null; statusSwr.fetchedAt = 0;
+  snapshotSwr.value = null; snapshotSwr.fetchedAt = 0;
+}
+
+export async function getComposioRuntimeStatus(): Promise<ReturnType<typeof getComposioCredentialStatus> & {
+  cli: ComposioCliStatus;
+}> {
+  return swrFetch(statusSwr, COMPOSIO_STATUS_TTL_MS, getComposioRuntimeStatusLive);
 }
 
 /**
@@ -1372,6 +1416,10 @@ export async function searchComposioToolsViaCli(
 }
 
 export async function buildComposioDashboardSnapshot(): Promise<ComposioDashboardSnapshot> {
+  return swrFetch(snapshotSwr, COMPOSIO_SNAPSHOT_TTL_MS, buildComposioDashboardSnapshotLive);
+}
+
+async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSnapshot> {
   const credentials = getComposioCredentialStatus();
   const cli = await getComposioCliStatus(composioCliOptions());
   if (!credentials.enabled) {

@@ -709,6 +709,68 @@ function workflowCertificationFor(def: WorkflowDefinition, workflowSlug: string)
   });
 }
 
+// ─── Workflow list memo ──────────────────────────────────────────────────────
+// certifyWorkflow runs a full dry-run plan with readiness probes; on the list
+// route that was 25 workflows × certification = ~11s of SYNCHRONOUS work per
+// GET (measured live 2026-07-07), which not only made the Automate screen
+// crawl but blocked the event loop so EVERY other request queued behind it.
+// Certification + proof are pure functions of (definition, this workflow's
+// run history), so memoize per workflow keyed on a cheap content hash + the
+// latest run id. A definition edit or a new run changes the key; everything
+// else is a hit.
+const workflowListMemo = new Map<string, { key: string; proof: unknown; certification: ReturnType<typeof workflowCertificationFor> }>();
+
+function djb2(text: string): string {
+  let h = 5381;
+  for (let i = 0; i < text.length; i += 1) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+function memoizedWorkflowListDerivations(
+  entry: { name: string; data: WorkflowDefinition },
+  runRecords: WorkflowRunRecordSummary[],
+  lastRunId: string | null,
+): { proof: unknown; certification: ReturnType<typeof workflowCertificationFor> } {
+  const key = `${djb2(JSON.stringify(entry.data))}::${lastRunId ?? 'none'}`;
+  const hit = workflowListMemo.get(entry.name);
+  if (hit && hit.key === key) return { proof: hit.proof, certification: hit.certification };
+  const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
+  const certification = workflowCertificationFor(entry.data, entry.name);
+  workflowListMemo.set(entry.name, { key, proof, certification });
+  return { proof, certification };
+}
+
+// Warm the memo once, shortly after boot and OFF the request path, so the
+// FIRST Automate/Workflows click doesn't pay the full certification sweep.
+// Spread across the event loop (one workflow per tick) so warming never
+// introduces the very stall it exists to remove. Guard against double-arm
+// (registerConsoleRoutes could in principle be called twice in tests).
+let workflowMemoWarmArmed = false;
+function armWorkflowListMemoWarm(): void {
+  if (workflowMemoWarmArmed) return;
+  workflowMemoWarmArmed = true;
+  const timer = setTimeout(() => {
+    try {
+      const runRecords = readWorkflowRunRecords();
+      const latestByWorkflow = new Map<string, string>();
+      for (const run of runRecords) {
+        if (!latestByWorkflow.has(run.workflow)) latestByWorkflow.set(run.workflow, run.id);
+      }
+      const entries = listWorkflows();
+      const warmNext = (index: number): void => {
+        if (index >= entries.length) return;
+        const entry = entries[index];
+        try {
+          memoizedWorkflowListDerivations(entry, runRecords, latestByWorkflow.get(entry.data.name) ?? latestByWorkflow.get(entry.name) ?? null);
+        } catch { /* per-entry warm is best-effort */ }
+        setImmediate(() => warmNext(index + 1));
+      };
+      warmNext(0);
+    } catch { /* warm pass is purely an optimization */ }
+  }, 20_000);
+  timer.unref?.();
+}
+
 function workflowCertificationSummary(cert: WorkflowCertification) {
   const dryRun = cert.dryRun;
   const codeSteps = dryRun.steps.filter((s) => s.executor === 'call' || s.executor === 'deterministic').length;
@@ -2294,6 +2356,7 @@ export function registerConsoleRoutes(
   // Read-only multi-agent workspace API (roster, canMessage graph, comms,
   // per-agent runs). Shares this function's auth gate.
   registerConsoleAgentsRoutes(app, isAuthorized);
+  armWorkflowListMemoWarm();
 
   /**
    * Serve the Clementine icon for use in the dashboard / favicons.
@@ -3280,8 +3343,7 @@ export function registerConsoleRoutes(
           const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
           const lastRunFailedItems = lastRun ? listFinalFailedItems(entry.name, lastRun.id) : [];
           const lastRunFailedItemStepIds = Array.from(new Set(lastRunFailedItems.map((item) => item.stepId)));
-          const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
-          const certification = workflowCertificationFor(entry.data, entry.name);
+          const { proof, certification } = memoizedWorkflowListDerivations(entry, runRecords, lastRun?.id ?? null);
           return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,

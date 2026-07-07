@@ -61,6 +61,7 @@ import { readEnvFile, writeEnvFile } from '../setup/env-file.js';
 import {
   authorizeToolkit,
   buildComposioDashboardSnapshot,
+  bustComposioDashboardCaches,
   COMPOSIO_AUTH_CONFIGS_URL,
   ComposioNeedsAuthConfigError,
   disconnectToolkit,
@@ -735,6 +736,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         return;
       }
       await saveComposioCredentials(apiKey, userId);
+      bustComposioDashboardCaches();
       res.json({
         ok: true,
         status: getComposioCredentialStatus(),
@@ -759,7 +761,9 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
   app.post('/api/composio/toolkits/:slug/authorize', requireAuth, async (req, res) => {
     const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
     try {
-      res.json(await authorizeToolkit(slug));
+      const authorized = await authorizeToolkit(slug);
+      bustComposioDashboardCaches();
+      res.json(authorized);
     } catch (error) {
       if (error instanceof ComposioNeedsAuthConfigError) {
         res.status(409).json({
@@ -786,6 +790,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
     try {
       await disconnectToolkit(connectionId);
+      bustComposioDashboardCaches();
       res.json({ ok: true });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -794,6 +799,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
 
   app.post('/api/composio/refresh', requireAuth, (_req, res) => {
     resetComposioClient();
+    bustComposioDashboardCaches();
     res.json({ ok: true });
   });
 
@@ -1106,6 +1112,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         return;
       }
       await saveComposioCredentials(apiKey, userId);
+      bustComposioDashboardCaches();
       const msg = validation.result === 'unknown'
         ? `Saved, but ${validation.message ?? 'could not confirm with Composio'}.`
         : 'Composio API key saved. You can connect app toolkits now.';
