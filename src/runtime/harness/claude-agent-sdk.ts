@@ -480,6 +480,22 @@ function claudeSdkNativeMcpEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NATIVE_MCP', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
+/**
+ * ToolSearch adoption (SOTA 2026, [[project_2026_harness_sota_gap]]). DEFAULT OFF —
+ * model-facing, needs a live smoke before default-on. When ON, the user's EXTERNAL
+ * native MCP servers (dataforseo, browsermcp, …) are marked `alwaysLoad: false` so
+ * the SDK DEFERS their tool schemas — the model sees them by name and loads the
+ * full schema on demand via tool search. Two wins at once: (1) token — those large
+ * schemas leave the per-turn prompt; (2) cold-start — a deferred server does NOT
+ * block the `claude` child's startup on connect (alwaysLoad servers "must be present
+ * when the turn-1 prompt is built"). The LOCAL `clementine-local` core stays
+ * alwaysLoad:true (memory/recall/composio_search/notify — the acquisition hatches
+ * must never defer), so the brain never loses tool reachability.
+ */
+export function claudeToolSearchEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CLAUDE_TOOL_SEARCH', 'off') ?? 'off').trim().toLowerCase() === 'on';
+}
+
 /** Match a server name against the scope's allowed slugs (mirrors mcp-servers.ts
  *  serverMatchesAllowedSlugs). Empty/undefined slugs ⇒ match all. */
 function nativeServerMatchesScope(serverName: string, allowedServerSlugs?: string[]): boolean {
@@ -525,11 +541,17 @@ export function buildScopedNativeMcpServers(scopeInput?: string): Record<string,
     if (all.length === 0) return {};
     const scope = resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
     if (scope.allowAll === false && (scope.allowedServerSlugs ?? []).length === 0) return {};
+    const deferExternal = claudeToolSearchEnabled();
     const out: Record<string, McpServerConfig> = {};
     for (const s of all) {
       if (!scope.allowAll && !nativeServerMatchesScope(s.name, scope.allowedServerSlugs)) continue;
       const cfg = toClaudeSdkMcpConfig(s);
-      if (cfg) out[s.name] = cfg;
+      if (!cfg) continue;
+      // ToolSearch: defer external server schemas (surface by name, load on demand)
+      // → smaller prompt + the server doesn't block the child's startup. The local
+      // clementine-local core (built separately) stays alwaysLoad, so acquisition
+      // hatches are always present. Default off until live-smoked.
+      out[s.name] = deferExternal ? { ...cfg, alwaysLoad: false } as McpServerConfig : cfg;
     }
     return out;
   } catch {

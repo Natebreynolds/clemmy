@@ -1173,6 +1173,42 @@ test('buildScopedNativeMcpServers: an SEO turn attaches the native dataforseo MC
   }
 });
 
+test('buildScopedNativeMcpServers: CLEMMY_CLAUDE_TOOL_SEARCH defers external servers (alwaysLoad:false), default keeps them loaded', async () => {
+  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
+  const mcpDir = path.join(TMP_HOME, 'mcp');
+  mkdirSync(mcpDir, { recursive: true });
+  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
+    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
+  }), 'utf-8');
+  invalidateMcpServerDiscoveryCache();
+
+  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
+  const prevTS = process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
+  try {
+    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
+
+    // Default (tool search OFF): external server loads normally (no forced defer).
+    delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
+    const loaded = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
+    assert.ok(loaded.dataforseo, 'attaches for an SEO turn');
+    assert.equal((loaded.dataforseo as any).alwaysLoad, undefined, 'default: not forced to defer');
+
+    // Tool search ON: external server is deferred behind tool search.
+    process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
+    const deferred = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
+    assert.ok(deferred.dataforseo, 'still attaches (discoverable by name)');
+    assert.equal((deferred.dataforseo as any).alwaysLoad, false, 'tool search ⇒ schema deferred / loaded on demand');
+    assert.equal((deferred.dataforseo as any).command, 'npx', 'the rest of the config is preserved');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
+    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
+    if (prevTS === undefined) delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH; else process.env.CLEMMY_CLAUDE_TOOL_SEARCH = prevTS;
+    invalidateMcpServerDiscoveryCache();
+  }
+});
+
 test('buildScopedNativeMcpServers: an EMPTY scope attaches NO external servers (no allowAll over-attach)', async () => {
   const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
   const mcpDir = path.join(TMP_HOME, 'mcp');
