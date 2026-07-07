@@ -1173,7 +1173,7 @@ test('buildScopedNativeMcpServers: an SEO turn attaches the native dataforseo MC
   }
 });
 
-test('buildScopedNativeMcpServers: CLEMMY_CLAUDE_TOOL_SEARCH defers external servers (alwaysLoad:false), default keeps them loaded', async () => {
+test('buildScopedNativeMcpServers: tool-search DEFAULT-ON defers external servers (alwaysLoad:false); =off keeps them loaded', async () => {
   const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
   const mcpDir = path.join(TMP_HOME, 'mcp');
   mkdirSync(mcpDir, { recursive: true });
@@ -1189,18 +1189,19 @@ test('buildScopedNativeMcpServers: CLEMMY_CLAUDE_TOOL_SEARCH defers external ser
     delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
     process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
 
-    // Default (tool search OFF): external server loads normally (no forced defer).
+    // DEFAULT (v1.0 = ON): the external server is deferred behind tool search
+    // (surfaced by name, schema on demand) — still attaches, discoverable.
     delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
-    const loaded = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
-    assert.ok(loaded.dataforseo, 'attaches for an SEO turn');
-    assert.equal((loaded.dataforseo as any).alwaysLoad, undefined, 'default: not forced to defer');
-
-    // Tool search ON: external server is deferred behind tool search.
-    process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
     const deferred = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
     assert.ok(deferred.dataforseo, 'still attaches (discoverable by name)');
-    assert.equal((deferred.dataforseo as any).alwaysLoad, false, 'tool search ⇒ schema deferred / loaded on demand');
+    assert.equal((deferred.dataforseo as any).alwaysLoad, false, 'default-on ⇒ schema deferred / loaded on demand');
     assert.equal((deferred.dataforseo as any).command, 'npx', 'the rest of the config is preserved');
+
+    // Kill-switch =off: external server loads normally (no forced defer).
+    process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'off';
+    const loaded = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
+    assert.ok(loaded.dataforseo, 'attaches for an SEO turn');
+    assert.equal((loaded.dataforseo as any).alwaysLoad, undefined, '=off ⇒ not forced to defer');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
     if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;

@@ -500,7 +500,12 @@ function claudeSdkNativeMcpEnabled(): boolean {
  * must never defer), so the brain never loses tool reachability.
  */
 export function claudeToolSearchEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_TOOL_SEARCH', 'off') ?? 'off').trim().toLowerCase() === 'on';
+  // DEFAULT ON (v1.0): live-validated with ZERO tool-calling regressions — local core
+  // tools (memory/recall/composio_search/sf CLI/notify) are alwaysLoad and never
+  // defer, and external MCP tools (dataforseo, …) are reachable on demand via tool
+  // search in BOTH the chat and workflow lanes. Cuts the per-turn cold-start (deferred
+  // servers don't block the claude child's startup) + trims the prompt. =off reverts.
+  return (getRuntimeEnv('CLEMMY_CLAUDE_TOOL_SEARCH', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
 /** Match a server name against the scope's allowed slugs (mirrors mcp-servers.ts
