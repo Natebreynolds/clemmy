@@ -120,7 +120,9 @@ function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryH
   const emb = health?.embeddings;
   const recall = health?.recall;
   if (!emb) return null;
-  const pct = (v?: number) => `${Math.round((v ?? 0) * 100)}%`;
+  // Clamp at 100 — coverage can transiently exceed 1 (embeddings for rows since
+  // deleted), and "101% notes" reads as a bug.
+  const pct = (v?: number) => `${Math.min(100, Math.round((v ?? 0) * 100))}%`;
   const semanticOn = emb.enabled && !emb.breakerOpen;
   const tone: 'good' | 'warn' | 'neutral' = !emb.enabled ? 'warn' : emb.breakerOpen ? 'warn' : 'good';
   const dot = tone === 'good' ? 'bg-success' : tone === 'warn' ? 'bg-warning' : 'bg-faint';

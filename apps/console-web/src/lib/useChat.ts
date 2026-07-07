@@ -67,10 +67,12 @@ function looksRawError(s: string): boolean {
 
 /** Fold one harness event into the turn's activity list. Returns the SAME array
  *  reference when nothing changed (so the caller can skip a re-render). Tools are
- *  correlated called→returned by name; agents (run_worker) keyed by item. */
-function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
+ *  correlated called→returned by callId when available, falling back to name for
+ *  older events; agents (run_worker) are keyed by item. */
+export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
+  const callId = typeof d.callId === 'string' ? d.callId : typeof d.call_id === 'string' ? d.call_id : '';
   const item = typeof d.item === 'string' ? d.item : '';
   const model = typeof d.model === 'string' ? d.model : '';
   // Server names can contain underscores (mcp__some_server__tool) — a non-greedy
@@ -79,10 +81,16 @@ function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] 
   switch (ev.type) {
     case 'tool_called':
       if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
-      return [...prev, { id: `t${prev.length}-${tool}`, kind: 'tool', label: toolLabel, status: 'running' }];
+      return [...prev, { id: callId ? `t-${callId}` : `t${prev.length}-${tool}`, kind: 'tool', label: toolLabel, status: 'running' }];
     case 'tool_returned': {
       // The backend now carries data.ok — a returned tool can have failed.
       const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
+      if (callId) {
+        const id = `t-${callId}`;
+        if (prev.some((a) => a.kind === 'tool' && a.id === id)) {
+          return prev.map((a) => (a.kind === 'tool' && a.id === id ? { ...a, status } : a));
+        }
+      }
       for (let i = prev.length - 1; i >= 0; i--) {
         if (prev[i].kind === 'tool' && prev[i].status === 'running' && prev[i].label === toolLabel) {
           return prev.map((a, j) => (j === i ? { ...a, status } : a));

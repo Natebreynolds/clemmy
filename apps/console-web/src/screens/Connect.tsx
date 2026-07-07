@@ -25,7 +25,16 @@ import {
 } from '@/lib/connect';
 
 function prettyName(name: string): string {
-  return name.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  // Title-case the slug, then fix the acronyms/brands title-casing mangles
+  // ("Openai Api Key" is not a 1.0 look).
+  const titled = name.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  return titled
+    .replace(/\bOpenai\b/g, 'OpenAI')
+    .replace(/\bApi\b/g, 'API')
+    .replace(/\bUrl\b/g, 'URL')
+    .replace(/\bOauth\b/g, 'OAuth')
+    .replace(/\bGlm\b/g, 'GLM')
+    .replace(/\bZai\b/g, 'Z.ai');
 }
 
 function Section({ icon: Icon, title, subtitle, children, action }: {

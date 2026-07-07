@@ -189,7 +189,10 @@ export function Meetings() {
 
         <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
           {!selected ? (
-            <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">Select a meeting to see the summary</div>
+            <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
+              <Video className="h-6 w-6 text-faint" aria-hidden />
+              <p className="text-body text-muted">Select a meeting to see its summary and action items.</p>
+            </div>
           ) : detail.isLoading ? <Skeleton className="h-64 w-full" /> : (
             <>
               <div className="mb-3 flex justify-end">
@@ -213,7 +216,7 @@ function MeetingRow({ m, selected, onSelect }: { m: MeetingSummary; selected: bo
       <Video className="h-4 w-4 shrink-0 text-muted" aria-hidden />
       <div className="min-w-0 flex-1">
         <div className="truncate text-body text-fg">{m.title || `${m.platform ?? 'Meeting'} call`}</div>
-        <div className="text-caption text-faint">{relativeTime(m.startedAt)}{typeof m.segmentCount === 'number' ? ` · ${m.segmentCount} segments` : ''}</div>
+        <div className="text-caption text-faint">{relativeTime(m.startedAt)}{typeof m.segmentCount === 'number' ? ` · ${m.segmentCount} segment${m.segmentCount === 1 ? '' : 's'}` : ''}</div>
       </div>
       <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
     </button>

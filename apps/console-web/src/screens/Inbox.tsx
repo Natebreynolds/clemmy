@@ -45,6 +45,7 @@ export function Inbox() {
   const approvalRows = approvals.data?.approvals ?? [];
   const runRows = runs.data?.runs ?? [];
   const notifRows = notifications.data?.notifications ?? [];
+  const hasRows = (tab === 'needs' ? approvalRows : tab === 'activity' ? runRows : notifRows).length > 0;
   const unread = notifRows.filter((n) => !n.read).length;
 
   const invalidate = (...keys: string[]) => keys.forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
@@ -108,7 +109,9 @@ export function Inbox() {
         })}
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
+      {/* Hide the reading pane when the current tab has nothing to select — an
+          empty list beside an empty "select an item" box reads as a broken page. */}
+      <div className={cn('grid gap-4', hasRows && 'lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]')}>
         {/* List */}
         <div className="space-y-2">
           {loading && [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
@@ -139,17 +142,19 @@ export function Inbox() {
             )))}
         </div>
 
-        {/* Reading pane */}
-        <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
-          {selApproval && <ApprovalDetail row={selApproval} onApprove={() => onDecide(selApproval.approvalId, 'approve')} onReject={() => onDecide(selApproval.approvalId, 'reject')} />}
-          {selRun && <RunDetail row={selRun} />}
-          {selNotif && <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />}
-          {!selApproval && !selRun && !selNotif && (
-            <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
-              Select an item to see the details
-            </div>
-          )}
-        </div>
+        {/* Reading pane — only rendered when the tab has selectable rows. */}
+        {hasRows && (
+          <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
+            {selApproval && <ApprovalDetail row={selApproval} onApprove={() => onDecide(selApproval.approvalId, 'approve')} onReject={() => onDecide(selApproval.approvalId, 'reject')} />}
+            {selRun && <RunDetail row={selRun} />}
+            {selNotif && <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />}
+            {!selApproval && !selRun && !selNotif && (
+              <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
+                Select an item to see the details
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </Page>
   );

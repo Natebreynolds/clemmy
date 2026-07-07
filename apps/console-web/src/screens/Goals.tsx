@@ -383,7 +383,10 @@ export function Goals() {
                   </div>
                   <div className="mt-2 break-words text-body font-semibold text-fg">{record.draft.objective}</div>
                   {record.draft.missingInputs.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
+                    // Say WHAT these chips are — bare phrases like "Deadline or
+                    // review cadence" read as random tags, not as gaps to fill.
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      <span className="text-caption font-semibold text-warning">Still needs:</span>
                       {record.draft.missingInputs.slice(0, 3).map((item) => (
                         <span key={item} className="rounded-md bg-warning-tint px-2 py-1 text-caption text-warning">{item}</span>
                       ))}

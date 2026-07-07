@@ -89,11 +89,40 @@ function LoopGuidance({
   coordination?: CoordinationPolicySnapshot;
   trend?: AgentSystemTrendSnapshot;
 }) {
+  // Collapsed by default: this is OPERATOR diagnostics (health scores, repair
+  // loops, retry pressure) — useful, but it must not be the first thing a user
+  // wades through to reach their workflows. One quiet summary line, expandable.
+  const [open, setOpen] = useState(false);
   if (recommendations.length === 0 && issueCauses.length === 0 && !interventions && !learning && !coordination && !trend) return null;
+  const attention = (coordination ? 1 : 0) + issueCauses.length + recommendations.length;
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="mb-5 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-left transition-colors hover:bg-subtle cursor-pointer"
+      >
+        <Zap className="h-3.5 w-3.5 shrink-0 text-faint" aria-hidden />
+        <span className="text-caption font-semibold uppercase tracking-wide text-faint">System health</span>
+        {trend && (
+          <StatusPill tone={trendTone(trend.status)}>
+            {trend.status}{trend.recent.length > 0 ? ` · ${trend.recent[trend.recent.length - 1]?.healthScore}/100` : ''}
+          </StatusPill>
+        )}
+        <span className="min-w-0 flex-1 truncate text-caption text-muted">
+          {attention > 0 ? `${attention} thing${attention === 1 ? '' : 's'} worth a look` : 'All quiet'}
+        </span>
+        <span className="shrink-0 text-caption text-faint">details</span>
+      </button>
+    );
+  }
   return (
     <Card className="mb-5 p-4">
-      <div className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
-        <Zap className="h-3.5 w-3.5" aria-hidden /> Loop guidance
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+          <Zap className="h-3.5 w-3.5" aria-hidden /> System health
+        </div>
+        <button type="button" onClick={() => setOpen(false)} className="text-caption text-faint transition-colors hover:text-muted cursor-pointer">hide</button>
       </div>
       {trend && (
         <div className="mb-3 rounded-md border border-border bg-surface p-3">
