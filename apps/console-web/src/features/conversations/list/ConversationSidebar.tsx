@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Search, Plus, Archive, X } from 'lucide-react';
+import { Search, Plus, Archive, X, PanelLeftClose } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/cn';
@@ -10,7 +10,7 @@ import { groupSessions, collectTags } from '../lib/groupSessions';
 import { ConversationListItem } from './ConversationListItem';
 import type { SessionFilters } from '../types';
 
-export function ConversationSidebar() {
+export function ConversationSidebar({ onCollapse }: { onCollapse?: () => void } = {}) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const mutations = useSessionMutations();
@@ -61,9 +61,22 @@ export function ConversationSidebar() {
   return (
     <aside className="flex h-full w-[300px] shrink-0 flex-col border-r border-border bg-surface">
       <div className="space-y-2 border-b border-border p-3">
-        <Button className="w-full" onClick={() => navigate('/chat', { state: { newChat: Date.now() } })}>
-          <Plus className="h-4 w-4" /> New chat
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button className="min-w-0 flex-1" onClick={() => navigate('/chat', { state: { newChat: Date.now() } })}>
+            <Plus className="h-4 w-4" /> New chat
+          </Button>
+          {onCollapse && (
+            <button
+              type="button"
+              title="Hide chat history"
+              aria-label="Hide chat history"
+              onClick={onCollapse}
+              className="shrink-0 rounded-md p-2 text-muted transition-colors hover:bg-subtle hover:text-fg cursor-pointer"
+            >
+              <PanelLeftClose className="h-4 w-4" aria-hidden />
+            </button>
+          )}
+        </div>
         <div className="flex items-center gap-2 rounded-md border border-border bg-canvas px-2.5">
           <Search className="h-4 w-4 shrink-0 text-faint" aria-hidden />
           <input

@@ -5,6 +5,21 @@ import { cn } from '@/lib/cn';
 import { originMeta } from '../lib/origin';
 import type { Session } from '../types';
 
+/** One-line preview hygiene: previews are raw message text, which for assistant
+ *  replies can open with markdown ("## Heading", "**bold**", backticks) — noise
+ *  in a truncated single line. Strip the syntax, keep the words. */
+function stripMarkdown(text: string | null | undefined): string {
+  if (!text) return '';
+  return text
+    .replace(/```[a-z]*\n?/gi, '')       // fence markers
+    .replace(/^#{1,6}\s+/gm, '')          // heading hashes
+    .replace(/\*\*([^*]+)\*\*/g, '$1')    // bold
+    .replace(/`([^`]+)`/g, '$1')          // inline code
+    .replace(/^\s*[-*]\s+/gm, '')         // list bullets
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function relativeTime(iso: string): string {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return '';
@@ -92,7 +107,7 @@ export function ConversationListItem({ session, actions }: { session: Session; a
         </div>
         <div className="mt-0.5 flex items-center gap-2 pr-6">
           <span className="min-w-0 flex-1 truncate text-caption text-muted">
-            {session.preview || (session.origin !== 'desktop' ? meta.label : 'No messages yet')}
+            {stripMarkdown(session.preview) || (session.origin !== 'desktop' ? meta.label : 'No messages yet')}
           </span>
         </div>
         {session.tags.length > 0 && (
