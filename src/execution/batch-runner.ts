@@ -249,6 +249,19 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
     const results = await Promise.all(wave.map((item) => runItem(item)));
     for (const outcome of results) {
       outcomes.push(outcome);
+      // Live progress for the chat activity strip: authoritative counts so the
+      // UI renders a real meter, not a guess. Every item for normal batches;
+      // throttled to every 5th (plus failures + the final item) on huge ones.
+      const done = outcomes.length;
+      const failedSoFar = outcomes.filter((o) => !o.ok).length;
+      if (plan.items.length <= 60 || !outcome.ok || done % 5 === 0 || done === plan.items.length) {
+        try {
+          appendEvent({
+            sessionId, turn: 0, role: 'system', type: 'batch_progress',
+            data: { batchId, done, total: plan.items.length, failed: failedSoFar, itemId: outcome.id, ok: outcome.ok },
+          });
+        } catch { /* telemetry never blocks */ }
+      }
       if (outcome.ok) {
         consecutiveFailures = 0;
       } else {

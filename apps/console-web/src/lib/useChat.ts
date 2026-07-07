@@ -10,11 +10,15 @@ export type MessageStatus =
 /** One live step in a turn's activity strip — a tool call or a spawned agent. */
 export interface ActivityItem {
   id: string;
-  kind: 'tool' | 'agent';
+  kind: 'tool' | 'agent' | 'batch';
   label: string;
   detail?: string;
   provider?: 'claude' | 'codex' | 'glm' | 'unknown';
   status: 'running' | 'done' | 'failed';
+  /** Client-clock start, for the live per-row elapsed timer while running. */
+  startedAt?: number;
+  /** kind 'batch' only: live meter state from authoritative batch_progress events. */
+  batch?: { done: number; total: number; failed: number };
 }
 
 export interface ChatMessage {
@@ -65,10 +69,46 @@ function looksRawError(s: string): boolean {
   return s.length > 200 || /at\s+\w+\s+\(|stack|ECONN|ETIMEDOUT|\{"/.test(s);
 }
 
+/** The one salient thing this call is ABOUT — recipient, keyword, path, query —
+ *  so the strip narrates "sending email → paul@…" instead of a bare wrench name.
+ *  Best-effort over the event's truncated args preview; '' when nothing salient. */
+export function salientArgDetail(argsRaw: unknown): string {
+  if (typeof argsRaw !== 'string' || !argsRaw) return '';
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(argsRaw) as Record<string, unknown>; } catch { return ''; }
+  // composio_execute_tool nests the real payload under `arguments` (a JSON string).
+  if (typeof parsed.arguments === 'string') {
+    try { parsed = { ...parsed, ...(JSON.parse(parsed.arguments) as Record<string, unknown>) }; } catch { /* keep outer */ }
+  }
+  const SALIENT_KEYS = ['to', 'recipient', 'recipient_email', 'recipients', 'subject', 'keyword', 'keywords', 'query', 'q', 'path', 'url', 'target', 'domain', 'name', 'title'];
+  for (const key of SALIENT_KEYS) {
+    const v = parsed[key];
+    const text = typeof v === 'string' ? v : Array.isArray(v) ? v.filter((x) => typeof x === 'string').join(', ') : '';
+    if (text.trim()) return text.trim().slice(0, 64);
+  }
+  return '';
+}
+
+/** Human label for a tool call: composio calls read as their inner slug
+ *  ("outlook send email"), MCP calls drop the server prefix, underscores drop. */
+function humanToolLabel(tool: string, argsRaw: unknown): string {
+  if (tool === 'composio_execute_tool' && typeof argsRaw === 'string') {
+    try {
+      const slug = (JSON.parse(argsRaw) as { tool_slug?: unknown }).tool_slug;
+      if (typeof slug === 'string' && slug) return slug.replace(/_/g, ' ').toLowerCase();
+    } catch { /* fall through */ }
+  }
+  // `server__tool` names render as "server · tool"; `mcp__server__tool` drops
+  // the mcp prefix first. Single underscores become spaces.
+  const stripped = tool.replace(/^mcp__/, '');
+  return stripped.split('__').map((part) => part.replace(/_/g, ' ')).filter(Boolean).join(' · ');
+}
+
 /** Fold one harness event into the turn's activity list. Returns the SAME array
  *  reference when nothing changed (so the caller can skip a re-render). Tools are
  *  correlated called→returned by callId when available, falling back to name for
- *  older events; agents (run_worker) are keyed by item. */
+ *  older events; agents (run_worker) are keyed by item; run_batch renders as ONE
+ *  live meter row driven by authoritative batch_progress counts. */
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] {
   const d = (ev.data ?? {}) as Record<string, unknown>;
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
@@ -77,12 +117,46 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   const model = typeof d.model === 'string' ? d.model : '';
   // Server names can contain underscores (mcp__some_server__tool) — a non-greedy
   // `.+?` strips the whole `mcp__…__` prefix; `[^_]+` stopped at the first `_`.
-  const toolLabel = tool.replace(/^mcp__.+?__/, '').replace(/_/g, ' ');
+  const toolLabel = humanToolLabel(tool, d.args);
   switch (ev.type) {
-    case 'tool_called':
+    case 'batch_started': {
+      const batchId = typeof d.batchId === 'string' ? d.batchId : `${prev.length}`;
+      const total = typeof d.items === 'number' ? d.items : 0;
+      const slugRaw = typeof d.slug === 'string' && d.slug ? d.slug : typeof d.tool === 'string' ? d.tool : 'items';
+      const verb = d.sideEffect === 'send' ? 'Sending' : d.sideEffect === 'write' ? 'Writing' : 'Fetching';
+      const label = `${verb} ${total} × ${slugRaw.replace(/^mcp__.+?__/, '').replace(/_/g, ' ').toLowerCase()}`;
+      return [...prev, { id: `b-${batchId}`, kind: 'batch', label, status: 'running', startedAt: Date.now(), batch: { done: 0, total, failed: 0 } }];
+    }
+    case 'batch_progress': {
+      const id = `b-${typeof d.batchId === 'string' ? d.batchId : ''}`;
+      if (!prev.some((a) => a.kind === 'batch' && a.id === id)) return prev;
+      const done = typeof d.done === 'number' ? d.done : 0;
+      const total = typeof d.total === 'number' ? d.total : 0;
+      const failed = typeof d.failed === 'number' ? d.failed : 0;
+      const itemId = typeof d.itemId === 'string' ? d.itemId : '';
+      return prev.map((a) => (a.kind === 'batch' && a.id === id ? { ...a, batch: { done, total, failed }, ...(itemId ? { detail: itemId } : {}) } : a));
+    }
+    case 'batch_completed': {
+      const id = `b-${typeof d.batchId === 'string' ? d.batchId : ''}`;
+      const failed = typeof d.failed === 'number' ? d.failed : 0;
+      const halted = d.halted === true;
+      return prev.map((a) => (a.kind === 'batch' && a.id === id
+        ? {
+            ...a,
+            status: failed > 0 || halted ? 'failed' : 'done',
+            detail: undefined,
+            batch: a.batch ? { ...a.batch, done: typeof d.succeeded === 'number' ? (d.succeeded as number) + failed : a.batch.done, failed } : a.batch,
+          }
+        : a));
+    }
+    case 'tool_called': {
       if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
-      return [...prev, { id: callId ? `t-${callId}` : `t${prev.length}-${tool}`, kind: 'tool', label: toolLabel, status: 'running' }];
+      if (d.batchMode === true) return prev; // batch items render as ONE live meter row, not N tool rows
+      const detail = salientArgDetail(d.args);
+      return [...prev, { id: callId ? `t-${callId}` : `t${prev.length}-${tool}`, kind: 'tool', label: toolLabel, ...(detail ? { detail } : {}), startedAt: Date.now(), status: 'running' }];
+    }
     case 'tool_returned': {
+      if (d.batchMode === true) return prev; // counted via batch_progress
       // The backend now carries data.ok — a returned tool can have failed.
       const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
       if (callId) {

@@ -31,3 +31,41 @@ test('reduceActivity falls back to label matching for legacy tool return events 
 
   assert.equal(activity[0].status, 'failed');
 });
+
+test('reduceActivity: run_batch renders as ONE live meter row; per-item batchMode tool events are suppressed', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('batch_started', { batchId: 'b1', items: 18, slug: 'OUTLOOK_SEND_EMAIL', sideEffect: 'send' }));
+  assert.equal(a.length, 1);
+  assert.equal(a[0].kind, 'batch');
+  assert.match(a[0].label, /Sending 18 × outlook send email/);
+  assert.deepEqual(a[0].batch, { done: 0, total: 18, failed: 0 });
+
+  // Per-item plumbing events must NOT add rows.
+  a = reduceActivity(a, ev('tool_called', { tool: 'composio_execute_tool', callId: 'c1', batchMode: true, args: '{}' }));
+  a = reduceActivity(a, ev('tool_returned', { tool: 'composio_execute_tool', callId: 'c1', batchMode: true, ok: true }));
+  assert.equal(a.length, 1, 'batch item events must not create tool rows');
+
+  a = reduceActivity(a, ev('batch_progress', { batchId: 'b1', done: 12, total: 18, failed: 1, itemId: 'lowryinc.com', ok: true }));
+  assert.deepEqual(a[0].batch, { done: 12, total: 18, failed: 1 });
+  assert.equal(a[0].detail, 'lowryinc.com');
+
+  a = reduceActivity(a, ev('batch_completed', { batchId: 'b1', total: 18, succeeded: 17, failed: 1, halted: false }));
+  assert.equal(a[0].status, 'failed', 'any failed item surfaces as a failed batch row');
+  assert.equal(a[0].batch?.failed, 1);
+});
+
+test('reduceActivity: tool rows carry the salient target and a composio call reads as its slug', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('tool_called', {
+    tool: 'composio_execute_tool',
+    callId: 'c9',
+    args: JSON.stringify({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: 'paul@lowryinc.com', subject: 'Hi' }) }),
+  }));
+  assert.equal(a[0].label, 'outlook send email', 'composio calls read as their inner slug');
+  assert.equal(a[0].detail, 'paul@lowryinc.com', 'the salient target is narrated');
+  assert.ok(typeof a[0].startedAt === 'number');
+
+  a = reduceActivity(a, ev('tool_called', { tool: 'dataforseo__serp_organic_live_advanced', callId: 'c10', args: JSON.stringify({ keyword: 'executive coaching' }) }));
+  assert.equal(a[1].label, 'dataforseo · serp organic live advanced', 'server__tool renders as server · tool');
+  assert.equal(a[1].detail, 'executive coaching');
+});

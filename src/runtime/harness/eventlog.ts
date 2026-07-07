@@ -175,6 +175,7 @@ export const EVENT_TYPES = [
   // with honest counts. The loop makes NO model calls, so these events are the
   // primary visibility into what it did.
   'batch_started',
+  'batch_progress',
   'batch_item_failed',
   'batch_completed',
   // NON-halting record that, in YOLO, an approval-shaped ask_user_question was

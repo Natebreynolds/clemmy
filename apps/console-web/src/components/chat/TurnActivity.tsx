@@ -1,12 +1,14 @@
 /**
  * TurnActivity — the premium "watch the team work" strip inside an assistant
- * message. While a turn runs it shows the live sequence of tool calls and the
- * parallel agents it spawned (Claude / Codex / GLM dots + live status), so the
- * wait becomes visible progress instead of a dead "Still working…". After the
- * turn it collapses to a one-line summary you can expand.
+ * message. While a turn runs it shows the live sequence of tool calls (with
+ * WHAT each call is about — recipient, keyword, path — and a ticking elapsed
+ * timer), the parallel agents it spawned (Claude / Codex / GLM dots + live
+ * status), and any run_batch as a single live progress meter ("Sending 18 ×
+ * outlook send email ▓▓▓░ 12/18 · 0 failed"). After the turn it collapses to
+ * a one-line summary you can expand.
  */
-import { useState } from 'react';
-import { Wrench, Users, Check, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Wrench, Users, Check, X, Zap } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
 
@@ -25,21 +27,70 @@ function StatusIcon({ status }: { status: ActivityItem['status'] }) {
   return <Check className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden />;
 }
 
-function summarize(toolCount: number, agentCount: number): string {
+function summarize(toolCount: number, agentCount: number, batchCount: number): string {
   const parts: string[] = [];
   if (agentCount) parts.push(`${agentCount} agent${agentCount > 1 ? 's' : ''}`);
+  if (batchCount) parts.push(`${batchCount} batch${batchCount > 1 ? 'es' : ''}`);
   if (toolCount) parts.push(`${toolCount} tool${toolCount > 1 ? 's' : ''}`);
   return parts.length ? `Used ${parts.join(' · ')}` : 'Activity';
 }
 
+function elapsedLabel(startedAt: number | undefined, now: number): string {
+  if (!startedAt) return '';
+  const s = Math.max(0, Math.round((now - startedAt) / 1000));
+  if (s < 1) return '';
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60 ? ` ${s % 60}s` : ''}`;
+}
+
+/** One run_batch as a live meter: label, thin progress bar, honest counts. */
+function BatchRow({ a, now, live }: { a: ActivityItem; now: number; live: boolean }) {
+  const b = a.batch ?? { done: 0, total: 0, failed: 0 };
+  const pct = b.total > 0 ? Math.min(100, Math.round((b.done / b.total) * 100)) : 0;
+  const running = live && a.status === 'running';
+  return (
+    <li className="flex flex-col gap-1 py-0.5 text-caption">
+      <div className="flex items-center gap-2">
+        <Zap className="h-3 w-3 shrink-0 text-primary" aria-hidden />
+        <span className={cn('min-w-0 flex-1 truncate', running ? 'text-fg' : 'text-muted')}>{a.label}</span>
+        <span className="shrink-0 tabular-nums text-faint">
+          {b.done}/{b.total}
+          {b.failed > 0 && <span className="text-danger"> · {b.failed} failed</span>}
+          {running && elapsedLabel(a.startedAt, now) && <span> · {elapsedLabel(a.startedAt, now)}</span>}
+        </span>
+        <StatusIcon status={a.status} />
+      </div>
+      <div className="ml-5 flex items-center gap-2">
+        <div className="h-1 flex-1 overflow-hidden rounded-full bg-border/60" role="progressbar" aria-valuenow={b.done} aria-valuemin={0} aria-valuemax={b.total}>
+          <div
+            className={cn('h-full rounded-full transition-all duration-300', a.status === 'failed' ? 'bg-danger' : 'bg-primary', running && 'animate-pulse')}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+        {running && a.detail && <span className="max-w-40 shrink-0 truncate text-faint">→ {a.detail}</span>}
+      </div>
+    </li>
+  );
+}
+
 export function TurnActivity({ items, live }: { items: ActivityItem[]; live: boolean }) {
   const [open, setOpen] = useState(false);
+  // Tick once a second while anything is live-running so elapsed timers and the
+  // header stay honest; completely quiescent (no interval) otherwise.
+  const anyRunning = live && items.some((a) => a.status === 'running');
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!anyRunning) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [anyRunning]);
+
   if (items.length === 0) return null;
 
   // Turn's over → a still-'running' row reads as done (no perpetual spinners).
   const view = live ? items : items.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const } : a));
   const agents = view.filter((a) => a.kind === 'agent');
   const tools = view.filter((a) => a.kind === 'tool');
+  const batches = view.filter((a) => a.kind === 'batch');
   const runningAgents = agents.filter((a) => a.status === 'running').length;
 
   // Finished turn, collapsed: a quiet one-line summary.
@@ -51,7 +102,7 @@ export function TurnActivity({ items, live }: { items: ActivityItem[]; live: boo
         className="mt-2.5 flex items-center gap-2 border-t border-border/60 pt-2 text-caption text-faint transition-colors hover:text-muted"
       >
         <Users className="h-3.5 w-3.5" aria-hidden />
-        <span>{summarize(tools.length, agents.length)}</span>
+        <span>{summarize(tools.length, agents.length, batches.length)}</span>
         <span aria-hidden>· show</span>
       </button>
     );
@@ -71,17 +122,27 @@ export function TurnActivity({ items, live }: { items: ActivityItem[]; live: boo
         </div>
       )}
       <ul className="flex max-h-52 flex-col gap-1 overflow-y-auto">
-        {view.map((a) => (
-          <li key={a.id} className="flex items-center gap-2 text-caption">
-            {a.kind === 'agent' ? (
-              <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
-            ) : (
-              <Wrench className="h-3 w-3 shrink-0 text-faint" aria-hidden />
-            )}
-            <span className={cn('min-w-0 flex-1 truncate', a.status === 'running' ? 'text-fg' : 'text-muted')}>{a.label}</span>
-            <StatusIcon status={a.status} />
-          </li>
-        ))}
+        {view.map((a) => {
+          if (a.kind === 'batch') return <BatchRow key={a.id} a={a} now={now} live={live} />;
+          const running = live && a.status === 'running';
+          const elapsed = running ? elapsedLabel(a.startedAt, now) : '';
+          return (
+            <li key={a.id} className="flex items-center gap-2 text-caption">
+              {a.kind === 'agent' ? (
+                <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
+              ) : (
+                <Wrench className="h-3 w-3 shrink-0 text-faint" aria-hidden />
+              )}
+              <span className={cn('min-w-0 truncate', running ? 'text-fg' : 'text-muted')}>{a.label}</span>
+              {a.detail && a.kind === 'tool' && (
+                <span className="min-w-0 flex-1 truncate text-faint">→ {a.detail}</span>
+              )}
+              {!a.detail && <span className="flex-1" />}
+              {elapsed && <span className="shrink-0 tabular-nums text-faint">{elapsed}</span>}
+              <StatusIcon status={a.status} />
+            </li>
+          );
+        })}
       </ul>
       {!live && open && (
         <button type="button" onClick={() => setOpen(false)} className="mt-1 text-caption text-faint transition-colors hover:text-muted">hide</button>
