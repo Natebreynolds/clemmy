@@ -32,8 +32,9 @@ import pino from 'pino';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { STATE_DIR } from '../memory/db.js';
 import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
-import { readWorkflow, writeWorkflow, type WorkflowDefinition, type WorkflowStepInput, type WorkflowStepInputBinding, type WorkflowStepOutputContract } from '../memory/workflow-store.js';
-import { checkWorkflowForWrite } from './workflow-enforce.js';
+import { readWorkflow, type WorkflowDefinition, type WorkflowStepInput, type WorkflowStepInputBinding, type WorkflowStepOutputContract } from '../memory/workflow-store.js';
+import { prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
+import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
 
 const logger = pino({ name: 'clementine-next.workflow-diagnosis' });
 
@@ -317,13 +318,13 @@ export function detectBlockedSteps(
 
 // ─── 2. Diagnose ─────────────────────────────────────────────────────
 
-const FIX_KINDS = ['edit_step', 'edit_contract', 'edit_input', 'edit_binding', 'reconnect_service', 'adjust_input', 'manual'] as const;
+const FIX_KINDS = ['edit_step', 'edit_contract', 'edit_input', 'edit_binding', 'uncodify_step', 'reconnect_service', 'adjust_input', 'manual'] as const;
 
 export const WorkflowDiagnosisSchema = z.object({
   summary: z.string().describe('One or two plain-English sentences: what happened, no jargon, no JSON.'),
   rootCause: z.string().describe('Why the step blocked — the specific cause (wrong tool/query, expired connection, missing input, ambiguous instruction, an output contract that does not match the real data).'),
   fix: z.object({
-    kind: z.enum(FIX_KINDS).describe('edit_step = rewrite the step prompt (incl. correcting the tool/query NAMED in the prompt); edit_contract = the step produced valid data but its output contract is WRONG; edit_input = the step\'s typed input BINDING is wrong (points at a missing source, or a required input needs a default); edit_binding = the step\'s allowed-tools SURFACE is too narrow/wrong (the tool it needs is not exposed); reconnect_service = a connection needs reauth (cannot auto-fix); adjust_input = a run input value is missing (human must supply it); manual = needs human judgment.'),
+    kind: z.enum(FIX_KINDS).describe('edit_step = rewrite the step prompt (incl. correcting the tool/query NAMED in the prompt); edit_contract = the step produced valid data but its output contract is WRONG; edit_input = the step\'s typed input BINDING is wrong (points at a missing source, or a required input needs a default); edit_binding = the step\'s allowed-tools SURFACE is too narrow/wrong (the tool it needs is not exposed); uncodify_step = a previously codified direct call should be restored to its original model step; reconnect_service = a connection needs reauth (cannot auto-fix); adjust_input = a run input value is missing (human must supply it); manual = needs human judgment.'),
     stepId: z.string().describe('The step the fix targets.'),
     description: z.string().describe('Plain-English description of the proposed fix, suitable to show the user.'),
     newStepPrompt: z.string().nullable().describe('For kind=edit_step ONLY: the COMPLETE replacement prompt for the step, fixing the root cause (e.g. correct the Composio tool/query, name the explicit access method like the local `sf` CLI, clarify the missing input). null otherwise.'),
@@ -331,7 +332,7 @@ export const WorkflowDiagnosisSchema = z.object({
     newInputsJson: z.string().nullable().describe('For kind=edit_input ONLY: a JSON object string mapping input NAME → binding, e.g. {"url":{"from":"input.url"}} or {"region":{"from":"steps.gather.output.region"}} or {"limit":{"default":50}}. Binding keys: from (input.<k> | steps.<id>.output[.path] | item[.path]), default, type, required. Only reference inputs/steps that exist. null otherwise.'),
     newAllowedToolsJson: z.string().nullable().describe('For kind=edit_binding ONLY: a JSON array string of the CORRECTED allowed-tools surface for the step, e.g. ["composio_gmail_search","composio_gmail_send"]. Use when the step is locked to a surface that omits a tool it genuinely needs. null otherwise.'),
     service: z.string().nullable().describe('For kind=reconnect_service: the service that needs reauthorization (e.g. "Google Drive", "Outlook"). null otherwise.'),
-    autoApplicable: z.boolean().describe('true ONLY when the fix is a safe structured edit: edit_step (drop-in prompt), edit_contract (genuine contract/data mismatch), edit_input (a binding that points at an existing source), or edit_binding (a real tool the step needs). false for reconnect/adjust_input/manual.'),
+    autoApplicable: z.boolean().describe('true ONLY when the fix is a safe structured edit: edit_step (drop-in prompt), edit_contract (genuine contract/data mismatch), edit_input (a binding that points at an existing source), edit_binding (a real tool the step needs), or uncodify_step when the step has codifiedFrom metadata. false for reconnect/adjust_input/manual.'),
   }),
   confidence: z.enum(['high', 'medium', 'low']),
 });
@@ -351,6 +352,7 @@ const DOCTOR_INSTRUCTIONS = [
   '- The step RAN and produced VALID, real data, but its declared output contract is itself WRONG — it requires a key the real data legitimately does not always carry (e.g. requires "phone" but this record has none), demands a min_items count higher than a legitimate result (7 items when 7 is a real, complete answer), or fixes a type/shape the data never actually matches: kind=edit_contract. Provide newOutputContractJson = the CORRECTED contract (loosen only what false-fails legitimate data). Do NOT loosen a contract to hide a genuinely empty or garbage output — that is a real failure, not a contract bug. When in doubt between edit_step and edit_contract, prefer edit_step (fix the work, not the check). autoApplicable=true.',
   '- The step failed because a declared INPUT BINDING is wrong — it points at a source that does not exist (a step id or input name that is not there), or a required input has no value and needs a sensible default: kind=edit_input. Provide newInputsJson = the corrected input map for the step. Only reference inputs/steps that ACTUALLY EXIST in this workflow (you are given the steps). If the input genuinely needs a value only the human can supply (an API key, a person to email), use kind=adjust_input (autoApplicable=false) instead. autoApplicable=true when the binding fix references an existing source.',
   '- The step failed because its allowed-tools SURFACE is too narrow — the error says a tool it needs is not available/exposed, AND that tool is a real one the step should be allowed to call: kind=edit_binding. Provide newAllowedToolsJson = the corrected surface (the existing tools PLUS the one it needs). NOTE: if the fix is to call a DIFFERENT tool or correct a tool NAME written in the prompt, that is kind=edit_step (rewrite the prompt), not edit_binding — edit_binding only widens/corrects the allow-list. autoApplicable=true.',
+  '- If the step is a codified direct call that used to be an LLM/model step (the step has codifiedFrom metadata), and the direct call itself is brittle/wrong or fails its contract while the original model step could adapt: kind=uncodify_step. Leave all new* JSON fields null. autoApplicable=true ONLY when codifiedFrom exists.',
   '- Genuinely needs human judgment: kind=manual. autoApplicable=false.',
   'When kind=edit_step, newStepPrompt MUST be the COMPLETE replacement prompt for that step (not a diff), preserving the original intent and output contract, fixing only what caused the block. Set autoApplicable=true only then.',
   'Set confidence honestly. If the reason is vague, say so and prefer a conservative fix.',
@@ -432,6 +434,29 @@ function diagnoseRuntimeToolSurfaceBlock(input: DiagnoseInput): WorkflowDiagnosi
   };
 }
 
+function diagnoseCodifiedStepFailure(input: DiagnoseInput): WorkflowDiagnosis | null {
+  const primary = input.blockedSteps[0];
+  if (!primary) return null;
+  const step = input.workflow.steps.find((s) => s.id === primary.stepId);
+  if (!step?.codifiedFrom?.prompt || !step.call?.tool) return null;
+  return {
+    summary: `The direct coded call for "${primary.stepId}" failed, so Clementine should restore the original adaptive step.`,
+    rootCause: `Step "${primary.stepId}" was auto-codified from a model step into direct call "${step.call.tool}", and the coded path failed or tripped its contract.`,
+    fix: {
+      kind: 'uncodify_step',
+      stepId: primary.stepId,
+      description: `Restore "${primary.stepId}" to the original model step preserved by codifiedFrom, removing the direct call.`,
+      newStepPrompt: null,
+      newOutputContractJson: null,
+      newInputsJson: null,
+      newAllowedToolsJson: null,
+      service: null,
+      autoApplicable: true,
+    },
+    confidence: 'high',
+  };
+}
+
 /** T3.2 — cross-family veto on an AUTO-applied heal ("judge ≠ brain family;
  *  never self-grade"). The Doctor's `autoApplicable` verdict is produced by
  *  the same fast model that wrote the rewrite; before the runner auto-applies
@@ -470,6 +495,7 @@ export async function judgeHealCrossFamily(
         'For an output-contract change: approve ONLY when the new contract still verifies the step\'s real deliverable and the change reflects LEGITIMATE data variation (a key the data genuinely does not always carry, a count that was set too high) — NOT a loosening that would hide a genuinely empty or garbage output. A contract change that removes the only check catching bad data must be REJECTED.',
         'For an input-binding change: approve ONLY when the new binding points at a source that plausibly supplies the right value for this step, or a default that is a reasonable, safe value — NOT a guess that would feed the step wrong data.',
         'For an allowed-tools change: approve ONLY when the added tool is one the step genuinely needs for its stated job and does not newly enable an unintended external action (a send/publish the step should not perform).',
+        'For uncodify_step: approve ONLY when the step was previously auto-codified and the fix restores the preserved model step instead of weakening the workflow.',
         'When uncertain, REJECT — a rejected fix is offered to the human instead of lost.',
       ].join('\n'),
       model: judge.modelId,
@@ -501,6 +527,8 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
   if (!primary) return null;
   const runtimeDiagnosis = diagnoseRuntimeToolSurfaceBlock({ ...input, blockedSteps });
   if (runtimeDiagnosis) return runtimeDiagnosis;
+  const codifiedDiagnosis = diagnoseCodifiedStepFailure({ ...input, blockedSteps });
+  if (codifiedDiagnosis) return codifiedDiagnosis;
   const step = input.workflow.steps.find((s) => s.id === primary.stepId);
   const agent = new Agent({
     name: 'WorkflowDoctor',
@@ -658,7 +686,7 @@ export function revertWorkflowFix(id: string): ApplyResult {
   try { backup = JSON.parse(fs.readFileSync(file, 'utf8')) as FixBackup; }
   catch { return { ok: false, message: `Heal backup "${id}" is unreadable.` }; }
   if (!readWorkflow(backup.workflow)) return { ok: false, message: `Workflow "${backup.workflow}" no longer exists.` };
-  writeWorkflow(backup.workflow, backup.priorDefinition);
+  writeWorkflowAndSyncTriggers(backup.workflow, backup.priorDefinition);
   try { fs.unlinkSync(file); } catch { /* best-effort */ }
   logger.info({ workflow: backup.workflow, step: backup.stepId, healId: id }, 'self-heal: reverted workflow fix');
   return { ok: true, message: `Reverted "${backup.workflow}" to the version before the auto-fix on step "${backup.stepId}".` };
@@ -687,6 +715,7 @@ export function fixIsAutoApplicable(fix: WorkflowDiagnosis['fix']): boolean {
   if (fix.kind === 'edit_contract') return Boolean(sanitizeOutputContract(fix.newOutputContractJson));
   if (fix.kind === 'edit_input') return Boolean(sanitizeStepInputs(fix.newInputsJson));
   if (fix.kind === 'edit_binding') return Boolean(sanitizeAllowedTools(fix.newAllowedToolsJson));
+  if (fix.kind === 'uncodify_step') return true;
   return false;
 }
 
@@ -792,6 +821,9 @@ export function applyProposedFix(id: string): ApplyResult {
   const def = entry.data;
   const idx = def.steps.findIndex((s) => s.id === fix.stepId);
   if (idx < 0) return { ok: false, message: `Step "${fix.stepId}" not found in "${fix.workflow}".` };
+  if (d.fix.kind === 'uncodify_step' && !def.steps[idx].codifiedFrom?.prompt) {
+    return { ok: false, message: `Step "${fix.stepId}" has no codifiedFrom metadata to restore.` };
+  }
 
   const editStep = (s: WorkflowStepInput): WorkflowStepInput => {
     switch (d.fix.kind) {
@@ -804,6 +836,16 @@ export function applyProposedFix(id: string): ApplyResult {
         return { ...s, inputs: { ...(s.inputs ?? {}), ...sanitizeStepInputs(d.fix.newInputsJson) } };
       case 'edit_binding':
         return { ...s, allowedTools: sanitizeAllowedTools(d.fix.newAllowedToolsJson) as string[] };
+      case 'uncodify_step': {
+        const codifiedFrom = s.codifiedFrom;
+        if (!codifiedFrom?.prompt) return s;
+        const { call: _call, codifiedFrom: _codifiedFrom, ...rest } = s;
+        return {
+          ...rest,
+          prompt: codifiedFrom.prompt,
+          ...(codifiedFrom.allowedTools ? { allowedTools: codifiedFrom.allowedTools } : {}),
+        };
+      }
       default:
         return s;
     }
@@ -812,19 +854,20 @@ export function applyProposedFix(id: string): ApplyResult {
     ...def,
     steps: def.steps.map((s, i) => (i === idx ? editStep(s) : s)),
   };
-  const check = checkWorkflowForWrite(updated);
-  if (!check.ok) {
-    return { ok: false, message: `The proposed fix would fail workflow validation; not applied.`, errors: check.errors };
+  const prepared = prepareWorkflowUpdateForWrite(def, updated, { allowInvalidDisabled: false });
+  if (prepared.status === 'invalid') {
+    return { ok: false, message: `The proposed fix would fail workflow validation; not applied.`, errors: prepared.errors };
   }
   // Snapshot the PRIOR definition first so a bad heal is reversible (#7).
   const backup = recordFixBackup(fix.workflow, fix.stepId, def, d.fix.description);
-  writeWorkflow(fix.workflow, updated);
+  writeWorkflowAndSyncTriggers(fix.workflow, prepared.def);
   dismissProposedFix(id);
   logger.info({ workflow: fix.workflow, step: fix.stepId, fixId: id, kind: d.fix.kind, backupId: backup?.id }, 'self-heal: applied workflow fix');
   const revertHint = backup ? ` If it doesn't help, revert with \`revert heal ${backup.id}\`.` : '';
+  const readinessHint = prepared.status === 'readiness_gaps' ? ` ${renderReadinessHold(fix.workflow)}` : '';
   return {
     ok: true,
-    message: `Applied the fix to "${fix.workflow}" · step "${fix.stepId}". Re-run the workflow when ready.${revertHint}`,
+    message: `Applied the fix to "${fix.workflow}" · step "${fix.stepId}". Re-run the workflow when ready.${readinessHint}${revertHint}`,
     backupId: backup?.id,
   };
 }

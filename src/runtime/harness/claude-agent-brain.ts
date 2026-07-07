@@ -448,7 +448,7 @@ function renderCapabilityBoundary(mode: ClaudeAgentBrainMode): string {
       'CAPABILITY — you are the AGENTIC Clementine brain on the user\'s Claude subscription. You CAN execute tools to complete the request: run shell commands (run_shell_command), discover + execute Composio actions (composio_search_tools → composio_execute_tool), write files, and chain multi-step work — exactly like the Codex harness.',
       '- CONVERSE FIRST on an AMBIGUOUS or big multi-step request: recall what you can, then ask ONE plain clarifying question with `ask_user_question` about the choice that genuinely changes the work (e.g. new topic vs. resume prior work, which source/destination) and WAIT for the answer. Do NOT decide you "know enough" and run the whole task unasked. Once aligned — or when the request is already unambiguous — proceed AUTONOMOUSLY to completion; do not stop again mid-run. (A pure question or a read-only lookup: just do it, no clarifying question.)',
       '- Every tool call runs through Clementine\'s safety gates (grounding, goal-fidelity, execution-wrap, destination, duplicate-write, loop-guard). Irreversible/external actions (sends, batch external writes) PAUSE for the user\'s approval BEFORE they run. Do the work — the gates + approval protect it; you do not need to ask permission in prose first.',
-      '- SURFACE NOTE: external vendor MCP servers (e.g. a native dataforseo/firecrawl/supabase MCP) are NOT attached on this lane — only Composio + the local CLI are. Reach those capabilities via composio_search_tools → composio_execute_tool (e.g. a DATAFORSEO_* slug) or run_shell_command (the vendor CLI). If a skill or instruction says "use the <X> MCP", use the Composio slug or CLI equivalent here instead of concluding it is unavailable. Use ONE surface per capability — do not pull the same data from two surfaces in the same run.',
+      '- SURFACE NOTE: the intent-matched native vendor MCP servers for THIS turn (e.g. a native dataforseo/firecrawl/supabase MCP) ARE attached on this lane — their tool schemas load on demand via tool search (surfaced by name, fetched when you call them). When a skill or instruction says "use the <X> MCP", use that native server/tool directly. Fall back to composio_search_tools → composio_execute_tool (e.g. a DATAFORSEO_* slug) or run_shell_command (the vendor CLI) only when no native server is attached for the need. Use ONE surface per capability — do not pull the same data from two surfaces in the same run.',
       '- Before a MUTATING external write (a composio send/create, a batch), call execution_create FIRST (title, objective, successCriteria), then proceed — the harness requires an active execution lane for those.',
       '- A large tool result may be clipped with a `[digest: … tool_output_query("call_…")]` footer — call tool_output_query or recall_tool_result to pull the records. Never report stored data as unavailable.',
       '- Do NOT claim you ran a command, sent a message, or wrote a file unless a tool result in THIS run proves it. If a tool result begins with `ERROR:`, treat that item as failed and say so.',
@@ -1119,7 +1119,9 @@ export async function respondViaClaudeAgentSdkBrain(
     // (persistSession:false) tracks progress in its own reply, so we hand that back
     // and tell it to finish the REST without redoing. Bounded by count + total
     // wall-clock; the per-query tool-ceiling/wall-clock stay the hard backstops.
-    if (result.limitHit && sdkAutoContinueEnabled()) {
+    if (result.limitHit && !result.selfStopped && sdkAutoContinueEnabled()) {
+      // !selfStopped: an anti-thrash loop-stop must not auto-continue (re-running
+      // it just re-loops — restores the guard the 33-shell-call incident added).
       const autoStart = Date.now();
       let autoContinues = 0;
       // Re-inject any SKILL bodies loaded this run into the continuation. The stateless
@@ -1154,6 +1156,7 @@ export async function respondViaClaudeAgentSdkBrain(
       };
       while (
         result.limitHit
+        && !result.selfStopped // a continuation that anti-thrash loop-STOPPED must NOT be re-run (would re-loop)
         && result.toolUses.length > 0
         && autoContinues < maxSdkAutoContinues()
         && (Date.now() - autoStart) < sdkAutoContinueWallMs()

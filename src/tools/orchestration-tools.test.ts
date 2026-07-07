@@ -3,7 +3,7 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -23,9 +23,11 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }> };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
 
 const handlers = new Map<string, ToolHandler>();
+const schemas = new Map<string, Record<string, { parse?: (value: unknown) => unknown }>>();
 registerOrchestrationTools({
   tool(name: string, _description: string, _schema: unknown, handler: ToolHandler) {
     handlers.set(name, handler);
+    schemas.set(name, _schema as Record<string, { parse?: (value: unknown) => unknown }>);
   },
 } as never);
 
@@ -52,9 +54,33 @@ function workflowUpdate(): ToolHandler {
   return handler;
 }
 
+function workflowGet(): ToolHandler {
+  const handler = handlers.get('workflow_get');
+  assert.ok(handler, 'workflow_get registered');
+  return handler;
+}
+
+function workflowApplyContractFixes(): ToolHandler {
+  const handler = handlers.get('workflow_apply_contract_fixes');
+  assert.ok(handler, 'workflow_apply_contract_fixes registered');
+  return handler;
+}
+
 function workflowSetEnabled(): ToolHandler {
   const handler = handlers.get('workflow_set_enabled');
   assert.ok(handler, 'workflow_set_enabled registered');
+  return handler;
+}
+
+function workflowCertify(): ToolHandler {
+  const handler = handlers.get('workflow_certify');
+  assert.ok(handler, 'workflow_certify registered');
+  return handler;
+}
+
+function workflowResourceProposals(): ToolHandler {
+  const handler = handlers.get('workflow_resource_proposals');
+  assert.ok(handler, 'workflow_resource_proposals registered');
   return handler;
 }
 
@@ -66,6 +92,12 @@ function workflowContractProposals(): ToolHandler {
 
 function resultText(result: ToolResult): string {
   return result.content.map((item) => item.text).join('\n');
+}
+
+function workflowRunFiles(): string[] {
+  return existsSync(WORKFLOW_RUNS_DIR)
+    ? readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))
+    : [];
 }
 
 function withEnv(over: Record<string, string | undefined>, fn: () => Promise<void> | void): Promise<void> | void {
@@ -173,6 +205,126 @@ test('workflow_create accepts an inputs SCHEMA as a JSON string and persists it'
   assert.deepEqual(entry!.data.inputs, { url: { type: 'string', description: 'Site to audit' } });
 });
 
+test('workflow_create/update tool schemas accept step input contracts for codification', () => {
+  const step = {
+    id: 'pull',
+    prompt: 'Fetch the domain rank overview.',
+    allowedTools: ['dataforseo_domain_rank_overview'],
+    inputs: { target: { from: 'input.domain', type: 'string' } },
+    output: { type: 'object', required_keys: ['metrics'] },
+    sideEffect: 'read',
+  };
+
+  const createSchema = schemas.get('workflow_create');
+  const updateSchema = schemas.get('workflow_update');
+  assert.ok(createSchema?.steps?.parse, 'workflow_create steps schema registered');
+  assert.ok(updateSchema?.steps?.parse, 'workflow_update steps schema registered');
+  assert.doesNotThrow(() => createSchema.steps.parse([step]));
+  assert.doesNotThrow(() => updateSchema.steps.parse([step]));
+});
+
+test('workflow_create saves authored step input contracts as direct call nodes when codifiable', async () => {
+  const result = await workflowCreate()({
+    name: 'codified-create-flow',
+    description: 'Pull domain rank metrics with a direct tool call.',
+    steps: [{
+      id: 'pull',
+      prompt: 'Fetch the domain rank overview.',
+      allowedTools: ['dataforseo_domain_rank_overview'],
+      inputs: { target: { from: 'input.domain', type: 'string' } },
+      output: { type: 'object', required_keys: ['metrics'] },
+      sideEffect: 'read',
+    }],
+    inputs: JSON.stringify({ domain: { type: 'string', description: 'Target domain' } }),
+  });
+
+  assert.match(resultText(result), /Created workflow "codified-create-flow"/);
+  const saved = readWorkflow('codified-create-flow')!.data.steps[0];
+  assert.equal(saved.call?.tool, 'dataforseo_domain_rank_overview');
+  assert.deepEqual(saved.call?.args, { target: '{{input.domain}}' });
+  assert.equal(saved.codifiedFrom?.prompt, 'Fetch the domain rank overview.');
+});
+
+test('workflow_create accepts durable resources separately from run inputs and workflow_get surfaces them', async () => {
+  const resources = {
+    lead_sheet: {
+      kind: 'sheet',
+      label: 'Lead sheet',
+      toolkit: 'googlesheets',
+      resourceId: 'sheet-123',
+      name: 'Daily leads',
+    },
+  };
+  const result = await workflowCreate()({
+    name: 'resource-wf',
+    description: 'Summarize a bound lead sheet.',
+    steps: [{ id: 'summarize', prompt: 'Summarize the bound lead sheet.', sideEffect: 'read' }],
+    resources: JSON.stringify(resources),
+  });
+  assert.match(resultText(result), /Created workflow "resource-wf"/);
+
+  const entry = readWorkflow('resource-wf');
+  assert.ok(entry, 'workflow persisted');
+  assert.equal(entry!.data.resources?.lead_sheet.resourceId, 'sheet-123');
+  assert.equal(entry!.data.resources?.lead_sheet.toolkit, 'googlesheets');
+  assert.equal(entry!.data.inputs, undefined);
+
+  const text = resultText(await workflowGet()({ name: 'resource-wf' }));
+  assert.match(text, /Resources:/);
+  assert.match(text, /lead_sheet: sheet/);
+  assert.match(text, /googlesheets -> sheet-123/);
+  assert.match(text, /Inputs:\n  \(none\)/);
+});
+
+test('workflow_run rejects incomplete required resource bindings without queueing', async () => {
+  writeWorkflow('resource-gap-wf', {
+    name: 'resource-gap-wf',
+    description: 'Summarize a bound lead sheet.',
+    enabled: true,
+    trigger: { manual: true },
+    resources: {
+      lead_sheet: {
+        id: 'lead_sheet',
+        kind: 'sheet',
+        label: 'Lead sheet',
+        toolkit: 'googlesheets',
+      },
+    },
+    steps: [{ id: 'summarize', prompt: 'Summarize the bound lead sheet.', sideEffect: 'read' }],
+  });
+
+  const text = resultText(await workflowRun()({ name: 'resource-gap-wf', inputs: '{}' }));
+
+  assert.match(text, /Workflow certification: NEEDS RESOURCE BINDING/);
+  assert.match(text, /Lead sheet: bind a concrete spreadsheet/);
+  assert.match(text, /Next command: workflow_update name="resource-gap-wf" resources=/);
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
+test('workflow_resource_proposals reports binding next actions for durable resources', async () => {
+  writeWorkflow('resource-proposal-wf', {
+    name: 'resource-proposal-wf',
+    description: 'Summarize a lead sheet.',
+    enabled: false,
+    trigger: { manual: true },
+    resources: {
+      lead_sheet: {
+        id: 'lead_sheet',
+        kind: 'sheet',
+        label: 'Lead sheet',
+      },
+    },
+    steps: [{ id: 'summarize', prompt: 'Summarize the bound lead sheet.', sideEffect: 'read' }],
+  });
+
+  const text = resultText(await workflowResourceProposals()({ name: 'resource-proposal-wf' }));
+
+  assert.match(text, /Workflow resource binding: resource-proposal-wf/);
+  assert.match(text, /Lead sheet \(sheet\) — needs_surface/);
+  assert.match(text, /Recommended: Google Sheets/);
+  assert.match(text, /Next: workflow_update name=<workflow> resources=/);
+});
+
 test('workflow_create syncs event triggers immediately after saving', async () => {
   const result = await workflowCreate()({
     name: 'instant-event-wf',
@@ -222,6 +374,61 @@ test('workflow_create accepts a call-only read step and queues a creation test',
   };
   assert.equal(run.workflow, 'call-grounded-wf');
   assert.equal(run.status, 'creation_test');
+});
+
+test('workflow_create tolerates model-emitted null optionals on authored steps', async () => {
+  const soql = 'SELECT Id, Name, StageName, Amount, CloseDate FROM Opportunity WHERE IsClosed = false ORDER BY CloseDate ASC LIMIT 50';
+  const result = await workflowCreate()({
+    name: 'Monday Salesforce Opportunity Report',
+    description: 'Every Monday at 8 AM PT, read open Salesforce opportunities and produce a report.',
+    trigger_schedule: '0 8 * * 1',
+    trigger_timezone: 'America/Los_Angeles',
+    steps: [
+      {
+        id: 'pull_open_opportunities',
+        prompt: null,
+        project: null,
+        dependsOn: null,
+        model: null,
+        intent: null,
+        maxTurns: null,
+        forEach: null,
+        call: { tool: 'SALESFORCE_RUN_SOQL_QUERY', args: { query: soql } },
+        deterministic: null,
+        allowedTools: ['composio_execute_tool'],
+        sideEffect: 'read',
+        requiresApproval: false,
+        approvalPreview: null,
+        inputs: null,
+        output: { type: 'object', required_keys: ['records'] },
+      },
+      {
+        id: 'summarize_opportunity_report',
+        prompt: 'Summarize total pipeline, overdue close dates, next-step gaps, largest opportunities, stage mix, owner mix, and recommended follow-up priorities.',
+        dependsOn: ['pull_open_opportunities'],
+        call: null,
+        deterministic: null,
+        allowedTools: [],
+        sideEffect: 'read',
+        requiresApproval: false,
+        approvalPreview: null,
+        output: { type: 'object', required_keys: ['summary', 'priorities'] },
+      },
+    ],
+    synthesis_prompt: 'Return the final Salesforce opportunity report for the workflow activity/results view.',
+  });
+  const text = resultText(result);
+  assert.match(text, /Created workflow "Monday Salesforce Opportunity Report"/);
+  assert.doesNotMatch(text, /declares call but no tool/);
+
+  const saved = readWorkflow('monday-salesforce-opportunity-report')!.data;
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.trigger.schedule, '0 8 * * 1');
+  assert.equal(saved.trigger.timezone, 'America/Los_Angeles');
+  assert.equal(saved.steps[0].prompt, '');
+  assert.deepEqual(saved.steps[0].call?.args, { query: soql });
+  assert.equal(saved.steps[1].call, undefined);
+  assert.equal(saved.steps[1].allowedTools, undefined);
 });
 
 test('workflow_create keeps external-read workflows disabled when smoke inputs are missing', async () => {
@@ -354,6 +561,37 @@ test('workflow_create persists step intent for intent-routed worker models', asy
   assert.equal(readWorkflow('intent-wf')!.data.steps[0].intent, 'design');
 });
 
+test('workflow_create persists workflow and step local project bindings', async () => {
+  const result = await workflowCreate()({
+    name: 'project-bound-wf',
+    description: 'Work across local repos.',
+    project: 'clementine-next',
+    steps: [
+      { id: 'inspect', prompt: 'Inspect {{project.path}}.' },
+      { id: 'patch_other', prompt: 'Patch the sibling repo.', project: 'sibling-app', dependsOn: ['inspect'] },
+    ],
+  });
+
+  assert.match(resultText(result), /Created workflow "project-bound-wf"/);
+  const saved = readWorkflow('project-bound-wf')!.data;
+  assert.equal(saved.project, 'clementine-next');
+  assert.equal(saved.steps[0].project, undefined);
+  assert.equal(saved.steps[1].project, 'sibling-app');
+});
+
+test('workflow_create portable_models strips exact model pins and keeps intents', async () => {
+  const result = await workflowCreate()({
+    name: 'portable-create-wf',
+    description: 'Draft a portable memo.',
+    portable_models: true,
+    steps: [{ id: 'draft', prompt: 'Draft the memo.', model: 'claude-opus-4-8', intent: 'writing' }],
+  });
+  assert.match(resultText(result), /portable intent routing `?"?writing"?`?|portable intent routing "writing"/);
+  const step = readWorkflow('portable-create-wf')!.data.steps[0];
+  assert.equal(step.model, undefined);
+  assert.equal(step.intent, 'writing');
+});
+
 test('autoTagStepsWithModelRoleIntents fills blank step intents from worker rules only', () => {
   const steps = [
     { id: 'design', prompt: 'Design the hero section.' },
@@ -438,6 +676,289 @@ test('workflow_create auto-repairs a missing summary output contract and pinned 
   assert.equal(saved.goal?.objective, 'Fetch the prospect site and return a summary.');
 });
 
+test('workflow_create keeps workflows with readiness gaps disabled', async () => {
+  const result = await workflowCreate()({
+    name: 'gapful-send-wf',
+    description: 'Send outreach.',
+    steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
+  });
+  const text = resultText(result);
+  assert.match(text, /saved DISABLED pending readiness answers/);
+  assert.match(text, /readiness gap test/i);
+  assert.equal(readWorkflow('gapful-send-wf')!.data.enabled, false);
+});
+
+test('workflow_create and workflow_update surface the visual contract to authoring agents', async () => {
+  const created = await workflowCreate()({
+    name: 'visual-contract-authoring-wf',
+    description: 'Render a client report with a missing local skill.',
+    steps: [{ id: 'render', prompt: 'Render the client report.', usesSkill: 'missing-report-skill' }],
+  });
+  const createText = resultText(created);
+  assert.match(createText, /Workflow visual contract: BLOCKED/);
+  assert.match(createText, /\[BLOCK\] Tool readiness/);
+  assert.match(createText, /Recommended contract fixes:/);
+  assert.match(createText, /Install or replace skill missing-report-skill/);
+  assert.match(createText, /missing-report-skill/);
+  assert.equal(readWorkflow('visual-contract-authoring-wf')?.data.steps[0].usesSkill, 'missing-report-skill');
+
+  writeWorkflow('visual-contract-update-wf', {
+    name: 'visual-contract-update-wf',
+    description: 'Draft a note.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{ id: 'draft', prompt: 'Draft an internal note.' }],
+  });
+
+  const updated = await workflowUpdate()({
+    name: 'visual-contract-update-wf',
+    steps: [{ id: 'render', prompt: 'Render the client report.', usesSkill: 'missing-report-skill' }],
+  });
+  const updateText = resultText(updated);
+  assert.match(updateText, /Workflow visual contract: BLOCKED/);
+  assert.match(updateText, /\[BLOCK\] Tool readiness/);
+  assert.match(updateText, /Recommended contract fixes:/);
+  assert.match(updateText, /Install or replace skill missing-report-skill/);
+  assert.match(updateText, /missing-report-skill/);
+});
+
+test('workflow_apply_contract_fixes applies safe model-portability and judge-gate remediations', async () => {
+  writeWorkflow('visual-fix-wf', {
+    name: 'visual-fix-wf',
+    description: 'Draft a weekly client memo.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{ id: 'draft', prompt: 'Draft the weekly client memo.', model: 'claude-opus-4-8' }],
+  });
+
+  const result = await workflowApplyContractFixes()({ name: 'visual fix' });
+  const text = resultText(result);
+
+  assert.match(text, /visual contract fixes applied/);
+  assert.match(text, /Replaced pinned model "claude-opus-4-8"/);
+  assert.match(text, /Pinned workflow goal/);
+  assert.match(text, /Workflow visual contract: TRUSTED/);
+
+  const saved = readWorkflow('visual-fix-wf')!.data;
+  assert.equal(saved.steps[0].model, undefined);
+  assert.equal(saved.goal?.objective, 'Draft a weekly client memo.');
+});
+
+test('workflow_apply_contract_fixes reports manual-only missing skill blockers without masking them', async () => {
+  writeWorkflow('missing-skill-contract-fix-wf', {
+    name: 'missing-skill-contract-fix-wf',
+    description: 'Render a report with a missing skill.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{ id: 'render', prompt: 'Render the report.', usesSkill: 'missing-report-skill' }],
+  });
+
+  const result = await workflowApplyContractFixes()({
+    name: 'missing skill contract',
+    fixes: ['install_skill'],
+  });
+  const text = resultText(result);
+
+  assert.match(text, /no automatic visual contract fixes/i);
+  assert.match(text, /Install or replace skill missing-report-skill/);
+  assert.match(text, /Missing skills must be installed locally/);
+  assert.match(text, /Workflow visual contract: BLOCKED/);
+  assert.equal(readWorkflow('missing-skill-contract-fix-wf')!.data.steps[0].usesSkill, 'missing-report-skill');
+});
+
+test('workflow_apply_contract_fixes requires explicit stable keys before making write fan-out resumable', async () => {
+  writeWorkflow('fanout-contract-fix-wf', {
+    name: 'fanout-contract-fix-wf',
+    description: 'Process each record.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'list',
+        prompt: 'Return records to update.',
+        sideEffect: 'read',
+        output: { type: 'array', min_items: { '': 1 } },
+      },
+      {
+        id: 'upsert',
+        prompt: 'Update each record.',
+        dependsOn: ['list'],
+        forEach: 'list',
+        sideEffect: 'write',
+      },
+    ],
+  });
+
+  const skipped = await workflowApplyContractFixes()({
+    name: 'fanout contract fix',
+    fixes: ['make_fanout_resumable'],
+  });
+  assert.match(resultText(skipped), /assume_stable_item_keys=true/);
+  assert.equal(readWorkflow('fanout-contract-fix-wf')!.data.steps[1].forEachNewOnly, undefined);
+
+  const applied = await workflowApplyContractFixes()({
+    name: 'fanout contract fix',
+    fixes: ['make_fanout_resumable'],
+    assume_stable_item_keys: true,
+  });
+  const text = resultText(applied);
+  assert.match(text, /visual contract fixes applied/);
+  assert.match(text, /Marked write fan-out step "upsert" as forEachNewOnly/);
+  assert.equal(readWorkflow('fanout-contract-fix-wf')!.data.steps[1].forEachNewOnly, true);
+});
+
+test('workflow_set_enabled refuses unresolved readiness gaps', async () => {
+  writeWorkflow('gapful-enable-wf', {
+    name: 'gapful-enable-wf',
+    description: 'Send outreach.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
+  } as never);
+
+  const result = await workflowSetEnabled()({ name: 'gapful-enable-wf', enabled: true });
+  const text = resultText(result);
+  assert.match(text, /was NOT enabled/);
+  assert.match(text, /readiness gap test/i);
+  assert.equal(readWorkflow('gapful-enable-wf')!.data.enabled, false);
+});
+
+test('workflow_update saves enabled workflows DISABLED when readiness gaps are introduced', async () => {
+  writeWorkflow('gapful-update-wf', {
+    name: 'gapful-update-wf',
+    description: 'Draft internal notes.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'draft', prompt: 'Draft a short internal note.' }],
+  } as never);
+
+  const result = await workflowUpdate()({
+    name: 'gapful-update-wf',
+    steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
+  });
+  const text = resultText(result);
+  assert.match(text, /stayed DISABLED/);
+  assert.match(text, /readiness gap test/i);
+  assert.equal(readWorkflow('gapful-update-wf')!.data.enabled, false);
+});
+
+test('workflow lifecycle routes create/update/enable/run through shared workflow paths', async () => {
+  const trigger = [{ type: 'crm.lifecycle.created', dedupeKey: 'lead-{{payload.leadId}}' }];
+  const inputs = JSON.stringify({ leadId: { type: 'string', description: 'Lead id to process' } });
+  const created = await workflowCreate()({
+    name: 'lifecycle-shared-wf',
+    description: 'Prepare outreach for a CRM lead.',
+    inputs,
+    trigger_events: trigger,
+    steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list for {{input.leadId}}.' }],
+  });
+  assert.match(resultText(created), /saved DISABLED pending readiness answers/);
+  assert.equal(readWorkflow('lifecycle-shared-wf')!.data.enabled, false);
+  assert.deepEqual(fireWorkflowSystemEvent('crm.lifecycle.created', { leadId: 'pre-enable' }), []);
+
+  const updated = await workflowUpdate()({
+    name: 'lifecycle-shared-wf',
+    steps: [{ id: 'draft', prompt: 'Draft an internal note for {{input.leadId}}.' }],
+  });
+  assert.match(resultText(updated), /Workflow "lifecycle-shared-wf" updated/);
+  assert.equal(readWorkflow('lifecycle-shared-wf')!.data.enabled, false);
+
+  const enabled = await workflowSetEnabled()({ name: 'lifecycle-shared-wf', enabled: true });
+  assert.match(resultText(enabled), /now approved/);
+  assert.equal(readWorkflow('lifecycle-shared-wf')!.data.enabled, true);
+
+  const manual = await workflowRun()({
+    name: 'lifecycle-shared-wf',
+    inputs: JSON.stringify({ leadId: 'manual-1' }),
+  });
+  assert.match(resultText(manual), /Queued "lifecycle-shared-wf"/);
+
+  const fired = fireWorkflowSystemEvent('crm.lifecycle.created', { leadId: 'event-1' })
+    .filter((r) => r.workflowName === 'lifecycle-shared-wf');
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].status, 'queued');
+
+  const runs = readdirSync(WORKFLOW_RUNS_DIR)
+    .filter((entry) => entry.endsWith('.json'))
+    .map((entry) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, entry), 'utf-8')) as {
+      workflow: string;
+      status: string;
+      inputs: Record<string, string>;
+    })
+    .filter((run) => run.workflow === 'lifecycle-shared-wf')
+    .sort((a, b) => a.inputs.leadId.localeCompare(b.inputs.leadId));
+  assert.deepEqual(
+    runs.map((run) => ({ status: run.status, leadId: run.inputs.leadId })),
+    [
+      { status: 'queued', leadId: 'event-1' },
+      { status: 'queued', leadId: 'manual-1' },
+    ],
+  );
+});
+
+test('workflow_certify gives one-door next action for creation-test input gaps', async () => {
+  writeWorkflow('certify-inputs-wf', {
+    name: 'certify-inputs-wf',
+    description: 'Inspect a website.',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: { url: { type: 'string', description: 'URL to inspect' } },
+    steps: [{ id: 'fetch', prompt: 'Fetch the website data for {{input.url}}.', allowedTools: ['web_search'] }],
+  });
+
+  const result = await workflowCertify()({ name: 'certify-inputs-wf' });
+  const text = resultText(result);
+
+  assert.match(text, /Workflow certification: NEEDS CREATION INPUTS/);
+  assert.match(text, /Missing creation-test inputs:\n- url/);
+  assert.match(text, /Next command: workflow_certify name="certify-inputs-wf" test_inputs=/);
+  assert.equal(readWorkflow('certify-inputs-wf')!.data.enabled, false);
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
+test('workflow_certify points creation-test-ready drafts at workflow_set_enabled', async () => {
+  writeWorkflow('certify-test-wf', {
+    name: 'certify-test-wf',
+    description: 'Inspect a website.',
+    enabled: false,
+    trigger: { manual: true },
+    inputs: { url: { type: 'string', description: 'URL to inspect' } },
+    steps: [{ id: 'fetch', prompt: 'Fetch the website data for {{input.url}}.', allowedTools: ['web_search'] }],
+  });
+
+  const result = await workflowCertify()({
+    name: 'certify-test-wf',
+    test_inputs: JSON.stringify({ url: 'https://example.com' }),
+  });
+  const text = resultText(result);
+
+  assert.match(text, /Workflow certification: NEEDS CREATION TEST/);
+  assert.match(text, /Can start creation test: yes/);
+  assert.match(text, /Next command: workflow_set_enabled name="certify-test-wf" enabled=true test_inputs=/);
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
+test('workflow_certify points live workflows with inputs at workflow_run', async () => {
+  writeWorkflow('certify-run-wf', {
+    name: 'certify-run-wf',
+    description: 'Draft lead note.',
+    enabled: true,
+    trigger: { manual: true },
+    inputs: { leadId: { type: 'string', description: 'Lead id' } },
+    steps: [{ id: 'draft', prompt: 'Draft an internal note for {{input.leadId}}.' }],
+  });
+
+  const result = await workflowCertify()({
+    name: 'certify-run-wf',
+    inputs: JSON.stringify({ leadId: 'L-1' }),
+  });
+  const text = resultText(result);
+
+  assert.match(text, /Workflow certification: READY TO RUN/);
+  assert.match(text, /Can run now: yes/);
+  assert.match(text, /Next command: workflow_run name="certify-run-wf"/);
+});
+
 test('workflow_update can add an output contract to an existing step', async () => {
   await workflowCreate()({
     name: 'upc-wf',
@@ -463,6 +984,22 @@ test('workflow_update can set step intent for intent-routed worker models', asyn
     steps: [{ id: 'design', prompt: 'Design the hero.', intent: 'design' }],
   });
   assert.equal(readWorkflow('intent-update-wf')!.data.steps[0].intent, 'design');
+});
+
+test('workflow_update portable_models strips existing exact model pins without replacing steps', async () => {
+  writeWorkflow('portable-update-wf', {
+    name: 'portable-update-wf',
+    description: 'Portable update test.',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{ id: 'draft', prompt: 'Draft the memo.', model: 'gpt-5-codex', intent: 'writing' }],
+  });
+
+  const result = await workflowUpdate()({ name: 'portable-update-wf', portable_models: true });
+  assert.match(resultText(result), /portable intent routing "writing"/);
+  const step = readWorkflow('portable-update-wf')!.data.steps[0];
+  assert.equal(step.model, undefined);
+  assert.equal(step.intent, 'writing');
 });
 
 test('workflow_update auto-tags edited steps from durable intent-scoped worker rules', async () => {
@@ -533,6 +1070,51 @@ test('workflow_update accepts an inputs SCHEMA JSON string and updates def.input
   });
   assert.match(resultText(result), /updated/);
   assert.deepEqual(readWorkflow('up-wf')!.data.inputs, { domain: { type: 'string' } });
+});
+
+test('workflow_update can set full loopUntil probe/until config', async () => {
+  await workflowCreate()({
+    name: 'loop-probe-update-wf',
+    description: 'Poll an export until it is done.',
+    steps: [{ id: 'poll', prompt: 'Start or check the export job.', sideEffect: 'read' }],
+  });
+
+  const loopUntil = {
+    maxAttempts: 8,
+    probe: { runner: 'check-export-status.mjs' },
+    until: { type: 'object' as const, required_keys: ['done'], non_empty: ['done'] },
+  };
+  const result = await workflowUpdate()({
+    name: 'loop-probe-update-wf',
+    steps: [{ id: 'poll', prompt: 'Start or check the export job.', sideEffect: 'read', loopUntil }],
+  });
+
+  assert.match(resultText(result), /updated/);
+  assert.deepEqual(readWorkflow('loop-probe-update-wf')!.data.steps[0].loopUntil, loopUntil);
+});
+
+test('workflow_update can set webhook and event triggers, and syncs the trigger registry', async () => {
+  await workflowCreate()({
+    name: 'trigger-update-wf',
+    description: 'Handle new lead events.',
+    steps: [{ id: 'handle', prompt: 'Handle the lead.' }],
+  });
+
+  const result = await workflowUpdate()({
+    name: 'trigger-update-wf',
+    trigger_webhook_path: 'lead-created',
+    trigger_events: [{ type: 'crm.lead.created', dedupeKey: 'lead-{{payload.id}}' }],
+  });
+  assert.match(resultText(result), /updated/);
+
+  const saved = readWorkflow('trigger-update-wf')!.data;
+  assert.equal(saved.trigger.webhookPath, 'lead-created');
+  assert.deepEqual(saved.trigger.events, [{ type: 'crm.lead.created', dedupeKey: 'lead-{{payload.id}}' }]);
+
+  const fired = fireWorkflowSystemEvent('crm.lead.created', { id: 'L-1' })
+    .filter((r) => r.workflowName === 'trigger-update-wf');
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].status, 'queued');
 });
 
 test('workflow_run does not queue duplicate active runs for identical inputs', async () => {
@@ -756,6 +1338,21 @@ test('draftToDefinition + commitAuthoredWorkflow: a promoted draft authors + val
   assert.equal(readWorkflow('zz-promote-test')!.data.steps.length, 2);
 });
 
+test('commitAuthoredWorkflow applies the shared create readiness gate', () => {
+  const built = commitAuthoredWorkflow({
+    name: 'Shared Gate Commit',
+    description: 'Send outreach.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'send', prompt: 'Send the emails to the outside prospect list.' }],
+  }, 'shared-gate-commit');
+
+  assert.equal(built.ok, true, built.errors.join('; '));
+  assert.ok(built.gaps.length > 0, 'readiness gaps are returned to the caller');
+  assert.equal(built.savedDef.enabled, false);
+  assert.equal(readWorkflow('shared-gate-commit')!.data.enabled, false);
+});
+
 test('draftToDefinition preserves inferred forEach loops and list output contracts', () => {
   const draft = traceToWorkflowDraft([
     { tool: 'composio_execute_tool', slug: 'DATAFORSEO_RANKED_KEYWORDS', args: '{"tool":"DATAFORSEO_RANKED_KEYWORDS","arguments":{"target":"a.com"}}', callId: 'a' },
@@ -813,12 +1410,6 @@ test('bindDiscussedToolkitsIntoSteps: idempotent (a second pass does not double-
 });
 
 // ─── Wave 1.3: workflow_get surfaces a deterministic step's RUNNER provenance ──
-
-function workflowGet(): ToolHandler {
-  const handler = handlers.get('workflow_get');
-  assert.ok(handler, 'workflow_get registered');
-  return handler;
-}
 
 test('workflow_get reads a deterministic step\'s runner SOURCE and surfaces what it reaches (Salesforce, not guessed)', async () => {
   resetState();

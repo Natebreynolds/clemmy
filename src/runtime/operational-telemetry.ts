@@ -23,6 +23,7 @@ export const WORKFLOW_OPERATIONAL_EVENT_TYPES = [
   'workflow_node_ready',
   'workflow_node_started',
   'workflow_node_completed',
+  'workflow_node_blocked',
   'workflow_node_failed',
   'workflow_branch_evaluated',
   'workflow_graph_patch_proposed',

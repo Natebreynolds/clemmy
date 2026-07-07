@@ -509,6 +509,30 @@ test('applyMode: warn mode still demotes non-exact-args block/halt to warn', () 
   assert.equal(applyMode(variedHalt, 'warn').action, 'warn');
 });
 
+test('applyMode: a MUTATING same-mut-tool HALT enforces ONLY when opted in (default off pending classifier reconciliation)', () => {
+  // The 45-emails-to-distinct-addresses class carries explicit mutating:true. The
+  // enforce is OPT-IN (default off) because the guardrail's composio mutating
+  // classifier is broader than the authoritative write classifier — see the
+  // sameMutHaltEnforcedInWarn() note (adversarial review 07-06).
+  const sendRunaway = {
+    action: 'halt' as const,
+    signature: 'sig',
+    toolName: 'composio_execute_tool',
+    reason: 'mutating tool called with 8 distinct arg sets — runaway',
+    rule: 'same_mut_tool_repeat' as const,
+    count: 8,
+    mutating: true,
+  };
+  // Default (unset) → demotes to warn (no false-halt on read-only DataForSEO/Firecrawl batches).
+  assert.equal(applyMode(sendRunaway, 'warn').action, 'warn', 'default off → warn-only');
+  process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE = 'on';
+  try {
+    assert.equal(applyMode(sendRunaway, 'warn').action, 'halt', 'opt-in enforces the runaway halt');
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_MUT_HALT_ENFORCE;
+  }
+});
+
 test('applyMode: strict mode passes block/halt through unchanged', () => {
   const blockDecision = {
     action: 'block' as const,

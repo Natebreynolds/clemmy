@@ -11,7 +11,8 @@
  *       id: "<tunnel uuid>",
  *       name: "clem-nathan",
  *       hostname: "clem.nathan.dev",
- *       credentialsFile: "/Users/.../.cloudflared/<id>.json"
+ *       credentialsFile: "/Users/.../.cloudflared/<id>.json",
+ *       mode: "named"
  *     } | null,
  *     binary: { path, version } | null,
  *     autoStart: boolean,        // run cloudflared at daemon boot
@@ -101,6 +102,14 @@ function emptyRecord(): MobileAccessRecord {
   };
 }
 
+function normalizeTunnel(tunnel: MobileAccessTunnel | null | undefined): MobileAccessTunnel | null {
+  if (!tunnel) return null;
+  return {
+    ...tunnel,
+    mode: tunnel.mode === 'quick' ? 'quick' : 'named',
+  };
+}
+
 export function readMobileAccess(opts?: MobileAccessStoreOptions): MobileAccessRecord {
   const file = stateFile(opts);
   if (!existsSync(file)) return emptyRecord();
@@ -109,7 +118,7 @@ export function readMobileAccess(opts?: MobileAccessStoreOptions): MobileAccessR
     if (parsed?.version !== 1) return emptyRecord();
     return {
       version: 1,
-      tunnel: parsed.tunnel ?? null,
+      tunnel: normalizeTunnel(parsed.tunnel),
       binary: parsed.binary ?? null,
       autoStart: parsed.autoStart ?? false,
       status: parsed.status ?? 'inactive',

@@ -17,10 +17,10 @@ export interface NavDest {
 export const PRIMARY_NAV: NavDest[] = [
   { path: '/chat', label: 'Chat', icon: MessageCircle, hint: 'Talk to Clementine' },
   { path: '/inbox', label: 'Inbox', icon: Inbox, hint: 'Approvals, activity & notifications' },
-  { path: '/tasks', label: 'Tasks', icon: ListChecks, hint: 'Live board of everything Clem is working on' },
+  { path: '/tasks', label: 'Tasks', icon: ListChecks, hint: 'Live board of everything Clementine is working on' },
   { path: '/goals', label: 'Goals', icon: Goal, hint: 'Long-running outcomes and self-drive' },
   { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows, schedules & skills' },
-  { path: '/workspaces', label: 'Workspaces', icon: LayoutDashboard, hint: 'Live surfaces Clem built for you' },
+  { path: '/workspaces', label: 'Workspaces', icon: LayoutDashboard, hint: 'Live surfaces Clementine built for you' },
   { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },
   { path: '/memory', label: 'Memory', icon: Brain, hint: 'What Clementine knows about you' },
   { path: '/meetings', label: 'Meetings', icon: Video, hint: 'Recorded meetings & summaries' },

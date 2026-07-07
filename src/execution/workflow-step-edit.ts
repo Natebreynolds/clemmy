@@ -9,18 +9,19 @@
  * REVERSIBLE — the prior full definition is snapshotted before the write so a bad
  * change is one `revertStepEdit(id)` away.
  *
- * Deliberately a LIGHT module (workflow-store + workflow-enforce only — no agent
- * runtime), so the proposer can import it without pulling in the Doctor's model
- * stack. Mirrors the Doctor's fix-backup discipline (workflow-diagnosis.ts) but
- * for proposer-applied edits, kept in its own backup namespace.
+ * Deliberately avoids the agent runtime, so the proposer can import it without
+ * pulling in the Doctor's model stack. Mirrors the Doctor's fix-backup discipline
+ * (workflow-diagnosis.ts) but for proposer-applied edits, kept in its own backup
+ * namespace.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { STATE_DIR } from '../memory/db.js';
-import { readWorkflow, writeWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
-import { checkWorkflowForWrite } from './workflow-enforce.js';
+import { readWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
 import { mismatchHint } from '../shared/edit-mismatch.js';
+import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
+import { prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
 
 const BACKUPS_DIR = path.join(STATE_DIR, 'workflow-step-edit-backups');
 
@@ -39,6 +40,27 @@ export interface StepEditResult {
   /** Set when the edit snapshotted a reversible backup. */
   backupId?: string;
   errors?: string[];
+}
+
+type RejectedStepEdit = StepEditResult & { ok: false };
+interface PreparedStepEdit {
+  ok: true;
+  def: WorkflowDefinition;
+  readinessHeld: boolean;
+  repairs: string[];
+}
+
+function prepareStepEditedWorkflow(before: WorkflowDefinition, after: WorkflowDefinition): RejectedStepEdit | PreparedStepEdit {
+  const prep = prepareWorkflowUpdateForWrite(before, after, { allowInvalidDisabled: false });
+  if (prep.status === 'invalid') {
+    return { ok: false, message: 'The edited workflow would fail validation; not applied.', errors: prep.errors };
+  }
+  return {
+    ok: true,
+    def: prep.def,
+    readinessHeld: prep.status === 'readiness_gaps',
+    repairs: prep.repairs,
+  };
 }
 
 /** Deterministic backup id (no Date.now/random — derived from what changed +
@@ -103,21 +125,20 @@ export function applyStepPromptEdit(
     ...def,
     steps: def.steps.map((s, i) => (i === idx ? { ...s, prompt: nextPrompt } : s)),
   };
-  const check = checkWorkflowForWrite(updated);
-  if (!check.ok) {
-    return { ok: false, message: 'The edited workflow would fail validation; not applied.', errors: check.errors };
-  }
+  const prepared = prepareStepEditedWorkflow(def, updated);
+  if (!prepared.ok) return prepared;
 
   const at = opts.nowIso ?? new Date().toISOString();
   const id = recordBackup(workflow, stepId, def, opts.description ?? `find/replace edit to ${stepId}`, at);
-  writeWorkflow(workflow, updated);
+  writeWorkflowAndSyncTriggers(workflow, prepared.def);
   const occNote = occurrences > 1 ? ` (replaced all ${occurrences} occurrences)` : '';
+  const readinessNote = prepared.readinessHeld ? ` ${renderReadinessHold(workflow)}` : '';
   return {
     ok: true,
     backupId: id ?? undefined,
     message: id
-      ? `Updated "${workflow}" step "${stepId}"${occNote}. Revert with revertStepEdit("${id}") if it doesn't help.`
-      : `Updated "${workflow}" step "${stepId}"${occNote} (backup unavailable — not reversible).`,
+      ? `Updated "${workflow}" step "${stepId}"${occNote}.${readinessNote} Revert with revertStepEdit("${id}") if it doesn't help.`
+      : `Updated "${workflow}" step "${stepId}"${occNote} (backup unavailable — not reversible).${readinessNote}`,
   };
 }
 
@@ -150,20 +171,19 @@ export function applyStepPromptAddendum(
     ...def,
     steps: def.steps.map((s, i) => (i === idx ? { ...s, prompt: `${s.prompt}\n\n${line}` } : s)),
   };
-  const check = checkWorkflowForWrite(updated);
-  if (!check.ok) {
-    return { ok: false, message: 'The edited workflow would fail validation; not applied.', errors: check.errors };
-  }
+  const prepared = prepareStepEditedWorkflow(def, updated);
+  if (!prepared.ok) return prepared;
 
   const at = opts.nowIso ?? new Date().toISOString();
   const id = recordBackup(workflow, stepId, def, opts.description ?? `prompt addendum to ${stepId}`, at);
-  writeWorkflow(workflow, updated);
+  writeWorkflowAndSyncTriggers(workflow, prepared.def);
+  const readinessNote = prepared.readinessHeld ? ` ${renderReadinessHold(workflow)}` : '';
   return {
     ok: true,
     backupId: id ?? undefined,
     message: id
-      ? `Updated "${workflow}" step "${stepId}". Revert with revertStepEdit("${id}") if it doesn't help.`
-      : `Updated "${workflow}" step "${stepId}" (backup unavailable — not reversible).`,
+      ? `Updated "${workflow}" step "${stepId}".${readinessNote} Revert with revertStepEdit("${id}") if it doesn't help.`
+      : `Updated "${workflow}" step "${stepId}" (backup unavailable — not reversible).${readinessNote}`,
   };
 }
 
@@ -186,7 +206,7 @@ export function revertStepEdit(id: string): StepEditResult {
   try { backup = JSON.parse(readFileSync(file, 'utf8')) as StepEditBackup; }
   catch { return { ok: false, message: `Step-edit backup "${id}" is unreadable.` }; }
   if (!readWorkflow(backup.workflow)) return { ok: false, message: `Workflow "${backup.workflow}" no longer exists.` };
-  writeWorkflow(backup.workflow, backup.priorDefinition);
+  writeWorkflowAndSyncTriggers(backup.workflow, backup.priorDefinition);
   try { unlinkSync(file); } catch { /* best-effort */ }
   return { ok: true, message: `Reverted "${backup.workflow}" step "${backup.stepId}" to its pre-edit definition.` };
 }

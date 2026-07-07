@@ -177,7 +177,7 @@ function sdkWallClockMs(): number {
 // work, only the permission decision). It is subtracted from the wall clock so a
 // long confirm-first approval can't self-abort the turn the moment the user
 // approves — honoring "approve once, then run to completion".
-interface ToolCeilingState { total: number; mutating: number; stopped: string | null; pausedMs: number }
+interface ToolCeilingState { total: number; mutating: number; stopped: string | null; stoppedKind: 'loop' | 'wallclock' | null; pausedMs: number }
 
 /** Wrap a base `canUseTool` to (1) ALWAYS meter approval-wait time into
  *  state.pausedMs (so the wall clock excludes it), and (2) when `countCeiling`,
@@ -202,6 +202,7 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
       if (state.mutating > mutCeiling || state.total > totalCeiling) {
         const why = state.mutating > mutCeiling ? `${state.mutating} actions` : `${state.total} tool calls`;
         state.stopped = `I stopped myself after ${why} without finishing — that looked like a loop, so I held off rather than keep going and risk repeating an action. Tell me how you'd like to proceed and I'll pick it back up.`;
+        state.stoppedKind = 'loop'; // anti-thrash: auto-continue must NOT re-run this (it just loops again)
         return { behavior: 'deny', message: state.stopped, interrupt: true } as PermissionResult;
       }
     }
@@ -413,6 +414,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   sessionId?: string,
   gatedMutations = false,
   mcpToolAllowlist?: string[],
+  attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string },
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
   const srcEntry = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
@@ -433,6 +435,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
           sessionId,
           gatedMutations,
           allowedTools: allowlist,
+          workflowRunId: attribution?.workflowRunId,
+          workflowName: attribution?.workflowName,
+          stepId: attribution?.stepId,
         }),
       },
     };
@@ -442,6 +447,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
+    ...(attribution?.workflowRunId?.trim() ? { CLEMENTINE_MCP_WORKFLOW_RUN_ID: attribution.workflowRunId.trim() } : {}),
+    ...(attribution?.workflowName?.trim() ? { CLEMENTINE_MCP_WORKFLOW_NAME: attribution.workflowName.trim() } : {}),
+    ...(attribution?.stepId?.trim() ? { CLEMENTINE_MCP_STEP_ID: attribution.stepId.trim() } : {}),
   });
   if (existsSync(distEntry)) {
     return {
@@ -479,6 +487,27 @@ function claudeSdkNativeMcpEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CLAUDE_SDK_NATIVE_MCP', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
+/**
+ * ToolSearch adoption (SOTA 2026, [[project_2026_harness_sota_gap]]). DEFAULT OFF —
+ * model-facing, needs a live smoke before default-on. When ON, the user's EXTERNAL
+ * native MCP servers (dataforseo, browsermcp, …) are marked `alwaysLoad: false` so
+ * the SDK DEFERS their tool schemas — the model sees them by name and loads the
+ * full schema on demand via tool search. Two wins at once: (1) token — those large
+ * schemas leave the per-turn prompt; (2) cold-start — a deferred server does NOT
+ * block the `claude` child's startup on connect (alwaysLoad servers "must be present
+ * when the turn-1 prompt is built"). The LOCAL `clementine-local` core stays
+ * alwaysLoad:true (memory/recall/composio_search/notify — the acquisition hatches
+ * must never defer), so the brain never loses tool reachability.
+ */
+export function claudeToolSearchEnabled(): boolean {
+  // DEFAULT ON (v1.0): live-validated with ZERO tool-calling regressions — local core
+  // tools (memory/recall/composio_search/sf CLI/notify) are alwaysLoad and never
+  // defer, and external MCP tools (dataforseo, …) are reachable on demand via tool
+  // search in BOTH the chat and workflow lanes. Cuts the per-turn cold-start (deferred
+  // servers don't block the claude child's startup) + trims the prompt. =off reverts.
+  return (getRuntimeEnv('CLEMMY_CLAUDE_TOOL_SEARCH', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
 /** Match a server name against the scope's allowed slugs (mirrors mcp-servers.ts
  *  serverMatchesAllowedSlugs). Empty/undefined slugs ⇒ match all. */
 function nativeServerMatchesScope(serverName: string, allowedServerSlugs?: string[]): boolean {
@@ -510,16 +539,31 @@ function toClaudeSdkMcpConfig(s: ManagedMcpServer): McpServerConfig | null {
  */
 export function buildScopedNativeMcpServers(scopeInput?: string): Record<string, McpServerConfig> {
   if (!claudeSdkNativeMcpEnabled()) return {};
+  // Empty/absent scope ⇒ we don't know what THIS query needs. For the SDK native
+  // lane attach ZERO external servers rather than inheriting resolveMcpToolScope's
+  // allowAll default — allowAll cold-starts EVERY external MCP child per query and
+  // injects all their tool schemas into the input context (the run_worker /
+  // workflow-step over-attach). Callers that need servers pass a concrete scope
+  // (brain: request.message; worker: objective+tools; step: prompt). Scoped to
+  // this function only — the shared resolveMcpToolScope default is untouched, and
+  // the LOCAL in-process clementine server is spread separately (unaffected).
+  if (!scopeInput || !scopeInput.trim()) return {};
   try {
     const all = discoverMcpServers().filter((s) => s.enabled);
     if (all.length === 0) return {};
-    const scope = resolveMcpToolScope({ userInput: scopeInput ?? '', pinnedCalendarLabels: pinnedCalendarRuleLabels() });
+    const scope = resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
     if (scope.allowAll === false && (scope.allowedServerSlugs ?? []).length === 0) return {};
+    const deferExternal = claudeToolSearchEnabled();
     const out: Record<string, McpServerConfig> = {};
     for (const s of all) {
       if (!scope.allowAll && !nativeServerMatchesScope(s.name, scope.allowedServerSlugs)) continue;
       const cfg = toClaudeSdkMcpConfig(s);
-      if (cfg) out[s.name] = cfg;
+      if (!cfg) continue;
+      // ToolSearch: defer external server schemas (surface by name, load on demand)
+      // → smaller prompt + the server doesn't block the child's startup. The local
+      // clementine-local core (built separately) stays alwaysLoad, so acquisition
+      // hatches are always present. Default off until live-smoked.
+      out[s.name] = deferExternal ? { ...cfg, alwaysLoad: false } as McpServerConfig : cfg;
     }
     return out;
   } catch {
@@ -544,6 +588,19 @@ export function buildAllowOnlyToolsPermission(allowedTools: string[]): CanUseToo
       interrupt: false,
     };
   };
+}
+
+/** Coarse, cheap bucket for a tool error string so tool_call_failed rows are
+ *  groupable in telemetry (auth / timeout / rate-limit / not-found / other). */
+function coarseToolErrorClass(msg: string): string {
+  const m = msg.toLowerCase();
+  if (/\b(401|403|unauthor|invalid_grant|expired|reauth|not authenticat|forbidden)\b/.test(m)) return 'auth';
+  if (/\b(timeout|timed out|etimedout|deadline)\b/.test(m)) return 'timeout';
+  if (/\b(429|rate.?limit|overloaded|quota)\b/.test(m)) return 'rate_limited';
+  if (/\b(404|not found|no such|missing|does not exist)\b/.test(m)) return 'not_found';
+  if (/\b(econnreset|econnrefused|network|socket|fetch failed|transport)\b/.test(m)) return 'network';
+  if (/\b(400|invalid|validation|schema|bad request|malformed)\b/.test(m)) return 'validation';
+  return 'other';
 }
 
 /** Emit a canonical operational tool-call event for the Claude SDK lane (chat +
@@ -710,6 +767,11 @@ export interface ClaudeAgentSdkRunOptions {
    * log); silently falls back to the read-only allowlist without one.
    */
   agentic?: boolean;
+  /** Workflow-step attribution: when set, a fan-out (run_worker) spawned inside this
+   *  run is recorded under the workflow RUN in the subagent-runs store (else session). */
+  workflowRunId?: string;
+  workflowName?: string;
+  stepId?: string;
   /**
    * The user's message/intent for THIS turn, used to SCOPE which native external MCP
    * servers (dataforseo, browsermcp, …) attach — so the Claude brain reaches those
@@ -776,6 +838,11 @@ export interface ClaudeAgentSdkRunResult {
    *  rather than finishing. The caller surfaces a graceful "say continue" instead
    *  of a hard error — parity with the harness loop's auto-continue-on-limit. */
   limitHit?: boolean;
+  /** True ONLY for the anti-thrash tool-ceiling self-stop (looked-like-a-loop).
+   *  Distinct from a benign wall-clock/max-turns limitHit so auto-continue loops
+   *  can EXCLUDE it — re-running a loop-stop just loops again (the 33-shell-call /
+   *  3-duplicate-email incident the ceiling exists to stop). */
+  selfStopped?: boolean;
   /** Typed stop reason for non-successful-but-non-error terminal states. */
   stoppedReason?: RunStoppedReason;
   /** A3 recall ledger: every tool call this run with its callId, so an
@@ -1112,7 +1179,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   const pathToClaudeCodeExecutable = resolveClaudeCliPath() ?? undefined;
   // Anti-thrash bounding (Phase 2): a per-turn call ceiling that INTERRUPTS the
   // SDK turn, shared with the run loop so a self-stop reads as a graceful limit.
-  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, pausedMs: 0 };
+  const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, stoppedKind: null, pausedMs: 0 };
   // Agentic: the async approval gate (read/local fast-allow, everything else
   // → decideToolApproval → register/surface/await). permissionMode 'default'
   // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.
@@ -1133,7 +1200,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     skills: [],
     tools: [],
     mcpServers: {
-      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
+      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist, {
+        workflowRunId: options.workflowRunId,
+        workflowName: options.workflowName,
+        stepId: options.stepId,
+      }),
       // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
       // canUseTool gate then covers every native call. Gives the Claude brain parity
       // with the Codex lane instead of being blind to native MCPs.
@@ -1251,6 +1322,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     ceilingState.total = 0;
     ceilingState.mutating = 0;
     ceilingState.stopped = null;
+    ceilingState.stoppedKind = null;
     ceilingState.pausedMs = 0;
     const startedAt = Date.now();
     const toolById = new Map<string, { name: string; input: unknown }>();
@@ -1288,6 +1360,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // take many minutes — never self-aborts the turn the instant they approve.
         if (wallClockMs > 0 && ceilingState.stopped === null && Date.now() - startedAt - ceilingState.pausedMs > wallClockMs) {
           ceilingState.stopped = 'I hit my time budget for this turn before finishing. Say "continue" and I\'ll pick up where I left off.';
+          ceilingState.stoppedKind = 'wallclock';
           try { await stream?.interrupt?.(); } catch { /* best-effort; finally closes */ }
           break;
         }
@@ -1330,7 +1403,33 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         toolUses.push(...extractAssistantToolUses(message));
         for (const tr of extractToolResults(message)) {
           const source = toolById.get(tr.callId);
-          emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name);
+          // On failure, carry the cause into telemetry — SDK-lane failures were
+          // emitted with no error detail (151/172 tool_call_failed rows had no
+          // cause), making the reliability signal unusable.
+          const failExtra = tr.isError
+            ? (() => {
+                const msg = String(typeof tr.output === 'string' ? tr.output : JSON.stringify(tr.output ?? '')).slice(0, 600);
+                return { error: msg, error_class: coarseToolErrorClass(msg) };
+              })()
+            : {};
+          emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name, failExtra);
+          // Activity-strip lifecycle: claude-agent-approval emits 'tool_called' for
+          // EVERY tool on this lane, but nothing here closes the loop (the @openai/agents
+          // onToolEnd hook doesn't run on the SDK lane), so the console strip spun
+          // forever. Emit a matching 'tool_returned' (same role/shape as the
+          // 'tool_called' emit) so the client reducer flips the still-running row.
+          // Fail-open — the strip is progress-only, never blocks the run.
+          if (options.sessionId) {
+            try {
+              appendEvent({
+                sessionId: options.sessionId,
+                turn: 0,
+                role: 'Clem',
+                type: 'tool_returned',
+                data: { tool: source ? mcpToolTail(source.name) : undefined, callId: tr.callId, ok: !tr.isError },
+              });
+            } catch { /* progress only */ }
+          }
           // A3 recall contract: park every result under the SDK's OWN tool_use id
           // (toolu_…) — the id the continuation ledger hands out. Without this,
           // outputs live only under harness-generated mcp-<uuid> ids (and only
@@ -1443,6 +1542,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       usage: result?.usage,
       modelUsage: result?.modelUsage,
       limitHit: true,
+      selfStopped: String(ceilingState.stoppedKind) === 'loop', // cast: the 'loop' set-site is a closure alias TS can't flow-narrow
     };
   }
 

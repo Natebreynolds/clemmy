@@ -1,5 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
+import { recordSubagentRun, providerClassForModel } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
 import { workerItemAlreadyCapped } from '../agents/worker-respawn-guard.js';
@@ -154,6 +155,7 @@ export function registerWorkerTools(server: McpServer): void {
       }
       // P6 concurrency cap: at most K workers in flight per session; excess queue.
       // worker_queued fires only when this worker actually has to wait for a slot.
+      const workerProvider = resolveProvider(workerModel);
       const release = await acquireWorkerSlot(sessionId, (info) => {
         try {
           recordOperationalEvent({
@@ -164,7 +166,7 @@ export function registerWorkerTools(server: McpServer): void {
             payload: { item: input.item, lane: 'sdk_brain', ...info },
           });
         } catch { /* telemetry is best-effort */ }
-      });
+      }, { modelId: workerModel, provider: workerProvider });
       // worker_spawned: a slot was acquired and the worker is about to run.
       try {
         recordOperationalEvent({
@@ -172,7 +174,7 @@ export function registerWorkerTools(server: McpServer): void {
           type: 'worker_spawned',
           sessionId,
           actor: 'run_worker',
-          payload: { item: input.item, model: workerModel, lane: 'sdk_brain', transport },
+          payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'sdk_brain', transport },
         });
       } catch { /* telemetry is best-effort */ }
       // Route-outcome capture (adaptive routing evidence): one decision+outcome
@@ -184,10 +186,16 @@ export function registerWorkerTools(server: McpServer): void {
         role: 'worker',
         intent: input.intent || undefined,
         resolvedModel: workerModel,
-        provider: resolveProvider(workerModel),
+        provider: workerProvider,
         source: 'default',
         reason: { lane: 'sdk_brain', item: input.item },
       });
+      // Live-visibility: announce the agent STARTING (the chat/board render it as a
+      // running specialist immediately, not only when worker_result lands). Cheap,
+      // fail-open. provider/role let the UI badge it (Claude/Codex/GLM + specialty).
+      try {
+        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
+      } catch { /* telemetry is best-effort */ }
       try {
         // Claude worker role → Claude Agent SDK lane; non-Claude → the SAME
         // cross-provider @openai/agents Worker the orchestrator lane fans out
@@ -201,6 +209,16 @@ export function registerWorkerTools(server: McpServer): void {
               return runCrossProviderWorker(input, workerModel, sessionId);
             })();
         const ok = !/^\s*ERROR:/i.test(result.text ?? '');
+        // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the
+        // hooks.ts worker_capped emit only fires in the nested lane — so the
+        // respawn guard was DEAD in this default-on lane (the non-converging
+        // cap-loop it exists to stop could recur). Emit it directly here so a
+        // re-spawn of THIS capped item is refused (workerItemAlreadyCapped).
+        if (!ok && /MaxTurnsExceeded|hit its turn cap/i.test(result.text ?? '')) {
+          try {
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_capped', data: { item: input.item } });
+          } catch { /* telemetry is best-effort */ }
+        }
         recordResult(ok, ok ? undefined : firstLine(result.text), result.model ?? workerModel);
         recordModelRouteOutcome({
           decisionId: routeDecisionId,
@@ -208,6 +226,29 @@ export function registerWorkerTools(server: McpServer): void {
           latencyMs: Date.now() - routeStartedAt,
           toolSuccess: ok,
         });
+        // Subagent-runs visibility spine: WHO ran (provider+model+role), WHAT they
+        // did (task + persisted work-product), OUTCOME — attributed to the workflow
+        // run when spawned in a step, else the session. This ONE choke-point covers
+        // all three lanes (Claude / Codex / GLM-BYO). Fail-open.
+        try {
+          const ctx = getToolOutputContext();
+          const capped = !ok && /MaxTurnsExceeded|hit its turn cap/i.test(result.text ?? '');
+          recordSubagentRun({
+            id: `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
+            parentRunId: ctx?.workflowRunId || sessionId,
+            parentKind: ctx?.workflowRunId ? 'workflow' : 'session',
+            workflowName: ctx?.workflowName,
+            stepId: ctx?.stepId,
+            role: input.intent || undefined,
+            provider: route.claudeLane ? 'claude' : providerClassForModel(result.model ?? workerModel),
+            model: result.model ?? workerModel,
+            task: input.item,
+            status: capped ? 'capped' : ok ? 'ok' : 'error',
+            output: result.text ?? '',
+            startedAt: new Date(routeStartedAt).toISOString(),
+            finishedAt: new Date().toISOString(),
+          });
+        } catch { /* visibility trace is best-effort */ }
         return textResult(result.text);
       } catch (err) {
         recordResult(false, firstLine(err), workerModel);
@@ -217,6 +258,27 @@ export function registerWorkerTools(server: McpServer): void {
           latencyMs: Date.now() - routeStartedAt,
           errorClass: err instanceof Error ? err.name : typeof err,
         });
+        // A THROWN worker (crashed before returning a result) was invisible in the
+        // Agents panel — the success path above records, this one didn't. Record it
+        // as a failed specialist so a crashed worker still shows up. Fail-open.
+        try {
+          const ctx = getToolOutputContext();
+          recordSubagentRun({
+            id: `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
+            parentRunId: ctx?.workflowRunId || sessionId,
+            parentKind: ctx?.workflowRunId ? 'workflow' : 'session',
+            workflowName: ctx?.workflowName,
+            stepId: ctx?.stepId,
+            role: input.intent || undefined,
+            provider: route.claudeLane ? 'claude' : providerClassForModel(workerModel),
+            model: workerModel,
+            task: input.item,
+            status: 'error',
+            output: `ERROR: worker for "${input.item}" failed: ${firstLine(err)}`,
+            startedAt: new Date(routeStartedAt).toISOString(),
+            finishedAt: new Date().toISOString(),
+          });
+        } catch { /* visibility trace is best-effort */ }
         return textResult(`ERROR: worker for "${input.item}" failed: ${firstLine(err)}`);
       } finally {
         release();

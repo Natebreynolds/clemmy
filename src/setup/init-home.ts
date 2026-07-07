@@ -1,9 +1,11 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR, VAULT_DIR } from '../config.js';
-import { CRON_FILE, ensureTodayNote, ensureVaultScaffold, WORKFLOWS_DIR } from '../memory/vault.js';
+import { CRON_FILE, ensureTodayNote, ensureVaultScaffold } from '../memory/vault.js';
+import { readWorkflow } from '../memory/workflow-store.js';
 import { ensureTasksFile, ensureToolDirectories, replaceFile } from '../tools/shared.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
+import { writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
 
 function ensureDir(dir: string): void {
   if (!existsSync(dir)) {
@@ -115,29 +117,27 @@ async function main(): Promise<void> {
     ].join('\n'),
   );
 
-  ensureFile(
-    path.join(WORKFLOWS_DIR, 'daily-summary.md'),
-    [
-      '---',
-      'name: daily-summary',
-      'description: On-demand daily summary workflow.',
-      'enabled: true',
-      'trigger:',
-      '  manual: true',
-      'steps:',
-      '  - id: summarize',
-      '    prompt: |',
-      '      Summarize the most important open work for today.',
-      '      Include: top tasks, active goals, working memory highlights.',
-      '      Be concise — this is a quick situational brief, not an essay.',
-      '---',
-      '',
-      '# Daily Summary',
-      '',
-      'Run manually via: clementine workflow run daily-summary',
-      '',
-    ].join('\n'),
-  );
+  if (!readWorkflow('daily-summary')) {
+    writeWorkflowAndSyncTriggers('daily-summary', {
+      name: 'daily-summary',
+      description: 'On-demand daily summary workflow.',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{
+        id: 'summarize',
+        prompt: [
+          'Summarize the most important open work for today.',
+          'Include: top tasks, active goals, working memory highlights.',
+          'Be concise - this is a quick situational brief, not an essay.',
+        ].join('\n'),
+      }],
+      description_body: [
+        '# Daily Summary',
+        '',
+        'Run manually via: clementine workflow run daily-summary',
+      ].join('\n'),
+    });
+  }
 
   ensureBuiltInWorkflows();
 

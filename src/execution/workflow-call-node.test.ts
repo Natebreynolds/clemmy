@@ -24,6 +24,13 @@ test('renderCallArgValue: a full-token value resolves to the RAW upstream value 
   assert.deepEqual(renderCallArgValue('{{steps.gather.output}}', INPUTS, OUTPUTS), { rows: [{ id: 1 }, { id: 2 }], region: 'west' });
   assert.deepEqual(renderCallArgValue('{{steps.gather.output.rows}}', INPUTS, OUTPUTS), [{ id: 1 }, { id: 2 }]);
   assert.equal(renderCallArgValue('{{input.url}}', INPUTS, OUTPUTS), 'https://acme.co');
+  assert.equal(renderCallArgValue('{{project.path}}', INPUTS, OUTPUTS, undefined, {
+    requested: 'clementine-next',
+    source: 'workflow',
+    name: 'clementine-next',
+    path: '/Users/tester/Developer/clementine-next',
+    type: 'node',
+  }), '/Users/tester/Developer/clementine-next');
   // item token
   assert.equal(renderCallArgValue('{{item.email}}', INPUTS, OUTPUTS, { email: 'a@b.co' }), 'a@b.co');
   assert.deepEqual(renderCallArgValue('{{item}}', INPUTS, OUTPUTS, { x: 1 }), { x: 1 });

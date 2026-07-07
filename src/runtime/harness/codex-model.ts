@@ -48,13 +48,14 @@ import type {
 } from '@openai/agents-core';
 import type { AgentInputItem, AgentOutputItem } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { MODELS } from '../../config.js';
+import { MODELS, getRuntimeEnv } from '../../config.js';
+import { harnessRunContextStorage } from './brackets.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
 import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthError } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
-import { restoreLegacyInstructionOrder } from './model-wire-registry.js';
+import { restoreLegacyInstructionOrder, stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 import { recordCodexRateLimit } from './rate-limit-store.js';
 import pino from 'pino';
 
@@ -953,25 +954,92 @@ interface CodexRequestBody {
   truncation?: 'auto' | 'disabled';
   reasoning?: { effort?: string; summary?: string };
   context_management?: Array<Record<string, unknown>>;
+  prompt_cache_key?: string;
+}
+
+/**
+ * Per-SESSION prompt-cache key. OpenAI's Responses API caches the longest
+ * identical prefix (instructions + tools + input head); `prompt_cache_key` is a
+ * shard key that ROUTES a session's calls to the same cache node so that prefix
+ * actually hits. Measured 2026-07-04: WITHOUT it, hit rate on ~50-94K-token
+ * (mostly tool-schema) prompts was only ~28% — the tool block was re-billed and
+ * re-processed nearly every call, the dominant turn-latency driver
+ * (project_latency_rootcause_0704). Granularity is per-session on purpose: the
+ * docs warn a too-broad key overflows a node's ~15 RPM/prefix budget and resets
+ * the cache, while a too-narrow key spreads traffic and loses reuse. Returns
+ * undefined outside a harness run context (unit/contract tests) → the field is
+ * omitted → byte-identical wire shape. CLEMMY_CODEX_CACHE_KEY=off disables.
+ */
+function codexPromptCacheKey(): string | undefined {
+  if (/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_CODEX_CACHE_KEY', 'on') || 'on').trim())) {
+    return undefined;
+  }
+  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+  return sessionId ? `clem:${sessionId}` : undefined;
+}
+
+/** When ON (default), keep the Codex `instructions` STABLE — the role rubric only —
+ *  and re-home the per-turn DYNAMIC memory context after the tools block (as a
+ *  trailing input system message). OpenAI's automatic cache is a single longest
+ *  common prefix over `instructions + tools + input`; the legacy dynamic-first wire
+ *  led with per-turn-changing context, so the prefix diverged BEFORE the large tool
+ *  schema block and re-billed it nearly every turn (~26% hit rate, measured — the
+ *  dominant cost driver). Keeping instructions stable makes `instructions + tools`
+ *  a cacheable prefix. OFF restores the legacy dynamic-first single-string wire
+ *  (byte-identical to pre-parity) for a clean rollback. */
+function codexStableInstructionsEnabled(): boolean {
+  return !/^(0|false|off|no)$/i.test((getRuntimeEnv('CLEMMY_CODEX_STABLE_INSTRUCTIONS', 'on') || 'on').trim());
+}
+
+/** Split the assembler's `${role}${DELIM}${ctx}` into the STABLE role prefix (kept
+ *  in `instructions`) and the DYNAMIC ctx (re-homed after tools, in input). No
+ *  sentinel (e.g. a sub-agent prompt that didn't pass through the assembler) → the
+ *  whole string is stable instructions, ctx empty. Exported for the contract test. */
+export function splitCodexInstructions(raw: string | undefined | null): { instructions: string; trailingContext: string } {
+  const s = raw ?? '';
+  const idx = s.indexOf(INSTRUCTION_CACHE_DELIM);
+  if (idx < 0) return { instructions: stripCacheBreakSentinel(s), trailingContext: '' };
+  return {
+    instructions: s.slice(0, idx),
+    trailingContext: s.slice(idx + INSTRUCTION_CACHE_DELIM.length),
+  };
 }
 
 // Exported so contract tests can assert the wire shape without
 // having to mock fetch + OAuth + SSE for every assertion.
 export function buildCodexRequestBody(modelId: string, request: ModelRequest): CodexRequestBody {
   const tools = serializeTools(request.tools, request.handoffs);
+  const input = serializeInput(request.input);
+  let instructions: string;
+  if (codexStableInstructionsEnabled()) {
+    // Stable-prefix wire: role rubric stays in `instructions`; the per-turn memory
+    // ctx moves to a trailing input system message (after tools) so `instructions +
+    // tools` caches. Placed at the input tail where the [AGENT CONTEXT PACKET]
+    // already lives — the model still sees it, it just no longer busts the prefix.
+    const split = splitCodexInstructions(request.systemInstructions);
+    instructions = split.instructions || 'You are a helpful assistant.';
+    if (split.trailingContext.trim()) {
+      input.push({ role: 'system', content: split.trailingContext.trim() });
+    }
+  } else {
+    // Legacy dynamic-first wire (kill-switch) — byte-identical to pre-parity.
+    instructions = restoreLegacyInstructionOrder(request.systemInstructions) || 'You are a helpful assistant.';
+  }
   const body: CodexRequestBody = {
     model: resolveCodexModel(modelId),
-    // Restore the legacy (dynamic-first) instruction order — Codex's wire is
-    // BYTE-IDENTICAL to pre-parity regardless of the flag (caching is automatic
-    // server-side here, so the stable-first reorder is a Claude-only concern).
-    instructions: restoreLegacyInstructionOrder(request.systemInstructions) || 'You are a helpful assistant.',
+    instructions,
     store: false,
     stream: true,
-    input: serializeInput(request.input),
+    input,
     tools,
     tool_choice: normalizeToolChoice(request.modelSettings?.toolChoice, tools.length > 0),
     include: ['reasoning.encrypted_content'],
   };
+
+  // Route this session's calls to the same cache node so the (large, stable)
+  // tool-schema prefix actually hits. See codexPromptCacheKey().
+  const cacheKey = codexPromptCacheKey();
+  if (cacheKey) body.prompt_cache_key = cacheKey;
 
   if (tools.length > 0 && typeof request.modelSettings?.parallelToolCalls === 'boolean') {
     body.parallel_tool_calls = request.modelSettings.parallelToolCalls;

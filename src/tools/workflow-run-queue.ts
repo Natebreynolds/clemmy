@@ -5,12 +5,14 @@ import { WORKFLOW_RUNS_DIR } from './shared.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { listFinalFailedItems } from '../execution/workflow-events.js';
+import { checkWorkflowRunReadiness, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 
 /**
  * Shared workflow-run queueing — the single place that writes a run request
- * to local workflow state. Used by the `workflow_run` MCP tool AND by the
- * plan-continuity resume path (ask-then-resume for missing inputs), so both
- * surfaces queue identically and the dedupe / messaging never drifts.
+ * to local workflow state. Used by MCP workflow_run, dashboard/legacy UI,
+ * mobile, scheduler, trigger dispatch, execution-controller, and
+ * plan-continuity resume paths so run record shape, dedupe, and messaging do
+ * not drift across surfaces.
  */
 
 function ensureDir(dir: string): void {
@@ -27,11 +29,17 @@ export function findDuplicateQueuedWorkflowRun(
   workflowName: string,
   inputs: Record<string, string>,
   excludeRunId?: string,
+  opts?: {
+    targetStepId?: string;
+    retryFailedItems?: QueueWorkflowRunOptions['retryFailedItems'];
+  },
 ): { id: string; status: string } | null {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
   // Normalize BOTH sides so dedupe is correct regardless of whether the
   // caller pre-normalized (url/website aliases must compare equal).
   const wanted = stableJson(normalizeWorkflowRunInputs(inputs));
+  const wantedTargetStepId = normalizedOptionalString(opts?.targetStepId);
+  const wantedRetryKey = retryFailedItemsKey(opts?.retryFailedItems);
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse()) {
     try {
       const parsed = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as {
@@ -39,6 +47,10 @@ export function findDuplicateQueuedWorkflowRun(
         workflow?: unknown;
         inputs?: unknown;
         status?: unknown;
+        targetStepId?: unknown;
+        retryFailedItemsFromRunId?: unknown;
+        retryFailedItemsStepId?: unknown;
+        retryFailedItemKeys?: unknown;
       };
       const status = typeof parsed.status === 'string' ? parsed.status : 'queued';
       if (status !== 'queued' && status !== 'running') continue;
@@ -53,6 +65,8 @@ export function findDuplicateQueuedWorkflowRun(
           : {},
       );
       if (stableJson(existingInputs) !== wanted) continue;
+      if (normalizedOptionalString(parsed.targetStepId) !== wantedTargetStepId) continue;
+      if (runRecordRetryFailedItemsKey(parsed) !== wantedRetryKey) continue;
       const id = typeof parsed.id === 'string' ? parsed.id : path.basename(file, '.json');
       return { id, status };
     } catch {
@@ -82,6 +96,43 @@ function normalizeOriginSessionIds(...values: unknown[]): string[] {
   return out;
 }
 
+function normalizedOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function uniqueTrimmed(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function retryFailedItemsKey(value: QueueWorkflowRunOptions['retryFailedItems'] | undefined): string | undefined {
+  if (!value) return undefined;
+  const fromRunId = value.fromRunId.trim();
+  const stepId = value.stepId.trim();
+  const itemKeys = uniqueTrimmed(value.itemKeys).sort();
+  if (!fromRunId || !stepId || itemKeys.length === 0) return undefined;
+  return stableJson({ fromRunId, stepId, itemKeys });
+}
+
+function runRecordRetryFailedItemsKey(record: {
+  retryFailedItemsFromRunId?: unknown;
+  retryFailedItemsStepId?: unknown;
+  retryFailedItemKeys?: unknown;
+}): string | undefined {
+  const fromRunId = normalizedOptionalString(record.retryFailedItemsFromRunId);
+  const stepId = normalizedOptionalString(record.retryFailedItemsStepId);
+  const itemKeys = Array.isArray(record.retryFailedItemKeys)
+    ? uniqueTrimmed(record.retryFailedItemKeys.filter((item): item is string => typeof item === 'string')).sort()
+    : [];
+  if (!fromRunId || !stepId || itemKeys.length === 0) return undefined;
+  return stableJson({ fromRunId, stepId, itemKeys });
+}
+
+function createRunId(prefix?: string): string {
+  const suffix = `${Date.now()}-${randomBytes(3).toString('hex')}`;
+  const safePrefix = normalizedOptionalString(prefix)?.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  return safePrefix ? `${safePrefix}-${suffix}` : suffix;
+}
+
 function attachOriginSessionIdsToRun(runId: string, origins: string[]): void {
   if (origins.length === 0) return;
   const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
@@ -102,9 +153,75 @@ function attachOriginSessionIdsToRun(runId: string, origins: string[]): void {
 }
 
 export interface QueueWorkflowRunResult {
-  status: 'queued' | 'duplicate';
+  status: 'queued' | 'duplicate' | 'blocked_readiness';
   id?: string;
   message: string;
+  readiness?: WorkflowRunReadinessCheck;
+}
+
+export type WorkflowRunRecoveryIntentKind =
+  | 'step_try'
+  | 'failed_items'
+  | 'safe_rerun'
+  | 'execution_optimize'
+  | 'goal_rerun'
+  | 'self_heal'
+  | 'manual_requeue';
+
+export interface WorkflowRunRecoveryIntent {
+  kind: WorkflowRunRecoveryIntentKind;
+  createdAt: string;
+  sourceRunId?: string;
+  sourceStepId?: string;
+  requestedFrom?: string;
+  reason?: string;
+}
+
+export interface QueueWorkflowRunRecoveryIntentInput {
+  kind?: string;
+  createdAt?: string;
+  sourceRunId?: string;
+  sourceStepId?: string;
+  requestedFrom?: string;
+  reason?: string;
+}
+
+const WORKFLOW_RUN_RECOVERY_INTENT_KINDS = new Set<WorkflowRunRecoveryIntentKind>([
+  'step_try',
+  'failed_items',
+  'safe_rerun',
+  'execution_optimize',
+  'goal_rerun',
+  'self_heal',
+  'manual_requeue',
+]);
+
+function workflowRunRecoveryIntentKind(value: unknown): WorkflowRunRecoveryIntentKind | undefined {
+  return typeof value === 'string' && WORKFLOW_RUN_RECOVERY_INTENT_KINDS.has(value as WorkflowRunRecoveryIntentKind)
+    ? value as WorkflowRunRecoveryIntentKind
+    : undefined;
+}
+
+function normalizeWorkflowRunRecoveryIntent(
+  input: QueueWorkflowRunRecoveryIntentInput | undefined,
+  fallback: QueueWorkflowRunRecoveryIntentInput | undefined,
+  createdAt: string,
+): WorkflowRunRecoveryIntent | undefined {
+  const kind = workflowRunRecoveryIntentKind(input?.kind) ?? workflowRunRecoveryIntentKind(fallback?.kind);
+  if (!kind) return undefined;
+  const out: WorkflowRunRecoveryIntent = {
+    kind,
+    createdAt: normalizedOptionalString(input?.createdAt) ?? normalizedOptionalString(fallback?.createdAt) ?? createdAt,
+  };
+  const sourceRunId = normalizedOptionalString(input?.sourceRunId) ?? normalizedOptionalString(fallback?.sourceRunId);
+  const sourceStepId = normalizedOptionalString(input?.sourceStepId) ?? normalizedOptionalString(fallback?.sourceStepId);
+  const requestedFrom = normalizedOptionalString(input?.requestedFrom) ?? normalizedOptionalString(fallback?.requestedFrom);
+  const reason = normalizedOptionalString(input?.reason) ?? normalizedOptionalString(fallback?.reason);
+  if (sourceRunId) out.sourceRunId = sourceRunId;
+  if (sourceStepId) out.sourceStepId = sourceStepId;
+  if (requestedFrom) out.requestedFrom = requestedFrom;
+  if (reason) out.reason = reason;
+  return out;
 }
 
 /**
@@ -139,6 +256,9 @@ export interface QueueWorkflowRunOptions {
    *  (the source is still status:'running' on disk during a mid-completion
    *  re-pursuit queue, and must not count as "already queued"). */
   excludeRunId?: string;
+  /** Durable lineage for whole-run requeues, so dashboards can compare attempts
+   *  without inferring ancestry from timestamps or matching inputs. */
+  requeuedFromRunId?: string;
   /** Failed-item retry lineage: queue a targeted workflow run that inherits
    *  completed upstream work from `fromRunId`, then reprocesses only these
    *  failed forEach item keys for `stepId`. */
@@ -146,6 +266,32 @@ export interface QueueWorkflowRunOptions {
     fromRunId: string;
     stepId: string;
     itemKeys: string[];
+  };
+  /** Origin surface for UI/filtering only (console, mobile, schedule, webhook). */
+  source?: string;
+  /** Queue a single-step TRY run. The runner bypasses the enabled gate for these. */
+  targetStepId?: string;
+  /** Operator-facing lineage for recovery runs: why this queued run exists and
+   *  which prior run/step triggered it. */
+  recoveryIntent?: QueueWorkflowRunRecoveryIntentInput;
+  /** Optional run-id prefix for system-triggered runs such as schedules. */
+  idPrefix?: string;
+  /** Disable duplicate suppression for sources that intentionally enqueue fresh runs. */
+  dedupe?: boolean;
+}
+
+function workflowRunReadinessSnapshot(
+  readiness: WorkflowRunReadinessCheck,
+  targetStepId?: string,
+): Record<string, unknown> {
+  return {
+    ok: readiness.ok,
+    checkedAt: new Date().toISOString(),
+    scope: targetStepId ? 'step' : 'run',
+    ...(targetStepId ? { targetStepId } : {}),
+    blockers: readiness.blockers,
+    warnings: readiness.warnings,
+    toolReadiness: readiness.plan.toolReadiness,
   };
 }
 
@@ -155,7 +301,12 @@ export function queueWorkflowRun(
   opts?: QueueWorkflowRunOptions,
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
-  const duplicate = findDuplicateQueuedWorkflowRun(name, normalizedInputs, opts?.excludeRunId);
+  const duplicate = opts?.dedupe === false
+    ? null
+    : findDuplicateQueuedWorkflowRun(name, normalizedInputs, opts?.excludeRunId, {
+        targetStepId: opts?.targetStepId,
+        retryFailedItems: opts?.retryFailedItems,
+      });
   const origins = normalizeOriginSessionIds(opts?.originSessionId, opts?.originSessionIds);
   if (duplicate) {
     attachOriginSessionIdsToRun(duplicate.id, origins);
@@ -165,8 +316,30 @@ export function queueWorkflowRun(
       message: `Workflow "${name}" is already ${duplicate.status} as run ${duplicate.id} with the same inputs — it's running in the background and will report back here when it finishes. No duplicate was queued; just tell the user it's already on it. (Only call workflow_run_status if the user explicitly asks for a progress check.)`,
     };
   }
-  const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
+  const workflowEntry = listWorkflows().find((entry) => entry.data.name === name || entry.name === name);
+  const readinessTargetStepId = opts?.targetStepId ?? opts?.retryFailedItems?.stepId;
+  let readiness: WorkflowRunReadinessCheck | undefined;
+  if (workflowEntry) {
+    readiness = checkWorkflowRunReadiness(workflowEntry.data, workflowEntry.name, {
+      targetStepId: readinessTargetStepId,
+    });
+    if (!readiness.ok) {
+      return {
+        status: 'blocked_readiness',
+        message: readiness.message,
+        readiness,
+      };
+    }
+  }
+  const id = createRunId(opts?.idPrefix);
+  const createdAt = new Date().toISOString();
   const origin = origins[0];
+  const source = normalizedOptionalString(opts?.source);
+  const targetStepId = normalizedOptionalString(opts?.targetStepId);
+  const requeuedFromRunId = normalizedOptionalString(opts?.requeuedFromRunId);
+  const readinessSnapshot = readiness
+    ? workflowRunReadinessSnapshot(readiness, normalizedOptionalString(readinessTargetStepId))
+    : undefined;
   const selfHealAttempt = typeof opts?.selfHealAttempt === 'number' && opts.selfHealAttempt > 0
     ? opts.selfHealAttempt
     : undefined;
@@ -184,6 +357,30 @@ export function queueWorkflowRun(
         retryFailedItemKeys: Array.from(new Set(opts.retryFailedItems.itemKeys.map((k) => k.trim()).filter(Boolean))),
       }
     : undefined;
+  const fallbackRecoveryIntent: QueueWorkflowRunRecoveryIntentInput | undefined = targetStepId
+    ? {
+        kind: 'step_try',
+        sourceStepId: targetStepId,
+        requestedFrom: source,
+        reason: 'single-step try run',
+      }
+    : retryFailedItems
+      ? {
+          kind: 'failed_items',
+          sourceRunId: retryFailedItems.retryFailedItemsFromRunId,
+          sourceStepId: retryFailedItems.retryFailedItemsStepId,
+          requestedFrom: source,
+          reason: 'retry final failed forEach items',
+        }
+      : requeuedFromRunId
+        ? {
+            kind: selfHealAttempt ? 'self_heal' : 'manual_requeue',
+            sourceRunId: requeuedFromRunId,
+            requestedFrom: source,
+            reason: selfHealAttempt ? 'self-heal verification requeue' : 'whole-run requeue',
+          }
+        : undefined;
+  const recoveryIntent = normalizeWorkflowRunRecoveryIntent(opts?.recoveryIntent, fallbackRecoveryIntent, createdAt);
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
     JSON.stringify({
@@ -191,9 +388,14 @@ export function queueWorkflowRun(
       workflow: name,
       inputs: normalizedInputs,
       status: 'queued',
-      createdAt: new Date().toISOString(),
-      // Only written when present → scheduled/dashboard/webhook records are
-      // byte-identical to before (no origin → notification-only).
+      createdAt,
+      ...(source ? { source } : {}),
+      ...(targetStepId ? { targetStepId } : {}),
+      ...(requeuedFromRunId ? { requeuedFromRunId } : {}),
+      ...(recoveryIntent ? { recoveryIntent } : {}),
+      ...(readinessSnapshot ? { readiness: readinessSnapshot } : {}),
+      // Only written when present: no origin means notification-only, while
+      // chat-dispatched runs can re-enter their originating session on finish.
       ...(origin ? { originSessionId: origin } : {}),
       ...(origins.length > 1 ? { originSessionIds: origins } : {}),
       ...(selfHealAttempt ? { selfHealAttempt } : {}),
@@ -207,11 +409,46 @@ export function queueWorkflowRun(
   return {
     status: 'queued',
     id,
+    ...(readiness ? { readiness } : {}),
     message:
       `Queued "${name}" (run ${id}) — it is now running in the BACKGROUND. `
       + `Tell the user it's running and that you'll report back here when it finishes; the outcome is delivered to this chat automatically on completion. `
       + `Do NOT wait, poll, or call workflow_run_status, and do NOT do the workflow's work yourself — you're free to take the user's next request right now. `
       + `(Only call workflow_run_status later if the user explicitly asks how it's going.)`,
+  };
+}
+
+/**
+ * Queue a dashboard/operator dry-run request. Dry-runs are deliberately fresh
+ * records, not deduped, because they are one-shot preflight checks rather than
+ * production work.
+ */
+export function queueWorkflowDryRun(
+  name: string,
+  normalizedInputs: Record<string, string>,
+  opts?: QueueWorkflowRunOptions,
+): QueueWorkflowRunResult {
+  ensureDir(WORKFLOW_RUNS_DIR);
+  const id = createRunId(opts?.idPrefix);
+  const source = normalizedOptionalString(opts?.source);
+  const targetStepId = normalizedOptionalString(opts?.targetStepId);
+  writeFileSync(
+    path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
+    JSON.stringify({
+      id,
+      workflow: name,
+      inputs: normalizedInputs,
+      status: 'dry_run',
+      createdAt: new Date().toISOString(),
+      ...(source ? { source } : {}),
+      ...(targetStepId ? { targetStepId } : {}),
+    }, null, 2),
+    'utf-8',
+  );
+  return {
+    status: 'queued',
+    id,
+    message: `Queued dry-run for "${name}" (run ${id}) — it will preflight without executing workflow steps.`,
   };
 }
 
@@ -230,8 +467,10 @@ export function queueWorkflowCreationTest(
   opts?: QueueWorkflowRunOptions,
 ): QueueWorkflowRunResult {
   ensureDir(WORKFLOW_RUNS_DIR);
-  const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
-  const origin = opts?.originSessionId?.trim();
+  const id = createRunId(opts?.idPrefix);
+  const origins = normalizeOriginSessionIds(opts?.originSessionId, opts?.originSessionIds);
+  const origin = origins[0];
+  const source = normalizedOptionalString(opts?.source);
   writeFileSync(
     path.join(WORKFLOW_RUNS_DIR, `${id}.json`),
     JSON.stringify({
@@ -240,7 +479,9 @@ export function queueWorkflowCreationTest(
       inputs: normalizedInputs,
       status: 'creation_test',
       createdAt: new Date().toISOString(),
+      ...(source ? { source } : {}),
       ...(origin ? { originSessionId: origin } : {}),
+      ...(origins.length > 1 ? { originSessionIds: origins } : {}),
     }, null, 2),
     'utf-8',
   );
@@ -257,10 +498,11 @@ export function queueWorkflowCreationTest(
 }
 
 export interface ResumeWorkflowRunResult {
-  status: 'queued' | 'duplicate' | 'missing_inputs' | 'not_found' | 'disabled';
+  status: 'queued' | 'duplicate' | 'blocked_readiness' | 'missing_inputs' | 'not_found' | 'disabled';
   id?: string;
   missing?: string[];
   message: string;
+  readiness?: WorkflowRunReadinessCheck;
 }
 
 /**
@@ -283,14 +525,15 @@ export function resumeWorkflowRun(
     return { status: 'missing_inputs', missing, message: `Still missing: ${missing.join(', ')}.` };
   }
   const queued = queueWorkflowRun(name, normalized, opts);
-  return { status: queued.status, id: queued.id, message: queued.message };
+  return { status: queued.status, id: queued.id, message: queued.message, readiness: queued.readiness };
 }
 
 export interface RequeueResult {
-  status: 'queued' | 'duplicate' | 'not_found' | 'no_failed_items' | 'ambiguous';
+  status: 'queued' | 'duplicate' | 'blocked_readiness' | 'not_found' | 'no_failed_items' | 'ambiguous';
   id?: string;
   failedItems?: Array<{ stepId: string; itemKey: string; error: string }>;
   message: string;
+  readiness?: WorkflowRunReadinessCheck;
 }
 
 /**
@@ -330,13 +573,21 @@ export function requeueWorkflowFromRun(
   const queued = queueWorkflowRun(workflow, inputs, {
     originSessionId: originSessionIds[0],
     originSessionIds,
+    source: opts.source,
     selfHealAttempt: opts.selfHealAttempt,
     selfHealBackupId: opts.selfHealBackupId,
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,
     excludeRunId: originalRunId,
+    requeuedFromRunId: originalRunId,
+    recoveryIntent: opts.recoveryIntent ?? {
+      kind: opts.selfHealAttempt ? 'self_heal' : 'manual_requeue',
+      sourceRunId: originalRunId,
+      requestedFrom: opts.source,
+      reason: opts.selfHealAttempt ? 'self-heal verification requeue' : 'whole-run requeue',
+    },
   });
-  return { status: queued.status, id: queued.id, message: queued.message };
+  return { status: queued.status, id: queued.id, message: queued.message, readiness: queued.readiness };
 }
 
 export function requeueWorkflowFailedItemsFromRun(
@@ -392,6 +643,7 @@ export function requeueWorkflowFailedItemsFromRun(
   const queued = queueWorkflowRun(workflow, inputs, {
     originSessionId: originSessionIds[0],
     originSessionIds,
+    source: opts.source,
     selfHealAttempt: opts.selfHealAttempt,
     goalAttempt: opts.goalAttempt,
     goalFeedback: opts.goalFeedback,
@@ -401,12 +653,20 @@ export function requeueWorkflowFailedItemsFromRun(
       stepId,
       itemKeys: failures.map((f) => f.itemKey),
     },
+    recoveryIntent: opts.recoveryIntent ?? {
+      kind: 'failed_items',
+      sourceRunId: originalRunId,
+      sourceStepId: stepId,
+      requestedFrom: opts.source,
+      reason: 'retry final failed forEach items',
+    },
   });
   const failedItems = failures.map(({ stepId: failedStepId, itemKey, error }) => ({ stepId: failedStepId, itemKey, error }));
   return {
     status: queued.status,
     id: queued.id,
     failedItems,
+    readiness: queued.readiness,
     message: queued.status === 'queued'
       ? `Queued failed-item retry for "${workflow}" step "${stepId}" (${failedItems.length} item${failedItems.length === 1 ? '' : 's'}) as run ${queued.id}. It will reuse completed upstream work and reprocess only the failed items.`
       : queued.message,

@@ -222,6 +222,11 @@ function mirrorWorkflowOperationalEvent(workflowName: string, runId: string, eve
     if (event.meta?.reason !== 'brain_fallover') return;
     mapped = { type: 'model_fallover', source: 'model' };
   }
+  // A step/item that finalized as BLOCKED is not a completion — emit
+  // workflow_node_blocked so dashboards stop counting blocks as successes.
+  if ((event.kind === 'step_completed' || event.kind === 'item_completed') && event.meta?.blocked === true) {
+    mapped = { type: 'workflow_node_blocked', source: 'workflow' };
+  }
   const type: OperationalEventType | null = mapped?.type
     ?? (isOperationalEventType(event.kind) ? event.kind : null);
   if (!type) return;

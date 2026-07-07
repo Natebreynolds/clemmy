@@ -8,7 +8,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { acquireWorkerSlot, _activeWorkerSlots, _activeGlobalWorkerSlots, _resetWorkerConcurrencyForTest } = await import('./worker-concurrency.js');
+const {
+  acquireWorkerSlot,
+  _activeWorkerSlots,
+  _activeGlobalWorkerSlots,
+  _activeProviderWorkerSlots,
+  _resetWorkerConcurrencyForTest,
+} = await import('./worker-concurrency.js');
 
 function withEnv(over: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
   const prev: Record<string, string | undefined> = {};
@@ -167,6 +173,81 @@ test('GLOBAL ceiling default (12) never further limits a single session on the d
     // One session, 6 workers = the per-session default; global default (12) ≥ 6 so nothing extra blocks.
     const releases = await Promise.all(Array.from({ length: 6 }, () => acquireWorkerSlot('solo')));
     assert.equal(releases.length, 6, 'all 6 acquire immediately — global default does not bite a single session');
+    releases.forEach((r) => r());
+  });
+});
+
+test('BYO workers parallelize up to the default cap (3/session) then queue — conservative vs native 6, but no longer serial', async () => {
+  await withEnv({
+    CLEMMY_WORKER_MAX_CONCURRENCY: undefined,
+    CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: undefined,
+    CLEMMY_WORKER_MAX_CONCURRENCY_BYO: undefined,
+    CLEMMY_WORKER_MAX_CONCURRENCY_BYO_GLOBAL: undefined,
+  }, async () => {
+    _resetWorkerConcurrencyForTest();
+    const queued: Array<{ queueDepth: number; perSessionCap: number; globalCap: number; provider?: string }> = [];
+    const opts = { provider: 'byo' as const, modelId: 'glm-5.2' };
+    // Three BYO workers acquire immediately (parallel fan-out, was serial at cap 1).
+    const r1 = await acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts);
+    const r2 = await acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts);
+    const r3 = await acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts);
+    assert.equal(_activeWorkerSlots('sess-byo'), 3, 'three BYO workers run concurrently');
+    // The FOURTH waits behind the per-session cap of 3.
+    let fourthAcquired = false;
+    const p4 = acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts)
+      .then((r) => { fourthAcquired = true; return r; });
+    await Promise.resolve();
+    assert.equal(fourthAcquired, false, 'the 4th BYO worker waits behind the default cap');
+    assert.deepEqual(queued[0], { queueDepth: 1, perSessionCap: 3, globalCap: 6, provider: 'byo' });
+    r1();
+    const r4 = await p4;
+    assert.equal(fourthAcquired, true, 'freeing a slot hands it to the waiter');
+    r2(); r3(); r4();
+    assert.equal(_activeWorkerSlots('sess-byo'), 0);
+    assert.equal(_activeProviderWorkerSlots('byo'), 0);
+  });
+});
+
+test('BYO provider-global cap limits bursts across sessions and is opt-up by env', async () => {
+  await withEnv({
+    CLEMMY_WORKER_MAX_CONCURRENCY: '6',
+    CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: '12',
+    CLEMMY_WORKER_MAX_CONCURRENCY_BYO: '3',
+    CLEMMY_WORKER_MAX_CONCURRENCY_BYO_GLOBAL: '2',
+  }, async () => {
+    _resetWorkerConcurrencyForTest();
+    let running = 0;
+    const releases: Array<() => void> = [];
+    const attempts = ['s1', 's2', 's3'].map((s) =>
+      acquireWorkerSlot(s, undefined, { provider: 'byo', modelId: 'glm-5.2' }).then((r) => {
+        running += 1;
+        releases.push(r);
+        return r;
+      }));
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(_activeProviderWorkerSlots('byo'), 2, 'two BYO workers hold the provider-global slots');
+    assert.equal(running, 2, 'the third waits on the BYO provider-global cap');
+    releases[0]();
+    await Promise.all(attempts);
+    assert.equal(running, 3, 'the queued BYO worker eventually runs');
+    releases.forEach((r) => r());
+    assert.equal(_activeProviderWorkerSlots('byo'), 0);
+  });
+});
+
+test('BYO-specific cap can be disabled without disabling the generic worker gate', async () => {
+  await withEnv({
+    CLEMMY_WORKER_MAX_CONCURRENCY: '3',
+    CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: '12',
+    CLEMMY_WORKER_MAX_CONCURRENCY_BYO: 'off',
+    CLEMMY_WORKER_MAX_CONCURRENCY_BYO_GLOBAL: 'off',
+  }, async () => {
+    _resetWorkerConcurrencyForTest();
+    const releases = await Promise.all(
+      Array.from({ length: 3 }, () => acquireWorkerSlot('sess-byo-wide', undefined, { provider: 'byo', modelId: 'glm-5.2' })),
+    );
+    assert.equal(releases.length, 3, 'BYO-specific off uses the generic per-session cap');
+    assert.equal(_activeWorkerSlots('sess-byo-wide'), 3);
     releases.forEach((r) => r());
   });
 });

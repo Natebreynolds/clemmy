@@ -4,6 +4,12 @@ export interface ToolOutputContext {
   sessionId?: string;
   callId?: string;
   toolName?: string;
+  /** Set when the tool runs inside a workflow STEP — carries the run attribution
+   *  so a fan-out spawned here (run_worker) is recorded under its workflow, not
+   *  just the session (subagent-runs visibility spine). */
+  workflowRunId?: string;
+  workflowName?: string;
+  stepId?: string;
 }
 
 export const toolOutputContextStorage = new AsyncLocalStorage<ToolOutputContext>();

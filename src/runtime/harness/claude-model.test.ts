@@ -130,4 +130,58 @@ test('getClaudeModel: headless transport falls back to the raw_messages adapter 
   }
 });
 
+function envelopeBody(obj: Record<string, unknown>): Record<string, unknown> {
+  const out = applyClaudeEnvelope({ body: JSON.stringify(obj) }, 'sk-ant-oat01-x');
+  return JSON.parse(out.body as string) as Record<string, unknown>;
+}
+
+test('transcript caching: a large transcript gets a cache_control breakpoint on the last message (fusion re-send fix)', () => {
+  const big = 'lorem ipsum dolor sit amet '.repeat(1000); // ~27K chars ≈ 6.8K tok > opus 4096 min
+  const parsed = envelopeBody({
+    model: 'claude-opus-4-8',
+    system: 'Be helpful.',
+    messages: [
+      { role: 'user', content: big },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'tail' },
+    ],
+    max_tokens: 100,
+  });
+  const msgs = parsed.messages as Array<Record<string, unknown>>;
+  const last = msgs[msgs.length - 1];
+  // string content wrapped into a cacheable text block
+  assert.ok(Array.isArray(last.content), 'last message content wrapped to a block array');
+  const block = (last.content as Array<Record<string, unknown>>).at(-1)!;
+  assert.deepEqual(block.cache_control, { type: 'ephemeral' });
+});
+
+test('transcript caching: a SMALL transcript is NOT breakpointed (below cacheMinTokens — a wasted marker)', () => {
+  const parsed = envelopeBody({
+    model: 'claude-opus-4-8',
+    system: 'Be helpful.',
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 100,
+  });
+  const last = (parsed.messages as Array<Record<string, unknown>>).at(-1)!;
+  // untouched: still a plain string, no cache_control
+  assert.equal(last.content, 'hi');
+});
+
+test('transcript caching kill-switch (CLEMMY_CLAUDE_CACHE_TRANSCRIPT=off) → no transcript breakpoint', () => {
+  process.env.CLEMMY_CLAUDE_CACHE_TRANSCRIPT = 'off';
+  try {
+    const big = 'lorem ipsum dolor sit amet '.repeat(1000);
+    const parsed = envelopeBody({
+      model: 'claude-opus-4-8',
+      system: 'Be helpful.',
+      messages: [{ role: 'user', content: big }],
+      max_tokens: 100,
+    });
+    const last = (parsed.messages as Array<Record<string, unknown>>).at(-1)!;
+    assert.equal(last.content, big, 'kill-switch → transcript left untouched');
+  } finally {
+    delete process.env.CLEMMY_CLAUDE_CACHE_TRANSCRIPT;
+  }
+});
+
 void ID;

@@ -21,7 +21,7 @@ test.after(() => {
 });
 
 const integration = await import('./mobile-access.js');
-const { setMobileAccessBinary, setMobileAccessTunnel } = await import('../runtime/mobile-access-state.js');
+const { setMobileAccessAccessAck, setMobileAccessBinary, setMobileAccessTunnel } = await import('../runtime/mobile-access-state.js');
 const { setPin } = await import('../runtime/mobile-pin.js');
 
 test('getMobileAccessStatusPayload returns a coherent empty-state payload', async () => {
@@ -34,6 +34,9 @@ test('getMobileAccessStatusPayload returns a coherent empty-state payload', asyn
   assert.equal(payload.login.active, false);
   assert.equal(payload.tunnel.running, false);
   assert.match(payload.targetUrl ?? '', /^http:\/\/127\.0\.0\.1:\d+\/m\/$/);
+  assert.equal(payload.target.mode, 'local-preview');
+  assert.equal(payload.target.qrReady, false);
+  assert.match(payload.target.qrBlockedReason ?? '', /phone cannot reach/i);
   assert.equal(payload.targetMode, 'local-preview');
 });
 
@@ -74,7 +77,7 @@ test('startTunnel refuses when prerequisites are missing', async () => {
   await updateMobileAccess((current) => ({ ...current, tunnel: null }));
   const result = await integration.startTunnel();
   assert.equal(result.ok, false);
-  assert.match(result.error || '', /(cloudflared binary|no tunnel configured)/);
+  assert.match(result.error || '', /(cloudflared binary|no .*tunnel configured)/);
 });
 
 test('startTunnel refuses when binary present but no tunnel configured', async () => {
@@ -84,35 +87,58 @@ test('startTunnel refuses when binary present but no tunnel configured', async (
   await updateMobileAccess((current) => ({ ...current, tunnel: null }));
   const result = await integration.startTunnel();
   assert.equal(result.ok, false);
-  assert.match(result.error || '', /no tunnel configured/);
+  assert.match(result.error || '', /no .*tunnel configured/);
 });
 
-test('generateQrSvg returns local-preview QR when no hostname is configured', async () => {
+test('generateQrSvg blocks local-preview QR when no hostname is configured', async () => {
   integration._resetMobileAccessForTests();
-  const result = await integration.generateQrSvg();
-  assert.ok(result);
-  assert.match(result.svg, /^<svg/);
-  assert.equal(result.targetMode, 'local-preview');
-  assert.match(result.targetUrl, /^http:\/\/127\.0\.0\.1:\d+\/m\/\?pair=/);
-  assert.ok(result.expiresAt);
+  await assert.rejects(
+    () => integration.generateQrSvg(),
+    (err: unknown) => {
+      assert.ok(err instanceof integration.MobileQrNotReadyError);
+      assert.equal(err.target.mode, 'local-preview');
+      assert.equal(err.target.qrReady, false);
+      return true;
+    },
+  );
 });
 
-test('generateQrSvg returns one-time pairing SVG when hostname is configured', async () => {
+test('generateQrSvg blocks custom-domain QR until Access is confirmed and tunnel is connected', async () => {
   integration._resetMobileAccessForTests();
-  await setMobileAccessTunnel({ id: 'tid', name: 'clem', hostname: 'clem.example.com' });
+  await setMobileAccessTunnel({ id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' });
+  integration._setTunnelRuntimeForTests({ running: true, connected: true, events: [] });
+  await assert.rejects(
+    () => integration.generateQrSvg(),
+    (err: unknown) => {
+      assert.ok(err instanceof integration.MobileQrNotReadyError);
+      assert.match(err.target.qrBlockedReason ?? '', /Access/i);
+      return true;
+    },
+  );
+});
+
+test('generateQrSvg returns one-time pairing SVG when custom-domain target is ready', async () => {
+  integration._resetMobileAccessForTests();
+  await setMobileAccessTunnel({ id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' });
+  await setMobileAccessAccessAck({ enabled: true });
+  integration._setTunnelRuntimeForTests({ running: true, connected: true, events: [] });
   const result = await integration.generateQrSvg();
   assert.ok(result);
   assert.match(result.svg, /^<svg/);
   assert.equal(result.targetMode, 'public');
+  assert.equal(result.target.mode, 'custom-domain');
+  assert.equal(result.target.qrReady, true);
   assert.match(result.targetUrl, /^https:\/\/clem\.example\.com\/m\/\?pair=/);
   assert.ok(result.expiresAt);
 });
 
-test('generateQrSvg accepts a hostname override', async () => {
-  const result = await integration.generateQrSvg('override.example.com');
-  assert.ok(result);
-  assert.equal(result.targetMode, 'public');
-  assert.match(result.targetUrl, /^https:\/\/override\.example\.com\/m\/\?pair=/);
+test('quick tunnel QR is allowed only for a running connected quick target', async () => {
+  integration._resetMobileAccessForTests();
+  await setMobileAccessTunnel({ id: 'quick', name: 'Quick mobile link', hostname: 'alpha.trycloudflare.com', mode: 'quick' });
+  integration._setTunnelRuntimeForTests({ running: true, connected: true, events: [] });
+  const result = await integration.generateQrSvg();
+  assert.equal(result.target.mode, 'quick');
+  assert.match(result.targetUrl, /^https:\/\/alpha\.trycloudflare\.com\/m\/\?pair=/);
 });
 
 test('install jobs are tracked in the module-scoped map and capped to 5 in recent list', async () => {

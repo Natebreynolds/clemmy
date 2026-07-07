@@ -26,7 +26,15 @@ import {
   type ModelTier,
   type ModelRoutingMode,
 } from '../config.js';
-import { getComposioRuntimeStatus } from '../integrations/composio/client.js';
+import {
+  COMPOSIO_AUTH_CONFIGS_URL,
+  CURATED_TOOLKITS,
+  displayNameFor,
+  getComposioCredentialStatus,
+  getComposioRuntimeStatus,
+  listCachedToolkits,
+  listUsableConnectedToolkits,
+} from '../integrations/composio/client.js';
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
 import { readEmbeddingStats, getEmbeddingHealth } from '../memory/embeddings.js';
@@ -47,25 +55,71 @@ import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { IDENTITY_FILE, MEMORY_FILE, SOUL_FILE, VAULT_DIR, WORKFLOWS_DIR, WORKING_MEMORY_FILE } from '../memory/vault.js';
 import { CRON_TRIGGERS_DIR, ensureDir, getWorkspaceDirs, listWorkspaceProjects, parseTasks, readBaseEnv, updateEnvKey, removeEnvKey, GOALS_DIR, TASKS_FILE, WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import {
-  deleteWorkflow,
   listWorkflows,
   readWorkflow,
-  writeWorkflow,
+  clampGoalMaxAttempts,
   type WorkflowDefinition,
+  type WorkflowGoal,
 } from '../memory/workflow-store.js';
 import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
 import { extractArchitectDiff } from './architect-diff.js';
 import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents, reconstructWorkflowRunQueue } from '../execution/workflow-events.js';
+import { normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
 } from '../execution/workflow-validator.js';
-import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
+import {
+  applyWorkflowTriggerPatch,
+  buildWorkflowTrigger,
+  deleteWorkflowAndSyncTriggers,
+  normalizeWorkflowInputs,
+  normalizeWorkflowResources,
+  normalizeWorkflowSteps,
+  prepareWorkflowCreateForWrite,
+  prepareWorkflowEnableForWrite,
+  prepareWorkflowUpdateForWrite,
+  prepareWorkflowVerification,
+  renderMissingSmokeInputs,
+  validateWorkflowStepGraph,
+  workflowReadinessGapPayload,
+  workflowModelPortabilityFromUnknown,
+  workflowSlugFromName,
+  workflowTriggerCreateInputFromUnknown,
+  workflowUpdateNeedsVerification,
+  writeWorkflowAndSyncTriggers,
+} from '../execution/workflow-authoring.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
+import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
+import { certifyWorkflow, type WorkflowCertification } from '../execution/workflow-certification.js';
+import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
+import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
+import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes, readWorkspaceCheckerReport, writeWorkspaceCheckerReport } from '../execution/workflow-run-workspace.js';
+import { listSubagentRuns, readSubagentOutput } from '../agents/subagent-runs.js';
+import { checkRunAgainstGoal } from '../execution/workflow-run-checker.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
+import {
+  applyWorkflowVisualContractFixes,
+  type WorkflowVisualContractFixKind,
+} from '../execution/workflow-visual-contract-fixes.js';
+import {
+  buildWorkflowRunGraphOverlay,
+  type WorkflowRunLaunchReadinessOverlay,
+  type WorkflowRunRecoveryIntentOverlay,
+} from './workflow-run-overlay.js';
+import type {
+  WorkflowToolReadiness,
+  WorkflowToolReadinessEvidence,
+  WorkflowToolReadinessItem,
+  WorkflowToolReadinessKind,
+  WorkflowToolReadinessStatus,
+} from './workflow-execution-plan.js';
+import { buildWorkflowGoalLineage } from './workflow-goal-lineage.js';
+import { buildWorkflowRecoveryLineage } from './workflow-recovery-lineage.js';
+import { buildWorkflowProof, type WorkflowProofRun } from './workflow-proof.js';
+import { promoteWorkflowFromSession } from '../tools/orchestration-tools.js';
 import { resolveRealtimeVad, buildRealtimeSessionConfig, VOICE_DELIVERY_INSTRUCTIONS } from './realtime-session-config.js';
-import { validateCronExpression } from '../shared/cron.js';
 import { ExecutionStore } from '../execution/store.js';
 import { listOpenCheckIns, closeCheckIn } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -89,6 +143,7 @@ import {
   generateQrSvg as mobileGenerateQrSvg,
   getInstallJob as getMobileInstallJob,
   getMobileAccessStatusPayload,
+  MobileQrNotReadyError,
   rotatePin as mobileRotatePin,
   startInstallJob as startMobileInstallJob,
   startLogin as startMobileLogin,
@@ -216,6 +271,7 @@ import {
   listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
   summarizeSessionForSignal,
+  type EventType,
   type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
@@ -287,7 +343,16 @@ import { serverEnvStatus } from '../tools/mcp-server-tools.js';
 import { collectDiagnostics } from './diagnostics.js';
 import { collectHarnessAudit } from './harness-audit.js';
 import { collectAgentSystemMetrics } from './agent-system-metrics.js';
-import { requeueWorkflowFailedItemsFromRun, requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
+import {
+  queueWorkflowCreationTest,
+  queueWorkflowDryRun,
+  queueWorkflowRun,
+  requeueWorkflowFailedItemsFromRun,
+  requeueWorkflowFromRun,
+  resumeWorkflowRun,
+  type QueueWorkflowRunRecoveryIntentInput,
+} from '../tools/workflow-run-queue.js';
+import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -328,10 +393,23 @@ function toolEventsDir(): string {
 interface WorkflowStepShape {
   id: string;
   prompt: string;
+  project?: string;
   dependsOn?: string[];
   model?: string;
+  intent?: string;
   tier?: number;
   maxTurns?: number;
+  forEach?: string;
+  forEachNewOnly?: boolean;
+  deterministic?: { runner: string };
+  call?: { tool: string; args?: Record<string, unknown> };
+  allowedTools?: string[];
+  usesSkill?: string;
+  sideEffect?: 'read' | 'write' | 'send';
+  requiresApproval?: boolean;
+  approvalPreview?: string;
+  inputs?: Record<string, unknown>;
+  output?: Record<string, unknown>;
 }
 interface WorkflowFrontmatter {
   name?: string;
@@ -340,6 +418,7 @@ interface WorkflowFrontmatter {
   trigger?: { schedule?: string; manual?: boolean };
   steps?: WorkflowStepShape[];
   inputs?: Record<string, { type?: string; default?: string; description?: string }>;
+  resources?: Record<string, unknown>;
   synthesis?: { prompt?: string };
   goal?: {
     objective?: string;
@@ -609,6 +688,668 @@ function workflowRunSummary(workflowSlug: string, runId: string): {
     because: typeof meta.because === 'string' ? trimConsoleTitle(meta.because, 180) : undefined,
     needsAttention: meta.needsAttention === true,
   };
+}
+
+function workflowExecutionPlanOptions() {
+  return {
+    stepConcurrency: positiveEnvInt('CLEMENTINE_WORKFLOW_CONCURRENCY', 5),
+    runConcurrency: positiveEnvInt('CLEMENTINE_WORKFLOW_RUN_CONCURRENCY', 1),
+    forEachBatchSize: positiveEnvInt('CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS', 200),
+  };
+}
+
+function workflowExecutionPlanFor(def: WorkflowDefinition, workflowSlug?: string) {
+  return buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, workflowExecutionPlanOptions());
+}
+
+function workflowCertificationFor(def: WorkflowDefinition, workflowSlug: string) {
+  return certifyWorkflow(def, {
+    workflowSlug,
+    planOptions: workflowExecutionPlanOptions(),
+  });
+}
+
+function workflowCertificationSummary(cert: WorkflowCertification) {
+  const dryRun = cert.dryRun;
+  const codeSteps = dryRun.steps.filter((s) => s.executor === 'call' || s.executor === 'deterministic').length;
+  const llmSteps = dryRun.steps.filter((s) => s.executor === 'model' || s.executor === 'skill').length;
+  return {
+    workflow: cert.workflow,
+    enabled: cert.enabled,
+    state: cert.state,
+    executionMode: cert.executionMode,
+    label: cert.label,
+    summary: cert.summary,
+    canRun: cert.canRun,
+    canEnableDirectly: cert.canEnableDirectly,
+    canQueueCreationTest: cert.canQueueCreationTest,
+    needsCreationTest: cert.needsCreationTest,
+    missingRunInputs: cert.missingRunInputs,
+    missingTestInputs: cert.missingTestInputs,
+    resourceGaps: cert.resourceGaps.slice(0, 5),
+    resourceGapCount: cert.resourceGaps.length,
+    readinessGapCount: cert.readinessGaps.length,
+    blockerCount: cert.blockingReasons.length,
+    contractAdvisoryCount: cert.contractAdvisories.length,
+    nextActions: cert.nextActions,
+    dryRun: {
+      verdict: dryRun.verdict,
+      runnable: dryRun.runnable,
+      summary: dryRun.summary,
+      waveCount: dryRun.waves.length,
+      parallelWaveCount: dryRun.waves.filter((wave) => wave.parallel).length,
+      criticalPathLength: dryRun.criticalPath.length,
+      // Execution economics — the "why Clem, not Claude Code" signal. `code`
+      // steps (direct tool calls + deterministic scripts) run token-free every
+      // run; `llm` steps (model reasoning + skill execution) are where the
+      // once-authored reasoning cost lives. A cheap workflow is mostly code.
+      stepCount: dryRun.steps.length,
+      codeSteps,
+      llmSteps,
+      effectCounts: {
+        sends: dryRun.effects.sends.length,
+        writes: dryRun.effects.writes.length,
+        readSteps: dryRun.effects.readSteps,
+        approvals: dryRun.effects.approvals.length,
+      },
+      toolsTouched: dryRun.effects.toolsTouched.slice(0, 8),
+    },
+  };
+}
+
+function workflowCertificationSummaryFor(def: WorkflowDefinition, workflowSlug: string) {
+  return workflowCertificationSummary(workflowCertificationFor(def, workflowSlug));
+}
+
+function workflowConsoleStatePayload(def: WorkflowDefinition, workflowSlug: string) {
+  const certification = workflowCertificationFor(def, workflowSlug);
+  const executionPlan = certification.dryRun.plan;
+  const proof = buildWorkflowProof(def, readWorkflowRunRecords(), [workflowSlug]);
+  return {
+    name: def.name,
+    enabled: def.enabled,
+    certification,
+    readinessGaps: workflowReadinessGapPayload(def),
+    proof,
+    executionPlan,
+    graph: buildWorkflowGraph(def.steps, {
+      readinessItems: executionPlan.toolReadiness.items,
+      workflowProject: def.project,
+      executionPlan,
+    }),
+    steps: def.steps,
+    goal: def.goal ?? null,
+    resources: def.resources ?? {},
+    inputs: def.inputs ?? {},
+    synthesis: def.synthesis ?? null,
+    project: def.project ?? null,
+  };
+}
+
+const WORKFLOW_VISUAL_CONTRACT_FIX_KINDS: ReadonlySet<WorkflowVisualContractFixKind> = new Set([
+  'fix_graph_structure',
+  'increase_concurrency',
+  'make_fanout_resumable',
+  'add_judge_gate',
+  'confirm_tool_connection',
+  'install_skill',
+  'add_workflow_script',
+  'select_local_project',
+  'make_models_portable',
+]);
+
+function parseWorkflowVisualContractFixes(raw: unknown): { ok: true; fixes?: WorkflowVisualContractFixKind[] } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true };
+  if (!Array.isArray(raw)) return { ok: false, error: 'fixes must be an array of visual-contract remediation kinds' };
+  const fixes: WorkflowVisualContractFixKind[] = [];
+  for (const value of raw) {
+    const kind = typeof value === 'string' ? value.trim() : '';
+    if (!WORKFLOW_VISUAL_CONTRACT_FIX_KINDS.has(kind as WorkflowVisualContractFixKind)) {
+      return { ok: false, error: `unknown visual-contract fix: ${kind || String(value)}` };
+    }
+    fixes.push(kind as WorkflowVisualContractFixKind);
+  }
+  return { ok: true, fixes: [...new Set(fixes)] };
+}
+
+function parseWorkflowFixStepIds(body: Record<string, unknown>): string[] | undefined {
+  const raw = body.stepIds ?? body.step_ids;
+  if (!Array.isArray(raw)) return undefined;
+  return [...new Set(raw
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean))];
+}
+
+type WorkflowContractActionKind = 'select_local_project' | 'add_workflow_script' | 'confirm_tool_connection';
+const WORKFLOW_CONTRACT_ACTION_KINDS: ReadonlySet<WorkflowContractActionKind> = new Set([
+  'select_local_project',
+  'add_workflow_script',
+  'confirm_tool_connection',
+]);
+
+function parseWorkflowContractActionKind(raw: unknown): { ok: true; kind: WorkflowContractActionKind } | { ok: false; error: string } {
+  const kind = typeof raw === 'string' ? raw.trim() : '';
+  if (!WORKFLOW_CONTRACT_ACTION_KINDS.has(kind as WorkflowContractActionKind)) {
+    return { ok: false, error: `unknown workflow contract action: ${kind || String(raw)}` };
+  }
+  return { ok: true, kind: kind as WorkflowContractActionKind };
+}
+
+function normalizeWorkflowContractProjectRef(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function normalizeWorkflowContractCliCommand(raw: unknown): string {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) return '';
+  const prefixed = value.match(/^(?:cli|local_cli):([A-Za-z0-9._+-]{1,60})$/);
+  if (prefixed?.[1]) return prefixed[1];
+  const which = value.match(/^which\s+([A-Za-z0-9._+-]{1,60})$/);
+  if (which?.[1]) return which[1];
+  return value;
+}
+
+function workflowCliCommandFromReadinessItem(item: WorkflowToolReadinessItem): string {
+  if (item.kind !== 'cli') return '';
+  const explicit = item.name.match(/^(?:cli|local_cli):([A-Za-z0-9._+-]{1,60})$/)?.[1];
+  if (explicit) return explicit;
+  const evidence = (item.evidence ?? [])
+    .find((entry) => entry.kind === 'cli_command' && /^[A-Za-z0-9._+-]{1,60}$/.test(entry.name));
+  return evidence?.name ?? '';
+}
+
+function scopedWorkflowReadinessItems(
+  items: WorkflowToolReadinessItem[],
+  stepIds: string[] | undefined,
+): WorkflowToolReadinessItem[] {
+  const scoped = new Set(stepIds ?? []);
+	  return items
+	    .filter((item) => item.status !== 'ready')
+	    .filter((item) => scoped.size === 0 || item.stepIds.some((stepId) => scoped.has(stepId)));
+	}
+
+function parseWorkflowRuntimeToolNames(body: Record<string, unknown>): string[] {
+  const raw = body.tools ?? body.toolNames ?? body.tool_names ?? body.failedTools ?? body.failed_tools;
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw
+    .map((value) => typeof value === 'string' ? value.trim() : '')
+    .filter((value) => value.length > 0 && value.length <= 160))]
+    .slice(0, 20);
+}
+
+function isWorkflowRuntimeMcpTool(tool: string): boolean {
+  return /^mcp/i.test(tool)
+    || tool.includes('__mcp')
+    || tool.includes('mcp__')
+    || /^[a-z0-9][a-z0-9_.-]*__[A-Za-z0-9_.-]+/.test(tool);
+}
+
+function isWorkflowRuntimeComposioTool(tool: string): boolean {
+  return /^composio/i.test(tool) || /^[A-Z0-9]+_[A-Z0-9_]+$/.test(tool);
+}
+
+function isWorkflowRuntimeCliTool(tool: string): boolean {
+  return tool === 'run_shell_command'
+    || tool.startsWith('local_cli_')
+    || tool.startsWith('cli:')
+    || tool.startsWith('local_cli:')
+    || tool.endsWith('_cli')
+    || tool.includes('shell')
+    || tool.includes('command');
+}
+
+function runtimeWorkflowReadinessKindForTool(tool: string): WorkflowToolReadinessKind {
+  if (isWorkflowRuntimeMcpTool(tool)) return 'mcp';
+  if (isWorkflowRuntimeComposioTool(tool)) return 'composio';
+  if (isWorkflowRuntimeCliTool(tool)) return 'cli';
+  if (tool === 'read_file' || tool === 'write_file' || tool === 'list_files' || tool.startsWith('local_')) return 'local';
+  return 'tool';
+}
+
+function runtimeWorkflowReadinessItems(
+  toolNames: string[],
+  stepIds: string[] | undefined,
+): WorkflowToolReadinessItem[] {
+  const scopedStepIds = stepIds && stepIds.length ? stepIds : [];
+  return toolNames.map((name) => ({
+    kind: runtimeWorkflowReadinessKindForTool(name),
+    name,
+    status: 'unknown',
+    reason: 'Runtime run evidence recorded this tool on a failed or attention-needed workflow node.',
+    stepIds: scopedStepIds,
+    sources: ['step_call'],
+    evidence: [{
+      kind: runtimeWorkflowReadinessKindForTool(name) === 'mcp' ? 'mcp_server'
+        : runtimeWorkflowReadinessKindForTool(name) === 'composio' ? 'composio_broker'
+          : runtimeWorkflowReadinessKindForTool(name) === 'cli' ? 'cli_command'
+            : 'tool_catalog',
+      name,
+      status: 'unknown',
+      detail: 'runtime failure evidence',
+    }],
+  }));
+}
+
+function mergeWorkflowReadinessItems(
+  base: WorkflowToolReadinessItem[],
+  runtime: WorkflowToolReadinessItem[],
+): WorkflowToolReadinessItem[] {
+  const seen = new Set<string>();
+  const merged: WorkflowToolReadinessItem[] = [];
+  for (const item of [...base, ...runtime]) {
+    const key = `${item.kind}:${item.name}:${[...item.stepIds].sort().join(',')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function workflowReadinessItemSummary(item: WorkflowToolReadinessItem): string {
+  return `${item.status}: ${item.kind} ${item.name} - ${item.reason}`;
+}
+
+type WorkflowToolConnectionCheckStatus = 'ready' | 'missing' | 'unknown';
+interface WorkflowToolConnectionAction {
+  kind: string;
+  label: string;
+  detail: string;
+  method?: string;
+  endpoint?: string;
+  command?: string;
+  href?: string;
+}
+interface WorkflowToolConnectionCheck {
+  runtime: WorkflowToolReadinessItem['kind'];
+  name: string;
+  status: WorkflowToolConnectionCheckStatus;
+  summary: string;
+  toolkitSlug?: string;
+  serverName?: string;
+  serverSlug?: string;
+  evidence: string[];
+  nextActions: WorkflowToolConnectionAction[];
+}
+
+function normalizeWorkflowToolSlug(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+function composioToolkitSlugForWorkflowTool(toolName: string): string {
+  const lower = toolName.trim().toLowerCase().replace(/^composio[_:-]/, '');
+  const normalizedTool = normalizeWorkflowToolSlug(lower);
+  const slugs = [...new Set([
+    ...CURATED_TOOLKITS.map((toolkit) => toolkit.slug),
+    ...listCachedToolkits().map((toolkit) => toolkit.slug),
+  ])].sort((a, b) => b.length - a.length);
+  for (const slug of slugs) {
+    const normalizedSlug = normalizeWorkflowToolSlug(slug);
+    if (normalizedTool === normalizedSlug || normalizedTool.startsWith(`${normalizedSlug}_`)) return slug;
+  }
+  const first = normalizedTool.split('_').find(Boolean);
+  return first ?? '';
+}
+
+function workflowMcpServerIdFromReadinessItem(item: WorkflowToolReadinessItem): string {
+  if (item.kind !== 'mcp') return '';
+  const mcpPrefixed = item.name.match(/^mcp__(.+?)__/i)?.[1];
+  if (mcpPrefixed) return mcpPrefixed;
+  const namespace = item.name.match(/^([a-z0-9][a-z0-9_.-]*)__[A-Za-z0-9_.-]+/)?.[1];
+  if (namespace) return namespace;
+  const evidence = (item.evidence ?? []).find((entry) => entry.kind === 'mcp_server' && entry.name.trim());
+  return evidence?.name ?? '';
+}
+
+function workflowConnectionCheckLine(check: WorkflowToolConnectionCheck): string {
+  const action = check.nextActions[0];
+  const next = action
+    ? ` Next: ${action.command || [action.method, action.endpoint].filter(Boolean).join(' ') || action.href || action.label}.`
+    : '';
+  return `${check.status}: ${check.runtime} ${check.name} - ${check.summary}${next}`;
+}
+
+async function workflowComposioConnectionCheck(item: WorkflowToolReadinessItem): Promise<WorkflowToolConnectionCheck> {
+  const credentials = getComposioCredentialStatus();
+  const toolkitSlug = composioToolkitSlugForWorkflowTool(item.name);
+  const evidence = [
+    credentials.apiKeyPresent ? 'COMPOSIO_API_KEY is configured.' : 'COMPOSIO_API_KEY is not configured.',
+    `execution backend: ${credentials.executionBackend}`,
+  ];
+  const nextActions: WorkflowToolConnectionAction[] = [
+    {
+      kind: 'search_composio_schema',
+      label: 'Search Composio schema',
+      detail: 'Fetch the exact action schema before unattended execution.',
+      command: `composio_search_tools query="${item.name}"`,
+    },
+  ];
+  if (!credentials.apiKeyPresent) {
+    nextActions.unshift({
+      kind: 'set_composio_api_key',
+      label: 'Add Composio API key',
+      detail: 'Save a Composio API key in Integrations before connecting app accounts.',
+      method: 'POST',
+      endpoint: '/api/composio/api-key',
+    });
+    return {
+      runtime: 'composio',
+      name: item.name,
+      status: 'missing',
+      summary: 'Composio is not configured for this Clementine runtime.',
+      ...(toolkitSlug ? { toolkitSlug } : {}),
+      evidence,
+      nextActions,
+    };
+  }
+
+  let connected: Awaited<ReturnType<typeof listUsableConnectedToolkits>> = [];
+  try {
+    connected = await listUsableConnectedToolkits();
+    evidence.push(`${connected.length} usable Composio connection${connected.length === 1 ? '' : 's'} found.`);
+  } catch (err) {
+    evidence.push(`Could not refresh connected toolkits: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (toolkitSlug) {
+    const toolkitName = displayNameFor(toolkitSlug);
+    const matches = connected.filter((connection) => connection.slug.toLowerCase() === toolkitSlug.toLowerCase());
+    const active = matches.filter((connection) => /active|enabled|initiat/i.test(connection.status));
+    evidence.push(matches.length
+      ? `${matches.length} ${toolkitName} connection${matches.length === 1 ? '' : 's'} found (${matches.map((connection) => connection.status).join(', ')}).`
+      : `No usable ${toolkitName} connection is currently visible.`);
+    nextActions.unshift(
+      {
+        kind: 'refresh_composio_connections',
+        label: 'Refresh Composio connections',
+        detail: 'Refresh connected toolkit/account inventory after connecting or repairing the account.',
+        method: 'POST',
+        endpoint: '/api/composio/refresh',
+      },
+      {
+        kind: 'open_composio_toolkit_setup',
+        label: `Review ${toolkitName} setup`,
+        detail: 'Open toolkit setup metadata so the user can choose OAuth or API-key setup.',
+        method: 'GET',
+        endpoint: `/api/composio/toolkits/${encodeURIComponent(toolkitSlug)}/setup-meta`,
+      },
+      {
+        kind: 'authorize_composio_toolkit',
+        label: `Connect ${toolkitName}`,
+        detail: 'Start the Composio connection flow for this toolkit after auth config exists.',
+        method: 'POST',
+        endpoint: `/api/composio/toolkits/${encodeURIComponent(toolkitSlug)}/authorize`,
+      },
+      {
+        kind: 'setup_composio_oauth',
+        label: `Prepare ${toolkitName} OAuth`,
+        detail: 'Create a managed OAuth auth config when Composio supports it, then authorize the toolkit.',
+        method: 'POST',
+        endpoint: `/api/composio/toolkits/${encodeURIComponent(toolkitSlug)}/setup-oauth`,
+      },
+    );
+    return {
+      runtime: 'composio',
+      name: item.name,
+      status: active.length > 0 ? 'ready' : 'missing',
+      summary: active.length > 0
+        ? `${toolkitName} has an active Composio connection.`
+        : `${toolkitName} is not connected through Composio yet.`,
+      toolkitSlug,
+      evidence,
+      nextActions,
+    };
+  }
+
+  nextActions.unshift({
+    kind: 'open_composio_auth_configs',
+    label: 'Open Composio auth configs',
+    detail: 'The toolkit slug could not be inferred from this action name; review Composio auth configs and schema search results.',
+    href: COMPOSIO_AUTH_CONFIGS_URL,
+  });
+  return {
+    runtime: 'composio',
+    name: item.name,
+    status: 'unknown',
+    summary: 'Composio is configured, but the required toolkit could not be inferred from this action name.',
+    evidence,
+    nextActions,
+  };
+}
+
+function workflowMcpConnectionCheck(item: WorkflowToolReadinessItem): WorkflowToolConnectionCheck {
+  const serverId = workflowMcpServerIdFromReadinessItem(item);
+  const wantedSlug = serverId ? slugifyServerName(serverId) : '';
+  const servers = discoverMcpServers();
+  const server = wantedSlug
+    ? servers.find((candidate) => slugifyServerName(candidate.name) === wantedSlug || candidate.name === serverId || candidate.name.toLowerCase() === serverId.toLowerCase())
+    : undefined;
+  const health = listMcpServerHealth();
+  const serverHealth = wantedSlug
+    ? health.find((candidate) => candidate.slug === wantedSlug || candidate.name === serverId || candidate.name === server?.name)
+    : undefined;
+  const evidence = [
+    serverId ? `required server namespace: ${serverId}` : 'no server namespace could be inferred from the tool name.',
+    `${servers.length} MCP server${servers.length === 1 ? '' : 's'} configured.`,
+  ];
+  const nextActions: WorkflowToolConnectionAction[] = [
+    {
+      kind: 'inspect_mcp_status',
+      label: 'Inspect MCP status',
+      detail: 'List configured MCP servers and credential key names.',
+      command: serverId ? `mcp_status query="${serverId}"` : 'mcp_status',
+    },
+  ];
+  if (!server) {
+    nextActions.push({
+      kind: 'add_mcp_server',
+      label: 'Add MCP server',
+      detail: 'Create a Clementine-managed MCP server config, then enter any required credentials in Settings.',
+      command: serverId ? `mcp_add name="${serverId}" ...` : 'mcp_add ...',
+    });
+    return {
+      runtime: 'mcp',
+      name: item.name,
+      status: 'missing',
+      summary: serverId ? `No configured MCP server matched "${serverId}".` : 'No MCP server namespace could be matched.',
+      ...(serverId ? { serverSlug: wantedSlug } : {}),
+      evidence,
+      nextActions,
+    };
+  }
+
+  const envStatus = serverEnvStatus(server);
+  evidence.push(`server "${server.name}" is ${server.enabled === false ? 'disabled' : 'enabled'}.`);
+  evidence.push(`connection state: ${serverHealth?.state ?? 'unknown'}.`);
+  if (serverHealth?.lastError) evidence.push(`last error: ${serverHealth.lastError}`);
+  if (envStatus.declaredEnvKeys.length) evidence.push(`declared credential keys: ${envStatus.declaredEnvKeys.join(', ')}.`);
+  if (envStatus.unsetEnvKeys.length) evidence.push(`unset credential keys: ${envStatus.unsetEnvKeys.join(', ')}.`);
+  if (server.enabled === false) {
+    nextActions.push({
+      kind: 'enable_mcp_server',
+      label: `Enable ${server.name}`,
+      detail: 'Enable this MCP server in the Integrations hub.',
+      method: 'PATCH',
+      endpoint: `/api/console/mcp-servers/${encodeURIComponent(server.name)}`,
+    });
+  }
+  if (envStatus.unsetEnvKeys.length) {
+    nextActions.push({
+      kind: 'set_mcp_credentials',
+      label: `Enter ${server.name} credentials`,
+      detail: `Enter values for: ${envStatus.unsetEnvKeys.join(', ')}.`,
+      method: 'POST',
+      endpoint: `/api/console/mcp-servers/${encodeURIComponent(server.name)}/credential`,
+    });
+  }
+  if (serverHealth?.state === 'degraded' || serverHealth?.state === 'unavailable') {
+    nextActions.push({
+      kind: 'reconnect_mcp',
+      label: `Reconnect ${server.name}`,
+      detail: 'Clear MCP backoff/cache so the server reconnects on the next tool call.',
+      method: 'POST',
+      endpoint: `/api/console/mcp-servers/${encodeURIComponent(server.name)}/reconnect`,
+      command: `mcp_reconnect server_name="${server.name}"`,
+    });
+  }
+  const connected = server.enabled !== false && envStatus.unsetEnvKeys.length === 0 && serverHealth?.state === 'connected';
+  const missing = server.enabled === false || envStatus.unsetEnvKeys.length > 0 || serverHealth?.state === 'unavailable';
+  return {
+    runtime: 'mcp',
+    name: item.name,
+    status: connected ? 'ready' : missing ? 'missing' : 'unknown',
+    summary: connected
+      ? `MCP server "${server.name}" is connected.`
+      : server.enabled === false
+        ? `MCP server "${server.name}" is disabled.`
+        : envStatus.unsetEnvKeys.length
+          ? `MCP server "${server.name}" needs credential values before it can connect.`
+          : `MCP server "${server.name}" is ${serverHealth?.state ?? 'not health-checked yet'}.`,
+    serverName: server.name,
+    serverSlug: slugifyServerName(server.name),
+    evidence,
+    nextActions,
+  };
+}
+
+async function workflowConnectionCheckForItem(item: WorkflowToolReadinessItem): Promise<WorkflowToolConnectionCheck> {
+  if (item.kind === 'composio') return workflowComposioConnectionCheck(item);
+  if (item.kind === 'mcp') return workflowMcpConnectionCheck(item);
+  return {
+    runtime: item.kind,
+    name: item.name,
+    status: item.status === 'ready' ? 'ready' : item.status === 'missing' ? 'missing' : 'unknown',
+    summary: item.reason || 'Runtime tool availability is not confirmed.',
+    evidence: (item.evidence ?? []).map((entry) => `${entry.kind}:${entry.name}=${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`),
+    nextActions: [{
+      kind: 'inspect_runtime_tool',
+      label: 'Inspect runtime tool',
+      detail: 'Verify this tool exists in the active Clementine runtime catalog.',
+    }],
+  };
+}
+
+function resolveWorkspaceProjectForContractAction(ref: string): { ok: true; project: { name: string; path: string; type?: string } } | { ok: false; error: string; projects: Array<{ name: string; path: string; type?: string }> } {
+  const projects = listWorkspaceProjects().map((project) => ({
+    name: project.name,
+    path: project.path,
+    ...(project.type ? { type: project.type } : {}),
+  }));
+  const wanted = ref.trim().toLowerCase();
+  const wantedSlug = wanted.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  const project = projects.find((candidate) => {
+    const aliases = [candidate.name, candidate.path, path.basename(candidate.path)]
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+    return aliases.some((alias) => alias === wanted || alias.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') === wantedSlug);
+  });
+  return project ? { ok: true, project } : { ok: false, error: `workspace project not found: ${ref}`, projects };
+}
+
+function normalizeWorkflowScriptRunner(raw: unknown): { ok: true; runner: string; relativePath: string } | { ok: false; error: string } {
+  const value = typeof raw === 'string' ? raw.trim().replace(/\\/g, '/') : '';
+  if (!value) return { ok: false, error: 'runner required' };
+  if (value.length > 180) return { ok: false, error: 'runner is too long' };
+  if (/\s/.test(value)) return { ok: false, error: 'runner must be a scripts/ path without inline arguments' };
+  if (path.posix.isAbsolute(value)) return { ok: false, error: 'runner must be relative to the workflow scripts directory' };
+  const stripped = value.startsWith('scripts/') ? value.slice('scripts/'.length) : value;
+  const normalized = path.posix.normalize(stripped);
+  if (!normalized || normalized === '.' || normalized.startsWith('../') || normalized.includes('/../')) {
+    return { ok: false, error: 'runner must stay inside the workflow scripts directory' };
+  }
+  if (normalized.startsWith('.')) return { ok: false, error: 'runner must not be hidden or parent-relative' };
+  return { ok: true, runner: normalized, relativePath: normalized };
+}
+
+function resolveWorkflowScriptFile(workflowSlug: string, runner: string): { ok: true; scriptsDir: string; filePath: string } | { ok: false; error: string } {
+  if (!/^[A-Za-z0-9_.-]+$/.test(workflowSlug)) return { ok: false, error: 'invalid workflow slug' };
+  const scriptsDir = path.resolve(WORKFLOWS_DIR, workflowSlug, 'scripts');
+  const filePath = path.resolve(scriptsDir, runner);
+  if (filePath !== scriptsDir && !filePath.startsWith(scriptsDir + path.sep)) {
+    return { ok: false, error: 'runner resolved outside the workflow scripts directory' };
+  }
+  return { ok: true, scriptsDir, filePath };
+}
+
+function workflowStepScopeForAction(def: WorkflowDefinition, stepIds: string[] | undefined): Set<string> {
+  const scoped = new Set((stepIds ?? []).filter(Boolean));
+  if (scoped.size > 0) return scoped;
+  const deterministicSteps = def.steps.filter((step) => step.deterministic?.runner).map((step) => step.id);
+  return new Set(deterministicSteps.length === 1 ? deterministicSteps : []);
+}
+
+function workflowReadinessBlockedBody(
+  message: string,
+  readiness: WorkflowRunReadinessCheck | undefined,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    error: message,
+    message,
+    ...extra,
+    ...(readiness ? {
+      readiness: {
+        ok: readiness.ok,
+        blockers: readiness.blockers,
+        warnings: readiness.warnings,
+        toolReadiness: readiness.plan.toolReadiness,
+      },
+      executionPlan: readiness.plan,
+    } : {}),
+  };
+}
+
+function positiveEnvInt(key: string, fallback: number): number {
+  const raw = getRuntimeEnv(key, String(fallback));
+  const n = parseInt(raw || String(fallback), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const WORKFLOW_GRAPH_HARNESS_EVENT_TYPES: EventType[] = [
+  'tool_called',
+  'approval_requested',
+  'approval_resolved',
+  'external_write',
+  'external_write_failed',
+  'external_write_orphaned',
+  'worker_result',
+  'worker_capped',
+  'worker_model_routed',
+  'turn_model_routed',
+  'brain_fallover',
+  'goal_validation',
+  'goal_alignment_judged',
+  'output_grounding_judged',
+  'guardrail_tripped',
+  'stuck_detected',
+];
+
+function workflowGraphHarnessEvidence(runId: string): Array<{
+  sessionId: string;
+  stepId?: string;
+  status?: string;
+  events: Array<{ type: string; data: Record<string, unknown> }>;
+}> {
+  if (!runId) return [];
+  const out: Array<{
+    sessionId: string;
+    stepId?: string;
+    status?: string;
+    events: Array<{ type: string; data: Record<string, unknown> }>;
+  }> = [];
+  for (let offset = 0; ; offset += 500) {
+    const page = listHarnessSessions({ kind: 'workflow', status: 'any', limit: 500, offset });
+    for (const session of page) {
+      if (session.metadata?.workflowRunId !== runId) continue;
+      const stepId = typeof session.metadata.stepId === 'string' ? session.metadata.stepId : undefined;
+      const events = listHarnessEvents(session.id, {
+        types: WORKFLOW_GRAPH_HARNESS_EVENT_TYPES,
+        limit: 2000,
+      }).map((event) => ({ type: event.type, data: event.data }));
+      out.push({ sessionId: session.id, stepId, status: session.status, events });
+    }
+    if (page.length < 500) break;
+  }
+  return out;
 }
 
 function workflowFailureSummary(workflowSlug: string, runId: string): BoardFailureSummary | undefined {
@@ -918,10 +1659,6 @@ function realtimeNumberEnv(name: string, fallback: number, min: number, max: num
 }
 
 
-function sanitizeWorkflowName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
-}
-
 /**
  * Tools the Workflow Architect chat is forbidden from calling. The
  * architect must propose changes as JSON diff ops the user applies
@@ -936,6 +1673,7 @@ function sanitizeWorkflowName(name: string): string {
 const ARCHITECT_HIDDEN_TOOLS = [
   'workflow_create',
   'workflow_update',
+  'workflow_apply_contract_fixes',
   'workflow_edit_step',
   'workflow_set_enabled',
   'workflow_delete',
@@ -971,27 +1709,87 @@ function mergeWorkflowStepsForPatch(existingSteps: WorkflowDefinition['steps'], 
   });
 }
 
-interface WorkflowRunRecordSummary {
-  id: string;
-  workflow: string;
-  status: string;
-  createdAt: string | null;
-  startedAt: string | null;
-  finishedAt: string | null;
-  source: string | null;
-  error: string | null;
-  targetStepId: string | null;
-  needsAttention: boolean;
+function dashboardWorkflowSmokeInputs(body: Record<string, unknown>): Record<string, string> {
+  const raw = body.testInputs ?? body.test_inputs;
+  if (!raw) return {};
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, value == null ? '' : String(value)]));
+    } catch {
+      return {};
+    }
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    return Object.fromEntries(Object.entries(raw).map(([key, value]) => [key, value == null ? '' : String(value)]));
+  }
+  return {};
+}
+
+function workflowGoalFromDashboardBody(raw: unknown): WorkflowGoal | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const body = raw as Record<string, unknown>;
+  const objective = typeof body.objective === 'string' ? body.objective.trim() : '';
+  if (objective.length < 4) return undefined;
+  const rawCriteria = body.successCriteria ?? body.success_criteria;
+  const successCriteria = Array.isArray(rawCriteria)
+    ? rawCriteria.map((criterion) => String(criterion).trim()).filter(Boolean)
+    : undefined;
+  const out: WorkflowGoal = { objective };
+  if (successCriteria && successCriteria.length > 0) out.successCriteria = successCriteria;
+  const rawMax = body.maxAttempts ?? body.max_attempts;
+  if (typeof rawMax === 'number' && Number.isFinite(rawMax)) out.maxAttempts = clampGoalMaxAttempts(rawMax);
+  return out;
+}
+
+interface WorkflowRunRecordSummary extends WorkflowProofRun {
+  recoveryIntent?: WorkflowRunRecoveryIntentOverlay | null;
 }
 
 function stringField(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
 }
 
+const WORKFLOW_RUN_RECOVERY_BODY_KINDS = new Set([
+  'step_try',
+  'failed_items',
+  'safe_rerun',
+  'execution_optimize',
+  'goal_rerun',
+  'self_heal',
+  'manual_requeue',
+]);
+
+function workflowRunRecoveryKindField(value: unknown): string | null {
+  const kind = stringField(value);
+  return kind && WORKFLOW_RUN_RECOVERY_BODY_KINDS.has(kind) ? kind : null;
+}
+
+function workflowRunRecoveryIntentFromBody(
+  body: unknown,
+  fallback: QueueWorkflowRunRecoveryIntentInput,
+): QueueWorkflowRunRecoveryIntentInput {
+  const row = body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown>
+    : {};
+  const raw = row.recoveryIntent && typeof row.recoveryIntent === 'object' && !Array.isArray(row.recoveryIntent)
+    ? row.recoveryIntent as Record<string, unknown>
+    : {};
+  return {
+    kind: workflowRunRecoveryKindField(raw.kind) ?? fallback.kind,
+    sourceRunId: stringField(raw.sourceRunId) ?? fallback.sourceRunId,
+    sourceStepId: stringField(raw.sourceStepId) ?? fallback.sourceStepId,
+    requestedFrom: stringField(raw.requestedFrom) ?? stringField(row.recoveryRequestedFrom) ?? fallback.requestedFrom,
+    reason: stringField(raw.reason) ?? stringField(row.recoveryReason) ?? fallback.reason,
+  };
+}
+
 function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRecordSummary | null {
   const id = stringField(raw.id);
   const workflow = stringField(raw.workflow);
   if (!id || !workflow) return null;
+  const recoveryIntent = normalizeWorkflowRunRecoveryIntent(raw.recoveryIntent);
   return {
     id,
     workflow,
@@ -1003,7 +1801,157 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
     error: stringField(raw.error),
     targetStepId: stringField(raw.targetStepId),
     needsAttention: raw.needsAttention === true,
+    ...(recoveryIntent ? { recoveryIntent } : {}),
   };
+}
+
+const WORKFLOW_READINESS_KINDS = new Set<WorkflowToolReadinessKind>(['tool', 'composio', 'mcp', 'cli', 'local', 'skill', 'script', 'project']);
+const WORKFLOW_READINESS_STATUSES = new Set<WorkflowToolReadinessStatus>(['ready', 'missing', 'unknown']);
+const WORKFLOW_READINESS_EVIDENCE_KINDS = new Set<WorkflowToolReadinessEvidence['kind']>([
+  'tool_catalog',
+  'composio_broker',
+  'mcp_server',
+  'cli_command',
+  'skill',
+  'script',
+  'project',
+]);
+
+function stringArrayField(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => typeof item === 'string' ? item.trim() : '').filter(Boolean)
+    : [];
+}
+
+function normalizeWorkflowReadinessEvidence(value: unknown): WorkflowToolReadinessEvidence[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const evidence = value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+      const row = entry as Record<string, unknown>;
+      const kind = stringField(row.kind);
+      const name = stringField(row.name);
+      const status = stringField(row.status);
+      if (!kind || !name || !status || !WORKFLOW_READINESS_STATUSES.has(status as WorkflowToolReadinessStatus)) return null;
+      if (!WORKFLOW_READINESS_EVIDENCE_KINDS.has(kind as WorkflowToolReadinessEvidence['kind'])) return null;
+      return {
+        kind: kind as WorkflowToolReadinessEvidence['kind'],
+        name,
+        status: status as WorkflowToolReadinessStatus,
+        ...(stringField(row.detail) ? { detail: stringField(row.detail)! } : {}),
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+  return evidence.length ? evidence : undefined;
+}
+
+function normalizeWorkflowReadinessItem(value: unknown): WorkflowToolReadinessItem | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  const kind = stringField(row.kind);
+  const name = stringField(row.name);
+  const status = stringField(row.status);
+  if (!kind || !name || !status) return null;
+  if (!WORKFLOW_READINESS_KINDS.has(kind as WorkflowToolReadinessKind)) return null;
+  if (!WORKFLOW_READINESS_STATUSES.has(status as WorkflowToolReadinessStatus)) return null;
+  const stepIds = stringArrayField(row.stepIds);
+  const sources = stringArrayField(row.sources);
+  const evidence = normalizeWorkflowReadinessEvidence(row.evidence);
+  return {
+    kind: kind as WorkflowToolReadinessKind,
+    name,
+    status: status as WorkflowToolReadinessStatus,
+    reason: stringField(row.reason) ?? '',
+    stepIds,
+    ...(sources.length ? { sources: sources as WorkflowToolReadinessItem['sources'] } : {}),
+    ...(evidence ? { evidence } : {}),
+  };
+}
+
+function normalizeWorkflowToolReadiness(value: unknown): WorkflowToolReadiness | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const row = value as Record<string, unknown>;
+  const items = Array.isArray(row.items)
+    ? row.items.map(normalizeWorkflowReadinessItem).filter((item): item is WorkflowToolReadinessItem => Boolean(item))
+    : [];
+  const missingCount = Number.isFinite(Number(row.missingCount)) ? Number(row.missingCount) : items.filter((item) => item.status === 'missing').length;
+  const unknownCount = Number.isFinite(Number(row.unknownCount)) ? Number(row.unknownCount) : items.filter((item) => item.status === 'unknown').length;
+  const readyCount = Number.isFinite(Number(row.readyCount)) ? Number(row.readyCount) : items.filter((item) => item.status === 'ready').length;
+  return {
+    ready: typeof row.ready === 'boolean' ? row.ready : missingCount === 0 && unknownCount === 0,
+    readyCount,
+    missingCount,
+    unknownCount,
+    items,
+  };
+}
+
+function normalizeWorkflowLaunchReadiness(value: unknown): WorkflowRunLaunchReadinessOverlay | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  if (typeof row.ok !== 'boolean') return null;
+  const scope = row.scope === 'run' || row.scope === 'step' ? row.scope : 'unknown';
+  const blockers = Array.isArray(row.blockers)
+    ? row.blockers.map(normalizeWorkflowReadinessItem).filter((item): item is WorkflowToolReadinessItem => Boolean(item))
+    : [];
+  const warnings = Array.isArray(row.warnings)
+    ? row.warnings.map(normalizeWorkflowReadinessItem).filter((item): item is WorkflowToolReadinessItem => Boolean(item))
+    : [];
+  const toolReadiness = normalizeWorkflowToolReadiness(row.toolReadiness);
+  return {
+    ok: row.ok,
+    scope,
+    blockers,
+    warnings,
+    ...(stringField(row.checkedAt) ? { checkedAt: stringField(row.checkedAt)! } : {}),
+    ...(stringField(row.targetStepId) ? { targetStepId: stringField(row.targetStepId)! } : {}),
+    ...(toolReadiness ? { toolReadiness } : {}),
+  };
+}
+
+function readWorkflowRunLaunchReadiness(runId: string, workflowNames: string[]): WorkflowRunLaunchReadinessOverlay | null {
+  const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  if (!safe) return null;
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    const workflow = stringField(raw.workflow);
+    if (workflow && workflowNames.length && !workflowNames.includes(workflow)) return null;
+    return normalizeWorkflowLaunchReadiness(raw.readiness);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeWorkflowRunRecoveryIntent(value: unknown): WorkflowRunRecoveryIntentOverlay | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const kind = stringField(row.kind);
+  if (!kind) return null;
+  return {
+    kind,
+    ...(stringField(row.createdAt) ? { createdAt: stringField(row.createdAt)! } : {}),
+    ...(stringField(row.sourceRunId) ? { sourceRunId: stringField(row.sourceRunId)! } : {}),
+    ...(stringField(row.sourceStepId) ? { sourceStepId: stringField(row.sourceStepId)! } : {}),
+    ...(stringField(row.requestedFrom) ? { requestedFrom: stringField(row.requestedFrom)! } : {}),
+    ...(stringField(row.reason) ? { reason: stringField(row.reason)! } : {}),
+  };
+}
+
+function readWorkflowRunRecoveryIntent(runId: string, workflowNames: string[]): WorkflowRunRecoveryIntentOverlay | null {
+  const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  if (!safe) return null;
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    const workflow = stringField(raw.workflow);
+    if (workflow && workflowNames.length && !workflowNames.includes(workflow)) return null;
+    return normalizeWorkflowRunRecoveryIntent(raw.recoveryIntent);
+  } catch {
+    return null;
+  }
 }
 
 function readWorkflowRunRecords(): WorkflowRunRecordSummary[] {
@@ -2265,17 +3213,22 @@ export function registerConsoleRoutes(
           const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
           const lastRunFailedItems = lastRun ? listFinalFailedItems(entry.name, lastRun.id) : [];
           const lastRunFailedItemStepIds = Array.from(new Set(lastRunFailedItems.map((item) => item.stepId)));
+          const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
+          const certification = workflowCertificationFor(entry.data, entry.name);
           return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
           description: entry.data.description,
+          project: entry.data.project ?? null,
           enabled: entry.data.enabled,
           triggerSchedule: entry.data.trigger.schedule ?? null,
           stepCount: entry.data.steps.length,
           trigger: entry.data.trigger,
           steps: entry.data.steps,
+          resources: entry.data.resources ?? {},
           inputs: entry.data.inputs ?? {},
           synthesis: entry.data.synthesis ?? null,
+          goal: entry.data.goal ?? null,
           allowedTools: entry.data.allowedTools ?? null,
           whenToUse: entry.data.whenToUse ?? null,
           lastRunStatus: lastRun ? (lastRun.needsAttention ? 'needs_attention' : lastRun.status) : null,
@@ -2284,6 +3237,9 @@ export function registerConsoleRoutes(
           lastRunFailedItemCount: lastRunFailedItems.length,
           lastRunFailedItemStepIds,
           lastRunAt: lastRun ? (lastRun.finishedAt ?? lastRun.startedAt ?? lastRun.createdAt) : null,
+          proof,
+          certification: workflowCertificationSummary(certification),
+          executionPlan: certification.dryRun.plan,
           };
         });
       res.json({ workflows: items });
@@ -2345,6 +3301,8 @@ export function registerConsoleRoutes(
       const workflowSummaries = workflows.map((entry) => {
         const runs = runRecords.filter((run) => run.workflow === entry.data.name || run.workflow === entry.name);
         const activeRun = activeRuns.find((run) => run.workflowName === entry.data.name || run.workflowSlug === entry.name) ?? null;
+        const proof = buildWorkflowProof(entry.data, runRecords, [entry.name]);
+        const certification = workflowCertificationSummaryFor(entry.data, entry.name);
         return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
@@ -2352,10 +3310,13 @@ export function registerConsoleRoutes(
           enabled: entry.data.enabled,
           triggerSchedule: entry.data.trigger.schedule ?? null,
           stepCount: entry.data.steps.length,
+          resourceCount: Object.keys(entry.data.resources ?? {}).length,
           inputCount: Object.keys(entry.data.inputs ?? {}).length,
           hasSynthesis: !!entry.data.synthesis?.prompt,
           activeRun,
           lastRun: runs[0] ?? null,
+          proof,
+          certification,
         };
       });
 
@@ -2443,34 +3404,114 @@ export function registerConsoleRoutes(
     });
   });
 
-  app.get('/api/console/workflows/:name', (req, res) => {
+  app.post('/api/console/workflows/from-session', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    // Accept lookup either by display name (data.name) or by directory
-    // slug. Most callers use the display name (round-tripped from the
-    // workflows list), but the Architect agent may pass the slug.
-    const target = req.params.name;
-    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
-    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    res.json({
-      name: entry.data.name,
-      file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
-      description: entry.data.description,
-      enabled: entry.data.enabled,
-      trigger: entry.data.trigger,
-      steps: entry.data.steps,
-      inputs: entry.data.inputs ?? {},
-      synthesis: entry.data.synthesis ?? null,
-      allowedTools: entry.data.allowedTools ?? null,
-      whenToUse: entry.data.whenToUse ?? null,
-      // Plain-English / printable rendering for the UI — "what this does, when
-      // it runs, what it needs/produces, where it pauses" — so the dashboard
-      // can show a readable summary instead of only raw step fields.
-      summary: describeWorkflowPlainEnglish(entry.data),
-      // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
-      // visual workflow view. Built server-side from the pure, unit-tested
-      // buildWorkflowGraph so the browser just hands it to Cytoscape.
-      graph: buildWorkflowGraph(entry.data.steps),
-    });
+    const body = req.body ?? {};
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim().slice(0, 120) : '';
+    if (!name) { res.status(400).json({ error: 'name required' }); return; }
+    if (!sessionId) { res.status(400).json({ error: 'sessionId required' }); return; }
+
+    try {
+      const promoted = promoteWorkflowFromSession({ name, sessionId });
+      if (!promoted.ok) {
+        const status =
+          promoted.status === 'duplicate' ? 409
+          : promoted.status === 'session_not_found' ? 404
+          : promoted.status === 'invalid_workflow' ? 422
+          : 400;
+        res.status(status).json({
+          error: promoted.message,
+          status: promoted.status,
+          errors: promoted.errors ?? [],
+          notes: promoted.draft?.notes ?? [],
+        });
+        return;
+      }
+      const savedDef = promoted.savedDef as WorkflowDefinition;
+      const slug = promoted.slug ?? workflowSlugFromName(savedDef.name);
+      const proof = buildWorkflowProof(savedDef, readWorkflowRunRecords(), [slug]);
+      const certification = workflowCertificationFor(savedDef, slug);
+      res.status(201).json({
+        created: true,
+        name: savedDef.name,
+        file: `${slug}/SKILL.md`,
+        enabled: savedDef.enabled !== false,
+        sessionId: promoted.sessionId,
+        toolCallCount: promoted.draft?.toolCallCount ?? 0,
+        stepCount: savedDef.steps.length,
+        summary: describeWorkflowPlainEnglish(savedDef),
+        notes: promoted.draft?.notes ?? [],
+        repairs: promoted.built?.repairs ?? [],
+        warnings: promoted.built?.warnings ?? [],
+        boundNotes: [
+          ...(promoted.promoteBindNotes ?? []),
+          ...(promoted.built?.boundNotes ?? []),
+        ],
+        advisories: promoted.built?.advisories ?? [],
+        gaps: promoted.built?.gaps ?? [],
+        preflight: promoted.preflight ?? null,
+        proof,
+        certification: workflowCertificationSummary(certification),
+        executionPlan: certification.dryRun.plan,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/workflows/:name', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      // Accept lookup either by display name (data.name) or by directory
+      // slug. Most callers use the display name (round-tripped from the
+      // workflows list), but the Architect agent may pass the slug.
+      const target = req.params.name;
+      const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+      const proof = buildWorkflowProof(entry.data, readWorkflowRunRecords(), [entry.name]);
+      const certification = workflowCertificationFor(entry.data, entry.name);
+      const executionPlan = certification.dryRun.plan;
+      const resourceBinding = await buildWorkflowResourceBindingReportFromRuntime(entry.data);
+      res.json({
+        name: entry.data.name,
+        file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
+        description: entry.data.description,
+        project: entry.data.project ?? null,
+        enabled: entry.data.enabled,
+        trigger: entry.data.trigger,
+        steps: entry.data.steps,
+        resources: entry.data.resources ?? {},
+        resourceBinding,
+        inputs: entry.data.inputs ?? {},
+        synthesis: entry.data.synthesis ?? null,
+        goal: entry.data.goal ?? null,
+        allowedTools: entry.data.allowedTools ?? null,
+        whenToUse: entry.data.whenToUse ?? null,
+        // Plain-English / printable rendering for the UI — "what this does, when
+        // it runs, what it needs/produces, where it pauses" — so the dashboard
+        // can show a readable summary instead of only raw step fields.
+        summary: describeWorkflowPlainEnglish(entry.data),
+        proof,
+        certification,
+        // Ready-to-draw flow graph (nodes = steps, edges = dependsOn) for the
+        // visual workflow view. Built server-side from the pure, unit-tested
+        // buildWorkflowGraph so the browser just hands it to Cytoscape.
+        graph: buildWorkflowGraph(entry.data.steps, {
+          readinessItems: executionPlan.toolReadiness.items,
+          workflowProject: entry.data.project,
+          executionPlan,
+        }),
+        executionPlan,
+        // Provable dry-run preview: a side-effect-free trace of what this workflow
+        // WOULD do (execution waves + every external write/send it would perform)
+        // with no inputs supplied, so the UI can show "here is exactly what this
+        // will touch and send" before anyone runs it.
+        dryRunSimulation: certification.dryRun,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/console/workflows', (req, res) => {
@@ -2478,49 +3519,86 @@ export function registerConsoleRoutes(
     const body = req.body ?? {};
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) { res.status(400).json({ error: 'name required' }); return; }
-    const slug = sanitizeWorkflowName(name);
+    const slug = workflowSlugFromName(name);
+    if (!slug) { res.status(400).json({ error: 'name must contain at least one letter or number' }); return; }
     if (readWorkflow(slug)) { res.status(409).json({ error: 'workflow already exists' }); return; }
     const description = typeof body.description === 'string' ? body.description : '';
-    const steps = Array.isArray(body.steps) ? body.steps : [];
-    // Accept the nested `trigger.schedule` shape as an alias, and REJECT any
-    // other non-empty `trigger` object instead of silently dropping it — a
-    // silently-unscheduled "overnight" workflow looks armed but never fires
-    // (audit 2026-06-12: a {trigger:{schedule}} create saved as manual-only).
-    const nestedSchedule = body.trigger && typeof body.trigger === 'object' && typeof (body.trigger as { schedule?: unknown }).schedule === 'string'
-      ? ((body.trigger as { schedule: string }).schedule).trim()
-      : '';
-    if (body.trigger && typeof body.trigger === 'object' && !nestedSchedule
-        && Object.keys(body.trigger as object).some((k) => k !== 'manual')) {
-      res.status(400).json({ error: 'unrecognized trigger shape — use top-level "triggerSchedule" (cron string) or {"trigger":{"schedule":"<cron>"}}' }); return;
-    }
-    const triggerSchedule = typeof body.triggerSchedule === 'string' ? body.triggerSchedule.trim() : nestedSchedule;
-    const trigger = triggerSchedule ? { schedule: triggerSchedule, manual: true } : { manual: true };
-    if (triggerSchedule && !validateCronExpression(triggerSchedule)) {
-      res.status(400).json({ error: `invalid cron expression: "${triggerSchedule}"` }); return;
-    }
+    const project = typeof body.project === 'string' && body.project.trim() ? body.project.trim() : undefined;
+    const steps = Array.isArray(body.steps) ? normalizeWorkflowSteps(body.steps) : [];
+    const stepGraphError = validateWorkflowStepGraph(steps);
+    if (stepGraphError) { res.status(400).json({ error: stepGraphError }); return; }
+    const triggerInput = workflowTriggerCreateInputFromUnknown(body);
+    if (!triggerInput.ok) { res.status(400).json({ error: triggerInput.error }); return; }
+    const triggerResult = buildWorkflowTrigger(triggerInput.input);
+    if (!triggerResult.ok) { res.status(400).json({ error: triggerResult.error }); return; }
     const synthesis = typeof body.synthesisPrompt === 'string' && body.synthesisPrompt.trim()
       ? { prompt: body.synthesisPrompt.trim() } : undefined;
-    const inputs = (body.inputs && typeof body.inputs === 'object') ? body.inputs : undefined;
+    const inputs = normalizeWorkflowInputs(body.inputs);
+    const resources = normalizeWorkflowResources(body.resources);
+    const goal = workflowGoalFromDashboardBody(body.goal);
 
     const def: WorkflowDefinition = {
       name,
       description,
+      project,
       enabled: body.enabled !== false,
-      trigger,
+      trigger: triggerResult.trigger,
       steps,
+      resources: resources && Object.keys(resources).length > 0 ? resources : undefined,
       inputs: inputs && Object.keys(inputs).length > 0 ? inputs : undefined,
       synthesis,
+      goal,
     };
     // Same author-time guard as workflow_create: auto-repair the fixable
     // binding gaps, then refuse only if an ENABLED workflow still can't flow
     // (so the dashboard isn't a back door around validation). Save disabled to
     // draft. A disabled workflow is still repaired so it saves runnable.
-    const createPrep = prepareWorkflowForWrite(def);
-    if (def.enabled && !createPrep.ok) {
+    const createPrep = prepareWorkflowCreateForWrite(def, {
+      modelPortability: workflowModelPortabilityFromUnknown(body),
+    });
+    if (createPrep.status === 'invalid') {
       res.status(400).json({ error: 'workflow failed validation', errors: createPrep.errors }); return;
     }
-    writeWorkflow(slug, createPrep.def);
-    res.json({ created: true, name, file: `${slug}/SKILL.md`, repairs: createPrep.repairs });
+    const createVerification = prepareWorkflowVerification(createPrep.def, dashboardWorkflowSmokeInputs(body));
+    if (createVerification.needsTest) {
+      const disabledDef = { ...createPrep.def, enabled: false };
+      writeWorkflowAndSyncTriggers(slug, disabledDef);
+      if (createVerification.missing.length > 0) {
+        res.status(202).json({
+          created: true,
+          name,
+          file: `${slug}/SKILL.md`,
+          repairs: createPrep.repairs,
+          enabled: false,
+          readinessGaps: workflowReadinessGapPayload(disabledDef),
+          missingSmokeInputs: createVerification.missing,
+          message: renderMissingSmokeInputs(name, createVerification.missing),
+        });
+        return;
+      }
+      const queued = queueWorkflowCreationTest(name, createVerification.inputs);
+      res.status(202).json({
+        created: true,
+        name,
+        file: `${slug}/SKILL.md`,
+        repairs: createPrep.repairs,
+        enabled: false,
+        readinessGaps: workflowReadinessGapPayload(disabledDef),
+        verificationQueued: true,
+        runId: queued.id,
+        message: queued.message,
+      });
+      return;
+    }
+    writeWorkflowAndSyncTriggers(slug, createPrep.def);
+    res.json({
+      created: true,
+      name,
+      file: `${slug}/SKILL.md`,
+      repairs: createPrep.repairs,
+      enabled: createPrep.def.enabled,
+      readinessGaps: workflowReadinessGapPayload(createPrep.def),
+    });
   });
 
   app.patch('/api/console/workflows/:name', (req, res) => {
@@ -2532,41 +3610,340 @@ export function registerConsoleRoutes(
     const next: WorkflowDefinition = { ...entry.data };
 
     if (typeof body.description === 'string') next.description = body.description;
-    if (Array.isArray(body.steps)) next.steps = mergeWorkflowStepsForPatch(entry.data.steps, body.steps);
+    if (typeof body.project === 'string') {
+      const project = body.project.trim();
+      if (project) next.project = project;
+      else delete next.project;
+    } else if (body.clearProject === true || body.clear_project === true) {
+      delete next.project;
+    }
+    if (Array.isArray(body.steps)) next.steps = normalizeWorkflowSteps(mergeWorkflowStepsForPatch(entry.data.steps, body.steps));
     if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
     if (body.synthesisPrompt !== undefined) {
       next.synthesis = typeof body.synthesisPrompt === 'string' && body.synthesisPrompt.trim()
         ? { prompt: body.synthesisPrompt.trim() } : undefined;
     }
-    if (body.inputs && typeof body.inputs === 'object') next.inputs = body.inputs;
-    // Carry the timezone over when rebuilding the trigger so a schedule's
-    // "8am" stays the OWNER's 8am (was silently dropped on every PATCH).
-    // A `timezone` in the body overrides; otherwise preserve the existing one.
-    const existingTz = (entry.data.trigger as { timezone?: string } | undefined)?.timezone;
-    const tz = typeof body.timezone === 'string' && body.timezone.trim() ? body.timezone.trim() : existingTz;
-    const withTz = <T extends Record<string, unknown>>(t: T): T => (tz ? { ...t, timezone: tz } : t);
-    if (typeof body.triggerSchedule === 'string') {
-      const s = body.triggerSchedule.trim();
-      if (s && !validateCronExpression(s)) { res.status(400).json({ error: `invalid cron: ${s}` }); return; }
-      next.trigger = withTz(s ? { schedule: s, manual: true } : { manual: true });
-    } else if (body.clearTriggerSchedule === true) {
-      next.trigger = withTz({ manual: true });
-    } else if (tz !== existingTz) {
-      // timezone-only change (keep whatever schedule/manual flag exists)
-      next.trigger = withTz({ ...(entry.data.trigger ?? { manual: true }) });
+    if (body.clearGoal === true || body.clear_goal === true) {
+      delete next.goal;
+    } else if (body.goal !== undefined) {
+      const goal = workflowGoalFromDashboardBody(body.goal);
+      if (goal) next.goal = goal;
+      else delete next.goal;
     }
+    const inputs = normalizeWorkflowInputs(body.inputs);
+    if (inputs) next.inputs = inputs;
+    if (body.clearResources === true || body.clear_resources === true) {
+      delete next.resources;
+    } else if (body.resources !== undefined) {
+      const resources = normalizeWorkflowResources(body.resources);
+      next.resources = resources && Object.keys(resources).length > 0 ? resources : undefined;
+    }
+    if (Array.isArray(body.steps)) {
+      const stepGraphError = validateWorkflowStepGraph(next.steps);
+      if (stepGraphError) { res.status(400).json({ error: stepGraphError }); return; }
+    }
+    const triggerPatch = applyWorkflowTriggerPatch(next.trigger, {
+      triggerSchedule: typeof body.triggerSchedule === 'string' ? body.triggerSchedule : undefined,
+      clearTriggerSchedule: body.clearTriggerSchedule === true,
+      timezone: typeof body.timezone === 'string' ? body.timezone : undefined,
+      triggerWebhookPath: typeof body.triggerWebhookPath === 'string' ? body.triggerWebhookPath : undefined,
+      clearTriggerWebhookPath: body.clearTriggerWebhookPath === true,
+      triggerEvents: Array.isArray(body.triggerEvents) ? body.triggerEvents : undefined,
+      clearTriggerEvents: body.clearTriggerEvents === true,
+    });
+    if (!triggerPatch.ok) { res.status(400).json({ error: triggerPatch.error }); return; }
+    if (triggerPatch.changed) next.trigger = triggerPatch.trigger;
 
     // PATCH can change steps AND flip enabled→true, so auto-repair + re-validate
     // before an enabled workflow is persisted (the set-enabled route already
     // does; this closes the parallel hole where PATCH enables without
     // re-validation).
-    const patchPrep = prepareWorkflowForWrite(next);
-    if (next.enabled && !patchPrep.ok) {
+    const patchPrep = prepareWorkflowUpdateForWrite(entry.data, next, {
+      modelPortability: workflowModelPortabilityFromUnknown(body),
+      codifyMechanicalSteps: Array.isArray(body.steps),
+    });
+    if (patchPrep.status === 'invalid') {
       res.status(400).json({ error: 'workflow failed validation', errors: patchPrep.errors }); return;
     }
+    if (patchPrep.status === 'readiness_gaps') {
+      writeWorkflowAndSyncTriggers(entry.name, patchPrep.def);
+      res.json({
+        updated: true,
+        name: patchPrep.def.name,
+        enabled: false,
+        repairs: patchPrep.repairs,
+        readinessGaps: workflowReadinessGapPayload(patchPrep.def),
+      });
+      return;
+    }
+    const activationRequested = entry.data.enabled !== true && patchPrep.def.enabled === true;
+    const executionChangedWhileLive = workflowUpdateNeedsVerification(entry.data, patchPrep.def);
+    if (patchPrep.def.enabled && (activationRequested || executionChangedWhileLive)) {
+      const verification = prepareWorkflowVerification(patchPrep.def, dashboardWorkflowSmokeInputs(body));
+      if (verification.needsTest) {
+        const disabledDef = { ...patchPrep.def, enabled: false };
+        writeWorkflowAndSyncTriggers(entry.name, disabledDef);
+        clearWorkflowFailures(entry.name);
+        if (verification.missing.length > 0) {
+          res.status(409).json({
+            error: 'workflow verification missing inputs',
+            message: renderMissingSmokeInputs(entry.data.name, verification.missing),
+            missingSmokeInputs: verification.missing,
+            repairs: patchPrep.repairs,
+            enabled: false,
+          });
+          return;
+        }
+        const queued = queueWorkflowCreationTest(entry.name, verification.inputs);
+        res.status(202).json({
+          updated: true,
+          name: patchPrep.def.name,
+          enabled: false,
+          verificationQueued: true,
+          runId: queued.id,
+          message: queued.message,
+          repairs: patchPrep.repairs,
+        });
+        return;
+      }
+    }
 
-    writeWorkflow(entry.name, patchPrep.def);
+    writeWorkflowAndSyncTriggers(entry.name, patchPrep.def);
     res.json({ updated: true, name: patchPrep.def.name, repairs: patchPrep.repairs });
+  });
+
+  app.post('/api/console/workflows/:name/contract-fixes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const parsedFixes = parseWorkflowVisualContractFixes(body.fixes);
+    if (!parsedFixes.ok) { res.status(400).json({ error: parsedFixes.error }); return; }
+
+    const fixed = applyWorkflowVisualContractFixes(entry.data, entry.name, {
+      fixes: parsedFixes.fixes,
+      stepIds: parseWorkflowFixStepIds(body),
+      assumeStableItemKeys: body.assumeStableItemKeys === true || body.assume_stable_item_keys === true,
+    });
+    const dryRun = body.dryRun === true || body.dry_run === true;
+    let finalDef = fixed.def;
+    let prepRepairs: string[] = [];
+    let persisted = false;
+    if (fixed.changes.length > 0) {
+      const prep = prepareWorkflowUpdateForWrite(entry.data, fixed.def);
+      if (prep.status === 'invalid') {
+        res.status(400).json({
+          error: 'workflow failed validation after contract fixes',
+          errors: prep.errors,
+          changes: fixed.changes,
+          skipped: fixed.skipped,
+          beforeExecutionPlan: fixed.beforePlan,
+          afterExecutionPlan: fixed.afterPlan,
+        });
+        return;
+      }
+      finalDef = prep.def;
+      prepRepairs = prep.repairs;
+      if (!dryRun) {
+        writeWorkflowAndSyncTriggers(entry.name, finalDef);
+        persisted = true;
+      }
+    }
+    res.json({
+      ok: true,
+      updated: persisted,
+      dryRun,
+      changes: [...new Set([...fixed.changes, ...prepRepairs])],
+      skipped: fixed.skipped,
+      ...workflowConsoleStatePayload(finalDef, entry.name),
+    });
+  });
+
+  app.post('/api/console/workflows/:name/contract-actions', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const parsedKind = parseWorkflowContractActionKind(body.kind ?? body.actionKind ?? body.action_kind);
+    if (!parsedKind.ok) { res.status(400).json({ error: parsedKind.error }); return; }
+    const stepIds = parseWorkflowFixStepIds(body);
+    const dryRun = body.dryRun === true || body.dry_run === true;
+    const changes: string[] = [];
+    const skipped: string[] = [];
+    const next = JSON.parse(JSON.stringify(entry.data)) as WorkflowDefinition;
+    let pendingScriptWrite: { filePath: string; content: string } | null = null;
+
+    if (parsedKind.kind === 'confirm_tool_connection') {
+      const plan = workflowExecutionPlanFor(entry.data, entry.name);
+      const runtimeToolNames = parseWorkflowRuntimeToolNames(body);
+      const runtimeItems = runtimeWorkflowReadinessItems(runtimeToolNames, stepIds);
+      const items = mergeWorkflowReadinessItems(
+        scopedWorkflowReadinessItems(plan.toolReadiness.items, stepIds),
+        runtimeItems,
+      );
+      const cliCommand = normalizeWorkflowContractCliCommand(body.command ?? body.cliCommand ?? body.cli_command);
+      if (cliCommand) {
+        const cliItems = items.filter((item) => item.kind === 'cli');
+        if (cliItems.length === 0) {
+          res.status(400).json({
+            error: 'no CLI readiness item matched the selected workflow step(s)',
+            checkedItems: items,
+          });
+          return;
+        }
+        const expected = [...new Set(cliItems.map(workflowCliCommandFromReadinessItem).filter(Boolean))];
+        if (expected.length > 0 && !expected.includes(cliCommand)) {
+          res.status(400).json({
+            error: `CLI command "${cliCommand}" does not match the selected workflow CLI requirement${expected.length === 1 ? '' : 's'}: ${expected.join(', ')}`,
+            checkedItems: cliItems,
+          });
+          return;
+        }
+        try {
+          if (dryRun) {
+            changes.push(`Would save CLI "${cliCommand}" to the local CLI inventory for this workflow.`);
+          } else {
+            addSavedCli(cliCommand);
+            changes.push(`Saved CLI "${cliCommand}" to the local CLI inventory for this workflow.`);
+          }
+        } catch (err) {
+          res.status(400).json({ error: err instanceof Error ? err.message : String(err), checkedItems: cliItems });
+          return;
+        }
+        const payload = workflowConsoleStatePayload(entry.data, entry.name);
+        const remaining = scopedWorkflowReadinessItems(payload.executionPlan.toolReadiness.items, stepIds);
+        res.json({
+          ok: true,
+          updated: !dryRun,
+          dryRun,
+          changes,
+          skipped: remaining.length ? remaining.map(workflowReadinessItemSummary) : [],
+          connectionReady: remaining.length === 0,
+          checkedItems: remaining,
+          savedCli: cliCommand,
+          savedClis: getSavedClis(),
+          ...payload,
+        });
+        return;
+      }
+      const toolConnectionChecks = await Promise.all(items.map(workflowConnectionCheckForItem));
+      const connectionReady = items.length === 0 || toolConnectionChecks.every((check) => check.status === 'ready');
+      res.json({
+        ok: true,
+        updated: false,
+        dryRun,
+        changes: [],
+        skipped: items.length
+          ? toolConnectionChecks.map(workflowConnectionCheckLine)
+          : ['No unconfirmed tool connection matched the selected workflow step(s).'],
+        connectionReady,
+        checkedItems: items,
+        toolConnectionChecks,
+        ...workflowConsoleStatePayload(entry.data, entry.name),
+      });
+      return;
+    }
+
+    if (parsedKind.kind === 'select_local_project') {
+      const projectRef = normalizeWorkflowContractProjectRef(body.project ?? body.projectName ?? body.project_name);
+      if (!projectRef) { res.status(400).json({ error: 'project required' }); return; }
+      const resolved = resolveWorkspaceProjectForContractAction(projectRef);
+      if (!resolved.ok) {
+        res.status(404).json({ error: resolved.error, projects: resolved.projects.slice(0, 50) });
+        return;
+      }
+      const projectName = resolved.project.name;
+      const scoped = new Set(stepIds ?? []);
+      const applyWorkflowLevel = body.scope === 'workflow' || body.workflowLevel === true || body.workflow_level === true || scoped.size === 0;
+      if (applyWorkflowLevel) {
+        if (next.project !== projectName) {
+          next.project = projectName;
+          changes.push(`Bound workflow project to "${projectName}" (${resolved.project.path}).`);
+        }
+      } else {
+        let touched = 0;
+        next.steps = next.steps.map((step) => {
+          if (!scoped.has(step.id)) return step;
+          if (step.project === projectName) return step;
+          touched += 1;
+          return { ...step, project: projectName };
+        });
+        if (touched > 0) changes.push(`Bound ${touched} step${touched === 1 ? '' : 's'} to local project "${projectName}" (${resolved.project.path}).`);
+      }
+      if (changes.length === 0) skipped.push(`Selected workflow scope already uses local project "${projectName}".`);
+    }
+
+    if (parsedKind.kind === 'add_workflow_script') {
+      const parsedRunner = normalizeWorkflowScriptRunner(body.runner ?? body.script ?? body.scriptName ?? body.script_name);
+      if (!parsedRunner.ok) { res.status(400).json({ error: parsedRunner.error }); return; }
+      const scriptFile = resolveWorkflowScriptFile(entry.name, parsedRunner.relativePath);
+      if (!scriptFile.ok) { res.status(400).json({ error: scriptFile.error }); return; }
+      const scriptContent = typeof body.scriptContent === 'string'
+        ? body.scriptContent
+        : typeof body.script_content === 'string'
+          ? body.script_content
+          : '';
+      const overwrite = body.overwrite === true;
+      if (scriptContent) {
+        if (scriptContent.length > 200_000) { res.status(400).json({ error: 'script content is too large' }); return; }
+        if (existsSync(scriptFile.filePath) && !overwrite) {
+          res.status(409).json({
+            error: 'workflow script already exists; pass overwrite=true to replace it',
+            runner: parsedRunner.runner,
+            workflowScriptsDir: scriptFile.scriptsDir,
+          });
+          return;
+        }
+        if (!dryRun) pendingScriptWrite = { filePath: scriptFile.filePath, content: scriptContent.trimEnd() + '\n' };
+        changes.push(`${dryRun ? 'Would create' : 'Created'} workflow script "scripts/${parsedRunner.runner}".`);
+      } else if (!existsSync(scriptFile.filePath)) {
+        res.status(409).json({
+          error: 'workflow script does not exist; add scriptContent or choose an existing runner',
+          runner: parsedRunner.runner,
+          workflowScriptsDir: scriptFile.scriptsDir,
+          availableScripts: listWorkflowScriptNames(entry.name).slice(0, 50),
+        });
+        return;
+      }
+
+      const scoped = workflowStepScopeForAction(next, stepIds);
+      if (scoped.size === 0) { res.status(400).json({ error: 'stepIds required when more than one deterministic step could be repaired' }); return; }
+      let touched = 0;
+      next.steps = next.steps.map((step) => {
+        if (!scoped.has(step.id)) return step;
+        if (!step.deterministic?.runner) return step;
+        if (step.deterministic.runner === parsedRunner.runner) return step;
+        touched += 1;
+        return { ...step, deterministic: { runner: parsedRunner.runner } };
+      });
+      if (touched > 0) changes.push(`Bound ${touched} deterministic step${touched === 1 ? '' : 's'} to runner "${parsedRunner.runner}".`);
+      if (touched === 0 && !scriptContent) skipped.push(`Selected deterministic step(s) already use runner "${parsedRunner.runner}".`);
+    }
+
+    const prep = prepareWorkflowUpdateForWrite(entry.data, next);
+    if (prep.status === 'invalid') {
+      res.status(400).json({ error: 'workflow failed validation after contract action', errors: prep.errors, changes, skipped });
+      return;
+    }
+    const finalDef = prep.def;
+    const allChanges = [...new Set([...changes, ...prep.repairs])];
+    if (allChanges.length > 0 && !dryRun) {
+      if (pendingScriptWrite) {
+        fs.mkdirSync(path.dirname(pendingScriptWrite.filePath), { recursive: true });
+        writeFileSync(pendingScriptWrite.filePath, pendingScriptWrite.content, 'utf-8');
+      }
+      writeWorkflowAndSyncTriggers(entry.name, finalDef);
+    }
+    res.json({
+      ok: true,
+      updated: allChanges.length > 0 && !dryRun,
+      dryRun,
+      changes: allChanges,
+      skipped,
+      ...workflowConsoleStatePayload(finalDef, entry.name),
+    });
   });
 
   app.delete('/api/console/workflows/:name', (req, res) => {
@@ -2574,7 +3951,7 @@ export function registerConsoleRoutes(
     const target = req.params.name;
     const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
     if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
-    deleteWorkflow(entry.name);
+    deleteWorkflowAndSyncTriggers(entry.name);
     res.json({ deleted: true });
   });
 
@@ -2589,16 +3966,47 @@ export function registerConsoleRoutes(
     // allowed). Auto-repair the fixable binding gaps so enabling an older
     // workflow fixes it in place instead of refusing.
     if (body.enabled) {
-      const prep = prepareWorkflowForWrite({ ...entry.data, enabled: true });
-      if (!prep.ok) {
+      const prep = prepareWorkflowEnableForWrite(entry.data);
+      if (prep.status === 'invalid') {
         res.status(400).json({ error: 'workflow failed validation', errors: prep.errors });
         return;
       }
-      writeWorkflow(entry.name, { ...prep.def, enabled: true });
+      if (prep.status === 'readiness_gaps') {
+        writeWorkflowAndSyncTriggers(entry.name, prep.def);
+        res.status(409).json({ error: 'workflow has unresolved readiness gaps', gaps: workflowReadinessGapPayload(prep.def), repairs: prep.repairs });
+        return;
+      }
+      const verification = prepareWorkflowVerification(prep.def, dashboardWorkflowSmokeInputs(body));
+      if (verification.needsTest) {
+        writeWorkflowAndSyncTriggers(entry.name, { ...prep.def, enabled: false });
+        clearWorkflowFailures(entry.name);
+        if (verification.missing.length > 0) {
+          res.status(409).json({
+            error: 'workflow verification missing inputs',
+            message: renderMissingSmokeInputs(entry.data.name, verification.missing),
+            missingSmokeInputs: verification.missing,
+            repairs: prep.repairs,
+            enabled: false,
+          });
+          return;
+        }
+        const queued = queueWorkflowCreationTest(entry.name, verification.inputs);
+        res.status(202).json({
+          updated: true,
+          enabled: false,
+          verificationQueued: true,
+          runId: queued.id,
+          message: queued.message,
+          repairs: prep.repairs,
+        });
+        return;
+      }
+      writeWorkflowAndSyncTriggers(entry.name, prep.def);
+      clearWorkflowFailures(entry.name);
       res.json({ updated: true, enabled: true, repairs: prep.repairs });
       return;
     }
-    writeWorkflow(entry.name, { ...entry.data, enabled: false });
+    writeWorkflowAndSyncTriggers(entry.name, { ...entry.data, enabled: false });
     res.json({ updated: true, enabled: false });
   });
 
@@ -2616,8 +4024,9 @@ export function registerConsoleRoutes(
       description: entry.data.description,
       enabled: entry.data.enabled,
       trigger: entry.data.trigger,
-      steps: entry.data.steps,
+      steps: entry.data.steps as unknown as WorkflowStepShape[],
       inputs: entry.data.inputs,
+      resources: entry.data.resources,
       synthesis: entry.data.synthesis,
       goal: entry.data.goal,
     };
@@ -2676,20 +4085,169 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'workflow is disabled — approve it first' }); return;
     }
 
-    ensureDir(WORKFLOW_RUNS_DIR);
-    const id = `${Date.now()}-${randomBytes(3).toString('hex')}`;
-    const filePath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
-    const payload: Record<string, unknown> = {
-      id,
-      workflow: entry.data.name,
-      inputs,
-      status: dryRun ? 'dry_run' : 'queued',
-      createdAt: new Date().toISOString(),
-      source: 'console',
-    };
-    if (targetStepId) payload.targetStepId = targetStepId;
-    writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
-    res.json({ queued: !dryRun, dryRun, id, targetStepId });
+    const normalizedInputs = normalizeWorkflowRunInputs(inputs as Record<string, string>);
+    if (!dryRun) {
+      const certification = workflowCertificationFor(entry.data, entry.name);
+      if (certification.resourceGaps.length > 0) {
+        res.status(409).json({
+          error: 'workflow resource bindings incomplete',
+          message: certification.summary,
+          resourceGaps: certification.resourceGaps,
+          certification: workflowCertificationSummary(certification),
+        });
+        return;
+      }
+    }
+    if (dryRun) {
+      const queued = queueWorkflowDryRun(entry.data.name, normalizedInputs, {
+        source: 'console',
+        ...(targetStepId ? { targetStepId } : {}),
+      });
+      res.json({ queued: false, dryRun, id: queued.id, targetStepId });
+      return;
+    }
+    if (targetStepId) {
+      const recoveryIntent = workflowRunRecoveryIntentFromBody(body, {
+        kind: 'step_try',
+        sourceStepId: targetStepId,
+        requestedFrom: 'console',
+        reason: 'single-step try run',
+      });
+      const queued = queueWorkflowRun(entry.data.name, normalizedInputs, {
+        source: 'console',
+        targetStepId,
+        dedupe: false,
+        recoveryIntent,
+      });
+      if (queued.status === 'blocked_readiness') {
+        res.status(409).json(workflowReadinessBlockedBody(queued.message, queued.readiness, { status: queued.status, dryRun, targetStepId }));
+        return;
+      }
+      res.json({ queued: true, dryRun, id: queued.id, targetStepId });
+      return;
+    }
+
+    const queued = resumeWorkflowRun(entry.data.name, normalizedInputs, { source: 'console' });
+    if (queued.status === 'missing_inputs') {
+      res.status(400).json({
+        error: `missing required workflow input${(queued.missing ?? []).length === 1 ? '' : 's'}: ${(queued.missing ?? []).join(', ')}`,
+        missingInputs: queued.missing ?? [],
+      });
+      return;
+    }
+    if (queued.status === 'disabled') {
+      res.status(409).json({ error: queued.message });
+      return;
+    }
+    if (queued.status === 'not_found') {
+      res.status(404).json({ error: queued.message });
+      return;
+    }
+    if (queued.status === 'blocked_readiness') {
+      res.status(409).json(workflowReadinessBlockedBody(queued.message, queued.readiness, { status: queued.status, dryRun, targetStepId }));
+      return;
+    }
+    res.json({ queued: queued.status !== 'duplicate', duplicate: queued.status === 'duplicate', dryRun, id: queued.id, targetStepId });
+  });
+
+  // Ever-learning quality contract: turn "this run was wrong because X" into
+  // durable, checkable success criteria the completion judge holds every FUTURE
+  // run to. This is how output-quality trust compounds — the same mistake never
+  // silently recurs once you've named it.
+  app.post('/api/console/workflows/:name/quality-feedback', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const feedback = typeof req.body?.feedback === 'string' ? req.body.feedback.trim() : '';
+    if (!feedback) { res.status(400).json({ error: 'feedback is required' }); return; }
+    const result = applyLearnedQualityCriteria(entry.data, feedback);
+    if (result.changed) writeWorkflowAndSyncTriggers(entry.name, result.def);
+    res.json({
+      changed: result.changed,
+      added: result.added,
+      criteria: result.criteria,
+      message: result.changed
+        ? `Learned ${result.added.length} new quality ${result.added.length === 1 ? 'criterion' : 'criteria'} — every future run of "${entry.data.name}" is now judged against ${result.criteria.length} criteria.`
+        : `No new criteria — "${entry.data.name}" already holds runs to that bar.`,
+    });
+  });
+
+  app.get('/api/console/workflows/:name/quality-contract', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    res.json({ criteria: workflowQualityCriteria(entry.data), objective: entry.data.goal?.objective ?? null });
+  });
+
+  // The live "check in on your employees" window: the run's shared workspace —
+  // its goal anchor + every step's persisted work product (the manifest). Reads
+  // straight off disk; no run needs to be in memory.
+  app.get('/api/console/workflows/:name/runs/:runId/workspace', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const goal = readRunGoal(entry.name, req.params.runId);
+    // Collapse to the latest artifact per producer, so a re-pursued step shows
+    // its newest work rather than every historical write.
+    const byAgent = new Map<string, import('../execution/workflow-run-workspace.js').WorkspaceArtifact>();
+    for (const a of readWorkspaceManifest(entry.name, req.params.runId)) byAgent.set(`${a.agent}:${a.tool}`, a);
+    const artifacts = Array.from(byAgent.values());
+    res.json({
+      runId: req.params.runId,
+      goal,
+      artifacts,
+      totalBytes: workspaceArtifactBytes(entry.name, req.params.runId),
+      checker: readWorkspaceCheckerReport(entry.name, req.params.runId),
+    });
+  });
+
+  // Subagent visibility: every specialized agent this run spawned (Claude / Codex
+  // / GLM-BYO fan-out), with role, provider, model, task, status — so opening a
+  // workflow shows WHO worked. Full work-product via the /output route below.
+  app.get('/api/console/workflows/:name/runs/:runId/agents', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    // Ownership check (parity with the sibling run routes): the :name must resolve
+    // to a real workflow, so a runId can't be read under an arbitrary slug.
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const runs = listSubagentRuns(req.params.runId);
+    res.json({
+      runId: req.params.runId,
+      agents: runs,
+      byProvider: runs.reduce<Record<string, number>>((acc, r) => { acc[r.provider] = (acc[r.provider] ?? 0) + 1; return acc; }, {}),
+    });
+  });
+
+  // One specialized agent's full persisted work-product ("the work they did").
+  app.get('/api/console/workflows/:name/runs/:runId/agents/:agentId/output', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const output = readSubagentOutput(req.params.runId, req.params.agentId);
+    if (output === null) { res.status(404).json({ error: 'no work-product for that agent' }); return; }
+    res.json({ agentId: req.params.agentId, output });
+  });
+
+  // Run the CHECKER agent: a second agent reads the shared workspace (goal +
+  // every step's work product) and judges it against the goal's criteria, then
+  // persists the verdict so the window shows it. This is "agents checking each
+  // other's work". Uses the real cross-family judge (default deps).
+  app.post('/api/console/workflows/:name/runs/:runId/check', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    try {
+      const report = await checkRunAgainstGoal({
+        workflowName: entry.name,
+        runId: req.params.runId,
+        objective: entry.data.goal?.objective?.trim() || entry.data.description?.trim() || `Deliver "${entry.data.name}"`,
+        successCriteria: entry.data.goal?.successCriteria,
+        checkedAt: new Date().toISOString(),
+      });
+      writeWorkspaceCheckerReport(entry.name, req.params.runId, report);
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.get('/api/console/workflows/:name/runs/:runId/failed-items', (req, res) => {
@@ -2744,13 +4302,24 @@ export function registerConsoleRoutes(
       const stepId = typeof req.body?.stepId === 'string' && req.body.stepId.trim()
         ? req.body.stepId.trim()
         : undefined;
-      const result = requeueWorkflowFailedItemsFromRun(runId, { stepId });
-      res.json({
+      const result = requeueWorkflowFailedItemsFromRun(runId, {
+        stepId,
+        source: 'console',
+        recoveryIntent: workflowRunRecoveryIntentFromBody(req.body, {
+          kind: 'failed_items',
+          sourceRunId: runId,
+          sourceStepId: stepId,
+          requestedFrom: 'console',
+          reason: 'retry final failed forEach items',
+        }),
+      });
+      res.status(result.status === 'blocked_readiness' ? 409 : 200).json({
         ok: result.status === 'queued' || result.status === 'duplicate',
         status: result.status,
         id: result.id,
         message: result.message,
         failedItems: result.failedItems ?? [],
+        ...(result.status === 'blocked_readiness' ? workflowReadinessBlockedBody(result.message, result.readiness) : {}),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -2798,6 +4367,56 @@ export function registerConsoleRoutes(
       };
       fs.writeFileSync(filePath, JSON.stringify(next, null, 2), 'utf-8');
       res.json({ ok: true, run: next });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Replay a run's durable event log into the compact read model needed by the
+   * workflow graph. This is deliberately derived on read from events.jsonl so
+   * the visualizer never becomes a second workflow state machine.
+   */
+  app.get('/api/console/workflows/:name/runs/:runId/graph-overlay', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    try {
+      const events = readWorkflowEvents(entry.name, req.params.runId);
+      const executionPlan = workflowExecutionPlanFor(entry.data, entry.name);
+      const overlay = buildWorkflowRunGraphOverlay(events, {
+        stepIds: entry.data.steps.map((step) => step.id),
+        harnessSessions: workflowGraphHarnessEvidence(req.params.runId),
+        launchReadiness: readWorkflowRunLaunchReadiness(req.params.runId, [entry.data.name, entry.name]),
+        executionPlan,
+        recoveryIntent: readWorkflowRunRecoveryIntent(req.params.runId, [entry.data.name, entry.name]),
+        recoveryLineage: buildWorkflowRecoveryLineage(entry.name, entry.data.name, req.params.runId),
+      });
+      const lineage = buildWorkflowGoalLineage(
+        entry.name,
+        entry.data.name,
+        req.params.runId,
+        entry.data.steps.map((step) => step.id),
+      );
+      if (lineage.length > 1) {
+        if (overlay.goal) {
+          overlay.goal.lineage = lineage;
+        } else {
+          overlay.goal = {
+            status: 'unknown',
+            failedCriteria: [],
+            attempts: [],
+            lineage,
+            attentionLevel: 'none',
+          };
+        }
+      }
+      res.json({
+        runId: req.params.runId,
+        workflow: entry.data.name,
+        overlay,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -2870,7 +4489,9 @@ export function registerConsoleRoutes(
 
     const prompt = [
       'You are the Clementine Workflow Architect — a focused sub-mode that helps the user design and edit multi-step workflows.',
-      'Each workflow has: name, description, trigger (manual or cron schedule), steps (id + prompt + optional dependsOn + optional allowed_tools + optional uses_skill), inputs, optional synthesis prompt.',
+      'Each workflow has: name, description, trigger, steps, workflow inputs, durable resources, optional goal, and optional synthesis prompt.',
+      'Step shape: { id, prompt?, dependsOn?, allowed_tools?, call?, inputs?, output?, sideEffect?, forEach?, uses_skill?, requiresApproval?, approvalPreview? }.',
+      'Use workflow inputs for per-run values. Use durable resources for fixed sheets/accounts/folders/channels/campaigns/repos/CLIs that the workflow should remember between runs.',
       'Be terse. No preamble. Lead with the answer. One short paragraph of prose at most.',
       '',
       'IMPORTANT — proposing changes:',
@@ -2878,16 +4499,20 @@ export function registerConsoleRoutes(
       '• If you are proposing ANY change to the draft, your reply MUST end with a single fenced ```json code block containing an object with shape { ops: [...], summary: "..." }.',
       '• Each op is one of:',
       '    { "type": "set_field",    "path": "name" | "description" | "triggerSchedule" | "enabled", "value": <value> }',
-      '    { "type": "add_step",     "step": { "id": "<id>", "prompt": "<text>", "dependsOn": ["<id>", ...], "allowed_tools": ["<tool>", ...], "uses_skill"?: "<skill-name>" } }',
-      '    { "type": "update_step",  "id": "<existing-id>", "patch": { "prompt"?: "...", "dependsOn"?: [...], "allowed_tools"?: [...], "uses_skill"?: "<skill-name> | null" } }',
+      '    { "type": "add_step",     "step": { "id": "<id>", "prompt"?: "<text>", "dependsOn"?: ["<id>", ...], "allowed_tools"?: ["<tool>", ...], "call"?: {"tool":"<direct-tool-slug>","args":{}}, "inputs"?: {"arg":{"from":"input.key"}}, "output"?: {"type":"object","required_keys":["..."]}, "sideEffect"?: "read|write|send", "uses_skill"?: "<skill-name>", "requiresApproval"?: true, "approvalPreview"?: "<text>" } }',
+      '    { "type": "update_step",  "id": "<existing-id>", "patch": { "prompt"?: "...", "dependsOn"?: [...], "allowed_tools"?: [...], "call"?: {...} | null, "inputs"?: {...} | null, "output"?: {...} | null, "sideEffect"?: "read|write|send" | null, "uses_skill"?: "<skill-name> | null", "requiresApproval"?: true | false, "approvalPreview"?: "<text> | null" } }',
       '    { "type": "remove_step",  "id": "<existing-id>" }',
       '    { "type": "reorder_step", "id": "<existing-id>", "after": "<other-id> | null (null = move to first)" }',
       '    { "type": "rename_step",  "id": "<existing-id>", "newId": "<new-id>" }',
       '    { "type": "add_input",    "key": "<key>", "value": "<default-or-empty>" }',
       '    { "type": "remove_input", "key": "<key>" }',
+      '    { "type": "add_resource", "key": "<id>", "value": { "kind": "sheet|account|folder|channel|campaign|repository|cli|api|other", "label"?: "<name>", "toolkit"?: "<toolkit>", "resourceId"?: "<id>", "url"?: "<url>", "name"?: "<name>", "required"?: true } }',
+      '    { "type": "remove_resource", "key": "<id>" }',
       '    { "type": "set_synthesis","value": "<prompt-text> | null (null clears it)" }',
       '• Keep ops minimal. Use update_step (with only the fields you actually change) instead of remove + add.',
-      '• When proposing a step that calls a tool, populate allowed_tools with the minimum set needed (e.g. ["composio_gmail_send_email"]).',
+      '• For known exact tool calls, prefer `call` with templated args. For mechanical single-tool prompt steps, set one direct `allowed_tools` slug plus step `inputs` and `output` so the compiler can codify it.',
+      '• When the exact direct call is not known, populate allowed_tools with the minimum runtime surface needed (e.g. ["composio_execute_tool"]) and keep the step as an adaptive prompt step.',
+      '• Declare sideEffect on every external step: read, write, or send. Set requiresApproval on irreversible sends/publishes unless the user explicitly wants autonomous sends.',
       '• When an installed skill already captures the expertise a step needs, set uses_skill instead of re-prompting that expertise inline. The runner injects the skill body automatically.',
       '• If you have nothing to propose (pure question, validation, advice), omit the JSON block entirely.',
       '',
@@ -3837,6 +5462,14 @@ export function registerConsoleRoutes(
       res.setHeader('X-Pairing-Expires-At', result.expiresAt);
       res.send(result.svg);
     } catch (err) {
+      if (err instanceof MobileQrNotReadyError) {
+        res.status(409).json({
+          error: err.message,
+          code: err.code,
+          target: err.target,
+        });
+        return;
+      }
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
@@ -4529,6 +6162,36 @@ export function registerConsoleRoutes(
     }
     return out;
   };
+
+  // ---- Plugins (content cartridges: skills/workflows/MCP bundles) ----------
+  app.get('/api/console/plugins', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listPlugins } = await import('../plugins/plugin-store.js');
+      res.json({ plugins: listPlugins() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/plugins/:id/:action', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const { id, action } = req.params;
+    try {
+      const { setPluginEnabled, uninstallPlugin } = await import('../plugins/plugin-store.js');
+      if (action === 'enable' || action === 'disable') {
+        res.json({ ok: true, plugin: setPluginEnabled(id, action === 'enable') });
+        return;
+      }
+      if (action === 'uninstall') {
+        res.json({ ok: true, ...uninstallPlugin(id) });
+        return;
+      }
+      res.status(400).json({ error: `unknown action ${action}` });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
 
   app.get('/api/console/settings/model-providers', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
@@ -5637,6 +7300,26 @@ export function registerConsoleRoutes(
         unavailable: servers.filter((s) => s.state === 'unavailable').length,
       };
       res.json({ servers, summary });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/mcp-servers/:name/reconnect', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = req.params.name;
+    try {
+      const server = discoverMcpServers().find((candidate) => candidate.name === name || slugifyServerName(candidate.name) === slugifyServerName(name));
+      if (!server) { res.status(404).json({ error: 'server not found' }); return; }
+      await invalidateConfiguredMcpServers();
+      clearAutonomyAgentCache();
+      const servers = listMcpServerHealth();
+      res.json({
+        ok: true,
+        server: server.name,
+        message: `MCP connections cleared; "${server.name}" will reconnect on the next tool call.`,
+        servers,
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6789,13 +8472,24 @@ export function registerConsoleRoutes(
       const stepId = typeof req.body?.stepId === 'string' && req.body.stepId.trim()
         ? req.body.stepId.trim()
         : stepIds.length === 1 ? stepIds[0] : undefined;
-      const result = requeueWorkflowFailedItemsFromRun(runId, { stepId });
-      res.json({
+      const result = requeueWorkflowFailedItemsFromRun(runId, {
+        stepId,
+        source: 'board',
+        recoveryIntent: workflowRunRecoveryIntentFromBody(req.body, {
+          kind: 'failed_items',
+          sourceRunId: runId,
+          sourceStepId: stepId,
+          requestedFrom: 'board',
+          reason: 'retry final failed forEach items',
+        }),
+      });
+      res.status(result.status === 'blocked_readiness' ? 409 : 200).json({
         ok: result.status === 'queued' || result.status === 'duplicate',
         status: result.status,
         id: result.id,
         message: result.message,
         failedItems: result.failedItems ?? [],
+        ...(result.status === 'blocked_readiness' ? workflowReadinessBlockedBody(result.message, result.readiness) : {}),
       });
     } catch (err) {
       res.status(500).json({ ok: false, reason: err instanceof Error ? err.message : String(err) });
@@ -6832,12 +8526,25 @@ export function registerConsoleRoutes(
       });
       return;
     }
-    const result = requeueWorkflowFromRun(runId);
-    res.status(result.status === 'not_found' ? 404 : 200).json({
+    const sourceStepId = typeof req.body?.stepId === 'string' && req.body.stepId.trim()
+      ? req.body.stepId.trim()
+      : undefined;
+    const result = requeueWorkflowFromRun(runId, {
+      source: 'board',
+      recoveryIntent: workflowRunRecoveryIntentFromBody(req.body, {
+        kind: 'safe_rerun',
+        sourceRunId: runId,
+        sourceStepId,
+        requestedFrom: 'board',
+        reason: 'safe whole-run rerun',
+      }),
+    });
+    res.status(result.status === 'not_found' ? 404 : result.status === 'blocked_readiness' ? 409 : 200).json({
       ok: result.status === 'queued' || result.status === 'duplicate',
       status: result.status,
       id: result.id,
       message: result.message,
+      ...(result.status === 'blocked_readiness' ? workflowReadinessBlockedBody(result.message, result.readiness) : {}),
     });
   });
 

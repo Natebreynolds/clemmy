@@ -6,9 +6,9 @@
 //   1. GET status returns a coherent empty-state payload
 //   2. POST pin saves a PIN, status reports pinConfigured=true
 //   3. POST configure rejects garbage hostname
-//   4. GET qr returns a local-preview SVG (no hostname yet) and then
-//      a public SVG once a hostname override is supplied
-//   5. POST tunnel/start refuses with "no tunnel configured" (since we
+//   4. GET qr refuses local-preview / unready public targets with a
+//      structured readiness error instead of emitting a dead localhost QR
+//   5. POST tunnel/start refuses with "no custom-domain tunnel configured" (since we
 //      never actually create one — that would require a real CF account)
 //
 // Run: npm run build && node scripts/smoke-mobile-access-api.mjs
@@ -185,28 +185,26 @@ ok('daemon booted');
   else fail(`expected 400 for bad configure, got ${res.status}`);
 }
 
-// 7. GET qr without hostname → local-preview SVG
+// 7. GET qr without hostname → readiness error (no dead localhost QR)
 {
   const res = await fetch(`${baseUrl}/api/console/mobile-access/qr`, { headers: authHeader });
-  if (res.ok) {
-    const text = await res.text();
-    const mode = res.headers.get('x-target-mode');
-    if (text.startsWith('<svg') && text.includes('</svg>') && mode === 'local-preview') {
-      ok('qr without hostname returns local-preview SVG');
-    } else {
-      fail(`qr without hostname returned unexpected shape: status=${res.status} mode=${mode} body=${text.slice(0, 120)}`);
-    }
-  } else fail(`expected local-preview SVG with no hostname, got ${res.status}`);
+  const body = await res.json().catch(() => ({}));
+  if (res.status === 409 && body?.code === 'MOBILE_QR_NOT_READY' && body?.target?.mode === 'local-preview') {
+    ok('qr without hostname is blocked with local-preview readiness reason');
+  } else {
+    fail(`expected 409 local-preview readiness error, got ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+  }
 }
 
-// 8. GET qr with hostname override → SVG
+// 8. GET qr with hostname override still refuses until Access + tunnel runtime are ready
 {
   const res = await fetch(`${baseUrl}/api/console/mobile-access/qr?hostname=clem.example.com`, { headers: authHeader });
-  if (res.ok) {
-    const text = await res.text();
-    if (text.startsWith('<svg') && text.includes('</svg>')) ok('qr with hostname override returns an SVG');
-    else fail(`qr returned ${res.status} but body is not SVG: ${text.slice(0, 120)}`);
-  } else fail(`qr with hostname override returned ${res.status}`);
+  const body = await res.json().catch(() => ({}));
+  if (res.status === 409 && body?.code === 'MOBILE_QR_NOT_READY' && body?.target?.mode === 'custom-domain') {
+    ok('qr with hostname override is blocked until custom-domain target is ready');
+  } else {
+    fail(`expected 409 custom-domain readiness error, got ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+  }
 }
 
 // 9. POST tunnel/start without configured tunnel → 400
@@ -217,7 +215,7 @@ ok('daemon booted');
   });
   if (res.status === 400) {
     const body = await res.json();
-    if (/no tunnel configured|cloudflared binary/.test(body.error || '')) ok('tunnel/start refuses without a tunnel');
+    if (/no (custom-domain )?tunnel configured|cloudflared binary/.test(body.error || '')) ok('tunnel/start refuses without a tunnel');
     else fail(`tunnel/start returned 400 but wrong error: ${JSON.stringify(body)}`);
   } else fail(`expected 400 for unconfigured tunnel start, got ${res.status}`);
 }

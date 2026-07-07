@@ -14,6 +14,7 @@ import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { defaultForRole, type ModelRole } from './model-roles.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import { getByoProviders, providerToBackendConfig } from './byo-providers.js';
+import { discoveredModels } from './model-discovery.js';
 
 export interface AvailableModelGroup {
   provider: ModelProviderClass;
@@ -57,6 +58,10 @@ function codexBrainModelChoices(): Array<{ id: string; label: string }> {
       // Unknown/custom ids are ignored here; the router still validates at dispatch.
     }
   }
+  // Live discovery: any additional gpt/o/codex-class model the user's OpenAI
+  // credentials can see (providers' /v1/models) — a NEW model shows up in the
+  // picker without a Clementine release. Presets stay first (curated labels win).
+  for (const m of discoveredModels().openai) pushUnique(models, m.id, m.label);
   return models;
 }
 
@@ -69,6 +74,9 @@ function claudeBrainModelChoices(): Array<{ id: string; label: string }> {
       // Unknown/custom ids are ignored here; the router still validates at dispatch.
     }
   }
+  // Live discovery (Anthropic /v1/models via API key or the subscription OAuth):
+  // a newly dropped Claude model appears here on the next settings poll.
+  for (const m of discoveredModels().anthropic) pushUnique(models, m.id, m.label);
   return models;
 }
 
@@ -141,20 +149,15 @@ export function claudeModelsAvailable(): boolean {
 export function connectedModelGroups(): AvailableModelGroup[] {
   const groups: AvailableModelGroup[] = [];
 
+  // Presets + configured slots + LIVE-DISCOVERED models (providers' /v1/models):
+  // a newly released Codex/Anthropic model shows up as a choice on the next
+  // settings poll, no Clementine release needed.
   if (codexModelsAvailable()) {
-    const models = [...MODEL_PRESETS];
-    for (const id of [MODELS.fast, MODELS.primary, MODELS.deep]) {
-      if (resolveProvider(id) === 'codex') pushUnique(models, id);
-    }
-    groups.push({ provider: 'codex', label: 'Codex', models });
+    groups.push({ provider: 'codex', label: 'Codex', models: codexBrainModelChoices() });
   }
 
   if (claudeModelsAvailable()) {
-    const models = [...CLAUDE_MODEL_PRESETS];
-    for (const id of [getClaudeBrainModel(), getDebateCheckerModel()]) {
-      if (resolveProvider(id) === 'claude') pushUnique(models, id);
-    }
-    groups.push({ provider: 'claude', label: 'Claude', models });
+    groups.push({ provider: 'claude', label: 'Claude', models: claudeBrainModelChoices() });
   }
 
   // One group per CONNECTED BYO provider, so the picker lists every model the
@@ -347,4 +350,9 @@ export function effectiveBrain(): BrainChoice {
   const mode = getActiveAuthMode();
   if (mode === 'api_key' && !byoConfigured) return 'codex_oauth';
   return mode;
+}
+
+/** Test-only: expose the raw choice builders (they read the discovery cache). */
+export function __testChoices(): { codex: Array<{ id: string; label: string }>; claude: Array<{ id: string; label: string }> } {
+  return { codex: codexBrainModelChoices(), claude: claudeBrainModelChoices() };
 }

@@ -32,6 +32,7 @@ export interface CodexFunctionCall {
   call_id?: string;
   name?: string;
   arguments?: string;
+  phase?: unknown;
 }
 
 interface StoredCodexApprovalState {
@@ -502,6 +503,9 @@ export function functionCallInput(toolCall: CodexFunctionCall): CodexInputMessag
   if (isCodexFunctionCallItemId(toolCall.id)) {
     item.id = toolCall.id;
   }
+  if (toolCall.phase !== undefined) {
+    item.phase = toolCall.phase;
+  }
   return item;
 }
 
@@ -851,12 +855,13 @@ async function performCodexRequest(
 	                id: typeof typedItem.id === 'string' ? typedItem.id : undefined,
 	                call_id: typeof typedItem.call_id === 'string' ? typedItem.call_id : undefined,
 	                name: typeof typedItem.name === 'string' ? typedItem.name : undefined,
-	                arguments: typeof typedItem.arguments === 'string'
-	                  ? typedItem.arguments
-	                  : typedItem.arguments !== undefined
-	                    ? JSON.stringify(typedItem.arguments)
-	                    : undefined,
-	              });
+		              arguments: typeof typedItem.arguments === 'string'
+		                ? typedItem.arguments
+		                : typedItem.arguments !== undefined
+		                  ? JSON.stringify(typedItem.arguments)
+		                  : undefined,
+		              phase: typedItem.phase,
+		            });
 	            }
 	          }
 	          continue;

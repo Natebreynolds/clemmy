@@ -726,7 +726,7 @@ function reportBootFailure(stage: string, err: unknown): void {
   try {
     dialog.showErrorBox(
       `Clementine couldn't ${stage}`,
-      `${message}\n\nLog file: ${LOG_FILE}\n\nTry quitting Clementine and relaunching. If this keeps happening, open the log and share it from Settings → Diagnostics.`,
+      `${message}\n\nLog file: ${LOG_FILE}\n\nTry quitting Clementine and relaunching. If this keeps happening, open the log and share it from Advanced → Diagnostics.`,
     );
   } catch {
     // dialog may not be ready (e.g. app.on('ready') hasn't fired yet);
@@ -1198,7 +1198,7 @@ ipcMain.handle('clemmy:setup-skip', async (evt: IpcMainInvokeEvent) => {
   try {
     new Notification({
       title: 'Clementine is open, but no AI auth is set',
-      body: 'Add an OpenAI key or sign in with ChatGPT from Settings → Credentials to make chat work.',
+      body: 'Add an OpenAI key or sign in with ChatGPT from Settings → Models & routing to make chat work.',
       silent: false,
     }).show();
   } catch {

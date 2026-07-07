@@ -20,12 +20,32 @@ export function Help() {
   const navigate = useNavigate();
   const build = usePoll(['build-info'], getBuildInfo, 60000);
   const [checking, setChecking] = useState(false);
+  // Result of the last manual check. The updater bridge surfaces an
+  // actionable update via the global UpdaterBanner, but an "up to date"
+  // result had nowhere to land — so a click gave zero feedback. Show it here.
+  const [checkNote, setCheckNote] = useState<string | null>(null);
 
   const checkUpdates = async () => {
     const bridge = clemmy();
     if (!bridge?.updaterCheck) return;
     setChecking(true);
-    try { await bridge.updaterCheck(); } finally { setChecking(false); }
+    setCheckNote(null);
+    try {
+      const result = await bridge.updaterCheck();
+      const state = result && typeof result === 'object' && 'state' in result
+        ? String((result as { state?: unknown }).state)
+        : undefined;
+      if (state === 'available' || state === 'downloading' || state === 'ready-to-install') {
+        setCheckNote('An update is available — see the prompt at the bottom-left.');
+      } else {
+        const v = build.data?.version ? ` (v${build.data.version})` : '';
+        setCheckNote(`You're on the latest version${v}.`);
+      }
+    } catch {
+      setCheckNote("Couldn't check for updates right now — try again in a moment.");
+    } finally {
+      setChecking(false);
+    }
   };
 
   return (
@@ -56,6 +76,7 @@ export function Help() {
           <div className="flex-1">
             <h3 className="text-h3 text-fg">Version</h3>
             <p className="text-small text-muted">{build.data?.version ? `Clementine ${build.data.version}` : 'Loading…'}</p>
+            {checkNote && <p className="mt-1 text-small text-primary" role="status" aria-live="polite">{checkNote}</p>}
           </div>
           {isDesktop() && (
             <Button variant="secondary" size="sm" onClick={checkUpdates} disabled={checking}>

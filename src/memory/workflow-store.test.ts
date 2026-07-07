@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -237,4 +237,41 @@ test('retryBudget round-trips as retry_budget and clamps malformed values', () =
   assert.equal(steps.find((x) => x.id === 'b')?.retryBudget, 10);
   assert.equal(steps.find((x) => x.id === 'c')?.retryBudget, undefined);
   assert.equal(steps.find((x) => x.id === 'd')?.retryBudget, 2);
+});
+
+test('deterministic step inline source materializes to scripts/ and is stripped from frontmatter', () => {
+  const body = "#!/usr/bin/env node\nconsole.log(JSON.stringify({ ok: true }));";
+  writeWorkflow('agent-writes-code', {
+    name: 'agent-writes-code', description: 'agent authors a script', enabled: true, trigger: { manual: true },
+    steps: [
+      { id: 'run', deterministic: { runner: 'do-it.js', source: body } },
+    ] as never,
+  });
+
+  // 1. the script file was written under the workflow's scripts/ dir
+  const scriptPath = path.join(WORKFLOWS_DIR, 'agent-writes-code', 'scripts', 'do-it.js');
+  assert.ok(existsSync(scriptPath), 'expected scripts/do-it.js to exist');
+  assert.equal(readFileSync(scriptPath, 'utf-8'), `${body}\n`);
+
+  // 2. inline source is NOT persisted — the on-disk step is just { runner }
+  const skill = readFileSync(path.join(WORKFLOWS_DIR, 'agent-writes-code', 'SKILL.md'), 'utf-8');
+  assert.ok(!skill.includes('console.log'), 'source must not leak into SKILL.md frontmatter');
+
+  // 3. readback yields a runnable deterministic step pointing at the file
+  const step = readWorkflow('agent-writes-code')!.data.steps.find((s) => s.id === 'run');
+  assert.equal(step?.deterministic?.runner, 'do-it.js');
+  assert.equal((step?.deterministic as { source?: string } | undefined)?.source, undefined);
+});
+
+test('an already-"scripts/"-prefixed runner is honored and a path escape is rejected', () => {
+  writeWorkflow('prefixed-runner', {
+    name: 'prefixed-runner', description: 'prefixed', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'run', deterministic: { runner: 'scripts/nested.py', source: 'print("{}")' } }] as never,
+  });
+  assert.ok(existsSync(path.join(WORKFLOWS_DIR, 'prefixed-runner', 'scripts', 'nested.py')));
+
+  assert.throws(() => writeWorkflow('escape-runner', {
+    name: 'escape-runner', description: 'escape', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'run', deterministic: { runner: '../evil.js', source: 'x' } }] as never,
+  }), /inside the workflow scripts\/ dir|outside scripts/);
 });

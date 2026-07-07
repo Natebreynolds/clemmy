@@ -106,11 +106,29 @@ export function isOverloadError(err: unknown): boolean {
  *  ("Overloaded") instead of falling over. 429 (rate_limited) is deliberately
  *  EXCLUDED — that's account-wide quota; switching Claude tiers won't help (the
  *  resilient wrapper backs off + surfaces it). */
+/** An AUTH failure on a brain — expired/invalid subscription token, 401/403,
+ *  reauth-required. RECOVERABLE by switching to a brain whose auth is valid, so
+ *  it must not be treated as terminal. This is the class that let one ~10-day
+ *  Claude OAuth lapse hard-fail whole scheduled batches (07-06 audit). Shared by
+ *  the chat + workflow brain lanes (both route through FallbackModel). */
+export function isAuthRecoverableError(err: unknown): boolean {
+  if (err instanceof Error && err.name === 'ClaudeAuthError') return true;
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /\b(401|403)\b/.test(msg)
+    || /invalid_grant|refresh token not found or invalid|token (?:is invalid)|expired (?:token|credential|subscription)|(?:token|credential|subscription|session)s? (?:has |have )?expired|re-?authenticat|unauthorized|forbidden|not authenticated/i.test(msg);
+}
+
+function authFalloverEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_AUTH_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 export function isFalloverError(err: unknown): boolean {
   const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
-  return kind === 'model.overloaded'
-    || kind === 'model.http_5xx'
-    || kind === 'model.transport_timeout';
+  if (kind === 'model.overloaded' || kind === 'model.http_5xx' || kind === 'model.transport_timeout') return true;
+  // Auth failure on THIS brain → switch to a brain whose auth is valid rather
+  // than hard-failing the turn/run. Kill-switch CLEMMY_AUTH_FALLOVER=off.
+  if (authFalloverEnabled() && isAuthRecoverableError(err)) return true;
+  return false;
 }
 
 export class FallbackModel implements Model {

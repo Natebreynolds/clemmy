@@ -12,6 +12,7 @@
 //   7. GET /m/inbox  (Accept: text/html)→ 200 HTML (SPA fallback)
 //   8. GET /m/api/whoami               → 401 (auth API not shadowed by static)
 //   9. Host=<configured mobile hostname> hides non-/m daemon routes
+//  10. Host=<configured mobile hostname> can approve via /m/api/approvals
 //
 // Run: node scripts/smoke-mobile-pwa.mjs
 // Build of the mobile-web bundle happens automatically if missing.
@@ -118,14 +119,14 @@ child.stderr.on('data', (b) => { stderr += String(b); });
 
 const baseUrl = `http://127.0.0.1:${PORT}`;
 
-function getWithHost(pathname, host, headers = {}) {
+function requestWithHost(pathname, host, options = {}) {
   return new Promise((resolve, reject) => {
     const req = httpRequest({
       hostname: '127.0.0.1',
       port: PORT,
       path: pathname,
-      method: 'GET',
-      headers: { host, ...headers },
+      method: options.method ?? 'GET',
+      headers: { host, ...(options.headers ?? {}) },
     }, (res) => {
       let body = '';
       res.setEncoding('utf8');
@@ -133,8 +134,13 @@ function getWithHost(pathname, host, headers = {}) {
       res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
     });
     req.on('error', reject);
+    if (options.body) req.write(options.body);
     req.end();
   });
+}
+
+function getWithHost(pathname, host, headers = {}) {
+  return requestWithHost(pathname, host, { headers });
 }
 
 async function tcpProbe() {
@@ -174,6 +180,7 @@ if (!(await waitForReady())) {
   process.exit(1);
 }
 ok('daemon booted');
+process.env.CLEMENTINE_HOME = path.join(tmpHome, '.clementine-next');
 
 // 1. GET /m and /m/ → index.html with #app
 {
@@ -260,6 +267,50 @@ ok('daemon booted');
   const blocked = await getWithHost('/api/status', 'phone-smoke.example.test');
   if (mobile.status >= 200 && mobile.status < 400 && blocked.status === 404) ok('configured mobile hostname serves /m but hides non-mobile daemon routes');
   else fail(`mobile host boundary wrong: /m=${mobile.status} /api/status=${blocked.status}`);
+}
+
+// 10. Mobile approval API stays inside /m on the configured hostname.
+{
+  const { setPin } = await import(`${stagedDist}/runtime/mobile-pin.js`);
+  const { createSession } = await import(`${stagedDist}/runtime/harness/eventlog.js`);
+  const approvalRegistry = await import(`${stagedDist}/runtime/harness/approval-registry.js`);
+  await setPin('SmokeTest-2024!');
+  const login = await requestWithHost('/m/auth/login', 'phone-smoke.example.test', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ pin: 'SmokeTest-2024!', deviceLabel: 'PWA smoke phone' }),
+  });
+  const setCookie = login.headers['set-cookie'];
+  const cookie = String(Array.isArray(setCookie) ? setCookie[0] : setCookie ?? '').split(';')[0];
+  if (login.status !== 200 || !cookie.includes('clem_mobile_session=')) {
+    fail(`mobile login on configured host failed: status=${login.status} body=${login.body.slice(0, 160)}`);
+  } else {
+    const session = createSession({
+      id: `pwa-smoke-${Date.now().toString(36)}`,
+      kind: 'chat',
+      channel: 'mobile',
+      title: 'PWA approval smoke',
+    });
+    const approval = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'mobile',
+      subject: 'Approve smoke action?',
+      tool: 'run_shell_command',
+      args: { command: 'echo ok' },
+    });
+    const list = await requestWithHost('/m/api/approvals', 'phone-smoke.example.test', {
+      headers: { cookie, accept: 'application/json' },
+    });
+    const approve = await requestWithHost(`/m/api/approvals/${approval.approvalId}/approve`, 'phone-smoke.example.test', {
+      method: 'POST',
+      headers: { cookie, accept: 'application/json' },
+    });
+    if (list.status === 200 && list.body.includes(approval.approvalId) && approve.status === 200) {
+      ok('mobile host approval list + approve work under /m/api/approvals');
+    } else {
+      fail(`mobile approval API failed: list=${list.status} approve=${approve.status} listBody=${list.body.slice(0, 160)} approveBody=${approve.body.slice(0, 160)}`);
+    }
+  }
 }
 
 console.log(exitCode === 0 ? '\nAll PWA serve checks passed.' : '\nSmoke FAILED.');

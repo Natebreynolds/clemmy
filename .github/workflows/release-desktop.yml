@@ -157,6 +157,11 @@ jobs:
 
   release-windows:
     runs-on: windows-latest
+    # Mac-only releases: put `[mac-only]` in the tagged commit's message to skip
+    # the Windows build for that release (the tag name is the version, so it
+    # can't carry the marker without breaking semver). Fails open — an absent
+    # head_commit just builds Windows as normal.
+    if: ${{ !contains(github.event.head_commit.message, '[mac-only]') }}
     permissions:
       contents: write
 

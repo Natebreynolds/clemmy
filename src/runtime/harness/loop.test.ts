@@ -3620,6 +3620,28 @@ test('isCodexAuthRevoked: a real revoke marker is terminal; a BARE model 401 is 
   // latches DEAD inside refreshStoredNativeOAuth) — then even a bare 401 is terminal.
   markCodexAuthDead('refresh token revoked');
   assert.equal(isCodexAuthRevoked({ status: 401 }, 'Codex /responses returned 401 Unauthorized'), true, 'once DEAD-latched, surface re-auth');
+
+  // 2026-07-07 regression: the DEAD latch is a fact about CODEX auth, not a
+  // verdict on every error. While latched, a DIFFERENT brain's unrelated
+  // failure must NOT be rebranded as "Codex sign-in expired" (observed live:
+  // a GLM/Together run hard-failed with the Codex re-auth message while the
+  // real error was a Together credit-limit 402 — terminal + cause masked).
+  assert.equal(
+    isCodexAuthRevoked({ status: 402 }, '402 Credit limit exceeded, please add credits'),
+    false,
+    'latched + non-auth-shaped (BYO 402) stays recoverable',
+  );
+  assert.equal(
+    isCodexAuthRevoked(new Error('model backend timeout'), 'model backend timeout'),
+    false,
+    'latched + generic model error stays recoverable',
+  );
+  // …while codex-lane / auth-shaped errors still hit the latch.
+  assert.equal(
+    isCodexAuthRevoked({ status: 403 }, 'forbidden'),
+    true,
+    'latched + auth-shaped (403) surfaces re-auth',
+  );
   clearCodexAuthDead();
 
   // Not auth: a 429 rate limit or a generic failure must NOT be misclassified.

@@ -43,9 +43,9 @@ beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
 });
 
-test('enabled ungated-send workflow is ALLOWED (default allowSends=true)', async () => {
-  // Approval gates are now opt-in (allowSends: true by default).
-  // Ungated sends are allowed without explicit approval gates.
+test('enabled ungated-send schedule is saved DISABLED pending readiness answers', async () => {
+  // Approval gates are opt-in (allowSends: true by default), but readiness
+  // questions still keep unclear outbound sends from going live blind.
   const result = await scheduleTool()({
     name: 'midday-sender',
     description: 'Compose and send the outreach emails at midday.',
@@ -57,7 +57,12 @@ test('enabled ungated-send workflow is ALLOWED (default allowSends=true)', async
   });
   const text = resultText(result);
   assert.ok(/Created workflow/.test(text), `expected creation, got: ${text}`);
-  assert.ok(readWorkflow('midday-sender'), 'workflow must be written');
+  assert.match(text, /Currently DISABLED/);
+  assert.match(text, /outside world/);
+  assert.match(text, /Workflow visual contract:/);
+  const written = readWorkflow('midday-sender')?.data;
+  assert.ok(written, 'workflow must be written');
+  assert.equal(written.enabled, false);
 });
 
 test('strict send mode refuses a send-looking schedule without an approval gate', async () => {
@@ -155,5 +160,6 @@ test('a clean research/report schedule is written and may surface gap questions'
   });
   const text = resultText(result);
   assert.ok(/Created workflow "daily-digest"/.test(text), `expected create, got: ${text}`);
+  assert.match(text, /Workflow visual contract:/);
   assert.ok(readWorkflow('daily-digest'), 'workflow must be written');
 });

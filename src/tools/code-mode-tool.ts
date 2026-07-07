@@ -64,8 +64,9 @@ export function codeModeMandateEnabled(): boolean {
  * composio_execute_tool as an in-program option only when writes are on. Pure +
  * exported for test.
  */
-export function codeModeMandateDirective(opts: { mcpServersInScope?: number; allowAllMcp?: boolean }): string {
+export function codeModeMandateDirective(opts: { mcpServersInScope?: number; allowAllMcp?: boolean; fanoutPreferred?: boolean }): string {
   if (!codeModeMandateEnabled()) return '';
+  if (opts.fanoutPreferred) return '';
   const hasMcpData = !!opts.allowAllMcp || (opts.mcpServersInScope ?? 0) >= 1;
   if (!hasMcpData) return '';
   const fetchTools = codeModeWritesEnabled()

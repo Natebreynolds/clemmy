@@ -89,6 +89,14 @@ export function isGoalFidelityDraftInformEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_FIDELITY_DRAFT_INFORM', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+/** When a judge OUTAGE coincides with a detected uniform send-BURST, fail CLOSED
+ *  (park for approval) instead of the usual fail-open. Default on — the safety
+ *  fix for the 45-email runaway. =off restores pure fail-open. */
+export function isGoalFidelityFailClosedBurstEnabled(): boolean {
+  if (!isGoalFidelityGateEnabled()) return false;
+  return (getRuntimeEnv('CLEMMY_GOAL_FIDELITY_FAIL_CLOSED_BURST', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 // Write-time fidelity is ALWAYS judged against the BLESSED goal contract (the
 // objective+successCriteria the completion validator uses), not a goal re-derived
 // from raw events — so a send can't be blocked against a goal the user never
@@ -633,6 +641,7 @@ export async function evaluateGoalFidelity(
   // tool_called ledger — NOT an auto-block (a legitimately-templated
   // announcement is identical too); the judge disambiguates with goal+skill.
   let evidence = '(none)';
+  let burstDetected = false; // a uniform same-shape send to DISTINCT targets → a batch/runaway in progress
   try {
     const shapeKey = classifyExternalWrite(toolName, rawArgs).shapeKey;
     const currentTarget = targets[0] ?? '';
@@ -643,15 +652,33 @@ export async function evaluateGoalFidelity(
       priorSends: gatherPriorSameShapeSends(sessionId, toolName, shapeKey),
     });
     if (uni.uniform) {
+      burstDetected = true;
       evidence = `This action's opening paragraph is BYTE-IDENTICAL to ${uni.peerTargets.length} prior same-shape send(s) this session to DISTINCT target(s) (e.g. ${uni.peerTargets.slice(0, 3).join(', ')}). If the loaded skill requires per-target research/personalization, that per-item step was likely skipped.`;
     }
   } catch { /* evidence stays '(none)' — fail toward allow */ }
 
-  // 3b. Goal-fidelity judge — one fast fail-open call.
+  // 3b. Goal-fidelity judge — one fast call.
   let verdict: GoalFidelityVerdict;
   try {
     verdict = await (judgeOverride ?? runGoalFidelityJudge)({ goal, skills, payload: renderPayloadForJudge(toolName, rawArgs), evidence });
   } catch {
+    // Normally the judge fails OPEN — the gate must never wedge a legitimate
+    // one-off send. But a judge OUTAGE during a detected uniform send-BURST is
+    // exactly when fail-open is dangerous: the 45-email runaway to distinct
+    // addresses (2026-07-06) went out while the judge fail-opened 43/44. So when
+    // a burst is in flight, fail CLOSED — park for the user's approval instead of
+    // sending unchecked. Present-for-approval (not a counted failure): a judge
+    // outage is not a fidelity violation. Kill-switch restores pure fail-open.
+    if (burstDetected && isGoalFidelityFailClosedBurstEnabled()) {
+      return {
+        action: 'block',
+        mode: 'judge',
+        reason: 'goal-fidelity check could not run during a repeated same-shape send to distinct targets — parking this batch for your approval rather than sending unchecked',
+        gap: 'The goal-fidelity judge was unavailable while a same-shape send-burst is in flight. Approve to continue the batch, or stop it — I will not send the rest unverified.',
+        targets,
+        blockKind: 'present_for_approval',
+      };
+    }
     return { action: 'allow', mode: 'judge', reason: 'goal-fidelity judge unavailable — fail open', targets };
   }
 

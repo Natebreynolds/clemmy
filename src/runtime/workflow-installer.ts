@@ -20,7 +20,8 @@ import {
   readWorkflowDefinitionFile,
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
-import { emitWorkflowChange } from '../memory/workflow-change-bus.js';
+import { prepareWorkflowCreateForWrite } from '../execution/workflow-authoring.js';
+import { syncWorkflowTriggersBestEffort, writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
 
 export type WorkflowImportStatus = 'queued' | 'cloning' | 'discovering' | 'installing' | 'succeeded' | 'failed';
 
@@ -218,28 +219,34 @@ export function importWorkflowFrameworkFromDirectory(
       continue;
     }
 
+    const prepared = prepareWorkflowCreateForWrite(candidate.definition);
+    if (prepared.status === 'invalid') {
+      skipped.push({
+        name: candidate.name,
+        pathInSource: candidate.pathInSource,
+        reason: `workflow failed validation: ${prepared.errors.join('; ')}`,
+      });
+      continue;
+    }
+
     const targetDir = path.join(WORKFLOWS_DIR, candidate.name);
     clearTargetDirPreservingRuns(targetDir);
     copyDirFiltered(candidate.sourceDir, targetDir);
+    const installedEntry = writeWorkflowAndSyncTriggers(candidate.name, prepared.def);
     writeSourceMeta(targetDir, {
       source: options.sourceLabel ?? sourceRoot,
       pathInSource: candidate.pathInSource,
       sha: options.sha,
       importedAt: new Date().toISOString(),
       kind: 'workflow-framework',
+      repairs: prepared.repairs,
+      warnings: prepared.warnings,
+      codifyNotes: prepared.codifyNotes,
     });
-    const installedEntry = readWorkflow(candidate.name);
-    if (!installedEntry) {
-      skipped.push({
-        name: candidate.name,
-        pathInSource: candidate.pathInSource,
-        reason: 'copied files but workflow did not parse on read-back',
-      });
-      continue;
-    }
-    emitWorkflowChange({ name: candidate.name, op: existing ? 'updated' : 'created' });
     installed.push({ name: candidate.name, pathInSource: candidate.pathInSource, filePath: installedEntry.filePath });
   }
+
+  if (installed.length > 0) syncWorkflowTriggersBestEffort();
 
   return { discovered, installed, skipped };
 }

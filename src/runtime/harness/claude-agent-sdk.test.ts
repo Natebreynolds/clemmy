@@ -11,6 +11,7 @@ import type { Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 const mod = await import('./claude-agent-sdk.js');
 const usageLog = await import('../usage-log.js');
+const eventlog = await import('./eventlog.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
   CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
@@ -643,16 +644,22 @@ test('runClaudeAgentSdk reflects each tool return into the learning pipeline (br
   setClaudeAgentSdkQueryForTest(((_params: any) => queryFromMessages(streamWithToolReturn(), {})) as any);
   const reflected: Array<{ sessionId: string; callId: string; tool: string | null; output: string }> = [];
   setClaudeAgentSdkReflectionForTest(((input: any) => { reflected.push(input); }) as any);
+  const sess = eventlog.createSession({ id: 'clem-sess-1', kind: 'chat' });
 
-  await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: 'clem-sess-1', agentic: true });
+  await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: sess.id, agentic: true });
 
   assert.equal(reflected.length, 1);
-  assert.equal(reflected[0].sessionId, 'clem-sess-1');
+  assert.equal(reflected[0].sessionId, sess.id);
   assert.equal(reflected[0].callId, 'toolu_42');
   // The MCP-namespaced Composio wrapper is unwrapped to the real action slug
   // for source-trust parity with the Codex RunHooks path.
   assert.equal(reflected[0].tool, 'SALESFORCE_QUERY');
   assert.match(reflected[0].output, /Acme Corp has 3 open opportunities/);
+
+  const returned = eventlog.listEvents(sess.id, { types: ['tool_returned'] });
+  assert.equal(returned.length, 1);
+  assert.equal(returned[0].data.callId, 'toolu_42');
+  assert.equal(returned[0].data.tool, 'composio_execute_tool');
 });
 
 test('learning-OUT is skipped without a session id and when kill-switched off', async () => {
@@ -1166,6 +1173,72 @@ test('buildScopedNativeMcpServers: an SEO turn attaches the native dataforseo MC
 
     process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = 'off';
     assert.deepEqual(buildScopedNativeMcpServers('get SEO rankings'), {}, 'kill-switch off ⇒ no native attach');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
+    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
+    invalidateMcpServerDiscoveryCache();
+  }
+});
+
+test('buildScopedNativeMcpServers: tool-search DEFAULT-ON defers external servers (alwaysLoad:false); =off keeps them loaded', async () => {
+  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
+  const mcpDir = path.join(TMP_HOME, 'mcp');
+  mkdirSync(mcpDir, { recursive: true });
+  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
+    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
+  }), 'utf-8');
+  invalidateMcpServerDiscoveryCache();
+
+  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
+  const prevTS = process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
+  try {
+    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
+
+    // DEFAULT (v1.0 = ON): the external server is deferred behind tool search
+    // (surfaced by name, schema on demand) — still attaches, discoverable.
+    delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH;
+    const deferred = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
+    assert.ok(deferred.dataforseo, 'still attaches (discoverable by name)');
+    assert.equal((deferred.dataforseo as any).alwaysLoad, false, 'default-on ⇒ schema deferred / loaded on demand');
+    assert.equal((deferred.dataforseo as any).command, 'npx', 'the rest of the config is preserved');
+
+    // Kill-switch =off: external server loads normally (no forced defer).
+    process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'off';
+    const loaded = buildScopedNativeMcpServers('get google organic SEO keyword rankings for a domain');
+    assert.ok(loaded.dataforseo, 'attaches for an SEO turn');
+    assert.equal((loaded.dataforseo as any).alwaysLoad, undefined, '=off ⇒ not forced to defer');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
+    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
+    if (prevTS === undefined) delete process.env.CLEMMY_CLAUDE_TOOL_SEARCH; else process.env.CLEMMY_CLAUDE_TOOL_SEARCH = prevTS;
+    invalidateMcpServerDiscoveryCache();
+  }
+});
+
+test('buildScopedNativeMcpServers: an EMPTY scope attaches NO external servers (no allowAll over-attach)', async () => {
+  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
+  const mcpDir = path.join(TMP_HOME, 'mcp');
+  mkdirSync(mcpDir, { recursive: true });
+  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
+    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
+    supabase: { type: 'stdio', command: 'npx', args: ['supabase-mcp'], description: 'db', enabled: true },
+  }), 'utf-8');
+  invalidateMcpServerDiscoveryCache();
+
+  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
+  try {
+    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; // default on
+    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
+    // The regression this guards: an unscoped native-lane call (run_worker /
+    // workflow-step used to pass nothing) must NOT fall through to allowAll and
+    // cold-start every external MCP child. Empty, whitespace, and undefined all
+    // yield {} — a concrete scope still attaches its server (asserted above).
+    assert.deepEqual(buildScopedNativeMcpServers(''), {}, 'empty string ⇒ no external servers');
+    assert.deepEqual(buildScopedNativeMcpServers('   '), {}, 'whitespace ⇒ no external servers');
+    assert.deepEqual(buildScopedNativeMcpServers(undefined), {}, 'undefined ⇒ no external servers');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
     if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;

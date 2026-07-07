@@ -53,9 +53,13 @@ export function BoardCard({
       className={cn(
         'group rounded-md border border-border bg-surface p-3 shadow-xs',
         isDragging && 'opacity-50',
-        draggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-default',
+        draggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer',
       )}
       {...(draggable ? { ...listeners, ...attributes } : {})}
+      // The whole card opens the live trace (the subtitle promises "click a card
+      // to watch it live"). Drag is separated by the 6px PointerSensor threshold;
+      // inner action buttons stopPropagation so they don't also open the drawer.
+      onClick={() => onOpen(card)}
     >
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
@@ -79,7 +83,9 @@ export function BoardCard({
       )}
 
       {card.failureSummary && (
-        <p className="mt-2 rounded-sm bg-danger-tint px-2 py-1 text-caption text-danger">
+        // line-clamp keeps a verbose failure reason from turning the card into a
+        // wall of red — the FULL text lives one click away in the trace drawer.
+        <p className="mt-2 line-clamp-3 rounded-sm bg-danger-tint px-2 py-1 text-caption text-danger">
           {card.failureSummary.failedItems > 0
             ? `${card.failureSummary.failedItems} failed item${card.failureSummary.failedItems === 1 ? '' : 's'}`
             : 'Needs review'}
@@ -130,7 +136,7 @@ export function BoardCard({
             <>
               <Button
                 size="sm"
-                onClick={() => runAction('approve')}
+                onClick={(e) => { e.stopPropagation(); runAction('approve'); }}
                 onPointerDown={(e) => e.stopPropagation()}
                 className="h-7 px-2 text-caption"
               >
@@ -139,7 +145,7 @@ export function BoardCard({
               <Button
                 size="sm"
                 variant="secondary"
-                onClick={() => runAction('reject')}
+                onClick={(e) => { e.stopPropagation(); runAction('reject'); }}
                 onPointerDown={(e) => e.stopPropagation()}
                 className="h-7 px-2 text-caption"
               >
@@ -150,7 +156,7 @@ export function BoardCard({
           {onAction && card.primaryAction === 'retry_failed_items' && (
             <Button
               size="sm"
-              onClick={() => runAction('retry_failed_items')}
+              onClick={(e) => { e.stopPropagation(); runAction('retry_failed_items'); }}
               onPointerDown={(e) => e.stopPropagation()}
               className="h-7 px-2 text-caption"
             >
@@ -160,7 +166,7 @@ export function BoardCard({
           {onAction && card.primaryAction === 'continue' && (
             <Button
               size="sm"
-              onClick={() => runAction(continueIntent(card))}
+              onClick={(e) => { e.stopPropagation(); runAction(continueIntent(card)); }}
               onPointerDown={(e) => e.stopPropagation()}
               className="h-7 px-2 text-caption"
             >
@@ -171,7 +177,7 @@ export function BoardCard({
             <Button
               size="sm"
               variant="secondary"
-              onClick={() => onOpen(card)}
+              onClick={(e) => { e.stopPropagation(); onOpen(card); }}
               onPointerDown={(e) => e.stopPropagation()}
               className="h-7 px-2 text-caption"
             >
@@ -180,7 +186,7 @@ export function BoardCard({
           )}
           {onArchive && card.actions.includes('archive') && (
             <button
-              onClick={() => onArchive(card)}
+              onClick={(e) => { e.stopPropagation(); onArchive(card); }}
               onPointerDown={(e) => e.stopPropagation()}
               className="inline-flex items-center gap-1 text-caption font-semibold text-muted opacity-0 transition-opacity group-hover:opacity-100 hover:text-fg focus:opacity-100"
               title="Archive (recoverable)"
@@ -189,9 +195,9 @@ export function BoardCard({
             </button>
           )}
           <button
-            onClick={() => onOpen(card)}
+            onClick={(e) => { e.stopPropagation(); onOpen(card); }}
             onPointerDown={(e) => e.stopPropagation()}
-            className="text-caption font-semibold text-primary opacity-0 transition-opacity group-hover:opacity-100 hover:underline focus:opacity-100"
+            className="text-caption font-semibold text-faint transition-colors hover:text-primary hover:underline"
           >
             View trace
           </button>

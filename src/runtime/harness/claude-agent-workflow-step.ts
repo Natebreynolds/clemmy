@@ -1,5 +1,6 @@
 import type { WorkflowStepInput } from '../../memory/workflow-store.js';
 import { getRuntimeEnv } from '../../config.js';
+import { recordSubagentRun, providerClassForModel } from '../../agents/subagent-runs.js';
 import {
   ClaudeAgentSdkToolSurfaceError,
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -204,17 +205,69 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   /** The step's REAL harness session id. Required for the full lane so the gated
    *  tools + async approval read/write the workflow session's plan-scope grants. */
   sessionId?: string;
+  /** The workflow RUN id — so a fan-out (run_worker) spawned inside this step is
+   *  attributed to the run in the subagent-runs visibility store. */
+  runId?: string;
   /** Tool-capable gated lane (read + write/send through the harness gate chain)
    *  rather than the read-only profile. */
   fullLane?: boolean;
 }): Promise<ClaudeAgentSdkWorkflowStepResult> {
   const fullLane = Boolean(args.fullLane);
+  // Subagent visibility: a workflow STEP (and each forEach item — this runs per
+  // item) IS a specialized agent. Workflow steps run the 'worker' tool profile,
+  // which deliberately EXCLUDES run_worker, so the run_worker choke-point never
+  // sees them — record the step here so the Agents panel populates for workflows.
+  // Fail-open. (Codex/BYO-lane steps that don't take the SDK path are a follow-up.)
+  const stepStartedMs = Date.now();
+  // Collision-proof id: a parallel forEach fans out N items of the SAME step id at
+  // the SAME ms, so `step-<id>-<ms>` alone overwrote siblings' work-products (default
+  // concurrency 5). The random suffix keeps each item's row + output distinct.
+  const stepAgentId = `step-${args.step.id}-${stepStartedMs}-${Math.random().toString(36).slice(2, 8)}`;
+  // A readable task label — the first line of the actual prompt (minus the
+  // "Workflow: …\nStep: …\n\n" preamble), not the raw step id (which made rows read
+  // "seo_fanout: seo_fanout" since role === task). Falls back to the step id.
+  const taskLabel = ((): string => {
+    const stripped = args.prompt.replace(/^Workflow:[^\n]*\nStep:[^\n]*\n\n/, '');
+    const firstLine = stripped.split('\n').find((l) => l.trim()) ?? '';
+    return firstLine.trim().slice(0, 80) || args.step.id;
+  })();
+  const recordStepAgent = (output: unknown, status: 'ok' | 'error' | 'capped', model?: string): void => {
+    try {
+      const parentRunId = args.runId || args.sessionId;
+      if (!parentRunId) return;
+      const resolvedModel = model ?? args.modelId;
+      recordSubagentRun({
+        id: stepAgentId,
+        parentRunId,
+        parentKind: args.runId ? 'workflow' : 'session',
+        workflowName: args.workflowName,
+        stepId: args.step.id,
+        role: (args.step as { intent?: string }).intent || args.step.id,
+        provider: providerClassForModel(resolvedModel),
+        model: resolvedModel,
+        task: taskLabel,
+        status,
+        output: typeof output === 'string' ? output : JSON.stringify(output ?? ''),
+        startedAt: new Date(stepStartedMs).toISOString(),
+        finishedAt: new Date().toISOString(),
+      });
+    } catch { /* visibility trace is best-effort */ }
+  };
   const stepRunOptions = {
     modelId: args.modelId,
     sessionId: args.sessionId,
+    workflowRunId: args.runId,
+    workflowName: args.workflowName,
+    stepId: args.step.id,
     systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step, fullLane }),
     allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only'),
     requiredLocalMcpTools: requiredLocalMcpToolsForWorkflowStep(args.step, fullLane),
+    // Scope the step's NATIVE external MCP surface to what the step actually names
+    // (mirrors the chat brain's request.message scoping). Without this the step
+    // defaulted to allowAll → every external MCP child cold-started per step and
+    // its tool schemas bloated the step's input context. Spreads into the
+    // auto-continue call below too, so the continuation keeps the same scope.
+    nativeMcpScopeInput: args.prompt,
     agentic: fullLane,
     maxTurns: maxTurns(args.step, fullLane),
     outputSchema: claudeWorkflowStepOutputSchema(),
@@ -227,11 +280,14 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     // step must not halt just because it hit the per-query turn cap while still making
     // tool progress. Bounded by count + wall-clock; a continuation error keeps the prior
     // partial (which then blocks honestly below).
-    if (result.limitHit && workflowStepAutoContinueEnabled()) {
+    if (result.limitHit && !result.selfStopped && workflowStepAutoContinueEnabled()) {
+      // !selfStopped: never auto-continue an anti-thrash loop-stop (re-running it
+      // just re-loops — the exact thrash the ceiling exists to prevent).
       const autoStart = Date.now();
       let autos = 0;
       while (
         result.limitHit
+        && !result.selfStopped // a continuation that anti-thrash loop-STOPPED must NOT be re-run
         && result.toolUses.length > 0
         && autos < maxWorkflowStepAutoContinues()
         && (Date.now() - autoStart) < workflowStepAutoContinueWallMs()
@@ -284,11 +340,12 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
           `Workflow-step local MCP tool surface temporarily unavailable: the per-step MCP server advertised ${err.availableTools.length} tools and none of the always-registered baseline tools, so it had not finished initializing. A fresh-server retry should recover. Needed: ${err.missingTools.join(', ')}.`,
         );
       }
+      const reason = `Clementine workflow runtime did not expose required local MCP tool${err.missingTools.length === 1 ? '' : 's'}: ${err.missingTools.join(', ')}. This is a runtime/tool-surface issue, not a service credential issue.`;
+      // A hard-blocked step IS a failed specialist — record it so the Agents panel
+      // shows the block (red), not an empty row (this path never recorded before).
+      recordStepAgent(reason, 'error');
       return {
-        output: {
-          blocked: true,
-          reason: `Clementine workflow runtime did not expose required local MCP tool${err.missingTools.length === 1 ? '' : 's'}: ${err.missingTools.join(', ')}. This is a runtime/tool-surface issue, not a service credential issue.`,
-        },
+        output: { blocked: true, reason },
         toolUses: [],
         structured: true,
       };
@@ -299,8 +356,14 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   // the runner's self-heal / retry handles it honestly, rather than reporting the
   // partial text as a finished result (or hard-failing the whole workflow run).
   if (result.limitHit) {
+    // Honest reason: an anti-thrash loop-stop is NOT a plain budget exhaustion —
+    // say so, so the runner's self-heal sees the real cause (was hardcoded generic).
+    const reason = result.selfStopped
+      ? 'Claude stopped this step early: it began repeating actions that looked like a loop (anti-thrash safeguard) before finishing.'
+      : 'Claude reached the workflow-step turn budget before finishing this step.';
+    recordStepAgent(reason, 'capped', result.model);
     return {
-      output: { blocked: true, reason: 'Claude reached the workflow-step turn budget before finishing this step.' },
+      output: { blocked: true, reason },
       sdkSessionId: result.sessionId,
       model: result.model,
       toolUses: result.toolUses,
@@ -310,6 +373,13 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     };
   }
   const normalized = normalizeWorkflowStepOutput(result);
+  // A step whose output is a { blocked:true } envelope (the SDK reported status
+  // "blocked") is a FAILED specialist, not a green ✓ — record it as 'error' so the
+  // Agents panel doesn't paint a self-declared block as success.
+  const outputBlocked = typeof normalized.output === 'object'
+    && normalized.output !== null
+    && (normalized.output as { blocked?: unknown }).blocked === true;
+  recordStepAgent(normalized.output, outputBlocked ? 'error' : 'ok', result.model);
   return {
     output: normalized.output,
     sdkSessionId: result.sessionId,

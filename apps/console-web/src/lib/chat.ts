@@ -123,9 +123,15 @@ export function runHarnessStream(
 
   const handleEvent = (ev: HarnessEvent) => {
     if (closed) return;
-    sawEvent = true;
     resetIdle();
-    if (ev && typeof ev.seq === 'number' && ev.seq > lastSeq) lastSeq = ev.seq;
+    // Auto-reconnect (and the replay/fallback paths) re-deliver already-seen
+    // events — dedupe by seq so the activity strip isn't duplicated. Token
+    // deltas carry seq 0 and MUST still pass through every time.
+    if (ev && typeof ev.seq === 'number' && ev.seq > 0) {
+      if (ev.seq <= lastSeq) return;
+      lastSeq = ev.seq;
+    }
+    sawEvent = true;
     try { opts.onEvent(ev); } catch { /* render errors shouldn't kill the stream */ }
     if (isTerminalEvent(ev.type)) { sawTerminal = true; finish(); }
   };

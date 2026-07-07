@@ -302,6 +302,33 @@ test('applyProposedFix snapshots a backup, and revertWorkflowFix restores the pr
   assert.equal(revertWorkflowFix(applied.backupId!).ok, false);
 });
 
+test('applyProposedFix saves enabled workflows disabled when a fix introduces readiness gaps', () => {
+  writeWorkflow('diagnosis-readiness-wf', {
+    name: 'diagnosis-readiness-wf', description: 'readiness regression', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'main', prompt: 'Summarize the prospect list.' }],
+  } as never);
+  const fix = recordProposedFix('diagnosis-readiness-wf', 'run-gap', {
+    summary: 's', rootCause: 'r',
+    fix: {
+      kind: 'edit_step' as const,
+      stepId: 'main',
+      description: 'rewrite into an external send step',
+      newStepPrompt: 'Send the emails to the outside prospect list.',
+      newOutputContractJson: null,
+      service: null,
+      autoApplicable: true,
+    },
+    confidence: 'high' as const,
+  });
+
+  const applied = applyProposedFix(fix.id);
+  assert.equal(applied.ok, true, applied.message);
+  assert.match(applied.message, /stayed DISABLED/i);
+  const saved = readWorkflow('diagnosis-readiness-wf')!.data;
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.steps[0].prompt, 'Send the emails to the outside prospect list.');
+});
+
 test('revertWorkflowFix on an unknown id fails cleanly', () => {
   assert.equal(revertWorkflowFix('heal-nope').ok, false);
 });
@@ -387,6 +414,7 @@ test('fixIsAutoApplicable: edit_input needs a usable binding; edit_binding needs
   assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_input', newInputsJson: '{}', newAllowedToolsJson: null }), false);
   assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_binding', newInputsJson: null, newAllowedToolsJson: '["composio_gmail_search"]' }), true);
   assert.equal(fixIsAutoApplicable({ ...base, kind: 'edit_binding', newInputsJson: null, newAllowedToolsJson: '[]' }), false);
+  assert.equal(fixIsAutoApplicable({ ...base, kind: 'uncodify_step', newInputsJson: null, newAllowedToolsJson: null }), true);
 });
 
 test('applyProposedFix: an edit_input fix merges corrected bindings onto the step, backed up + revertible', () => {
@@ -429,6 +457,35 @@ test('applyProposedFix: an edit_binding fix corrects the step allowed-tools surf
   const applied = applyProposedFix(fix.id);
   assert.equal(applied.ok, true, applied.message);
   assert.deepEqual(readWorkflow('binding-wf')!.data.steps[0].allowedTools, ['composio_gmail_search', 'composio_gmail_send']);
+});
+
+test('applyProposedFix: uncodify_step restores the preserved model step', () => {
+  writeWorkflow('uncodify-wf', {
+    name: 'uncodify-wf', description: 'u', enabled: true, trigger: { manual: true },
+    steps: [{
+      id: 'pull',
+      prompt: 'Fetch as a direct call.',
+      call: { tool: 'dataforseo_domain_rank_overview', args: { target: '{{input.domain}}' } },
+      allowedTools: ['dataforseo_domain_rank_overview'],
+      codifiedFrom: { prompt: 'Fetch the domain rank overview adaptively.', allowedTools: ['dataforseo_domain_rank_overview'] },
+      output: { type: 'object' },
+    }],
+  } as never);
+  const fix = recordProposedFix('uncodify-wf', 'run-u', {
+    summary: 's', rootCause: 'the direct call failed its contract',
+    fix: {
+      kind: 'uncodify_step' as const, stepId: 'pull', description: 'restore model step',
+      newStepPrompt: null, newOutputContractJson: null, newInputsJson: null,
+      newAllowedToolsJson: null, service: null, autoApplicable: true,
+    },
+    confidence: 'high' as const,
+  });
+  const applied = applyProposedFix(fix.id);
+  assert.equal(applied.ok, true, applied.message);
+  const step = readWorkflow('uncodify-wf')!.data.steps[0];
+  assert.equal(step.prompt, 'Fetch the domain rank overview adaptively.');
+  assert.equal(step.call, undefined);
+  assert.equal(step.codifiedFrom, undefined);
 });
 
 test('applyProposedFix: an edit_contract fix replaces the step output contract, backed up + revertible', () => {

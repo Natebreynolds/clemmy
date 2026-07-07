@@ -152,13 +152,6 @@ export interface BackgroundTaskDetail {
   };
 }
 
-export interface DemoAgenticFlowResult {
-  ok: boolean;
-  task?: BackgroundTaskDetail['task'];
-  detail?: BackgroundTaskDetail['detail'];
-  reason?: string;
-}
-
 export const COLUMNS: { id: BoardColumnId; label: string }[] = [
   { id: 'queued', label: 'Queued' },
   { id: 'running', label: 'Running' },
@@ -182,9 +175,6 @@ export const repostBackgroundTaskResult = (id: string, target: BackgroundReportB
     `/api/console/background-tasks/${encodeURIComponent(id)}/repost-result`,
     target,
   );
-
-export const seedDemoAgenticFlow = () =>
-  apiPost<DemoAgenticFlowResult>('/api/console/demo/agentic-flow');
 
 // Queue visibility: the sub-task queue of one workflow run (each step/forEach
 // unit with status + what runs next), reconstructed server-side from the durable
@@ -210,6 +200,31 @@ export interface RunQueue {
 
 export const getRunQueue = (slug: string, runId: string) =>
   apiGet<RunQueue>(`/api/console/board/run/${encodeURIComponent(slug)}/${encodeURIComponent(runId)}/queue`);
+
+/** A specialized agent this run spawned (Claude / Codex / GLM-BYO fan-out). */
+export interface RunAgent {
+  id: string;
+  parentKind: 'workflow' | 'session';
+  workflowName?: string;
+  stepId?: string;
+  role?: string;
+  provider: 'claude' | 'codex' | 'glm' | 'unknown';
+  model?: string;
+  task: string;
+  status: 'ok' | 'error' | 'capped';
+  outputPreview: string;
+  outputRef?: string;
+  startedAt: string;
+  finishedAt: string;
+}
+
+export const listRunAgents = (slug: string, runId: string) =>
+  apiGet<{ runId: string; agents: RunAgent[]; byProvider: Record<string, number> }>(
+    `/api/console/workflows/${encodeURIComponent(slug)}/runs/${encodeURIComponent(runId)}/agents`);
+
+export const getRunAgentOutput = (slug: string, runId: string, agentId: string) =>
+  apiGet<{ agentId: string; output: string }>(
+    `/api/console/workflows/${encodeURIComponent(slug)}/runs/${encodeURIComponent(runId)}/agents/${encodeURIComponent(agentId)}/output`);
 
 /** The workflow slug + runId a card's queue lives under, or null if the card
  *  isn't a workflow run (background/execution/approval have no step queue). */

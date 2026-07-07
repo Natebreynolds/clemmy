@@ -3,10 +3,15 @@
  * drop is hovering (the dragged card allows an action that targets this
  * column) and red when the drop would be rejected.
  */
+import { useState } from 'react';
 import { useDroppable } from '@dnd-kit/core';
 import { cn } from '@/lib/cn';
 import { BoardCard } from './BoardCard';
 import { intentForDrop, type BoardButtonIntent, type BoardCard as BoardCardT, type BoardColumnId } from '@/lib/board';
+
+/** A crowded column (a Done pile of 40) reads as clutter, not a queue — show the
+ *  newest few and tuck the rest behind an expander. */
+const COLUMN_VISIBLE_MAX = 7;
 
 export function BoardColumn({
   id,
@@ -26,8 +31,11 @@ export function BoardColumn({
   onAction?: (card: BoardCardT, intent: BoardButtonIntent) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id });
+  const [showAll, setShowAll] = useState(false);
   const validHover = activeCard && isOver ? intentForDrop(activeCard, id) !== null : null;
   const showReject = activeCard && isOver && activeCard.column !== id && validHover === null;
+  const visible = showAll ? cards : cards.slice(0, COLUMN_VISIBLE_MAX);
+  const hidden = cards.length - visible.length;
 
   return (
     <div className="flex min-w-0 flex-col">
@@ -46,9 +54,29 @@ export function BoardColumn({
         {cards.length === 0 ? (
           <p className="px-1 py-6 text-center text-caption text-faint">Nothing here</p>
         ) : (
-          cards.map((card) => (
-            <BoardCard key={card.id} card={card} onOpen={onOpen} onArchive={onArchive} onAction={onAction} />
-          ))
+          <>
+            {visible.map((card) => (
+              <BoardCard key={card.id} card={card} onOpen={onOpen} onArchive={onArchive} onAction={onAction} />
+            ))}
+            {hidden > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowAll(true)}
+                className="rounded-md border border-border/60 bg-surface px-2 py-1.5 text-caption text-muted transition-colors hover:bg-subtle hover:text-fg cursor-pointer"
+              >
+                Show {hidden} more
+              </button>
+            )}
+            {showAll && cards.length > COLUMN_VISIBLE_MAX && (
+              <button
+                type="button"
+                onClick={() => setShowAll(false)}
+                className="rounded-md px-2 py-1 text-caption text-faint transition-colors hover:text-muted cursor-pointer"
+              >
+                Show fewer
+              </button>
+            )}
+          </>
         )}
       </div>
     </div>

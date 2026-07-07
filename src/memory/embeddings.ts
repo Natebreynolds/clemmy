@@ -44,7 +44,14 @@ const MAX_INPUT_CHARS = 16_000;
 // Per-call timeout for the embeddings fetch. Tighter than undici's
 // default (10s) so the daemon doesn't hang for a full 10s on a stale
 // Cloudflare IP — chat/recall fall back to FTS-only on timeout.
-const FETCH_TIMEOUT_MS = 6_000;
+// 10s (was 6s): the 6s ceiling tripped on slow-but-healthy calls, the #1 real
+// recall degradation (156 timeouts / 32 breaker-opens in 14d). Read per-call via
+// getRuntimeEnv (not a module const / raw process.env) so a .env-file drop of
+// CLEMMY_EMBED_TIMEOUT_MS reverts it LIVE like every other daemon flag.
+function fetchTimeoutMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_EMBED_TIMEOUT_MS', '') || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
+}
 
 // Circuit breaker for the long-running daemon's pool-poisoning
 // failure mode. After ~hours of uptime, undici keeps stale Cloudflare
@@ -71,6 +78,16 @@ export function classifyEmbedError(err: unknown): EmbedErrorClass {
   if (/\b401\b|invalid_api_key|incorrect api key|OPENAI_API_KEY is not set/i.test(msg)) return 'auth';
   if (/\b429\b|rate.?limit/i.test(msg)) return 'rate_limit';
   return 'transient';
+}
+
+/** Worth ONE retry before counting toward the breaker: a genuinely TRANSIENT blip
+ *  (timeout / network / 5xx). NOT a persistent CLIENT error (400 oversized-input,
+ *  404 bad-model) — those fail identically on retry and just double the synchronous
+ *  JIT/recall latency — nor terminal (auth/quota) / rate-limit (429). Pure/testable. */
+export function embedErrorIsRetryable(err: unknown): boolean {
+  if (classifyEmbedError(err) !== 'transient') return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return !/\b4\d\d\b/.test(msg); // any 4xx that slipped into 'transient' (≠429) won't recover
 }
 
 function cooldownForClass(cls: EmbedErrorClass): number {
@@ -122,7 +139,10 @@ function recordFailure(err: unknown): void {
   // threshold so a single blip doesn't drop recall to FTS.
   const shouldOpen = cooldownUntilMs === 0 && (terminal || consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD);
   if (shouldOpen) {
-    const ms = cooldownForClass(cls);
+    // ±12% jitter so many daemons/callers don't re-probe in lockstep (thundering
+    // herd on the embedding endpoint the moment a cooldown lapses).
+    const base = cooldownForClass(cls);
+    const ms = Math.round(base * (0.88 + Math.random() * 0.24));
     cooldownUntilMs = Date.now() + ms;
     const line = `embeddings circuit breaker open (${cls}) — recall on FTS-only for ~${Math.round(ms / 60_000)}m`;
     if (terminal) {
@@ -388,29 +408,48 @@ async function openaiEmbedBatch(texts: string[]): Promise<Float32Array[]> {
   // times out at undici's 10s connect timeout. Opting out of the pool
   // means every embedding call does a fresh DNS lookup + TCP connect.
   // That's a few-ms tax per call but avoids the multi-hour outage.
-  const response = await fetch('https://api.openai.com/v1/embeddings', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: safeInputs,
-    }),
-    keepalive: false,
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+  const attempt = async (): Promise<Float32Array[]> => {
+    const response = await fetch('https://api.openai.com/v1/embeddings', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: EMBEDDING_MODEL,
+        input: safeInputs,
+      }),
+      keepalive: false,
+      signal: AbortSignal.timeout(fetchTimeoutMs()),
+    });
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`Embeddings API ${response.status}: ${body.slice(0, 400)}`);
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Embeddings API ${response.status}: ${body.slice(0, 400)}`);
+    }
+
+    const json = await response.json() as EmbeddingsApiResponse;
+    // Sort by `index` defensively; the API returns in order but we don't rely on it.
+    const sorted = [...json.data].sort((a, b) => a.index - b.index);
+    return sorted.map((row) => Float32Array.from(row.embedding));
+  };
+
+  try {
+    return await attempt();
+  } catch (err) {
+    // One retry on a genuinely TRANSIENT blip (timeout / network / 5xx) before it
+    // counts toward the breaker — a single slow call must not drop recall to FTS
+    // for minutes. NOT retried: terminal (auth/quota), rate-limit (429), AND a
+    // persistent CLIENT error (400 oversized-input / 404 bad-model) — those fail
+    // identically on retry and just DOUBLE the synchronous JIT/recall latency on
+    // this pre-turn path (07-06 ship-review finding). Kill-switch =off.
+    if (embedErrorIsRetryable(err)
+      && (getRuntimeEnv('CLEMMY_EMBED_RETRY', 'on') || 'on').toLowerCase() !== 'off') {
+      await new Promise((r) => setTimeout(r, 300));
+      return await attempt();
+    }
+    throw err;
   }
-
-  const json = await response.json() as EmbeddingsApiResponse;
-  // Sort by `index` defensively; the API returns in order but we don't rely on it.
-  const sorted = [...json.data].sort((a, b) => a.index - b.index);
-  return sorted.map((row) => Float32Array.from(row.embedding));
 }
 
 /**

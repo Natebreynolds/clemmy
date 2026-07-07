@@ -18,6 +18,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
 import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
+import { RunAgentsPanel } from '@/components/board/RunAgentsPanel';
 import {
   cardTone,
   getBackgroundTaskDetail,
@@ -126,6 +127,31 @@ function workflowArtifactsText(value: unknown): string {
   return parts.slice(0, 3).join(' · ');
 }
 
+// Structural workflow events (steps, run lifecycle, attempts, advisories,
+// synthesis) that WorkflowRunDetail folds the timeline from — never window
+// these out. Only the noisy high-frequency kinds (item_*, tool_*, heartbeat)
+// get trimmed once the buffer exceeds the cap.
+const WORKFLOW_IMPORTANT_KIND = /^(step_|run_|attempt|advisory|synthesis)/;
+const WORKFLOW_EVENT_CAP = 400;
+
+/** Cap the workflow event buffer at WORKFLOW_EVENT_CAP, but evict only the
+ *  OLDEST noisy events — every structural event is retained so a long forEach
+ *  can't push the first steps out of the folded detail. Chronological order is
+ *  preserved (we drop from the front of the noisy stream, in place). */
+function trimWorkflowEvents(events: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  if (events.length <= WORKFLOW_EVENT_CAP) return events;
+  let noisy = 0;
+  for (const ev of events) if (!WORKFLOW_IMPORTANT_KIND.test(String(ev.kind ?? ''))) noisy += 1;
+  let drop = noisy - Math.max(0, WORKFLOW_EVENT_CAP - (events.length - noisy));
+  if (drop <= 0) return events; // all-important overflow: keep everything
+  const out: Array<Record<string, unknown>> = [];
+  for (const ev of events) {
+    if (drop > 0 && !WORKFLOW_IMPORTANT_KIND.test(String(ev.kind ?? ''))) { drop -= 1; continue; }
+    out.push(ev);
+  }
+  return out;
+}
+
 function formatTime(value?: string): string {
   if (!value) return 'Not yet';
   const date = new Date(value);
@@ -208,7 +234,13 @@ export function LiveTraceDrawer({
   const [targetNotice, setTargetNotice] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
-  const isWorkflow = card.sourceKind === 'workflow';
+  // A finished run loses its `sourceKind === 'workflow'` tag but still carries a
+  // runId + workflow reference — treat those as workflow cards too, else the
+  // drawer opens EMPTY for completed workflows (the structured detail never
+  // renders because it falls into the harness-SSE branch with no session).
+  const isWorkflow =
+    card.sourceKind === 'workflow' ||
+    Boolean(card.raw.runId && (card.raw.workflowSlug || card.raw.workflowName));
   const isBackground = card.sourceKind === 'background';
 
   useEffect(() => {
@@ -323,7 +355,7 @@ export function LiveTraceDrawer({
         const fresh = data.events ?? [];
         if (fresh.length) {
           since = String(fresh[fresh.length - 1].t ?? since);
-          setRawWorkflow((prev) => [...prev, ...fresh].slice(-400));
+          setRawWorkflow((prev) => trimWorkflowEvents([...prev, ...fresh]));
           const latest = fresh[fresh.length - 1];
           const latestKind = String(latest.kind ?? '');
           const label = WORKFLOW_MILESTONES[latestKind]?.label ?? latestKind.replace(/_/g, ' ');
@@ -552,7 +584,15 @@ export function LiveTraceDrawer({
               // Workflow runs get the structured, step-grouped detail (timeline +
               // attempts + advisories + summary + per-step tokens) — the flat
               // milestone list above can't express a finished run's depth.
-              <WorkflowRunDetail events={rawWorkflow} />
+              <>
+                <WorkflowRunDetail events={rawWorkflow} />
+                {(card.raw.workflowSlug || card.raw.workflowName) && card.raw.runId && (
+                  <RunAgentsPanel
+                    slug={String(card.raw.workflowSlug || card.raw.workflowName)}
+                    runId={String(card.raw.runId)}
+                  />
+                )}
+              </>
             ) : rows.length === 0 ? (
               <p className="text-body text-faint">No milestones yet — the trace streams in as the agent works.</p>
             ) : (

@@ -331,6 +331,7 @@ export function updateEnvKey(key: string, value: string): void {
   // handful of call sites worked around this by manually setting process.env[key]
   // after the call; doing it here fixes the whole class once, for every caller.
   process.env[key] = value;
+  if (key === 'WORKSPACE_DIRS') clearWorkspaceProjectCache();
 }
 
 /**
@@ -472,6 +473,10 @@ function extractDescription(dirPath: string, entries: string[]): string {
 // surface within a minute.
 const PROJECT_LIST_CACHE_TTL_MS = 60_000;
 let projectListCache: { at: number; projects: WorkspaceProject[] } | null = null;
+
+export function clearWorkspaceProjectCache(): void {
+  projectListCache = null;
+}
 
 export function listWorkspaceProjects(filter?: string): WorkspaceProject[] {
   if (projectListCache && Date.now() - projectListCache.at < PROJECT_LIST_CACHE_TTL_MS) {

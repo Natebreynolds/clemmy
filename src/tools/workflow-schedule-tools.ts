@@ -2,15 +2,23 @@ import { existsSync, readFileSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import matter from 'gray-matter';
 import { z } from 'zod';
-import { listWorkflows, writeWorkflow, readWorkflow } from '../memory/workflow-store.js';
+import { listWorkflows, readWorkflow } from '../memory/workflow-store.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { CRON_FILE } from '../memory/vault.js';
 import { textResult } from './shared.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
-import { prepareWorkflowForWrite } from '../execution/workflow-enforce.js';
 import { describeCron } from '../execution/workflow-describe.js';
 import { validateCronExpression } from '../shared/cron.js';
-import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
+import { renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
+import {
+  buildWorkflowTrigger,
+  prepareWorkflowCreateForWrite,
+  writeWorkflowAndSyncTriggers,
+} from '../execution/workflow-authoring.js';
+import {
+  buildWorkflowExecutionPlanWithReadiness,
+  renderWorkflowVisualContract,
+} from '../execution/workflow-run-readiness.js';
 
 /**
  * Schedule authoring tools — the agent's primary surface for "schedule
@@ -171,11 +179,13 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       const stepRequiresApproval = requiresApproval ?? priorStep?.requiresApproval;
       const stepApprovalPreview = approvalPreview ?? priorStep?.approvalPreview;
       const resolvedAllowSends = allowSends ?? existing?.data.allowSends;
+      const triggerResult = buildWorkflowTrigger({ schedule: cron, timezone: resolvedTz });
+      if (!triggerResult.ok) return textResult(`Error: ${triggerResult.error}`);
       const def: WorkflowDefinition = {
         name,
         description,
         enabled: enabled !== false,
-        trigger: { schedule: cron, ...(resolvedTz ? { timezone: resolvedTz } : {}) },
+        trigger: triggerResult.trigger,
         allowedTools,
         ...(resolvedAllowSends !== undefined ? { allowSends: resolvedAllowSends } : {}),
         steps: [
@@ -200,23 +210,26 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
       // authoring surface, so it must not be a back door that ships a workflow
       // set up to fail (ungated send, undeclared input, broken dataflow). An
       // ENABLED workflow that fails validation is refused; disable to draft.
-      const writeCheck = prepareWorkflowForWrite(def);
-      if (def.enabled && !writeCheck.ok) {
+      const writeCheck = prepareWorkflowCreateForWrite(def);
+      if (writeCheck.status === 'invalid') {
         return textResult(
           `Workflow "${name}" was NOT scheduled — fix these first (or pass enabled=false to draft it):\n- ${writeCheck.errors.join('\n- ')}`,
         );
       }
 
-      const written = writeWorkflow(name, writeCheck.def);
+      const written = writeWorkflowAndSyncTriggers(name, writeCheck.def);
       const next = nextFireDescription(cron);
       const verb = existing ? 'Updated' : 'Created';
-      const gapQuestions = renderWorkflowGapQuestions(analyzeWorkflowGaps(writeCheck.def));
+      const gapQuestions = renderWorkflowGapQuestions(writeCheck.gaps);
+      const visualContract = renderWorkflowVisualContract(
+        buildWorkflowExecutionPlanWithReadiness(writeCheck.def, name),
+      );
       const advisories = (writeCheck.repairs.length > 0 || writeCheck.warnings.length > 0)
         ? `\n\nHeads up (advisory — the workflow was saved):\n- ${[...writeCheck.repairs, ...writeCheck.warnings].join('\n- ')}`
         : '';
       return textResult(
-        `${verb} workflow "${name}" with cron "${cron}". ${def.enabled ? `Will fire ${next}.` : 'Currently DISABLED — pass enabled=true to activate.'}\nFile: ${written.filePath}`
-          + `${advisories}${gapQuestions}`,
+        `${verb} workflow "${name}" with cron "${cron}". ${writeCheck.def.enabled ? `Will fire ${next}.` : 'Currently DISABLED — resolve readiness/validation issues, then enable it.'}\nFile: ${written.filePath}`
+          + `${visualContract ? `\n\n${visualContract}` : ''}${advisories}${gapQuestions}`,
       );
     },
   );
@@ -243,7 +256,7 @@ export function registerWorkflowScheduleTools(server: McpServer): void {
         return textResult(`Workflow "${name}" is already disabled.`);
       }
       const updated: WorkflowDefinition = { ...entry.data, enabled: false };
-      writeWorkflow(name, updated);
+      writeWorkflowAndSyncTriggers(name, updated);
       return textResult(`Workflow "${name}" disabled. The definition remains on disk — re-enable any time via workflow_schedule with the same name.`);
     },
   );

@@ -25,7 +25,7 @@ process.env.MCP_ATTACH_CONNECTED_ONLY = 'off';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createCodexToolDefinitions, expandParallelHallucination, isWallClockAbort, trimNativeInputForRetry, parseCodexUsage, sanitizeCodexInputIds, type CodexFunctionCall } from './codex-native-runtime.js';
+import { createCodexToolDefinitions, expandParallelHallucination, functionCallInput, isWallClockAbort, trimNativeInputForRetry, parseCodexUsage, sanitizeCodexInputIds, type CodexFunctionCall } from './codex-native-runtime.js';
 import { invalidateConfiguredMcpServers } from './mcp-servers.js';
 import { AgentRuntimeCancelledError } from './provider.js';
 
@@ -47,6 +47,20 @@ test('sanitizeCodexInputIds strips non-fc ids off function_call items (the 2026-
   assert.equal(out[1].call_id, 'call_x', 'call_id preserved for correlation');
   assert.equal(out[2].id, 'fc_abc123', 'a real fc id is kept');
   assert.equal(out[3].type, 'function_call_output', 'non-function_call items untouched');
+});
+
+test('functionCallInput preserves Responses phase metadata on Codex function call history', () => {
+  const item = functionCallInput({
+    id: 'fc_phase_123',
+    call_id: 'call_phase_123',
+    name: 'read_file',
+    arguments: '{"path":"/tmp/a.txt"}',
+    phase: 'call',
+  }) as Record<string, unknown>;
+
+  assert.equal(item.id, 'fc_phase_123');
+  assert.equal(item.call_id, 'call_phase_123');
+  assert.equal(item.phase, 'call');
 });
 
 // ─── P0-A wall-clock recovery helpers ────────────────────────────────────────

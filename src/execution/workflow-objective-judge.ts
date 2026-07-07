@@ -90,11 +90,16 @@ export function buildWorkflowObjective(
   inputs: Record<string, unknown>,
 ): string {
   const parts: string[] = [];
-  if (workflow.description?.trim()) parts.push(workflow.description.trim());
-  if (workflow.description_body?.trim()) parts.push(workflow.description_body.trim());
-  else if (workflow.whenToUse?.trim()) parts.push(`When to use: ${workflow.whenToUse.trim()}`);
+  const pushUnique = (part: string | undefined): void => {
+    const trimmed = part?.trim();
+    if (!trimmed) return;
+    if (!parts.includes(trimmed)) parts.push(trimmed);
+  };
+  pushUnique(workflow.description);
+  if (workflow.description_body?.trim()) pushUnique(workflow.description_body);
+  else if (workflow.whenToUse?.trim()) pushUnique(`When to use: ${workflow.whenToUse.trim()}`);
   if (workflow.synthesis?.prompt?.trim()) {
-    parts.push(`The final deliverable should satisfy: ${workflow.synthesis.prompt.trim()}`);
+    pushUnique(`The final deliverable should satisfy: ${workflow.synthesis.prompt.trim()}`);
   }
   const inputKeys = Object.keys(inputs ?? {});
   if (inputKeys.length) {

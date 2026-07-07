@@ -97,6 +97,37 @@ test('buildSpaceHealthSnapshot surfaces view, runners, freshness, and issues', (
   assert.ok(health.issues.some((issue) => /never refreshed/.test(issue)));
 });
 
+test('buildSpaceHealthSnapshot surfaces failed data-source refresh metadata', () => {
+  const slug = 'health-failed-refresh';
+  store.spaceStore.save({
+    id: slug,
+    title: 'Health Failed Refresh',
+    dataSources: [{ id: 'pull', runner: 'refresh.mjs' }],
+  });
+  const viewFile = store.resolveInSpace(slug, 'view/index.html');
+  mkdirSync(path.dirname(viewFile), { recursive: true });
+  writeFileSync(viewFile, '<html>failed refresh</html>', 'utf-8');
+  const scriptDir = store.resolveInSpace(slug, 'data');
+  mkdirSync(scriptDir, { recursive: true });
+  writeFileSync(path.join(scriptDir, 'refresh.mjs'), 'process.stdout.write("{}")', 'utf-8');
+  data.writeData(slug, {
+    _meta: {
+      pull: {
+        refreshedAt: '2026-06-09T00:00:00.000Z',
+        ok: false,
+        error: 'runner produced no output',
+      },
+    },
+  });
+  const rec = store.spaceStore.update(slug, { lastRefreshedAt: '2026-06-09T00:00:00.000Z' })!;
+
+  const health = store.buildSpaceHealthSnapshot(rec, { now: Date.parse('2026-06-09T00:01:00.000Z') });
+
+  assert.equal(health.freshness.state, 'fresh');
+  assert.ok(health.issues.some((issue) => /data source "pull" last refresh failed/.test(issue)));
+  assert.ok(health.issues.some((issue) => /runner produced no output/.test(issue)));
+});
+
 test('archive hides from default list; includeArchived shows it; remove deletes dir', () => {
   store.spaceStore.save({ id: 'gone', title: 'Gone' });
   store.spaceStore.archive('gone');

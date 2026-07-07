@@ -455,6 +455,7 @@ export function renderConsoleHtml(token: string): string {
                 <div class="home-block-head">
                   <span>CHAT DOCK</span>
                   <span class="home-chat-head-actions">
+                    <button type="button" class="home-chat-workflow-btn" data-home-chat-save-workflow title="Save this chat as a disabled workflow draft">WORKFLOW</button>
                     <button type="button" class="home-chat-live-btn" data-home-live-open title="Open Clementine Live">LIVE</button>
                     <span class="home-chat-meta" data-home-chat-meta>local session</span>
                   </span>
@@ -3965,7 +3966,8 @@ body {
   gap: 8px;
   min-width: 0;
 }
-.home-chat-live-btn {
+.home-chat-live-btn,
+.home-chat-workflow-btn {
   background: transparent;
   border: 1px solid var(--line);
   color: var(--accent);
@@ -3975,10 +3977,18 @@ body {
   padding: 3px 8px;
   cursor: pointer;
 }
-.home-chat-live-btn:hover {
+.home-chat-workflow-btn {
+  color: var(--accent-2);
+}
+.home-chat-live-btn:hover,
+.home-chat-workflow-btn:hover {
   border-color: var(--accent);
   background: var(--accent);
   color: var(--bg-0);
+}
+.home-chat-workflow-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
 }
 .home-chat-turn {
   display: flex;
@@ -6037,11 +6047,223 @@ body {
 .wf-visual { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
 .wf-visual-summary { font-size: 12px; line-height: 1.55; color: var(--fg-2); }
 .wf-visual-summary h1, .wf-visual-summary h2 { font-size: 14px; color: var(--fg); margin: 6px 0 4px; }
+.wf-proof {
+  border: 1px solid var(--line);
+  background: var(--bg-1);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-proof-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wf-proof-head strong {
+  color: var(--fg);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+.wf-proof-label,
+.wf-list li.wf .pill.lifecycle,
+.wf-home-pill.lifecycle-draft,
+.wf-home-pill.lifecycle-needs_info,
+.wf-home-pill.lifecycle-testing,
+.wf-home-pill.lifecycle-live {
+  border: 1px solid var(--line);
+  padding: 2px 6px;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+}
+.wf-proof-label.lifecycle-live,
+.wf-list li.wf .pill.lifecycle-live,
+.wf-home-pill.lifecycle-live { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-proof-label.lifecycle-testing,
+.wf-list li.wf .pill.lifecycle-testing,
+.wf-home-pill.lifecycle-testing { color: var(--accent-3); border-color: var(--accent-3); }
+.wf-proof-label.lifecycle-needs_info,
+.wf-list li.wf .pill.lifecycle-needs_info,
+.wf-home-pill.lifecycle-needs_info { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-proof-label.lifecycle-draft,
+.wf-list li.wf .pill.lifecycle-draft,
+.wf-home-pill.lifecycle-draft { color: var(--fg-mute); border-color: var(--line); }
+.wf-proof-reason,
+.wf-home-card-proof {
+  color: var(--fg-3);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.wf-proof-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.wf-proof-grid > div,
+.wf-proof-gaps,
+.wf-proof-evidence {
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  padding: 8px;
+  min-width: 0;
+}
+.wf-proof-grid span,
+.wf-proof-gaps span,
+.wf-proof-evidence span {
+  display: block;
+  color: var(--fg-mute);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  margin-bottom: 5px;
+}
+.wf-proof-grid p,
+.wf-proof-gaps p,
+.wf-proof-evidence p {
+  margin: 0;
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+.wf-proof-gaps,
+.wf-proof-evidence {
+  border-left: 2px solid var(--accent-warn);
+}
+.wf-proof-evidence { border-left-color: var(--accent-3); }
+.wf-exec-plan {
+  border: 1px solid var(--line); background: var(--bg-1); padding: 10px 12px;
+}
+.wf-exec-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font: 10px var(--mono); letter-spacing: 0.14em; color: var(--fg-3);
+}
+.wf-exec-head strong { color: var(--fg); font-weight: 600; }
+.wf-exec-grid {
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 8px;
+}
+.wf-exec-grid > div,
+.wf-exec-row {
+  background: var(--bg-2); border: 1px solid var(--line); padding: 8px;
+}
+.wf-exec-row { margin-top: 8px; }
+.wf-exec-row.warn { border-left: 2px solid var(--accent-warn); }
+.wf-cockpit-card:empty { display: none; }
+.wf-cockpit { margin-top: 8px; }
+.wf-cockpit-wave {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;
+  padding-left: 10px; border-left: 2px solid var(--line);
+}
+.wf-cockpit-step {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 3px;
+  padding: 3px 8px; font: 11px var(--mono); color: var(--fg-2);
+}
+.wf-cockpit-step .wf-cockpit-metric { color: var(--fg-mute); font-size: 10px; }
+.wf-cockpit-step.status-running { border-color: var(--accent); color: var(--fg); }
+.wf-cockpit-step.status-done { border-color: var(--accent-ok, #3ba55d); }
+.wf-cockpit-step.status-failed { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-cockpit-step.status-skipped { opacity: 0.55; }
+.wf-workspace-card:empty { display: none; }
+.wf-workspace { margin-top: 8px; }
+.wf-workspace .wf-ws-size { color: var(--fg-mute); font-size: 10px; font-family: var(--mono); }
+.wf-workspace strong { color: var(--fg); }
+.wf-check-btn {
+  background: var(--bg-2); border: 1px solid var(--line); color: var(--fg-2);
+  font: 10px var(--mono); letter-spacing: 0.1em; padding: 6px 12px; cursor: pointer;
+}
+.wf-check-btn:hover { border-color: var(--accent); color: var(--fg); }
+.wf-check-btn:disabled { opacity: 0.55; cursor: default; }
+.wf-exec-grid span,
+.wf-exec-row span {
+  display: block; margin-bottom: 4px; font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute);
+}
+.wf-exec-grid p,
+.wf-exec-row p {
+  margin: 0; font-size: 11px; line-height: 1.45; color: var(--fg-2);
+}
+.wf-contract-fixes {
+  display: grid;
+  gap: 6px;
+}
+.wf-contract-fix-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+}
+.wf-contract-fix-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.wf-contract-fix-row p {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.wf-contract-fix-row strong {
+  color: var(--fg);
+  font-size: 11px;
+  font-weight: 600;
+}
+.wf-contract-fix-row span {
+  display: block;
+  margin: 0;
+  color: var(--fg-3);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  word-break: break-word;
+}
+.wf-contract-fix-guidance {
+  display: grid !important;
+  gap: 3px;
+  margin-top: 4px !important;
+}
+.wf-contract-fix-guidance em {
+  display: block;
+  color: var(--fg-2);
+  font-style: normal;
+  line-height: 1.35;
+}
+.wf-contract-fix-guidance code {
+  color: var(--accent-2);
+  font: 10px var(--mono);
+}
+.wf-contract-fix-action {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+  font: 10px var(--mono);
+  letter-spacing: 0.1em;
+  padding: 5px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.wf-contract-fix-action.warn { border-color: var(--accent-warn); color: var(--accent-warn); }
+.wf-contract-fix-action.danger { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-contract-fix-action:hover { border-color: var(--accent); color: var(--accent); }
+.wf-contract-fix-action:disabled { opacity: 0.55; cursor: default; }
+.wf-contract-fixes-drawer {
+  padding: 2px 14px 10px;
+  border-bottom: 1px solid var(--line);
+}
+@media (max-width: 980px) {
+  .wf-proof-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .wf-exec-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .wf-contract-fix-row { grid-template-columns: 1fr; align-items: start; }
+}
+@media (max-width: 640px) {
+  .wf-proof-grid { grid-template-columns: 1fr; }
+  .wf-exec-grid { grid-template-columns: 1fr; }
+}
 .wf-visual-head {
   display: flex; align-items: baseline; justify-content: space-between;
   font-size: 10px; letter-spacing: 0.18em; color: var(--fg-3);
 }
 .wf-visual-legend { font-size: 10px; letter-spacing: 0.04em; color: var(--fg-mute); }
+.wf-visual-run-summary { font-size: 10px; letter-spacing: 0.06em; color: var(--accent-warn); }
 .wf-graph {
   position: relative; height: 360px; border: 1px solid var(--line);
   background:
@@ -6054,7 +6276,24 @@ body {
   color: var(--fg-mute); font-size: 11px; letter-spacing: 0.06em; text-align: center; padding: 20px;
 }
 .wf-graph-fallback { margin: 0; padding: 12px 12px 12px 30px; font-size: 12px; color: var(--fg-2); }
-.wf-graph-fallback li { padding: 4px 0; cursor: pointer; }
+.wf-graph-fallback li { padding: 5px 0; cursor: pointer; display: grid; gap: 2px; }
+.wf-graph-fallback strong { color: var(--fg); font-weight: 500; }
+.wf-graph-meta { color: var(--fg-mute); font-size: 10px; letter-spacing: 0.04em; }
+.wf-graph-verdict { color: var(--fg-2); font-size: 10px; letter-spacing: 0.04em; }
+.wf-graph-verdict.verdict-blocked { color: var(--accent-fail); }
+.wf-graph-verdict.verdict-attention { color: var(--accent-warn); }
+.wf-graph-readiness { color: var(--fg-2); font-size: 10px; letter-spacing: 0.04em; }
+.wf-graph-readiness.readiness-missing { color: var(--accent-fail); }
+.wf-graph-readiness.readiness-unknown { color: var(--accent-warn); }
+.wf-graph-readiness.contract-block { color: var(--accent-fail); }
+.wf-graph-readiness.contract-warn { color: var(--accent-warn); }
+.wf-graph-plan { color: var(--fg-3); font-size: 10px; letter-spacing: 0.04em; }
+.wf-graph-plan.plan-critical { color: var(--accent); }
+.wf-graph-run { color: var(--accent-2); font-size: 10px; letter-spacing: 0.03em; }
+.wf-graph-run.run-verdict-proven { color: var(--accent-2); }
+.wf-graph-run.run-verdict-attention,
+.wf-graph-run.run-verdict-blocked { color: var(--accent-warn); }
+.wf-graph-run.run-verdict-failed { color: var(--accent-fail); }
 .wf-graph-fallback li:hover { color: var(--accent); }
 .wf-edit-toggle {
   align-self: flex-start; background: transparent; border: 1px solid var(--line);
@@ -6090,10 +6329,40 @@ body {
 .wf-drawer-close:hover { color: var(--accent); }
 .wf-drawer-flags { padding: 10px 14px; font-size: 10px; color: var(--fg-3); border-bottom: 1px solid var(--line); }
 .wf-drawer-sub { padding: 12px 14px 4px; font-size: 9px; letter-spacing: 0.18em; color: var(--fg-mute); }
+.wf-drawer-run {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 2px 14px 10px; border-bottom: 1px solid var(--line);
+}
+.wf-drawer-run span {
+  border: 1px solid var(--line); color: var(--fg-2); background: var(--bg-2);
+  padding: 3px 6px; font: 10px var(--mono);
+}
+.wf-drawer-run.readiness-missing span { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-drawer-run.readiness-unknown span { border-color: var(--accent-warn); color: var(--accent-warn); }
+.wf-drawer-run.verdict-blocked span,
+.wf-drawer-run.run-verdict-failed span { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-drawer-run.verdict-attention span,
+.wf-drawer-run.run-verdict-attention span,
+.wf-drawer-run.run-verdict-blocked span { border-color: var(--accent-warn); color: var(--accent-warn); }
+.wf-drawer-run.run-verdict-proven span { border-color: var(--accent-2); color: var(--accent-2); }
+.wf-drawer-actions {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 10px 14px; border-bottom: 1px solid var(--line);
+}
+.wf-drawer-action {
+  background: transparent; border: 1px solid var(--line); color: var(--fg-2);
+  font: 10px var(--mono); letter-spacing: 0.12em; padding: 5px 8px; cursor: pointer;
+}
+.wf-drawer-action.primary { border-color: var(--accent-2); color: var(--accent-2); }
+.wf-drawer-action.warn { border-color: var(--accent-warn); color: var(--accent-warn); }
+.wf-drawer-action.danger { border-color: var(--accent-fail); color: var(--accent-fail); }
+.wf-drawer-action:hover { border-color: var(--accent); color: var(--accent); }
+.wf-drawer-action:disabled { opacity: 0.55; cursor: wait; }
 .wf-drawer-pre {
   margin: 0; padding: 0 14px 12px; font: 11px/1.5 var(--mono); color: var(--fg);
   white-space: pre-wrap; word-break: break-word;
 }
+.wf-drawer-preview { color: var(--fg-2); border-bottom: 1px solid var(--line); }
 .wf-list-pane,
 .wf-editor,
 .wf-chat-pane {
@@ -7203,6 +7472,131 @@ body {
 .wf-insp-summary.attn .wf-insp-summary-badge { color: var(--accent-warn); }
 .wf-insp-summary-because { color: var(--fg); }
 .wf-insp-summary-artifacts { color: var(--fg-3); margin-top: 6px; font-family: var(--mono); font-size: 10px; }
+.wf-insp-launch {
+  margin: 12px 16px 0;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  padding: 10px 12px;
+  font-size: 11px;
+}
+.wf-insp-launch.ok { border-left-color: var(--accent-2); }
+.wf-insp-launch.warn { border-left-color: var(--accent-warn); }
+.wf-insp-launch.block { border-left-color: var(--accent-fail); }
+.wf-insp-launch-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.wf-insp-launch-kicker { font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute); }
+.wf-insp-launch-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  color: var(--fg-2);
+  text-transform: uppercase;
+}
+.wf-insp-launch.ok .wf-insp-launch-badge { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-insp-launch.warn .wf-insp-launch-badge { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-insp-launch.block .wf-insp-launch-badge { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-insp-launch-metric { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
+.wf-insp-launch-items { margin-top: 8px; border-top: 1px dotted var(--line); padding-top: 6px; display: flex; flex-direction: column; gap: 5px; }
+.wf-insp-launch-item { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
+.wf-insp-launch-compare { margin-top: 9px; border-top: 1px dotted var(--line); padding-top: 8px; display: grid; gap: 6px; }
+.wf-insp-launch-compare-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.wf-insp-launch-compare-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  color: var(--fg-2);
+  text-transform: uppercase;
+}
+.wf-insp-launch-compare.ok .wf-insp-launch-compare-badge { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-insp-launch-compare.warn .wf-insp-launch-compare-badge { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-insp-launch-compare.fail .wf-insp-launch-compare-badge { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-insp-launch-compare-note,
+.wf-insp-launch-compare-row { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
+.wf-insp-launch-compare-row strong { color: var(--fg-2); font-weight: 600; }
+.wf-insp-goal {
+  margin: 12px 16px 0;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  padding: 10px 12px;
+  font-size: 11px;
+}
+.wf-insp-goal.status-satisfied { border-left-color: var(--accent-2); }
+.wf-insp-goal.status-repursue,
+.wf-insp-goal.status-advisory { border-left-color: var(--accent-warn); }
+.wf-insp-goal.status-escalate { border-left-color: var(--accent-fail); }
+.wf-insp-goal-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.wf-insp-goal-kicker { font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute); }
+.wf-insp-goal-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  color: var(--fg-2);
+  text-transform: uppercase;
+}
+.wf-insp-goal.status-satisfied .wf-insp-goal-badge { color: var(--accent-2); border-color: var(--accent-2); }
+.wf-insp-goal.status-repursue .wf-insp-goal-badge,
+.wf-insp-goal.status-advisory .wf-insp-goal-badge { color: var(--accent-warn); border-color: var(--accent-warn); }
+.wf-insp-goal.status-escalate .wf-insp-goal-badge { color: var(--accent-fail); border-color: var(--accent-fail); }
+.wf-insp-goal-metric {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-3);
+}
+.wf-insp-goal-reason { margin-top: 6px; color: var(--fg); }
+.wf-insp-goal-failed { margin: 6px 0 0; padding-left: 16px; }
+.wf-insp-goal-failed li { font-size: 10px; color: var(--fg-3); }
+.wf-insp-goal-feedback {
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-2);
+}
+.wf-insp-goal-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.wf-insp-goal-action {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.wf-insp-goal-action:hover { border-color: var(--accent); background: var(--accent); color: var(--bg-0); }
+.wf-insp-goal-action:disabled { opacity: 0.55; cursor: wait; }
+.wf-insp-goal-lineage { margin-top: 8px; border-top: 1px dotted var(--line); padding-top: 8px; }
+.wf-insp-goal-lineage-head { font-size: 9px; letter-spacing: 0.16em; color: var(--fg-mute); margin-bottom: 6px; }
+.wf-insp-goal-lineage-row {
+  display: grid;
+  grid-template-columns: minmax(92px, 1.2fr) minmax(64px, 0.7fr) minmax(96px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border-left: 2px solid var(--line);
+  padding: 5px 0 5px 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-3);
+}
+.wf-insp-goal-lineage-row.current { border-left-color: var(--accent); color: var(--fg-2); }
+.wf-insp-goal-lineage-run { color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-insp-goal-lineage-status { text-transform: uppercase; color: var(--accent-warn); }
+.wf-insp-goal-lineage-row.status-satisfied .wf-insp-goal-lineage-status { color: var(--accent-2); }
+.wf-insp-goal-lineage-row.status-escalate .wf-insp-goal-lineage-status { color: var(--accent-fail); }
+.wf-insp-goal-lineage-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 640px) {
+  .wf-insp-goal-lineage-row { grid-template-columns: 1fr; gap: 3px; }
+}
 .wf-insp-steps { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 10px; }
 .wf-insp-empty { color: var(--fg-mute); font-size: 11px; padding: 8px 0; }
 .wf-insp-step {
@@ -7431,6 +7825,44 @@ body {
   font-size: 10px;
   color: var(--fg-mute);
   letter-spacing: 0.06em;
+}
+.wf-goal-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px;
+  gap: 8px;
+  align-items: start;
+}
+.wf-goal-grid textarea {
+  min-height: 78px;
+}
+.wf-goal-attempts input {
+  text-align: center;
+}
+.wf-goal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+.wf-goal-actions .hint {
+  margin-top: 0;
+}
+.wf-goal-clear {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-3);
+  font: 10px var(--mono);
+  letter-spacing: 0.12em;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.wf-goal-clear:hover {
+  color: var(--accent-warn);
+  border-color: var(--accent-warn);
+}
+@media (max-width: 720px) {
+  .wf-goal-grid { grid-template-columns: 1fr; }
 }
 .sched-picker {
   display: flex;
@@ -15861,7 +16293,17 @@ const CONSOLE_JS = `
   let wfDraft = null;
   let wfSelectedName = null;
   let wfIsNew = false;
-  let wfGraphCy = null;   // Cytoscape instance for the workflow flow diagram
+	  let wfGraphCy = null;   // Cytoscape instance for the workflow flow diagram
+	  let wfGraphByStep = {};
+	  let wfGraphOverlayByStep = {};
+	  let wfGraphOverlaySummary = null;
+  let wfGraphOverlayGoal = null;
+  let wfGraphOverlayComparison = null;
+  let wfGraphOverlayExecutionEfficiency = null;
+  let wfGraphOverlayRecoveryIntent = null;
+  let wfGraphOverlayRecoveryLineage = [];
+	  let wfGraphOverlayRunId = '';
+  let wfGraphOverlaySeq = 0;
   let wfItems = [];
   let wfHomeData = null;
   let wfMode = 'home';
@@ -16364,6 +16806,371 @@ const CONSOLE_JS = `
     return status + (when ? ' · ' + fmtCronAgo(when) : '');
   }
 
+  function workflowLifecycleClass(proof) {
+    const state = String((proof && proof.lifecycle) || 'draft').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    return 'lifecycle-' + (state || 'draft');
+  }
+
+  function workflowLifecycleLabel(proof, fallback) {
+    return (proof && proof.label) || fallback || 'DRAFT';
+  }
+
+  function workflowProofRunLabel(run) {
+    if (!run) return 'no evidence yet';
+    const status = run.needsAttention ? 'needs attention' : String(run.status || 'unknown');
+    const when = run.finishedAt || run.startedAt || run.createdAt || '';
+    return status + (when ? ' · ' + fmtCronAgo(when) : '') + (run.id ? ' · ' + run.id : '');
+  }
+
+  // The workspace window — "check in on your employees": each step's persisted
+  // work product (from the run's shared workspace manifest). Filled when a run
+  // is selected; empty (hidden) otherwise.
+  function renderWorkflowRunWorkspace(data) {
+    const el = document.querySelector('[data-wf-workspace]');
+    if (!el) return;
+    const artifacts = data && Array.isArray(data.artifacts) ? data.artifacts : [];
+    if (!artifacts.length) { el.innerHTML = ''; return; }
+    const kb = (n) => (Number(n) / 1024).toFixed(1) + 'KB';
+    const rows = artifacts.map((a) => '<p><strong>' + escMem(String(a.agent || '')) + '</strong> '
+      + '<span class="wf-ws-size">' + escMem(kb(a.bytes)) + '</span> — ' + escMem(String(a.summary || '')) + '</p>').join('');
+    const checker = data.checker;
+    const unmet = checker && Array.isArray(checker.perCriterion) ? checker.perCriterion.filter((c) => !c.pass) : [];
+    const checkerHtml = checker
+      ? '  <div class="wf-exec-row' + (checker.pass ? '' : ' warn') + '"><span>CHECKER</span><p>'
+        + (checker.pass ? '✅ ' : '⚠️ ') + escMem(String(checker.summary || '')) + '</p>'
+        + unmet.map((c) => '<p>✗ ' + escMem(String(c.criterion)) + (c.detail ? ' — ' + escMem(String(c.detail)) : '') + '</p>').join('')
+        + '</div>'
+      : '';
+    el.innerHTML = [
+      '<section class="wf-exec-plan wf-workspace">',
+      '  <div class="wf-exec-head"><strong>WORKSPACE</strong><span>' + escMem(String(artifacts.length) + ' work products · ' + kb(data.totalBytes || 0)) + '</span></div>',
+      '  <div class="wf-exec-row"><span>WHAT EACH STEP PRODUCED</span>' + rows + '</div>',
+      checkerHtml,
+      '  <div class="wf-exec-row"><button type="button" class="wf-check-btn" data-wf-check-run>◉ CHECK WORK AGAINST GOAL</button></div>',
+      '</section>',
+    ].join('');
+    const btn = el.querySelector('[data-wf-check-run]');
+    if (btn) btn.onclick = async () => {
+      btn.disabled = true; btn.textContent = '◉ CHECKING…';
+      try {
+        const token = new URLSearchParams(location.search).get('token');
+        const q = token ? ('?token=' + encodeURIComponent(token)) : '';
+        await fetch('/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+          + '/runs/' + encodeURIComponent(data.runId) + '/check' + q, { method: 'POST' });
+        const ws = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+          + '/runs/' + encodeURIComponent(data.runId) + '/workspace');
+        renderWorkflowRunWorkspace(ws);
+      } catch (_) {
+        btn.disabled = false; btn.textContent = '◉ CHECK WORK AGAINST GOAL';
+      }
+    };
+  }
+
+  // Live-run cockpit — the SAME execution-wave layout as the dry-run card, but
+  // lit with real per-step status from the run-overlay poll. The dry-run's
+  // "📤 will send" becomes "✓ / ⟳ / ✗" on the identical picture, so preview and
+  // execution read as one continuous view. Filled by renderWorkflowRunCockpit()
+  // on each overlay apply; empty (hidden) when no run is selected.
+  function renderWorkflowRunCockpit() {
+    const el = document.querySelector('[data-wf-cockpit]');
+    if (!el) return;
+    const rows = wfGraphOverlayByStep ? Object.keys(wfGraphOverlayByStep).map((k) => wfGraphOverlayByStep[k]) : [];
+    if (!rows.length) { el.innerHTML = ''; return; }
+    const s = wfGraphOverlaySummary || {};
+    const icon = { running: '⟳', done: '✓', failed: '✗', skipped: '⊝', pending: '·' };
+    const byWave = {};
+    rows.forEach((r) => {
+      const w = Number.isFinite(Number(r.readyRound)) ? Number(r.readyRound) : 0;
+      (byWave[w] = byWave[w] || []).push(r);
+    });
+    const waveKeys = Object.keys(byWave).map(Number).sort((a, b) => a - b);
+    const metric = (r) => {
+      const bits = [];
+      if (Number(r.retries) > 0) bits.push('↻' + r.retries);
+      if (Number(r.toolCalls) > 0) bits.push('⚙' + r.toolCalls);
+      if (Number(r.itemsStarted) > 0) bits.push(String(r.itemsCompleted || 0) + '/' + String(r.itemsStarted) + ' items' + (Number(r.itemsFailed) > 0 ? ' ✗' + r.itemsFailed : ''));
+      if (Number(r.externalWrites) > 0) bits.push('📤' + r.externalWrites);
+      if (Number(r.durationMs) > 0) bits.push(fmtDurationMs(r.durationMs));
+      return bits.length ? ' <span class="wf-cockpit-metric">' + escMem(bits.join(' · ')) + '</span>' : '';
+    };
+    const chip = (r) => '<span class="wf-cockpit-step status-' + escMem(String(r.status || 'pending')) + '">'
+      + (icon[r.status] || '·') + ' ' + escMem(r.stepId) + metric(r) + '</span>';
+    const head = [
+      String(Number(s.doneSteps) || 0) + '/' + String(Number(s.totalSteps) || rows.length) + ' done',
+      Number(s.runningSteps) > 0 ? String(s.runningSteps) + ' running' : '',
+      Number(s.failedSteps) > 0 ? String(s.failedSteps) + ' failed' : '',
+    ].filter(Boolean).join(' · ');
+    el.innerHTML = [
+      '<section class="wf-exec-plan wf-cockpit' + (Number(s.failedSteps) > 0 ? ' warn' : '') + '">',
+      '  <div class="wf-exec-head"><strong>LIVE RUN</strong><span>' + escMem(head) + '</span></div>',
+      waveKeys.map((w) => '  <div class="wf-cockpit-wave">'
+        + byWave[w].sort((a, b) => Number(a.laneIndex || 0) - Number(b.laneIndex || 0)).map(chip).join('')
+        + '</div>').join(''),
+      '</section>',
+    ].join('');
+  }
+
+  function renderWorkflowProofCard(proof) {
+    if (!proof) return '';
+    const stateClass = workflowLifecycleClass(proof);
+    const effects = proof.sideEffects || {};
+    const effectBits = [
+      effects.send ? effects.send + ' send' : '',
+      effects.write ? effects.write + ' write' : '',
+      effects.read ? effects.read + ' read' : '',
+      effects.unknown ? effects.unknown + ' unspecified' : '',
+    ].filter(Boolean);
+    const triggers = Array.isArray(proof.triggerSummary) && proof.triggerSummary.length
+      ? proof.triggerSummary
+      : ['manual'];
+    const inputKeys = Array.isArray(proof.requiredInputKeys) && proof.requiredInputKeys.length
+      ? proof.requiredInputKeys.map((key) => key + ' required')
+      : (Array.isArray(proof.inputKeys) && proof.inputKeys.length ? proof.inputKeys : ['none']);
+    const toolNames = Array.isArray(proof.toolNames) && proof.toolNames.length ? proof.toolNames.slice(0, 6) : ['model only'];
+    const skillNames = Array.isArray(proof.skillNames) && proof.skillNames.length ? proof.skillNames.slice(0, 4) : [];
+    const gaps = Array.isArray(proof.readinessGaps) ? proof.readinessGaps.slice(0, 3) : [];
+    const evidence = proof.evidence || {};
+    const evidenceBits = [
+      evidence.latestCreationTest ? 'creation test: ' + workflowProofRunLabel(evidence.latestCreationTest) : '',
+      evidence.latestSuccessfulRun ? 'last success: ' + workflowProofRunLabel(evidence.latestSuccessfulRun) : '',
+      !evidence.latestCreationTest && !evidence.latestSuccessfulRun && evidence.latestRun ? 'latest run: ' + workflowProofRunLabel(evidence.latestRun) : '',
+    ].filter(Boolean);
+    return [
+      '<section class="wf-proof ' + stateClass + '">',
+      '  <div class="wf-proof-head">',
+      '    <span class="wf-proof-label ' + stateClass + '">' + escMem(workflowLifecycleLabel(proof)) + '</span>',
+      '    <strong>Workflow proof</strong>',
+      '  </div>',
+      proof.reason ? '  <div class="wf-proof-reason">' + escMem(proof.reason) + '</div>' : '',
+      '  <div class="wf-proof-grid">',
+      '    <div><span>TRIGGERS</span><p>' + escMem(triggers.join(' · ')) + '</p></div>',
+      '    <div><span>INPUTS</span><p>' + escMem(inputKeys.join(' · ')) + '</p></div>',
+      '    <div><span>TOOLS</span><p>' + escMem(toolNames.concat(skillNames.map((name) => 'skill:' + name)).join(' · ')) + '</p></div>',
+      '    <div><span>RISK</span><p>' + escMem((effectBits.length ? effectBits.join(' · ') : 'none') + (proof.approvalStepCount ? ' · ' + proof.approvalStepCount + ' approval' : '')) + '</p></div>',
+      '  </div>',
+      gaps.length ? '  <div class="wf-proof-gaps"><span>NEEDS</span>' + gaps.map((gap) => '<p>' + escMem(gap.question || gap.why || 'Resolve readiness gap') + '</p>').join('') + '</div>' : '',
+      evidenceBits.length ? '  <div class="wf-proof-evidence"><span>EVIDENCE</span>' + evidenceBits.map((item) => '<p>' + escMem(item) + '</p>').join('') + '</div>' : '',
+      '</section>',
+    ].join('');
+  }
+
+  function workflowReadinessItemLine(item) {
+    if (!item) return '';
+    const steps = Array.isArray(item.stepIds) && item.stepIds.length ? ' @ ' + item.stepIds.join(', ') : '';
+    const sources = Array.isArray(item.sources) && item.sources.length
+      ? ' via ' + item.sources.map((source) => String(source || '').replace(/_/g, ' ')).join(', ')
+      : '';
+    const evidence = Array.isArray(item.evidence) && item.evidence.length
+      ? ' | checked ' + item.evidence.slice(0, 3).map((entry) => {
+        const detail = entry && entry.detail ? ' (' + String(entry.detail) + ')' : '';
+        return String(entry.kind || 'check') + ':' + String(entry.name || '?') + '=' + String(entry.status || 'unknown') + detail;
+      }).join('; ')
+      : '';
+    return String(item.status || 'unknown').toUpperCase() + ' ' + String(item.kind || 'tool') + ' ' + String(item.name || '?') + steps + sources + ' - ' + String(item.reason || 'not confirmed') + evidence;
+  }
+
+  const WF_AUTO_CONTRACT_FIX_KINDS = ['make_models_portable', 'add_judge_gate', 'make_fanout_resumable'];
+
+  function wfContractRemediations(plan) {
+    const contract = plan && plan.visualContract ? plan.visualContract : null;
+    return contract && Array.isArray(contract.remediations) ? contract.remediations : [];
+  }
+
+  function wfContractFixIsAutomatic(fix) {
+    return fix && WF_AUTO_CONTRACT_FIX_KINDS.includes(String(fix.kind || ''));
+  }
+
+  function wfContractFixStatusClass(fix) {
+    const status = String((fix && fix.status) || '').toLowerCase();
+    if (status === 'block') return 'danger';
+    if (status === 'warn') return 'warn';
+    return '';
+  }
+
+  function wfContractFixButtonLabel(fix) {
+    const kind = String((fix && fix.kind) || '');
+    if (kind === 'make_models_portable') return 'MAKE PORTABLE';
+    if (kind === 'add_judge_gate') return 'ADD JUDGE';
+    if (kind === 'make_fanout_resumable') return 'MARK RESUMABLE';
+    return 'APPLY FIX';
+  }
+
+  function wfContractActionButtonLabel(action) {
+    const kind = String((action && action.kind) || '');
+    if (kind === 'select_local_project') return 'BIND PROJECT';
+    if (kind === 'add_workflow_script') return 'SET RUNNER';
+    if (kind === 'confirm_tool_connection') return 'CHECK TOOL';
+    return 'OPEN STEP';
+  }
+
+  function wfContractPrimaryManualAction(fix) {
+    const actions = Array.isArray(fix && fix.actions) ? fix.actions : [];
+    return actions.find((action) => {
+      const kind = String((action && action.kind) || '');
+      return kind === 'select_local_project' || kind === 'add_workflow_script' || kind === 'confirm_tool_connection';
+    }) || null;
+  }
+
+  function wfContractFixActionHtml(fix) {
+    if (!fix) return '';
+    const stepIds = Array.isArray(fix.stepIds) ? fix.stepIds.filter(Boolean) : [];
+    if (wfContractFixIsAutomatic(fix) && !wfIsNew && wfSelectedName) {
+      return '<button type="button" class="wf-contract-fix-action ' + escMem(wfContractFixStatusClass(fix)) + '" data-wf-contract-fix-kind="' + escMem(String(fix.kind || '')) + '" data-wf-contract-fix-step-ids="' + escMem(stepIds.join(',')) + '">' + escMem(wfContractFixButtonLabel(fix)) + '</button>';
+    }
+    const manualAction = wfContractPrimaryManualAction(fix);
+    if (manualAction && !wfIsNew && wfSelectedName) {
+      return '<button type="button" class="wf-contract-fix-action ' + escMem(wfContractFixStatusClass(fix)) + '" data-wf-contract-action-kind="' + escMem(String(manualAction.kind || '')) + '" data-wf-contract-action-fix-kind="' + escMem(String(fix.kind || '')) + '" data-wf-contract-fix-step-ids="' + escMem(stepIds.join(',')) + '">' + escMem(wfContractActionButtonLabel(manualAction)) + '</button>';
+    }
+    if (stepIds.length === 1) {
+      return '<button type="button" class="wf-contract-fix-action" data-wf-contract-open-step="' + escMem(stepIds[0]) + '">OPEN STEP</button>';
+    }
+    return '<button type="button" class="wf-contract-fix-action" disabled>MANUAL</button>';
+  }
+
+  function wfContractFixGuidanceHtml(fix) {
+    const actions = Array.isArray(fix && fix.actions) ? fix.actions : [];
+    if (!actions.length) return '';
+    return '<span class="wf-contract-fix-guidance">' + actions.slice(0, 3).map((action) => {
+      const kind = String(action.kind || 'manual');
+      const command = action.command ? ' <code>' + escMem(String(action.command)) + '</code>' : '';
+      const automate = action.safeToAutomate === true ? 'safe auto' : 'manual';
+      return '<em data-wf-contract-guidance-kind="' + escMem(kind) + '">' + escMem(String(action.label || kind) + ' - ' + String(action.detail || automate)) + command + '</em>';
+    }).join('') + '</span>';
+  }
+
+  function wfContractFixRows(fixes) {
+    return (Array.isArray(fixes) ? fixes : []).slice(0, 6).map((fix) => {
+      const stepIds = Array.isArray(fix.stepIds) && fix.stepIds.length ? ' · ' + fix.stepIds.slice(0, 4).join(', ') : '';
+      return '<div class="wf-contract-fix-row"><p><strong>' + escMem(String(fix.title || fix.kind || 'Fix contract')) + '</strong><span>' + escMem(String(fix.detail || '') + stepIds) + '</span>' + wfContractFixGuidanceHtml(fix) + '</p>' + wfContractFixActionHtml(fix) + '</div>';
+    }).join('');
+  }
+
+  function renderWorkflowExecutionPlanCard(plan) {
+    if (!plan) return '';
+    const levels = Array.isArray(plan.levels) ? plan.levels : [];
+    const parallel = levels.filter((level) => level && level.parallel).slice(0, 4);
+    const fanout = Array.isArray(plan.fanout) ? plan.fanout.slice(0, 4) : [];
+    const gates = Array.isArray(plan.gates) ? plan.gates.slice(0, 6) : [];
+    const tools = plan.toolSurface || {};
+    const readiness = plan.toolReadiness || {};
+    const models = plan.modelSurface || {};
+    const contract = plan.visualContract || {};
+    const readinessItems = Array.isArray(readiness.items) ? readiness.items : [];
+    const readinessProblems = readinessItems.filter((item) => item && item.status !== 'ready').slice(0, 6);
+    const modelWarnings = Array.isArray(models.warnings) ? models.warnings.slice(0, 4) : [];
+    const contractChecks = Array.isArray(contract.checks) ? contract.checks : [];
+    const contractWarnings = contractChecks.filter((check) => check && check.status !== 'pass').slice(0, 5);
+    const contractFixes = wfContractRemediations(plan).slice(0, 6);
+    const readinessLabel = typeof readiness.ready === 'boolean'
+      ? (readiness.ready ? 'ready' : String(readiness.missingCount || 0) + ' missing · ' + String(readiness.unknownCount || 0) + ' unknown')
+      : 'not checked';
+    const modelLabel = models.portability
+      ? String(models.portability) + ' · ' + String(models.modelSteps || 0) + ' model / ' + String(models.nonModelSteps || 0) + ' direct'
+      : 'not checked';
+    const contractLabel = contract.status
+      ? String(contract.status).toUpperCase() + ' · ' + String(contract.blockedCount || 0) + ' block · ' + String(contract.warningCount || 0) + ' warn'
+      : 'not checked';
+    const toolBits = [
+      Array.isArray(tools.composioTools) && tools.composioTools.length ? tools.composioTools.length + ' composio' : '',
+      Array.isArray(tools.mcpTools) && tools.mcpTools.length ? tools.mcpTools.length + ' mcp' : '',
+      Array.isArray(tools.cliTools) && tools.cliTools.length ? tools.cliTools.length + ' cli' : '',
+      Array.isArray(tools.localTools) && tools.localTools.length ? tools.localTools.length + ' local' : '',
+      Array.isArray(tools.deterministicRunners) && tools.deterministicRunners.length ? tools.deterministicRunners.length + ' scripts' : '',
+      Array.isArray(tools.skills) && tools.skills.length ? tools.skills.length + ' skills' : '',
+      Array.isArray(tools.projects) && tools.projects.length ? tools.projects.length + ' projects' : '',
+    ].filter(Boolean);
+    const runner = plan.runner || {};
+    const stat = (label, value) => '<div><span>' + escMem(label) + '</span><p>' + escMem(value) + '</p></div>';
+    return [
+      '<section class="wf-exec-plan">',
+      '  <div class="wf-exec-head"><strong>EXECUTION PLAN</strong><span>' + escMem(String(plan.stepCount || 0)) + ' steps</span></div>',
+      '  <div class="wf-exec-grid">',
+      stat('ROUNDS', String(plan.estimatedRounds || 0) + ' / ' + String(plan.sequentialRounds || 0)),
+      stat('PARALLEL', String(plan.maxParallelWidth || 1) + ' wide · cap ' + String(runner.stepConcurrency || 1)),
+      stat('FANOUT', String((plan.fanout || []).length) + ' lanes · batch ' + String(runner.forEachBatchSize || 0)),
+      stat('GATES', String((plan.gates || []).length) + ' checks'),
+      stat('PREFLIGHT', readinessLabel),
+      stat('MODELS', modelLabel),
+      stat('CONTRACT', contractLabel),
+      '  </div>',
+      contract.status
+        ? '  <div class="wf-exec-row wf-visual-contract' + (contract.status === 'trusted' ? '' : ' warn') + '"><span>VISUAL CONTRACT</span><p>' + escMem(contract.summary || contractLabel) + '</p>' + (contractWarnings.length ? contractWarnings.map((check) => '<p>' + escMem(String(check.label || check.kind || 'check') + ': ' + String(check.detail || check.status || 'attention')) + '</p>').join('') : contractChecks.slice(0, 4).map((check) => '<p>' + escMem(String(check.label || check.kind || 'check') + ': ' + String(check.detail || check.status || 'pass')) + '</p>').join('')) + '</div>' : '',
+      contractFixes.length
+        ? '  <div class="wf-exec-row wf-contract-fixes"><span>RECOMMENDED FIXES</span>' + wfContractFixRows(contractFixes) + '</div>' : '',
+      Array.isArray(plan.criticalPath) && plan.criticalPath.length
+        ? '  <div class="wf-exec-row"><span>CRITICAL PATH</span><p>' + escMem(plan.criticalPath.join(' -> ')) + '</p></div>' : '',
+      parallel.length
+        ? '  <div class="wf-exec-row"><span>PARALLEL BATCHES</span>' + parallel.map((level) => '<p>L' + escMem(level.index + 1) + ': ' + escMem((level.stepIds || []).join(' · ')) + '</p>').join('') + '</div>' : '',
+      fanout.length
+        ? '  <div class="wf-exec-row"><span>FANOUT / SUB-AGENTS</span>' + fanout.map((row) => '<p>' + escMem(row.stepId) + ': ' + escMem(row.source) + ' · x' + escMem(row.concurrency) + (row.workerModel ? ' · ' + escMem(row.workerModel) : row.workerIntent ? ' · intent ' + escMem(row.workerIntent) : '') + '</p>').join('') + '</div>' : '',
+      gates.length
+        ? '  <div class="wf-exec-row"><span>JUDGES / GATES</span>' + gates.map((gate) => '<p>' + escMem(gate.stepId) + ': ' + escMem(gate.label) + '</p>').join('') + '</div>' : '',
+      toolBits.length
+        ? '  <div class="wf-exec-row"><span>TOOL SURFACE</span><p>' + escMem(toolBits.join(' · ')) + '</p></div>' : '',
+      models.portability
+        ? '  <div class="wf-exec-row' + (modelWarnings.length ? ' warn' : '') + '"><span>MODEL PORTABILITY</span><p>' + escMem([
+          String(models.portability).toUpperCase(),
+          Number(models.defaultModelSteps || 0) ? String(models.defaultModelSteps || 0) + ' default' : '',
+          Number(models.intentRoutedSteps || 0) ? String(models.intentRoutedSteps || 0) + ' intent' : '',
+          Number(models.explicitModelSteps || 0) ? String(models.explicitModelSteps || 0) + ' pinned' : '',
+          Array.isArray(models.explicitModels) && models.explicitModels.length ? models.explicitModels.slice(0, 3).join(', ') : '',
+        ].filter(Boolean).join(' · ')) + '</p>' + modelWarnings.map((warning) => '<p>' + escMem(warning) + '</p>').join('') + '</div>' : '',
+      readinessProblems.length
+        ? '  <div class="wf-exec-row warn"><span>PREFLIGHT READINESS</span>' + readinessProblems.map((item) => {
+          return '<p>' + escMem(workflowReadinessItemLine(item)) + '</p>';
+        }).join('') + '</div>' : '',
+      Array.isArray(plan.issues) && plan.issues.length
+        ? '  <div class="wf-exec-row warn"><span>ISSUES</span>' + plan.issues.slice(0, 4).map((issue) => '<p>' + escMem(issue) + '</p>').join('') + '</div>' : '',
+      '</section>',
+    ].join('');
+  }
+
+  // Provable dry-run preview — leads with the effects rollup ("what will it
+  // touch and send") so an operator sees every external write/send before a run.
+  function renderWorkflowDryRunCard(sim) {
+    if (!sim) return '';
+    const verdict = String(sim.verdict || 'ready');
+    const verdictLabel = verdict === 'ready' ? 'READY' : verdict === 'needs_inputs' ? 'NEEDS INPUTS' : 'BLOCKED';
+    const effects = sim.effects || {};
+    const sends = Array.isArray(effects.sends) ? effects.sends : [];
+    const writes = Array.isArray(effects.writes) ? effects.writes : [];
+    const approvals = Array.isArray(effects.approvals) ? effects.approvals : [];
+    const waves = Array.isArray(sim.waves) ? sim.waves : [];
+    const steps = Array.isArray(sim.steps) ? sim.steps : [];
+    const icon = { external_send: '📤', external_write: '✏️', read_only: '👁️', internal: '•' };
+    const stepById = {};
+    steps.forEach((s) => { stepById[s.stepId] = s; });
+    const chip = (id) => (stepById[id] ? (icon[stepById[id].effect] || '•') : '•') + ' ' + escMem(id);
+    const blockers = Array.isArray(sim.blockingReasons) ? sim.blockingReasons : [];
+    const advisories = Array.isArray(sim.contractAdvisories) ? sim.contractAdvisories : [];
+    const quality = Array.isArray(sim.qualityCriteria) ? sim.qualityCriteria : [];
+    const warnings = (sim.readiness && Array.isArray(sim.readiness.warnings)) ? sim.readiness.warnings : [];
+    return [
+      '<section class="wf-exec-plan wf-dryrun' + (verdict === 'blocked' ? ' warn' : '') + '">',
+      '  <div class="wf-exec-head"><strong>PROVABLE DRY-RUN</strong><span>' + escMem(verdictLabel) + '</span></div>',
+      '  <div class="wf-exec-row"><span>WHAT IT DOES</span><p>' + escMem(sim.summary || '') + '</p></div>',
+      sends.length
+        ? '  <div class="wf-exec-row warn"><span>WILL SEND</span>' + sends.map((e) => '<p>📤 ' + escMem(e.stepId) + ' — ' + escMem(e.detail) + '</p>').join('') + '</div>' : '',
+      writes.length
+        ? '  <div class="wf-exec-row warn"><span>WILL WRITE</span>' + writes.map((e) => '<p>✏️ ' + escMem(e.stepId) + ' — ' + escMem(e.detail) + '</p>').join('') + '</div>' : '',
+      (!sends.length && !writes.length)
+        ? '  <div class="wf-exec-row"><span>SIDE EFFECTS</span><p>👁️ Reads only — no external writes or sends.</p></div>' : '',
+      approvals.length
+        ? '  <div class="wf-exec-row"><span>APPROVAL GATES</span><p>' + escMem(approvals.join(' · ')) + '</p></div>' : '',
+      quality.length
+        ? '  <div class="wf-exec-row"><span>QUALITY BAR</span>' + quality.slice(0, 8).map((c) => '<p>✓ ' + escMem(c) + '</p>').join('') + '</div>' : '',
+      waves.length
+        ? '  <div class="wf-exec-row"><span>EXECUTION WAVES</span>' + waves.map((w) => '<p>' + escMem(String((Number(w.index) || 0) + 1)) + (w.parallel ? ' ∥ ' : '. ') + (Array.isArray(w.stepIds) ? w.stepIds.map(chip).join('   ') : '') + '</p>').join('') + '</div>' : '',
+      blockers.length
+        ? '  <div class="wf-exec-row warn"><span>BLOCKING</span>' + blockers.slice(0, 6).map((r) => '<p>' + escMem(r) + '</p>').join('') + '</div>' : '',
+      advisories.length
+        ? '  <div class="wf-exec-row"><span>ADVISORIES</span>' + advisories.slice(0, 5).map((a) => '<p>' + escMem(a) + '</p>').join('') + '</div>' : '',
+      warnings.length
+        ? '  <div class="wf-exec-row"><span>UNCONFIRMED</span><p>' + escMem(warnings.slice(0, 5).map((w) => String(w.kind) + ':' + String(w.name)).join(' · ')) + '</p></div>' : '',
+      '</section>',
+    ].join('');
+  }
+
   function workflowHomeDayLabel(day) {
     if (!day) return 'unscheduled';
     const today = new Date().toISOString().slice(0, 10);
@@ -16446,7 +17253,9 @@ const CONSOLE_JS = `
       ? workflows.map((item) => {
         const schedule = item.triggerSchedule ? (humanizeCronExpression(item.triggerSchedule) || item.triggerSchedule) : 'manual only';
         const last = item.lastRun ? workflowRunLabel(item.lastRun) : 'no runs yet';
-        const status = item.activeRun ? 'ACTIVE' : (item.enabled ? 'ENABLED' : 'DISABLED');
+        const proof = item.proof || {};
+        const status = item.activeRun ? 'ACTIVE' : workflowLifecycleLabel(proof, item.enabled ? 'LIVE' : 'DRAFT');
+        const proofReason = proof.reason ? '<div class="wf-home-card-proof">' + escMem(proof.reason) + '</div>' : '';
         return [
           '<article class="wf-home-card">',
           '  <div class="wf-home-card-head">',
@@ -16454,8 +17263,9 @@ const CONSOLE_JS = `
           '      <h3>' + escMem(item.name) + '</h3>',
           '      <p>' + escMem(item.description || 'No description yet.') + '</p>',
           '    </div>',
-          '    <span class="wf-home-pill ' + (item.activeRun ? 'run' : item.enabled ? 'on' : 'off') + '">' + status + '</span>',
+          '    <span class="wf-home-pill ' + (item.activeRun ? 'run' : workflowLifecycleClass(proof)) + '">' + escMem(status) + '</span>',
           '  </div>',
+          proofReason,
           '  <div class="wf-home-card-meta">',
           '    <span>' + escMem(item.stepCount || 0) + ' steps</span>',
           '    <span>' + escMem(schedule) + '</span>',
@@ -16851,7 +17661,8 @@ const CONSOLE_JS = `
       }
       wf.list.innerHTML = items.map((w) => {
         const cls = (wfSelectedName === w.name) ? 'wf selected' : 'wf';
-        const enabledPill = w.enabled ? '<span class="pill on">● ENABLED</span>' : '<span class="pill off">○ DISABLED</span>';
+        const proof = w.proof || {};
+        const enabledPill = '<span class="pill lifecycle ' + workflowLifecycleClass(proof) + '">' + escMem(workflowLifecycleLabel(proof, w.enabled ? 'LIVE' : 'DRAFT')) + '</span>';
         // v0.5.11 UX: humanize cron expressions for the workflow list.
         // The raw cron (e.g. 0 8,13 * * 1-5) stays in the title tooltip
         // so power-users can read it without clicking. Non-power users
@@ -16919,6 +17730,7 @@ const CONSOLE_JS = `
     wfDraft = {
       name: data.name,
       description: data.description || '',
+      project: data.project || '',
       enabled: data.enabled !== false,
       triggerSchedule: data.trigger && data.trigger.schedule ? data.trigger.schedule : '',
       steps: Array.isArray(data.steps) ? data.steps.map((s) => {
@@ -16933,16 +17745,22 @@ const CONSOLE_JS = `
         return step;
       }) : [],
       inputs: data.inputs || {},
+      resources: data.resources || {},
       synthesisPrompt: data.synthesis && data.synthesis.prompt ? data.synthesis.prompt : '',
+      goal: data.goal || null,
       allowedTools: data.allowedTools || null,
       whenToUse: data.whenToUse || null,
       summary: data.summary || '',
+      proof: data.proof || null,
+      executionPlan: data.executionPlan || null,
+      graph: data.graph || null,
     };
     wfChatHistory = [];
     // Reset per-step edit state when loading a different workflow —
     // never carry over edit toggles across switches.
     wfEditingStepIndices.clear();
     stopActiveRunPolling();
+    clearWorkflowGraphOverlay();
     renderEditor();
     if (opts && opts.primeArchitect) {
       primeArchitectForWorkflow(data.name || wfDraft.name);
@@ -16964,6 +17782,7 @@ const CONSOLE_JS = `
     wfDraft = {
       name: 'new-workflow',
       description: 'Briefly describe what this workflow does.',
+      project: '',
       enabled: false,
       triggerSchedule: '',
       steps: [
@@ -16979,9 +17798,13 @@ const CONSOLE_JS = `
         },
       ],
       inputs: { topic: '' },
+      resources: {},
       synthesisPrompt: 'Return the draft from the previous step, formatted clearly. No preamble.',
+      goal: null,
+      graph: null,
     };
     wfChatHistory = [];
+    clearWorkflowGraphOverlay();
     Array.from(wf.list.querySelectorAll('li.wf')).forEach((el) => el.classList.remove('selected'));
     renderEditor();
   }
@@ -16992,6 +17815,19 @@ const CONSOLE_JS = `
   // Client-side mirror of the pure backend buildWorkflowGraph (kept tiny
   // + tested server-side via workflow-graph.test.ts). Building it from the
   // live wfDraft.steps means the diagram reflects edits immediately.
+  function wfEmptyNodePlan() {
+    return {
+      levelIndex: null,
+      laneIndex: null,
+      parallelWidth: 0,
+      cappedByConcurrency: false,
+      critical: false,
+      fanout: null,
+      gates: [],
+      modelRoute: null,
+    };
+  }
+
   function wfBuildGraph(steps) {
     const list = Array.isArray(steps) ? steps : [];
     const ids = new Set(list.map((s) => s.id));
@@ -17004,6 +17840,11 @@ const CONSOLE_JS = `
         skill: s.usesSkill || null,
         deterministic: !!s.deterministic,
       },
+      meta: wfStepGraphMeta(s),
+      readiness: { status: 'ready', readyCount: 0, missingCount: 0, unknownCount: 0, items: [] },
+      plan: wfEmptyNodePlan(),
+      contract: { status: 'pass', fixCount: 0, blockCount: 0, warningCount: 0, fixes: [] },
+      verdict: { status: 'trusted', label: 'Trusted', reasons: [], primaryAction: null },
     }));
     const edges = [];
     const seen = {};
@@ -17028,9 +17869,1428 @@ const CONSOLE_JS = `
     return b.length ? b.join(' ') + '  ' : '';
   }
 
-  async function renderWorkflowGraph(container, steps) {
-    if (!container) return;
+  function wfStepTools(step) {
+    const out = [];
+    if (Array.isArray(step.allowedTools)) out.push(...step.allowedTools);
+    if (step.call && step.call.tool) out.push(step.call.tool);
+    return Array.from(new Set(out.map((tool) => String(tool || '').trim()).filter(Boolean)));
+  }
+
+  function wfStepExecutor(step) {
+    if (step.call && step.call.tool) return 'call';
+    if (step.deterministic && step.deterministic.runner) return 'deterministic';
+    if (step.usesSkill) return 'skill';
+    return 'model';
+  }
+
+  function wfStepSideEffect(step) {
+    if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
+    const tools = wfStepTools(step).join(' ').toLowerCase();
+    const text = String((step.prompt || '') + ' ' + tools).toLowerCase();
+    const hasAny = (words) => words.some((word) => text.includes(word));
+    if (hasAny(['send', 'email', 'publish', 'post ', 'dm ', 'message ', 'notify'])) return 'send';
+    if (hasAny(['create', 'update', 'delete', 'write', 'insert', 'save', 'upload', 'sync'])) return 'write';
+    if (tools || step.call || step.usesSkill || step.forEach) return 'read';
+    return 'unknown';
+  }
+
+  function wfStepGraphMeta(step) {
+    const tools = wfStepTools(step);
+    return {
+      sideEffect: wfStepSideEffect(step),
+      executor: wfStepExecutor(step),
+      tools: tools,
+      toolCount: tools.length,
+      inputKeys: Object.keys(step.inputs || {}),
+      outputType: step.output && step.output.type ? String(step.output.type) : '',
+      approvalPreview: step.approvalPreview || '',
+      forEach: step.forEach || '',
+      forEachNewOnly: step.forEachNewOnly === true,
+      runner: step.deterministic && step.deterministic.runner ? String(step.deterministic.runner) : '',
+      callTool: step.call && step.call.tool ? String(step.call.tool) : '',
+      project: step.project || '',
+      model: step.model || '',
+      intent: step.intent || '',
+    };
+  }
+
+  function wfNodeMetaLine(meta) {
+    const bits = [];
+    if (meta.sideEffect && meta.sideEffect !== 'unknown') bits.push(meta.sideEffect.toUpperCase());
+    bits.push(String(meta.executor || 'model').toUpperCase());
+    if (meta.callTool) bits.push(meta.callTool);
+    else if (meta.runner) bits.push(meta.runner);
+    else if (meta.tools && meta.tools[0]) bits.push(meta.tools[0]);
+    if (meta.project) bits.push('PROJECT:' + meta.project);
+    if (meta.outputType) bits.push('OUT:' + meta.outputType);
+    return bits.slice(0, 4).join(' · ');
+  }
+
+  function wfNodePlanLine(plan) {
+    if (!plan) return '';
+    const bits = [];
+    if (Number.isFinite(Number(plan.levelIndex))) {
+      const level = Number(plan.levelIndex) + 1;
+      const lane = Number.isFinite(Number(plan.laneIndex)) ? '.' + String(Number(plan.laneIndex) + 1) : '';
+      bits.push('L' + level + lane);
+    }
+    if (Number(plan.parallelWidth) > 1) bits.push('parallel ' + String(plan.parallelWidth));
+    if (plan.critical) bits.push('critical path');
+    if (plan.fanout) {
+      bits.push('fanout x' + String(plan.fanout.concurrency || 0)
+        + (plan.fanout.workerModel ? ' ' + String(plan.fanout.workerModel) : plan.fanout.workerIntent ? ' intent ' + String(plan.fanout.workerIntent) : ''));
+    }
+    const gates = Array.isArray(plan.gates) ? plan.gates : [];
+    if (gates.length) bits.push(String(gates.length) + ' judge/gate' + (gates.length === 1 ? '' : 's'));
+    const route = plan.modelRoute || null;
+    if (route && route.binding === 'explicit_model') bits.push('pinned ' + String(route.model || 'model'));
+    else if (route && route.binding === 'intent') bits.push('intent ' + String(route.intent || 'model'));
+    else if (route && route.binding === 'default') bits.push('default model');
+    else if (route && route.binding === 'non_model') bits.push('direct execution');
+    return bits.slice(0, 6).join(' · ');
+  }
+
+  function wfNodePlanClass(plan) {
+    const classes = [];
+    if (!plan) return '';
+    if (plan.critical) classes.push('plan-critical');
+    if (Number(plan.parallelWidth) > 1) classes.push('plan-parallel');
+    if (plan.cappedByConcurrency) classes.push('plan-capped');
+    if (plan.fanout) classes.push('has-plan-fanout');
+    if (Array.isArray(plan.gates) && plan.gates.length) classes.push('has-plan-gates');
+    const route = plan.modelRoute || null;
+    if (route && route.binding === 'explicit_model') classes.push('model-pinned');
+    else if (route && route.binding === 'intent') classes.push('model-intent');
+    else if (route && route.portable === true) classes.push('model-portable');
+    return classes.join(' ');
+  }
+
+  function wfGraphForRender(steps, serverGraph) {
     const graph = wfBuildGraph(steps);
+    const serverNodes = serverGraph && Array.isArray(serverGraph.nodes) ? serverGraph.nodes : [];
+    if (!serverNodes.length) return graph;
+    const readinessById = {};
+    const metaById = {};
+    const planById = {};
+    const contractById = {};
+    const verdictById = {};
+    serverNodes.forEach((node) => {
+      if (node && node.id && node.readiness) readinessById[node.id] = node.readiness;
+      if (node && node.id && node.meta) metaById[node.id] = node.meta;
+      if (node && node.id && node.plan) planById[node.id] = node.plan;
+      if (node && node.id && node.contract) contractById[node.id] = node.contract;
+      if (node && node.id && node.verdict) verdictById[node.id] = node.verdict;
+    });
+    graph.nodes.forEach((node) => {
+      if (readinessById[node.id]) node.readiness = readinessById[node.id];
+      if (metaById[node.id] && metaById[node.id].project && node.meta) node.meta.project = metaById[node.id].project;
+      if (planById[node.id]) node.plan = planById[node.id];
+      if (contractById[node.id]) node.contract = contractById[node.id];
+      if (verdictById[node.id]) node.verdict = verdictById[node.id];
+    });
+    return graph;
+  }
+
+  function wfIndexGraph(graph) {
+    wfGraphByStep = {};
+    if (!graph || !Array.isArray(graph.nodes)) return;
+    graph.nodes.forEach((node) => {
+      if (node && node.id) wfGraphByStep[node.id] = node;
+    });
+  }
+
+  function wfGraphNodeForStep(stepId) {
+    if (!stepId) return null;
+    if (wfGraphByStep[stepId]) return wfGraphByStep[stepId];
+    const nodes = wfDraft && wfDraft.graph && Array.isArray(wfDraft.graph.nodes) ? wfDraft.graph.nodes : [];
+    return nodes.find((node) => node && node.id === stepId) || null;
+  }
+
+  function wfNodeReadinessClass(readiness) {
+    const status = readiness && readiness.status ? String(readiness.status) : 'ready';
+    return status === 'missing' || status === 'unknown' ? 'readiness-' + status : 'readiness-ready';
+  }
+
+  function wfNodeReadinessLine(readiness) {
+    if (!readiness || readiness.status === 'ready') return '';
+    const bits = [];
+    if (Number(readiness.missingCount) > 0) bits.push('MISSING: ' + String(readiness.missingCount));
+    if (Number(readiness.unknownCount) > 0) bits.push('UNKNOWN: ' + String(readiness.unknownCount));
+    return bits.join(' · ');
+  }
+
+  function wfNodeContractClass(contract) {
+    const status = contract && contract.status ? String(contract.status) : 'pass';
+    return status === 'block' ? 'contract-block' : status === 'warn' ? 'contract-warn' : 'contract-pass';
+  }
+
+  function wfNodeContractLine(contract) {
+    if (!contract || contract.status === 'pass' || Number(contract.fixCount || 0) <= 0) return '';
+    const bits = [];
+    if (Number(contract.blockCount) > 0) bits.push('CONTRACT BLOCK: ' + String(contract.blockCount));
+    if (Number(contract.warningCount) > 0) bits.push('CONTRACT WARN: ' + String(contract.warningCount));
+    return bits.join(' · ');
+  }
+
+  function wfNodeVerdictClass(verdict) {
+    const status = verdict && verdict.status ? String(verdict.status) : 'trusted';
+    return status === 'blocked' ? 'verdict-blocked' : status === 'attention' ? 'verdict-attention' : 'verdict-trusted';
+  }
+
+  function wfNodeVerdictLine(verdict) {
+    if (!verdict || verdict.status === 'trusted') return '';
+    const label = verdict.label ? String(verdict.label).toUpperCase() : String(verdict.status || 'attention').toUpperCase();
+    const reasons = Array.isArray(verdict.reasons) ? verdict.reasons.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 2) : [];
+    return 'VERDICT: ' + label + (reasons.length ? ' · ' + reasons.join(' · ') : '');
+  }
+
+  function wfNodeVerdictDrawer(verdict) {
+    if (!verdict) return '';
+    const details = [];
+    details.push('status: ' + escMem(verdict.label || verdict.status || 'Trusted'));
+    if (Array.isArray(verdict.reasons) && verdict.reasons.length) {
+      details.push('reason: ' + escMem(verdict.reasons.slice(0, 6).join(' · ')));
+    }
+    if (verdict.primaryAction) details.push('next: ' + escMem(verdict.primaryAction));
+    return [
+      '<div class="wf-drawer-sub">GRAPH VERDICT</div>',
+      '<div class="wf-drawer-run ' + escMem(wfNodeVerdictClass(verdict)) + '">',
+      details.map((item) => '<span>' + item + '</span>').join(''),
+      '</div>',
+    ].join('');
+  }
+
+  function wfReadinessDrawer(readiness) {
+    const line = wfNodeReadinessLine(readiness);
+    if (!line) return '';
+    const items = Array.isArray(readiness.items)
+      ? readiness.items.filter((item) => item && item.status !== 'ready').slice(0, 8)
+      : [];
+    const details = items.length
+      ? items.map((item) => {
+        return '<span>' + escMem(workflowReadinessItemLine(item)) + '</span>';
+      }).join('')
+      : '<span>' + escMem(line) + '</span>';
+    return [
+      '<div class="wf-drawer-sub">READINESS</div>',
+      '<div class="wf-drawer-run ' + escMem(wfNodeReadinessClass(readiness)) + '">',
+      details,
+      '</div>',
+    ].join('');
+  }
+
+  function wfExecutionPlanDrawer(plan) {
+    const line = wfNodePlanLine(plan);
+    if (!line) return '';
+    const details = [];
+    details.push(escMem(line));
+    if (plan && plan.fanout) {
+      details.push('fanout source: ' + escMem(String(plan.fanout.source || '?'))
+        + ' · batch ' + escMem(String(plan.fanout.batchSize || 0))
+        + ' · safe resume: ' + escMem(plan.fanout.safeToResume ? 'yes' : 'no'));
+    }
+    const route = plan && plan.modelRoute ? plan.modelRoute : null;
+    if (route) {
+      details.push('model route: ' + escMem(String(route.binding || 'default'))
+        + (route.intent ? ' · intent ' + escMem(String(route.intent)) : '')
+        + (route.model ? ' · ' + escMem(String(route.model)) : '')
+        + (route.provider ? ' · ' + escMem(String(route.provider)) : '')
+        + ' · portable: ' + escMem(route.portable ? 'yes' : 'no'));
+    }
+    const gates = plan && Array.isArray(plan.gates) ? plan.gates : [];
+    gates.slice(0, 6).forEach((gate) => {
+      details.push('gate: ' + escMem(String(gate.kind || 'gate')) + ' · ' + escMem(String(gate.severity || 'info')) + ' · ' + escMem(String(gate.label || '')));
+    });
+    return [
+      '<div class="wf-drawer-sub">EXECUTION PLAN</div>',
+      '<div class="wf-drawer-run ' + escMem(wfNodePlanClass(plan)) + '">',
+      details.map((item) => '<span>' + item + '</span>').join(''),
+      '</div>',
+    ].join('');
+  }
+
+  function wfNodeClasses(node) {
+    const meta = node.meta || {};
+    return [
+      'side-' + (meta.sideEffect || 'unknown'),
+      'exec-' + (meta.executor || 'model'),
+      node.flags && node.flags.approval ? 'has-approval' : '',
+      wfNodeReadinessClass(node.readiness),
+      wfNodePlanClass(node.plan),
+      wfNodeContractClass(node.contract),
+      wfNodeVerdictClass(node.verdict),
+    ].filter(Boolean).join(' ');
+  }
+
+  function wfLaunchComparisonLine(comparison) {
+    if (!comparison) return '';
+    const bits = [];
+    const riskHits = Array.isArray(comparison.preflightRiskHits) ? comparison.preflightRiskHits : [];
+    const failedTools = Array.isArray(comparison.failedTools) ? comparison.failedTools : [];
+    const runtimeOnly = Array.isArray(comparison.runtimeOnlyTools) ? comparison.runtimeOnlyTools : [];
+    const unconfirmed = Array.isArray(comparison.unconfirmedLaunchTools) ? comparison.unconfirmedLaunchTools : [];
+    const confirmed = Array.isArray(comparison.confirmedLaunchTools) ? comparison.confirmedLaunchTools : [];
+    if (riskHits.length) bits.push('PREFLIGHT HIT ' + riskHits.slice(0, 2).join(', '));
+    else if (failedTools.length) bits.push('FAILED TOOL ' + failedTools.slice(0, 2).join(', '));
+    if (runtimeOnly.length) bits.push('RUNTIME-ONLY ' + runtimeOnly.slice(0, 2).join(', '));
+    if (unconfirmed.length) bits.push('UNOBSERVED ' + unconfirmed.slice(0, 2).join(', '));
+    if (!bits.length && confirmed.length) bits.push('CONFIRMED ' + confirmed.length);
+    return bits.slice(0, 3).join(' · ');
+  }
+
+  function wfExecutionEfficiencyLine(efficiency) {
+    if (!efficiency) return '';
+    const issues = Array.isArray(efficiency.issueKinds) ? efficiency.issueKinds : [];
+    const notes = Array.isArray(efficiency.notes) ? efficiency.notes : [];
+    const bits = [];
+    if (issues.length) bits.push('EXEC ' + issues.slice(0, 2).map((kind) => String(kind).replace(new RegExp('_', 'g'), ' ').toUpperCase()).join(', '));
+    else if (Number(efficiency.plannedParallelWidth) > 1 || Number(efficiency.plannedFanoutConcurrency) > 0) bits.push('EXEC OK');
+    if (Number(efficiency.plannedParallelWidth) > 1) bits.push('plan width ' + String(efficiency.plannedParallelWidth));
+    if (Number(efficiency.plannedFanoutConcurrency) > 0) bits.push('fanout x' + String(efficiency.plannedFanoutConcurrency));
+    if (efficiency.plannedCritical) bits.push('critical');
+    if (!bits.length && notes.length) bits.push(notes[0]);
+    return bits.slice(0, 4).join(' · ');
+  }
+
+  function wfRunVerdictClass(verdict) {
+    const status = verdict && verdict.status ? String(verdict.status) : '';
+    return status ? 'run-verdict-' + status.replace(new RegExp('[^a-z0-9_-]', 'gi'), '-').toLowerCase() : '';
+  }
+
+  function wfRunVerdictLine(verdict) {
+    if (!verdict || !verdict.status) return '';
+    const status = String(verdict.status);
+    if (status === 'pending' || status === 'running' || status === 'completed') return '';
+    const label = verdict.label ? String(verdict.label).toUpperCase() : status.toUpperCase();
+    const reasons = Array.isArray(verdict.reasons) ? verdict.reasons.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 2) : [];
+    return 'RUN ' + label + (reasons.length ? ' · ' + reasons.join(' · ') : '');
+  }
+
+  function wfRunOverlayLine(row) {
+    if (!row) return '';
+    const bits = [];
+    if (row.status) bits.push(String(row.status).toUpperCase());
+    const verdictLine = wfRunVerdictLine(row.runVerdict);
+    if (verdictLine) bits.push(verdictLine);
+    const comparisonLine = wfLaunchComparisonLine(row.launchComparison);
+    if (comparisonLine) bits.push(comparisonLine);
+    const efficiencyLine = wfExecutionEfficiencyLine(row.executionEfficiency);
+    if (efficiencyLine) bits.push(efficiencyLine);
+    if (Number.isFinite(Number(row.durationMs))) bits.push(fmtDurationMs(row.durationMs));
+    if (Number.isFinite(Number(row.queueWaitMs)) && Number(row.queueWaitMs) > 0) bits.push('wait ' + fmtDurationMs(row.queueWaitMs));
+    if (Number(row.retries) > 0) bits.push(row.retries + ' retry' + (Number(row.retries) === 1 ? '' : 's'));
+    if (Number(row.attempts) > 0) bits.push(row.attempts + ' attempt' + (Number(row.attempts) === 1 ? '' : 's'));
+    if (Number(row.toolCalls) > 0) bits.push(row.toolCalls + ' tool' + (Number(row.toolCalls) === 1 ? '' : 's'));
+    if (Number(row.workerBranches) > 0) bits.push(row.workerBranches + ' worker' + (Number(row.workerBranches) === 1 ? '' : 's'));
+    if (Number(row.itemsStarted) > 0 || Number(row.itemsFailed) > 0) {
+      bits.push(String(row.itemsCompleted || 0) + '/' + String(row.itemsStarted || 0) + ' items'
+        + (Number(row.itemsFailed) > 0 ? ' · ' + row.itemsFailed + ' failed' : ''));
+    }
+    if (Number(row.externalWrites) > 0 || Number(row.externalWriteFailures) > 0) {
+      bits.push(String(row.externalWrites || 0) + ' writes'
+        + (Number(row.externalWriteFailures) > 0 ? ' · ' + row.externalWriteFailures + ' failed' : ''));
+    }
+    if (Number(row.approvalsRequested) > 0) bits.push('approval');
+    if (row.bottleneck && row.attentionLevel && row.attentionLevel !== 'none') bits.push(String(row.bottleneck).toUpperCase());
+    if (Number(row.judgeVerdicts) > 0) bits.push(row.judgeVerdicts + ' judge');
+    else if (Number(row.advisories) > 0) bits.push(row.advisories + ' advisory');
+    return bits.filter(Boolean).slice(0, 8).join(' · ');
+  }
+
+  function wfRunOverlayDrawer(row) {
+    if (!row) return '';
+    const details = [];
+    details.push('status: ' + escMem(String(row.status || 'pending')));
+    if (row.runVerdict) {
+      details.push('runtime verdict: ' + escMem(String(row.runVerdict.label || row.runVerdict.status || 'unknown')));
+      if (Array.isArray(row.runVerdict.reasons) && row.runVerdict.reasons.length) {
+        details.push('verdict reason: ' + escMem(row.runVerdict.reasons.slice(0, 5).join(' · ')));
+      }
+      if (row.runVerdict.primaryAction) details.push('verdict action: ' + escMem(row.runVerdict.primaryAction));
+    }
+    if (row.attentionLevel && row.attentionLevel !== 'none') {
+      details.push('attention: ' + escMem(String(row.attentionLevel))
+        + (Array.isArray(row.attentionReasons) && row.attentionReasons.length ? ' · ' + escMem(row.attentionReasons.slice(0, 4).join(' · ')) : ''));
+    }
+    if (row.bottleneck) details.push('bottleneck: ' + escMem(row.bottleneck));
+    if (Array.isArray(row.riskSignals) && row.riskSignals.length) details.push('risk: ' + escMem(row.riskSignals.slice(0, 5).join(' · ')));
+    if (Number.isFinite(Number(row.queueWaitMs)) && Number(row.queueWaitMs) > 0) details.push('ready wait: ' + escMem(fmtDurationMs(row.queueWaitMs)));
+    if (Number(row.readyWidth) > 0 || Number(row.concurrencyCap) > 0) {
+      details.push('batch: width ' + escMem(row.readyWidth || 0)
+        + ' · cap ' + escMem(row.concurrencyCap || 0)
+        + (Number.isFinite(Number(row.laneIndex)) ? ' · lane ' + escMem(Number(row.laneIndex) + 1) : '')
+        + (row.deferredByConcurrency ? ' · deferred' : ''));
+    }
+    if (Number.isFinite(Number(row.durationMs))) details.push('duration: ' + escMem(fmtDurationMs(row.durationMs)));
+    if (Number(row.retries) > 0) details.push('retries: ' + escMem(row.retries));
+    if (Number(row.attempts) > 0) details.push('attempts: ' + escMem(row.attempts));
+    if (Number(row.toolCalls) > 0) details.push('tool calls: ' + escMem(row.toolCalls));
+    if (Array.isArray(row.tools) && row.tools.length) details.push('tools: ' + escMem(row.tools.slice(0, 5).join(', ')));
+    const comparisonLine = wfLaunchComparisonLine(row.launchComparison);
+    if (comparisonLine) details.push('preflight/runtime: ' + escMem(comparisonLine));
+    if (row.launchComparison && Array.isArray(row.launchComparison.confirmedLaunchTools) && row.launchComparison.confirmedLaunchTools.length) {
+      details.push('confirmed preflight: ' + escMem(row.launchComparison.confirmedLaunchTools.slice(0, 5).join(', ')));
+    }
+    if (row.launchComparison && Array.isArray(row.launchComparison.runtimeOnlyTools) && row.launchComparison.runtimeOnlyTools.length) {
+      details.push('runtime-only tools: ' + escMem(row.launchComparison.runtimeOnlyTools.slice(0, 5).join(', ')));
+    }
+    if (row.executionEfficiency) {
+      const issues = Array.isArray(row.executionEfficiency.issueKinds) ? row.executionEfficiency.issueKinds : [];
+      details.push('execution plan: ' + escMem(wfExecutionEfficiencyLine(row.executionEfficiency) || 'matched'));
+      if (issues.length) details.push('execution drift: ' + escMem(issues.map((kind) => String(kind).replace(new RegExp('_', 'g'), ' ')).join(', ')));
+      if (Array.isArray(row.executionEfficiency.notes) && row.executionEfficiency.notes.length) {
+        details.push('execution notes: ' + escMem(row.executionEfficiency.notes.slice(0, 4).join(' · ')));
+      }
+    }
+    if (Array.isArray(row.models) && row.models.length) details.push('models: ' + escMem(row.models.slice(0, 4).join(', ')));
+    if (Array.isArray(row.routes) && row.routes.length) details.push('routes: ' + escMem(row.routes.slice(0, 3).join(', ')));
+    if (Array.isArray(row.sessionIds) && row.sessionIds.length) details.push('sessions: ' + escMem(row.sessionIds.slice(0, 3).join(', ')));
+    if (Number(row.itemsStarted) > 0 || Number(row.itemsFailed) > 0) {
+      details.push('items: ' + escMem(String(row.itemsCompleted || 0) + '/' + String(row.itemsStarted || 0))
+        + (Number(row.itemsFailed) > 0 ? ' · failed: ' + escMem(row.itemsFailed) : ''));
+    }
+    if (Number(row.workerBranches) > 0 || Number(row.workerCapped) > 0) {
+      details.push('workers: ' + escMem(row.workerBranches || 0)
+        + (Number(row.workerFailures) > 0 ? ' · failed: ' + escMem(row.workerFailures) : '')
+        + (Number(row.workerCapped) > 0 ? ' · capped: ' + escMem(row.workerCapped) : ''));
+    }
+    if (Number(row.externalWrites) > 0 || Number(row.externalWriteFailures) > 0) {
+      details.push('writes: ' + escMem(row.externalWrites || 0)
+        + (Number(row.externalWriteFailures) > 0 ? ' · failed/orphaned: ' + escMem(row.externalWriteFailures) : ''));
+    }
+    if (Number(row.approvalsRequested) > 0) {
+      details.push('approvals: ' + escMem(row.approvalsResolved || 0) + '/' + escMem(row.approvalsRequested) + ' resolved');
+    }
+    if (Number(row.judgeVerdicts) > 0 || Number(row.advisories) > 0) {
+      details.push('judge/advisory: ' + escMem(row.judgeVerdicts || 0) + '/' + escMem(row.advisories || 0));
+    }
+    if (row.error) details.push('error: ' + escMem(row.error));
+    const runVerdictClass = row.runVerdict ? wfRunVerdictClass(row.runVerdict) : '';
+    return [
+      '<div class="wf-drawer-sub">LATEST RUN' + (wfGraphOverlayRunId ? ' · ' + escMem(wfGraphOverlayRunId) : '') + '</div>',
+      '<div class="wf-drawer-run ' + escMem(runVerdictClass) + '">',
+      details.map((line) => '<span>' + line + '</span>').join(''),
+      '</div>',
+      row.outputPreview ? '<pre class="wf-drawer-pre wf-drawer-preview">' + escMem(row.outputPreview) + '</pre>' : '',
+    ].join('');
+  }
+
+  function wfExecutionIssueKinds(row) {
+    const efficiency = row && row.executionEfficiency ? row.executionEfficiency : null;
+    return efficiency && Array.isArray(efficiency.issueKinds)
+      ? efficiency.issueKinds.map((kind) => String(kind || '').trim()).filter(Boolean)
+      : [];
+  }
+
+  function wfExecutionRecoveryLabel(issueKinds) {
+    const issues = Array.isArray(issueKinds) ? issueKinds : [];
+    if (issues.includes('fanout_underused') || issues.includes('fanout_worker_cap')) return 'RE-RUN FANOUT';
+    if (issues.includes('parallel_underused') || issues.includes('concurrency_cap')) return 'RE-RUN TO PLAN';
+    if (issues.includes('critical_path_blocked')) return 'RE-RUN CRITICAL PATH';
+    return 'RE-RUN TO PLAN';
+  }
+
+  function wfRuntimeFailedTools(row) {
+    if (!row) return [];
+    const tools = [];
+    if (Array.isArray(row.failedTools)) tools.push(...row.failedTools);
+    const comparison = row.launchComparison || null;
+    if (comparison && Array.isArray(comparison.failedTools)) tools.push(...comparison.failedTools);
+    if (comparison && Array.isArray(comparison.preflightRiskHits)) tools.push(...comparison.preflightRiskHits);
+    return Array.from(new Set(tools.map((tool) => String(tool || '').trim()).filter(Boolean))).slice(0, 8);
+  }
+
+  function wfShouldOfferRuntimeToolRepair(row) {
+    const tools = wfRuntimeFailedTools(row);
+    if (!tools.length) return false;
+    const verdictAction = row && row.runVerdict && row.runVerdict.primaryAction ? String(row.runVerdict.primaryAction) : '';
+    return verdictAction === 'Repair failed tool connection'
+      || row.status === 'failed'
+      || (row.launchComparison && row.launchComparison.attentionLevel === 'failed');
+  }
+
+  function wfGraphRecoveryActions(stepId, row) {
+    if (!stepId || wfIsNew || !wfSelectedName) return '';
+    const buttons = [
+      '<button type="button" class="wf-drawer-action primary" data-wf-graph-action="try-step" data-wf-graph-step="' + escMem(stepId) + '">TRY STEP</button>',
+    ];
+    if (wfGraphOverlayRunId && row) {
+      const executionIssues = wfExecutionIssueKinds(row);
+      const runtimeTools = wfRuntimeFailedTools(row);
+      if (wfShouldOfferRuntimeToolRepair(row)) {
+        buttons.push('<button type="button" class="wf-drawer-action danger" data-wf-graph-action="repair-runtime-tool" data-wf-graph-step="' + escMem(stepId) + '" data-wf-graph-run="' + escMem(wfGraphOverlayRunId) + '" data-wf-runtime-tools="' + escMem(runtimeTools.join(',')) + '">REPAIR TOOL</button>');
+      }
+      if (Number(row.itemsFailed) > 0) {
+        buttons.push('<button type="button" class="wf-drawer-action danger" data-wf-graph-action="retry-failed-items" data-wf-graph-step="' + escMem(stepId) + '" data-wf-graph-run="' + escMem(wfGraphOverlayRunId) + '">RETRY FAILED ITEMS</button>');
+      }
+      if (executionIssues.length > 0) {
+        buttons.push('<button type="button" class="wf-drawer-action warn" data-wf-graph-action="optimize-rerun" data-wf-graph-step="' + escMem(stepId) + '" data-wf-graph-run="' + escMem(wfGraphOverlayRunId) + '" data-wf-execution-issues="' + escMem(executionIssues.join(',')) + '">' + escMem(wfExecutionRecoveryLabel(executionIssues)) + '</button>');
+      }
+      const comparisonAttention = row.launchComparison && row.launchComparison.attentionLevel ? String(row.launchComparison.attentionLevel) : 'none';
+      const shouldOfferRerun = row.status === 'failed'
+        || row.attentionLevel === 'failed'
+        || comparisonAttention === 'failed'
+        || comparisonAttention === 'watch'
+        || Number(row.externalWriteFailures) > 0;
+      if (shouldOfferRerun) {
+        buttons.push('<button type="button" class="wf-drawer-action warn" data-wf-graph-action="safe-rerun" data-wf-graph-step="' + escMem(stepId) + '" data-wf-graph-run="' + escMem(wfGraphOverlayRunId) + '">RE-RUN SAFELY</button>');
+      }
+      buttons.push('<button type="button" class="wf-drawer-action" data-wf-graph-action="inspect-run" data-wf-graph-run="' + escMem(wfGraphOverlayRunId) + '">OPEN RUN</button>');
+    }
+    return '<div class="wf-drawer-actions">' + buttons.join('') + '</div>';
+  }
+
+  function wfContractFixesForStep(stepId) {
+    if (!stepId || !wfDraft || !wfDraft.executionPlan) return [];
+    return wfContractRemediations(wfDraft.executionPlan)
+      .filter((fix) => Array.isArray(fix.stepIds) && fix.stepIds.includes(stepId));
+  }
+
+  function wfContractFixDrawer(stepId) {
+    const fixes = wfContractFixesForStep(stepId);
+    if (!fixes.length) return '';
+    return [
+      '<div class="wf-drawer-sub">VISUAL CONTRACT FIXES</div>',
+      '<div class="wf-contract-fixes wf-contract-fixes-drawer">',
+      wfContractFixRows(fixes),
+      '</div>',
+    ].join('');
+  }
+
+  function wfGraphRecoveryIntentPayload(action, stepId, runId) {
+    const kind = action === 'try-step' ? 'step_try'
+      : action === 'retry-failed-items' ? 'failed_items'
+      : action === 'safe-rerun' ? 'safe_rerun'
+      : action === 'optimize-rerun' ? 'execution_optimize'
+      : 'manual_requeue';
+    const row = stepId && wfGraphOverlayByStep ? wfGraphOverlayByStep[stepId] : null;
+    const executionIssues = action === 'optimize-rerun' ? wfExecutionIssueKinds(row) : [];
+    const reason = action === 'try-step' ? 'graph node try step'
+      : action === 'retry-failed-items' ? 'graph node retry failed forEach items'
+      : action === 'safe-rerun' ? 'graph node safe rerun'
+      : action === 'optimize-rerun' ? 'graph execution optimization rerun' + (executionIssues.length ? ': ' + executionIssues.join(', ') : '')
+      : 'graph recovery action';
+    return {
+      kind: kind,
+      requestedFrom: action === 'optimize-rerun' ? 'graph_execution_drift' : 'graph',
+      reason: reason,
+      ...(runId ? { sourceRunId: runId } : {}),
+      ...(stepId ? { sourceStepId: stepId } : {}),
+    };
+  }
+
+  async function handleWfGraphRecoveryAction(button) {
+    if (!button || button.disabled) return;
+    const action = button.getAttribute('data-wf-graph-action') || '';
+    const stepId = button.getAttribute('data-wf-graph-step') || '';
+    const runId = button.getAttribute('data-wf-graph-run') || wfGraphOverlayRunId || '';
+    const original = button.textContent || '';
+    button.disabled = true;
+    button.textContent = 'QUEUEING';
+    try {
+      if (action === 'try-step') {
+        const step = (wfDraft && Array.isArray(wfDraft.steps) ? wfDraft.steps : []).find((s) => s && s.id === stepId);
+        if (!step) throw new Error('step not found');
+        await tryStep(step, wfGraphRecoveryIntentPayload(action, stepId, runId));
+        button.textContent = 'TRY QUEUED';
+        return;
+      }
+      if (action === 'repair-runtime-tool') {
+        if (!wfSelectedName) throw new Error('workflow not selected');
+        const tools = (button.getAttribute('data-wf-runtime-tools') || '')
+          .split(',')
+          .map((item) => item.trim())
+          .filter(Boolean);
+        if (!tools.length) throw new Error('no failed runtime tool was recorded for this node');
+        button.textContent = 'CHECKING';
+        const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/contract-actions'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ kind: 'confirm_tool_connection', stepIds: stepId ? [stepId] : [], tools: tools }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok || body.ok === false) throw new Error(body.error || body.message || ('HTTP ' + r.status));
+        updateWfDraftFromContractResponse(body);
+        const launched = await maybeLaunchWfToolConnectionRepair(body);
+        button.textContent = launched ? 'REPAIR OPENED' : 'CHECKED';
+        if (!launched) alert((body.skipped && body.skipped.length ? body.skipped.join('\\n') : 'Runtime tool connection checked.'));
+        return;
+      }
+      if (action === 'inspect-run') {
+        if (!runId || !wfSelectedName) throw new Error('run not found');
+        openRunInspector(wfSelectedName, runId);
+        button.textContent = 'OPENED';
+        return;
+      }
+      if (!runId || !wfSelectedName) throw new Error('run not found');
+      const endpoint = action === 'retry-failed-items'
+        ? '/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/runs/' + encodeURIComponent(runId) + '/retry-failed-items'
+        : action === 'safe-rerun' || action === 'optimize-rerun'
+          ? '/api/console/board/workflow/' + encodeURIComponent(wfSelectedName) + '/runs/' + encodeURIComponent(runId) + '/resume-safe'
+          : '';
+      if (!endpoint) throw new Error('unknown graph action');
+      const payload = {
+        ...(action === 'retry-failed-items' || action === 'safe-rerun' || action === 'optimize-rerun' ? { stepId: stepId } : {}),
+        recoveryIntent: wfGraphRecoveryIntentPayload(action, stepId, runId),
+      };
+      const r = await fetch(withToken(endpoint), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) throw new Error(body.reason || body.message || body.error || ('HTTP ' + r.status));
+      button.textContent = body.id ? 'QUEUED' : String(body.status || 'QUEUED').toUpperCase();
+      if (body.id) startActiveRunPolling(body.id);
+      try { await refreshWorkflowRuns(); } catch (_) {}
+      if (body.id) {
+        try { await loadWorkflowGraphOverlay(body.id); } catch (_) {}
+      }
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = original;
+      alert('Could not queue workflow recovery: ' + ((err && err.message) || err));
+    }
+  }
+
+  function bindWfContractFixButtons(root) {
+    if (!root) return;
+    root.querySelectorAll('[data-wf-contract-open-step]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        const stepId = button.getAttribute('data-wf-contract-open-step') || '';
+        if (stepId) openWfStepDrawer(stepId);
+      });
+    });
+    root.querySelectorAll('[data-wf-contract-fix-kind]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        handleWfContractFixAction(button).catch((err) => {
+          alert('Could not apply workflow contract fix: ' + ((err && err.message) || err));
+        });
+      });
+    });
+    root.querySelectorAll('button[data-wf-contract-action-kind]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        handleWfContractManualAction(button).catch((err) => {
+          alert('Could not apply workflow contract action: ' + ((err && err.message) || err));
+        });
+      });
+    });
+  }
+
+  function updateWfDraftFromContractResponse(body) {
+    wfDraft = {
+      ...wfDraft,
+      enabled: body.enabled !== false,
+      project: body.project || '',
+      steps: Array.isArray(body.steps) ? body.steps : wfDraft.steps,
+      inputs: body.inputs || wfDraft.inputs || {},
+      resources: body.resources || wfDraft.resources || {},
+      synthesisPrompt: body.synthesis && body.synthesis.prompt ? body.synthesis.prompt : wfDraft.synthesisPrompt,
+      goal: body.goal || null,
+      proof: body.proof || wfDraft.proof || null,
+      executionPlan: body.executionPlan || wfDraft.executionPlan,
+      graph: body.graph || wfDraft.graph,
+    };
+  }
+
+  async function handleWfContractFixAction(button) {
+    if (!button || button.disabled || !wfSelectedName || wfIsNew) return;
+    const kind = button.getAttribute('data-wf-contract-fix-kind') || '';
+    const stepIds = (button.getAttribute('data-wf-contract-fix-step-ids') || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const payload = { fixes: [kind], stepIds: stepIds };
+    if (kind === 'make_fanout_resumable') {
+      const needsStableKeyConfirmation = stepIds.some((stepId) => {
+        const step = wfDraft && Array.isArray(wfDraft.steps) ? wfDraft.steps.find((s) => s && s.id === stepId) : null;
+        return step && String(step.sideEffect || step.side_effect || '').toLowerCase() !== 'read';
+      });
+      if (needsStableKeyConfirmation) {
+        const ok = confirm('Mark this fan-out resumable only if each item has a stable id/key/slug. Continue?');
+        if (!ok) return;
+        payload.assumeStableItemKeys = true;
+      }
+    }
+    const original = button.textContent || '';
+    button.disabled = true;
+    button.textContent = 'APPLYING';
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/contract-fixes'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) throw new Error(body.error || body.message || ('HTTP ' + r.status));
+      updateWfDraftFromContractResponse(body);
+      renderEditor();
+      renderValidation({ ok: true, errors: [], warnings: [], stepCount: wfDraft.steps.length, hasCycles: false }, body.updated ? 'CONTRACT FIXED' : 'NO AUTO FIX');
+      refreshWorkflowList({ skipReselect: true });
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = original;
+      throw err;
+    }
+  }
+
+  function wfSelectedStepForContractAction(stepIds) {
+    const steps = wfDraft && Array.isArray(wfDraft.steps) ? wfDraft.steps : [];
+    return steps.find((step) => step && stepIds.includes(step.id)) || null;
+  }
+
+  function wfContractReadinessItemsForSteps(stepIds) {
+    const items = wfDraft && wfDraft.executionPlan && wfDraft.executionPlan.toolReadiness && Array.isArray(wfDraft.executionPlan.toolReadiness.items)
+      ? wfDraft.executionPlan.toolReadiness.items
+      : [];
+    const scoped = new Set(Array.isArray(stepIds) ? stepIds : []);
+    return items.filter((item) => {
+      if (!item || String(item.status || '') === 'ready') return false;
+      if (scoped.size === 0) return true;
+      const itemSteps = Array.isArray(item.stepIds) ? item.stepIds : [];
+      return itemSteps.some((stepId) => scoped.has(stepId));
+    });
+  }
+
+  function wfCliCommandFromReadinessItem(item) {
+    if (!item || String(item.kind || '') !== 'cli') return '';
+    const name = String(item.name || '').trim();
+    const explicit = name.match(/^(?:cli|local_cli):([A-Za-z0-9._+-]{1,60})$/);
+    if (explicit && explicit[1]) return explicit[1];
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+    const cliEvidence = evidence.find((entry) => entry && String(entry.kind || '') === 'cli_command' && /^[A-Za-z0-9._+-]{1,60}$/.test(String(entry.name || '')));
+    return cliEvidence ? String(cliEvidence.name || '') : '';
+  }
+
+  function wfCliCommandForContractAction(stepIds) {
+    const cliItems = wfContractReadinessItemsForSteps(stepIds).filter((item) => String(item.kind || '') === 'cli');
+    for (const item of cliItems) {
+      const command = wfCliCommandFromReadinessItem(item);
+      if (command) return command;
+    }
+    return '';
+  }
+
+  const WF_TOOL_CONNECTION_ACTION_PRIORITY = [
+    'set_composio_api_key',
+    'set_mcp_credentials',
+    'enable_mcp_server',
+    'reconnect_mcp',
+    'setup_composio_oauth',
+    'authorize_composio_toolkit',
+    'refresh_composio_connections',
+    'open_composio_toolkit_setup',
+    'add_mcp_server',
+    'inspect_mcp_status',
+    'open_composio_auth_configs',
+    'search_composio_schema',
+  ];
+
+  function wfToolConnectionPrimaryCheck(checks) {
+    const list = Array.isArray(checks) ? checks : [];
+    return list.find((check) => check && String(check.status || '') !== 'ready') || null;
+  }
+
+  function wfToolConnectionPrimaryAction(check) {
+    const actions = Array.isArray(check && check.nextActions) ? check.nextActions : [];
+    for (const kind of WF_TOOL_CONNECTION_ACTION_PRIORITY) {
+      const action = actions.find((candidate) => candidate && String(candidate.kind || '') === kind);
+      if (action) return action;
+    }
+    return actions[0] || null;
+  }
+
+  function wfToolConnectionEndpoint(action) {
+    return action && action.endpoint ? String(action.endpoint) : '';
+  }
+
+  function wfToolConnectionMcpCredentialKey(check, action) {
+    const detail = String((action && action.detail) || '');
+    const fromDetail = detail.match(/\\b([A-Z][A-Z0-9_]{2,})\\b/);
+    if (fromDetail && fromDetail[1]) return fromDetail[1];
+    const evidence = Array.isArray(check && check.evidence) ? check.evidence : [];
+    for (const line of evidence) {
+      const match = String(line || '').match(/unset credential keys:\\s*([A-Z0-9_,\\s]+)/i);
+      if (match && match[1]) return match[1].split(',').map((item) => item.trim()).filter(Boolean)[0] || '';
+    }
+    return '';
+  }
+
+  async function wfPostJson(endpoint, body) {
+    const r = await fetch(withToken(endpoint), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error(j.error || j.message || ('HTTP ' + r.status));
+    return j;
+  }
+
+  async function wfLaunchToolConnectionAction(action, check) {
+    const kind = String((action && action.kind) || '');
+    const endpoint = wfToolConnectionEndpoint(action);
+    if (!kind) return false;
+
+    if (kind === 'set_composio_api_key') {
+      hubAppSearch = check && check.toolkitSlug ? String(check.toolkitSlug) : hubAppSearch;
+      switchPanel('integrations');
+      setTimeout(() => { try { refreshIntegrationsHub(); } catch (_) {} }, 50);
+      alert('Opened Integrations. Paste your Composio API key, then re-check this workflow tool.');
+      return true;
+    }
+
+    if (kind === 'refresh_composio_connections' && endpoint) {
+      await fetch(withToken(endpoint), { method: 'POST', headers: { Accept: 'application/json' } });
+      await refreshHubApps();
+      alert('Composio connections refreshed. Re-check the workflow tool to verify readiness.');
+      return true;
+    }
+
+    if (kind === 'setup_composio_oauth' && endpoint) {
+      await wfPostJson(endpoint, {});
+      const authorize = Array.isArray(check && check.nextActions)
+        ? check.nextActions.find((candidate) => candidate && String(candidate.kind || '') === 'authorize_composio_toolkit')
+        : null;
+      if (authorize && authorize.endpoint) {
+        const auth = await wfPostJson(String(authorize.endpoint), {});
+        const url = auth.redirectUrl || auth.url;
+        if (url) window.open(url, '_blank');
+      }
+      setTimeout(() => refreshHubApps(), 3000);
+      alert('Started the Composio OAuth setup. Finish the browser authorization, then re-check the workflow tool.');
+      return true;
+    }
+
+    if (kind === 'authorize_composio_toolkit' && endpoint) {
+      const auth = await wfPostJson(endpoint, {});
+      const url = auth.redirectUrl || auth.url;
+      if (url) window.open(url, '_blank');
+      setTimeout(() => refreshHubApps(), 3000);
+      alert('Opened Composio authorization. Finish the browser flow, then re-check this workflow tool.');
+      return true;
+    }
+
+    if (kind === 'open_composio_toolkit_setup') {
+      hubAppSearch = check && check.toolkitSlug ? String(check.toolkitSlug) : hubAppSearch;
+      switchPanel('integrations');
+      setTimeout(() => { try { refreshIntegrationsHub(); } catch (_) {} }, 50);
+      if (endpoint) {
+        try {
+          const meta = await fetchJSON(endpoint);
+          alert('Opened Integrations. Toolkit setup: ' + String((meta && meta.name) || check.name || 'Composio') + ' · auth ' + String((meta && meta.authScheme) || 'unknown') + '.');
+        } catch (_) {
+          alert('Opened Integrations. Review the Composio app setup card, then re-check the workflow tool.');
+        }
+      }
+      return true;
+    }
+
+    if (kind === 'set_mcp_credentials' && endpoint) {
+      const key = wfToolConnectionMcpCredentialKey(check, action);
+      if (!key) {
+        switchPanel('integrations');
+        alert('Opened Integrations. Enter the missing MCP credential values, then re-check this workflow tool.');
+        return true;
+      }
+      const value = prompt('Enter value for MCP credential ' + key + ':');
+      if (value == null || !String(value).trim()) return false;
+      await wfPostJson(endpoint, { key: key, value: value });
+      await refreshHubMcp();
+      alert('Saved MCP credential "' + key + '". Re-check the workflow tool after the server reconnects.');
+      return true;
+    }
+
+    if (kind === 'enable_mcp_server' && endpoint) {
+      const r = await fetch(withToken(endpoint), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      await refreshHubMcp();
+      alert('MCP server enabled. Re-check the workflow tool to verify readiness.');
+      return true;
+    }
+
+    if (kind === 'reconnect_mcp' && endpoint) {
+      await wfPostJson(endpoint, {});
+      await refreshHubMcp();
+      alert('MCP reconnect requested. Re-check this workflow tool after the next tool scan.');
+      return true;
+    }
+
+    if (kind === 'add_mcp_server') {
+      switchPanel('integrations');
+      hubMcpEditing = 'new';
+      setTimeout(() => { try { renderHubMcp(); } catch (_) {} }, 50);
+      alert('Opened Integrations. Add the MCP server config, then re-check this workflow tool.');
+      return true;
+    }
+
+    if (kind === 'inspect_mcp_status') {
+      switchPanel('integrations');
+      setTimeout(() => { try { refreshHubMcp(); } catch (_) {} }, 50);
+      if (action.command) alert('Opened Integrations. Diagnostic command: ' + action.command);
+      return true;
+    }
+
+    if (kind === 'open_composio_auth_configs' && action.href) {
+      window.open(String(action.href), '_blank');
+      return true;
+    }
+
+    if (action.command) {
+      alert('Diagnostic command: ' + action.command);
+      return true;
+    }
+    return false;
+  }
+
+  async function maybeLaunchWfToolConnectionRepair(body) {
+    const check = wfToolConnectionPrimaryCheck(body && body.toolConnectionChecks);
+    if (!check) return false;
+    const action = wfToolConnectionPrimaryAction(check);
+    if (!action) return false;
+    const label = String(action.label || action.kind || 'repair tool connection');
+    const summary = String(check.summary || check.name || 'Tool connection needs attention');
+    const detail = String(action.detail || '');
+    const ok = confirm(summary + '\\n\\nLaunch repair: ' + label + (detail ? '\\n' + detail : ''));
+    if (!ok) return false;
+    await wfLaunchToolConnectionAction(action, check);
+    return true;
+  }
+
+  async function handleWfContractManualAction(button) {
+    if (!button || button.disabled || !wfSelectedName || wfIsNew) return;
+    const actionKind = button.getAttribute('data-wf-contract-action-kind') || '';
+    const fixKind = button.getAttribute('data-wf-contract-action-fix-kind') || '';
+    const stepIds = (button.getAttribute('data-wf-contract-fix-step-ids') || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const payload = { kind: actionKind, fixKind: fixKind, stepIds: stepIds };
+    const step = wfSelectedStepForContractAction(stepIds);
+
+    if (actionKind === 'select_local_project') {
+      const current = (step && step.project) || (wfDraft && wfDraft.project) || '';
+      const project = prompt('Bind this workflow step to a local workspace project name or path:', current);
+      if (project == null) return;
+      const trimmed = project.trim();
+      if (!trimmed) return;
+      payload.project = trimmed;
+    } else if (actionKind === 'add_workflow_script') {
+      const currentRunner = step && step.deterministic && step.deterministic.runner ? step.deterministic.runner : '';
+      const runner = prompt('Set the deterministic runner under this workflow scripts/ directory:', currentRunner);
+      if (runner == null) return;
+      const trimmedRunner = runner.trim();
+      if (!trimmedRunner) return;
+      payload.runner = trimmedRunner;
+      const content = prompt('Optional: paste script content to create this runner. Leave blank if it already exists.');
+      if (content == null) return;
+      if (content.trim()) payload.scriptContent = content;
+    } else if (actionKind === 'confirm_tool_connection') {
+      const cliCommand = wfCliCommandForContractAction(stepIds);
+      if (cliCommand) {
+        const command = prompt('Save this CLI command to the local runtime inventory for workflow execution:', cliCommand);
+        if (command == null) return;
+        const trimmedCommand = command.trim();
+        if (!trimmedCommand) return;
+        payload.command = trimmedCommand;
+      }
+    } else if (actionKind !== 'confirm_tool_connection') {
+      if (stepIds.length === 1) openWfStepDrawer(stepIds[0]);
+      return;
+    }
+
+    const original = button.textContent || '';
+    button.disabled = true;
+    button.textContent = actionKind === 'confirm_tool_connection' ? 'CHECKING' : 'APPLYING';
+    try {
+      const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/contract-actions'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) {
+        const extra = Array.isArray(body.availableScripts) && body.availableScripts.length
+          ? ' Available scripts: ' + body.availableScripts.join(', ')
+          : '';
+        throw new Error((body.error || body.message || ('HTTP ' + r.status)) + extra);
+      }
+      updateWfDraftFromContractResponse(body);
+      renderEditor();
+      const label = actionKind === 'confirm_tool_connection'
+        ? (body.connectionReady ? 'TOOLS READY' : 'TOOLS NEED CONNECTION')
+        : body.updated ? 'CONTRACT ACTION' : 'NO CHANGE';
+      renderValidation({ ok: true, errors: [], warnings: body.skipped || [], stepCount: wfDraft.steps.length, hasCycles: false }, label);
+      refreshWorkflowList({ skipReselect: true });
+      if (actionKind === 'confirm_tool_connection' && body.connectionReady !== true) {
+        await maybeLaunchWfToolConnectionRepair(body);
+      }
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = original;
+      throw err;
+    }
+  }
+
+  const WF_GRAPH_OVERLAY_NODE_CLASSES = 'pending running done failed skipped has-run-retry has-run-advisory has-run-approval has-run-failed-items has-run-workers has-run-writes has-run-risk has-run-concurrency attention-watch attention-blocked attention-failed launch-runtime-confirmed launch-runtime-drift launch-runtime-failed execution-drift execution-blocked execution-failed execution-capped execution-fanout-underused run-verdict-pending run-verdict-running run-verdict-completed run-verdict-proven run-verdict-attention run-verdict-blocked run-verdict-failed run-verdict-skipped';
+
+  function wfRecoveryNodeId(runId) {
+    return 'recovery-run-' + String(runId || '').replace(new RegExp('[^a-zA-Z0-9_-]', 'g'), '-');
+  }
+
+  function wfRecoveryLineageLabel(entry) {
+    const bits = [];
+    bits.push(entry && entry.isCurrent ? 'CURRENT RUN' : 'RECOVERY RUN');
+    if (entry && entry.kind) bits.push(String(entry.kind).replace(new RegExp('_', 'g'), ' ').toUpperCase());
+    if (entry && entry.status) bits.push(String(entry.status).toUpperCase());
+    if (entry && entry.sourceStepId) bits.push('STEP ' + String(entry.sourceStepId));
+    return bits.slice(0, 4).join('\\n');
+  }
+
+  function wfRecoveryLineageRunLine(entry) {
+    if (!entry) return '';
+    const bits = [];
+    bits.push((entry.isCurrent ? 'CURRENT ' : '') + String(entry.runId || 'run'));
+    if (entry.kind) bits.push(String(entry.kind).replace(new RegExp('_', 'g'), ' '));
+    if (entry.status) bits.push(String(entry.status));
+    if (entry.sourceStepId) bits.push('step ' + String(entry.sourceStepId));
+    if (entry.requestedFrom) bits.push('from ' + String(entry.requestedFrom));
+    if (entry.sourceMissing) bits.push('source missing');
+    return bits.join(' · ');
+  }
+
+  function wfRecoveryEntryClass(entry) {
+    const status = String((entry && entry.status) || '').toLowerCase();
+    if (entry && entry.sourceMissing) return 'source-missing';
+    if (status.indexOf('fail') !== -1 || status.indexOf('error') !== -1) return 'failed';
+    if (status === 'queued' || status === 'running') return 'running';
+    if (status.indexOf('complete') !== -1 || status === 'done') return 'done';
+    return 'pending';
+  }
+
+  function wfRecoveryLineageEntry(runId) {
+    const lineage = Array.isArray(wfGraphOverlayRecoveryLineage) ? wfGraphOverlayRecoveryLineage : [];
+    return lineage.find((entry) => entry && entry.runId === runId) || null;
+  }
+
+  function wfRecoveryShouldOfferSafeRerun(entry) {
+    const status = String((entry && entry.status) || '').toLowerCase();
+    return status.indexOf('fail') !== -1
+      || status.indexOf('error') !== -1
+      || status === 'cancelled'
+      || status === 'completed_with_errors';
+  }
+
+  function wfRecoveryActionIntent(action, entry) {
+    return {
+      kind: action === 'safe-rerun' ? 'safe_rerun' : 'manual_requeue',
+      sourceRunId: entry && entry.runId ? entry.runId : '',
+      sourceStepId: entry && entry.sourceStepId ? entry.sourceStepId : '',
+      requestedFrom: 'recovery_graph',
+      reason: action === 'safe-rerun' ? 'recovery lineage node safe rerun' : 'recovery lineage node action',
+    };
+  }
+
+  function wfRecoveryNodeActions(entry) {
+    if (!entry || !entry.runId || !wfSelectedName) return '';
+    const buttons = [
+      '<button type="button" class="wf-drawer-action primary" data-wf-recovery-node-action="open-run" data-wf-recovery-run="' + escMem(entry.runId) + '">OPEN RUN</button>',
+      '<button type="button" class="wf-drawer-action" data-wf-recovery-node-action="focus-run" data-wf-recovery-run="' + escMem(entry.runId) + '">FOCUS GRAPH</button>',
+    ];
+    if (entry.sourceRunId && !entry.sourceMissing) {
+      buttons.push('<button type="button" class="wf-drawer-action" data-wf-recovery-node-action="open-source" data-wf-recovery-run="' + escMem(entry.runId) + '" data-wf-recovery-source-run="' + escMem(entry.sourceRunId) + '">OPEN SOURCE</button>');
+    }
+    if (entry.sourceStepId) {
+      buttons.push('<button type="button" class="wf-drawer-action" data-wf-recovery-node-action="open-source-step" data-wf-recovery-source-step="' + escMem(entry.sourceStepId) + '">OPEN STEP</button>');
+    }
+    if (wfRecoveryShouldOfferSafeRerun(entry)) {
+      buttons.push('<button type="button" class="wf-drawer-action warn" data-wf-recovery-node-action="safe-rerun" data-wf-recovery-run="' + escMem(entry.runId) + '">RE-RUN SAFELY</button>');
+    }
+    return '<div class="wf-drawer-actions">' + buttons.join('') + '</div>';
+  }
+
+  function openWfRecoveryRunDrawer(runId) {
+    if (!runId || !wfSelectedName) return;
+    const entry = wfRecoveryLineageEntry(runId) || { runId: runId, isCurrent: runId === wfGraphOverlayRunId };
+    let drawer = document.querySelector('[data-wf-step-drawer]');
+    if (!drawer) {
+      drawer = document.createElement('div');
+      drawer.className = 'wf-step-drawer';
+      drawer.setAttribute('data-wf-step-drawer', '');
+      document.body.appendChild(drawer);
+    }
+    const flags = [];
+    if (entry.status) flags.push('status: ' + escMem(entry.status));
+    if (entry.kind) flags.push('kind: ' + escMem(String(entry.kind).replace(new RegExp('_', 'g'), ' ')));
+    if (entry.sourceRunId) flags.push('source run: ' + escMem(entry.sourceRunId));
+    if (entry.sourceStepId) flags.push('source step: ' + escMem(entry.sourceStepId));
+    if (entry.requestedFrom) flags.push('requested from: ' + escMem(entry.requestedFrom));
+    if (entry.sourceMissing) flags.push('source missing');
+    drawer.setAttribute('data-wf-step-drawer-id', 'recovery:' + runId);
+    drawer.innerHTML = [
+      '<div class="wf-drawer-head"><span>RECOVERY RUN · ' + escMem(runId) + '</span><button class="wf-drawer-close" data-wf-drawer-close>✕</button></div>',
+      flags.length ? '<div class="wf-drawer-flags">' + flags.join(' · ') + '</div>' : '',
+      wfRecoveryNodeActions(entry),
+      entry.reason ? '<div class="wf-drawer-sub">REASON</div><pre class="wf-drawer-pre wf-drawer-preview">' + escMem(entry.reason) + '</pre>' : '',
+      '<div class="wf-drawer-sub">LINEAGE</div><div class="wf-drawer-run"><span>' + escMem(wfRecoveryLineageRunLine(entry)) + '</span></div>',
+    ].join('');
+    drawer.classList.add('open');
+    const close = drawer.querySelector('[data-wf-drawer-close]');
+    if (close) close.addEventListener('click', () => drawer.classList.remove('open'));
+    drawer.querySelectorAll('[data-wf-recovery-node-action]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        handleWfRecoveryNodeAction(button).catch((err) => {
+          alert('Could not run recovery action: ' + ((err && err.message) || err));
+        });
+      });
+    });
+  }
+
+  async function handleWfRecoveryNodeAction(button) {
+    if (!button || button.disabled || !wfSelectedName) return;
+    const action = button.getAttribute('data-wf-recovery-node-action') || '';
+    const runId = button.getAttribute('data-wf-recovery-run') || '';
+    const entry = wfRecoveryLineageEntry(runId) || { runId: runId };
+    if (action === 'open-run') {
+      if (!runId) throw new Error('run not found');
+      openRunInspector(wfSelectedName, runId);
+      return;
+    }
+    if (action === 'focus-run') {
+      if (!runId) throw new Error('run not found');
+      await loadWorkflowGraphOverlay(runId);
+      const status = String(entry.status || '').toLowerCase();
+      if (status === 'queued' || status === 'running') startActiveRunPolling(runId);
+      return;
+    }
+    if (action === 'open-source') {
+      const sourceRunId = button.getAttribute('data-wf-recovery-source-run') || entry.sourceRunId || '';
+      if (!sourceRunId) throw new Error('source run not found');
+      openRunInspector(wfSelectedName, sourceRunId);
+      return;
+    }
+    if (action === 'open-source-step') {
+      const stepId = button.getAttribute('data-wf-recovery-source-step') || entry.sourceStepId || '';
+      if (!stepId) throw new Error('source step not found');
+      openWfStepDrawer(stepId);
+      return;
+    }
+    if (action !== 'safe-rerun') throw new Error('unknown recovery action');
+    if (!runId) throw new Error('run not found');
+    const original = button.textContent || '';
+    button.disabled = true;
+    button.textContent = 'QUEUEING';
+    try {
+      const endpoint = '/api/console/board/workflow/' + encodeURIComponent(wfSelectedName)
+        + '/runs/' + encodeURIComponent(runId) + '/resume-safe';
+      const r = await fetch(withToken(endpoint), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          ...(entry.sourceStepId ? { stepId: entry.sourceStepId } : {}),
+          recoveryIntent: wfRecoveryActionIntent(action, entry),
+        }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body.ok === false) throw new Error(body.reason || body.message || body.error || ('HTTP ' + r.status));
+      button.textContent = body.id ? 'QUEUED' : String(body.status || 'QUEUED').toUpperCase();
+      if (body.id) startActiveRunPolling(body.id);
+      try { await refreshWorkflowRuns(); } catch (_) {}
+      if (body.id) {
+        await loadWorkflowGraphOverlay(body.id);
+        openWfRecoveryRunDrawer(body.id);
+      }
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = original;
+      throw err;
+    }
+  }
+
+  function wfClearRecoveryLineageGraph() {
+    const fallbackLine = document.querySelector('[data-wf-recovery-lineage]');
+    if (fallbackLine) fallbackLine.remove();
+    if (!wfGraphCy) return;
+    try {
+      wfGraphCy.elements('.recovery-lineage-edge, .recovery-run-node').remove();
+    } catch (_) { /* ignore */ }
+  }
+
+  function wfRenderRecoveryLineageFallback() {
+    const fallback = document.querySelector('.wf-graph-fallback');
+    if (!fallback) return;
+    let line = fallback.querySelector('[data-wf-recovery-lineage]');
+    const lineage = Array.isArray(wfGraphOverlayRecoveryLineage) ? wfGraphOverlayRecoveryLineage : [];
+    if (line) line.remove();
+    if (lineage.length === 0) return;
+    line = document.createElement('li');
+    line.className = 'wf-graph-recovery-lineage';
+    line.setAttribute('data-wf-recovery-lineage', '');
+    line.innerHTML = '<strong>RECOVERY LINEAGE</strong><span class="wf-graph-run">' + lineage.map((entry) =>
+      '<button type="button" class="wf-graph-recovery-run" data-wf-recovery-node-action="drawer" data-wf-recovery-run="' + escMem(entry.runId || '') + '">' + escMem(wfRecoveryLineageRunLine(entry)) + '</button>'
+    ).join(' → ') + '</span>';
+    fallback.appendChild(line);
+    line.querySelectorAll('[data-wf-recovery-node-action="drawer"]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        const runId = button.getAttribute('data-wf-recovery-run');
+        if (runId && wfSelectedName) openWfRecoveryRunDrawer(runId);
+      });
+    });
+  }
+
+  function wfRenderRecoveryLineageGraph() {
+    wfClearRecoveryLineageGraph();
+    wfRenderRecoveryLineageFallback();
+    if (!wfGraphCy) return;
+    const lineage = Array.isArray(wfGraphOverlayRecoveryLineage) ? wfGraphOverlayRecoveryLineage : [];
+    if (lineage.length === 0) return;
+    try {
+      const elements = [];
+      const existingStepIds = new Set();
+      wfGraphCy.nodes().forEach((node) => {
+        const stepId = node.data('stepId');
+        if (stepId) existingStepIds.add(String(stepId));
+      });
+      lineage.forEach((entry, index) => {
+        if (!entry || !entry.runId) return;
+        const nodeId = wfRecoveryNodeId(entry.runId);
+        elements.push({
+          group: 'nodes',
+          data: {
+            id: nodeId,
+            label: wfRecoveryLineageLabel(entry),
+            recoveryRunId: entry.runId,
+            sourceStepId: entry.sourceStepId || '',
+          },
+          classes: 'recovery-run-node recovery-' + wfRecoveryEntryClass(entry) + (entry.isCurrent ? ' recovery-current' : ''),
+        });
+        const prior = index > 0 ? lineage[index - 1] : null;
+        if (prior && prior.runId) {
+          elements.push({
+            group: 'edges',
+            data: {
+              id: 'recovery-edge-' + wfRecoveryNodeId(prior.runId) + '-' + nodeId,
+              source: wfRecoveryNodeId(prior.runId),
+              target: nodeId,
+            },
+            classes: 'recovery-lineage-edge',
+          });
+        }
+        if (entry.sourceStepId && existingStepIds.has(String(entry.sourceStepId))) {
+          elements.push({
+            group: 'edges',
+            data: {
+              id: 'recovery-step-edge-' + String(entry.sourceStepId).replace(new RegExp('[^a-zA-Z0-9_-]', 'g'), '-') + '-' + nodeId,
+              source: String(entry.sourceStepId),
+              target: nodeId,
+            },
+            classes: 'recovery-lineage-edge recovery-step-edge',
+          });
+        }
+      });
+      if (elements.length === 0) return;
+      wfGraphCy.add(elements);
+      try {
+        wfGraphCy.layout({ name: 'breadthfirst', directed: true, spacingFactor: 1.15, padding: 30, fit: true, grid: true }).run();
+      } catch (_) {
+        try { wfGraphCy.layout({ name: 'grid', fit: true, padding: 30 }).run(); } catch (__) { /* ignore */ }
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+	  function clearWorkflowGraphOverlay() {
+	    wfGraphOverlaySeq += 1;
+	    wfGraphOverlayByStep = {};
+	    wfGraphOverlaySummary = null;
+    wfGraphOverlayGoal = null;
+    wfGraphOverlayComparison = null;
+    wfGraphOverlayExecutionEfficiency = null;
+    wfGraphOverlayRecoveryIntent = null;
+    wfGraphOverlayRecoveryLineage = [];
+	    wfGraphOverlayRunId = '';
+	    updateWorkflowGraphOverlaySummary();
+    renderWorkflowRunCockpit();
+    renderWorkflowRunWorkspace(null);
+    if (!wfGraphCy) return;
+    try {
+      wfClearRecoveryLineageGraph();
+      wfGraphCy.nodes().forEach((node) => {
+        node.removeClass(WF_GRAPH_OVERLAY_NODE_CLASSES);
+        node.data('label', node.data('baseLabel') || node.data('label') || '');
+      });
+    } catch (_) { /* ignore */ }
+  }
+
+	  function updateWorkflowGraphOverlaySummary() {
+	    const el = document.querySelector('[data-wf-graph-overlay-summary]');
+	    if (!el) return;
+	    const s = wfGraphOverlaySummary;
+	    if (!s) {
+      el.textContent = '';
+      return;
+	    }
+	    const bits = [];
+    const recovery = wfGraphOverlayRecoveryIntent;
+    if (recovery && recovery.kind) {
+      const recoveryBits = ['recovery ' + String(recovery.kind).replace(new RegExp('_', 'g'), ' ').toUpperCase()];
+      if (recovery.sourceStepId) recoveryBits.push('step ' + String(recovery.sourceStepId));
+      if (recovery.requestedFrom) recoveryBits.push('from ' + String(recovery.requestedFrom));
+      bits.push(recoveryBits.join(' '));
+    }
+    if (Array.isArray(wfGraphOverlayRecoveryLineage) && wfGraphOverlayRecoveryLineage.length > 1) {
+      bits.push('lineage ' + String(wfGraphOverlayRecoveryLineage.length) + ' runs');
+    }
+    const goal = wfGraphOverlayGoal;
+    if (goal && goal.status && goal.status !== 'unknown') {
+      const goalBits = ['goal ' + String(goal.status).toUpperCase()];
+      if (Number.isFinite(Number(goal.successRatePercent))) goalBits.push(String(goal.successRatePercent) + '%');
+      if (Number.isFinite(Number(goal.attempt)) && Number.isFinite(Number(goal.maxAttempts))) goalBits.push(String(goal.attempt) + '/' + String(goal.maxAttempts));
+      bits.push(goalBits.join(' '));
+    } else if (s.goalStatus) {
+      const goalBits = ['goal ' + String(s.goalStatus).toUpperCase()];
+      if (Number.isFinite(Number(s.goalSuccessRatePercent))) goalBits.push(String(s.goalSuccessRatePercent) + '%');
+      if (Number.isFinite(Number(s.goalAttempt)) && Number.isFinite(Number(s.goalMaxAttempts))) goalBits.push(String(s.goalAttempt) + '/' + String(s.goalMaxAttempts));
+      bits.push(goalBits.join(' '));
+    }
+    const comparison = wfGraphOverlayComparison;
+    if (comparison) {
+      if (Array.isArray(comparison.preflightRiskHits) && comparison.preflightRiskHits.length) bits.push(comparison.preflightRiskHits.length + ' preflight hit');
+      else if (Array.isArray(comparison.failedTools) && comparison.failedTools.length) bits.push(comparison.failedTools.length + ' failed tool');
+      if (Array.isArray(comparison.runtimeOnlyTools) && comparison.runtimeOnlyTools.length) bits.push(comparison.runtimeOnlyTools.length + ' runtime-only');
+      if (Array.isArray(comparison.unconfirmedLaunchTools) && comparison.unconfirmedLaunchTools.length) bits.push(comparison.unconfirmedLaunchTools.length + ' unobserved');
+    }
+    const efficiency = wfGraphOverlayExecutionEfficiency;
+    if (efficiency) {
+      if (Array.isArray(efficiency.issues) && efficiency.issues.length) bits.push(efficiency.issues.length + ' execution drift');
+      else if (Number(efficiency.plannedMaxParallelWidth) > 1 || Number(efficiency.fanoutStepCount) > 0) bits.push('execution matched plan');
+      if (Number(efficiency.runtimeMaxParallelWidth) > 0 && Number(efficiency.plannedMaxParallelWidth) > 0) {
+        bits.push('width ' + String(efficiency.runtimeMaxParallelWidth) + '/' + String(efficiency.plannedMaxParallelWidth));
+      }
+    }
+	    if (Number(s.runningSteps) > 0) bits.push(s.runningSteps + ' running');
+	    if (Number(s.failedSteps) > 0) bits.push(s.failedSteps + ' failed');
+    if (Number(s.attentionSteps) > 0) bits.push(s.attentionSteps + ' attention');
+    if (s.bottleneckStepId && s.bottleneck) bits.push('bottleneck: ' + s.bottleneckStepId + ' / ' + s.bottleneck);
+    if (Number(s.concurrencyCapPressureSteps) > 0) bits.push(s.concurrencyCapPressureSteps + ' cap-limited');
+    if (Number(s.maxQueueWaitMs) > 0) bits.push('max wait ' + fmtDurationMs(s.maxQueueWaitMs));
+    if (Number(s.workerBranches) > 0) bits.push(s.workerBranches + ' workers');
+    if (Number(s.toolCalls) > 0) bits.push(s.toolCalls + ' tools');
+    el.textContent = bits.slice(0, 5).join(' · ');
+  }
+
+	  function applyWorkflowGraphOverlay(payload) {
+	    const overlay = payload && payload.overlay ? payload.overlay : payload;
+	    if (!overlay || !Array.isArray(overlay.steps)) return;
+	    wfGraphOverlayRunId = payload && payload.runId ? String(payload.runId) : wfGraphOverlayRunId;
+	    wfGraphOverlaySummary = overlay.summary || null;
+    wfGraphOverlayGoal = overlay.goal || null;
+    wfGraphOverlayComparison = overlay.launchComparison || null;
+    wfGraphOverlayExecutionEfficiency = overlay.executionEfficiency || null;
+    wfGraphOverlayRecoveryIntent = overlay.recoveryIntent || null;
+    wfGraphOverlayRecoveryLineage = Array.isArray(overlay.recoveryLineage) ? overlay.recoveryLineage : [];
+	    updateWorkflowGraphOverlaySummary();
+    wfGraphOverlayByStep = {};
+    overlay.steps.forEach((row) => {
+      if (row && row.stepId) wfGraphOverlayByStep[row.stepId] = row;
+    });
+    if (wfGraphCy) {
+      try {
+        wfGraphCy.nodes().forEach((node) => {
+          const stepId = node.data('stepId');
+          const row = wfGraphOverlayByStep[stepId];
+          node.removeClass(WF_GRAPH_OVERLAY_NODE_CLASSES);
+          const base = node.data('baseLabel') || node.data('label') || '';
+          if (!row) {
+            node.data('label', base);
+            return;
+          }
+          if (row.status) node.addClass(row.status);
+          if (row.runVerdict) {
+            const verdictClass = wfRunVerdictClass(row.runVerdict);
+            if (verdictClass) node.addClass(verdictClass);
+          }
+          if (row.attentionLevel && row.attentionLevel !== 'none') node.addClass('attention-' + row.attentionLevel);
+          if (Array.isArray(row.riskSignals) && row.riskSignals.length) node.addClass('has-run-risk');
+          if ((Number(row.readyWidth) > Number(row.concurrencyCap || 0)) || row.deferredByConcurrency || Number(row.queueWaitMs) > 0) node.addClass('has-run-concurrency');
+          if (Number(row.retries) > 0) node.addClass('has-run-retry');
+          if (Number(row.advisories) > 0 || Number(row.judgeVerdicts) > 0) node.addClass('has-run-advisory');
+          if (Number(row.approvalsRequested) > 0) node.addClass('has-run-approval');
+          if (Number(row.itemsFailed) > 0) node.addClass('has-run-failed-items');
+          if (Number(row.workerBranches) > 0) node.addClass('has-run-workers');
+          if (Number(row.externalWrites) > 0) node.addClass('has-run-writes');
+          const comparison = row.launchComparison || null;
+          if (comparison) {
+            if (comparison.attentionLevel === 'failed') node.addClass('launch-runtime-failed');
+            else if (comparison.attentionLevel === 'watch' || comparison.attentionLevel === 'blocked') node.addClass('launch-runtime-drift');
+            else if (Array.isArray(comparison.confirmedLaunchTools) && comparison.confirmedLaunchTools.length) node.addClass('launch-runtime-confirmed');
+          }
+          const efficiency = row.executionEfficiency || null;
+          if (efficiency) {
+            const issues = Array.isArray(efficiency.issueKinds) ? efficiency.issueKinds : [];
+            if (issues.length) node.addClass('execution-drift');
+            if (efficiency.attentionLevel === 'blocked') node.addClass('execution-blocked');
+            if (efficiency.attentionLevel === 'failed') node.addClass('execution-failed');
+            if (issues.includes('concurrency_cap')) node.addClass('execution-capped');
+            if (issues.includes('fanout_underused') || issues.includes('fanout_worker_cap')) node.addClass('execution-fanout-underused');
+          }
+          const runLine = wfRunOverlayLine(row);
+          node.data('label', base + (runLine ? '\\n' + runLine : ''));
+        });
+        wfRenderRecoveryLineageGraph();
+      } catch (_) { /* ignore */ }
+    }
+    renderWorkflowRunCockpit();
+    const fallback = document.querySelectorAll('[data-wf-graph-step]');
+    fallback.forEach((li) => {
+      const row = wfGraphOverlayByStep[li.getAttribute('data-wf-graph-step') || ''];
+      let line = li.querySelector('[data-wf-graph-run]');
+      if (!line) {
+        line = document.createElement('span');
+        line.className = 'wf-graph-run';
+        line.setAttribute('data-wf-graph-run', '');
+        li.appendChild(line);
+      }
+      line.className = 'wf-graph-run' + (row && row.runVerdict ? ' ' + wfRunVerdictClass(row.runVerdict) : '');
+      line.textContent = row ? wfRunOverlayLine(row) : '';
+    });
+    wfRenderRecoveryLineageFallback();
+    const drawer = document.querySelector('[data-wf-step-drawer].open');
+    const drawerStep = drawer ? drawer.getAttribute('data-wf-step-drawer-id') : '';
+    if (drawerStep && wfGraphOverlayByStep[drawerStep]) openWfStepDrawer(drawerStep);
+  }
+
+  async function loadWorkflowGraphOverlay(runId) {
+    if (!runId || !wfSelectedName || wfIsNew) return;
+    const seq = ++wfGraphOverlaySeq;
+    try {
+      const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+        + '/runs/' + encodeURIComponent(runId) + '/graph-overlay');
+      if (seq !== wfGraphOverlaySeq) return;
+      applyWorkflowGraphOverlay(data);
+      try {
+        const ws = await fetchJSON('/api/console/workflows/' + encodeURIComponent(wfSelectedName)
+          + '/runs/' + encodeURIComponent(runId) + '/workspace');
+        if (seq === wfGraphOverlaySeq) renderWorkflowRunWorkspace(ws);
+      } catch (_) { /* workspace window is best-effort */ }
+    } catch (_) {
+      // Overlay is diagnostic. The run list / editor remain usable if this read fails.
+    }
+  }
+
+  async function renderWorkflowGraph(container, steps, serverGraph) {
+    if (!container) return;
+    const graph = wfGraphForRender(steps, serverGraph);
+    wfIndexGraph(graph);
     if (graph.nodes.length === 0) {
       container.innerHTML = '<div class="wf-graph-empty">No steps yet — add steps or ask Clem in chat to build this workflow.</div>';
       return;
@@ -17039,10 +19299,16 @@ const CONSOLE_JS = `
     if (!ok || typeof window.cytoscape !== 'function') {
       // Graceful fallback: a simple ordered list of steps.
       container.innerHTML = '<ol class="wf-graph-fallback">' + graph.nodes.map((n) =>
-        '<li data-wf-graph-step="' + escMem(n.id) + '">' + escMem(wfNodeBadges(n.flags) + n.label) + '</li>'
+        '<li data-wf-graph-step="' + escMem(n.id) + '"><strong>' + escMem(wfNodeBadges(n.flags) + n.label) + '</strong><span class="wf-graph-meta">' + escMem(wfNodeMetaLine(n.meta)) + '</span>' +
+        (wfNodeVerdictLine(n.verdict) ? '<span class="wf-graph-verdict ' + escMem(wfNodeVerdictClass(n.verdict)) + '">' + escMem(wfNodeVerdictLine(n.verdict)) + '</span>' : '') +
+        (wfNodePlanLine(n.plan) ? '<span class="wf-graph-plan ' + escMem(wfNodePlanClass(n.plan)) + '">' + escMem(wfNodePlanLine(n.plan)) + '</span>' : '') +
+        (wfNodeReadinessLine(n.readiness) ? '<span class="wf-graph-readiness ' + escMem(wfNodeReadinessClass(n.readiness)) + '">' + escMem(wfNodeReadinessLine(n.readiness)) + '</span>' : '') +
+        (wfNodeContractLine(n.contract) ? '<span class="wf-graph-readiness ' + escMem(wfNodeContractClass(n.contract)) + '">' + escMem(wfNodeContractLine(n.contract)) + '</span>' : '') +
+        '<span class="wf-graph-run" data-wf-graph-run></span></li>'
       ).join('') + '</ol>';
       Array.from(container.querySelectorAll('[data-wf-graph-step]')).forEach((li) =>
         li.addEventListener('click', () => openWfStepDrawer(li.getAttribute('data-wf-graph-step'))));
+      if (Object.keys(wfGraphOverlayByStep || {}).length) applyWorkflowGraphOverlay({ runId: wfGraphOverlayRunId, overlay: { summary: wfGraphOverlaySummary, goal: wfGraphOverlayGoal, launchComparison: wfGraphOverlayComparison, executionEfficiency: wfGraphOverlayExecutionEfficiency, recoveryIntent: wfGraphOverlayRecoveryIntent, recoveryLineage: wfGraphOverlayRecoveryLineage, steps: Object.values(wfGraphOverlayByStep) } });
       return;
     }
     container.innerHTML = '';
@@ -17057,7 +19323,30 @@ const CONSOLE_JS = `
     const fg3 = cv('--fg-3', '#6b6b78');
     const bg2 = cv('--bg-2', '#14141c');
     const elements = [];
-    graph.nodes.forEach((n) => elements.push({ data: { id: n.id, label: wfNodeBadges(n.flags) + n.label, stepId: n.id } }));
+    graph.nodes.forEach((n) => {
+      const metaLine = wfNodeMetaLine(n.meta);
+      const verdictLine = wfNodeVerdictLine(n.verdict);
+      const planLine = wfNodePlanLine(n.plan);
+      const readinessLine = wfNodeReadinessLine(n.readiness);
+      const contractLine = wfNodeContractLine(n.contract);
+      const baseLabel = wfNodeBadges(n.flags) + n.label
+        + (metaLine ? '\\n' + metaLine : '')
+        + (verdictLine ? '\\n' + verdictLine : '')
+        + (planLine ? '\\n' + planLine : '')
+        + (readinessLine ? '\\n' + readinessLine : '')
+        + (contractLine ? '\\n' + contractLine : '');
+      elements.push({
+        data: {
+          id: n.id,
+          label: baseLabel,
+          baseLabel: baseLabel,
+          stepId: n.id,
+          sideEffect: n.meta.sideEffect,
+          executor: n.meta.executor,
+        },
+        classes: wfNodeClasses(n),
+      });
+    });
     graph.edges.forEach((e) => elements.push({ data: { id: e.id, source: e.source, target: e.target } }));
     // Explicit roots = steps with no upstream dependency. Without this,
     // breadthfirst's auto root-detection throws ("reading 'x1'") on some
@@ -17082,6 +19371,18 @@ const CONSOLE_JS = `
           'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
           'text-max-width': 150, 'width': 172, 'height': 'label', 'padding': 12,
         } },
+        { selector: 'node.side-read', style: { 'border-color': accent2 } },
+        { selector: 'node.side-write', style: { 'border-color': accentWarn } },
+        { selector: 'node.side-send', style: { 'border-color': accentFail } },
+        { selector: 'node.exec-call', style: { 'font-weight': 700 } },
+        { selector: 'node.exec-deterministic', style: { 'font-weight': 700 } },
+        { selector: 'node.has-approval', style: { 'border-style': 'double', 'border-width': 3 } },
+        { selector: 'node.readiness-missing', style: { 'background-color': '#281117', 'border-color': accentFail, 'border-width': 3 } },
+        { selector: 'node.readiness-unknown', style: { 'background-color': '#221d10', 'border-color': accentWarn, 'border-width': 2 } },
+        { selector: 'node.contract-block', style: { 'background-color': '#281117', 'border-color': accentFail, 'border-width': 4 } },
+        { selector: 'node.contract-warn', style: { 'background-color': '#211f12', 'border-color': accentWarn, 'border-width': 3 } },
+        { selector: 'node.verdict-attention', style: { 'background-color': '#211f12', 'border-color': accentWarn, 'border-width': 3 } },
+        { selector: 'node.verdict-blocked', style: { 'background-color': '#281117', 'border-color': accentFail, 'border-width': 4 } },
         { selector: 'edge', style: {
           'width': 1.5, 'line-color': line, 'target-arrow-color': line,
           'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.9,
@@ -17090,6 +19391,50 @@ const CONSOLE_JS = `
         { selector: 'node.done', style: { 'border-color': accent2, 'border-width': 2 } },
         { selector: 'node.failed', style: { 'border-color': accentFail, 'border-width': 2 } },
         { selector: 'node.skipped', style: { 'color': fg3, 'border-color': line } },
+        { selector: 'node.run-verdict-proven', style: { 'background-color': '#10201b', 'border-color': accent2, 'border-width': 4 } },
+        { selector: 'node.run-verdict-attention', style: { 'background-color': '#211f12', 'border-color': accentWarn, 'border-width': 3 } },
+        { selector: 'node.run-verdict-blocked', style: { 'background-color': '#221d10', 'border-color': accentWarn, 'border-width': 4 } },
+        { selector: 'node.run-verdict-failed', style: { 'background-color': '#281117', 'border-color': accentFail, 'border-width': 4 } },
+        { selector: 'node.has-run-retry', style: { 'border-style': 'dashed' } },
+        { selector: 'node.has-run-advisory', style: { 'background-color': '#211f12' } },
+        { selector: 'node.has-run-approval', style: { 'border-width': 3 } },
+        { selector: 'node.has-run-failed-items', style: { 'border-color': accentFail, 'border-width': 3 } },
+        { selector: 'node.has-run-workers', style: { 'background-color': '#10201b' } },
+        { selector: 'node.has-run-writes', style: { 'border-color': accent, 'border-width': 3 } },
+        { selector: 'node.has-run-risk', style: { 'text-outline-color': '#000000', 'text-outline-width': 1 } },
+        { selector: 'node.has-run-concurrency', style: { 'border-style': 'dashed' } },
+        { selector: 'node.plan-critical', style: { 'border-color': accent, 'border-width': 3 } },
+        { selector: 'node.plan-parallel', style: { 'text-outline-color': '#000000', 'text-outline-width': 1 } },
+        { selector: 'node.plan-capped', style: { 'border-style': 'dashed' } },
+        { selector: 'node.has-plan-fanout', style: { 'background-color': '#10201b' } },
+        { selector: 'node.has-plan-gates', style: { 'border-style': 'double', 'border-width': 3 } },
+        { selector: 'node.model-pinned', style: { 'background-color': '#211f12', 'border-color': accentWarn } },
+        { selector: 'node.model-intent', style: { 'border-color': accent2 } },
+        { selector: 'node.launch-runtime-confirmed', style: { 'background-color': '#10201b' } },
+        { selector: 'node.launch-runtime-drift', style: { 'background-color': '#211f12', 'border-color': accentWarn, 'border-width': 3 } },
+        { selector: 'node.launch-runtime-failed', style: { 'background-color': '#281117', 'border-color': accentFail, 'border-width': 4 } },
+        { selector: 'node.execution-drift', style: { 'border-color': accentWarn, 'border-style': 'dashed', 'border-width': 3 } },
+        { selector: 'node.execution-blocked', style: { 'background-color': '#221d10', 'border-color': accentWarn, 'border-width': 4 } },
+        { selector: 'node.execution-failed', style: { 'background-color': '#281117', 'border-color': accentFail, 'border-width': 4 } },
+        { selector: 'node.execution-capped', style: { 'border-style': 'dashed' } },
+        { selector: 'node.execution-fanout-underused', style: { 'background-color': '#211f12' } },
+        { selector: 'node.recovery-run-node', style: {
+          'shape': 'round-rectangle', 'background-color': '#101b24', 'border-color': accent, 'border-width': 2,
+          'border-style': 'dashed', 'color': fg, 'font-size': 10, 'text-max-width': 130,
+          'width': 150, 'height': 'label', 'padding': 10,
+        } },
+        { selector: 'node.recovery-current', style: { 'border-color': accent2, 'border-width': 3 } },
+        { selector: 'node.recovery-failed', style: { 'background-color': '#281117', 'border-color': accentFail } },
+        { selector: 'node.recovery-running', style: { 'background-color': '#221d10', 'border-color': accentWarn } },
+        { selector: 'node.recovery-source-missing', style: { 'background-color': '#20121b', 'border-color': accentWarn, 'border-style': 'dotted' } },
+        { selector: 'edge.recovery-lineage-edge', style: {
+          'line-color': accent, 'target-arrow-color': accent, 'line-style': 'dashed', 'width': 2,
+          'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.8,
+        } },
+        { selector: 'edge.recovery-step-edge', style: { 'line-color': accentWarn, 'target-arrow-color': accentWarn } },
+        { selector: 'node.attention-watch', style: { 'background-color': '#211f12', 'border-color': accentWarn, 'border-width': 3 } },
+        { selector: 'node.attention-blocked', style: { 'background-color': '#221d10', 'border-color': accentWarn, 'border-width': 4 } },
+        { selector: 'node.attention-failed', style: { 'background-color': '#281117', 'border-color': accentFail, 'border-width': 4 } },
         { selector: 'node:selected', style: { 'border-color': accent, 'border-width': 2 } },
       ],
       // Construct without an auto-layout; we run breadthfirst explicitly
@@ -17099,13 +19444,21 @@ const CONSOLE_JS = `
       wheelSensitivity: 0.2, boxSelectionEnabled: false,
       userPanningEnabled: true, userZoomingEnabled: true,
     });
-    wfGraphCy.on('tap', 'node', (evt) => openWfStepDrawer(evt.target.data('stepId')));
+    wfGraphCy.on('tap', 'node', (evt) => {
+      const runId = evt.target.data('recoveryRunId');
+      if (runId && wfSelectedName) {
+        openWfRecoveryRunDrawer(runId);
+        return;
+      }
+      openWfStepDrawer(evt.target.data('stepId'));
+    });
     try {
       wfGraphCy.layout({ name: 'breadthfirst', directed: true, roots: rootSel || undefined, spacingFactor: 1.2, padding: 26, fit: true, grid: true }).run();
     } catch (_) {
       try { wfGraphCy.layout({ name: 'grid', fit: true, padding: 26 }).run(); } catch (__) { /* ignore */ }
     }
     wfGraphCy.ready(() => { try { wfGraphCy.resize(); wfGraphCy.fit(undefined, 26); } catch (_) { /* ignore */ } });
+    if (Object.keys(wfGraphOverlayByStep || {}).length) applyWorkflowGraphOverlay({ runId: wfGraphOverlayRunId, overlay: { summary: wfGraphOverlaySummary, goal: wfGraphOverlayGoal, launchComparison: wfGraphOverlayComparison, executionEfficiency: wfGraphOverlayExecutionEfficiency, recoveryIntent: wfGraphOverlayRecoveryIntent, recoveryLineage: wfGraphOverlayRecoveryLineage, steps: Object.values(wfGraphOverlayByStep) } });
   }
 
   // Paint live run status onto a node (called from applyStepEvent).
@@ -17124,6 +19477,12 @@ const CONSOLE_JS = `
     if (!wfDraft || !stepId) return;
     const step = (wfDraft.steps || []).find((s) => s.id === stepId);
     if (!step) return;
+    const graphNode = wfGraphNodeForStep(stepId);
+    const meta = graphNode && graphNode.meta ? graphNode.meta : wfStepGraphMeta(step);
+    const readiness = graphNode && graphNode.readiness ? graphNode.readiness : null;
+    const plan = graphNode && graphNode.plan ? graphNode.plan : wfEmptyNodePlan();
+    const contract = graphNode && graphNode.contract ? graphNode.contract : null;
+    const verdict = graphNode && graphNode.verdict ? graphNode.verdict : null;
     let drawer = document.querySelector('[data-wf-step-drawer]');
     if (!drawer) {
       drawer = document.createElement('div');
@@ -17132,20 +19491,51 @@ const CONSOLE_JS = `
       document.body.appendChild(drawer);
     }
     const flags = [];
+    flags.push('effect: ' + escMem(meta.sideEffect));
+    flags.push('executor: ' + escMem(meta.executor));
+    if (meta.tools.length) flags.push('tools: ' + escMem(meta.tools.slice(0, 4).join(', ')));
+    if (meta.callTool) flags.push('call: ' + escMem(meta.callTool));
+    if (meta.runner) flags.push('runner: ' + escMem(meta.runner));
+    if (meta.project) flags.push('project: ' + escMem(meta.project));
+    if (meta.outputType) flags.push('output: ' + escMem(meta.outputType));
+    if (meta.inputKeys.length) flags.push('inputs: ' + escMem(meta.inputKeys.join(', ')));
+    if (meta.approvalPreview) flags.push('approval: ' + escMem(meta.approvalPreview));
     if (step.forEach) flags.push('🔁 for each ' + escMem(String(step.forEach)));
     if (step.usesSkill) flags.push('🧩 skill: ' + escMem(step.usesSkill));
     if (step.deterministic) flags.push('⚙ deterministic');
     if (Array.isArray(step.dependsOn) && step.dependsOn.length) flags.push('depends on ' + step.dependsOn.map(escMem).join(', '));
+    if (wfNodePlanLine(plan)) flags.push('plan: ' + escMem(wfNodePlanLine(plan)));
+    if (wfNodeVerdictLine(verdict)) flags.push('verdict: ' + escMem(wfNodeVerdictLine(verdict)));
+    if (wfNodeReadinessLine(readiness)) flags.push('readiness: ' + escMem(wfNodeReadinessLine(readiness)));
+    if (wfNodeContractLine(contract)) flags.push('contract: ' + escMem(wfNodeContractLine(contract)));
+    const runOverlay = wfGraphOverlayByStep[stepId] || null;
+    if (runOverlay) flags.push('run: ' + escMem(wfRunOverlayLine(runOverlay)));
     const lastOut = document.querySelector('[data-wf-step-output="' + (window.CSS && CSS.escape ? CSS.escape(stepId) : stepId) + '"]');
+    drawer.setAttribute('data-wf-step-drawer-id', stepId);
     drawer.innerHTML = [
       '<div class="wf-drawer-head"><span>STEP · ' + escMem(stepId) + '</span><button class="wf-drawer-close" data-wf-drawer-close>✕</button></div>',
       flags.length ? '<div class="wf-drawer-flags">' + flags.join(' · ') + '</div>' : '',
+      wfNodeVerdictDrawer(verdict),
+      wfExecutionPlanDrawer(plan),
+      wfReadinessDrawer(readiness),
+      wfRunOverlayDrawer(runOverlay),
+      wfContractFixDrawer(stepId),
+      wfGraphRecoveryActions(stepId, runOverlay),
       '<div class="wf-drawer-sub">PROMPT</div><pre class="wf-drawer-pre">' + escMem(step.prompt || '') + '</pre>',
       lastOut && lastOut.textContent ? '<div class="wf-drawer-sub">LATEST OUTPUT</div><pre class="wf-drawer-pre">' + escMem(lastOut.textContent) + '</pre>' : '',
     ].join('');
     drawer.classList.add('open');
     const close = drawer.querySelector('[data-wf-drawer-close]');
     if (close) close.addEventListener('click', () => drawer.classList.remove('open'));
+    drawer.querySelectorAll('[data-wf-graph-action]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        handleWfGraphRecoveryAction(button).catch((err) => {
+          alert('Could not queue workflow recovery: ' + ((err && err.message) || err));
+        });
+      });
+    });
+    bindWfContractFixButtons(drawer);
   }
 
   function renderEditor() {
@@ -17200,8 +19590,13 @@ const CONSOLE_JS = `
     // by default; the editable form is revealed by the EDIT toggle.
     const visual = [
       '<div class="wf-visual">',
+      renderWorkflowProofCard(d.proof),
+      renderWorkflowExecutionPlanCard(d.executionPlan),
+      renderWorkflowDryRunCard(d.dryRunSimulation),
+      '<div class="wf-cockpit-card" data-wf-cockpit></div>',
+      '<div class="wf-workspace-card" data-wf-workspace></div>',
       d.summary ? '<div class="wf-visual-summary pe-md">' + renderTinyMarkdown(d.summary) + '</div>' : '',
-      '  <div class="wf-visual-head"><span>FLOW</span><span class="wf-visual-legend">🔁 loop · 🔒 approval · 🧩 skill · ⚙ deterministic</span></div>',
+      '  <div class="wf-visual-head"><span>FLOW</span><span class="wf-visual-run-summary" data-wf-graph-overlay-summary></span><span class="wf-visual-legend">READ/WRITE/SEND · CALL/DETERMINISTIC/MODEL · 🔁 loop · 🔒 approval · 🧩 skill</span></div>',
       '  <div class="wf-graph" data-wf-graph><div class="wf-graph-empty">— rendering flow —</div></div>',
       '  <button type="button" class="wf-edit-toggle" data-wf-edit-toggle>✎ EDIT WORKFLOW</button>',
       '</div>',
@@ -17216,15 +19611,22 @@ const CONSOLE_JS = `
       '    <span class="hint">A clear description helps the agent pick the right workflow.</span>',
       '  </div>',
 
+      '  <div class="wf-field">',
+      '    <label>PROJECT</label>',
+      '    <input data-wf-field="project" type="text" value="' + escMem(d.project || '') + '" spellcheck="false" placeholder="workspace project name or path" />',
+      '  </div>',
+
       '  <div class="wf-field wf-schedule">',
       '    <label>SCHEDULE</label>',
            renderSchedulePicker(d.triggerSchedule),
       '    <input type="hidden" data-wf-field="triggerSchedule" value="' + escMem(d.triggerSchedule) + '" />',
-      '    <span class="hint" data-sched-summary>' + escMem(describeCron(d.triggerSchedule)) + '</span>',
-      '  </div>',
+	      '    <span class="hint" data-sched-summary>' + escMem(describeCron(d.triggerSchedule)) + '</span>',
+	      '  </div>',
 
-      '  <div class="wf-field">',
-      '    <label>STEPS · ' + d.steps.length + '</label>',
+           renderWorkflowGoalEditor(d.goal),
+
+	      '  <div class="wf-field">',
+	      '    <label>STEPS · ' + d.steps.length + '</label>',
       '    <div class="wf-steps" data-wf-steps>',
            d.steps.map((s, i) => renderStep(s, i, stepIds)).join(''),
       '    </div>',
@@ -17254,6 +19656,7 @@ const CONSOLE_JS = `
 
     wf.editor.innerHTML = head + controls + (wfIsNew ? '' : visual) + runSummary + body;
     bindEditorEvents();
+    bindWfContractFixButtons(wf.editor);
     bindSchedulePicker(wf.editor);
     refreshWorkflowRuns();
     // Render the flow diagram (skip for brand-new drafts — nothing to show
@@ -17263,7 +19666,7 @@ const CONSOLE_JS = `
       if (bodyEl) bodyEl.hidden = false;
     } else {
       const graphEl = wf.editor.querySelector('[data-wf-graph]');
-      if (graphEl) renderWorkflowGraph(graphEl, d.steps);
+      if (graphEl) renderWorkflowGraph(graphEl, d.steps, d.graph);
       const toggle = wf.editor.querySelector('[data-wf-edit-toggle]');
       const bodyEl = wf.editor.querySelector('[data-wf-edit-body]');
       if (toggle && bodyEl) {
@@ -17394,6 +19797,8 @@ const CONSOLE_JS = `
     return flat.length > 140 ? flat.slice(0, 140) + '…' : (flat || '(empty)');
   }
 
+  const RUN_GOAL_STEP_ID = '(run goal)';
+
   function buildRunInspectorModel(events) {
     const order = [];
     const byStep = {};
@@ -17425,7 +19830,7 @@ const CONSOLE_JS = `
       if (k === 'run_failed') { runFinishedAt = ev.t; runStatus = 'failed'; continue; }
       if (k === 'run_cancelled') { runFinishedAt = ev.t; runStatus = 'cancelled'; continue; }
       if (k === 'run_summary') { summary = ev.meta || {}; continue; }
-      if (!ev || !ev.stepId) continue;
+      if (!ev || !ev.stepId || ev.stepId === RUN_GOAL_STEP_ID) continue;
       const s = ensure(ev.stepId);
       if (k === 'step_started') { s.status = 'running'; s.startedAt = ev.t; }
       else if (k === 'step_completed') {
@@ -17535,7 +19940,182 @@ const CONSOLE_JS = `
     ].join('');
   }
 
-  function renderRunInspectorBody(model, workflowName, runId) {
+  function renderInspectorLaunchRuntimeComparison(comparison) {
+    if (!comparison) return '';
+    const attention = String(comparison.attentionLevel || 'none');
+    const statusClass = attention === 'failed' ? 'fail' : attention === 'watch' || attention === 'blocked' ? 'warn' : 'ok';
+    const badge = attention === 'failed' ? 'RUNTIME FAILED' : attention === 'watch' || attention === 'blocked' ? 'RUNTIME DRIFT' : 'RUNTIME MATCH';
+    const metrics = [
+      Number.isFinite(Number(comparison.launchToolCount)) ? String(comparison.launchToolCount) + ' launch tools' : '',
+      Number.isFinite(Number(comparison.launchIssueCount)) ? String(comparison.launchIssueCount) + ' launch issues' : '',
+      Number.isFinite(Number(comparison.runtimeToolCount)) ? String(comparison.runtimeToolCount) + ' runtime tools' : '',
+    ].filter(Boolean);
+    const rows = [
+      ['confirmed', comparison.confirmedLaunchTools],
+      ['unobserved', comparison.unconfirmedLaunchTools],
+      ['runtime only', comparison.runtimeOnlyTools],
+      ['failed', comparison.failedTools],
+      ['risk hit', comparison.preflightRiskHits],
+    ].filter((row) => Array.isArray(row[1]) && row[1].length);
+    const notes = Array.isArray(comparison.notes) ? comparison.notes.slice(0, 4) : [];
+    return [
+      '<div class="wf-insp-launch-compare ' + escMem(statusClass) + '">',
+      '  <div class="wf-insp-launch-compare-head">',
+      '    <span class="wf-insp-launch-compare-badge">' + escMem(badge) + '</span>',
+      metrics.map((m) => '<span class="wf-insp-launch-metric">' + escMem(m) + '</span>').join(''),
+      '  </div>',
+      notes.map((note) => '<div class="wf-insp-launch-compare-note">' + escMem(note) + '</div>').join(''),
+      rows.map((row) => '<div class="wf-insp-launch-compare-row"><strong>' + escMem(row[0]) + '</strong> ' + escMem(row[1].slice(0, 8).join(' · ')) + '</div>').join(''),
+      '</div>',
+    ].join('');
+  }
+
+  function renderInspectorLaunchReadiness(readiness, comparison) {
+    if (!readiness) return '';
+    const blockers = Array.isArray(readiness.blockers) ? readiness.blockers.filter(Boolean) : [];
+    const warnings = Array.isArray(readiness.warnings) ? readiness.warnings.filter(Boolean) : [];
+    const toolReadiness = readiness.toolReadiness || {};
+    const statusClass = readiness.ok ? (warnings.length ? 'warn' : 'ok') : 'block';
+    const badge = readiness.ok ? (warnings.length ? 'READY WITH WARNINGS' : 'READY') : 'BLOCKED';
+    const metrics = [
+      readiness.scope ? 'scope ' + String(readiness.scope) : '',
+      readiness.targetStepId ? 'step ' + String(readiness.targetStepId) : '',
+      Number.isFinite(Number(toolReadiness.missingCount)) ? String(toolReadiness.missingCount) + ' missing' : '',
+      Number.isFinite(Number(toolReadiness.unknownCount)) ? String(toolReadiness.unknownCount) + ' unknown' : '',
+      readiness.checkedAt ? 'checked ' + String(readiness.checkedAt) : '',
+    ].filter(Boolean);
+    const items = blockers.concat(warnings).slice(0, 8);
+    return [
+      '<div class="wf-insp-launch ' + escMem(statusClass) + '">',
+      '  <div class="wf-insp-launch-head">',
+      '    <span class="wf-insp-launch-kicker">LAUNCH PREFLIGHT</span>',
+      '    <span class="wf-insp-launch-badge">' + escMem(badge) + '</span>',
+      metrics.map((m) => '<span class="wf-insp-launch-metric">' + escMem(m) + '</span>').join(''),
+      '  </div>',
+      items.length
+        ? '  <div class="wf-insp-launch-items">' + items.map((item) => '<div class="wf-insp-launch-item">' + escMem(workflowReadinessItemLine(item)) + '</div>').join('') + '</div>'
+        : '',
+      renderInspectorLaunchRuntimeComparison(comparison),
+      '</div>',
+    ].join('');
+  }
+
+  function renderInspectorGoalCard(goal, workflowName, runId) {
+    const lineage = Array.isArray(goal && goal.lineage) ? goal.lineage : [];
+    if (!goal || (!goal.status && !goal.reason && !(Array.isArray(goal.attempts) && goal.attempts.length) && lineage.length === 0)) return '';
+    const status = String(goal.status || 'unknown');
+    if (status === 'unknown' && !goal.reason && !(Array.isArray(goal.attempts) && goal.attempts.length) && lineage.length === 0) return '';
+    const statusClass = status.toLowerCase().replace(new RegExp('[^a-z0-9_-]', 'g'), '');
+    const metrics = [];
+    if (Number.isFinite(Number(goal.successRatePercent))) metrics.push('score ' + String(goal.successRatePercent) + '%');
+    if (Number.isFinite(Number(goal.criteriaMet)) && Number.isFinite(Number(goal.criteriaTotal))) {
+      metrics.push('criteria ' + String(goal.criteriaMet) + '/' + String(goal.criteriaTotal));
+    }
+    if (Number.isFinite(Number(goal.attempt)) && Number.isFinite(Number(goal.maxAttempts))) {
+      metrics.push('attempt ' + String(goal.attempt) + '/' + String(goal.maxAttempts));
+    }
+    if (goal.judgeFailedOpen) metrics.push('judge failed open');
+    if (goal.requeueRunId) metrics.push('requeue ' + String(goal.requeueRunId));
+    const failed = Array.isArray(goal.failedCriteria) ? goal.failedCriteria.filter(Boolean).slice(0, 8) : [];
+    const actions = [];
+    if (goal.requeueRunId) {
+      actions.push('<button type="button" class="wf-insp-goal-action" data-wf-goal-open-run="' + escMem(goal.requeueRunId) + '" data-wf-goal-workflow="' + escMem(workflowName) + '">OPEN REQUEUE</button>');
+    } else if (status === 'repursue') {
+      actions.push('<button type="button" class="wf-insp-goal-action" data-wf-goal-rerun="' + escMem(runId) + '" data-wf-goal-workflow="' + escMem(workflowName) + '">RE-RUN SAFELY</button>');
+    }
+    const lineageHtml = lineage.length > 1
+      ? [
+        '<div class="wf-insp-goal-lineage">',
+        '  <div class="wf-insp-goal-lineage-head">ATTEMPT LINEAGE</div>',
+        lineage.map((entry) => {
+          const entryStatus = String(entry.goalStatus || entry.status || 'pending');
+          const entryClass = entryStatus.toLowerCase().replace(new RegExp('[^a-z0-9_-]', 'g'), '');
+          const meta = [
+            Number.isFinite(Number(entry.successRatePercent)) ? String(entry.successRatePercent) + '%' : '',
+            Number.isFinite(Number(entry.criteriaMet)) && Number.isFinite(Number(entry.criteriaTotal)) ? String(entry.criteriaMet) + '/' + String(entry.criteriaTotal) + ' criteria' : '',
+            Number.isFinite(Number(entry.attempt)) && Number.isFinite(Number(entry.maxAttempts)) ? 'attempt ' + String(entry.attempt) + '/' + String(entry.maxAttempts) : '',
+          ].filter(Boolean).join(' · ');
+          const canOpen = entry.runId && entry.runId !== runId;
+          return [
+            '<div class="wf-insp-goal-lineage-row status-' + escMem(entryClass || 'pending') + (entry.isCurrent ? ' current' : '') + '">',
+            '  <span class="wf-insp-goal-lineage-run">' + escMem(entry.runId || '') + (entry.isCurrent ? ' · current' : '') + '</span>',
+            '  <span class="wf-insp-goal-lineage-status">' + escMem(entryStatus.toUpperCase()) + '</span>',
+            '  <span class="wf-insp-goal-lineage-meta">' + escMem(meta || entry.reason || '') + '</span>',
+            canOpen ? '  <button type="button" class="wf-insp-goal-action" data-wf-goal-open-run="' + escMem(entry.runId) + '" data-wf-goal-workflow="' + escMem(workflowName) + '">OPEN</button>' : '',
+            '</div>',
+          ].join('');
+        }).join(''),
+        '</div>',
+      ].join('')
+      : '';
+    return [
+      '<div class="wf-insp-goal status-' + escMem(statusClass || 'unknown') + '">',
+      '  <div class="wf-insp-goal-head">',
+      '    <span class="wf-insp-goal-kicker">RUN GOAL JUDGE</span>',
+      '    <span class="wf-insp-goal-badge">' + escMem(status.toUpperCase()) + '</span>',
+      metrics.map((m) => '<span class="wf-insp-goal-metric">' + escMem(m) + '</span>').join(''),
+      '  </div>',
+      goal.reason ? '  <div class="wf-insp-goal-reason">' + escMem(goal.reason) + '</div>' : '',
+      failed.length ? '  <ul class="wf-insp-goal-failed">' + failed.map((item) => '<li>' + escMem(item) + '</li>').join('') + '</ul>' : '',
+      goal.feedbackPreview ? '  <pre class="wf-insp-goal-feedback">' + escMem(goal.feedbackPreview) + '</pre>' : '',
+      actions.length ? '  <div class="wf-insp-goal-actions">' + actions.join('') + '</div>' : '',
+      lineageHtml,
+      renderInspectorAttempts(Array.isArray(goal.attempts) ? goal.attempts : []),
+      '</div>',
+    ].join('');
+  }
+
+  function renderInspectorRecoveryIntent(intent, lineage, workflowName, runId) {
+    const rows = Array.isArray(lineage) ? lineage : [];
+    if ((!intent || !intent.kind) && rows.length === 0) return '';
+    const kind = String((intent && intent.kind) || 'recovery').replace(new RegExp('_', 'g'), ' ').toUpperCase();
+    const metrics = [
+      intent && intent.sourceRunId ? 'from run ' + String(intent.sourceRunId) : '',
+      intent && intent.sourceStepId ? 'step ' + String(intent.sourceStepId) : '',
+      intent && intent.requestedFrom ? 'requested from ' + String(intent.requestedFrom) : '',
+      intent && intent.createdAt ? 'created ' + String(intent.createdAt) : '',
+      rows.length > 1 ? String(rows.length) + ' linked runs' : '',
+    ].filter(Boolean);
+    const lineageHtml = rows.length > 0
+      ? [
+        '<div class="wf-insp-goal-lineage">',
+        '  <div class="wf-insp-goal-lineage-head">RECOVERY LINEAGE</div>',
+        rows.map((entry) => {
+          const entryKind = String(entry.kind || entry.status || 'run');
+          const entryClass = entryKind.toLowerCase().replace(new RegExp('[^a-z0-9_-]', 'g'), '');
+          const meta = [
+            entry.sourceStepId ? 'step ' + String(entry.sourceStepId) : '',
+            entry.requestedFrom ? 'from ' + String(entry.requestedFrom) : '',
+            entry.sourceRunId ? 'source ' + String(entry.sourceRunId) : '',
+            entry.reason ? String(entry.reason) : '',
+          ].filter(Boolean).join(' · ');
+          const canOpen = entry.runId && entry.runId !== runId && !entry.sourceMissing;
+          return [
+            '<div class="wf-insp-goal-lineage-row status-' + escMem(entryClass || 'pending') + (entry.isCurrent ? ' current' : '') + '">',
+            '  <span class="wf-insp-goal-lineage-run">' + escMem(entry.runId || '') + (entry.isCurrent ? ' · current' : '') + (entry.sourceMissing ? ' · missing' : '') + '</span>',
+            '  <span class="wf-insp-goal-lineage-status">' + escMem(entryKind.replace(new RegExp('_', 'g'), ' ').toUpperCase()) + '</span>',
+            '  <span class="wf-insp-goal-lineage-meta">' + escMem(meta || entry.status || '') + '</span>',
+            canOpen ? '  <button type="button" class="wf-insp-goal-action" data-wf-recovery-open-run="' + escMem(entry.runId) + '" data-wf-recovery-workflow="' + escMem(workflowName) + '">OPEN</button>' : '',
+            '</div>',
+          ].join('');
+        }).join(''),
+        '</div>',
+      ].join('')
+      : '';
+    return [
+      '<div class="wf-insp-launch warn">',
+      '  <div class="wf-insp-launch-head">',
+      '    <span class="wf-insp-launch-kicker">RECOVERY INTENT</span>',
+      '    <span class="wf-insp-launch-badge">' + escMem(kind) + '</span>',
+      metrics.map((m) => '<span class="wf-insp-launch-metric">' + escMem(m) + '</span>').join(''),
+      '  </div>',
+      intent && intent.reason ? '  <div class="wf-insp-launch-items"><div class="wf-insp-launch-item">' + escMem(intent.reason) + '</div></div>' : '',
+      lineageHtml,
+      '</div>',
+    ].join('');
+  }
+
+  function renderRunInspectorBody(model, workflowName, runId, overlayGoal, launchReadiness, launchComparison, recoveryIntent, recoveryLineage) {
     const stepRows = model.steps.length
       ? model.steps.map((s) => {
         const dur = (s.startedAt && s.finishedAt)
@@ -17599,6 +20179,9 @@ const CONSOLE_JS = `
       overallDur ? '    <span class="wf-insp-meta-dur">' + escMem(overallDur) + '</span>' : '',
       '  </div>',
       renderInspectorSummary(model.summary),
+      renderInspectorRecoveryIntent(recoveryIntent, recoveryLineage, workflowName, runId),
+      renderInspectorLaunchReadiness(launchReadiness, launchComparison),
+      renderInspectorGoalCard(overlayGoal, workflowName, runId),
       '  <div class="wf-insp-steps">' + stepRows + '</div>',
       '</div>',
     ].join('');
@@ -17624,13 +20207,86 @@ const CONSOLE_JS = `
     const onKey = (e) => { if (e.key === 'Escape') cleanup(); };
     document.addEventListener('keydown', onKey);
     overlay.addEventListener('click', (e) => {
-      if (e.target === overlay || (e.target instanceof HTMLElement && e.target.closest('[data-close]'))) cleanup();
+      const target = e.target instanceof HTMLElement ? e.target : null;
+      if (e.target === overlay || (target && target.closest('[data-close]'))) cleanup();
+      const openRun = target && target.closest('[data-wf-goal-open-run]');
+      if (openRun) {
+        e.preventDefault();
+        const nextRunId = openRun.getAttribute('data-wf-goal-open-run');
+        const nextWorkflow = openRun.getAttribute('data-wf-goal-workflow') || workflowName;
+        if (nextRunId && nextWorkflow) {
+          cleanup();
+          openRunInspector(nextWorkflow, nextRunId);
+        }
+        return;
+      }
+      const openRecoveryRun = target && target.closest('[data-wf-recovery-open-run]');
+      if (openRecoveryRun) {
+        e.preventDefault();
+        const nextRunId = openRecoveryRun.getAttribute('data-wf-recovery-open-run');
+        const nextWorkflow = openRecoveryRun.getAttribute('data-wf-recovery-workflow') || workflowName;
+        if (nextRunId && nextWorkflow) {
+          cleanup();
+          openRunInspector(nextWorkflow, nextRunId);
+        }
+        return;
+      }
+      const rerun = target && target.closest('[data-wf-goal-rerun]');
+      if (rerun) {
+        e.preventDefault();
+        const sourceRunId = rerun.getAttribute('data-wf-goal-rerun') || runId;
+        const sourceWorkflow = rerun.getAttribute('data-wf-goal-workflow') || workflowName;
+        const original = rerun.textContent;
+        rerun.disabled = true;
+        rerun.textContent = 'QUEUEING';
+        const endpoint = '/api/console/board/workflow/' + encodeURIComponent(sourceWorkflow)
+          + '/runs/' + encodeURIComponent(sourceRunId) + '/resume-safe';
+        fetch(withToken(endpoint), {
+          method: 'POST',
+          headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            recoveryIntent: {
+              kind: 'goal_rerun',
+              sourceRunId: sourceRunId,
+              requestedFrom: 'inspector',
+              reason: 'run goal judge requested a safe rerun',
+            },
+          }),
+        })
+          .then(async (r) => {
+            const body = await r.json().catch(() => ({}));
+            if (!r.ok || !body.ok) throw new Error(body.reason || body.message || ('HTTP ' + r.status));
+            if (body.id) {
+              try { await refreshWorkflowRuns(); } catch (_) {}
+              if (wfMode === 'board') { try { await loadWorkflowBoard({ silent: true }); } catch (_) {} }
+              cleanup();
+              openRunInspector(sourceWorkflow, body.id);
+            } else {
+              rerun.textContent = body.status ? String(body.status).toUpperCase() : 'QUEUED';
+            }
+          })
+          .catch((err) => {
+            rerun.disabled = false;
+            rerun.textContent = original || 'RE-RUN SAFELY';
+            alert('Could not re-run workflow safely: ' + ((err && err.message) || err));
+          });
+        return;
+      }
     });
     try {
-      const data = await fetchJSON('/api/console/workflows/' + encodeURIComponent(workflowName)
-        + '/runs/' + encodeURIComponent(runId) + '/events');
+      const base = '/api/console/workflows/' + encodeURIComponent(workflowName)
+        + '/runs/' + encodeURIComponent(runId);
+      const [data, overlayData] = await Promise.all([
+        fetchJSON(base + '/events'),
+        fetchJSON(base + '/graph-overlay').catch(() => null),
+      ]);
       const model = buildRunInspectorModel(Array.isArray(data.events) ? data.events : []);
-      overlay.innerHTML = renderRunInspectorBody(model, workflowName, runId);
+      const goal = overlayData && overlayData.overlay ? overlayData.overlay.goal : null;
+      const launchReadiness = overlayData && overlayData.overlay ? overlayData.overlay.launchReadiness : null;
+      const launchComparison = overlayData && overlayData.overlay ? overlayData.overlay.launchComparison : null;
+      const recoveryIntent = overlayData && overlayData.overlay ? overlayData.overlay.recoveryIntent : null;
+      const recoveryLineage = overlayData && overlayData.overlay ? overlayData.overlay.recoveryLineage : [];
+      overlay.innerHTML = renderRunInspectorBody(model, workflowName, runId, goal, launchReadiness, launchComparison, recoveryIntent, recoveryLineage);
     } catch (err) {
       overlay.innerHTML = [
         '<div class="wf-run-modal wf-insp-modal" role="dialog" aria-modal="true">',
@@ -17996,7 +20652,83 @@ const CONSOLE_JS = `
         btn.classList.toggle('on');
         recompute();
       });
-    });
+	    });
+	  }
+
+  function clampWorkflowGoalAttempts(value) {
+    const n = Math.floor(Number(value));
+    if (!Number.isFinite(n)) return 3;
+    return Math.max(1, Math.min(10, n));
+  }
+
+  function workflowGoalDraft(goal) {
+    const raw = goal && typeof goal === 'object' ? goal : {};
+    const criteria = Array.isArray(raw.successCriteria)
+      ? raw.successCriteria
+      : (Array.isArray(raw.success_criteria) ? raw.success_criteria : []);
+    return {
+      objective: typeof raw.objective === 'string' ? raw.objective : '',
+      successCriteria: criteria.map((item) => String(item ?? '')).filter((item) => item.trim()),
+      maxAttempts: clampWorkflowGoalAttempts(raw.maxAttempts ?? raw.max_attempts ?? 3),
+    };
+  }
+
+  function workflowGoalHasDraft(goal) {
+    const draft = workflowGoalDraft(goal);
+    return !!(draft.objective.trim() || draft.successCriteria.some((item) => item.trim()));
+  }
+
+  function workflowGoalPayloadForSave(goal) {
+    const draft = workflowGoalDraft(goal);
+    const objective = draft.objective.trim();
+    if (objective.length < 4) return null;
+    return {
+      objective,
+      successCriteria: draft.successCriteria.map((item) => item.trim()).filter(Boolean),
+      maxAttempts: draft.maxAttempts,
+    };
+  }
+
+  function renderWorkflowGoalEditor(goal) {
+    const draft = workflowGoalDraft(goal);
+    const criteria = draft.successCriteria.join('\\n');
+    return [
+      '  <div class="wf-field wf-goal-field">',
+      '    <label>RUN GOAL JUDGE</label>',
+      '    <div class="wf-goal-grid">',
+      '      <div>',
+      '        <textarea data-wf-goal-field="objective" rows="2" spellcheck="false" placeholder="What must be true before this workflow counts as complete?">' + escMem(draft.objective) + '</textarea>',
+      '        <span class="hint">This is the workflow-level contract the runner judges after execution.</span>',
+      '      </div>',
+      '      <div class="wf-goal-attempts">',
+      '        <input data-wf-goal-field="maxAttempts" type="number" min="1" max="10" value="' + escMem(String(draft.maxAttempts)) + '" />',
+      '        <span class="hint">attempt cap</span>',
+      '      </div>',
+      '    </div>',
+      '    <textarea data-wf-goal-field="successCriteria" rows="3" spellcheck="false" placeholder="One success criterion per line">' + escMem(criteria) + '</textarea>',
+      '    <div class="wf-goal-actions">',
+      '      <span class="hint">Leave blank for a one-pass workflow. Add criteria when the run should repair/retry until judged complete.</span>',
+      '      <button type="button" class="wf-goal-clear" data-wf-action="clear-goal">CLEAR GOAL</button>',
+      '    </div>',
+      '  </div>',
+    ].join('');
+  }
+
+  function syncWorkflowGoalFromEditor() {
+    if (!wfDraft || !wf.editor) return;
+    const objectiveEl = wf.editor.querySelector('[data-wf-goal-field="objective"]');
+    const criteriaEl = wf.editor.querySelector('[data-wf-goal-field="successCriteria"]');
+    const attemptsEl = wf.editor.querySelector('[data-wf-goal-field="maxAttempts"]');
+    const objective = objectiveEl ? String(objectiveEl.value || '') : '';
+    const criteria = criteriaEl
+      ? String(criteriaEl.value || '').split(/\\r?\\n/).map((line) => line.trim()).filter(Boolean)
+      : [];
+    const maxAttempts = attemptsEl ? clampWorkflowGoalAttempts(attemptsEl.value) : 3;
+    if (!objective.trim() && criteria.length === 0) {
+      wfDraft.goal = null;
+      return;
+    }
+    wfDraft.goal = { objective, successCriteria: criteria, maxAttempts };
   }
 
   function renderInputsList(inputs) {
@@ -18037,6 +20769,7 @@ const CONSOLE_JS = `
     const chips = [];
     if (step.forEach) chips.push('<span class="step-chip chip-forEach" title="Runs once per item in &quot;' + escMem(step.forEach) + '&quot;">⇢ forEach ' + escMem(step.forEach) + '</span>');
     if (step.deterministic && step.deterministic.runner) chips.push('<span class="step-chip chip-deterministic" title="Runs a script — no LLM call">⚙ ' + escMem(step.deterministic.runner) + '</span>');
+    if (step.project) chips.push('<span class="step-chip chip-project">project: ' + escMem(step.project) + '</span>');
     if (deps.length > 0) {
       chips.push('<span class="step-chip chip-deps">↑ depends on ' + escMem(deps.join(', ')) + '</span>');
     }
@@ -18121,19 +20854,22 @@ const CONSOLE_JS = `
         wfDraft[key] = input.value;
       });
     });
-    wf.editor.querySelectorAll('[data-wf-step-field]').forEach((input) => {
-      input.addEventListener('input', () => {
-        const idx = parseInt(input.getAttribute('data-wf-step-index'), 10);
-        const field = input.getAttribute('data-wf-step-field');
-        if (Number.isFinite(idx) && wfDraft.steps[idx]) {
-          wfDraft.steps[idx][field] = input.value;
-        }
-      });
+	    wf.editor.querySelectorAll('[data-wf-step-field]').forEach((input) => {
+	      input.addEventListener('input', () => {
+	        const idx = parseInt(input.getAttribute('data-wf-step-index'), 10);
+	        const field = input.getAttribute('data-wf-step-field');
+	        if (Number.isFinite(idx) && wfDraft.steps[idx]) {
+	          wfDraft.steps[idx][field] = input.value;
+	        }
+	      });
+	    });
+    wf.editor.querySelectorAll('[data-wf-goal-field]').forEach((input) => {
+      input.addEventListener('input', syncWorkflowGoalFromEditor);
     });
-    // Dependency pill toggles
-    wf.editor.querySelectorAll('.dep-pill').forEach((pill) => {
-      pill.addEventListener('click', () => {
-        const stepId = pill.getAttribute('data-wf-step-id');
+	    // Dependency pill toggles
+	    wf.editor.querySelectorAll('.dep-pill').forEach((pill) => {
+	      pill.addEventListener('click', () => {
+	        const stepId = pill.getAttribute('data-wf-step-id');
         const depId = pill.getAttribute('data-wf-dep');
         const step = wfDraft.steps.find((s) => s.id === stepId);
         if (!step) return;
@@ -18199,11 +20935,11 @@ const CONSOLE_JS = `
           renderEditor();
           return;
         }
-        if (action === 'add-input') {
-          if (!wfDraft.inputs) wfDraft.inputs = {};
-          let n = Object.keys(wfDraft.inputs).length + 1;
-          let k = 'input_' + n;
-          while (wfDraft.inputs[k] !== undefined) { n++; k = 'input_' + n; }
+	        if (action === 'add-input') {
+	          if (!wfDraft.inputs) wfDraft.inputs = {};
+	          let n = Object.keys(wfDraft.inputs).length + 1;
+	          let k = 'input_' + n;
+	          while (wfDraft.inputs[k] !== undefined) { n++; k = 'input_' + n; }
           wfDraft.inputs[k] = '';
           renderEditor();
           return;
@@ -18213,12 +20949,20 @@ const CONSOLE_JS = `
           if (name && wfDraft.inputs) {
             delete wfDraft.inputs[name];
             renderEditor();
-          }
+	          }
+	          return;
+	        }
+        if (action === 'clear-goal') {
+          wfDraft.goal = null;
+          wf.editor.querySelectorAll('[data-wf-goal-field]').forEach((field) => {
+            if (field.getAttribute('data-wf-goal-field') === 'maxAttempts') field.value = '3';
+            else field.value = '';
+          });
           return;
         }
-        if (action === 'step-remove' && Number.isFinite(idx)) {
-          wfDraft.steps.splice(idx, 1);
-          renderEditor();
+	        if (action === 'step-remove' && Number.isFinite(idx)) {
+	          wfDraft.steps.splice(idx, 1);
+	          renderEditor();
           return;
         }
         if (action === 'step-up' && idx > 0) {
@@ -18326,7 +21070,7 @@ const CONSOLE_JS = `
   // The runner respects this hint and only fires that step. We then
   // poll the events endpoint (added in this redesign) for live status
   // updates that drive the per-step pill + output panel.
-  async function tryStep(step) {
+  async function tryStep(step, recoveryIntent) {
     if (wfIsNew || !wfSelectedName) {
       alert('Save the workflow first — TRY requires the SKILL.md on disk.');
       return;
@@ -18337,7 +21081,11 @@ const CONSOLE_JS = `
       const r = await fetch(withToken('/api/console/workflows/' + encodeURIComponent(wfSelectedName) + '/run'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetStepId: step.id, inputs: {} }),
+        body: JSON.stringify({
+          targetStepId: step.id,
+          inputs: {},
+          ...(recoveryIntent ? { recoveryIntent: recoveryIntent } : {}),
+        }),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
@@ -18378,6 +21126,7 @@ const CONSOLE_JS = `
           applyStepEvent(ev);
           wfActiveRunLastEventAt = ev.t;
         }
+        if (events.length > 0) await loadWorkflowGraphOverlay(wfActiveRunId);
         // Stop polling once the run reaches a terminal kind.
         const terminal = events.some((ev) =>
           ev.kind === 'run_completed' || ev.kind === 'run_failed' || ev.kind === 'run_cancelled',
@@ -18439,23 +21188,33 @@ const CONSOLE_JS = `
     }
   }
 
-  async function saveWorkflow() {
-    if (!wfDraft) return;
-    try {
-      if (wfIsNew) {
-        const r = await fetch(withToken('/api/console/workflows'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+	  async function saveWorkflow() {
+	    if (!wfDraft) return;
+	    try {
+      syncWorkflowGoalFromEditor();
+      const goalPayload = workflowGoalPayloadForSave(wfDraft.goal);
+      if (workflowGoalHasDraft(wfDraft.goal) && !goalPayload) {
+        renderValidation({ ok: false, errors: ['Run goal judge objective must be at least 4 characters.'], warnings: [], stepCount: wfDraft.steps.length, hasCycles: false });
+        return;
+      }
+      wfDraft.goal = goalPayload;
+	      if (wfIsNew) {
+	        const r = await fetch(withToken('/api/console/workflows'), {
+	          method: 'POST',
+	          headers: { 'Content-Type': 'application/json' },
+	          body: JSON.stringify({
             name: wfDraft.name,
             description: wfDraft.description,
+            project: wfDraft.project || undefined,
             enabled: wfDraft.enabled,
-            triggerSchedule: wfDraft.triggerSchedule || undefined,
-            steps: wfDraft.steps,
+	            triggerSchedule: wfDraft.triggerSchedule || undefined,
+	            steps: wfDraft.steps,
             synthesisPrompt: wfDraft.synthesisPrompt || undefined,
-            inputs: wfDraft.inputs,
-          }),
-        });
+            goal: goalPayload || undefined,
+	            inputs: wfDraft.inputs,
+            resources: wfDraft.resources || undefined,
+	          }),
+	        });
         if (!r.ok) {
           const j = await r.json().catch(() => ({}));
           renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
@@ -18469,13 +21228,17 @@ const CONSOLE_JS = `
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             description: wfDraft.description,
-            triggerSchedule: wfDraft.triggerSchedule || undefined,
-            clearTriggerSchedule: !wfDraft.triggerSchedule,
-            steps: wfDraft.steps,
-            synthesisPrompt: wfDraft.synthesisPrompt,
-            inputs: wfDraft.inputs,
-          }),
-        });
+            project: wfDraft.project || '',
+	            triggerSchedule: wfDraft.triggerSchedule || undefined,
+	            clearTriggerSchedule: !wfDraft.triggerSchedule,
+	            steps: wfDraft.steps,
+	            synthesisPrompt: wfDraft.synthesisPrompt,
+            goal: goalPayload || undefined,
+            clearGoal: !goalPayload,
+	            inputs: wfDraft.inputs,
+            resources: wfDraft.resources || undefined,
+	          }),
+	        });
         if (!r.ok) {
           const j = await r.json().catch(() => ({}));
           renderValidation({ ok: false, errors: [j.error || ('HTTP ' + r.status)], warnings: [], stepCount: 0, hasCycles: false });
@@ -18544,6 +21307,7 @@ const CONSOLE_JS = `
       renderValidation({ ok: true, errors: [], warnings: [], stepCount: 0, hasCycles: false }, dryRun ? ('DRY-RUN QUEUED · ' + j.id) : ('QUEUED · ' + j.id));
       // Refresh the runs list so the user sees their new run land.
       refreshWorkflowRuns();
+      if (j.id) startActiveRunPolling(j.id);
     } catch (err) {
       renderValidation({ ok: false, errors: [err.message || String(err)], warnings: [], stepCount: 0, hasCycles: false });
     }
@@ -18614,10 +21378,12 @@ const CONSOLE_JS = `
       const runs = data.runs || [];
       if (summarySlot) summarySlot.outerHTML = renderWorkflowRunSummary(runs);
       if (runs.length === 0) {
+        clearWorkflowGraphOverlay();
         slot.innerHTML = '<div class="wf-runs-empty">— no runs yet. Click RUN ▶ to kick one off. —</div>';
         bindWorkflowRunCancelButtons(wf.editor);
         return;
       }
+      loadWorkflowGraphOverlay(runs[0].id);
       slot.innerHTML = [
         '<div class="wf-runs-head">RECENT RUNS</div>',
         '<ol class="wf-runs-list">',
@@ -19048,8 +21814,78 @@ const CONSOLE_JS = `
   function applyDiff(currentDraft, ops) {
     const warnings = [];
     const base = currentDraft || {
-      name: 'new-workflow', description: '', enabled: false,
-      triggerSchedule: '', steps: [], inputs: {}, synthesisPrompt: '',
+      name: 'new-workflow', description: '', project: '', enabled: false,
+      triggerSchedule: '', steps: [], inputs: {}, resources: {}, synthesisPrompt: '', goal: null,
+    };
+    const cloneValue = (value) => {
+      if (value === undefined) return undefined;
+      if (value === null) return null;
+      try { return JSON.parse(JSON.stringify(value)); } catch (_) { return value; }
+    };
+    const objectOrNull = (value) => value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    const stringOrNull = (value) => typeof value === 'string' ? value.trim() : null;
+    const copyStringField = (target, source, outKey, keys, allowClear) => {
+      for (const key of keys) {
+        if (!(key in source)) continue;
+        const value = source[key];
+        if ((value === null || value === '') && allowClear) delete target[outKey];
+        else {
+          const text = stringOrNull(value);
+          if (text) target[outKey] = text;
+        }
+        return;
+      }
+    };
+    const copyBooleanField = (target, source, outKey, keys, allowClear) => {
+      for (const key of keys) {
+        if (!(key in source)) continue;
+        const value = source[key];
+        if (typeof value === 'boolean') target[outKey] = value;
+        else if (value === null && allowClear) delete target[outKey];
+        return;
+      }
+    };
+    const copyObjectField = (target, source, outKey, keys, allowClear) => {
+      for (const key of keys) {
+        if (!(key in source)) continue;
+        const value = source[key];
+        if (value === null && allowClear) delete target[outKey];
+        else if (objectOrNull(value)) target[outKey] = cloneValue(value);
+        return;
+      }
+    };
+    const applyRichStepFields = (target, source, allowClear) => {
+      if (!source || typeof source !== 'object') return;
+      const allowedTools = Array.isArray(source.allowed_tools) ? source.allowed_tools
+        : Array.isArray(source.allowedTools) ? source.allowedTools : null;
+      if (allowedTools) {
+        target.allowedTools = allowedTools.filter((tool) => typeof tool === 'string' && tool.trim()).map((tool) => tool.trim());
+      } else if (allowClear && ('allowed_tools' in source || 'allowedTools' in source) && (source.allowed_tools === null || source.allowedTools === null)) {
+        delete target.allowedTools;
+      }
+      copyStringField(target, source, 'project', ['project'], allowClear);
+      copyStringField(target, source, 'model', ['model'], allowClear);
+      copyStringField(target, source, 'intent', ['intent'], allowClear);
+      copyStringField(target, source, 'forEach', ['forEach', 'for_each'], allowClear);
+      copyStringField(target, source, 'usesSkill', ['usesSkill', 'uses_skill'], allowClear);
+      copyStringField(target, source, 'approvalPreview', ['approvalPreview', 'approval_preview'], allowClear);
+      if ('sideEffect' in source || 'side_effect' in source) {
+        const raw = source.sideEffect !== undefined ? source.sideEffect : source.side_effect;
+        if (raw === null && allowClear) delete target.sideEffect;
+        else if (raw === 'read' || raw === 'write' || raw === 'send') target.sideEffect = raw;
+      }
+      if (typeof source.tier === 'number') target.tier = source.tier;
+      else if (source.tier === null && allowClear) delete target.tier;
+      if (typeof source.maxTurns === 'number') target.maxTurns = source.maxTurns;
+      else if (source.maxTurns === null && allowClear) delete target.maxTurns;
+      copyBooleanField(target, source, 'forEachNewOnly', ['forEachNewOnly', 'for_each_new_only'], allowClear);
+      copyBooleanField(target, source, 'requiresApproval', ['requiresApproval', 'requires_approval'], allowClear);
+      copyBooleanField(target, source, 'loopSafe', ['loopSafe', 'loop_safe'], allowClear);
+      copyObjectField(target, source, 'call', ['call'], allowClear);
+      copyObjectField(target, source, 'deterministic', ['deterministic'], allowClear);
+      copyObjectField(target, source, 'inputs', ['inputs'], allowClear);
+      copyObjectField(target, source, 'output', ['output'], allowClear);
+      copyObjectField(target, source, 'loopUntil', ['loopUntil', 'loop_until'], allowClear);
     };
     // Deep-ish clone — steps + inputs are the parts that get mutated.
     const draft = {
@@ -19058,11 +21894,17 @@ const CONSOLE_JS = `
         ...s,
         dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn.slice() : [],
         allowedTools: Array.isArray(s.allowedTools) ? s.allowedTools.slice() : s.allowedTools,
+        call: cloneValue(s.call),
+        deterministic: cloneValue(s.deterministic),
+        inputs: cloneValue(s.inputs),
+        output: cloneValue(s.output),
+        loopUntil: cloneValue(s.loopUntil),
       })),
       inputs: { ...(base.inputs || {}) },
+      resources: cloneValue(base.resources || {}),
     };
     const findStepIndex = (id) => draft.steps.findIndex((s) => s.id === id);
-    const SET_FIELD_PATHS = { name: 1, description: 1, triggerSchedule: 1, enabled: 1, whenToUse: 1 };
+    const SET_FIELD_PATHS = { name: 1, description: 1, project: 1, triggerSchedule: 1, enabled: 1, whenToUse: 1 };
 
     for (const op of ops) {
       if (!op || typeof op !== 'object') { warnings.push('skipped malformed op'); continue; }
@@ -19082,16 +21924,15 @@ const CONSOLE_JS = `
           // Same snake/camel tolerance for uses_skill.
           const usesSkill = typeof step.uses_skill === 'string' ? step.uses_skill.trim()
             : typeof step.usesSkill === 'string' ? step.usesSkill.trim() : '';
-          draft.steps.push({
+          const nextStep = {
             id: step.id,
             prompt: typeof step.prompt === 'string' ? step.prompt : '',
             dependsOn: Array.isArray(step.dependsOn) ? step.dependsOn.slice() : [],
-            ...(step.model ? { model: step.model } : {}),
-            ...(step.forEach ? { forEach: step.forEach } : {}),
-            ...(step.deterministic ? { deterministic: step.deterministic } : {}),
             ...(allowedTools ? { allowedTools } : {}),
             ...(usesSkill ? { usesSkill } : {}),
-          });
+          };
+          applyRichStepFields(nextStep, step, false);
+          draft.steps.push(nextStep);
           break;
         }
         case 'update_step': {
@@ -19102,6 +21943,10 @@ const CONSOLE_JS = `
           if (Array.isArray(patch.dependsOn)) draft.steps[idx].dependsOn = patch.dependsOn.slice();
           if (Array.isArray(patch.allowed_tools)) draft.steps[idx].allowedTools = patch.allowed_tools.slice();
           else if (Array.isArray(patch.allowedTools)) draft.steps[idx].allowedTools = patch.allowedTools.slice();
+          if ('project' in patch) {
+            if (patch.project === null || patch.project === '') delete draft.steps[idx].project;
+            else if (typeof patch.project === 'string') draft.steps[idx].project = patch.project.trim();
+          }
           if (typeof patch.model === 'string') draft.steps[idx].model = patch.model;
           if (typeof patch.forEach === 'string') draft.steps[idx].forEach = patch.forEach;
           if (patch.deterministic !== undefined) draft.steps[idx].deterministic = patch.deterministic;
@@ -19111,6 +21956,7 @@ const CONSOLE_JS = `
             if (next === null || next === '') delete draft.steps[idx].usesSkill;
             else if (typeof next === 'string') draft.steps[idx].usesSkill = next.trim();
           }
+          applyRichStepFields(draft.steps[idx], patch, true);
           break;
         }
         case 'remove_step': {
@@ -19163,6 +22009,19 @@ const CONSOLE_JS = `
         case 'remove_input': {
           if (typeof op.key !== 'string') { warnings.push('remove_input: invalid key'); break; }
           delete draft.inputs[op.key];
+          break;
+        }
+        case 'add_resource': {
+          if (typeof op.key !== 'string' || !op.key.trim()) { warnings.push('add_resource: invalid key'); break; }
+          const value = objectOrNull(op.value);
+          if (!value) { warnings.push('add_resource: invalid value for ' + op.key); break; }
+          if (!draft.resources || typeof draft.resources !== 'object') draft.resources = {};
+          draft.resources[op.key] = { id: op.key, ...cloneValue(value) };
+          break;
+        }
+        case 'remove_resource': {
+          if (typeof op.key !== 'string') { warnings.push('remove_resource: invalid key'); break; }
+          if (draft.resources && typeof draft.resources === 'object') delete draft.resources[op.key];
           break;
         }
         case 'set_synthesis': {
@@ -20600,6 +23459,11 @@ const CONSOLE_JS = `
         for (const f of Array.from((e.dataTransfer && e.dataTransfer.files) || [])) uploadHomeAttachment(f);
       });
     }
+    const saveWorkflowBtn = document.querySelector('[data-home-chat-save-workflow]');
+    if (saveWorkflowBtn) {
+      saveWorkflowBtn.addEventListener('click', () => saveCurrentChatAsWorkflow(saveWorkflowBtn));
+      updateHomeWorkflowSaveState();
+    }
     // STOP — abort the in-flight turn from the composer. The SEND button is
     // disabled while a turn streams, so this is the only stop affordance the
     // user has where they are. Hits the harness-session cancel endpoint AND
@@ -20738,6 +23602,11 @@ const CONSOLE_JS = `
     if (meta) meta.textContent = text || 'local session';
   }
 
+  function updateHomeWorkflowSaveState() {
+    const btn = document.querySelector('[data-home-chat-save-workflow]');
+    if (btn) btn.disabled = !__harnessSessionId;
+  }
+
   function setHomeHarnessSessionId(sessionId, label) {
     const next = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
     __harnessSessionId = next;
@@ -20751,6 +23620,7 @@ const CONSOLE_JS = `
     } else {
       updateHomeChatMeta('local session');
     }
+    updateHomeWorkflowSaveState();
   }
 
   function restoreHomeHarnessSessionId() {
@@ -20759,6 +23629,84 @@ const CONSOLE_JS = `
       const stored = localStorage.getItem(HOME_HARNESS_SESSION_KEY);
       if (stored) setHomeHarnessSessionId(stored, 'resume');
     } catch (_) {}
+    updateHomeWorkflowSaveState();
+  }
+
+  function suggestedWorkflowNameFromChat() {
+    const lastUser = [...homeChatHistory].reverse().find((turn) => turn && turn.role === 'user' && String(turn.text || '').trim());
+    const seed = String(lastUser?.text || '')
+      .split('📎')[0]
+      .split(' ')
+      .map((part) => part.startsWith('http://') || part.startsWith('https://') ? 'link' : part)
+      .join(' ');
+    const cleaned = Array.from(seed).map((ch) => /[a-zA-Z0-9 -]/.test(ch) ? ch : ' ').join('');
+    const words = cleaned
+      .split(' ')
+      .filter((word) => word.length > 1 && !/^(please|could|would|make|show|give|tell|what|with|from|this|that|into)$/i.test(word))
+      .slice(0, 7);
+    const title = words
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ')
+      .trim();
+    return title || 'Saved Chat Workflow';
+  }
+
+  async function saveCurrentChatAsWorkflow(button) {
+    const sessionId = __harnessSessionId;
+    if (!sessionId) {
+      alert('Run something in chat first, then save that session as a workflow.');
+      return;
+    }
+    const proposed = suggestedWorkflowNameFromChat();
+    const entered = prompt('Name this workflow draft:', proposed);
+    if (entered == null) return;
+    const name = entered.trim();
+    if (!name) return;
+
+    const original = button ? button.textContent : '';
+    if (button) { button.disabled = true; button.textContent = 'SAVING'; }
+    try {
+      const r = await fetchWithToken('/api/console/workflows/from-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ name, sessionId }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+
+      const proof = body.proof || {};
+      const pieces = [
+        'Saved draft workflow "' + (body.name || name) + '" from ' + (body.toolCallCount || 0) + ' action' + (body.toolCallCount === 1 ? '' : 's') + '.',
+        'Status: ' + (proof.label || 'DRAFT') + ' — disabled until reviewed.',
+        body.summary || '',
+      ].filter(Boolean);
+      const turn = appendChatTurn('assistant', pieces.join('\\n\\n'));
+      setChatTurnStatus(turn, 'workflow draft saved');
+      const textBody = turn?.querySelector?.('[data-home-chat-turn-text]');
+      if (textBody) {
+        const actions = document.createElement('div');
+        actions.className = 'home-chat-turn-actions';
+        const open = document.createElement('button');
+        open.type = 'button';
+        open.textContent = 'Open workflow';
+        open.addEventListener('click', async () => {
+          switchPanel('workflows');
+          location.hash = 'workflows/' + encodeURIComponent(body.name || name);
+          try { await refreshWorkflowList(); } catch (_) {}
+          setTimeout(() => { try { selectWorkflowByName(body.name || name); } catch (_) {} }, 100);
+        });
+        actions.appendChild(open);
+        textBody.appendChild(actions);
+      }
+      try { await refreshWorkflowList({ skipReselect: true }); } catch (_) {}
+    } catch (err) {
+      alert('Could not save workflow: ' + ((err && err.message) || err));
+    } finally {
+      if (button) {
+        button.textContent = original || 'WORKFLOW';
+        updateHomeWorkflowSaveState();
+      }
+    }
   }
 
   function harnessModeOn() {

@@ -69,6 +69,13 @@ test('codeModeMandateDirective: fires on a data-heavy turn (MCP servers in scope
   assert.match(codeModeMandateDirective({ allowAllMcp: true }), /run_tool_program/);
 });
 
+test('codeModeMandateDirective: fan-out-shaped turns keep Code Mode silent so run_worker can win', () => {
+  assert.equal(
+    codeModeMandateDirective({ mcpServersInScope: 2, fanoutPreferred: true }),
+    '',
+  );
+});
+
 test('codeModeMandateDirective: mentions composio_execute_tool only when writes are on', () => {
   const prev = process.env.CLEMMY_CODE_MODE_WRITES;
   try {

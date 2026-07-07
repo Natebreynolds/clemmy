@@ -48,11 +48,20 @@ export function Composer({
         continue;
       }
       setAttachments((p) => [...p, { localId, name: file.name, status: 'uploading' }]);
-      void uploadAttachment(file).then((res) => {
-        setAttachments((p) => p.map((a) => a.localId === localId
-          ? (res.ok ? { ...a, status: 'ready', id: res.id } : { ...a, status: 'error', error: res.error })
-          : a));
-      });
+      void uploadAttachment(file)
+        .then((res) => {
+          setAttachments((p) => p.map((a) => a.localId === localId
+            ? (res.ok ? { ...a, status: 'ready', id: res.id } : { ...a, status: 'error', error: res.error })
+            : a));
+        })
+        .catch(() => {
+          // A network-level reject (offline, dropped socket) otherwise leaves the
+          // chip spinning forever and blocks Send. Mark it errored so it can be
+          // removed via its X and no longer counts as an in-flight upload.
+          setAttachments((p) => p.map((a) => a.localId === localId
+            ? { ...a, status: 'error', error: 'Upload failed' }
+            : a));
+        });
     }
   }, []);
 
@@ -81,6 +90,9 @@ export function Composer({
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Don't send while an IME composition is active (Japanese/Chinese/Korean) —
+    // the Enter that commits candidates would otherwise fire the message.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       submit();

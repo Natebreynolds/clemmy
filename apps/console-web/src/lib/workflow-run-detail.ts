@@ -24,7 +24,7 @@ export interface WorkflowRunAdvisory {
   note: string;
 }
 
-export type WorkflowStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+export type WorkflowStepStatus = 'pending' | 'running' | 'done' | 'blocked' | 'failed' | 'skipped';
 
 export interface WorkflowRunStep {
   stepId: string;
@@ -172,13 +172,23 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
         s.status = 'running';
         s.startedAt = t;
         break;
-      case 'step_completed':
-        s.status = 'done';
+      case 'step_completed': {
+        // A step that finalized as BLOCKED ({blocked:true,reason}) is NOT a
+        // success — the runner tags meta.blocked so we render it as its own
+        // warning-tone status with the block reason, instead of painting it
+        // green like a real completion.
         s.finishedAt = t;
-        s.output = outputText(ev.output);
+        if (meta.blocked === true) {
+          s.status = 'blocked';
+          s.error = str(asMeta(ev.output).reason) || 'Blocked — the step could not produce its deliverable.';
+        } else {
+          s.status = 'done';
+          s.output = outputText(ev.output);
+        }
         if (num(meta.tokens) !== undefined) s.tokens = num(meta.tokens);
         if (num(meta.costUsd) !== undefined) s.costUsd = num(meta.costUsd);
         break;
+      }
       case 'step_failed':
         s.status = 'failed';
         s.finishedAt = t;

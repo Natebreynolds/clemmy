@@ -452,6 +452,10 @@ class ModelRouteMetricsModel implements Model {
         },
       });
     }
+    // NOTE: success/cancelled latency + token breakdown is already emitted as a
+    // `model_call_completed` operational event by usage-log.ts (with durationMs,
+    // firstByteMs, cachedInputTokens, contextWindowTokens, promptComponents) —
+    // richer than a duplicate here would be. Query THAT for latency analysis.
   }
 }
 

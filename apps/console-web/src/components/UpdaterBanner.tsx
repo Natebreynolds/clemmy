@@ -112,7 +112,7 @@ export function UpdaterBanner() {
   const cardBg = tone === 'ready' ? 'bg-primary-tint' : 'bg-surface';
   const btnClass = tone === 'ready'
     ? 'bg-primary text-primary-fg hover:bg-primary-hover'
-    : 'bg-surface border border-black/10 text-fg hover:bg-black/5';
+    : 'bg-surface border border-border text-fg hover:bg-subtle';
 
   // Unobtrusive floating chip pinned bottom-left — only mounts on an actionable
   // state (we returned null above otherwise), so it simply isn't there when
@@ -122,7 +122,7 @@ export function UpdaterBanner() {
       role="status"
       aria-live="polite"
       title={text}
-      className={`fixed bottom-4 left-4 z-50 flex max-w-xs items-center gap-2 rounded-xl border border-black/10 px-3 py-2 text-sm text-fg shadow-warm-halo ${cardBg}`}
+      className={`fixed bottom-4 left-4 z-50 flex max-w-xs items-center gap-2 rounded-xl border border-border px-3 py-2 text-sm text-fg shadow-warm-halo ${cardBg}`}
     >
       <span aria-hidden className="shrink-0">{icon}</span>
       <span className="min-w-0 truncate">{text}</span>

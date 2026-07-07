@@ -115,6 +115,7 @@ function detokenize(prompt: string): string {
   return prompt
     .replace(/\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?\s*\}\}/g, 'the result of "$1"')
     .replace(/\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g, 'the $1')
+    .replace(/\{\{\s*project\.([a-zA-Z0-9_-]+)\s*\}\}/g, 'the project $1')
     .replace(/\{\{\s*item\.([a-zA-Z0-9_.-]+)\s*\}\}/g, "each item's $1")
     .replace(/\{\{\s*item\s*\}\}/g, 'each item')
     .replace(/\{\{\s*date\s*\}\}/g, "today's date")
@@ -135,6 +136,7 @@ export function shortStepLabel(prompt: string): string {
 function stepAnnotations(step: WorkflowStepInput): string[] {
   const notes: string[] = [];
   if (step.forEach) notes.push(`once for each item from "${step.forEach}"`);
+  if (step.project) notes.push(`uses project "${step.project}"`);
   const skill = step.usesSkill ?? (step as { uses_skill?: string }).uses_skill;
   if (skill) notes.push(`uses the "${skill}" skill`);
   if (step.deterministic?.runner) notes.push('runs a script (no AI)');
@@ -183,6 +185,7 @@ export function deriveStepDataSources(step: WorkflowStepInput): string[] {
   if (step.allowedTools && step.allowedTools.length > 0) {
     out.push(`allowed tools: ${step.allowedTools.join(', ')}`);
   }
+  if (step.project) out.push(`project: ${step.project}`);
 
   // 2) Concrete tool/connector references INSIDE the prompt (general patterns,
   //    no vendor list): MCP tool names, Composio-style ALL_CAPS slugs
@@ -201,6 +204,7 @@ export function deriveStepDataSources(step: WorkflowStepInput): string[] {
   const flow = new Set<string>();
   for (const m of prompt.matchAll(/\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output[^}]*\}\}/g)) flow.add(`steps.${m[1]}`);
   for (const m of prompt.matchAll(/\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g)) flow.add(`input.${m[1]}`);
+  for (const m of prompt.matchAll(/\{\{\s*project\.([a-zA-Z0-9_-]+)\s*\}\}/g)) flow.add(`project.${m[1]}`);
   if (step.forEach) flow.add(`forEach ${step.forEach}`);
   if (/\{\{\s*item[.\s}]/.test(prompt)) flow.add('item');
   if (flow.size > 0) out.push(`data flow: ${[...flow].join(', ')}`);
@@ -262,6 +266,7 @@ export function describeWorkflowPlainEnglish(def: WorkflowDefinition): string {
   lines.push('');
   lines.push(`⏰ **When:** ${describeSchedule(def)}`);
   lines.push(`📥 **Needs:** ${describeInputs(def)}`);
+  if (def.project) lines.push(`🗂 **Project:** ${def.project}`);
   lines.push(`📤 **Produces:** ${describeProduces(def)}`);
   lines.push('');
   const steps = def.steps ?? [];
@@ -283,6 +288,7 @@ export function describeWorkflowOneLine(def: WorkflowDefinition): string {
   );
   const when = def.trigger?.schedule ? describeCron(def.trigger.schedule) : 'on demand';
   const bits = [`${when}`, `${stepCount} step${stepCount === 1 ? '' : 's'}`];
+  if (def.project) bits.push(`project ${def.project}`);
   if (gated) bits.push('pauses for approval');
   if (def.enabled === false) bits.push('paused');
   return `${def.name} — ${bits.join(' · ')}`;

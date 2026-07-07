@@ -760,10 +760,16 @@ test('openMemoryDb self-heals after a direct close of the cached handle', () => 
 
 test('mergeParaphrases leaves the shared db connection usable', async () => {
   const { mergeParaphrases } = await import('./memory-merge.js');
+  const prevMerge = process.env.CLEMMY_MERGE_ENABLED;
   process.env.CLEMMY_MERGE_ENABLED = 'true';
-  await mergeParaphrases();
-  const db = openMemoryDb();
-  assert.equal(db.open, true, 'nightly merge must not close the singleton');
-  const f = rememberFact({ kind: 'project', content: 'Post-merge write probe.' });
-  assert.ok(getFact(f.id), 'memory writes still work after the merge job');
+  try {
+    await mergeParaphrases();
+    const db = openMemoryDb();
+    assert.equal(db.open, true, 'nightly merge must not close the singleton');
+    const f = rememberFact({ kind: 'project', content: 'Post-merge write probe.' });
+    assert.ok(getFact(f.id), 'memory writes still work after the merge job');
+  } finally {
+    // Don't leak the flag to memory-merge.test.ts later in the single-process suite.
+    if (prevMerge === undefined) delete process.env.CLEMMY_MERGE_ENABLED; else process.env.CLEMMY_MERGE_ENABLED = prevMerge;
+  }
 });

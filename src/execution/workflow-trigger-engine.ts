@@ -176,7 +176,7 @@ export function syncWorkflowTriggerRegistry(): { synced: number; removed: number
 export interface WorkflowTriggerFireResult {
   workflowName: string;
   triggerId: string;
-  status: 'queued' | 'duplicate_run' | 'deduped_event' | 'filtered' | 'error';
+  status: 'queued' | 'duplicate_run' | 'readiness_blocked' | 'deduped_event' | 'filtered' | 'error';
   runId?: string;
   message?: string;
 }
@@ -266,8 +266,13 @@ function fireTriggers(kind: 'webhook' | 'system_event', key: string, payload: un
       results.push({
         workflowName: row.workflow_name,
         triggerId: row.id,
-        status: queued.status === 'queued' ? 'queued' : 'duplicate_run',
+        status: queued.status === 'queued'
+          ? 'queued'
+          : queued.status === 'blocked_readiness'
+            ? 'readiness_blocked'
+            : 'duplicate_run',
         runId: queued.id,
+        message: queued.status === 'blocked_readiness' ? queued.message : undefined,
       });
       logger.info({ workflow: row.workflow_name, kind, key, runId: queued.id, status: queued.status }, 'workflow trigger fired');
     } catch (err) {

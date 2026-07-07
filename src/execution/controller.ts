@@ -1,13 +1,12 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
 import { MODELS } from '../config.js';
 import { refreshSessionBrief } from '../memory/session-briefs.js';
 import { SessionStore } from '../memory/session-store.js';
-import { WORKFLOWS_DIR } from '../memory/vault.js';
+import { listWorkflows } from '../memory/workflow-store.js';
 import { refreshWorkingMemory } from '../memory/working-memory.js';
 import { addNotification, getNotification } from '../runtime/notifications.js';
 import { actionBus } from '../runtime/action-bus.js';
@@ -28,6 +27,8 @@ import { ExecutionStore } from './store.js';
 import { isUserFacingExecution } from './scope.js';
 import { validateGoal, type GoalValidationResult } from './goal-validate.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
+import { normalizeWorkflowRunInputs } from './workflow-inputs.js';
+import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 
 const logger = pino({ name: 'clementine-next.execution-controller' });
 
@@ -39,7 +40,6 @@ export function _setExecutionCompletionJudgeForTests(fn: ObjectiveJudgeFn | null
 interface WorkflowSummary {
   name: string;
   enabled: boolean;
-  inputs?: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
 }
 
 interface ControllerAction {
@@ -229,24 +229,11 @@ function appendExecutionActivity(
 }
 
 function loadWorkflowSummaries(): WorkflowSummary[] {
-  if (!existsSync(WORKFLOWS_DIR)) return [];
-  const summaries: Array<WorkflowSummary | null> = readdirSync(WORKFLOWS_DIR)
-    .filter((entry) => entry.endsWith('.md'))
-    .map((file) => {
-      try {
-        const parsed = matter(readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8'));
-        return {
-          name: String(parsed.data.name ?? path.basename(file, '.md')),
-          enabled: parsed.data.enabled !== false,
-          inputs: typeof parsed.data.inputs === 'object' && parsed.data.inputs ? parsed.data.inputs as WorkflowSummary['inputs'] : undefined,
-        } satisfies WorkflowSummary;
-      } catch {
-        return null;
-      }
-    });
-
-  return summaries
-    .filter((entry): entry is WorkflowSummary => entry !== null)
+  return listWorkflows()
+    .map((entry) => ({
+      name: entry.data.name,
+      enabled: entry.data.enabled !== false,
+    }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
@@ -741,19 +728,12 @@ function createTaskForExecution(store: ExecutionStore, execution: ExecutionRecor
 }
 
 function queueWorkflow(store: ExecutionStore, execution: ExecutionRecord, workflow: string, inputs?: Record<string, string>): ExecutionRecord {
-  ensureDir(WORKFLOW_RUNS_DIR);
-  const runId = `${Date.now()}-${randomBytes(3).toString('hex')}`;
-  writeFileSync(
-    path.join(WORKFLOW_RUNS_DIR, `${runId}.json`),
-    JSON.stringify({
-      id: runId,
-      workflow,
-      inputs: inputs ?? {},
-      status: 'queued',
-      createdAt: new Date().toISOString(),
-    }, null, 2),
-    'utf-8',
-  );
+  const queued = queueWorkflowRun(workflow, normalizeWorkflowRunInputs(inputs ?? {}), {
+    source: 'execution-controller',
+    dedupe: false,
+  });
+  if (!queued.id) throw new Error(`Execution controller failed to queue workflow "${workflow}".`);
+  const runId = queued.id;
 
   logger.info({ executionId: execution.id, runId, workflow }, 'Execution controller queued workflow');
   let updatedExecution = store.update(execution.id, {

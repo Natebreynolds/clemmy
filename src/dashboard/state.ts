@@ -2,7 +2,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { BASE_DIR } from '../config.js';
-import { CRON_FILE, WORKFLOWS_DIR } from '../memory/vault.js';
+import { CRON_FILE } from '../memory/vault.js';
+import { listWorkflows } from '../memory/workflow-store.js';
 import { listNotificationDestinations, listNotifications, listQueuedNotificationDeliveries } from '../runtime/notifications.js';
 import { getWorkspaceDirs, listWorkspaceProjects, loadTeamAgents } from '../tools/shared.js';
 import { countDiscordSessions, listDiscordSessions } from '../channels/discord-store.js';
@@ -134,23 +135,15 @@ export function loadCronJobs(): CronJobRecord[] {
 }
 
 export function loadWorkflows(): WorkflowFile[] {
-  if (!existsSync(WORKFLOWS_DIR)) return [];
-  const workflows: WorkflowFile[] = [];
-  for (const file of readdirSync(WORKFLOWS_DIR).filter((entry) => entry.endsWith('.md'))) {
-    try {
-      const parsed = matter(readFileSync(path.join(WORKFLOWS_DIR, file), 'utf-8'));
-      workflows.push({
-        name: String(parsed.data.name ?? path.basename(file, '.md')),
-        description: String(parsed.data.description ?? ''),
-        enabled: parsed.data.enabled !== false,
-        trigger: typeof parsed.data.trigger === 'object' && parsed.data.trigger ? parsed.data.trigger as WorkflowFile['trigger'] : { manual: true },
-        steps: Array.isArray(parsed.data.steps) ? parsed.data.steps as WorkflowStepInput[] : [],
-      });
-    } catch {
-      continue;
-    }
-  }
-  return workflows.sort((left, right) => left.name.localeCompare(right.name));
+  return listWorkflows()
+    .map((entry) => ({
+      name: entry.data.name,
+      description: entry.data.description,
+      enabled: entry.data.enabled !== false,
+      trigger: entry.data.trigger ?? { manual: true },
+      steps: entry.data.steps.map((step) => ({ id: step.id, prompt: step.prompt })),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 export async function buildDashboardSnapshot() {

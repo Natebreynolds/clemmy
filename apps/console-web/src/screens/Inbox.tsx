@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, X, RefreshCw, Mail, Activity as ActivityIcon, BellRing, Send } from 'lucide-react';
+import { Check, X, RefreshCw, Mail, BellRing, Send } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -12,12 +12,19 @@ import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
-  listRuns, listNotifications, markNotificationRead, retryNotification,
-  relativeTime, statusTone, notifTone, notifFailed,
-  type ApprovalRow, type RunRow, type NotificationRow,
+  listNotifications, markNotificationRead, retryNotification,
+  relativeTime, notifTone, notifFailed,
+  type ApprovalRow, type NotificationRow,
 } from '@/lib/inbox';
 
-type Tab = 'needs' | 'activity' | 'notifications';
+/** Client mirror of the backend's needs-attention rule (runtime/notifications.ts)
+ *  — these are DECISIONS/blocks for the user, so they belong on the "Needs you"
+ *  tab beside approvals, not buried under general notifications. */
+function needsAttentionNotif(n: NotificationRow): boolean {
+  return /\bblocked\b|needs attention|needs input|couldn['\u2019]t finish|action required/i.test(n.title || '');
+}
+
+type Tab = 'needs' | 'notifications';
 
 export function Inbox() {
   const qc = useQueryClient();
@@ -26,26 +33,33 @@ export function Inbox() {
   // the default approvals tab showed an empty "all caught up" page).
   const [searchParams] = useSearchParams();
   const tabParam = searchParams.get('tab');
-  const initialTab: Tab = tabParam === 'notifications' || tabParam === 'activity' || tabParam === 'needs' ? tabParam : 'needs';
+  // 'activity' is gone (it duplicated the Tasks board) — legacy links map to notifications.
+  const initialTab: Tab = tabParam === 'notifications' || tabParam === 'activity' ? 'notifications' : 'needs';
   const [tab, setTab] = useState<Tab>(initialTab);
   const [selected, setSelected] = useState<string | null>(searchParams.get('select'));
   // Re-apply when the deep link changes while the screen stays mounted
   // (e.g. Home card → Inbox already open in the router tree).
   useEffect(() => {
-    if (tabParam === 'notifications' || tabParam === 'activity' || tabParam === 'needs') setTab(tabParam);
+    if (tabParam === 'notifications' || tabParam === 'activity') setTab('notifications');
+    else if (tabParam === 'needs') setTab('needs');
     const select = searchParams.get('select');
     if (select) setSelected(select);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
   const approvals = usePoll(['approvals'], listApprovals, 6000);
-  const runs = usePoll(['runs'], () => listRuns(40), 4000);
   const notifications = usePoll(['notifications'], listNotifications, 8000);
 
   const approvalRows = approvals.data?.approvals ?? [];
-  const runRows = runs.data?.runs ?? [];
   const notifRows = notifications.data?.notifications ?? [];
-  const unread = notifRows.filter((n) => !n.read).length;
+  // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
+  // beside approvals (and leave once read); everything else stays in Notifications.
+  const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n));
+  const attentionIds = new Set(attentionRows.map((n) => n.id));
+  const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
+  const needsCount = approvalRows.length + attentionRows.length;
+  const hasRows = (tab === 'needs' ? needsCount : plainNotifRows.length) > 0;
+  const unread = plainNotifRows.filter((n) => !n.read).length;
 
   const invalidate = (...keys: string[]) => keys.forEach((k) => void qc.invalidateQueries({ queryKey: [k] }));
 
@@ -60,24 +74,21 @@ export function Inbox() {
   const onRetry = async (id: string) => { try { await retryNotification(id); } finally { invalidate('notifications'); } };
 
   const tabs: { key: Tab; label: string; icon: typeof Mail; count: number }[] = [
-    { key: 'needs', label: 'Needs approval', icon: Mail, count: approvalRows.length },
-    { key: 'activity', label: 'Activity', icon: ActivityIcon, count: runRows.length },
+    { key: 'needs', label: 'Needs you', icon: Mail, count: needsCount },
     { key: 'notifications', label: 'Notifications', icon: BellRing, count: unread },
   ];
 
   const selApproval = approvalRows.find((a) => a.approvalId === selected);
-  const selRun = runRows.find((r) => r.id === selected);
   const selNotif = notifRows.find((n) => n.id === selected);
 
   const loading =
-    (tab === 'needs' && approvals.isLoading) ||
-    (tab === 'activity' && runs.isLoading) ||
+    (tab === 'needs' && (approvals.isLoading || notifications.isLoading)) ||
     (tab === 'notifications' && notifications.isLoading);
 
   return (
     <Page
       title="Inbox"
-      subtitle="Approvals, activity, and notifications — in one place"
+      subtitle="Decisions waiting on you, and updates from finished work"
       actions={tab === 'needs' && approvalRows.length > 0
         ? <Button variant="secondary" size="sm" onClick={onCancelStale}><RefreshCw className="h-4 w-4" aria-hidden /> Clear stale</Button>
         : undefined}
@@ -108,48 +119,52 @@ export function Inbox() {
         })}
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
+      {/* Hide the reading pane when the current tab has nothing to select — an
+          empty list beside an empty "select an item" box reads as a broken page. */}
+      <div className={cn('grid gap-4', hasRows && 'lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]')}>
         {/* List */}
         <div className="space-y-2">
           {loading && [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
 
-          {!loading && tab === 'needs' && (approvalRows.length === 0
-            ? <EmptyState title="You're all caught up" description="Nothing needs your approval right now." />
-            : approvalRows.map((a) => (
-              <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
-                onSelect={() => setSelected(a.approvalId)}
-                onApprove={() => onDecide(a.approvalId, 'approve')}
-                onReject={() => onDecide(a.approvalId, 'reject')} />
-            )))}
+          {!loading && tab === 'needs' && (needsCount === 0
+            ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
+            : (
+              <>
+                {approvalRows.map((a) => (
+                  <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
+                    onSelect={() => setSelected(a.approvalId)}
+                    onApprove={() => onDecide(a.approvalId, 'approve')}
+                    onReject={() => onDecide(a.approvalId, 'reject')} />
+                ))}
+                {attentionRows.map((n) => (
+                  <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
+                    title={n.title || n.body || 'Needs attention'} meta={relativeTime(n.createdAt)}
+                    tone={{ tone: 'warning', label: 'Needs attention' }} />
+                ))}
+              </>
+            ))}
 
-          {!loading && tab === 'activity' && (runRows.length === 0
-            ? <EmptyState title="Nothing here yet" description="Things Clementine does will show up here." />
-            : runRows.map((r) => (
-              <ListRow key={r.id} selected={selected === r.id} onSelect={() => setSelected(r.id)}
-                title={r.title || r.input || 'Untitled'} meta={[r.kind, relativeTime(r.updatedAt || r.createdAt)].filter(Boolean).join(' · ')}
-                tone={statusTone(r.runState || r.status)} />
-            )))}
-
-          {!loading && tab === 'notifications' && (notifRows.length === 0
+          {!loading && tab === 'notifications' && (plainNotifRows.length === 0
             ? <EmptyState title="No notifications" description="Updates from completed work will appear here." />
-            : notifRows.map((n) => (
+            : plainNotifRows.map((n) => (
               <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
                 title={n.title || n.body || 'Notification'} meta={relativeTime(n.createdAt)}
                 tone={notifTone(n)} dim={n.read} />
             )))}
         </div>
 
-        {/* Reading pane */}
-        <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
-          {selApproval && <ApprovalDetail row={selApproval} onApprove={() => onDecide(selApproval.approvalId, 'approve')} onReject={() => onDecide(selApproval.approvalId, 'reject')} />}
-          {selRun && <RunDetail row={selRun} />}
-          {selNotif && <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />}
-          {!selApproval && !selRun && !selNotif && (
-            <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
-              Select an item to see the details
-            </div>
-          )}
-        </div>
+        {/* Reading pane — only rendered when the tab has selectable rows. */}
+        {hasRows && (
+          <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
+            {selApproval && <ApprovalDetail row={selApproval} onApprove={() => onDecide(selApproval.approvalId, 'approve')} onReject={() => onDecide(selApproval.approvalId, 'reject')} />}
+            {selNotif && <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />}
+            {!selApproval && !selNotif && (
+              <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
+                Select an item to see the details
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </Page>
   );
@@ -254,22 +269,6 @@ function PendingActionDetail({ action }: { action: NonNullable<ApprovalRow['pend
   );
 }
 
-function RunDetail({ row }: { row: RunRow }) {
-  const tone = statusTone(row.runState || row.status);
-  return (
-    <div>
-      <div className="mb-3 flex items-center gap-2">
-        <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
-        <span className="text-caption text-faint">{relativeTime(row.updatedAt || row.createdAt)}</span>
-      </div>
-      <h3 className="mb-3 text-h3 text-fg">{row.title || 'Run'}</h3>
-      {row.input && <Field label="Asked"><span className="whitespace-pre-wrap">{linkify(row.input)}</span></Field>}
-      {row.outputPreview && <Field label="Result"><span className="whitespace-pre-wrap">{linkify(row.outputPreview)}</span></Field>}
-      {row.error && <Field label="Error"><span className="text-danger">{row.error}</span></Field>}
-      {row.kind && <Field label="Kind">{row.kind}</Field>}
-    </div>
-  );
-}
 
 function NotifDetail({ row, onRead, onRetry }: { row: NotificationRow; onRead: () => void; onRetry: () => void }) {
   const failed = notifFailed(row);

@@ -33,6 +33,8 @@ const {
   storeEpisodicPointer,
   listRecentEpisodicPointers,
   reflectOnToolReturn,
+  scheduleReflection,
+  _testOnly_reflectionPending,
   isSelfReferentialTool,
   REFLECTION_MIN_CONTENT_CHARS,
   EXTRACTOR_MAX_FACTS,
@@ -342,7 +344,10 @@ test('isSelfReferentialTool: denies Clementine introspective tools, keeps real-d
     'unified_recall',
     'goal_get', 'goal_list', 'goal_status',
     'space_get', 'space_get_runner', 'space_get_view', 'attempt_record',
+    // Clem's own scratchpad + ephemeral status pollers.
+    'focus_get', 'focus_set', 'focus_park', 'browser_harness_status',
     'MEMORY_READ', // case-insensitive
+    'FOCUS_GET',   // case-insensitive
   ]) {
     assert.equal(isSelfReferentialTool(t), true, `${t} should be denied`);
   }
@@ -380,6 +385,61 @@ test('reflectOnToolReturn: a self-tool return is skipped before the extractor (n
     assert.equal(res.factsWritten, 0, 'no fact written from a self-tool reflection');
   } finally {
     if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
+  }
+});
+
+test('reflectOnToolReturn: a focus_get return is skipped before the extractor (no model call)', async () => {
+  resetMemoryDb();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  const prevSelf = process.env.CLEMMY_REFLECT_SELF_TOOLS;
+  delete process.env.CLEMMY_REFLECTION;
+  delete process.env.CLEMMY_REFLECT_SELF_TOOLS;
+  try {
+    // focus_get returns the full plan/focus blob — well over the too_short gate,
+    // so ONLY the self_tool gate can produce the skip, and it returns BEFORE
+    // runExtractor (no model call, no 12-27s stall).
+    const longFocusBlob = 'plan step: gather data before validate. '.repeat(30);
+    const res = await reflectOnToolReturn({
+      sessionId: 'sess-focus',
+      callId: 'call-focus-1',
+      tool: 'focus_get',
+      output: longFocusBlob,
+    });
+    assert.equal(res.skipped, 'self_tool', 'focus_get must short-circuit as self_tool before the extractor');
+    assert.equal(res.factsWritten, 0, 'no fact written from a focus_get reflection');
+  } finally {
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
+  }
+});
+
+test('scheduleReflection: serial queue drains self-tool returns without concurrent extractor calls', async () => {
+  resetMemoryDb();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  const prevSerial = process.env.CLEMMY_REFLECTION_SERIAL;
+  const prevSelf = process.env.CLEMMY_REFLECT_SELF_TOOLS;
+  delete process.env.CLEMMY_REFLECTION;
+  delete process.env.CLEMMY_REFLECTION_SERIAL; // serial ON (default)
+  delete process.env.CLEMMY_REFLECT_SELF_TOOLS;
+  try {
+    // Enqueue several self-tool reflections. They short-circuit (self_tool) so
+    // no real model call fires, but they still exercise the FIFO chain: each
+    // increments pending on enqueue and decrements as the chain drains. After a
+    // microtask flush the queue must be fully drained (pending back to 0).
+    const longBlob = 'recalled fact: '.repeat(40);
+    for (let i = 0; i < 5; i += 1) {
+      scheduleReflection({ sessionId: 'sess-serial', callId: `c-${i}`, tool: 'focus_get', output: longBlob });
+    }
+    assert.ok(_testOnly_reflectionPending() > 0, 'reflections should be queued synchronously on enqueue');
+    // Let the serial chain drain.
+    for (let i = 0; i < 10 && _testOnly_reflectionPending() > 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(_testOnly_reflectionPending(), 0, 'serial queue must fully drain');
+  } finally {
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevSerial === undefined) delete process.env.CLEMMY_REFLECTION_SERIAL; else process.env.CLEMMY_REFLECTION_SERIAL = prevSerial;
     if (prevSelf === undefined) delete process.env.CLEMMY_REFLECT_SELF_TOOLS; else process.env.CLEMMY_REFLECT_SELF_TOOLS = prevSelf;
   }
 });

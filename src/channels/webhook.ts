@@ -35,6 +35,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { registerConsoleRoutes } from '../dashboard/console-routes.js';
 import { fireWorkflowWebhook, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
+import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
 import { isSpacesEnabled } from '../spaces/store.js';
@@ -200,6 +201,16 @@ function requireMobileSurfaceForMobileHost(
     return;
   }
   res.status(404).type('text/plain').send('Not found');
+}
+
+async function autoStartMobileTunnelIfConfigured(): Promise<void> {
+  const access = readMobileAccess();
+  if (!access.autoStart || !access.tunnel || access.tunnel.mode === 'quick') return;
+  const { startTunnel } = await import('../integrations/mobile-access.js');
+  const result = await startTunnel();
+  if (!result.ok) {
+    logger.warn({ error: result.error }, 'Mobile custom-domain tunnel auto-start failed');
+  }
 }
 
 function effectiveHarnessStatus(session: HarnessSessionRow, events: HarnessEventRow[]): string {
@@ -1273,9 +1284,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         res.status(400).send('Workflow is not runnable from the dashboard.');
         return;
       }
-      const id = `${Date.now()}-${randomUUID().slice(0, 8)}`;
-      mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
-      writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${id}.json`), JSON.stringify({ id, workflow: name, status: 'queued', createdAt: new Date().toISOString() }, null, 2), 'utf-8');
+      queueWorkflowRun(name, {}, { source: 'dashboard', dedupe: false });
     }
     const token = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
     redirectDashboard(res, token);
@@ -1961,5 +1970,8 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     server.on('error', (error) => {
       reject(error);
     });
+  });
+  void autoStartMobileTunnelIfConfigured().catch((err) => {
+    logger.warn({ err }, 'Mobile custom-domain tunnel auto-start failed');
   });
 }

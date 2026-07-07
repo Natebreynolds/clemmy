@@ -43,6 +43,13 @@ function brainFalloverEnabled(): boolean {
  *  default 75s) so a hung provider falls over to the next brain instead of dead-ending. */
 function brainFalloverFirstByteMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS', '') || '', 10);
+  // 60s: the fallover budget MUST stay strictly below the loop's first-byte stall
+  // watchdog (~75s) — otherwise the watchdog kills the turn before fallover can
+  // switch brains, DISABLING cross-brain fallover for a silent hang (the exact
+  // case it exists for; adversarial review 07-06 caught a 90s value regressing
+  // this). Giving high-effort turns more first-byte headroom requires raising the
+  // watchdog AND the fallover budget together (a coordinated follow-up), not this
+  // value alone. Tunable via CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS.
   return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
 }
 

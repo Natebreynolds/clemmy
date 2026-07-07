@@ -69,8 +69,8 @@ test('configureHarnessRuntime returns ok:false when NO provider is connected', a
     resetHarnessRuntimeConfig();
     const result = await configureHarnessRuntime();
     assert.equal(result.ok, false);
-    assert.match(result.reason ?? '', /No codex OAuth tokens/);
-    assert.match(result.reason ?? '', /Settings|login-native/);
+    assert.match(result.reason ?? '', /No AI model is signed in/);
+    assert.match(result.reason ?? '', /Settings → Models/);
   } finally {
     clearClaudeVault();
     resetHarnessRuntimeConfig();

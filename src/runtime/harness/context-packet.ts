@@ -40,6 +40,7 @@ export interface MultiItemIntent {
   itemCount: number;
   itemKind: string | null;
   sameShapeWork: boolean;
+  explicitParallelRequest: boolean;
 }
 
 export interface AgentContextPacket {
@@ -95,7 +96,7 @@ const DOMAIN_PATTERNS: RegExp[] = [
 
 const READ_RE = /\b(?:find|pull|query|search|scrape|crawl|research|audit|summarize|analyze|gather|inspect)\b/i;
 const WRITE_RE =
-  /\b(?:create|draft|send|write|update|append|post|publish|host|deploy|file|sheet|email|proposal|report|edit)\b/i;
+  /\b(?:create|draft|send|write|produce|generate|compile|assemble|update|append|post|publish|host|deploy|file|sheet|email|proposal|report|edit)\b/i;
 const BATCH_RE = /\b(?:\d+|top\s+\d+|several|many|multiple|batch|bulk|list of|all of them|for each|each one)\b/i;
 const SEQUENCE_RE = /\b(?:then|after that|afterward|before .* then|once .* then|first .* then)\b/i;
 
@@ -131,6 +132,7 @@ const DEEP_WORK_RE = /\b(?:research|audit|scrape|crawl|analy[sz]e|enrich|profile
 const INTERNAL_OWNER_RE = /\b(?:this|that|the|a|an|each|every|its|his|her|their|our|my|one|same)\s+[a-z][\w-]*['’]s\s+(?:top\s+|first\s+)?\d{1,3}\b/i;
 // Distinct-items markers that override the sequence guard ("these 10 ...").
 const DISTINCT_MARKER_RE = /\b(?:these|those|each|every|all (?:of )?(?:the|these|those|my|them)|the following|following|below|listed|respectively)\b/i;
+const EXPLICIT_PARALLEL_RE = /\b(?:parallel(?:ize|ise|ized|ised)?|concurrent(?:ly)?|fan[- ]?out|same[- ]shape|same shape|per[- ]item|one per)\b/i;
 // Nouns that are units/pagination/chit-chat, never independent fan-out items.
 // Catches "30 days", paginated "200 rows", and "3 options" / "5 ideas".
 const NON_ITEM_NOUNS = new Set([
@@ -146,6 +148,7 @@ const NO_MULTI_ITEM: MultiItemIntent = Object.freeze({
   itemCount: 0,
   itemKind: null,
   sameShapeWork: false,
+  explicitParallelRequest: false,
 });
 
 /**
@@ -181,7 +184,8 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
 
     // 2. Per-item work verb — there must be real per-item tool work, not just
     //    a quantity ("3 options" already filtered above as a non-item noun).
-    const sameShapeWork = READ_RE.test(text) || WRITE_RE.test(text);
+    const explicitParallelRequest = EXPLICIT_PARALLEL_RE.test(text);
+    const sameShapeWork = READ_RE.test(text) || WRITE_RE.test(text) || explicitParallelRequest;
     if (!sameShapeWork) return NO_MULTI_ITEM;
 
     // 3. Zero-regression guards — each resolves ambiguity to NOT multi-item.
@@ -193,7 +197,13 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     const hasDistinct = enumerated || DISTINCT_MARKER_RE.test(text);
     if (SEQUENCE_RE.test(text) && !hasDistinct) return NO_MULTI_ITEM; // A->B->C chain
 
-    return { isMultiItem: true, itemCount: count, itemKind: kind, sameShapeWork: true };
+    return {
+      isMultiItem: true,
+      itemCount: count,
+      itemKind: kind,
+      sameShapeWork: true,
+      explicitParallelRequest,
+    };
   } catch {
     return NO_MULTI_ITEM; // fail-open: detection must never break a turn
   }
@@ -208,12 +218,14 @@ export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): stri
   const kind = intent.itemKind ? ` ${intent.itemKind}` : ' items';
   const n = intent.itemCount;
   const cappedWaveSize = Math.max(1, Math.min(8, Math.round(waveSize || 8)));
-  if (n >= 8) {
+  if (n >= 8 || intent.explicitParallelRequest) {
     return (
       `Fan-out directive: this turn names ${n} independent same-shape${kind} to process. `
       + 'Do NOT serialize them in this context — that balloons tokens and forces the harness to clip your freshly-fetched data mid-run. '
       + `Resolve any shared tool/connection ONCE, then call run_worker once per item in parallel waves of up to ${cappedWaveSize} so each worker keeps its own lean context. `
-      + 'This is a large/recurring shape: after you finish, offer in ONE line to save it as a forEach workflow — do not create or run a workflow unless the user says yes.'
+      + (n >= 8
+        ? 'This is a large/recurring shape: after you finish, offer in ONE line to save it as a forEach workflow — do not create or run a workflow unless the user says yes.'
+        : 'The user explicitly asked for parallel/same-shape execution, so do not collapse this into one aggregate program or one inline batch.')
     );
   }
   return (

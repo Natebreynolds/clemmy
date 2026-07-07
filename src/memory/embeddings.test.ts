@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   bufferToVector,
   classifyEmbedError,
+  embedErrorIsRetryable,
   cosine,
   EMBEDDING_DIM,
   embedQuery,
@@ -190,6 +191,21 @@ test('classifyEmbedError: maps API errors to terminal/transient classes', () => 
   assert.equal(classifyEmbedError(new Error('Embeddings API 429: {"error":{"type":"rate_limit_exceeded"}}')), 'rate_limit');
   assert.equal(classifyEmbedError(new Error('The operation was aborted due to timeout')), 'transient');
   assert.equal(classifyEmbedError(new Error('Embeddings API 503: upstream error')), 'transient');
+});
+
+test('embedErrorIsRetryable: retries genuine transient (timeout/5xx), NOT persistent 4xx or terminal', () => {
+  // Genuine transient blips → worth one retry.
+  assert.equal(embedErrorIsRetryable(new Error('The operation was aborted due to timeout')), true);
+  assert.equal(embedErrorIsRetryable(new Error('Embeddings API 503: upstream error')), true);
+  assert.equal(embedErrorIsRetryable(new Error('fetch failed: ECONNRESET')), true);
+  // Persistent CLIENT errors classify as 'transient' by default but must NOT retry
+  // (they fail identically and double the synchronous JIT/recall latency).
+  assert.equal(embedErrorIsRetryable(new Error('Embeddings API 400: input array too large')), false);
+  assert.equal(embedErrorIsRetryable(new Error('Embeddings API 404: model not found')), false);
+  // Terminal / rate-limit are never retried.
+  assert.equal(embedErrorIsRetryable(new Error('Embeddings API 401: invalid_api_key')), false);
+  assert.equal(embedErrorIsRetryable(new Error('exceeded your current quota, check your plan and billing')), false);
+  assert.equal(embedErrorIsRetryable(new Error('Embeddings API 429: rate_limit_exceeded')), false);
 });
 
 test('breaker: a quota error opens the breaker IMMEDIATELY with a long cooldown', () => {

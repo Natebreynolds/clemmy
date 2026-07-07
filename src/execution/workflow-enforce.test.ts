@@ -16,6 +16,7 @@ import {
   stepLooksMutating,
   stepIsTestableRead,
   workflowNeedsCreationTest,
+  workflowExecutionSurfaceChanged,
 } from './workflow-enforce.js';
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
@@ -66,6 +67,14 @@ test('checkWorkflowForWrite: user-only notification workflow is allowed without 
   const result = checkWorkflowForWrite(notification);
   assert.equal(result.ok, true);
   assert.equal(result.errors.length, 0);
+});
+
+test('checkWorkflowForWrite: forEachNewOnly without forEach is rejected through the write seam', () => {
+  const result = checkWorkflowForWrite(wf({
+    steps: [{ id: 'send', prompt: 'Send each new lead.', forEachNewOnly: true }],
+  }));
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join(' '), /forEachNewOnly.*no forEach source/);
 });
 
 // ─── runnability (the "can't author an unrunnable workflow" guarantee) ───
@@ -326,6 +335,30 @@ test('autoRepair: never overrides explicit output contracts or pinned goals', ()
   assert.equal(repairs.some((repair) => /Added output contract|Pinned a workflow goal/.test(repair)), false);
 });
 
+test('workflowExecutionSurfaceChanged: call nodes and watermarks are execution surface', () => {
+  const before = wf({
+    steps: [{ id: 'list', prompt: '', call: { tool: 'HUBSPOT_LIST_CONTACTS', args: { limit: 10 } } }],
+  });
+  const changedCall = wf({
+    steps: [{ id: 'list', prompt: '', call: { tool: 'HUBSPOT_LIST_COMPANIES', args: { limit: 10 } } }],
+  });
+  const changedWatermark = wf({
+    steps: [
+      { id: 'pull', prompt: 'Pull leads.', output: { type: 'array' } },
+      { id: 'send', prompt: 'Send each new lead.', dependsOn: ['pull'], forEach: 'pull', forEachNewOnly: true },
+    ],
+  });
+  const noWatermark = wf({
+    steps: [
+      { id: 'pull', prompt: 'Pull leads.', output: { type: 'array' } },
+      { id: 'send', prompt: 'Send each new lead.', dependsOn: ['pull'], forEach: 'pull' },
+    ],
+  });
+
+  assert.equal(workflowExecutionSurfaceChanged(before, changedCall), true);
+  assert.equal(workflowExecutionSurfaceChanged(noWatermark, changedWatermark), true);
+});
+
 test('autoRepair: hardens weak live-research contracts with evidence keys', () => {
   const def = wf({
     steps: [
@@ -429,6 +462,8 @@ test('prepareWorkflowForWrite: a genuinely broken workflow still fails after rep
 test('stepLooksMutating: a send/write step is mutating; a pure read step is not', () => {
   assert.equal(stepLooksMutating({ prompt: 'send the report email to the owner' }), true);
   assert.equal(stepLooksMutating({ prompt: 'create a new record in the Airtable table' }), true);
+  assert.equal(stepLooksMutating({ prompt: 'create a Salesforce opportunity report', sideEffect: 'read' }), false);
+  assert.equal(stepLooksMutating({ prompt: 'summarize opportunities', sideEffect: 'write' }), true);
   assert.equal(stepLooksMutating({ prompt: 'do anything', requiresApproval: true }), true);
   assert.equal(stepLooksMutating({ prompt: 'scrape the Facebook page posts with Apify' }), false);
   assert.equal(stepLooksMutating({ prompt: 'fetch the latest SERP rankings' }), false);

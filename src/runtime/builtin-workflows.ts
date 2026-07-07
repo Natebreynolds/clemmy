@@ -3,9 +3,9 @@ import path from 'node:path';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
   readWorkflow,
-  writeWorkflow,
   type WorkflowDefinition,
 } from '../memory/workflow-store.js';
+import { writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
 
 export const OBJECTIVE_EXECUTION_WORKFLOW_SLUG = 'objective-execution-loop';
 export const OBJECTIVE_EXECUTION_WORKFLOW_NAME = 'Objective Execution Loop';
@@ -335,7 +335,7 @@ export function ensureBuiltInWorkflows(options: EnsureBuiltInWorkflowsOptions = 
   if (existing && !options.overwrite) {
     skipped.push(OBJECTIVE_EXECUTION_WORKFLOW_SLUG);
   } else {
-    writeWorkflow(OBJECTIVE_EXECUTION_WORKFLOW_SLUG, objectiveExecutionWorkflow());
+    writeWorkflowAndSyncTriggers(OBJECTIVE_EXECUTION_WORKFLOW_SLUG, objectiveExecutionWorkflow());
     writeReferenceFiles(OBJECTIVE_EXECUTION_WORKFLOW_SLUG);
     installed.push(OBJECTIVE_EXECUTION_WORKFLOW_SLUG);
   }

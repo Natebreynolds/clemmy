@@ -72,6 +72,10 @@ test('memory_self_heal is exposed in the local MCP catalog', () => {
   assert.ok(LOCAL_MCP_TOOL_NAMES.includes('memory_self_heal'));
 });
 
+test('convert_to_markdown is exposed in the local MCP catalog', () => {
+  assert.ok(LOCAL_MCP_TOOL_NAMES.includes('convert_to_markdown'));
+});
+
 function registeredToolHandlers(): Map<string, (args: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>> {
   const handlers = new Map<string, (args: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>>();
   const server = {

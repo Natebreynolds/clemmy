@@ -113,7 +113,7 @@ export function Workspaces() {
   return (
     <Page
       title="Workspaces"
-      subtitle="Live, interactive surfaces Clem builds for you — reports, trackers, planners"
+      subtitle="Live, interactive surfaces Clementine builds for you — reports, trackers, planners"
       actions={
         <Button onClick={() => setModalOpen(true)}>
           <Plus className="h-4 w-4" aria-hidden /> New workspace
@@ -130,7 +130,7 @@ export function Workspaces() {
         <EmptyState
           title="No workspaces yet"
           description={
-            <>Ask Clem to build one — “make me a live dashboard for my pipeline” — or start a blank one and tell her what you want.</>
+            <>Ask Clementine to build one — “make me a live dashboard for my pipeline” — or start a blank one and tell her what you want.</>
           }
           action={<Button onClick={() => setModalOpen(true)}><Plus className="h-4 w-4" aria-hidden /> New workspace</Button>}
         />

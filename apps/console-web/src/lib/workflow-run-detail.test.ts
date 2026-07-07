@@ -63,6 +63,26 @@ test('captures attempts, retries, and rolls tokens up from attempt samples', () 
   assert.equal(detail.tokensTotal, 1200);
 });
 
+test('a step_completed tagged meta.blocked folds to blocked (not done) with its reason', () => {
+  const events: Ev[] = [
+    { t: '2026-07-04T00:00:00.000Z', kind: 'run_started' },
+    { t: '2026-07-04T00:00:01.000Z', kind: 'step_started', stepId: 'add_to_airtable' },
+    {
+      t: '2026-07-04T00:00:02.000Z',
+      kind: 'step_completed',
+      stepId: 'add_to_airtable',
+      output: { blocked: true, reason: 'no prospects — Salesforce connection expired' },
+      meta: { blocked: true },
+    },
+    { t: '2026-07-04T00:00:02.500Z', kind: 'run_completed' },
+  ];
+  const step = buildWorkflowRunDetail(events).steps[0];
+  assert.equal(step.status, 'blocked');
+  assert.equal(step.error, 'no prospects — Salesforce connection expired');
+  // The raw {blocked:true} envelope is NOT surfaced as the step's output.
+  assert.equal(step.output, '');
+});
+
 test('prefers completion-meta tokens/cost over attempt samples', () => {
   const events: Ev[] = [
     { t: '2026-07-04T00:00:00.000Z', kind: 'step_started', stepId: 's' },

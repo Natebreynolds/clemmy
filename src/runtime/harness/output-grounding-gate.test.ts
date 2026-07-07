@@ -144,6 +144,32 @@ test('evaluateOutputGrounding: contradiction BOUNCES, escalates on repeat; no ju
   }
 });
 
+test('evaluateOutputGrounding: judge OUTAGE with ungrounded residual figures fails to ADVISORY (not silent allow), kill-switch restores fail-open', async () => {
+  resetEventLog();
+  _resetOutputGroundingStateForTests();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_spend',
+    tool: 'composio_execute_tool',
+    output: 'Ad spend by campaign: Alpha $4,000; Bravo $4,000; Charlie $3,000. Total $11,000.',
+  });
+  // The judge is DOWN (throws) — and $24.5K does NOT deterministically clear.
+  _setOutputGroundingJudgeForTests(async () => { throw new Error('judge unavailable (overloaded)'); });
+  try {
+    const res = await evaluateOutputGrounding(sess.id, 'Total ad spend across campaigns was $24.5K this quarter.', { kind: 'chat' });
+    assert.equal(res.action, 'advisory', 'judge down + ungrounded figure → advisory, not a silent allow');
+    assert.ok(res.figures.some((f) => /24\.5/.test(f)), 'the still-ungrounded figure is surfaced');
+
+    process.env.CLEMMY_GROUNDING_FAIL_TO_ADVISORY = 'off';
+    const off = await evaluateOutputGrounding(sess.id, 'Total ad spend across campaigns was $24.5K this quarter.', { kind: 'chat' });
+    assert.equal(off.action, 'allow', 'kill-switch restores the prior fail-open');
+  } finally {
+    delete process.env.CLEMMY_GROUNDING_FAIL_TO_ADVISORY;
+    _setOutputGroundingJudgeForTests(null);
+  }
+});
+
 test('evaluateOutputGrounding: no-plausible-source figure is ADVISORY, not a block', async () => {
   resetEventLog();
   _resetOutputGroundingStateForTests();
@@ -163,7 +189,7 @@ test('evaluateOutputGrounding: no-plausible-source figure is ADVISORY, not a blo
   }
 });
 
-test('evaluateOutputGrounding: fail-open — no figures, no sources, and judge error all ALLOW', async () => {
+test('evaluateOutputGrounding: no-figures and no-sources ALLOW; a judge error with ungrounded figures now ADVISES (not silent allow)', async () => {
   resetEventLog();
   _resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
@@ -179,12 +205,17 @@ test('evaluateOutputGrounding: fail-open — no figures, no sources, and judge e
   assert.equal(noSources.action, 'allow');
   assert.equal(judged, false, 'no sources → no judge call');
 
-  // Judge infra error → fail open.
+  // Judge infra error WITH an ungrounded residual figure → ADVISORY by default
+  // (surface it, don't silently pass). Kill-switch restores the old fail-open.
   writeToolOutput({ sessionId: sess.id, callId: 'c1', tool: 'x', output: 'spend campaign data totalling 11000' });
   _setOutputGroundingJudgeForTests(async () => { throw new Error('model down'); });
   const judgeErr = await evaluateOutputGrounding(sess.id, 'Spend was $24.5K across campaigns.', { kind: 'chat' });
-  assert.equal(judgeErr.action, 'allow');
-  assert.match(judgeErr.reason, /fail open/);
+  assert.equal(judgeErr.action, 'advisory');
+  process.env.CLEMMY_GROUNDING_FAIL_TO_ADVISORY = 'off';
+  const judgeErrOpen = await evaluateOutputGrounding(sess.id, 'Spend was $24.5K across campaigns.', { kind: 'chat' });
+  assert.equal(judgeErrOpen.action, 'allow');
+  assert.match(judgeErrOpen.reason, /fail open/);
+  delete process.env.CLEMMY_GROUNDING_FAIL_TO_ADVISORY;
   _setOutputGroundingJudgeForTests(null);
 });
 

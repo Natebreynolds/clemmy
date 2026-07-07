@@ -2659,10 +2659,16 @@ async function runConversationCore(
     // tool-call floor, one-shot, skip-if-already-offered) keep it off quick work;
     // the nudge itself tells the model to just finish if it's nearly done.
     let bgOfferNudge = '';
+    // Fire on OBSERVED WORK, not message phrasing: either the ask read as an
+    // action, OR the turn has genuinely been grinding (tool floor + elapsed).
+    // The elapsed path is what makes a conversationally-phrased long task (the
+    // 18-min foreground workflow edit) actually offer to move to Tasks.
+    const bgOfferMinMs = backgroundOfferNudgeMinElapsedMs();
+    const bgOfferLongRunning = bgOfferMinMs > 0 && (Date.now() - startedAt) >= bgOfferMinMs;
     if (
       !backgroundOfferNudged
       && backgroundOfferNudgeEnabled()
-      && objectiveJudgeActionIntent
+      && (objectiveJudgeActionIntent || bgOfferLongRunning)
       && totalToolCalls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS
       && !options.sessionId.startsWith('background:')
     ) {
@@ -2671,7 +2677,7 @@ async function runConversationCore(
       if (isForegroundChat && !backgroundOfferAlreadyMade(options.sessionId)) {
         backgroundOfferNudged = true;
         bgOfferNudge =
-          ' NOTE: you have already done substantial work on this in the foreground. If finishing it will take more than a step or two, call `offer_background` NOW with the objective so the user can move it to the background (or hold it) instead of waiting here — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
+          ' NOTE: you have already done substantial work on this in the foreground and it is taking a while. If finishing it will take more than a step or two, call `offer_background` NOW with the objective — tell the user plainly that this is a longer task and you can keep working on it in the background and post updates as it goes (it shows up in Tasks), instead of making them watch here — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
       }
     }
     nextInput = CONTINUATION_INPUT + bgOfferNudge;
@@ -2834,6 +2840,21 @@ function backgroundOfferNudgeEnabled(): boolean {
 /** Tool-call floor before the background-offer nudge can fire — enough work that
  *  the task is clearly substantial (not a quick 1-3 tool wrap-up). */
 const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
+
+/** Wall-clock floor (ms) that ALSO trips the background-offer nudge, independent
+ *  of how the triggering message was phrased. The original gate required the
+ *  user's message to classify as 'action' intent — so a task kicked off by a
+ *  conversational message ("just make sure it works", "here's a good example
+ *  <url>") ground for many minutes in the FOREGROUND and never offered to
+ *  background, because the phrasing read as chat, not action. This mirrors the
+ *  objective-judge's own rule (loop.ts): gate on OBSERVED WORK, not phrasing. A
+ *  turn that has run the tool floor AND been going this long is self-evidently a
+ *  long task worth offering to move to Tasks. Default 90s; 0 disables the
+ *  elapsed path (reverts to intent-only). Env: CLEMMY_BG_OFFER_NUDGE_MIN_MS. */
+function backgroundOfferNudgeMinElapsedMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE_MIN_MS', '90000') ?? '90000', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 90000;
+}
 
 /** True if a background offer was ALREADY posted in this session (so we never
  *  re-offer after the user has already seen the choice). Best-effort. */
@@ -4738,8 +4759,21 @@ export function isCodexAuthRevoked(err: unknown, message: string): boolean {
   // and retried it, so reaching here with a marker-less 401 means a transient
   // failure — classify it 'model' so it falls through to normal retryable-error
   // handling instead of permanently bricking auth on a one-off blip.
-  if (isCodexAuthDead()) return true;
+  //
+  // The DEAD latch is a fact about CODEX auth, not about this error: while it
+  // is set, every brain's every failure reaches here, and an unconditional
+  // short-circuit rebrands unrelated errors (a BYO Together 402, a GLM 5xx) as
+  // "Codex sign-in expired" — terminal, real cause masked (observed live
+  // 2026-07-07: GLM run hard-failed with the Codex re-auth message while the
+  // actual error was a Together credit-limit 402). Only let the latch decide
+  // when the error itself is auth-shaped; anything else falls through to
+  // normal classification and stays recoverable.
   const status = (err as { status?: number } | null)?.status;
+  const authShaped =
+    status === 401
+    || status === 403
+    || /codex|token_revoked|invalid_grant|refresh_token|oauth/i.test(message);
+  if (isCodexAuthDead() && authShaped) return true;
   return classifyCodexAuthError({ message, status, source: 'model' }) === 'terminal';
 }
 
@@ -4846,6 +4880,26 @@ function handleRunError(
     session.markStatus('failed');
     bumpTurnNumber(sessionId, turn);
     return { sessionId, turn, status: 'limit_exceeded', error: err.message };
+  }
+  // The OpenAI/Codex Agents Runner throws MaxTurnsExceededError when a turn hits
+  // its maxTurns budget. That escaped to the generic terminal run_failed below —
+  // a dead-end that strands the session with no recourse. Treat it as a graceful
+  // CAP (like ToolCallsLimitExceeded and the Claude-SDK limitHit path): a soft
+  // limit_exceeded the caller can offer "continue" on. Match the class by name
+  // AND the wrapped message (the SDK re-wraps thrown errors). Kill-switch =off.
+  const maxTurnsHit =
+    (err instanceof Error && err.name === 'MaxTurnsExceededError')
+    || (err instanceof Error && /max turns \(\d+\) exceeded|maximum number of turns/i.test(err.message));
+  if (maxTurnsHit && (getRuntimeEnv('CLEMMY_MAX_TURNS_CONTINUE', 'on') ?? 'on').toLowerCase() !== 'off') {
+    safeAppend({ sessionId, turn, role: 'system', type: 'guardrail_tripped', data: { kind: 'max_turns' } });
+    session.markStatus('failed');
+    bumpTurnNumber(sessionId, turn);
+    return {
+      sessionId,
+      turn,
+      status: 'limit_exceeded',
+      error: 'Reached the per-turn step budget before finishing — say "continue" to pick up where it left off.',
+    };
   }
   // A mutating tool was called with byte-identical args past the escalate
   // threshold — an unrecoverable loop. End the turn cleanly instead of

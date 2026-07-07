@@ -12,6 +12,7 @@ const {
   importWorkflowFrameworkFromDirectory,
 } = await import('./workflow-installer.js');
 const { readWorkflow } = await import('../memory/workflow-store.js');
+const { fireWorkflowSystemEvent, closeWorkflowTriggerDbForTest } = await import('../execution/workflow-trigger-engine.js');
 
 function writeWorkflowPackage(root: string): void {
   const workflowDir = path.join(root, '.clementine', 'workflows', 'sample-brief');
@@ -53,6 +54,7 @@ function writeWorkflowPackage(root: string): void {
 }
 
 test.after(() => {
+  closeWorkflowTriggerDbForTest();
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
@@ -85,6 +87,41 @@ test('importWorkflowFrameworkFromDirectory installs workflow files and skips run
 
   const sourceMeta = JSON.parse(readFileSync(path.join(workflow!.dir, '.clementine-source.json'), 'utf-8')) as Record<string, unknown>;
   assert.equal(sourceMeta.kind, 'workflow-framework');
+});
+
+test('importWorkflowFrameworkFromDirectory syncs imported event triggers immediately', () => {
+  closeWorkflowTriggerDbForTest();
+  const source = path.join(tmp, 'event-source');
+  const workflowDir = path.join(source, '.clementine', 'workflows', 'imported-event-flow');
+  mkdirSync(workflowDir, { recursive: true });
+  writeFileSync(
+    path.join(workflowDir, 'SKILL.md'),
+    [
+      '---',
+      'name: Imported Event Flow',
+      'description: Imported event trigger workflow',
+      'enabled: true',
+      'trigger:',
+      '  events:',
+      '    - type: imported.lead.created',
+      '      dedupeKey: lead-{{payload.id}}',
+      'steps:',
+      '  - id: handle',
+      '    prompt: Handle the imported lead.',
+      '---',
+      'Handle imported leads.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const result = importWorkflowFrameworkFromDirectory(source);
+  assert.equal(result.installed.length, 1);
+
+  const fired = fireWorkflowSystemEvent('imported.lead.created', { id: 'L-100' })
+    .filter((entry) => entry.workflowName === 'imported-event-flow');
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].status, 'queued');
 });
 
 test('importWorkflowFrameworkFromDirectory protects existing workflow unless overwrite is true', () => {

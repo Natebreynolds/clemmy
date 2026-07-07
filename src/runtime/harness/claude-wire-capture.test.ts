@@ -147,12 +147,22 @@ test('CLAUDE wire (parity on, no-sentinel sub-agent + large tools): tools-array 
   assert.equal(countCacheControl(parsed), 1, 'exactly one breakpoint, on the tools array');
 });
 
-test('CODEX wire is BYTE-IDENTICAL to legacy (dynamic-first), sentinel-free — primary path unchanged for users', () => {
-  const codex = buildCodexRequestBody('gpt-5.4', {
-    systemInstructions: ASSEMBLED_PARITY, input: [], tools: [], handoffs: [], modelSettings: {},
-  } as any);
-  assert.equal(codex.instructions, ASSEMBLED_LEGACY, 'Codex instructions reconstruct the exact pre-parity order');
-  assert.equal(codex.instructions.includes(CACHE_BREAK_SENTINEL), false);
+test('CODEX wire with stable-instructions OFF is BYTE-IDENTICAL to legacy (dynamic-first), sentinel-free', () => {
+  // Stable-instructions (default ON since v0.12.57) intentionally keeps the role
+  // in a cacheable prefix and pushes the dynamic ctx to a trailing input item —
+  // so the DEFAULT wire is no longer the legacy dynamic-first reconstruction.
+  // With the flag OFF, the legacy reconstruction must still be byte-identical.
+  const prev = process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS;
+  process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS = 'off';
+  try {
+    const codex = buildCodexRequestBody('gpt-5.4', {
+      systemInstructions: ASSEMBLED_PARITY, input: [], tools: [], handoffs: [], modelSettings: {},
+    } as any);
+    assert.equal(codex.instructions, ASSEMBLED_LEGACY, 'Codex instructions reconstruct the exact pre-parity order');
+    assert.equal(codex.instructions.includes(CACHE_BREAK_SENTINEL), false);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS; else process.env.CLEMMY_CODEX_STABLE_INSTRUCTIONS = prev;
+  }
 });
 
 test('BYO wire restores legacy order in the system message, sentinel-free', () => {

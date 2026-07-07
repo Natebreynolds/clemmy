@@ -23,6 +23,7 @@ const {
   setMobileAccessTunnel,
   setMobileAccessStatus,
   setMobileAccessAutoStart,
+  setMobileAccessAccessAck,
   updateMobileAccess,
 } = await import('./mobile-access-state.js');
 
@@ -125,14 +126,28 @@ test('setMobileAccessBinary persists across reads', async () => {
 test('setMobileAccessTunnel + setMobileAccessStatus update independently', async () => {
   const stateDir = freshStateDir();
   await setMobileAccessTunnel(
-    { id: 'tid', name: 'clem', hostname: 'clem.example.com' },
+    { id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' },
     { stateDir },
   );
   await setMobileAccessStatus('running', undefined, { stateDir });
   const after = readMobileAccess({ stateDir });
   assert.equal(after.tunnel?.id, 'tid');
   assert.equal(after.tunnel?.hostname, 'clem.example.com');
+  assert.equal(after.tunnel?.mode, 'named');
   assert.equal(after.status, 'running');
+});
+
+test('readMobileAccess normalizes legacy custom tunnels to named mode', async () => {
+  const stateDir = freshStateDir();
+  await updateMobileAccess(
+    (current) => ({
+      ...current,
+      tunnel: { id: 'legacy', name: 'clem', hostname: 'clem.example.com' },
+    }),
+    { stateDir },
+  );
+  const after = readMobileAccess({ stateDir });
+  assert.equal(after.tunnel?.mode, 'named');
 });
 
 test('setMobileAccessStatus("error", message) records lastError', async () => {
@@ -159,6 +174,28 @@ test('setMobileAccessAutoStart flips the autoStart flag', async () => {
   assert.equal(readMobileAccess({ stateDir }).autoStart, true);
   await setMobileAccessAutoStart(false, { stateDir });
   assert.equal(readMobileAccess({ stateDir }).autoStart, false);
+});
+
+test('setMobileAccessAccessAck stores the current named hostname only', async () => {
+  const stateDir = freshStateDir();
+  await setMobileAccessTunnel(
+    { id: 'tid', name: 'clem', hostname: 'clem.example.com', mode: 'named' },
+    { stateDir },
+  );
+  await setMobileAccessAccessAck({ enabled: true }, { stateDir });
+  const after = readMobileAccess({ stateDir });
+  assert.equal(after.cloudflareAccess?.hostname, 'clem.example.com');
+  assert.equal(after.cloudflareAccess?.enabled, true);
+});
+
+test('setMobileAccessAccessAck ignores quick tunnels', async () => {
+  const stateDir = freshStateDir();
+  await setMobileAccessTunnel(
+    { id: 'quick', name: 'Quick mobile link', hostname: 'alpha.trycloudflare.com', mode: 'quick' },
+    { stateDir },
+  );
+  await setMobileAccessAccessAck({ enabled: true }, { stateDir });
+  assert.equal(readMobileAccess({ stateDir }).cloudflareAccess, undefined);
 });
 
 test('every updateMobileAccess bumps updatedAt', async () => {

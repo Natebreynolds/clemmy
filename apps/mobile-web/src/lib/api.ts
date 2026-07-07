@@ -109,17 +109,19 @@ export interface ApprovalsListResponse {
 }
 
 export async function listApprovals(): Promise<ApprovalsListResponse> {
-  return api<ApprovalsListResponse>('/api/console/approvals/list');
+  return api<ApprovalsListResponse>('/m/api/approvals');
 }
 
 export async function approveApproval(id: string, modifiedArgs?: string): Promise<unknown> {
-  return api(`/api/console/harness-approvals/${encodeURIComponent(id)}/approve`, {
+  if (modifiedArgs) {
+    throw new Error('Mobile approval editing is not supported yet.');
+  }
+  return api(`/m/api/approvals/${encodeURIComponent(id)}/approve`, {
     method: 'POST',
-    body: modifiedArgs ? JSON.stringify({ modifiedArgs }) : undefined,
   });
 }
 export async function rejectApproval(id: string): Promise<unknown> {
-  return api(`/api/console/harness-approvals/${encodeURIComponent(id)}/reject`, {
+  return api(`/m/api/approvals/${encodeURIComponent(id)}/reject`, {
     method: 'POST',
   });
 }

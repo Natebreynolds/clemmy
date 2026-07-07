@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink } from 'lucide-react';
+import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, Activity, GitBranch, Send, Wrench, Gauge, X, FileText, Target, CheckCircle2, AlertTriangle, Radio, type LucideIcon } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -14,10 +14,12 @@ import { statusTone } from '@/lib/inbox';
 import { humanizeCron } from '@/lib/cron';
 import { WorkflowDrawer } from '@/components/automate/WorkflowDrawer';
 import { cn } from '@/lib/cn';
+import { certificationTone, workflowCertificationCounts, workflowPrimaryAction } from '@/lib/workflowCertification';
 import {
+  checkRunAgainstGoal, getRunWorkspace, listWorkflowRuns,
   listWorkflows, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
   listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
-  type SkillRow, type WorkflowRow,
+  type RunWorkspace, type SkillRow, type WorkflowRow, type WorkflowRunRecord,
 } from '@/lib/automate';
 import {
   getAgentSystemMetrics,
@@ -87,11 +89,40 @@ function LoopGuidance({
   coordination?: CoordinationPolicySnapshot;
   trend?: AgentSystemTrendSnapshot;
 }) {
+  // Collapsed by default: this is OPERATOR diagnostics (health scores, repair
+  // loops, retry pressure) — useful, but it must not be the first thing a user
+  // wades through to reach their workflows. One quiet summary line, expandable.
+  const [open, setOpen] = useState(false);
   if (recommendations.length === 0 && issueCauses.length === 0 && !interventions && !learning && !coordination && !trend) return null;
+  const attention = (coordination ? 1 : 0) + issueCauses.length + recommendations.length;
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="mb-5 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-left transition-colors hover:bg-subtle cursor-pointer"
+      >
+        <Zap className="h-3.5 w-3.5 shrink-0 text-faint" aria-hidden />
+        <span className="text-caption font-semibold uppercase tracking-wide text-faint">System health</span>
+        {trend && (
+          <StatusPill tone={trendTone(trend.status)}>
+            {trend.status}{trend.recent.length > 0 ? ` · ${trend.recent[trend.recent.length - 1]?.healthScore}/100` : ''}
+          </StatusPill>
+        )}
+        <span className="min-w-0 flex-1 truncate text-caption text-muted">
+          {attention > 0 ? `${attention} thing${attention === 1 ? '' : 's'} worth a look` : 'All quiet'}
+        </span>
+        <span className="shrink-0 text-caption text-faint">details</span>
+      </button>
+    );
+  }
   return (
     <Card className="mb-5 p-4">
-      <div className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
-        <Zap className="h-3.5 w-3.5" aria-hidden /> Loop guidance
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+          <Zap className="h-3.5 w-3.5" aria-hidden /> System health
+        </div>
+        <button type="button" onClick={() => setOpen(false)} className="text-caption text-faint transition-colors hover:text-muted cursor-pointer">hide</button>
       </div>
       {trend && (
         <div className="mb-3 rounded-md border border-border bg-surface p-3">
@@ -258,6 +289,105 @@ function LoopGuidance({
   );
 }
 
+function engineToneClasses(tone: Tone) {
+  switch (tone) {
+    case 'success': return 'border-success/30 bg-success-tint text-success';
+    case 'info': return 'border-info/30 bg-info-tint text-info';
+    case 'warning': return 'border-warning/30 bg-warning-tint text-warning';
+    case 'danger': return 'border-danger/30 bg-danger-tint text-danger';
+    case 'live': return 'border-primary/30 bg-primary-tint text-primary';
+    case 'neutral': return 'border-border bg-surface text-muted';
+  }
+}
+
+function dryRunTone(verdict?: string): Tone {
+  if (verdict === 'ready') return 'success';
+  if (verdict === 'needs_inputs') return 'warning';
+  if (verdict === 'blocked') return 'danger';
+  return 'neutral';
+}
+
+function relativeRunTime(iso?: string | null): string {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '';
+  const diff = Date.now() - t;
+  if (diff < 60_000) return 'now';
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+function formatBytes(bytes?: number): string {
+  const n = bytes ?? 0;
+  if (n < 1024) return `${n}B`;
+  return `${(n / 1024).toFixed(1)}KB`;
+}
+
+function goalObjective(goal: string | null): string | null {
+  if (!goal) return null;
+  const lines = goal.split('\n').map((line) => line.trim()).filter(Boolean);
+  const header = lines.findIndex((line) => line.toLowerCase().startsWith('# run goal'));
+  return (header >= 0 ? lines[header + 1] : lines.find((line) => !line.startsWith('#'))) ?? null;
+}
+
+function WorkflowEngineStrip({ workflow, onOpen }: { workflow: WorkflowRow; onOpen: () => void }) {
+  const cert = workflow.certification;
+  if (!cert) return null;
+  const counts = workflowCertificationCounts(cert);
+  const resourceCount = workflow.resourceCount ?? Object.keys(workflow.resources ?? {}).length;
+  const resourceTone: Tone = counts.resourceGaps > 0 ? 'info' : resourceCount > 0 ? 'success' : 'neutral';
+  const missingTone: Tone = counts.missingInputs > 0 ? 'warning' : 'success';
+  const authorTone: Tone = counts.blockers > 0 ? 'danger' : counts.readinessGaps > 0 ? 'info' : 'success';
+  const effectTone: Tone = counts.sends > 0 ? 'warning' : counts.writes > 0 ? 'info' : 'success';
+  const phases: Array<{ label: string; value: string; tone: Tone; Icon: LucideIcon }> = [
+    { label: 'Bindings', value: counts.resourceGaps > 0 ? `${counts.resourceGaps} needed` : resourceCount > 0 ? `${resourceCount} bound` : 'none', tone: resourceTone, Icon: Puzzle },
+    { label: 'Inputs', value: counts.missingInputs > 0 ? `${counts.missingInputs} missing` : 'set', tone: missingTone, Icon: Gauge },
+    { label: 'Plan', value: `${counts.waves} wave${counts.waves === 1 ? '' : 's'}`, tone: authorTone, Icon: GitBranch },
+    { label: 'Dry-run', value: cert.dryRun?.verdict?.replace('_', ' ') ?? 'unknown', tone: dryRunTone(cert.dryRun?.verdict), Icon: Activity },
+    { label: 'Tools', value: counts.tools > 0 ? `${counts.tools} linked` : 'local', tone: counts.blockers > 0 ? 'danger' : 'success', Icon: Wrench },
+    { label: 'Effects', value: `${counts.sends + counts.writes} external`, tone: effectTone, Icon: Send },
+  ];
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="mb-3 w-full rounded-md border border-border bg-subtle p-3 text-left transition-colors hover:border-primary cursor-pointer"
+    >
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <StatusPill tone={certificationTone(cert.state)}>{cert.label}</StatusPill>
+        {cert.executionMode && cert.executionMode !== 'empty' && (
+          <span title="Steps that run as code (a direct tool call or script) are free every run; AI steps carry the reasoning cost.">
+            <StatusPill tone={cert.executionMode === 'agentless' ? 'success' : cert.executionMode === 'agent' ? 'warning' : 'info'}>
+              {cert.executionMode === 'agentless' ? '⚡ runs as code · no AI cost'
+                : cert.executionMode === 'agent' ? 'AI every step'
+                : `${cert.dryRun?.codeSteps ?? 0}/${cert.dryRun?.stepCount ?? 0} steps as code`}
+            </StatusPill>
+          </span>
+        )}
+        <span className="text-caption text-faint">{counts.parallelWaves}/{counts.waves} parallel waves</span>
+        {resourceCount > 0 && <span className="text-caption text-faint">{resourceCount} resources</span>}
+        <span className="text-caption text-faint">{counts.tools} tools</span>
+        {(counts.sends + counts.writes) > 0 && <span className="text-caption text-faint">{counts.sends + counts.writes} external effects</span>}
+      </div>
+      <div className="grid grid-cols-2 gap-1 sm:grid-cols-3 xl:grid-cols-6">
+        {phases.map(({ label, value, tone, Icon }) => (
+          <div key={label} className={cn('min-w-0 rounded-sm border px-2 py-1.5', engineToneClasses(tone))}>
+            <div className="flex items-center gap-1">
+              <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+              <span className="truncate text-caption font-semibold">{label}</span>
+            </div>
+            <div className="truncate text-caption opacity-80">{value}</div>
+          </div>
+        ))}
+      </div>
+    </button>
+  );
+}
+
 export function Automate() {
   const qc = useQueryClient();
   const navigate = useNavigate();
@@ -273,6 +403,7 @@ export function Automate() {
   const [checking, setChecking] = useState(false);
   const [busyRecovery, setBusyRecovery] = useState<string | null>(null);
   const [openWf, setOpenWf] = useState<string | null>(null);
+  const [openRun, setOpenRun] = useState<{ workflow: string; runId?: string } | null>(null);
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 
   const wf = workflows.data?.workflows ?? [];
@@ -289,7 +420,13 @@ export function Automate() {
 
   const run = async (name: string) => {
     setBusyName(name); setNotice(null);
-    try { await runWorkflow(name); void qc.invalidateQueries({ queryKey: ['runs'] }); setNotice({ tone: 'info', text: `Started "${name}" — watch it in Inbox → Activity.` }); }
+    try {
+      const queued = await runWorkflow(name) as { id?: string } | undefined;
+      void qc.invalidateQueries({ queryKey: ['runs'] });
+      void qc.invalidateQueries({ queryKey: ['wf-runs', name] });
+      setOpenRun({ workflow: name, runId: queued?.id });
+      setNotice({ tone: 'info', text: `Started "${name}".` });
+    }
     catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
     finally { setBusyName(null); }
   };
@@ -381,6 +518,7 @@ export function Automate() {
             : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {wf.map((w) => {
                   const tone = statusTone(w.lastRunStatus ?? undefined);
+                  const canRun = !w.certification || w.certification.canRun;
                   return (
                     <Card key={w.name} className="flex flex-col p-5">
                       <div className="mb-2 flex items-start justify-between gap-3">
@@ -390,6 +528,7 @@ export function Automate() {
                         <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
                       </div>
                       <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
+                      <WorkflowEngineStrip workflow={w} onOpen={() => setOpenWf(w.name)} />
                       <div className="mb-3 flex flex-wrap items-center gap-2">
                         {w.lastRunStatus && <StatusPill tone={tone.tone}>{tone.label}</StatusPill>}
                         {(w.lastRunFailedItemCount ?? 0) > 0 && <StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill>}
@@ -397,7 +536,7 @@ export function Automate() {
                         {typeof w.stepCount === 'number' && <span className="text-caption text-faint">{w.stepCount} steps</span>}
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        <Button size="sm" variant="secondary" disabled={busyName === w.name} onClick={() => run(w.name)}>
+                        <Button size="sm" variant="secondary" disabled={busyName === w.name || !canRun} title={!canRun ? w.certification?.summary : undefined} onClick={() => run(w.name)}>
                           {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
                         </Button>
                         {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
@@ -405,7 +544,12 @@ export function Automate() {
                             {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
                           </Button>
                         )}
-                        <Button size="sm" variant="ghost" onClick={() => setOpenWf(w.name)}>Open</Button>
+                        {w.lastRunId && (
+                          <Button size="sm" variant="ghost" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })}>
+                            <FileText className="h-4 w-4" aria-hidden /> View run
+                          </Button>
+                        )}
+                        <Button size="sm" variant={canRun ? 'ghost' : 'secondary'} onClick={() => setOpenWf(w.name)}>{canRun ? 'Open' : workflowPrimaryAction(w.certification)}</Button>
                       </div>
                     </Card>
                   );
@@ -419,33 +563,42 @@ export function Automate() {
           : scheduled.length === 0
             ? <EmptyState title="No schedules yet" description="Recurring jobs (like a morning briefing) show up here. Ask Clementine to set one up." action={<Button onClick={() => navigate('/chat')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
             : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {scheduled.map((w) => (
-                  <Card key={w.name} className="flex flex-col p-5">
-                    <div className="mb-2 flex items-start justify-between gap-3">
-                      <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">{w.name}</button>
-                      <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
-                    </div>
-                    <div className="mb-3 flex items-center gap-1.5 text-body text-primary">
-                      <Clock className="h-4 w-4" aria-hidden />
-                      <span>{humanizeCron(w.trigger?.schedule || w.triggerSchedule, w.trigger?.timezone)}</span>
-                    </div>
-                    {(w.lastRunFailedItemCount ?? 0) > 0 && (
-                      <div className="mb-3"><StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill></div>
-                    )}
-                    {w.description && <p className="mb-3 line-clamp-2 flex-1 text-small text-muted">{w.description}</p>}
-                    <div className="flex flex-wrap gap-2">
-                      <Button size="sm" variant="secondary" disabled={busyName === w.name} onClick={() => run(w.name)}>
-                        {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run now
-                      </Button>
-                      {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
-                        <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
-                          {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
-                        </Button>
+                {scheduled.map((w) => {
+                  const canRun = !w.certification || w.certification.canRun;
+                  return (
+                    <Card key={w.name} className="flex flex-col p-5">
+                      <div className="mb-2 flex items-start justify-between gap-3">
+                        <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">{w.name}</button>
+                        <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
+                      </div>
+                      <div className="mb-3 flex items-center gap-1.5 text-body text-primary">
+                        <Clock className="h-4 w-4" aria-hidden />
+                        <span>{humanizeCron(w.trigger?.schedule || w.triggerSchedule, w.trigger?.timezone)}</span>
+                      </div>
+                      <WorkflowEngineStrip workflow={w} onOpen={() => setOpenWf(w.name)} />
+                      {(w.lastRunFailedItemCount ?? 0) > 0 && (
+                        <div className="mb-3"><StatusPill tone="warning">{w.lastRunFailedItemCount} failed item{w.lastRunFailedItemCount === 1 ? '' : 's'}</StatusPill></div>
                       )}
-                      <Button size="sm" variant="ghost" onClick={() => setOpenWf(w.name)}>Open</Button>
-                    </div>
-                  </Card>
-                ))}
+                      {w.description && <p className="mb-3 line-clamp-2 flex-1 text-small text-muted">{w.description}</p>}
+                      <div className="flex flex-wrap gap-2">
+                        <Button size="sm" variant="secondary" disabled={busyName === w.name || !canRun} title={!canRun ? w.certification?.summary : undefined} onClick={() => run(w.name)}>
+                          {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run now
+                        </Button>
+                        {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
+                          <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
+                            {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
+                          </Button>
+                        )}
+                        {w.lastRunId && (
+                          <Button size="sm" variant="ghost" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })}>
+                            <FileText className="h-4 w-4" aria-hidden /> View run
+                          </Button>
+                        )}
+                        <Button size="sm" variant={canRun ? 'ghost' : 'secondary'} onClick={() => setOpenWf(w.name)}>{canRun ? 'Open' : workflowPrimaryAction(w.certification)}</Button>
+                      </div>
+                    </Card>
+                  );
+                })}
               </div>
       )}
 
@@ -484,6 +637,7 @@ export function Automate() {
       )}
 
       {openWf && <WorkflowDrawer key={openWf} name={openWf} onClose={() => setOpenWf(null)} />}
+      {openRun && <RunWorkspaceDrawer workflow={openRun.workflow} initialRunId={openRun.runId} onClose={() => setOpenRun(null)} />}
     </Page>
   );
 }
@@ -492,6 +646,194 @@ function CardGridSkeleton() {
   return (
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {[0, 1, 2].map((i) => <Skeleton key={i} className="h-40 w-full" />)}
+    </div>
+  );
+}
+
+function RunWorkspaceDrawer({
+  workflow,
+  initialRunId,
+  onClose,
+}: {
+  workflow: string;
+  initialRunId?: string;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [selectedRunId, setSelectedRunId] = useState<string | undefined>(initialRunId);
+  const [checking, setChecking] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  const [showAllCriteria, setShowAllCriteria] = useState(false);
+  const runsQ = useQuery({
+    queryKey: ['wf-runs', workflow],
+    queryFn: () => listWorkflowRuns(workflow, 25),
+    refetchInterval: 4000,
+  });
+  const runs: WorkflowRunRecord[] = runsQ.data?.runs ?? [];
+
+  useEffect(() => {
+    if (selectedRunId && runs.some((run) => run.id === selectedRunId)) return;
+    if (runs[0]?.id) setSelectedRunId(runs[0].id);
+  }, [runs, selectedRunId]);
+
+  const workspaceQ = useQuery({
+    queryKey: ['run-workspace', workflow, selectedRunId],
+    queryFn: () => getRunWorkspace(workflow, selectedRunId as string),
+    enabled: Boolean(selectedRunId),
+    refetchInterval: 4000,
+  });
+  const workspace: RunWorkspace | undefined = workspaceQ.data;
+  const selectedRun = runs.find((run) => run.id === selectedRunId);
+  const selectedTone = statusTone(selectedRun?.status);
+
+  const runChecker = async () => {
+    if (!selectedRunId) return;
+    setChecking(true);
+    setCheckError(null);
+    try {
+      await checkRunAgainstGoal(workflow, selectedRunId);
+      void qc.invalidateQueries({ queryKey: ['run-workspace', workflow, selectedRunId] });
+    } catch (e) {
+      // Surface the failure instead of silently stopping the spinner — the
+      // check was swallowing errors, leaving the user staring at nothing.
+      const reason = (e instanceof Error ? e.message : String(e)).slice(0, 160);
+      setCheckError(reason || 'unknown error');
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[120] flex justify-end bg-black/30 animate-fade-in" onMouseDown={onClose}>
+      <div className="flex h-full w-full max-w-5xl flex-col bg-surface shadow-lg" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-3 border-b border-border px-5 py-4">
+          <Radio className="h-5 w-5 shrink-0 text-live" aria-hidden />
+          <div className="min-w-0 flex-1">
+            <h2 className="truncate text-h2 text-fg">{workflow}</h2>
+            <p className="truncate text-caption text-faint">Runs and work products</p>
+          </div>
+          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close"><X className="h-5 w-5" aria-hidden /></Button>
+        </div>
+
+        <div className="grid min-h-0 flex-1 gap-0 md:grid-cols-[18rem_minmax(0,1fr)]">
+          <aside className="min-h-0 border-b border-border md:border-b-0 md:border-r">
+            <div className="border-b border-border px-4 py-3 text-label text-muted">Recent runs</div>
+            <div className="max-h-full overflow-y-auto p-2">
+              {runsQ.isLoading ? <Skeleton className="h-32 w-full" /> : runs.length === 0 ? (
+                <EmptyState title="No runs yet" className="py-10" />
+              ) : runs.map((run) => {
+                const tone = statusTone(run.status);
+                return (
+                  <button
+                    key={run.id}
+                    type="button"
+                    onClick={() => setSelectedRunId(run.id)}
+                    className={cn('mb-1 w-full rounded-md px-2.5 py-2 text-left transition-colors', selectedRunId === run.id ? 'bg-subtle' : 'hover:bg-subtle/60')}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="min-w-0 flex-1 truncate text-small font-medium text-fg">{run.id.slice(0, 22)}</span>
+                      <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
+                    </div>
+                    <div className="mt-1 truncate text-caption text-faint">
+                      {relativeRunTime(run.finishedAt ?? run.startedAt ?? run.createdAt)}
+                      {run.source ? ` · ${run.source}` : ''}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
+
+          <main className="min-h-0 overflow-y-auto p-5">
+            {!selectedRunId ? <EmptyState title="Pick a run" />
+              : workspaceQ.isLoading ? <Skeleton className="h-72 w-full" />
+              : (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3 rounded-md border border-border bg-subtle px-4 py-3">
+                    <div className="min-w-0">
+                      <div className="mb-1 flex flex-wrap items-center gap-2">
+                        <StatusPill tone={selectedTone.tone}>{selectedTone.label}</StatusPill>
+                        {selectedRun?.needsAttention && <StatusPill tone="warning">Needs attention</StatusPill>}
+                        <span className="text-caption text-faint">{selectedRunId}</span>
+                      </div>
+                      {selectedRun?.error && <p className="text-small text-danger">{selectedRun.error}</p>}
+                    </div>
+                    <div className="flex flex-col items-end gap-1">
+                      <Button size="sm" variant="secondary" onClick={runChecker} disabled={checking || !workspace}>
+                        {checking ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <CheckCircle2 className="h-4 w-4" aria-hidden />} Check goal
+                      </Button>
+                      {checkError && (
+                        <span className="max-w-xs text-right text-caption text-danger">Check failed — {checkError}. Try again.</span>
+                      )}
+                    </div>
+                  </div>
+
+                  {workspace?.goal && (
+                    <section className="rounded-md border border-border bg-surface px-4 py-3">
+                      <div className="mb-1 flex items-center gap-1.5 text-label text-muted">
+                        <Target className="h-4 w-4" aria-hidden /> Goal
+                      </div>
+                      <p className="text-body text-fg">{goalObjective(workspace.goal) ?? workspace.goal}</p>
+                    </section>
+                  )}
+
+                  {workspace?.checker && (
+                    <section className={cn('rounded-md border px-4 py-3', workspace.checker.pass ? 'border-success/30 bg-success-tint' : 'border-warning/30 bg-warning-tint')}>
+                      <div className="mb-2 flex items-center gap-2">
+                        {workspace.checker.pass ? <CheckCircle2 className="h-4 w-4 text-success" aria-hidden /> : <AlertTriangle className="h-4 w-4 text-warning" aria-hidden />}
+                        <span className={cn('text-small font-semibold', workspace.checker.pass ? 'text-success' : 'text-warning')}>{workspace.checker.summary}</span>
+                      </div>
+                      <div className="grid gap-1.5">
+                        {(showAllCriteria ? workspace.checker.perCriterion : workspace.checker.perCriterion.slice(0, 6)).map((criterion) => (
+                          <div key={criterion.criterion} className="flex gap-2 text-caption text-muted">
+                            <span className={criterion.pass ? 'text-success' : 'text-warning'}>{criterion.pass ? 'Pass' : 'Review'}</span>
+                            <span className="min-w-0 flex-1">{criterion.criterion}</span>
+                          </div>
+                        ))}
+                      </div>
+                      {workspace.checker.perCriterion.length > 6 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllCriteria((v) => !v)}
+                          className="mt-2 inline-flex items-center gap-1 text-caption font-semibold text-primary hover:underline cursor-pointer"
+                        >
+                          {showAllCriteria ? 'Show fewer' : `+${workspace.checker.perCriterion.length - 6} more`}
+                        </button>
+                      )}
+                    </section>
+                  )}
+
+                  <section>
+                    <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="text-h3 text-fg">Work Products</h3>
+                      <span className="text-caption text-faint">{workspace?.artifacts.length ?? 0} files · {formatBytes(workspace?.totalBytes)}</span>
+                    </div>
+                    {!workspace || workspace.artifacts.length === 0 ? (
+                      <EmptyState title="No work products" description="This run has not written artifacts to its shared workspace yet." className="rounded-md border border-border py-12" />
+                    ) : (
+                      <div className="grid gap-2">
+                        {workspace.artifacts.map((artifact) => (
+                          <div key={`${artifact.agent}:${artifact.tool}:${artifact.path}`} className="rounded-md border border-border bg-surface px-4 py-3">
+                            <div className="flex items-center gap-2">
+                              <FileText className="h-4 w-4 shrink-0 text-faint" aria-hidden />
+                              <span className="min-w-0 flex-1 truncate text-small font-semibold text-fg">{artifact.agent}</span>
+                              <span className="shrink-0 text-caption text-faint">{formatBytes(artifact.bytes)}</span>
+                            </div>
+                            <p className="mt-1 line-clamp-2 text-small text-muted">{artifact.summary}</p>
+                            <div className="mt-2 flex flex-wrap gap-1.5 text-caption text-faint">
+                              <span className="rounded-sm bg-subtle px-2 py-0.5">{artifact.tool}</span>
+                              <span className="min-w-0 truncate rounded-sm bg-subtle px-2 py-0.5">{artifact.path}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                </div>
+              )}
+          </main>
+        </div>
+      </div>
     </div>
   );
 }

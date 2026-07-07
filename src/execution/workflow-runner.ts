@@ -17,17 +17,17 @@ import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
 import { addRunEvent, startRun, finishRun } from '../runtime/run-events.js';
-import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { WORKFLOW_RUNS_DIR, listWorkspaceProjects } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
   listWorkflows,
   readWorkflow,
-  writeWorkflow,
   clampGoalMaxAttempts,
   type WorkflowDefinition,
   type WorkflowStepInput,
   type WorkflowStepOutputContract,
 } from '../memory/workflow-store.js';
+import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
 import { validateGoal, toGoalEvidence, type GoalValidationResult } from './goal-validate.js';
 import {
   ensureWorkflowRunGoal,
@@ -36,6 +36,8 @@ import {
   expireGoal,
 } from '../agents/plan-proposals.js';
 import { loadSkill } from '../memory/skill-store.js';
+import { anchorRunGoal, recordStepOutput, writeWorkspaceCheckerReport } from './workflow-run-workspace.js';
+import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import {
   appendWorkflowEvent,
   computeResumeState,
@@ -76,9 +78,10 @@ import {
   type BlockedStep,
 } from './workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
-import { checkWorkflowForWrite, prepareWorkflowForWrite, stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
+import { checkWorkflowForWrite, classifyStepSideEffect, prepareWorkflowForWrite, stepLooksLikeIrreversibleSend, stepLooksMutating } from './workflow-enforce.js';
 import { recordAndDeriveStableTightenings } from './workflow-contract-evidence-store.js';
 import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
+import { simulateWorkflowDryRun, renderWorkflowDryRunSimulation } from './workflow-dry-run-simulation.js';
 import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold, clearWorkflowFailures } from './workflow-failure-ledger.js';
 import { takeStepResult } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
@@ -712,14 +715,80 @@ export function applyGoalFeedbackToPrompt(
   ].join('\n');
 }
 
+interface WorkflowStepProjectContext {
+  requested: string;
+  source: 'workflow' | 'step';
+  name?: string;
+  path?: string;
+  type?: string;
+}
+
+function normalizeWorkflowProjectRef(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase();
+}
+
+function slugifyWorkflowProjectRef(value: string): string {
+  return normalizeWorkflowProjectRef(value).replace(/[^a-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+function findWorkspaceProjectForRef(ref: string): { name: string; path: string; type?: string } | null {
+  const wanted = normalizeWorkflowProjectRef(ref);
+  const wantedSlug = slugifyWorkflowProjectRef(ref);
+  try {
+    return listWorkspaceProjects().find((project) => {
+      const pathParts = project.path.split(/[\\/]/).filter(Boolean);
+      const aliases = [project.name, project.path, pathParts[pathParts.length - 1]]
+        .map((alias) => alias?.trim())
+        .filter((alias): alias is string => Boolean(alias));
+      return aliases.some((alias) => {
+        const normalized = normalizeWorkflowProjectRef(alias);
+        return normalized === wanted || slugifyWorkflowProjectRef(alias) === wantedSlug;
+      });
+    }) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWorkflowStepProjectContext(
+  step: Pick<WorkflowStepInput, 'project'>,
+  workflow?: Pick<WorkflowDefinition, 'project'>,
+): WorkflowStepProjectContext | undefined {
+  const stepProject = step.project?.trim();
+  const workflowProject = workflow?.project?.trim();
+  const requested = stepProject || workflowProject;
+  if (!requested) return undefined;
+  const matched = findWorkspaceProjectForRef(requested);
+  return {
+    requested,
+    source: stepProject ? 'step' : 'workflow',
+    ...(matched ? { name: matched.name, path: matched.path, type: matched.type } : { name: requested }),
+  };
+}
+
+function projectContextValue(project: WorkflowStepProjectContext | undefined, key: string): unknown {
+  if (!project) return undefined;
+  if (key === 'requested') return project.requested;
+  if (key === 'source') return project.source;
+  if (key === 'name') return project.name;
+  if (key === 'path') return project.path;
+  if (key === 'type') return project.type;
+  return undefined;
+}
+
 function renderTemplate(
   template: string,
   inputs: Record<string, string>,
   stepOutputs: Record<string, unknown>,
   item?: unknown,
+  project?: WorkflowStepProjectContext,
 ): string {
   return template
     .replace(/\{\{date\}\}/g, new Date().toISOString().slice(0, 10))
+    .replace(/\{\{project\.([a-zA-Z0-9_-]+)\}\}/g, (_m, key: string) => {
+      const value = projectContextValue(project, key);
+      return value === undefined || value === null ? '' : String(value);
+    })
     .replace(/\{\{input\.([a-zA-Z0-9_-]+)\}\}/g, (_m, key: string) => inputs[key] ?? '')
     .replace(/\{\{steps\.([a-zA-Z0-9_-]+)\.output\}\}/g, (_m, key: string) => {
       const out = stepOutputs[key];
@@ -747,7 +816,7 @@ function renderTemplate(
 // A call arg value that is EXACTLY one template token resolves to the RAW
 // upstream value (object/array preserved, so a whole step output can be handed
 // to a tool). An embedded token ("prefix {{input.x}}") renders as a string.
-const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|date)\s*\}\}\s*$/;
+const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|date)\s*\}\}\s*$/;
 
 function pathGet(value: unknown, dotted: string): unknown {
   if (!dotted) return value;
@@ -759,8 +828,9 @@ function pathGet(value: unknown, dotted: string): unknown {
   return cursor;
 }
 
-function resolveCallToken(token: string, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item: unknown): unknown {
+function resolveCallToken(token: string, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item: unknown, project?: WorkflowStepProjectContext): unknown {
   if (token === 'date') return new Date().toISOString().slice(0, 10);
+  if (token.startsWith('project.')) return projectContextValue(project, token.slice(8));
   if (token.startsWith('input.')) return inputs[token.slice(6)];
   if (token === 'item') return item;
   if (token.startsWith('item.')) return pathGet(item, token.slice(5));
@@ -769,27 +839,27 @@ function resolveCallToken(token: string, inputs: Record<string, string>, stepOut
   return undefined;
 }
 
-export function renderCallArgValue(val: unknown, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item?: unknown): unknown {
+export function renderCallArgValue(val: unknown, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item?: unknown, project?: WorkflowStepProjectContext): unknown {
   if (typeof val === 'string') {
     const full = CALL_FULL_TOKEN_RE.exec(val);
     if (full) {
-      const raw = resolveCallToken(full[1], inputs, stepOutputs, item);
+      const raw = resolveCallToken(full[1], inputs, stepOutputs, item, project);
       return raw === undefined ? '' : raw; // preserve object/array; unresolved → ''
     }
-    return renderTemplate(val, inputs, stepOutputs, item);
+    return renderTemplate(val, inputs, stepOutputs, item, project);
   }
-  if (Array.isArray(val)) return val.map((v) => renderCallArgValue(v, inputs, stepOutputs, item));
+  if (Array.isArray(val)) return val.map((v) => renderCallArgValue(v, inputs, stepOutputs, item, project));
   if (val && typeof val === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(val)) out[k] = renderCallArgValue(v, inputs, stepOutputs, item);
+    for (const [k, v] of Object.entries(val)) out[k] = renderCallArgValue(v, inputs, stepOutputs, item, project);
     return out;
   }
   return val; // numbers/booleans/null pass through
 }
 
-export function renderCallArgs(args: Record<string, unknown> | undefined, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item?: unknown): Record<string, unknown> {
+export function renderCallArgs(args: Record<string, unknown> | undefined, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item?: unknown, project?: WorkflowStepProjectContext): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(args ?? {})) out[k] = renderCallArgValue(v, inputs, stepOutputs, item);
+  for (const [k, v] of Object.entries(args ?? {})) out[k] = renderCallArgValue(v, inputs, stepOutputs, item, project);
   return out;
 }
 
@@ -797,7 +867,7 @@ export function renderCallArgs(args: Record<string, unknown> | undefined, inputs
  *  executeComposioTool. Args are rendered against inputs/upstream/(item). */
 async function executeWorkflowCallNode(step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown): Promise<unknown> {
   const call = step.call!;
-  const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item);
+  const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
   const { executeComposioTool } = await import('../integrations/composio/client.js');
   return executeComposioTool(call.tool, args);
 }
@@ -809,6 +879,7 @@ interface DeterministicStepPayload {
   stepId: string;
   inputs: Record<string, string>;
   stepOutputs: Record<string, unknown>;
+  project?: WorkflowStepProjectContext;
 }
 
 function redactProcessOutput(text: string): string {
@@ -1469,7 +1540,7 @@ async function runStepViaHarness(
   workflowName: string,
   allowedTools: string[],
   workflowRunId: string,
-  stepContext?: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown },
+  stepContext?: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown; project?: WorkflowStepProjectContext },
   // P0 parking: true only at call sites where a thrown ParkRunSignal can
   // unwind to processOneRunFile (plain step + synthesis). forEach items
   // run inside a per-item try/catch that would swallow the signal as an
@@ -1553,6 +1624,7 @@ async function runStepViaHarness(
         sdkResult = await runClaudeAgentSdkWorkflowStep({
           step,
           workflowName,
+          runId: workflowRunId, // attribute this step's fan-out to the workflow run
           prompt: message,
           modelId: stepModel,
           // Run gated mutating tools on the step's REAL session so the workflow's
@@ -1971,7 +2043,7 @@ function bindStepContext(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
   item?: unknown,
-): { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown } | undefined {
+): { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown; project?: WorkflowStepProjectContext } | undefined {
   const bound = bindStepInputs(step, ctx.inputs, ctx.stepOutputs, item);
   if (bound.missing.length > 0) {
     const message =
@@ -1988,8 +2060,9 @@ function bindStepContext(
   const hasValues = Object.keys(bound.values).length > 0;
   const hasUpstream = Object.keys(bound.upstream).length > 0;
   const hasItem = item !== undefined;
-  if (!hasValues && !hasUpstream && !hasItem) return undefined;
-  return { values: bound.values, upstream: bound.upstream, item };
+  const project = resolveWorkflowStepProjectContext(step, ctx.workflow);
+  if (!hasValues && !hasUpstream && !hasItem && !project) return undefined;
+  return { values: bound.values, upstream: bound.upstream, item, ...(project ? { project } : {}) };
 }
 
 /**
@@ -2350,6 +2423,7 @@ async function runStepVerifiedAttempt(
           stepId: `${step.id}#probe`,
           inputs: ctx.inputs,
           stepOutputs: { ...ctx.stepOutputs, [step.id]: output },
+          project: resolveWorkflowStepProjectContext(step, ctx.workflow),
         });
         const verdict = verifyStepOutput(step.loopUntil!.until, probeOutput);
         if (!verdict.ok) {
@@ -2584,8 +2658,17 @@ export function finalizeStepOutput(
     kind: 'step_completed',
     stepId: step.id,
     output: bound,
-    ...(meta ? { meta } : {}),
+    // Tag a blocked-but-finalized step so telemetry emits workflow_node_blocked
+    // instead of workflow_node_completed — a block is NOT a success (it was
+    // counting as one, overstating reliability on the engine's central concept).
+    ...(meta || isBlockedOutput ? { meta: { ...(meta ?? {}), ...(isBlockedOutput ? { blocked: true } : {}) } } : {}),
   });
+  // Persist the step's work product to the shared run workspace so the manifest
+  // is a complete, inspectable record of the run — what the live window shows
+  // and a checker agent reads. Best-effort: never blocks a completed step.
+  try {
+    recordStepOutput({ workflowName: workflowSlug, runId, stepId: step.id, output: bound, nowIso: new Date().toISOString() });
+  } catch { /* best-effort */ }
   return bound;
 }
 
@@ -2791,7 +2874,7 @@ export function tightenWorkflowContractsFromCleanRun(
     current,
     `clean-run contract tightening (run ${runId}): ${applicable.map((t) => `${t.stepId} ← ${t.evidence}`).join('; ')}`,
   );
-  writeWorkflow(workflowSlug, tightened);
+  writeWorkflowAndSyncTriggers(workflowSlug, tightened);
   for (const t of applicable) {
     appendWorkflowEvent(workflowSlug, runId, {
       kind: 'step_advisory',
@@ -2839,6 +2922,7 @@ export async function executeStep(
         stepId: step.id,
         inputs: ctx.inputs,
         stepOutputs: ctx.stepOutputs,
+        project: resolveWorkflowStepProjectContext(step, ctx.workflow),
       });
     } catch (err) {
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
@@ -3026,7 +3110,7 @@ export async function executeStep(
             // Bind this item's declared inputs + fast-fail on missing (no-op
             // when the step declares no `inputs`). `item` is in scope here.
             const itemContext = bindStepContext(step, ctx, item);
-            const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item);
+            const itemIntent = renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
             const prompt = applyWorkflowOriginLineage(
               ctx,
               applyWorkflowPatternHint(
@@ -3218,7 +3302,7 @@ export async function executeStep(
   });
   const prompt = applyGoalFeedbackToPrompt(
     ctx,
-    applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs))),
+    applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, undefined, resolveWorkflowStepProjectContext(step, ctx.workflow)))),
   );
   const promptedWithPatterns = applyWorkflowOriginLineage(ctx, applyWorkflowPatternHint(ctx, prompt));
   let output: unknown;
@@ -3279,7 +3363,7 @@ export async function executeStep(
   // quality advisory that rides along with the delivered output. It never
   // fails the step or hides the deliverable; terminal accounting may still mark
   // the run needsAttention so the miss is not treated as clean success.
-  await noteStepSkillAdvisory(step, stepSessionId, output, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs), ctx);
+  await noteStepSkillAdvisory(step, stepSessionId, output, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, undefined, resolveWorkflowStepProjectContext(step, ctx.workflow)), ctx);
 
   // DETERMINISTIC skill-execution FLOOR (hard). The advisory above is detection-
   // only; this HARD-fails a `usesSkill` step whose skill ships a RENDERER that
@@ -3482,6 +3566,34 @@ function parallelStepLabel(steps: WorkflowStepInput[]): string {
   return labels.length > 3 ? `parallel: ${preview} + ${labels.length - 3} more` : `parallel: ${preview}`;
 }
 
+function appendWorkflowNodeReadyBatch(
+  workflowSlug: string,
+  runId: string,
+  readyBatch: WorkflowStepInput[],
+  scheduledBatch: WorkflowStepInput[],
+  round: number,
+  concurrencyCap: number,
+): void {
+  const scheduledIndex = new Map(scheduledBatch.map((step, index) => [step.id, index]));
+  readyBatch.forEach((step, index) => {
+    const laneIndex = scheduledIndex.get(step.id);
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'workflow_node_ready',
+      stepId: step.id,
+      meta: {
+        round,
+        readyIndex: index,
+        readyWidth: readyBatch.length,
+        concurrencyCap,
+        scheduled: laneIndex !== undefined,
+        laneIndex: laneIndex ?? null,
+        deferredByConcurrency: laneIndex === undefined,
+        parallel: readyBatch.length > 1,
+      },
+    });
+  });
+}
+
 /**
  * Run the full step DAG to completion. Steps whose dependencies are
  * already satisfied run in the same batch, capped by
@@ -3493,13 +3605,11 @@ function parallelStepLabel(steps: WorkflowStepInput[]): string {
  *  field if set, else derived from the prose heuristic. Drives the crash-resume
  *  guard (don't blind-re-run a step that may have partially sent/written). */
 export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' | 'send' {
-  if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
-  // CALL-1: a structured call has no prose to heuristic on — classify from the
-  // tool slug so a *_send / *_create call is guarded for crash-resume + retry.
-  if (step.call?.tool) return callToolSideEffectClass(step.call.tool);
-  if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
-  if (stepLooksMutating(step)) return 'write';
-  return 'read';
+  // Delegates to the canonical classifier (workflow-enforce) so the gate, the
+  // dashboard graph, and the proof card never disagree. The gate needs a
+  // decision, so an unclassifiable step defaults to the safe 'read' bucket.
+  const cls = classifyStepSideEffect(step);
+  return cls === 'unknown' ? 'read' : cls;
 }
 
 /** Derive a call node's side-effect class from its tool slug (conservative:
@@ -3895,6 +4005,16 @@ async function executeWorkflow(
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
 
+  // Anchor the shared run workspace on this run's goal — the objective + learned
+  // success criteria every step/agent references, and the file the checker agent
+  // and the live window read. Best-effort; a workspace hiccup never blocks a run.
+  try {
+    anchorRunGoal(workflowSlug, runId, {
+      objective: workflow.goal?.objective?.trim() || workflow.description?.trim() || `Deliver "${workflow.name}"`,
+      successCriteria: workflow.goal?.successCriteria,
+    });
+  } catch { /* best-effort */ }
+
   // Wave 3 P0-3: crash-resume idempotency guard. A step that started but never
   // completed (crash / daemon restart) and performs an external side effect
   // must NOT be blind-re-run — it may have already sent or written some items.
@@ -3996,9 +4116,13 @@ async function executeWorkflow(
     }
   } else {
     let completedStepIds = new Set(Object.keys(stepOutputs));
+    let executionRound = 0;
     while (completedStepIds.size < steps.length) {
+      executionRound += 1;
       const readyBatch = planWorkflowExecutionBatches(steps, completedStepIds)[0] ?? [];
-      const batch = readyBatch.slice(0, Math.max(1, RUNNER_CONCURRENCY));
+      const concurrencyCap = Math.max(1, RUNNER_CONCURRENCY);
+      const batch = readyBatch.slice(0, concurrencyCap);
+      appendWorkflowNodeReadyBatch(workflowSlug, runId, readyBatch, batch, executionRound, concurrencyCap);
       const batchIndex = completedStepIds.size + 1;
       setWorkflowRunCurrentStep(runId, {
         stepId: parallelStepLabel(batch),
@@ -4060,7 +4184,7 @@ async function executeWorkflow(
       stepId: '__synthesis__',
     });
     const stepOutputsAsText = formatStepOutputs(workflow.steps, stepOutputs);
-    const synthesisPrompt = renderTemplate(workflow.synthesis.prompt, inputs, stepOutputs);
+    const synthesisPrompt = renderTemplate(workflow.synthesis.prompt, inputs, stepOutputs, undefined, resolveWorkflowStepProjectContext({}, workflow));
     const synthesisStep: WorkflowStepInput = {
       id: '__synthesis__',
       prompt: synthesisPrompt,
@@ -4313,15 +4437,16 @@ function clipForContext(value: unknown): unknown {
   const head = 6000, tail = 1500;
   return `[clipped to a head+tail preview of ${json.length} chars — declare an explicit inputs.from binding for the precise full value]\n${json.slice(0, head)}\n…[${json.length - head - tail} chars omitted from the middle]…\n${json.slice(json.length - tail)}`;
 }
-function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown }): string {
+function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown; project?: WorkflowStepProjectContext }): string {
   const payload: Record<string, unknown> = {
     input: Object.fromEntries(Object.entries(ctx.values).map(([k, v]) => [k, clipForContext(v)])),
     upstream: Object.fromEntries(Object.entries(ctx.upstream).map(([k, v]) => [k, clipForContext(v)])),
   };
+  if (ctx.project !== undefined) payload.project = ctx.project;
   if (ctx.item !== undefined) payload.item = clipForContext(ctx.item);
   return [
     '=== STEP CONTEXT (structured, authoritative) ===',
-    'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step. Use it over prose. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
+    'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step; `project` is the required local workspace when present. Use it over prose. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
     JSON.stringify(payload, null, 2),
     '=== END STEP CONTEXT ===',
   ].join('\n');
@@ -4640,10 +4765,10 @@ async function tryAutoHealAndRequeue(args: {
     selfHealAttempt: attempt,
     selfHealBackupId: applied.backupId,
   });
-  if (requeued.status === 'not_found') {
+  if (requeued.status !== 'queued' && requeued.status !== 'duplicate') {
     // Fix is applied but we couldn't re-queue — report it so it's never silent.
-    logger.warn({ runId: run.id }, 'self-heal: applied fix but could not re-queue; surfacing for manual re-run');
-    return { attempt, max, stepId: fix.stepId, message: `I auto-applied a fix to step "${fix.stepId}" (${fix.description}), but couldn't re-run automatically — please run the workflow again.` };
+    logger.warn({ runId: run.id, status: requeued.status, reason: requeued.message }, 'self-heal: applied fix but could not re-queue; surfacing for manual re-run');
+    return { attempt, max, stepId: fix.stepId, message: `I auto-applied a fix to step "${fix.stepId}" (${fix.description}), but couldn't re-run automatically: ${requeued.message}` };
   }
   // RSH-5: remember this fix as PENDING, keyed by the healed re-run. If that run
   // completes clean the fix is PROMOTED to the confirmed store (it stuck); if it
@@ -4963,32 +5088,43 @@ async function processOneRunFile(
     // per-issue "would this run?" verdict, then finalizes the record.
     if (run.status === 'dry_run') {
       startWorkflowActivityRun(run, workflow.data.name, `Dry-running workflow "${workflow.data.name}"`);
-      const inputs = normalizeWorkflowRunInputs({
-        ...Object.fromEntries(Object.entries(workflow.data.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
-        ...(run.inputs ?? {}),
+      // Provable dry-run: trace the whole plan side-effect-free and enumerate
+      // every external write/send BEFORE anything runs. The verdict mirrors what
+      // the queue would actually refuse (structural preflight + authoritative
+      // readiness blockers); plain-tool/contract advisories inform, not block.
+      const sim = simulateWorkflowDryRun(workflow.data, {
+        workflowSlug: workflow.name,
+        inputs: run.inputs ?? {},
       });
-      const preflight = preflightWorkflow(workflow.data, inputs);
-      const report = renderPreflightReport(workflow.data.name, preflight);
+      const report = renderWorkflowDryRunSimulation(sim);
       writeRunRecord(filePath, {
         ...run,
         status: 'dry_run',
         finishedAt: new Date().toISOString(),
-        output: preflight.summary,
+        output: sim.summary,
       });
       addNotification({
         id: `workflow-${run.id}-dryrun`,
         kind: 'workflow',
-        title: preflight.ok ? `Dry-run OK: ${workflow.data.name}` : `Dry-run found issues: ${workflow.data.name}`,
+        title: sim.runnable ? `Dry-run OK: ${workflow.data.name}` : `Dry-run found blockers: ${workflow.data.name}`,
         body: report,
         createdAt: new Date().toISOString(),
         read: false,
-        metadata: { workflow: workflow.data.name, runId: run.id, dryRun: true, preflightOk: preflight.ok },
+        metadata: {
+          workflow: workflow.data.name,
+          runId: run.id,
+          dryRun: true,
+          preflightOk: sim.runnable,
+          verdict: sim.verdict,
+          sendCount: sim.effects.sends.length,
+          writeCount: sim.effects.writes.length,
+        },
       });
       finishWorkflowActivityRun(run.id, {
         status: 'completed',
-        message: preflight.ok ? 'Workflow dry-run passed' : 'Workflow dry-run found issues',
+        message: sim.runnable ? 'Workflow dry-run passed' : 'Workflow dry-run found blockers',
         outputPreview: report,
-        needsAttention: !preflight.ok,
+        needsAttention: !sim.runnable,
       });
       markRunNotified(filePath);
       return;
@@ -5013,7 +5149,7 @@ async function processOneRunFile(
       // stays disabled and the report says what to fix (informs, not a hard gate
       // — the user can still enable manually).
       if (result.pass) {
-        try { writeWorkflow(workflow.name, { ...workflow.data, enabled: true }); } catch { /* best-effort */ }
+        try { writeWorkflowAndSyncTriggers(workflow.name, { ...workflow.data, enabled: true }); } catch { /* best-effort */ }
         try { clearWorkflowFailures(workflow.name); } catch { /* best-effort */ }
       }
       writeRunRecord(filePath, { ...run, status: 'creation_test', finishedAt: new Date().toISOString(), output: result.pass ? 'creation test passed' : 'creation test found issues' });
@@ -5078,7 +5214,7 @@ async function processOneRunFile(
       const prep = prepareWorkflowForWrite(workflow.data);
       if (prep.ok && prep.repairs.length > 0) {
         workflow.data = prep.def;
-        try { writeWorkflow(workflow.name, prep.def); } catch { /* best-effort: run with repaired in-memory definition */ }
+        try { writeWorkflowAndSyncTriggers(workflow.name, prep.def); } catch { /* best-effort: run with repaired in-memory definition */ }
         try {
           appendWorkflowEvent(workflow.name, run.id, {
             kind: 'step_advisory',
@@ -5354,6 +5490,15 @@ async function processOneRunFile(
           evidenceText: buildGoalEvidenceText(finalOutput, stepOutputs),
         });
         goalFeedbackNext = renderGoalFeedback(goalVerdict);
+        // Auto-checker: reuse the verdict just computed (no second judge call)
+        // and persist it to the shared workspace so the run window ALWAYS shows
+        // the checker's read on this run — no click needed. Best-effort.
+        try {
+          writeWorkspaceCheckerReport(
+            workflow.name, run.id,
+            checkerReportFromVerdict(run.id, goalVerdict, Object.keys(stepOutputs), new Date().toISOString()),
+          );
+        } catch { /* best-effort — checker persistence never affects the run */ }
         // Contract row (plan-proposals, origin kind 'workflow'): the pinned
         // goal's external home — attempt lineage + per-criterion evidence
         // accumulate across re-pursuit runs, visible to /goal status. Pure
@@ -5423,7 +5568,9 @@ async function processOneRunFile(
               action: 'escalate',
               reason: requeued?.status === 'duplicate'
                 ? 'goal unmet, and an identical run is already queued — could not queue a feedback-carrying re-pursuit (the queued run will validate the goal again on its own)'
-                : 'goal unmet and the automatic re-run could not be queued — re-run manually',
+                : requeued?.status === 'blocked_readiness'
+                  ? `goal unmet and the automatic re-run was blocked by workflow readiness: ${requeued.message}`
+                  : 'goal unmet and the automatic re-run could not be queued — re-run manually',
             };
           }
         }
@@ -5434,13 +5581,25 @@ async function processOneRunFile(
           if (goalContractId && goalDecision.action === 'satisfied') satisfyGoal(goalContractId, 'external validation passed');
           if (goalContractId && goalDecision.action === 'escalate') expireGoal(goalContractId, goalDecision.reason);
         } catch { /* best-effort */ }
-        try {
-          appendWorkflowEvent(workflow.name, run.id, {
-            kind: 'step_advisory',
-            stepId: '(run goal)',
-            meta: { goal: goalDecision.action, reason: goalDecision.reason, attempt: (run.goalAttempt ?? 0) + 1, max: runGoal.maxAttempts },
-          });
-        } catch { /* journal note is best-effort — a re-pursuit may already be queued, so this run must reach its terminal record write */ }
+	        try {
+	          appendWorkflowEvent(workflow.name, run.id, {
+	            kind: 'step_advisory',
+	            stepId: '(run goal)',
+	            meta: {
+	              goal: goalDecision.action,
+	              reason: goalDecision.reason,
+	              attempt: (run.goalAttempt ?? 0) + 1,
+	              max: runGoal.maxAttempts,
+	              successRatePercent: goalVerdict.successRatePercent,
+	              criteriaMet: goalVerdict.criteriaMet,
+	              criteriaTotal: goalVerdict.criteriaTotal,
+	              judgeFailedOpen: goalVerdict.judgeFailedOpen === true,
+	              failedCriteria: goalVerdict.perCriterion.filter((criterion) => !criterion.pass).map((criterion) => criterion.criterion).slice(0, 6),
+	              ...(goalRequeueId ? { requeueRunId: goalRequeueId } : {}),
+	              ...(goalFeedbackNext ? { feedbackPreview: goalFeedbackNext.slice(0, 800) } : {}),
+	            },
+	          });
+	        } catch { /* journal note is best-effort — a re-pursuit may already be queued, so this run must reach its terminal record write */ }
         logger.info(
           { workflow: workflow.data.name, runId: run.id, goal: goalDecision.action, reason: goalDecision.reason },
           'pinned run goal validated',

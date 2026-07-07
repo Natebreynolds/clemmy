@@ -148,7 +148,7 @@ export function buildGatedToolPermission(sessionId: string, fastAllowTools: stri
     // so the dock shows "Using read_file…" — instead of streaming the model's raw
     // text, which dumped its tool-call XML into the bubble. Fires for EVERY tool
     // (fast-allow reads included). Best-effort: progress never blocks a tool.
-    try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: bare } }); } catch { /* progress only */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: bare, callId: options.toolUseID } }); } catch { /* progress only */ }
     // The CLI's control-protocol schema requires `updatedInput` on EVERY allow
     // (a bare {behavior:'allow'} fails its Zod parse with "updatedInput expected
     // record, received undefined" and the tool call dies — 2026-07-02 end-of-day

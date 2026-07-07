@@ -6,6 +6,7 @@ import { listWorkflows } from '../memory/workflow-store.js';
 import { reapRunEventDir } from './workflow-events.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 
 /**
  * Workflow scheduling tick.
@@ -19,13 +20,13 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
  * What this module does (clean lane — does not touch workflow-runner.ts):
  *   - Loads every workflow (via existing workflow-store)
  *   - For each one with `enabled && trigger.schedule` matching the
- *     current minute, writes a queued run record into WORKFLOW_RUNS_DIR
+ *     current minute, queues a run record through the shared workflow queue
  *   - Dedupes by per-workflow minute-key so a daemon that ticks twice
  *     in the same minute doesn't double-fire
  *   - The existing `processWorkflowRuns` picks the queued run up on the
  *     next tick and executes it through the normal workflow runner
  *
- * Coordination contract: this module ONLY appends queued-run files. It
+ * Coordination contract: this module ONLY queues workflow runs. It
  * does not read or mutate any in-flight run state. Any concurrent work
  * happening inside workflow-runner.ts is decoupled.
  */
@@ -383,21 +384,16 @@ function emitCatchupNotice(workflowName: string, missed: number, firedMinuteKey:
   }
 }
 
-/** Writes the queued run record and returns its id (so the caller can correlate a
+/** Queues the scheduled run record and returns its id (so the caller can correlate a
  *  workflow_trigger_fired telemetry event to the run it enqueued). */
 function enqueueScheduledRun(workflowName: string): string {
-  ensureDir(WORKFLOW_RUNS_DIR);
-  const id = `sched-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  const filePath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
-  const record = {
-    id,
-    workflow: workflowName,
-    status: 'queued',
-    createdAt: new Date().toISOString(),
+  const queued = queueWorkflowRun(workflowName, {}, {
     source: 'schedule',
-  };
-  writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf-8');
-  return id;
+    idPrefix: 'sched',
+    dedupe: false,
+  });
+  if (!queued.id) throw new Error(queued.message || `Scheduled workflow "${workflowName}" did not return a run id.`);
+  return queued.id;
 }
 
 /**
