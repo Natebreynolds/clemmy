@@ -96,6 +96,7 @@ import { certifyWorkflow, type WorkflowCertification } from '../execution/workfl
 import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
 import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes, readWorkspaceCheckerReport, writeWorkspaceCheckerReport } from '../execution/workflow-run-workspace.js';
+import { listSubagentRuns, readSubagentOutput } from '../agents/subagent-runs.js';
 import { checkRunAgainstGoal } from '../execution/workflow-run-checker.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
 import {
@@ -4199,6 +4200,27 @@ export function registerConsoleRoutes(
       totalBytes: workspaceArtifactBytes(entry.name, req.params.runId),
       checker: readWorkspaceCheckerReport(entry.name, req.params.runId),
     });
+  });
+
+  // Subagent visibility: every specialized agent this run spawned (Claude / Codex
+  // / GLM-BYO fan-out), with role, provider, model, task, status — so opening a
+  // workflow shows WHO worked. Full work-product via the /output route below.
+  app.get('/api/console/workflows/:name/runs/:runId/agents', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const runs = listSubagentRuns(req.params.runId);
+    res.json({
+      runId: req.params.runId,
+      agents: runs,
+      byProvider: runs.reduce<Record<string, number>>((acc, r) => { acc[r.provider] = (acc[r.provider] ?? 0) + 1; return acc; }, {}),
+    });
+  });
+
+  // One specialized agent's full persisted work-product ("the work they did").
+  app.get('/api/console/workflows/:name/runs/:runId/agents/:agentId/output', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const output = readSubagentOutput(req.params.runId, req.params.agentId);
+    if (output === null) { res.status(404).json({ error: 'no work-product for that agent' }); return; }
+    res.json({ agentId: req.params.agentId, output });
   });
 
   // Run the CHECKER agent: a second agent reads the shared workspace (goal +

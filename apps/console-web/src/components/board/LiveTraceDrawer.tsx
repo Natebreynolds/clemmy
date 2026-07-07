@@ -18,6 +18,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
 import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
+import { RunAgentsPanel } from '@/components/board/RunAgentsPanel';
 import {
   cardTone,
   getBackgroundTaskDetail,
@@ -552,7 +553,15 @@ export function LiveTraceDrawer({
               // Workflow runs get the structured, step-grouped detail (timeline +
               // attempts + advisories + summary + per-step tokens) — the flat
               // milestone list above can't express a finished run's depth.
-              <WorkflowRunDetail events={rawWorkflow} />
+              <>
+                <WorkflowRunDetail events={rawWorkflow} />
+                {(card.raw.workflowSlug || card.raw.workflowName) && card.raw.runId && (
+                  <RunAgentsPanel
+                    slug={String(card.raw.workflowSlug || card.raw.workflowName)}
+                    runId={String(card.raw.runId)}
+                  />
+                )}
+              </>
             ) : rows.length === 0 ? (
               <p className="text-body text-faint">No milestones yet — the trace streams in as the agent works.</p>
             ) : (
