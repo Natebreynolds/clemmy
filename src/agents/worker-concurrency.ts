@@ -40,8 +40,13 @@
 
 const DEFAULT_MAX_CONCURRENCY = 6;
 const DEFAULT_GLOBAL_MAX_CONCURRENCY = 12;
-const DEFAULT_BYO_MAX_CONCURRENCY = 1;
-const DEFAULT_BYO_GLOBAL_MAX_CONCURRENCY = 2;
+// BYO parallel fan-out: 3/session, 4/global (was 1/2 — a serial bottleneck that
+// made GLM/BYO worker fan-out run one item at a time). 3 concurrent is absorbed by
+// essentially every real BYO provider (z.ai, Together, OpenRouter, Groq, …) yet
+// stays well under the native 6/12 for smaller quota pools. Still opt-up AND
+// opt-down via CLEMMY_WORKER_MAX_CONCURRENCY_BYO[_GLOBAL] for a tiny endpoint.
+const DEFAULT_BYO_MAX_CONCURRENCY = 3;
+const DEFAULT_BYO_GLOBAL_MAX_CONCURRENCY = 4;
 
 type WorkerProviderClass = 'codex' | 'claude' | 'byo';
 

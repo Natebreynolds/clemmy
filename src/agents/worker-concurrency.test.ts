@@ -177,7 +177,7 @@ test('GLOBAL ceiling default (12) never further limits a single session on the d
   });
 });
 
-test('BYO workers default to a conservative per-session cap even when the generic cap is higher', async () => {
+test('BYO workers parallelize up to the default cap (3/session) then queue — conservative vs native 6, but no longer serial', async () => {
   await withEnv({
     CLEMMY_WORKER_MAX_CONCURRENCY: undefined,
     CLEMMY_WORKER_MAX_CONCURRENCY_GLOBAL: undefined,
@@ -186,17 +186,23 @@ test('BYO workers default to a conservative per-session cap even when the generi
   }, async () => {
     _resetWorkerConcurrencyForTest();
     const queued: Array<{ queueDepth: number; perSessionCap: number; globalCap: number; provider?: string }> = [];
-    const r1 = await acquireWorkerSlot('sess-byo', (info) => queued.push(info), { provider: 'byo', modelId: 'glm-5.2' });
-    let secondAcquired = false;
-    const p2 = acquireWorkerSlot('sess-byo', (info) => queued.push(info), { provider: 'byo', modelId: 'glm-5.2' })
-      .then((r) => { secondAcquired = true; return r; });
+    const opts = { provider: 'byo' as const, modelId: 'glm-5.2' };
+    // Three BYO workers acquire immediately (parallel fan-out, was serial at cap 1).
+    const r1 = await acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts);
+    const r2 = await acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts);
+    const r3 = await acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts);
+    assert.equal(_activeWorkerSlots('sess-byo'), 3, 'three BYO workers run concurrently');
+    // The FOURTH waits behind the per-session cap of 3.
+    let fourthAcquired = false;
+    const p4 = acquireWorkerSlot('sess-byo', (info) => queued.push(info), opts)
+      .then((r) => { fourthAcquired = true; return r; });
     await Promise.resolve();
-    assert.equal(secondAcquired, false, 'the second BYO worker waits behind the default BYO cap');
-    assert.deepEqual(queued[0], { queueDepth: 1, perSessionCap: 1, globalCap: 2, provider: 'byo' });
+    assert.equal(fourthAcquired, false, 'the 4th BYO worker waits behind the default cap');
+    assert.deepEqual(queued[0], { queueDepth: 1, perSessionCap: 3, globalCap: 4, provider: 'byo' });
     r1();
-    const r2 = await p2;
-    assert.equal(secondAcquired, true);
-    r2();
+    const r4 = await p4;
+    assert.equal(fourthAcquired, true, 'freeing a slot hands it to the waiter');
+    r2(); r3(); r4();
     assert.equal(_activeWorkerSlots('sess-byo'), 0);
     assert.equal(_activeProviderWorkerSlots('byo'), 0);
   });
