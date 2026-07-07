@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
-  FileSearch, Users, MapPin, Wrench, CheckCircle2, XCircle,
+  FileSearch, Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
@@ -18,10 +18,11 @@ import { cn } from '@/lib/cn';
 import {
   listFacts, forgetFact, pinFact, getContext, addFact, addGoal, searchMemory, getMemoryFiles,
   getBrainHealth, getMemoryHealth, getToolRecall, listEntities, getSourceMap, fileBasename, FACT_KINDS,
-  type Fact, type ContextFile, type Entity, type ToolRecallRecord,
+  discoverImportSources, scanImportPath, runMemoryImport, listImportBatches, undoImportBatch,
+  type Fact, type ContextFile, type Entity, type ToolRecallRecord, type ImportScan, type ImportBatch,
 } from '@/lib/memory';
 
-type Tab = 'overview' | 'facts' | 'entities' | 'procedures' | 'sources' | 'you';
+type Tab = 'overview' | 'facts' | 'entities' | 'procedures' | 'sources' | 'you' | 'import';
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference' };
 
 export function Memory() {
@@ -40,6 +41,7 @@ export function Memory() {
     { key: 'procedures', label: 'Tool recall', icon: Wrench },
     { key: 'sources', label: 'Sources', icon: FileText },
     { key: 'you', label: 'You & goals', icon: User },
+    { key: 'import', label: 'Import', icon: Download },
   ];
 
   return (
@@ -73,6 +75,7 @@ export function Memory() {
           {tab === 'procedures' && <ProceduresTab />}
           {tab === 'sources' && <SourcesTab />}
           {tab === 'you' && <YouTab qc={qc} />}
+          {tab === 'import' && <ImportTab qc={qc} />}
         </>
       )}
     </Page>
@@ -426,4 +429,167 @@ function YouTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
 
 function ProfileItem({ label, value }: { label: string; value?: string }) {
   return <div><dt className="text-label text-faint">{label}</dt><dd className="text-body text-fg">{value || '—'}</dd></div>;
+}
+
+// ─────────── Import: bring another agent's memory into Clementine ───────────
+
+function ImportTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
+  const [path, setPath] = useState('');
+  const [scan, setScan] = useState<ImportScan | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [distill, setDistill] = useState(true);
+  const [label, setLabel] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [lastBatch, setLastBatch] = useState<ImportBatch | null>(null);
+  const [error, setError] = useState('');
+
+  const discovered = useQuery({ queryKey: ['mem-import-discover'], queryFn: discoverImportSources, staleTime: 60_000 });
+  const batches = useQuery({ queryKey: ['mem-import-batches'], queryFn: listImportBatches, staleTime: 10_000 });
+
+  const doScan = async (p: string) => {
+    setError(''); setLastBatch(null); setScanning(true);
+    try {
+      const result = await scanImportPath(p);
+      setScan(result);
+      setSelected(new Set(result.files.map((f) => f.path)));
+      setPath(p);
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setScanning(false); }
+  };
+
+  const doImport = async () => {
+    if (!scan || selected.size === 0) return;
+    setError(''); setImporting(true);
+    try {
+      const { batch } = await runMemoryImport({
+        path: scan.root,
+        files: selected.size === scan.files.length ? undefined : [...selected],
+        sourceLabel: label.trim() || undefined,
+        distill,
+      });
+      setLastBatch(batch);
+      setScan(null);
+      qc.invalidateQueries({ queryKey: ['mem-import-batches'] });
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setImporting(false); }
+  };
+
+  const doUndo = async (id: string) => {
+    setError('');
+    try {
+      await undoImportBatch(id);
+      setLastBatch(null);
+      qc.invalidateQueries({ queryKey: ['mem-import-batches'] });
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+  };
+
+  return (
+    <div className="space-y-5">
+      <Card>
+        <div className="mb-1 flex items-center gap-2 text-body-lg font-semibold text-fg"><Download className="h-4 w-4" aria-hidden /> Import another agent&apos;s memory</div>
+        <p className="mb-4 text-body text-muted">
+          Point Clementine at any local memory store — Claude Code memories, OpenClaw or Fermis files, a bare <code>memory.md</code> / <code>AGENTS.md</code> — and she&apos;ll
+          normalize it into her own facts, de-duplicate, embed, and make it searchable. Imports are additive and undoable; source files are never modified.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Input value={path} onChange={(e) => setPath(e.target.value)} placeholder="/path/to/memory-folder or ~/notes/memory.md"
+            aria-label="Memory source path" className="min-w-72 flex-1" />
+          <Button onClick={() => path.trim() && doScan(path.trim())} disabled={!path.trim() || scanning}>
+            <FolderSearch className="h-4 w-4" aria-hidden /> {scanning ? 'Scanning…' : 'Scan'}
+          </Button>
+        </div>
+        {error && <p className="mt-2 text-body text-danger">{error}</p>}
+      </Card>
+
+      {!scan && (discovered.data?.sources.length ?? 0) > 0 && (
+        <Card>
+          <div className="mb-2 text-body-lg font-semibold text-fg">Found on this Mac</div>
+          <p className="mb-3 text-body text-muted">Agent-memory locations Clementine can see. Nothing is imported until you scan and confirm.</p>
+          <ul className="space-y-2">
+            {discovered.data!.sources.map((s) => (
+              <li key={s.path} className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
+                <div className="min-w-0">
+                  <div className="truncate text-body font-medium text-fg">{s.label}</div>
+                  <div className="truncate text-label text-faint">{s.path} · {s.fileCount} file{s.fileCount === 1 ? '' : 's'}</div>
+                </div>
+                <Button variant="secondary" onClick={() => doScan(s.path)}>Scan</Button>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {scan && (
+        <Card>
+          <div className="mb-2 flex items-center justify-between">
+            <div className="text-body-lg font-semibold text-fg">{scan.files.length} importable file{scan.files.length === 1 ? '' : 's'} in {scan.root}</div>
+            <button type="button" className="cursor-pointer text-label text-muted hover:text-fg"
+              onClick={() => setSelected(selected.size === scan.files.length ? new Set() : new Set(scan.files.map((f) => f.path)))}>
+              {selected.size === scan.files.length ? 'Deselect all' : 'Select all'}
+            </button>
+          </div>
+          <ul className="mb-4 max-h-80 space-y-1 overflow-y-auto">
+            {scan.files.map((f) => (
+              <li key={f.path}>
+                <label className="flex cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 hover:bg-surface-2">
+                  <input type="checkbox" checked={selected.has(f.path)} className="mt-1"
+                    onChange={(e) => { const next = new Set(selected); if (e.target.checked) next.add(f.path); else next.delete(f.path); setSelected(next); }} />
+                  <span className="min-w-0">
+                    <span className="block truncate text-body text-fg">{fileBasename(f.path)} <span className="text-faint">· {f.shape === 'structured_md' ? 'structured' : 'freeform'} · {Math.max(1, Math.round(f.bytes / 1024))}KB</span></span>
+                    <span className="block truncate text-label text-muted">{f.preview}</span>
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+          {scan.skipped.length > 0 && <p className="mb-3 text-label text-faint">{scan.skipped.length} file(s) skipped (unsupported, empty, or too large).</p>}
+          <div className="flex flex-wrap items-center gap-3">
+            <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Source label (e.g. openclaw)" aria-label="Source label" className="w-56" />
+            <label className="flex cursor-pointer items-center gap-2 text-body text-muted">
+              <input type="checkbox" checked={distill} onChange={(e) => setDistill(e.target.checked)} />
+              Distill freeform files with the model
+            </label>
+            <Button onClick={doImport} disabled={selected.size === 0 || importing}>
+              <Download className="h-4 w-4" aria-hidden /> {importing ? 'Importing…' : `Import ${selected.size} file${selected.size === 1 ? '' : 's'}`}
+            </Button>
+          </div>
+        </Card>
+      )}
+
+      {lastBatch && (
+        <Card>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="mb-1 flex items-center gap-2 text-body-lg font-semibold text-fg"><CheckCircle2 className="h-4 w-4 text-success" aria-hidden /> Imported</div>
+              <p className="text-body text-muted">
+                {lastBatch.newFactIds.length} new fact(s) from {lastBatch.fileCount} file(s) · {lastBatch.dedupedCount} already known ·
+                {' '}{lastBatch.distilledFiles} distilled · {lastBatch.errors.length} error(s). Embedding started — these are entering semantic recall now.
+              </p>
+            </div>
+            <Button variant="secondary" onClick={() => doUndo(lastBatch.id)}><Undo2 className="h-4 w-4" aria-hidden /> Undo</Button>
+          </div>
+        </Card>
+      )}
+
+      {(batches.data?.batches.length ?? 0) > 0 && (
+        <Card>
+          <div className="mb-2 text-body-lg font-semibold text-fg">Past imports</div>
+          <ul className="space-y-2">
+            {batches.data!.batches.slice(0, 10).map((b) => (
+              <li key={b.id} className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
+                <div className="min-w-0">
+                  <div className="truncate text-body font-medium text-fg">{b.sourceLabel} <span className="text-faint">· {new Date(b.startedAt).toLocaleString()}</span></div>
+                  <div className="truncate text-label text-faint">{b.root} · +{b.newFactIds.length} facts ({b.dedupedCount} deduped)</div>
+                </div>
+                {b.newFactIds.length > 0 && (
+                  <Button variant="secondary" onClick={() => doUndo(b.id)}><Undo2 className="h-4 w-4" aria-hidden /> Undo</Button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+    </div>
+  );
 }

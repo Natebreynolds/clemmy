@@ -495,4 +495,61 @@ export function registerMemoryTools(server: McpServer): void {
       }
     },
   );
+
+  server.tool(
+    'memory_import',
+    [
+      'Import ANOTHER agent\'s memory files (Claude Code memories, OpenClaw/Fermis stores, bare memory.md / AGENTS.md — any local folder or file) into Clementine\'s own memory: normalized into facts, deduped, embedded, and reachable via semantic recall.',
+      'Actions: discover (propose known agent-memory locations on this machine), scan (list importable files under a path with previews — show the user BEFORE ingesting), ingest (import a path; confirm the path with the user first), batches (list past imports), undo (remove every fact a batch added).',
+      'Ingest is additive and undoable; it never modifies the source files.',
+    ].join(' '),
+    {
+      action: z.enum(['discover', 'scan', 'ingest', 'batches', 'undo']),
+      path: z.string().nullable().optional().describe('Folder or file to scan/ingest (required for scan and ingest). ~ expands.'),
+      source_label: z.string().max(60).nullable().optional().describe('Short provenance label, e.g. "openclaw" — facts get sourceApp import:<label>.'),
+      batch_id: z.string().nullable().optional().describe('Batch id for undo.'),
+      distill: z.boolean().nullable().optional().describe('LLM-distill freeform files into discrete facts (default true). false = deterministic harvest only.'),
+    },
+    async ({ action, path: targetPath, source_label, batch_id, distill }) => {
+      try {
+        const { discoverKnownMemorySources, scanMemorySource, ingestMemorySource, listMemoryImportBatches, undoMemoryImportBatch } = await import('../memory/memory-import.js');
+        if (action === 'discover') {
+          const found = discoverKnownMemorySources();
+          if (found.length === 0) return textResult('No known agent-memory locations found on this machine. The user can point me at any folder or file instead.');
+          return textResult(['Importable agent-memory sources found (nothing imported yet — ask the user which to bring in):',
+            ...found.map((s) => `- ${s.label}: ${s.path} (${s.fileCount} file${s.fileCount === 1 ? '' : 's'})`)].join('\n'));
+        }
+        if (action === 'scan') {
+          if (!targetPath) return textResult('memory_import scan needs a path.');
+          const scan = scanMemorySource(targetPath);
+          const lines = [`Scan of ${scan.root}: ${scan.files.length} importable file(s), ${scan.skipped.length} skipped.`];
+          for (const f of scan.files.slice(0, 30)) lines.push(`- ${f.path} [${f.shape}] ${Math.round(f.bytes / 1024)}KB — ${f.preview.slice(0, 120)}`);
+          if (scan.files.length > 30) lines.push(`- … ${scan.files.length - 30} more`);
+          return textResult(lines.join('\n'));
+        }
+        if (action === 'ingest') {
+          if (!targetPath) return textResult('memory_import ingest needs a path.');
+          const batch = await ingestMemorySource(targetPath, { sourceLabel: source_label ?? undefined, distill: distill ?? true });
+          return textResult(
+            `Imported ${batch.fileCount} file(s) from ${batch.root} as batch ${batch.id}: `
+            + `${batch.newFactIds.length} new fact(s), ${batch.dedupedCount} already known, `
+            + `${batch.distilledFiles} distilled, ${batch.fallbackFiles} harvested deterministically, ${batch.errors.length} error(s). `
+            + 'Embedding started — the facts are entering semantic recall now. Undo anytime with action=undo batch_id=' + batch.id + '.',
+          );
+        }
+        if (action === 'batches') {
+          const batches = listMemoryImportBatches();
+          if (batches.length === 0) return textResult('No memory imports yet.');
+          return textResult(batches.slice(0, 15).map((b) =>
+            `- ${b.id} · ${b.sourceLabel} · ${b.root} · ${b.startedAt} · +${b.newFactIds.length} facts (${b.dedupedCount} deduped)`).join('\n'));
+        }
+        if (!batch_id) return textResult('memory_import undo needs a batch_id.');
+        const undone = undoMemoryImportBatch(batch_id);
+        if (!undone.batch) return textResult(`No import batch found with id ${batch_id}.`);
+        return textResult(`Undid batch ${batch_id}: removed ${undone.deleted} imported fact(s).`);
+      } catch (err) {
+        return textResult(`memory_import failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  );
 }

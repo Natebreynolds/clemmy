@@ -2674,6 +2674,73 @@ export function registerConsoleRoutes(
     }
   });
 
+  // ─── Memory import: bring OTHER agents' memory stores into Clementine ─────
+  // discover → propose known local agent-memory locations (never auto-imports);
+  // scan → preview importable files under a user-supplied path;
+  // run → ingest (facts + provenance + dedup + immediate embedding kick);
+  // batches/undo → audit trail and per-batch rollback.
+  app.get('/api/console/memory/import/discover', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { discoverKnownMemorySources } = await import('../memory/memory-import.js');
+      res.json({ sources: discoverKnownMemorySources() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/memory/import/scan', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+    if (!target) { res.status(400).json({ error: 'path required' }); return; }
+    try {
+      const { scanMemorySource } = await import('../memory/memory-import.js');
+      res.json(scanMemorySource(target));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/memory/import/run', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as { path?: unknown; files?: unknown; sourceLabel?: unknown; distill?: unknown };
+    const target = typeof body.path === 'string' ? body.path.trim() : '';
+    if (!target) { res.status(400).json({ error: 'path required' }); return; }
+    try {
+      const { ingestMemorySource } = await import('../memory/memory-import.js');
+      const batch = await ingestMemorySource(target, {
+        files: Array.isArray(body.files) ? body.files.filter((f): f is string => typeof f === 'string') : undefined,
+        sourceLabel: typeof body.sourceLabel === 'string' ? body.sourceLabel : undefined,
+        distill: body.distill !== false,
+      });
+      res.json({ batch });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/memory/import/batches', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listMemoryImportBatches } = await import('../memory/memory-import.js');
+      res.json({ batches: listMemoryImportBatches() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/memory/import/batches/:id/undo', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { undoMemoryImportBatch } = await import('../memory/memory-import.js');
+      const result = undoMemoryImportBatch(req.params.id);
+      if (!result.batch) { res.status(404).json({ error: 'batch not found' }); return; }
+      res.json({ deleted: result.deleted, batchId: req.params.id });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Tier D1 — edit/correct a fact's content (and optionally importance).
    * Lets the owner fix a wrong derivation in place instead of only being

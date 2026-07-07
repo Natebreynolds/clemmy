@@ -163,3 +163,20 @@ export const getGraph = (params?: GraphParams) => {
   const q = qs.toString();
   return apiGet<GraphResponse>(`/api/console/memory/graph${q ? `?${q}` : ''}`);
 };
+
+// ─── Memory import (other agents' memory stores → Clementine facts) ─────────
+export interface ImportSource { path: string; label: string; fileCount: number }
+export interface ImportFile { path: string; bytes: number; mtime: string; shape: 'structured_md' | 'freeform'; preview: string }
+export interface ImportScan { root: string; files: ImportFile[]; skipped: Array<{ path: string; reason: string }> }
+export interface ImportBatch {
+  id: string; root: string; sourceLabel: string; startedAt: string; finishedAt: string;
+  fileCount: number; newFactIds: number[]; dedupedCount: number;
+  distilledFiles: number; deterministicFiles: number; fallbackFiles: number;
+  errors: Array<{ path: string; error: string }>;
+}
+export const discoverImportSources = () => apiGet<{ sources: ImportSource[] }>('/api/console/memory/import/discover');
+export const scanImportPath = (path: string) => apiGet<ImportScan>(`/api/console/memory/import/scan?path=${encodeURIComponent(path)}`);
+export const runMemoryImport = (input: { path: string; files?: string[]; sourceLabel?: string; distill?: boolean }) =>
+  apiPost<{ batch: ImportBatch }>('/api/console/memory/import/run', input);
+export const listImportBatches = () => apiGet<{ batches: ImportBatch[] }>('/api/console/memory/import/batches');
+export const undoImportBatch = (id: string) => apiPost<{ deleted: number }>(`/api/console/memory/import/batches/${encodeURIComponent(id)}/undo`);
