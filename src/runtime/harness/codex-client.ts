@@ -95,6 +95,33 @@ export async function loadFreshCodexAccessToken(): Promise<string> {
 
 let configured = false;
 
+// Kill the SDK's import-time booby trap at OUR import time. `@openai/agents`
+// registers a KEYLESS OpenAIProvider as the global default model provider the
+// moment it is imported (dist/index.js: setDefaultModelProvider(new
+// OpenAIProvider(...))). Any code path that reaches an agents-SDK run before
+// configureHarnessRuntime() — scripts, background loops, the Claude-SDK
+// brain's cross-provider run_worker in a fresh process — resolved models
+// through that unkeyed client and died with the SDK's raw "Missing
+// credentials. Please pass an apiKey … or set the OPENAI_API_KEY environment
+// variable." (observed live 2026-07-06: 9/10 sdk_brain workers). Registering
+// here makes EVERY entry point route through Codex-OAuth / Claude / BYO
+// credential handling; configureHarnessRuntime still re-registers (with
+// debate wrapping decided at that point) and remains the auth gate.
+//
+// LAZY THUNK, not `new RouterModelProvider()` at module scope: codex-client is
+// itself inside the router's import cycle (router-model → codex-model →
+// codex-client), so constructing the router during module evaluation throws
+// "Cannot access 'RouterModelProvider' before initialization" when a cycle
+// participant is the entry module. First getModel() call constructs it — every
+// module is initialized by then.
+let bootDefaultProvider: ReturnType<typeof maybeWrapDebate> | null = null;
+setDefaultModelProvider({
+  getModel(modelName?: string) {
+    bootDefaultProvider ??= maybeWrapDebate(new RouterModelProvider());
+    return bootDefaultProvider.getModel(modelName);
+  },
+});
+
 export interface ConfigureResult {
   ok: boolean;
   reason?: string;

@@ -41,6 +41,10 @@ export interface MultiItemIntent {
   itemKind: string | null;
   sameShapeWork: boolean;
   explicitParallelRequest: boolean;
+  /** True when the multi-item signal came from a PRIOR conversation turn
+   *  (e.g. the assistant proposed "research these 18 firms?" and the user
+   *  answered "yes") rather than the current input itself. */
+  carriedFromPrior?: boolean;
 }
 
 export interface AgentContextPacket {
@@ -170,14 +174,30 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
     if (enumerated) {
       count = listMatches!.length;
     } else {
-      const m = COUNT_PLURAL_RE.exec(text);
-      if (m) {
+      // A message can carry SEVERAL counts ("Found 20 accounts … research
+      // these 18 email-ready firms next?" / "audit these 8 firms … write a
+      // 2-3 sentence analysis"). Rule: the LAST count introduced by a
+      // distinct-items marker ("these/those/each of N …") names the batch
+      // being acted on; with no marked count anywhere, keep the legacy
+      // first-valid-match behavior (live 2026-07-07).
+      const globalCountRe = new RegExp(COUNT_PLURAL_RE.source, 'gi');
+      const MARKED_PREFIX_RE = /\b(?:these|those|each of|all(?: of)?(?: the)?|the following)\s*$/i;
+      let firstValid: { n: number; noun: string } | null = null;
+      let lastMarked: { n: number; noun: string } | null = null;
+      let m: RegExpExecArray | null;
+      while ((m = globalCountRe.exec(text)) !== null) {
         const n = Number.parseInt(m[1], 10);
         const noun = m[2].toLowerCase();
-        if (Number.isFinite(n) && n >= 3 && n <= 500 && !NON_ITEM_NOUNS.has(noun)) {
-          count = n;
-          kind = noun;
+        if (!Number.isFinite(n) || n < 3 || n > 500 || NON_ITEM_NOUNS.has(noun)) continue;
+        if (!firstValid) firstValid = { n, noun };
+        if (MARKED_PREFIX_RE.test(text.slice(Math.max(0, m.index - 16), m.index))) {
+          lastMarked = { n, noun };
         }
+      }
+      const picked = lastMarked ?? firstValid;
+      if (picked) {
+        count = picked.n;
+        kind = picked.noun;
       }
     }
     if (count < 3) return NO_MULTI_ITEM;
@@ -207,6 +227,44 @@ export function detectMultiItemIntent(input: string): MultiItemIntent {
   } catch {
     return NO_MULTI_ITEM; // fail-open: detection must never break a turn
   }
+}
+
+// Continuation/affirmation markers: the current input approves or refers back
+// to work the conversation already framed ("yes", "go ahead", "scrape those").
+// Deliberately broad — it only OPENS the door to scanning prior turns; the
+// prior turn itself must still pass the full detector to carry a count.
+const CONTINUATION_REFERENCE_RE =
+  /\b(?:yes|yea|yeah|yep|sure|ok(?:ay)?|go ahead|do it|do that|proceed|please|let'?s|lets|start|run(?: it| them)?|go|them|those|these|all of (?:them|those|these))\b/i;
+
+/**
+ * Multi-item detection over the CONVERSATION, not just the current message.
+ * The count usually lives a turn back — the assistant proposes "run research
+ * on these 18 email-ready firms?" and the user answers "yes" / "scrape those"
+ * (live 2026-07-07: that exact shape produced a serial 18-firm grind because
+ * the current-message detector saw no count). Rules:
+ *   1. The current input wins when it is itself multi-item (unchanged path).
+ *   2. Otherwise, only a continuation/affirmation-shaped input may inherit:
+ *      scan the most recent conversation texts (both roles, newest first) and
+ *      carry the first prior turn that passes the FULL detector.
+ * Pure + total like the base detector; empty/absent history degrades to the
+ * current-message behavior exactly.
+ */
+export function detectMultiItemIntentFromConversation(
+  input: string,
+  recentConversationTexts: readonly string[] | undefined,
+  maxPriorTexts = 6,
+): MultiItemIntent {
+  const direct = detectMultiItemIntent(input);
+  if (direct.isMultiItem) return direct;
+  try {
+    const text = (typeof input === 'string' ? input : '').trim();
+    if (!text || !CONTINUATION_REFERENCE_RE.test(text)) return direct;
+    for (const prior of (recentConversationTexts ?? []).slice(0, maxPriorTexts)) {
+      const carried = detectMultiItemIntent(prior);
+      if (carried.isMultiItem) return { ...carried, carriedFromPrior: true };
+    }
+  } catch { /* fail-open to the direct result — detection must never break a turn */ }
+  return direct;
 }
 
 /**

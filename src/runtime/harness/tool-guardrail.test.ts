@@ -252,6 +252,41 @@ test('fanoutNudge: re-polling the SAME id never nudges (identical args = one dis
   }
 });
 
+test('fanoutNudge: native MCP data tools (<server>__<tool>) are keyed too — 3rd DISTINCT call nudges', () => {
+  // 2026-07-07 live gap: only composio_execute_tool was keyed, so the 18-firm
+  // run's 29 dataforseo__serp_organic_live_advanced calls (native MCP server)
+  // ground serially with zero nudges. Same-tool distinct-args batch work must
+  // nudge regardless of which gateway carries the call.
+  _resetAllTrackersForTests();
+  const call = (i: number) =>
+    evaluateToolCall('sess-mcp-fan', 'dataforseo__serp_organic_live_advanced', {
+      keyword: `site:firm-${i}.com`,
+      location_name: 'United States',
+    });
+  assert.equal(call(1).fanoutNudge, undefined);
+  assert.equal(call(2).fanoutNudge, undefined);
+  const d3 = call(3);
+  assert.ok(d3.fanoutNudge, '3rd distinct same-MCP-tool call must carry the nudge');
+  assert.match(d3.fanoutNudge!, /run_worker/);
+  assert.match(d3.fanoutNudge!, /dataforseo__serp_organic_live_advanced/);
+});
+
+test('fanoutNudge: local tools and clementine-local MCP tools are never keyed', () => {
+  _resetAllTrackersForTests();
+  for (let i = 1; i <= 6; i += 1) {
+    assert.equal(
+      evaluateToolCall('sess-local', 'read_file', { path: `/tmp/f${i}` }).fanoutNudge,
+      undefined,
+      'local tools legitimately serialize',
+    );
+    assert.equal(
+      evaluateToolCall('sess-local', 'mcp__clementine-local__memory_search', { q: `q${i}` }).fanoutNudge,
+      undefined,
+      'daemon-local MCP plumbing must not be nudged',
+    );
+  }
+});
+
 test('fanoutNudge: different slugs do NOT group together', () => {
   _resetAllTrackersForTests();
   const slugs = ['AIRTABLE_LIST_RECORDS', 'SALESFORCE_QUERY', 'OUTLOOK_LIST_MESSAGES'];

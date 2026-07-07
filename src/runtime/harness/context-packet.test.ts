@@ -44,7 +44,7 @@ writeFileSync(
   'utf-8',
 );
 
-const { buildAgentContextPacket, detectMultiItemIntent } = await import('./context-packet.js');
+const { buildAgentContextPacket, detectMultiItemIntent, detectMultiItemIntentFromConversation } = await import('./context-packet.js');
 const { __resetAgentSystemGuidanceCacheForTests } = await import('../agent-system-guidance.js');
 
 test.after(() => {
@@ -73,6 +73,47 @@ test('context packet ranks relevant skills and workflows for the current request
   // (the resolver confirms), while still not auto-running unrequested workflows.
   assert.match(packet.text, /call workflow_run with their exact phrasing/);
   assert.match(packet.text, /Do NOT auto-run a workflow the user did not ask to run/);
+});
+
+// ─── detectMultiItemIntentFromConversation — count carried from prior turns ──
+
+test('conversation carry: "yes" answering the assistant\'s own "18 firms?" proposal inherits the batch', () => {
+  // The live 2026-07-07 shape: the ASSISTANT proposed the batch, the user
+  // affirmed without repeating the count, and the run serialized 18 firms.
+  const proposal = 'Found 20 accounts; 2 have no email on file. Want me to run research on these 18 email-ready firms next?';
+  for (const affirmation of [
+    'yes',
+    'yea lets fan out some robust seo research for these firms please finding where they are missing on page 2.',
+    'go ahead and scrape those',
+  ]) {
+    const r = detectMultiItemIntentFromConversation(affirmation, [proposal]);
+    assert.equal(r.isMultiItem, true, `"${affirmation}" must inherit the prior 18-firm batch`);
+    assert.equal(r.itemCount, 18);
+    assert.equal(r.itemKind, 'firms');
+    assert.equal(r.carriedFromPrior, true);
+  }
+});
+
+test('conversation carry: current-message detection still wins and is not marked carried', () => {
+  const r = detectMultiItemIntentFromConversation(
+    'Scrape these 44 law firms and pull each one’s contact page.',
+    ['Want me to run research on these 18 email-ready firms next?'],
+  );
+  assert.equal(r.isMultiItem, true);
+  assert.equal(r.itemCount, 44, 'the current message\'s own batch wins over history');
+  assert.ok(!r.carriedFromPrior);
+});
+
+test('conversation carry: a NEW unrelated request does not inherit a stale batch', () => {
+  const history = ['Want me to run research on these 18 email-ready firms next?'];
+  // No continuation/affirmation shape → no carry.
+  const fresh = detectMultiItemIntentFromConversation('what time is my next meeting?', history);
+  assert.equal(fresh.isMultiItem, false, 'unrelated question must not inherit the firm batch');
+  // Empty/absent history degrades to current-message behavior.
+  const noHist = detectMultiItemIntentFromConversation('yes', []);
+  assert.equal(noHist.isMultiItem, false);
+  const undefHist = detectMultiItemIntentFromConversation('yes', undefined);
+  assert.equal(undefHist.isMultiItem, false);
 });
 
 // ─── P0: detectMultiItemIntent unit table ──────────────────────────────────

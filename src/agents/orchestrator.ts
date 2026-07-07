@@ -23,7 +23,7 @@ import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
-import { detectMultiItemIntent } from '../runtime/harness/context-packet.js';
+import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
 import type { Tool } from '@openai/agents';
@@ -631,6 +631,46 @@ export function recentPriorUserInputsForScope(
   return out;
 }
 
+/**
+ * Recent conversation texts (BOTH roles, newest first) for multi-item/fan-out
+ * detection. The item count usually lives in the ASSISTANT's own proposal
+ * ("run research on these 18 email-ready firms?"), so user inputs alone miss
+ * it — read `user_input_received` texts AND `conversation_step` replies from
+ * this session's eventlog. Best-effort: any failure returns [].
+ */
+export function recentConversationTextsForFanout(
+  sessionId: string,
+  currentInput?: string | null,
+  limit = 6,
+): string[] {
+  try {
+    const rows = listEvents(sessionId, {
+      types: ['user_input_received', 'conversation_step'],
+      desc: true,
+      limit: 16,
+    });
+    const current = (currentInput ?? '').trim();
+    const out: string[] = [];
+    // desc:true returns chronological (oldest→newest); walk backwards → newest-first.
+    for (const ev of [...rows].reverse()) {
+      const data = ev.data as { text?: unknown; decision?: { reply?: unknown; summary?: unknown } };
+      const text = typeof data?.text === 'string'
+        ? data.text.trim()
+        : typeof data?.decision?.reply === 'string'
+          ? data.decision.reply.trim()
+          : typeof data?.decision?.summary === 'string'
+            ? data.decision.summary.trim()
+            : '';
+      if (!text || text === current) continue;
+      out.push(text);
+      if (out.length >= limit) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOptions = {}): Promise<
   Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>
 > {
@@ -690,15 +730,26 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   if (typeof options.userInput === 'string' && options.userInput.trim() && !mcpToolScope.queryText) {
     mcpToolScope.queryText = options.userInput;
   }
-  // JIT Code Mode adoption mandate: on a data-heavy turn (MCP data servers in
-  // scope) inject a directive steering multi-fetch work to run_tool_program.
+  // Batch-shape directive: on a data-heavy turn (MCP data servers in scope)
+  // inject the standing lane rule (run_worker per item / run_tool_program /
+  // direct read). Multi-item detection reads the CONVERSATION, not just the
+  // current message — the count usually lives in the assistant's own prior
+  // proposal ("research these 18 firms?") answered with a bare "yes"
+  // (live 2026-07-07: current-message-only detection serialized 18 firms).
   // '' (byte-identical prompt) on non-data turns or when the kill-switch is off.
+  const multiItem = typeof options.userInput === 'string'
+    ? detectMultiItemIntentFromConversation(
+        options.userInput,
+        options.sessionId ? recentConversationTextsForFanout(options.sessionId, options.userInput) : priorUserInputs,
+      )
+    : undefined;
   const codeModeMandate = codeModeMandateDirective({
     mcpServersInScope: mcpToolScope.allowedServerSlugs?.length ?? 0,
     allowAllMcp: !!mcpToolScope.allowAll,
-    fanoutPreferred: options.allowToolJit === true
-      && typeof options.userInput === 'string'
-      && detectMultiItemIntent(options.userInput).isMultiItem,
+    fanoutPreferred: options.allowToolJit === true && !!multiItem?.isMultiItem,
+    multiItem: multiItem?.isMultiItem
+      ? { count: multiItem.itemCount, kind: multiItem.itemKind, carried: !!multiItem.carriedFromPrior }
+      : undefined,
   });
   if (options.sessionId) {
     try {
@@ -1058,6 +1109,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       } catch (err) {
         appendWorkerResult({ item: input.item, ok: false, model: route.model ?? workerModel, toolUses: [], reason: workerResultReason(err) });
         recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, route.model ?? workerModel);
+        // Infra-shaped failure (credentials/auth/provider config): every sibling
+        // dies identically — return an actionable envelope instead of a raw
+        // throw so the model stops fanning out, finishes inline, and TELLS the
+        // user the run degraded to sequential (mirrors worker-tools.ts).
+        const reason = workerResultReason(err);
+        if (/missing credentials|no default model provider|api key|apikey|unauthorized|invalid_grant|token_revoked|sign-?in expired/i.test(reason)) {
+          return `ERROR: worker for "${input.item}" failed before starting: ${reason} `
+            + 'PARALLEL FAN-OUT IS UNAVAILABLE this run (worker model backend has no usable credentials — this will fail identically for every item). '
+            + 'Do NOT call run_worker again this turn. Process the remaining items inline instead, and TELL THE USER in your reply that parallel fan-out was unavailable (and why).';
+        }
         throw err;
       }
       } finally {

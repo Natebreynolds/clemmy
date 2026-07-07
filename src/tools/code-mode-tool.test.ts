@@ -60,20 +60,34 @@ test('MCP tools are allowed in-sandbox even when local writes are OFF (gated by 
 test('codeModeMandateDirective: fires on a data-heavy turn (MCP servers in scope), silent otherwise', () => {
   // non-data turn → byte-identical prompt (empty directive)
   assert.equal(codeModeMandateDirective({ mcpServersInScope: 0 }), '');
-  // data-heavy turn → a directive that steers to run_tool_program
+  // data-heavy turn → the standing lane rule with ALL THREE lanes present
   const d = codeModeMandateDirective({ mcpServersInScope: 2 });
   assert.match(d, /run_tool_program/);
-  assert.match(d, /DATA-HEAVY/);
-  assert.match(d, /MORE THAN ONE/);
+  assert.match(d, /BATCH-SHAPE RULE/);
+  assert.match(d, /run_worker/);
+  assert.match(d, /SINGLE read/);
   // allowAll also triggers it
   assert.match(codeModeMandateDirective({ allowAllMcp: true }), /run_tool_program/);
 });
 
-test('codeModeMandateDirective: fan-out-shaped turns keep Code Mode silent so run_worker can win', () => {
-  assert.equal(
-    codeModeMandateDirective({ mcpServersInScope: 2, fanoutPreferred: true }),
-    '',
-  );
+test('codeModeMandateDirective: fan-out-shaped turns get a POSITIVE lane-(a) directive, not silence', () => {
+  // 2026-07-07: the old contract returned '' on fanoutPreferred, so a missed
+  // detection actively steered batch work into code mode and a hit detection
+  // left the model with no guidance at all. Now: the rule is always present,
+  // and a detected multi-item turn names the batch and mandates run_worker.
+  const d = codeModeMandateDirective({
+    mcpServersInScope: 2,
+    fanoutPreferred: true,
+    multiItem: { count: 18, kind: 'firms', carried: true },
+  });
+  assert.match(d, /THIS TURN IS LANE \(a\)/);
+  assert.match(d, /~18 independent firms/);
+  assert.match(d, /your own prior message names the batch/);
+  assert.match(d, /run_worker/);
+  // fanoutPreferred without shape detail still gets the standing rule
+  const bare = codeModeMandateDirective({ mcpServersInScope: 2, fanoutPreferred: true });
+  assert.match(bare, /BATCH-SHAPE RULE/);
+  assert.doesNotMatch(bare, /THIS TURN IS LANE/);
 });
 
 test('codeModeMandateDirective: mentions composio_execute_tool only when writes are on', () => {

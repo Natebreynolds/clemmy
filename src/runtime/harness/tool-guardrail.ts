@@ -467,13 +467,19 @@ export function evaluateToolCall(
   }
   const tracker = getOrCreateTracker(sessionId);
 
-  // Fan-out grouping key: composio_execute_tool is the external-API gateway
-  // where serial batch work actually bites (DataForSEO, Airtable, Salesforce,
-  // Outlook). Key by the INNER slug so 25 different-keyword TASK_POSTs group
-  // together while unrelated slugs don't. Local tools (read_file, execution_*)
-  // legitimately serialize and get no key.
+  // Fan-out grouping key: the external-API gateways where serial batch work
+  // actually bites. TWO shapes: (1) composio_execute_tool — key by the INNER
+  // slug so 25 different-keyword TASK_POSTs group together while unrelated
+  // slugs don't; (2) native MCP tools (`<server>__<tool>`, e.g.
+  // dataforseo__serp_organic_live_advanced) — the live 2026-07-07 18-firm run
+  // ground 29 SERP calls through one context precisely because only composio
+  // was keyed and the user's DataForSEO had moved to a native MCP server.
+  // Local tools (read_file, execution_*) have no `__` and legitimately
+  // serialize; the daemon's own clementine-local MCP tools are excluded (they
+  // are session plumbing, not per-item external fetches).
   const slug = toolName === 'composio_execute_tool' ? composioSlugOf(args) : undefined;
-  const fanoutKey = slug ? `composio::${slug}` : undefined;
+  const mcpFanoutTool = !slug && toolName.includes('__') && !/clementine/i.test(toolName);
+  const fanoutKey = slug ? `composio::${slug}` : mcpFanoutTool ? `mcp::${toolName}` : undefined;
 
   // Push + bound the window
   tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}), ...(callId ? { callId } : {}) });
@@ -519,8 +525,9 @@ export function evaluateToolCall(
     const at = thresholds.fanoutNudgeAt;
     if (distinct >= at && (distinct - at) % 5 === 0) {
       const batchHint = slug ? batchApiHintFor(slug) : undefined;
+      const callLabel = slug ?? toolName;
       fanoutNudge =
-        `[harness fan-out check] You have now made ${distinct} DISTINCT ${slug} calls in this conversation's recent window — `
+        `[harness fan-out check] You have now made ${distinct} DISTINCT ${callLabel} calls in this conversation's recent window — `
         + `you are serializing per-item batch work through your own context. STOP looping serially: `
         + `fan the REMAINING items out with run_worker (one item per worker, waves of up to 8), `
         + `or use the service's real batch API if it accepts an array of items in one call. `

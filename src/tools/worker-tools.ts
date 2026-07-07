@@ -279,6 +279,19 @@ export function registerWorkerTools(server: McpServer): void {
             finishedAt: new Date().toISOString(),
           });
         } catch { /* visibility trace is best-effort */ }
+        // Infra-shaped failure (credentials / auth / no provider): EVERY sibling
+        // worker will die the same way, so retrying items through run_worker is
+        // pure waste — and silently serializing hides the degradation from the
+        // user (live 2026-07-06: 9/10 workers died on "Missing credentials" and
+        // the chat never said so). Tell the model to switch lanes AND say so.
+        const infraShaped = /missing credentials|no default model provider|api key|apikey|unauthorized|invalid_grant|token_revoked|sign-?in expired/i.test(firstLine(err));
+        if (infraShaped) {
+          return textResult(
+            `ERROR: worker for "${input.item}" failed before starting: ${firstLine(err)} `
+            + 'PARALLEL FAN-OUT IS UNAVAILABLE this run (worker model backend has no usable credentials — this will fail identically for every item). '
+            + 'Do NOT call run_worker again this turn. Process the remaining items inline instead, and TELL THE USER in your reply that parallel fan-out was unavailable (and why), so they know this run degraded to sequential.',
+          );
+        }
         return textResult(`ERROR: worker for "${input.item}" failed: ${firstLine(err)}`);
       } finally {
         release();

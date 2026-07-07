@@ -64,21 +64,37 @@ export function codeModeMandateEnabled(): boolean {
  * composio_execute_tool as an in-program option only when writes are on. Pure +
  * exported for test.
  */
-export function codeModeMandateDirective(opts: { mcpServersInScope?: number; allowAllMcp?: boolean; fanoutPreferred?: boolean }): string {
+export function codeModeMandateDirective(opts: {
+  mcpServersInScope?: number;
+  allowAllMcp?: boolean;
+  fanoutPreferred?: boolean;
+  multiItem?: { count: number; kind: string | null; carried?: boolean };
+}): string {
   if (!codeModeMandateEnabled()) return '';
-  if (opts.fanoutPreferred) return '';
   const hasMcpData = !!opts.allowAllMcp || (opts.mcpServersInScope ?? 0) >= 1;
   if (!hasMcpData) return '';
   const fetchTools = codeModeWritesEnabled()
     ? 'MCP tools (`<server>__<tool>`) and `composio_execute_tool`'
     : 'MCP tools (`<server>__<tool>`)';
-  return [
-    'DATA-HEAVY TURN — USE CODE MODE:',
-    `external data-fetch tools are in scope this turn (${fetchTools}).`,
-    'If you need MORE THAN ONE data fetch (several sources, or one source several times), you MUST call `run_tool_program` and do the fetches INSIDE one program',
-    '(Promise.all the independent ones), distill, and return ONLY the small result — do NOT emit several discrete data-fetch calls that each push raw JSON into the conversation.',
-    'A SINGLE read is fine to call directly.',
+  // ONE standing lane rule, always present on data turns. The old shape was
+  // either/or — mandate code mode OR (on multi-item detection) say nothing —
+  // so a missed detection ACTIVELY steered batch work away from fan-out
+  // (live 2026-07-07: 18 firms ground serially through one context). The
+  // model now always has all three lanes and the decision rule; detection
+  // only sharpens the rule with the concrete count, it no longer gates it.
+  const rule = [
+    `BATCH-SHAPE RULE — external data-fetch tools are in scope this turn (${fetchTools}). Pick the lane by the SHAPE of the work:`,
+    '(a) 3+ INDEPENDENT same-shape items (N firms/domains/records/accounts, each needing the same lookups) → FAN OUT: call `run_worker` once PER ITEM, in parallel, each with a complete job packet — do NOT grind the items one-by-one in your own context;',
+    '(b) several DIFFERENT fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result;',
+    '(c) a SINGLE read → call the tool directly.',
   ].join(' ');
+  if (opts.fanoutPreferred && opts.multiItem) {
+    const n = opts.multiItem.count >= 3 ? `~${opts.multiItem.count}` : 'several';
+    const kind = opts.multiItem.kind ?? 'items';
+    const source = opts.multiItem.carried ? 'the conversation (your own prior message names the batch)' : 'the request';
+    return `${rule} THIS TURN IS LANE (a): ${source} indicates ${n} independent ${kind} — fan out via run_worker now.`;
+  }
+  return rule;
 }
 
 /** Phase 2 mutating surface. Each routes through wrapToolForHarness, so the
