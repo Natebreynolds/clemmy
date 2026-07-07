@@ -506,13 +506,68 @@ async function main(): Promise<void> {
   // --- Plugin commands ---
   if (command === 'plugin') {
     const sub = process.argv[3] ?? 'list';
-    if (sub === 'list') { process.exitCode = cmdPluginList(); return; }
-    if (sub === 'install') {
-      const target = process.argv[4] ?? '';
-      process.exitCode = cmdPluginInstall(target);
+    const arg = process.argv[4] ?? '';
+    const yes = process.argv.includes('--yes') || process.argv.includes('-y');
+    // Content cartridges (plugin.json bundles of skills/workflows/MCP servers)
+    // are the primary plugin concept; the legacy JS tool-module install path is
+    // kept for code plugins (no plugin.json).
+    const { resolvePluginSource, previewPlugin, installPlugin, listPlugins, setPluginEnabled, uninstallPlugin } = await import('./plugins/plugin-store.js');
+    if (sub === 'list') {
+      const cartridges = listPlugins();
+      if (cartridges.length) {
+        console.log('Installed plugins:');
+        for (const c of cartridges) {
+          const counts = c.artifacts.reduce<Record<string, number>>((acc, a) => { acc[a.kind] = (acc[a.kind] ?? 0) + 1; return acc; }, {});
+          const parts = Object.entries(counts).map(([k, n]) => `${n} ${k}${n === 1 ? '' : 's'}`).join(', ');
+          console.log(`  ${c.enabled ? '●' : '○'} ${c.manifest.name} v${c.manifest.version} (${c.manifest.id}) — ${parts}${c.enabled ? '' : ' [disabled]'}`);
+        }
+        console.log('');
+      }
+      process.exitCode = cmdPluginList(); // legacy code plugins + dir pointer
       return;
     }
-    console.log('Usage: clementine plugin <list|install <path-or-package>>');
+    if (sub === 'install' && arg) {
+      // A source with plugin.json is a cartridge; anything else = legacy path.
+      let resolved: { dir: string; cleanup: () => void } | null = null;
+      try { resolved = resolvePluginSource(arg); } catch { /* not a dir/tarball → legacy npm path below */ }
+      if (resolved && existsSync(path.join(resolved.dir, 'plugin.json'))) {
+        try {
+          const preview = previewPlugin(resolved.dir);
+          console.log(preview.consent.join('\n'));
+          for (const w of preview.warnings) console.log(`  ! ${w}`);
+          if (!yes) {
+            console.log('\nRe-run with --yes to consent and install.');
+            return;
+          }
+          const installed = installPlugin(resolved.dir);
+          console.log(`\nInstalled ${installed.manifest.id} v${installed.manifest.version} (${installed.artifacts.length} artifact${installed.artifacts.length === 1 ? '' : 's'}).`);
+        } catch (err) {
+          console.error(`Install failed: ${err instanceof Error ? err.message : String(err)}`);
+          process.exitCode = 1;
+        } finally {
+          resolved.cleanup();
+        }
+        return;
+      }
+      resolved?.cleanup();
+      process.exitCode = cmdPluginInstall(arg);
+      return;
+    }
+    if ((sub === 'enable' || sub === 'disable') && arg) {
+      try {
+        const plugin = setPluginEnabled(arg, sub === 'enable');
+        console.log(`${plugin.manifest.id} ${plugin.enabled ? 'enabled' : 'disabled'}.`);
+      } catch (err) { console.error(err instanceof Error ? err.message : String(err)); process.exitCode = 1; }
+      return;
+    }
+    if (sub === 'uninstall' && arg) {
+      try {
+        const { removed } = uninstallPlugin(arg);
+        console.log(`Uninstalled ${arg} (${removed.length} artifact${removed.length === 1 ? '' : 's'} removed).`);
+      } catch (err) { console.error(err instanceof Error ? err.message : String(err)); process.exitCode = 1; }
+      return;
+    }
+    console.log('Usage: clementine plugin <list | install <dir|.clemplug|npm-package> [--yes] | enable <id> | disable <id> | uninstall <id>>');
     return;
   }
 

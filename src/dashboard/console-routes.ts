@@ -6163,6 +6163,36 @@ export function registerConsoleRoutes(
     return out;
   };
 
+  // ---- Plugins (content cartridges: skills/workflows/MCP bundles) ----------
+  app.get('/api/console/plugins', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listPlugins } = await import('../plugins/plugin-store.js');
+      res.json({ plugins: listPlugins() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/plugins/:id/:action', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const { id, action } = req.params;
+    try {
+      const { setPluginEnabled, uninstallPlugin } = await import('../plugins/plugin-store.js');
+      if (action === 'enable' || action === 'disable') {
+        res.json({ ok: true, plugin: setPluginEnabled(id, action === 'enable') });
+        return;
+      }
+      if (action === 'uninstall') {
+        res.json({ ok: true, ...uninstallPlugin(id) });
+        return;
+      }
+      res.status(400).json({ error: `unknown action ${action}` });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/settings/model-providers', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

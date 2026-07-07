@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug } from 'lucide-react';
 import { Page } from '@/components/Page';
+import { PluginsPanel } from '@/components/connect/PluginsPanel';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Field';
@@ -186,6 +187,9 @@ export function Connect() {
 
       {/* Slack — guided two-way chat setup (manifest + 2 tokens) */}
       <SlackConnect />
+
+      {/* Plugins — content cartridges (skills + workflows + MCP bundles) */}
+      <PluginsPanel />
 
       {/* MCP */}
       <McpManager />
