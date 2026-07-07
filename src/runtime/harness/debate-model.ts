@@ -52,6 +52,7 @@ import {
   debateBrainsAvailable,
   judgeCrossFamilyEnabled,
   chooseBoundaryJudgeFamily,
+  boundaryClaudeJudgeModel,
   boundaryCodexJudgeModel,
 } from './judge-family.js';
 // Re-exported from the judge-family leaf (moved out of this file) so existing
@@ -918,6 +919,23 @@ export interface BoundaryJudgeRouting {
  * verify, completion judge, grounding judge, and goal-fidelity judge all agree.
  * If that lane is unavailable, fail open to the historical MODELS.fast path.
  */
+/** Boundary judges run on MOST action turns against a 12s deadline — a
+ *  flagship model there is structurally wrong regardless of user pins.
+ *  Live 2026-07-07: the judge role pinned to claude-opus-4-8 rode every
+ *  goal-fidelity/grounding call → 80/84 timeouts → the send-burst gate
+ *  fail-closed and parked 10 approved emails. The pin governs the FAMILY
+ *  on this hot path; the exact heavyweight id only governs deliberate
+ *  judge lanes (fusion reconciler). */
+export function downshiftForBoundary(checker: ResolvedRoleModel): ResolvedRoleModel {
+  const id = (checker.modelId || '').toLowerCase();
+  const heavy =
+    (checker.provider === 'claude' && /opus/.test(id))
+    || (checker.provider === 'codex' && /^gpt-\d+(\.\d+)?$/.test(id)); // flagship gpt-N(.M); -mini/-nano/-fast suffixed ids pass through
+  if (!heavy) return checker;
+  const fast = checker.provider === 'claude' ? boundaryClaudeJudgeModel() : boundaryCodexJudgeModel();
+  return { ...checker, modelId: fast };
+}
+
 export function resolveBoundaryJudge(): BoundaryJudgeRouting {
   const brain = resolveRoleModel('brain');
   const brainFamily = brain.provider;
@@ -926,7 +944,7 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
   }
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
-  const checker = resolveRoleModel('judge');
+  const checker = downshiftForBoundary(resolveRoleModel('judge'));
   const model = buildJudgeForRole(checker, haveClaude, haveCodex);
   if (model) {
     return {

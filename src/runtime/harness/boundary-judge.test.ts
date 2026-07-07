@@ -132,3 +132,16 @@ test('judge metrics snapshot aggregates outcomes and latency by lane', () => {
   }
   assert.equal(getJudgeMetricsSnapshot().total.calls, 0);
 });
+
+test('boundary downshift: a heavyweight judge PIN governs family only on the hot path (2026-07-07 opus-timeout regression)', async () => {
+  const { downshiftForBoundary } = await import('./debate-model.js');
+  const mk = (provider: 'claude' | 'codex' | 'byo', modelId: string) => ({ provider, modelId, source: 'settings' }) as never;
+  // Heavyweights downshift to the family's cheap boundary id.
+  assert.equal(downshiftForBoundary(mk('claude', 'claude-opus-4-8')).modelId, 'claude-haiku-4-5');
+  assert.notEqual(downshiftForBoundary(mk('codex', 'gpt-5.5')).modelId, 'gpt-5.5');
+  // Fast/cheap pins pass through untouched — the user's choice is honored.
+  assert.equal(downshiftForBoundary(mk('claude', 'claude-sonnet-5')).modelId, 'claude-sonnet-5');
+  assert.equal(downshiftForBoundary(mk('codex', 'gpt-5.4-mini')).modelId, 'gpt-5.4-mini');
+  // BYO judges are never downshifted (their tiers are unknowable here).
+  assert.equal(downshiftForBoundary(mk('byo', 'glm-5.2')).modelId, 'glm-5.2');
+});
