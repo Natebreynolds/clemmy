@@ -414,6 +414,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   sessionId?: string,
   gatedMutations = false,
   mcpToolAllowlist?: string[],
+  attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string },
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
   const srcEntry = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
@@ -434,6 +435,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
           sessionId,
           gatedMutations,
           allowedTools: allowlist,
+          workflowRunId: attribution?.workflowRunId,
+          workflowName: attribution?.workflowName,
+          stepId: attribution?.stepId,
         }),
       },
     };
@@ -443,6 +447,9 @@ export function buildClaudeAgentSdkLocalMcpServers(
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
+    ...(attribution?.workflowRunId?.trim() ? { CLEMENTINE_MCP_WORKFLOW_RUN_ID: attribution.workflowRunId.trim() } : {}),
+    ...(attribution?.workflowName?.trim() ? { CLEMENTINE_MCP_WORKFLOW_NAME: attribution.workflowName.trim() } : {}),
+    ...(attribution?.stepId?.trim() ? { CLEMENTINE_MCP_STEP_ID: attribution.stepId.trim() } : {}),
   });
   if (existsSync(distEntry)) {
     return {
@@ -755,6 +762,11 @@ export interface ClaudeAgentSdkRunOptions {
    * log); silently falls back to the read-only allowlist without one.
    */
   agentic?: boolean;
+  /** Workflow-step attribution: when set, a fan-out (run_worker) spawned inside this
+   *  run is recorded under the workflow RUN in the subagent-runs store (else session). */
+  workflowRunId?: string;
+  workflowName?: string;
+  stepId?: string;
   /**
    * The user's message/intent for THIS turn, used to SCOPE which native external MCP
    * servers (dataforseo, browsermcp, …) attach — so the Claude brain reaches those
@@ -1183,7 +1195,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     skills: [],
     tools: [],
     mcpServers: {
-      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist),
+      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist, {
+        workflowRunId: options.workflowRunId,
+        workflowName: options.workflowName,
+        stepId: options.stepId,
+      }),
       // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
       // canUseTool gate then covers every native call. Gives the Claude brain parity
       // with the Codex lane instead of being blind to native MCPs.

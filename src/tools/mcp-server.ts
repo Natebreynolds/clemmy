@@ -48,11 +48,21 @@ export interface ClementineMcpServerOptions {
   sessionId?: string;
   gatedMutations?: boolean;
   allowedTools?: string[];
+  /** Set for a workflow-step MCP surface so a fan-out spawned here (run_worker) is
+   *  attributed to the workflow RUN in the subagent-runs store, not just the session. */
+  workflowRunId?: string;
+  workflowName?: string;
+  stepId?: string;
 }
 
 function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
   const sessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
   if (!sessionId) return;
+  // Workflow attribution flows via opts (in-process server) OR env (stdio child) —
+  // mirrors how sessionId reaches here, so run_worker's context carries the run.
+  const workflowRunId = opts.workflowRunId?.trim() || process.env.CLEMENTINE_MCP_WORKFLOW_RUN_ID?.trim() || undefined;
+  const workflowName = opts.workflowName?.trim() || process.env.CLEMENTINE_MCP_WORKFLOW_NAME?.trim() || undefined;
+  const stepId = opts.stepId?.trim() || process.env.CLEMENTINE_MCP_STEP_ID?.trim() || undefined;
   const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
@@ -60,7 +70,7 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
     const handler = args[last];
     if (toolName && typeof handler === 'function') {
       args[last] = async (...handlerArgs: any[]) => withToolOutputContext(
-        { sessionId, toolName },
+        { sessionId, toolName, ...(workflowRunId ? { workflowRunId } : {}), ...(workflowName ? { workflowName } : {}), ...(stepId ? { stepId } : {}) },
         // Also establish the harness run context so tools that read it for the
         // active session (execution_create / execution_* / plan / goal, etc.)
         // resolve CLEMENTINE_MCP_SESSION_ID instead of failing with "requires a

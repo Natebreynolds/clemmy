@@ -1624,6 +1624,7 @@ async function runStepViaHarness(
         sdkResult = await runClaudeAgentSdkWorkflowStep({
           step,
           workflowName,
+          runId: workflowRunId, // attribute this step's fan-out to the workflow run
           prompt: message,
           modelId: stepModel,
           // Run gated mutating tools on the step's REAL session so the workflow's

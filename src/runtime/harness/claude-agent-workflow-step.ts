@@ -204,6 +204,9 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   /** The step's REAL harness session id. Required for the full lane so the gated
    *  tools + async approval read/write the workflow session's plan-scope grants. */
   sessionId?: string;
+  /** The workflow RUN id — so a fan-out (run_worker) spawned inside this step is
+   *  attributed to the run in the subagent-runs visibility store. */
+  runId?: string;
   /** Tool-capable gated lane (read + write/send through the harness gate chain)
    *  rather than the read-only profile. */
   fullLane?: boolean;
@@ -212,6 +215,9 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   const stepRunOptions = {
     modelId: args.modelId,
     sessionId: args.sessionId,
+    workflowRunId: args.runId,
+    workflowName: args.workflowName,
+    stepId: args.step.id,
     systemAppend: renderClaudeAgentWorkflowStepSystemAppend({ workflowName: args.workflowName, step: args.step, fullLane }),
     allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(fullLane ? 'worker' : 'read_only'),
     requiredLocalMcpTools: requiredLocalMcpToolsForWorkflowStep(args.step, fullLane),
