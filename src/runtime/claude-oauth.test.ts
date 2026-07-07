@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseClaudeCredential, assertSubscriptionToken, loadFreshClaudeAccessToken, claudeVaultRefreshDead, ClaudeAuthError, __test__ } from './claude-oauth.js';
+import { parseClaudeCredential, assertSubscriptionToken, loadFreshClaudeAccessToken, claudeVaultRefreshDead, getClaudeAuthSnapshot, ClaudeAuthError, __test__ } from './claude-oauth.js';
 
 const FUTURE = Date.now() + 60 * 60_000;
 
@@ -118,6 +118,60 @@ test('a transient refresh failure (timeout/5xx) IS retried on the next call', as
     await loadFreshClaudeAccessToken();
     assert.equal(refreshCalls, 2, 'transient failures must keep retrying');
     assert.equal(claudeVaultRefreshDead(), false);
+  } finally {
+    __test__.setVaultTokenReaderForTests(null);
+    __test__.setRawCredentialReaderForTests(null);
+    __test__.setRefreshClaudeTokensForTests(null);
+    __test__.resetDegradedStateForTests();
+  }
+});
+
+test('auth snapshot reports an expired Clementine vault token as configured when it is refreshable', () => {
+  __test__.resetDegradedStateForTests();
+  __test__.setVaultTokenReaderForTests(() => ({
+    accessToken: 'sk-ant-oat01-expired-vault',
+    refreshToken: 'refreshable',
+    expiresAt: Date.now() - 60_000,
+    source: 'vault',
+  }));
+  __test__.setRawCredentialReaderForTests(() => null);
+  try {
+    const snapshot = getClaudeAuthSnapshot();
+    assert.equal(snapshot.configured, true);
+    assert.equal(snapshot.source, 'vault');
+    assert.equal(snapshot.refreshable, true);
+    assert.match(snapshot.reason ?? '', /refreshable/i);
+  } finally {
+    __test__.setVaultTokenReaderForTests(null);
+    __test__.setRawCredentialReaderForTests(null);
+    __test__.resetDegradedStateForTests();
+  }
+});
+
+test('auth snapshot reports CLI fallback as configured when the vault grant is degraded', async () => {
+  __test__.resetDegradedStateForTests();
+  let refreshCalls = 0;
+  __test__.setVaultTokenReaderForTests(() => ({
+    accessToken: 'sk-ant-oat01-expired-vault',
+    refreshToken: 'dead-refresh',
+    expiresAt: Date.now() - 60_000,
+    source: 'vault',
+  }));
+  __test__.setRawCredentialReaderForTests(() => JSON.stringify({
+    claudeAiOauth: { accessToken: 'sk-ant-oat01-cli-good', expiresAt: FUTURE },
+  }));
+  __test__.setRefreshClaudeTokensForTests(async () => {
+    refreshCalls += 1;
+    throw new Error('Claude token refresh failed (400): {"error": "invalid_grant"}');
+  });
+  try {
+    await loadFreshClaudeAccessToken();
+    assert.equal(refreshCalls, 1);
+    const snapshot = getClaudeAuthSnapshot();
+    assert.equal(snapshot.configured, true);
+    assert.equal(snapshot.source, 'claude-code');
+    assert.equal(snapshot.degraded, true);
+    assert.match(snapshot.reason ?? '', /Claude Code subscription token/i);
   } finally {
     __test__.setVaultTokenReaderForTests(null);
     __test__.setRawCredentialReaderForTests(null);

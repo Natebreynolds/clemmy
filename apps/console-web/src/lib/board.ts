@@ -152,13 +152,6 @@ export interface BackgroundTaskDetail {
   };
 }
 
-export interface DemoAgenticFlowResult {
-  ok: boolean;
-  task?: BackgroundTaskDetail['task'];
-  detail?: BackgroundTaskDetail['detail'];
-  reason?: string;
-}
-
 export const COLUMNS: { id: BoardColumnId; label: string }[] = [
   { id: 'queued', label: 'Queued' },
   { id: 'running', label: 'Running' },
@@ -182,9 +175,6 @@ export const repostBackgroundTaskResult = (id: string, target: BackgroundReportB
     `/api/console/background-tasks/${encodeURIComponent(id)}/repost-result`,
     target,
   );
-
-export const seedDemoAgenticFlow = () =>
-  apiPost<DemoAgenticFlowResult>('/api/console/demo/agentic-flow');
 
 // Queue visibility: the sub-task queue of one workflow run (each step/forEach
 // unit with status + what runs next), reconstructed server-side from the durable

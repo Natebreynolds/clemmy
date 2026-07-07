@@ -541,11 +541,11 @@ const SETUP_JS = `
       '<div class="step">',
       '  <div class="step-tag">AUTH · 02</div>',
       '  <h1>How should I authenticate?</h1>',
-      '  <div class="step-desc">Pick how I get to the model. You can add an extra OpenAI API key on the next step for embeddings and live voice regardless of what you pick here.</div>',
+      '  <div class="step-desc">Pick how I get to the model. You can add an extra OpenAI API key on the next step for embeddings and live voice regardless of what you pick here. Prefer Claude? You can connect a Claude sign-in later from Settings → Models &amp; routing.</div>',
       '  <div class="choice">',
            card('openai', 'OpenAI API key runtime', 'Use direct API billing for the agent runtime.'),
            card('codex',  'Codex OAuth runtime', 'Use your ChatGPT/Codex subscription. Signs in here, no terminal.'),
-           card('skipped', 'Skip for now', 'Set up later from Settings → Credentials.'),
+           card('skipped', 'Skip for now', 'Set up later from Settings → Models &amp; routing.'),
       '  </div>',
            openaiField + codexBlock,
       '</div>',
@@ -571,7 +571,7 @@ const SETUP_JS = `
       '<div class="step">',
       '  <div class="step-tag">VOICE &amp; EMBEDDINGS · 03</div>',
       '  <h1>Voice and embeddings (optional)</h1>',
-      '  <div class="step-desc">An OpenAI API key unlocks two extras that Codex OAuth doesn&rsquo;t cover: <strong>embeddings</strong> (semantic search across your vault) and <strong>live voice</strong> (Realtime API on the home screen). Leave blank to skip &mdash; you can paste one later from Settings → Credentials.</div>',
+      '  <div class="step-desc">An OpenAI API key unlocks two extras that Codex OAuth doesn&rsquo;t cover: <strong>embeddings</strong> (semantic search across your vault) and <strong>live voice</strong> (Realtime API on the home screen). Leave blank to skip &mdash; you can paste one later from Settings → Models &amp; routing.</div>',
       '  <div class="field">',
       '    <label>OPENAI API KEY (OPTIONAL)</label>',
       '    <input type="text" class="secret-input" data-state="extraOpenaiKey" name="setup-extra-openai-key-no-autofill" value="' + esc(state.extraOpenaiKey) + '" placeholder="sk-..." autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-form-type="other" spellcheck="false" />',
@@ -682,7 +682,7 @@ const SETUP_JS = `
       '  <div class="step-desc">A little context up-front, so I sound right from message one.</div>',
       '  <div class="field-row">',
       '    <div class="field"><label>PREFERRED NAME</label><input type="text" data-state="profile.preferredName" value="' + esc(p.preferredName) + '" placeholder="e.g. Nate" /></div>',
-      '    <div class="field"><label>ROLE</label><input type="text" data-state="profile.role" value="' + esc(p.role) + '" placeholder="e.g. building clemmy" /></div>',
+      '    <div class="field"><label>ROLE</label><input type="text" data-state="profile.role" value="' + esc(p.role) + '" placeholder="e.g. VP of Sales at an agency" /></div>',
       '  </div>',
       '  <div class="field-row">',
       '    <div class="field">',
@@ -835,8 +835,8 @@ const SETUP_JS = `
   });
   skipBtn.addEventListener('click', async () => {
     const msg = state.authChoice === 'skipped'
-      ? 'Skip setup without configuring AI auth?\\n\\nClementine will open, but every chat / agent call will fail until you add an OpenAI key or sign in with ChatGPT from Settings → Credentials.\\n\\nContinue anyway?'
-      : 'Skip the rest of setup?\\nYou can finish from Settings → Credentials later.';
+      ? 'Skip setup without configuring AI auth?\\n\\nClementine will open, but every chat / agent call will fail until you add an OpenAI key or sign in with ChatGPT from Settings → Models & routing.\\n\\nContinue anyway?'
+      : 'Skip the rest of setup?\\nYou can finish from Settings → Models & routing later.';
     if (!confirm(msg)) return;
     if (window.clemmy.setupSkip) await window.clemmy.setupSkip();
   });

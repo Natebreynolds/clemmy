@@ -222,8 +222,8 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
     return {
       ok: false,
       reason:
-        'No codex OAuth tokens are stored. Run `clementine auth login-native` ' +
-        '(or connect Claude or a BYO model in Settings → Models).',
+        'No AI model is signed in yet. Open Settings → Models & routing and ' +
+        'sign in with ChatGPT or Claude (or add an API-key model).',
     };
   }
 

@@ -4207,6 +4207,10 @@ export function registerConsoleRoutes(
   // workflow shows WHO worked. Full work-product via the /output route below.
   app.get('/api/console/workflows/:name/runs/:runId/agents', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    // Ownership check (parity with the sibling run routes): the :name must resolve
+    // to a real workflow, so a runId can't be read under an arbitrary slug.
+    const entry = listWorkflows().find((e) => e.data.name === req.params.name || e.name === req.params.name);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
     const runs = listSubagentRuns(req.params.runId);
     res.json({
       runId: req.params.runId,

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, Sparkles, X } from 'lucide-react';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
@@ -100,16 +100,46 @@ export function Chat() {
   };
   const chat = useChat();
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Whether the view is "stuck" to the bottom. True by default so the initial
+  // load lands at the newest message; flips false the moment the user scrolls up
+  // (so streaming tokens don't yank them back down mid-read).
+  const stickRef = useRef(true);
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
   const seededRef = useRef(false);
 
   const needsYou = cc.data?.needsYou ?? [];
   const workingNow = cc.data?.workingNow ?? [];
   const hasThread = chat.messages.length > 0;
 
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chat.messages]);
+    if (!stickRef.current) return;
+    // 'auto' while streaming: smooth-scroll can't keep up with rapid token
+    // appends and piles up into visible jitter.
+    bottomRef.current?.scrollIntoView({ behavior: chat.busy ? 'auto' : 'smooth', block: 'end' });
+  }, [chat.messages, chat.busy]);
+
+  // "New chat" from the sidebar navigates to /chat with a fresh state stamp even
+  // when already here — reset the live thread so it doesn't append to the old one.
+  // Guard on the stamp value so a re-render (chat is a fresh object each time)
+  // doesn't reset again and wipe a thread the user just started.
+  const resetChat = chat.reset;
+  const lastNewChatRef = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const stamp = (location.state as { newChat?: number } | null)?.newChat;
+    if (stamp && stamp !== lastNewChatRef.current) {
+      lastNewChatRef.current = stamp;
+      resetChat();
+      stickRef.current = true;
+    }
+  }, [location.state, resetChat]);
 
   // Deep-link: /chat?prompt=… auto-sends a message (e.g. "Discuss in chat"
   // from a meeting). Fires once, then strips the param so a refresh won't resend.
@@ -165,7 +195,7 @@ export function Chat() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl space-y-5 px-8 py-6">
           {(needsYou.length > 0 || workingNow.length > 0) && (
             <AttentionStrip needsYou={needsYou} workingNow={workingNow} onDismiss={dismissCard} />

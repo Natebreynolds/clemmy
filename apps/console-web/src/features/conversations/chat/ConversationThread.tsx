@@ -57,10 +57,21 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     initialMessages: historyToMessages(history),
   });
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Stick to the bottom by default; release the moment the user scrolls up so
+  // streaming tokens don't yank them back down mid-read.
+  const stickRef = useRef(true);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chat.messages]);
+    if (!stickRef.current) return;
+    bottomRef.current?.scrollIntoView({ behavior: chat.busy ? 'auto' : 'smooth', block: 'end' });
+  }, [chat.messages, chat.busy]);
 
   const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[] }) => {
     await chat.send(input);
@@ -71,7 +82,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl space-y-5 px-6 py-6">
           {chat.messages.map((m) => (
             <ChatBubble

@@ -219,13 +219,25 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   // sees them — record the step here so the Agents panel populates for workflows.
   // Fail-open. (Codex/BYO-lane steps that don't take the SDK path are a follow-up.)
   const stepStartedMs = Date.now();
+  // Collision-proof id: a parallel forEach fans out N items of the SAME step id at
+  // the SAME ms, so `step-<id>-<ms>` alone overwrote siblings' work-products (default
+  // concurrency 5). The random suffix keeps each item's row + output distinct.
+  const stepAgentId = `step-${args.step.id}-${stepStartedMs}-${Math.random().toString(36).slice(2, 8)}`;
+  // A readable task label — the first line of the actual prompt (minus the
+  // "Workflow: …\nStep: …\n\n" preamble), not the raw step id (which made rows read
+  // "seo_fanout: seo_fanout" since role === task). Falls back to the step id.
+  const taskLabel = ((): string => {
+    const stripped = args.prompt.replace(/^Workflow:[^\n]*\nStep:[^\n]*\n\n/, '');
+    const firstLine = stripped.split('\n').find((l) => l.trim()) ?? '';
+    return firstLine.trim().slice(0, 80) || args.step.id;
+  })();
   const recordStepAgent = (output: unknown, status: 'ok' | 'error' | 'capped', model?: string): void => {
     try {
       const parentRunId = args.runId || args.sessionId;
       if (!parentRunId) return;
       const resolvedModel = model ?? args.modelId;
       recordSubagentRun({
-        id: `step-${args.step.id}-${stepStartedMs}`,
+        id: stepAgentId,
         parentRunId,
         parentKind: args.runId ? 'workflow' : 'session',
         workflowName: args.workflowName,
@@ -233,7 +245,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
         role: (args.step as { intent?: string }).intent || args.step.id,
         provider: providerClassForModel(resolvedModel),
         model: resolvedModel,
-        task: args.step.id,
+        task: taskLabel,
         status,
         output: typeof output === 'string' ? output : JSON.stringify(output ?? ''),
         startedAt: new Date(stepStartedMs).toISOString(),
@@ -328,11 +340,12 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
           `Workflow-step local MCP tool surface temporarily unavailable: the per-step MCP server advertised ${err.availableTools.length} tools and none of the always-registered baseline tools, so it had not finished initializing. A fresh-server retry should recover. Needed: ${err.missingTools.join(', ')}.`,
         );
       }
+      const reason = `Clementine workflow runtime did not expose required local MCP tool${err.missingTools.length === 1 ? '' : 's'}: ${err.missingTools.join(', ')}. This is a runtime/tool-surface issue, not a service credential issue.`;
+      // A hard-blocked step IS a failed specialist — record it so the Agents panel
+      // shows the block (red), not an empty row (this path never recorded before).
+      recordStepAgent(reason, 'error');
       return {
-        output: {
-          blocked: true,
-          reason: `Clementine workflow runtime did not expose required local MCP tool${err.missingTools.length === 1 ? '' : 's'}: ${err.missingTools.join(', ')}. This is a runtime/tool-surface issue, not a service credential issue.`,
-        },
+        output: { blocked: true, reason },
         toolUses: [],
         structured: true,
       };
@@ -360,7 +373,13 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     };
   }
   const normalized = normalizeWorkflowStepOutput(result);
-  recordStepAgent(normalized.output, 'ok', result.model);
+  // A step whose output is a { blocked:true } envelope (the SDK reported status
+  // "blocked") is a FAILED specialist, not a green ✓ — record it as 'error' so the
+  // Agents panel doesn't paint a self-declared block as success.
+  const outputBlocked = typeof normalized.output === 'object'
+    && normalized.output !== null
+    && (normalized.output as { blocked?: unknown }).blocked === true;
+  recordStepAgent(normalized.output, outputBlocked ? 'error' : 'ok', result.model);
   return {
     output: normalized.output,
     sdkSessionId: result.sessionId,

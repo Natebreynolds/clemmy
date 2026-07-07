@@ -15,7 +15,7 @@
  * else the chat sessionId. Best-effort + fail-open: a store error never breaks the
  * worker (the durable trace is a convenience, not the critical path).
  */
-import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
@@ -47,6 +47,38 @@ export interface SubagentRunRecord {
 }
 
 const PREVIEW_MAX = 600;
+/** Cap on the persisted work-product per run — a runaway worker can emit MBs; the
+ *  panel only ever renders a preview + on-demand full read, so a hard ceiling keeps
+ *  the store from ballooning. */
+const OUTPUT_MAX_CHARS = 64 * 1024;
+/** Prune persisted runs older than this on an opportunistic sweep. */
+const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+/** At most one retention sweep per process-lifetime-hour. */
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+let lastSweepMs = 0;
+
+/** Opportunistic retention: at most once an hour, drop run dirs whose ledger has
+ *  not been touched in RETENTION_MS. Fail-open — pruning is a convenience, never a
+ *  reason to fail (or slow) the worker path. */
+function sweepOldSubagentRuns(): void {
+  try {
+    const now = Date.now();
+    if (now - lastSweepMs < SWEEP_INTERVAL_MS) return;
+    lastSweepMs = now; // claim the window even if the sweep below throws
+    const base = path.join(BASE_DIR, 'state', 'subagents');
+    if (!existsSync(base)) return;
+    for (const name of readdirSync(base)) {
+      try {
+        const dir = path.join(base, name);
+        const ledger = path.join(dir, 'runs.jsonl');
+        if (!existsSync(ledger)) continue;
+        if (now - statSync(ledger).mtimeMs > RETENTION_MS) {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      } catch { /* skip a single unreadable/locked dir */ }
+    }
+  } catch { /* retention is best-effort */ }
+}
 
 /** Classify a worker's provider from its model id (unified across the 3 lanes). */
 export function providerClassForModel(model: string | undefined): SubagentProvider {
@@ -81,6 +113,7 @@ export function recordSubagentRun(
   input: Omit<SubagentRunRecord, 'outputPreview' | 'outputRef'> & { output?: string },
 ): SubagentRunRecord | null {
   try {
+    sweepOldSubagentRuns(); // opportunistic, self-throttled to once an hour
     const dir = subagentDir(input.parentRunId);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const output = input.output ?? '';
@@ -88,7 +121,11 @@ export function recordSubagentRun(
     if (output.trim()) {
       const outDir = path.join(dir, 'outputs');
       if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-      writeFileSync(outputPath(input.parentRunId, input.id), output, 'utf-8');
+      // Cap the persisted work-product so a runaway worker can't write MBs to disk.
+      const persisted = output.length > OUTPUT_MAX_CHARS
+        ? output.slice(0, OUTPUT_MAX_CHARS) + '\n…(truncated)'
+        : output;
+      writeFileSync(outputPath(input.parentRunId, input.id), persisted, 'utf-8');
       outputRef = path.join('outputs', `${safeSegment(input.id, 'agent')}.txt`);
     }
     const record: SubagentRunRecord = {

@@ -40,6 +40,8 @@ import { acquireWorkerSlot } from './worker-concurrency.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
+import { recordSubagentRun, providerClassForModel } from './subagent-runs.js';
+import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
@@ -824,6 +826,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'orchestrator' },
         });
       } catch { /* telemetry is best-effort */ }
+      // Live-visibility: announce the agent STARTING so the chat activity strip
+      // renders a running specialist immediately (parity with worker-tools.ts's SDK
+      // lane — this @openai/agents lane emitted worker_spawned telemetry but never
+      // the worker_started event the NowStrip/Slack/Discord read). Fail-open.
+      if (sessionId) {
+        try {
+          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
+        } catch { /* telemetry is best-effort */ }
+      }
       const turn = extractTurn(runContext);
       const toolCallId = details?.toolCall?.callId ?? null;
       const appendWorkerRoute = (data: Record<string, unknown>) => {
@@ -908,6 +919,39 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const n = (k: string): number => (typeof u[k] === 'number' ? (u[k] as number) : 0);
         return n('input_tokens') + n('output_tokens') + n('cache_read_input_tokens') + n('cache_creation_input_tokens');
       };
+      // Subagent-runs visibility spine (parity with worker-tools.ts's SDK-brain
+      // lane): record WHO ran (provider+model+role), WHAT they did (task +
+      // work-product), OUTCOME — attributed to the workflow run when spawned inside
+      // a step, else the chat session. This @openai/agents (Codex/GLM-BYO) lane
+      // never recorded, so the Agents panel was empty on those brains. Fail-open;
+      // never blocks fan-out. Derives ok/capped from the worker output text (the
+      // same "ERROR:" / turn-cap signals the in-memory ledger reads).
+      const recordWorkerSubagent = (outputText: string, ranModel: string | null | undefined): void => {
+        try {
+          const ctx = getToolOutputContext();
+          const parentRunId = ctx?.workflowRunId || sessionId;
+          if (!parentRunId) return;
+          const text = outputText ?? '';
+          const ok = !/^\s*ERROR:/i.test(text);
+          const capped = !ok && /MaxTurnsExceeded|hit its turn cap/i.test(text);
+          const model = ranModel || workerModel;
+          recordSubagentRun({
+            id: `w-${workerRouteStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
+            parentRunId,
+            parentKind: ctx?.workflowRunId ? 'workflow' : 'session',
+            workflowName: ctx?.workflowName,
+            stepId: ctx?.stepId,
+            role: input.intent || undefined,
+            provider: providerClassForModel(model),
+            model,
+            task: input.item,
+            status: capped ? 'capped' : ok ? 'ok' : 'error',
+            output: text,
+            startedAt: new Date(workerRouteStartedAt).toISOString(),
+            finishedAt: new Date().toISOString(),
+          });
+        } catch { /* visibility trace is best-effort */ }
+      };
       // HARD respawn guard (covers BOTH worker lanes — placed before the route
       // branch). If THIS item already hit its turn cap (worker_capped) earlier in
       // this run, refuse to re-spawn it: a re-run with the same packet just caps
@@ -959,6 +1003,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             toolUses: sdkResult.toolUses,
             tokens: workerResultTokens(sdkResult.usage),
           });
+          recordWorkerSubagent(sdkResult.text ?? '', sdkResult.model ?? workerModel);
           return sdkResult.text;
         } catch (err) {
           // Claude SDK worker overloaded BEFORE committing anything (no tool ran,
@@ -971,6 +1016,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             : undefined;
           if (!next) {
             appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });
+            recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, workerModel);
             throw err;
           }
           appendWorkerRoute({
@@ -985,9 +1031,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           try {
             const output = await worker.clone({ model: next.modelId }).asTool(fbOptions).invoke(runContext, JSON.stringify(input), details);
             appendWorkerResultFromOutput(output, { model: next.modelId, toolUses: [] });
+            recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
             return output;
           } catch (fallbackErr) {
             appendWorkerResult({ item: input.item, ok: false, model: next.modelId, toolUses: [], reason: workerResultReason(fallbackErr) });
+            recordWorkerSubagent(`ERROR: ${workerResultReason(fallbackErr)}`, next.modelId);
             throw fallbackErr;
           }
         }
@@ -1005,9 +1053,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       try {
         const output = await nestedWorkerTool.invoke(runContext, JSON.stringify(input), details);
         appendWorkerResultFromOutput(output, { model: route.model ?? workerModel, toolUses: [] });
+        recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), route.model ?? workerModel);
         return output;
       } catch (err) {
         appendWorkerResult({ item: input.item, ok: false, model: route.model ?? workerModel, toolUses: [], reason: workerResultReason(err) });
+        recordWorkerSubagent(`ERROR: ${workerResultReason(err)}`, route.model ?? workerModel);
         throw err;
       }
       } finally {

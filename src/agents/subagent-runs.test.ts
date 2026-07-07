@@ -57,6 +57,23 @@ test('a run captures ALL providers together (the unified cross-brain view)', () 
   assert.equal(list.find((r) => r.id === 'c')!.outputRef, undefined, 'an empty output records NO work-product file');
 });
 
+test('recordSubagentRun caps a persisted work-product at 64KB with a truncated marker', () => {
+  const runId = 'wfrun-huge';
+  const huge = 'x'.repeat(200 * 1024); // 200KB — well over the 64KB ceiling
+  const rec = recordSubagentRun({
+    id: 'big', parentRunId: runId, parentKind: 'workflow', provider: 'claude', model: 'claude-sonnet-4-6',
+    task: 'runaway', status: 'ok', output: huge, startedAt: 't', finishedAt: 't',
+  });
+  assert.ok(rec);
+  assert.ok(rec!.outputRef, 'a large output still persists a work-product file');
+
+  const readBack = readSubagentOutput(runId, 'big');
+  assert.ok(readBack, 'the capped work-product reads back');
+  assert.ok(readBack!.length < huge.length, 'the persisted work-product was truncated below the original size');
+  assert.ok(readBack!.endsWith('…(truncated)'), 'the truncated marker is appended when the output is cut');
+  assert.ok(readBack!.length <= 64 * 1024 + '\n…(truncated)'.length, 'stays within the 64KB ceiling (+ marker)');
+});
+
 test('listSubagentRuns is empty (not a throw) for an unknown run', () => {
   assert.deepEqual(listSubagentRuns('never-existed'), []);
   assert.equal(readSubagentOutput('never-existed', 'nope'), null);

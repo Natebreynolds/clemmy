@@ -43,6 +43,28 @@ function providerFromModel(model: string): ActivityItem['provider'] {
   return 'unknown';
 }
 
+/** Prefer an explicit provider string carried on the event (e.g. 'claude',
+ *  'codex', or a BYO id) before falling back to regexing the model id — model
+ *  ids miss (a BYO/renamed model reads as 'unknown' but its provider is known). */
+function providerFor(d: Record<string, unknown>, model: string): ActivityItem['provider'] {
+  const explicit = typeof d.provider === 'string' ? d.provider.toLowerCase() : '';
+  if (explicit) {
+    if (/claude|anthropic/.test(explicit)) return 'claude';
+    if (/glm|zhipu|zai/.test(explicit)) return 'glm';
+    if (/codex|openai|gpt/.test(explicit)) return 'codex';
+    // Unrecognized (BYO id): fall through to the model regex.
+  }
+  return providerFromModel(model);
+}
+
+const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
+
+/** A backend error string is unsafe to show raw when it's a stack trace, a
+ *  transport code, embedded JSON, or just very long — swap those for a calm line. */
+function looksRawError(s: string): boolean {
+  return s.length > 200 || /at\s+\w+\s+\(|stack|ECONN|ETIMEDOUT|\{"/.test(s);
+}
+
 /** Fold one harness event into the turn's activity list. Returns the SAME array
  *  reference when nothing changed (so the caller can skip a re-render). Tools are
  *  correlated called→returned by name; agents (run_worker) keyed by item. */
@@ -51,15 +73,19 @@ function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] 
   const tool = typeof d.tool === 'string' ? d.tool : typeof d.toolName === 'string' ? d.toolName : '';
   const item = typeof d.item === 'string' ? d.item : '';
   const model = typeof d.model === 'string' ? d.model : '';
-  const toolLabel = tool.replace(/^mcp__[^_]+__/, '').replace(/_/g, ' ');
+  // Server names can contain underscores (mcp__some_server__tool) — a non-greedy
+  // `.+?` strips the whole `mcp__…__` prefix; `[^_]+` stopped at the first `_`.
+  const toolLabel = tool.replace(/^mcp__.+?__/, '').replace(/_/g, ' ');
   switch (ev.type) {
     case 'tool_called':
       if (!tool || tool === 'run_worker' || /run_worker/.test(tool)) return prev; // agents render as agents, not a tool row
       return [...prev, { id: `t${prev.length}-${tool}`, kind: 'tool', label: toolLabel, status: 'running' }];
     case 'tool_returned': {
+      // The backend now carries data.ok — a returned tool can have failed.
+      const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
       for (let i = prev.length - 1; i >= 0; i--) {
         if (prev[i].kind === 'tool' && prev[i].status === 'running' && prev[i].label === toolLabel) {
-          return prev.map((a, j) => (j === i ? { ...a, status: 'done' } : a));
+          return prev.map((a, j) => (j === i ? { ...a, status } : a));
         }
       }
       return prev;
@@ -67,12 +93,23 @@ function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): ActivityItem[] 
     case 'worker_started': {
       if (!item) return prev;
       const role = typeof d.role === 'string' ? d.role : '';
-      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFromModel(model), status: 'running' }];
+      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status: 'running' }];
     }
-    case 'worker_result':
-      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}`
-        ? { ...a, status: d.ok === false ? 'failed' : 'done', ...(model ? { detail: model, provider: providerFromModel(model) } : {}) }
-        : a));
+    case 'worker_result': {
+      // UPSERT: on non-Claude (orchestrator) lanes worker_started historically
+      // wasn't emitted, so there's no `a-${item}` row to update — append one with
+      // the final status so the agent still appears in the strip.
+      if (!item) return prev;
+      const id = `a-${item}`;
+      const status: ActivityItem['status'] = d.ok === false ? 'failed' : 'done';
+      if (prev.some((a) => a.kind === 'agent' && a.id === id)) {
+        return prev.map((a) => (a.kind === 'agent' && a.id === id
+          ? { ...a, status, ...(model ? { detail: model, provider: providerFor(d, model) } : {}) }
+          : a));
+      }
+      const role = typeof d.role === 'string' ? d.role : '';
+      return [...prev, { id, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status }];
+    }
     case 'worker_capped':
       return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed' } : a));
     default:
@@ -174,7 +211,9 @@ export function useChat(options?: UseChatOptions) {
         });
       }
     } else if (ev.type === 'run_failed') {
-      patch(assistantId, { text: `Something went wrong: ${String(d.error ?? 'failed')}`, status: 'failed', progress: undefined });
+      const errStr = String(d.error ?? '').trim();
+      const text = !errStr || looksRawError(errStr) ? GENERIC_TURN_ERROR : `Something went wrong: ${errStr}`;
+      patch(assistantId, { text, status: 'failed', progress: undefined });
     } else if (ev.type === 'conversation_limit_exceeded') {
       patch(assistantId, { status: 'stopped', progress: undefined });
     } else if (ev.type === 'awaiting_user_input') {
@@ -240,7 +279,9 @@ export function useChat(options?: UseChatOptions) {
     } catch (err) {
       const e = err as ApiError;
       if (e.status === 404) sessionIdRef.current = null;
-      patch(assistantId, { text: `Couldn't send: ${e.message || 'error'}`, status: 'failed', progress: undefined });
+      const msg = (e.message || '').trim();
+      const text = !msg || looksRawError(msg) ? GENERIC_TURN_ERROR : `Couldn't send: ${msg}`;
+      patch(assistantId, { text, status: 'failed', progress: undefined });
     } finally {
       activeAssistantId.current = null;
       setBusy(false);
@@ -249,16 +290,24 @@ export function useChat(options?: UseChatOptions) {
 
   const stop = useCallback(() => {
     const sid = sessionIdRef.current;
+    const aid = activeAssistantId.current;
     streamRef.current?.stop();
     streamRef.current = null;
-    if (activeAssistantId.current) patch(activeAssistantId.current, { status: 'stopped', progress: undefined });
+    // Stopping before any text streamed in otherwise leaves an empty bubble.
+    if (aid) setMessages((prev) => prev.map((m) => (m.id === aid
+      ? { ...m, status: 'stopped', progress: undefined, text: m.text.trim() ? m.text : 'Stopped.' }
+      : m)));
     if (sid) void cancelSession(sid);
     setBusy(false);
-  }, [patch]);
+  }, []);
 
   const reset = useCallback(() => {
+    streamRef.current?.stop();
+    streamRef.current = null;
+    activeAssistantId.current = null;
     sessionIdRef.current = null;
     setMessages([]);
+    setBusy(false);
   }, []);
 
   return { messages, busy, send, stop, reset, sessionId: sessionIdRef };

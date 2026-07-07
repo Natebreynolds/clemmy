@@ -1413,6 +1413,23 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               })()
             : {};
           emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name, failExtra);
+          // Activity-strip lifecycle: claude-agent-approval emits 'tool_called' for
+          // EVERY tool on this lane, but nothing here closes the loop (the @openai/agents
+          // onToolEnd hook doesn't run on the SDK lane), so the console strip spun
+          // forever. Emit a matching 'tool_returned' (same role/shape as the
+          // 'tool_called' emit) so the client reducer flips the still-running row.
+          // Fail-open — the strip is progress-only, never blocks the run.
+          if (options.sessionId) {
+            try {
+              appendEvent({
+                sessionId: options.sessionId,
+                turn: 0,
+                role: 'Clem',
+                type: 'tool_returned',
+                data: { tool: source ? mcpToolTail(source.name) : undefined, ok: !tr.isError },
+              });
+            } catch { /* progress only */ }
+          }
           // A3 recall contract: park every result under the SDK's OWN tool_use id
           // (toolu_…) — the id the continuation ledger hands out. Without this,
           // outputs live only under harness-generated mcp-<uuid> ids (and only

@@ -1,13 +1,11 @@
 /**
  * Claude (Anthropic) subscription OAuth wallet — peer to codex-native-oauth.ts.
  *
- * v1 piggybacks on the user's existing Claude Code login: it reads the OAuth
- * token Claude Code already stores (macOS Keychain `Claude Code-credentials`,
- * or ~/.claude/.credentials.json on Linux). The access token is long-lived
- * (~10h), so a test session needs no refresh — and we deliberately do NOT
- * rotate the shared refresh token in v1 (that would desync Claude Code's
- * rotating-refresh login). A decoupled, Clementine-owned Claude login + refresh
- * is the follow-up (mirrors Codex Phase 3).
+ * Preferred path: Clementine's own Claude OAuth grant, stored in the local
+ * vault and refreshed/rotated by Clementine before expiry. Fallback path: the
+ * user's existing Claude Code login (macOS Keychain `Claude Code-credentials`,
+ * or ~/.claude/.credentials.json on Linux). We deliberately do NOT rotate the
+ * Claude Code refresh token, because that would desync the user's CLI login.
  *
  * BILLING GUARANTEE (the owner's top concern): this wallet ONLY ever returns an
  * `sk-ant-oat01-` subscription OAuth token. An `sk-ant-api03-` API key (which
@@ -196,6 +194,16 @@ export function loadClaudeAccessToken(): string {
   return assertSubscriptionToken(getStoredClaudeTokens());
 }
 
+export interface ClaudeAuthSnapshot {
+  configured: boolean;
+  reason?: string;
+  plan?: string;
+  expiresAt?: string;
+  source?: ClaudeOAuthTokens['source'];
+  refreshable?: boolean;
+  degraded?: boolean;
+}
+
 const REFRESH_BEFORE_MS = 5 * 60_000;
 let refreshClaudeTokensImpl = refreshClaudeTokens;
 
@@ -313,13 +321,51 @@ export function claudeVaultFallbackReady(): boolean {
   return !t.expiresAt || t.expiresAt > Date.now() + 60_000; // or currently valid
 }
 
+function tokenExpiryIso(tokens: ClaudeOAuthTokens | null): string | undefined {
+  return tokens?.expiresAt ? new Date(tokens.expiresAt).toISOString() : undefined;
+}
+
 /** Diagnostic snapshot (never includes the token value). */
-export function getClaudeAuthSnapshot(): { configured: boolean; reason?: string; plan?: string; expiresAt?: string } {
+export function getClaudeAuthSnapshot(): ClaudeAuthSnapshot {
+  const tokens = getStoredClaudeTokens();
   try {
-    loadClaudeAccessToken();
-    const t = getStoredClaudeTokens();
-    return { configured: true, plan: t?.subscriptionType, expiresAt: t?.expiresAt ? new Date(t.expiresAt).toISOString() : undefined };
+    assertSubscriptionToken(tokens);
+    return { configured: true, plan: tokens?.subscriptionType, expiresAt: tokenExpiryIso(tokens), source: tokens?.source };
   } catch (err) {
+    // The request path refreshes Clementine-owned vault tokens asynchronously.
+    // This snapshot is sync, so don't show "logged out" for an expired but
+    // refreshable vault grant before the next request has a chance to rotate it.
+    if (
+      tokens?.source === 'vault' &&
+      tokens.accessToken?.startsWith(OAT_PREFIX) &&
+      Boolean(tokens.refreshToken) &&
+      !claudeVaultRefreshDead()
+    ) {
+      return {
+        configured: true,
+        plan: tokens.subscriptionType,
+        expiresAt: tokenExpiryIso(tokens),
+        source: 'vault',
+        refreshable: true,
+        reason: 'Claude vault token is expired but refreshable.',
+      };
+    }
+    if (tokens?.source === 'vault') {
+      const fallback = getClaudeCodeTokens();
+      try {
+        assertSubscriptionToken(fallback);
+        return {
+          configured: true,
+          plan: fallback?.subscriptionType,
+          expiresAt: tokenExpiryIso(fallback),
+          source: fallback?.source,
+          degraded: true,
+          reason: 'Using Claude Code subscription token because the Clementine Claude vault token is unavailable.',
+        };
+      } catch {
+        // Fall through to the primary error.
+      }
+    }
     return { configured: false, reason: err instanceof ClaudeAuthError ? err.message : String(err) };
   }
 }

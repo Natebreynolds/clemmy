@@ -61,7 +61,7 @@ export function ConversationSidebar() {
   return (
     <aside className="flex h-full w-[300px] shrink-0 flex-col border-r border-border bg-surface">
       <div className="space-y-2 border-b border-border p-3">
-        <Button className="w-full" onClick={() => navigate('/chat')}>
+        <Button className="w-full" onClick={() => navigate('/chat', { state: { newChat: Date.now() } })}>
           <Plus className="h-4 w-4" /> New chat
         </Button>
         <div className="flex items-center gap-2 rounded-md border border-border bg-canvas px-2.5">
@@ -109,7 +109,7 @@ export function ConversationSidebar() {
             includeArchived ? 'text-primary' : 'text-faint hover:text-muted',
           )}
         >
-          <Archive className="h-3.5 w-3.5" /> {includeArchived ? 'Hiding archived' : 'Show archived'}
+          <Archive className="h-3.5 w-3.5" /> {includeArchived ? 'Hide archived' : 'Show archived'}
         </button>
       </div>
 

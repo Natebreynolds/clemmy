@@ -10,7 +10,7 @@
  * Presentational only — all folding lives in lib/workflow-run-detail.ts.
  */
 import { useMemo } from 'react';
-import { CheckCircle2, AlertCircle, Radio, Circle, MinusCircle, Package } from 'lucide-react';
+import { CheckCircle2, AlertCircle, AlertTriangle, Radio, Circle, MinusCircle, Package } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import {
@@ -23,6 +23,7 @@ import {
 
 const STEP_TONE: Record<WorkflowStepStatus, Tone> = {
   done: 'success',
+  blocked: 'warning',
   failed: 'danger',
   running: 'live',
   skipped: 'neutral',
@@ -31,6 +32,7 @@ const STEP_TONE: Record<WorkflowStepStatus, Tone> = {
 
 const STEP_ICON = {
   done: CheckCircle2,
+  blocked: AlertTriangle,
   failed: AlertCircle,
   running: Radio,
   skipped: MinusCircle,
@@ -120,6 +122,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
       className={cn(
         'rounded-md border border-border border-l-2 px-3 py-2',
         step.status === 'done' && 'border-l-success',
+        step.status === 'blocked' && 'border-l-warning',
         step.status === 'failed' && 'border-l-danger',
         step.status === 'running' && 'border-l-primary',
         (step.status === 'skipped' || step.status === 'pending') && 'border-l-border',
@@ -130,6 +133,7 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
           className={cn(
             'h-4 w-4 shrink-0',
             STEP_TONE[step.status] === 'success' && 'text-success',
+            STEP_TONE[step.status] === 'warning' && 'text-warning',
             STEP_TONE[step.status] === 'danger' && 'text-danger',
             STEP_TONE[step.status] === 'live' && 'text-primary',
             STEP_TONE[step.status] === 'neutral' && 'text-faint',
@@ -159,8 +163,15 @@ function StepRow({ step }: { step: WorkflowRunStep }) {
       )}
 
       {step.error && (
-        <div className="mt-1.5 whitespace-pre-wrap break-words rounded-sm border border-danger/40 bg-danger-tint px-2 py-1.5 text-caption text-danger">
-          {step.error}
+        <div
+          className={cn(
+            'mt-1.5 whitespace-pre-wrap break-words rounded-sm border px-2 py-1.5 text-caption',
+            step.status === 'blocked'
+              ? 'border-warning/40 bg-warning-tint text-warning'
+              : 'border-danger/40 bg-danger-tint text-danger',
+          )}
+        >
+          {step.status === 'blocked' ? `Blocked: ${step.error}` : step.error}
         </div>
       )}
 

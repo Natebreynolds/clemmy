@@ -1,3 +1,4 @@
+import { Fragment, useState, type ReactNode } from 'react';
 import { Check, Send, X } from 'lucide-react';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -6,6 +7,81 @@ import { TurnActivity } from '@/components/chat/TurnActivity';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import type { ChatMessage } from '@/lib/useChat';
+
+/** Inline spans within a line: **bold** and `code`; everything else is linkified
+ *  plain text. No dangerouslySetInnerHTML — React escapes all text children. */
+function renderInline(text: string, keyBase: string): ReactNode {
+  const RE = /\*\*([^*]+)\*\*|`([^`]+)`/g;
+  const nodes: ReactNode[] = [];
+  let last = 0;
+  let i = 0;
+  let m: RegExpExecArray | null;
+  RE.lastIndex = 0;
+  while ((m = RE.exec(text)) !== null) {
+    if (m.index > last) nodes.push(<Fragment key={`${keyBase}-t${i}`}>{linkify(text.slice(last, m.index))}</Fragment>);
+    if (m[1] != null) nodes.push(<strong key={`${keyBase}-b${i}`} className="font-semibold">{m[1]}</strong>);
+    else if (m[2] != null) nodes.push(<code key={`${keyBase}-c${i}`} className="rounded bg-subtle px-1 py-0.5 font-mono text-[0.9em]">{m[2]}</code>);
+    last = m.index + m[0].length;
+    i++;
+  }
+  if (last < text.length) nodes.push(<Fragment key={`${keyBase}-t${i}`}>{linkify(text.slice(last))}</Fragment>);
+  return nodes;
+}
+
+/** Minimal, dependency-free markdown for assistant replies: ##/### headings,
+ *  bold, inline code, fenced code blocks, and bullet/numbered lists. Plain
+ *  paragraphs keep whitespace-pre-wrap. Unhandled text falls through linkified. */
+function Markdown({ text }: { text: string }): ReactNode {
+  const lines = text.split('\n');
+  const blocks: ReactNode[] = [];
+  let para: string[] = [];
+  let key = 0;
+  const flushPara = () => {
+    if (para.length === 0) return;
+    const body = para.join('\n');
+    blocks.push(<p key={`p${key++}`} className="whitespace-pre-wrap">{renderInline(body, `p${key}`)}</p>);
+    para = [];
+  };
+  for (let i = 0; i < lines.length; ) {
+    const line = lines[i];
+    if (/^```/.test(line.trim())) {
+      flushPara();
+      const fence: string[] = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim())) { fence.push(lines[i]); i++; }
+      if (i < lines.length) i++; // consume closing fence
+      blocks.push(<pre key={`f${key++}`} className="overflow-x-auto rounded-md bg-subtle p-3 font-mono text-caption">{fence.join('\n')}</pre>);
+      continue;
+    }
+    const h = /^(#{2,3})\s+(.*)$/.exec(line);
+    if (h) {
+      flushPara();
+      const cls = h[1].length === 2 ? 'text-h3 font-semibold' : 'text-body-lg font-semibold';
+      blocks.push(<div key={`h${key++}`} className={cls}>{renderInline(h[2], `h${key}`)}</div>);
+      i++;
+      continue;
+    }
+    const ordered = /^\s*\d+\.\s+/.test(line);
+    const unordered = /^\s*[-*]\s+/.test(line);
+    if (ordered || unordered) {
+      flushPara();
+      const marker = ordered ? /^\s*\d+\.\s+/ : /^\s*[-*]\s+/;
+      const items: string[] = [];
+      const listKey = key++;
+      while (i < lines.length && marker.test(lines[i])) { items.push(lines[i].replace(marker, '')); i++; }
+      const lis = items.map((it, idx) => <li key={idx}>{renderInline(it, `li${listKey}-${idx}`)}</li>);
+      blocks.push(ordered
+        ? <ol key={`l${listKey}`} className="list-decimal space-y-0.5 pl-5">{lis}</ol>
+        : <ul key={`l${listKey}`} className="list-disc space-y-0.5 pl-5">{lis}</ul>);
+      continue;
+    }
+    if (line.trim() === '') { flushPara(); i++; continue; }
+    para.push(line);
+    i++;
+  }
+  flushPara();
+  return <div className="space-y-2">{blocks}</div>;
+}
 
 function PayloadPreview({ value }: { value: unknown }) {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -24,8 +100,8 @@ function ThinkingDots() {
       {[0, 1, 2].map((i) => (
         <span
           key={i}
-          className="h-1.5 w-1.5 rounded-full bg-primary/70"
-          style={{ animation: 'breathe 1s ease-in-out infinite', animationDelay: `${i * 150}ms` }}
+          className="h-1.5 w-1.5 rounded-full bg-primary"
+          style={{ animation: 'dot-pulse 1.2s ease-in-out infinite', animationDelay: `${i * 180}ms` }}
         />
       ))}
     </span>
@@ -42,6 +118,9 @@ export function ChatBubble({
   onReject: () => void;
 }) {
   const isUser = message.role === 'user';
+  // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
+  // without a local latch the buttons stay live forever. Latch on first click.
+  const [resolved, setResolved] = useState(false);
 
   if (isUser) {
     return (
@@ -68,17 +147,21 @@ export function ChatBubble({
               <ThinkingDots />
               <span>{message.progress ?? 'Thinking…'}</span>
             </div>
-          ) : (
-            <p className={cn('whitespace-pre-wrap text-body-lg leading-relaxed', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
+          ) : thinking && message.text ? (
+            // Mid-stream: render plain (linkified) text + a live caret. Full
+            // markdown formatting is applied once the reply lands (below).
+            <p className="whitespace-pre-wrap text-body-lg leading-relaxed text-fg">
               {linkify(message.text)}
-              {thinking && message.text && (
-                <span
-                  aria-hidden
-                  className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[0.2em] rounded-full bg-primary/80"
-                  style={{ animation: 'breathe 1s ease-in-out infinite' }}
-                />
-              )}
+              <span
+                aria-hidden
+                className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[0.2em] rounded-full bg-primary"
+                style={{ animation: 'dot-pulse 1.2s ease-in-out infinite' }}
+              />
             </p>
+          ) : (
+            <div className={cn('text-body-lg leading-relaxed', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
+              <Markdown text={message.text} />
+            </div>
           )}
 
           {/* Premium activity strip: live tool calls + parallel agents (Claude/Codex/
@@ -114,12 +197,13 @@ export function ChatBubble({
               )}
               {message.approval?.reason && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
               {pendingAction && <PayloadPreview value={pendingAction.payload} />}
-              <div className="mt-2.5 flex gap-2">
-                <Button size="sm" onClick={onApprove}>
+              <div className="mt-2.5 flex items-center gap-2">
+                <Button size="sm" disabled={resolved} onClick={() => { setResolved(true); onApprove(); }}>
                   {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
                   {pendingAction ? 'Execute queued action' : 'Approve'}
                 </Button>
-                <Button size="sm" variant="secondary" onClick={onReject}><X className="h-4 w-4" aria-hidden /> Not now</Button>
+                <Button size="sm" variant="secondary" disabled={resolved} onClick={() => { setResolved(true); onReject(); }}><X className="h-4 w-4" aria-hidden /> Not now</Button>
+                {resolved && <span className="text-caption text-muted">Submitted</span>}
               </div>
             </div>
           )}

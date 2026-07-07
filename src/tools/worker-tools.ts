@@ -258,6 +258,27 @@ export function registerWorkerTools(server: McpServer): void {
           latencyMs: Date.now() - routeStartedAt,
           errorClass: err instanceof Error ? err.name : typeof err,
         });
+        // A THROWN worker (crashed before returning a result) was invisible in the
+        // Agents panel — the success path above records, this one didn't. Record it
+        // as a failed specialist so a crashed worker still shows up. Fail-open.
+        try {
+          const ctx = getToolOutputContext();
+          recordSubagentRun({
+            id: `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
+            parentRunId: ctx?.workflowRunId || sessionId,
+            parentKind: ctx?.workflowRunId ? 'workflow' : 'session',
+            workflowName: ctx?.workflowName,
+            stepId: ctx?.stepId,
+            role: input.intent || undefined,
+            provider: route.claudeLane ? 'claude' : providerClassForModel(workerModel),
+            model: workerModel,
+            task: input.item,
+            status: 'error',
+            output: `ERROR: worker for "${input.item}" failed: ${firstLine(err)}`,
+            startedAt: new Date(routeStartedAt).toISOString(),
+            finishedAt: new Date().toISOString(),
+          });
+        } catch { /* visibility trace is best-effort */ }
         return textResult(`ERROR: worker for "${input.item}" failed: ${firstLine(err)}`);
       } finally {
         release();

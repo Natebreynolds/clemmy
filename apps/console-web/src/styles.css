@@ -130,6 +130,13 @@
   }
 }
 
+/* Working indicator: a visible opacity pulse for the chat "thinking" dots and
+   the streaming caret (the theme's `breathe` scales only 6% — imperceptible). */
+@keyframes dot-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+
 /* Respect the user's reduced-motion preference globally. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

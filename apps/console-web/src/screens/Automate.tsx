@@ -633,6 +633,8 @@ function RunWorkspaceDrawer({
   const qc = useQueryClient();
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(initialRunId);
   const [checking, setChecking] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  const [showAllCriteria, setShowAllCriteria] = useState(false);
   const runsQ = useQuery({
     queryKey: ['wf-runs', workflow],
     queryFn: () => listWorkflowRuns(workflow, 25),
@@ -658,9 +660,15 @@ function RunWorkspaceDrawer({
   const runChecker = async () => {
     if (!selectedRunId) return;
     setChecking(true);
+    setCheckError(null);
     try {
       await checkRunAgainstGoal(workflow, selectedRunId);
       void qc.invalidateQueries({ queryKey: ['run-workspace', workflow, selectedRunId] });
+    } catch (e) {
+      // Surface the failure instead of silently stopping the spinner — the
+      // check was swallowing errors, leaving the user staring at nothing.
+      const reason = (e instanceof Error ? e.message : String(e)).slice(0, 160);
+      setCheckError(reason || 'unknown error');
     } finally {
       setChecking(false);
     }
@@ -721,9 +729,14 @@ function RunWorkspaceDrawer({
                       </div>
                       {selectedRun?.error && <p className="text-small text-danger">{selectedRun.error}</p>}
                     </div>
-                    <Button size="sm" variant="secondary" onClick={runChecker} disabled={checking || !workspace}>
-                      {checking ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <CheckCircle2 className="h-4 w-4" aria-hidden />} Check goal
-                    </Button>
+                    <div className="flex flex-col items-end gap-1">
+                      <Button size="sm" variant="secondary" onClick={runChecker} disabled={checking || !workspace}>
+                        {checking ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <CheckCircle2 className="h-4 w-4" aria-hidden />} Check goal
+                      </Button>
+                      {checkError && (
+                        <span className="max-w-xs text-right text-caption text-danger">Check failed — {checkError}. Try again.</span>
+                      )}
+                    </div>
                   </div>
 
                   {workspace?.goal && (
@@ -742,13 +755,22 @@ function RunWorkspaceDrawer({
                         <span className={cn('text-small font-semibold', workspace.checker.pass ? 'text-success' : 'text-warning')}>{workspace.checker.summary}</span>
                       </div>
                       <div className="grid gap-1.5">
-                        {workspace.checker.perCriterion.slice(0, 6).map((criterion) => (
+                        {(showAllCriteria ? workspace.checker.perCriterion : workspace.checker.perCriterion.slice(0, 6)).map((criterion) => (
                           <div key={criterion.criterion} className="flex gap-2 text-caption text-muted">
                             <span className={criterion.pass ? 'text-success' : 'text-warning'}>{criterion.pass ? 'Pass' : 'Review'}</span>
                             <span className="min-w-0 flex-1">{criterion.criterion}</span>
                           </div>
                         ))}
                       </div>
+                      {workspace.checker.perCriterion.length > 6 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllCriteria((v) => !v)}
+                          className="mt-2 inline-flex items-center gap-1 text-caption font-semibold text-primary hover:underline cursor-pointer"
+                        >
+                          {showAllCriteria ? 'Show fewer' : `+${workspace.checker.perCriterion.length - 6} more`}
+                        </button>
+                      )}
                     </section>
                   )}
 
