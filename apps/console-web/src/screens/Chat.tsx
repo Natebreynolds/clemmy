@@ -26,11 +26,11 @@ const SUGGESTIONS = [
   'Draft a follow-up email',
 ];
 
-/** Where a "Needs you" card should land. Notification-backed cards open the
- *  notification itself; approval-backed cards open the approvals tab. A bare
- *  '/inbox' landed notification cards on an empty "Needs approval" tab. */
+/** Where a "Needs you" card should land. Both approval- and needs-attention-
+ *  notification-backed cards live on the Inbox "Needs you" tab now — deep-link
+ *  straight to the item so "See all in Inbox" always lands on what it promised. */
 function inboxTarget(item: CommandCenterItem): string {
-  if (item.notifId) return `/inbox?tab=notifications&select=${encodeURIComponent(item.notifId)}`;
+  if (item.notifId) return `/inbox?tab=needs&select=${encodeURIComponent(item.notifId)}`;
   if (item.approvalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.approvalId)}`;
   return '/inbox';
 }
@@ -68,11 +68,7 @@ function AttentionStrip({ needsYou, workingNow, onDismiss }: { needsYou: Command
       {needsYou.length > 3 && (
         <button
           type="button"
-          onClick={() => navigate(
-            needsYou.some((item) => item.approvalId) ? '/inbox'
-              : needsYou.some((item) => item.notifId) ? '/inbox?tab=notifications'
-                : '/inbox',
-          )}
+          onClick={() => navigate('/inbox')}
           className="text-small text-primary hover:underline cursor-pointer"
         >
           See all {needsYou.length} in Inbox
