@@ -661,7 +661,11 @@ export async function evaluateGoalFidelity(
   let verdict: GoalFidelityVerdict;
   try {
     verdict = await (judgeOverride ?? runGoalFidelityJudge)({ goal, skills, payload: renderPayloadForJudge(toolName, rawArgs), evidence });
-  } catch {
+  } catch (judgeErr) {
+    // Diagnosability: the 2026-07-07 send-burst park was undiagnosable from the
+    // block alone ("check could not run") — the actual cause (judge model
+    // timeouts, 80/84 that session) was only visible via judge metrics. Name it.
+    const judgeFailure = (judgeErr instanceof Error ? judgeErr.message : String(judgeErr)).slice(0, 200);
     // Normally the judge fails OPEN — the gate must never wedge a legitimate
     // one-off send. But a judge OUTAGE during a detected uniform send-BURST is
     // exactly when fail-open is dangerous: the 45-email runaway to distinct
@@ -673,13 +677,13 @@ export async function evaluateGoalFidelity(
       return {
         action: 'block',
         mode: 'judge',
-        reason: 'goal-fidelity check could not run during a repeated same-shape send to distinct targets — parking this batch for your approval rather than sending unchecked',
-        gap: 'The goal-fidelity judge was unavailable while a same-shape send-burst is in flight. Approve to continue the batch, or stop it — I will not send the rest unverified.',
+        reason: `goal-fidelity check could not run during a repeated same-shape send to distinct targets (judge failure: ${judgeFailure}) — parking this batch for your approval rather than sending unchecked`,
+        gap: `The goal-fidelity judge was unavailable (${judgeFailure}) while a same-shape send-burst is in flight. Approve to continue the batch, or stop it — I will not send the rest unverified.`,
         targets,
         blockKind: 'present_for_approval',
       };
     }
-    return { action: 'allow', mode: 'judge', reason: 'goal-fidelity judge unavailable — fail open', targets };
+    return { action: 'allow', mode: 'judge', reason: `goal-fidelity judge unavailable (${judgeFailure}) — fail open`, targets };
   }
 
   const targetKey = targets[0] ?? skills[0]?.name ?? 'goal';

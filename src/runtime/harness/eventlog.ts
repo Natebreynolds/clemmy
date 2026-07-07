@@ -170,6 +170,13 @@ export const EVENT_TYPES = [
   // A fan-out worker STARTING — lets the chat/board render the specialist as
   // running the moment it spawns (not only when worker_result lands).
   'worker_started',
+  // Deterministic batch runner (run_batch): plan execution started / a single
+  // item failed (with consecutive-failure count) / the whole batch finished
+  // with honest counts. The loop makes NO model calls, so these events are the
+  // primary visibility into what it did.
+  'batch_started',
+  'batch_item_failed',
+  'batch_completed',
   // NON-halting record that, in YOLO, an approval-shaped ask_user_question was
   // auto-resolved (standing approval) and the run proceeded instead of pausing.
   // Distinct from awaiting_user_input precisely so it does NOT halt the loop.

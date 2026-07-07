@@ -80,14 +80,15 @@ test('codeModeMandateDirective: fan-out-shaped turns get a POSITIVE lane-(a) dir
     fanoutPreferred: true,
     multiItem: { count: 18, kind: 'firms', carried: true },
   });
-  assert.match(d, /THIS TURN IS LANE \(a\)/);
+  assert.match(d, /THIS TURN IS BATCH-SHAPED/);
   assert.match(d, /~18 independent firms/);
   assert.match(d, /your own prior message names the batch/);
+  assert.match(d, /run_batch/);
   assert.match(d, /run_worker/);
   // fanoutPreferred without shape detail still gets the standing rule
   const bare = codeModeMandateDirective({ mcpServersInScope: 2, fanoutPreferred: true });
   assert.match(bare, /BATCH-SHAPE RULE/);
-  assert.doesNotMatch(bare, /THIS TURN IS LANE/);
+  assert.doesNotMatch(bare, /THIS TURN IS BATCH-SHAPED/);
 });
 
 test('codeModeMandateDirective: mentions composio_execute_tool only when writes are on', () => {

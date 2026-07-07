@@ -84,15 +84,16 @@ export function codeModeMandateDirective(opts: {
   // only sharpens the rule with the concrete count, it no longer gates it.
   const rule = [
     `BATCH-SHAPE RULE — external data-fetch tools are in scope this turn (${fetchTools}). Pick the lane by the SHAPE of the work:`,
-    '(a) 3+ INDEPENDENT same-shape items (N firms/domains/records/accounts, each needing the same lookups) → FAN OUT: call `run_worker` once PER ITEM, in parallel, each with a complete job packet — do NOT grind the items one-by-one in your own context;',
-    '(b) several DIFFERENT fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result;',
-    '(c) a SINGLE read → call the tool directly.',
+    '(a) 3+ same-shape items whose tool arguments you can FULLY MATERIALIZE right now (send N drafted emails, update N records with known values, pull N known lookups) → `run_batch` ONE plan: certified once, then executed deterministically with zero model calls between items — the fastest and most auditable lane;',
+    '(b) 3+ independent items that each need their own REASONING/discovery (research each firm, judge each doc) → FAN OUT: `run_worker` once PER ITEM, in parallel, each with a complete job packet — do NOT grind the items one-by-one in your own context;',
+    '(c) several DIFFERENT fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result;',
+    '(d) a SINGLE read → call the tool directly.',
   ].join(' ');
   if (opts.fanoutPreferred && opts.multiItem) {
     const n = opts.multiItem.count >= 3 ? `~${opts.multiItem.count}` : 'several';
     const kind = opts.multiItem.kind ?? 'items';
     const source = opts.multiItem.carried ? 'the conversation (your own prior message names the batch)' : 'the request';
-    return `${rule} THIS TURN IS LANE (a): ${source} indicates ${n} independent ${kind} — fan out via run_worker now.`;
+    return `${rule} THIS TURN IS BATCH-SHAPED: ${source} indicates ${n} independent ${kind} — use run_batch if you can bake every item's args now, else run_worker.`;
   }
   return rule;
 }
@@ -225,6 +226,38 @@ async function dispatchCodeModeMcpTool(method: string, args: unknown): Promise<u
   if (typeof shim.listTools === 'function') { try { await shim.listTools(); } catch { /* routing rebuilds on call */ } }
   const argObj = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
   return shim.callTool(method, argObj);
+}
+
+/**
+ * Batch-runner dispatch: same two gated lanes as code mode (local wrapped tool /
+ * namespaced MCP shim), WITHOUT the code-mode allowlist. The batch runner's
+ * authority model is different: a READ plan may call read tools freely, and a
+ * WRITE plan only executes after its exact payloads were certified and approved
+ * as ONE pending action — so the code-mode CLEMMY_CODE_MODE_WRITES switch does
+ * not govern it. Every per-call runtime gate still fires: local tools route
+ * through wrapToolForHarness (write boundary, guardrails, telemetry) and MCP
+ * tools through the shim's decideToolApproval. Telemetry parity via the same
+ * tool_called/tool_returned events with batchMode:true.
+ */
+export async function dispatchBatchItemTool(
+  method: string,
+  args: unknown,
+  sessionId: string,
+  counter: ToolCallsCounter,
+): Promise<unknown> {
+  const callId = `batch-${randomUUID()}`;
+  try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
+  try {
+    const out = isMcpNamespacedTool(method)
+      ? await dispatchCodeModeMcpTool(method, args)
+      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    if (typeof out !== 'string') return out ?? null;
+    try { return JSON.parse(out); } catch { return out; }
+  } catch (err) {
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, batchMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
+    throw err;
+  }
 }
 
 /** Run a code-mode program for a session. ONE counter spans all in-program calls
