@@ -8976,8 +8976,17 @@ export function registerConsoleRoutes(
       const openCheckIns = listOpenCheckIns();
       // For WORKING NOW we only want executions the daemon is RUNNING
       // right now. Blocked/paused are stalled — they show in Activity.
+      // RECENCY guard (live 2026-07-08): a failed turn's execution record can
+      // stay status='active' forever ("Coffee shop landing page deploy" showed
+      // as Working 40 min after its turn died) — an execution with no update
+      // in 10 min is not "working now"; it stays reachable in Activity.
+      const executionActiveCutoff = Date.now() - 10 * 60_000;
       const executions = new ExecutionStore().list(60)
-        .filter((execution) => execution.status === 'active');
+        .filter((execution) => execution.status === 'active')
+        .filter((execution) => {
+          const t = Date.parse((execution as { updatedAt?: string }).updatedAt ?? '');
+          return !Number.isFinite(t) || t >= executionActiveCutoff;
+        });
       const backgroundTasks = listBackgroundTasks().slice(0, 60);
       const pendingApprovalIds = new Set<string>([
         ...approvals.map((approval) => approval.id),
