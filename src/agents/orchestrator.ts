@@ -1447,10 +1447,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // reduced) — so both arms are attributable. Off / no-query / no-embeddings / no-signal
   // → full surface (byte-identical). The ranking query folds in recent prior-turn texts
   // so bare follow-ups inherit intent. Never throws into construction.
-  const jitDecision = resolveToolJitDecision({ allowLane: options.allowToolJit === true, sessionId: options.sessionId });
+  // Resolved EARLY so JIT can stand down when the deferred surface governs: with
+  // tool-search active, first-class = structural + hot set and everything else is
+  // catalog-reachable — JIT's semantic top-K over the same tools is pure waste
+  // (measured 10.5s cold on 2026-07-08: it embedded+ranked 127 built-ins, dropped
+  // 61, and the switch then rebuilt the surface its own way) and can even prune a
+  // session-LRU tool the hot set wanted first-class.
+  const searchDecision = resolveToolSearchDecision({ allowLane: options.allowToolJit === true, sessionId: options.sessionId });
+  const jitDecision = resolveToolJitDecision({ allowLane: options.allowToolJit === true && !searchDecision.active, sessionId: options.sessionId });
   let jitDiscoveryTools = dedupedDiscoveryTools;
   let jitDropped = 0;
-  let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
+  let jitReason = searchDecision.active ? 'jit-superseded-by-tool-search' : jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
   if (jitDecision.active && typeof options.userInput === 'string' && options.userInput.trim()) {
     try {
       const jitQuery = [options.userInput, ...priorUserInputs.slice(0, 3)]
@@ -1510,7 +1517,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // appears only in the catalog block, reachable THIS turn via call_tool. The catalog
   // is injected via the SAME instructions-trailer mechanism as codeModeMandate (a
   // per-turn re-render), not baked into a separate cacheable prefix.
-  const searchDecision = resolveToolSearchDecision({ allowLane: options.allowToolJit === true, sessionId: options.sessionId });
   let firstClassDiscovery = jitDiscoveryTools;
   let callTool: Tool<RuntimeContextValue> | null = null;
   let catalogBlock: string | null = null;
