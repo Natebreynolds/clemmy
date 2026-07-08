@@ -97,6 +97,12 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'background_tasks_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'List recent durable background tasks with status, latest activity, approvals, and result…' },
   { name: 'browser_harness_run', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'], description: 'Run a Browser Harness Python snippet against the user browser through the browser-harness…' },
   { name: 'browser_harness_status', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], description: 'Check Browser Harness availability and setup state.' },
+  // Generic gated dispatcher for schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07,
+  // Phase 1). Structural, orchestrator-lane only, added to assembledTools ONLY when
+  // CLEMMY_CODEX_TOOL_SEARCH is on (lanes [] like request_approval/run_worker).
+  // sideEffect 'write' = documented default-ask, but needsApproval is FALSE: the
+  // runtime gate keys on the INNER tool (dispatchBatchItemTool), not call_tool.
+  { name: 'call_tool', sideEffect: 'write', tier: 'core', lanes: [], needsApproval: false, description: 'Invoke a catalog-only built-in tool by name with a JSON args string; gates key on the inner tool.' },
   { name: 'check_capability', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], description: 'Check whether a CLI / binary is available on this machine.' },
   { name: 'check_delegation', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'Check a delegated task by ID or list delegations for an agent.' },
   { name: 'clear_model_role', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', description: 'Revert a model ROLE to its default (the model derived from whichever provider the user is…' },

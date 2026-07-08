@@ -14,6 +14,8 @@
  * imports only the registry (plain data), tool-jit's exported seed/recall helpers,
  * and the hot-set store — never the orchestrator or the runtime tool registry.
  */
+import { createHash } from 'node:crypto';
+import { getRuntimeEnv } from '../config.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { TOOL_JIT_MANDATED, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
@@ -163,4 +165,70 @@ function clamp01(n: number): number {
 /** Test-only: clear the catalog embedding cache. */
 export function _resetCatalogCacheForTest(): void {
   catalogVecCache.clear();
+}
+
+// ── Schema-on-demand surface decision (mirrors resolveToolJitDecision) ─────────
+
+export type ToolSearchArm = 'tool_search' | 'control';
+
+export interface ToolSearchDecision {
+  /** Whether the schema-on-demand surface is used this turn. */
+  active: boolean;
+  /** Assigned arm when the A/B is running; null otherwise. */
+  arm: ToolSearchArm | null;
+  /** True when the per-session A/B governs (vs the global flag). */
+  experiment: boolean;
+}
+
+/** Global switch. DEFAULT OFF this phase — off ⇒ byte-identical first-class surface. */
+export function codexToolSearchEnabled(): boolean {
+  const v = (getRuntimeEnv('CLEMMY_CODEX_TOOL_SEARCH', 'off') || 'off').trim().toLowerCase();
+  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
+}
+
+/** Per-session A/B experiment switch (independent of the global flag). Default OFF. */
+export function codexToolSearchExperimentEnabled(): boolean {
+  const v = (getRuntimeEnv('CLEMMY_CODEX_TOOL_SEARCH_AB', 'off') || 'off').trim().toLowerCase();
+  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
+}
+
+function abRatio(): number {
+  const r = Number.parseFloat(getRuntimeEnv('CLEMMY_CODEX_TOOL_SEARCH_AB_RATIO', '') || '');
+  return Number.isFinite(r) && r >= 0 && r <= 1 ? r : 0.5;
+}
+
+/** Deterministic, stable arm for a session (same sessionId → same arm all conversation). */
+export function assignToolSearchArm(sessionId: string): ToolSearchArm {
+  const digest = createHash('sha1').update(`codex_tool_search_ab::${sessionId}`).digest();
+  const frac = digest.readUInt32BE(0) / 0xffffffff;
+  return frac < abRatio() ? 'tool_search' : 'control';
+}
+
+/**
+ * The single source of truth for "does the schema-on-demand surface run this turn?".
+ * When the A/B is on and a session exists, the per-session ARM governs; otherwise the
+ * global flag governs. Always respects the lane gate (interactive chat only) — an
+ * autonomous lane can't recover a catalog-only tool via call_tool the way a
+ * conversational turn can, so it keeps the full first-class surface.
+ */
+export function resolveToolSearchDecision(opts: { allowLane: boolean; sessionId?: string | null }): ToolSearchDecision {
+  if (!opts.allowLane) return { active: false, arm: null, experiment: false };
+  if (codexToolSearchExperimentEnabled() && opts.sessionId) {
+    const arm = assignToolSearchArm(opts.sessionId);
+    return { active: arm === 'tool_search', arm, experiment: true };
+  }
+  return { active: codexToolSearchEnabled(), arm: null, experiment: false };
+}
+
+/** Rough token estimate (chars/4) of the serialized JSON schemas for a set of tool
+ *  names — used to measure the first-class surface cost with/without schema-on-demand.
+ *  `schemaFor` returns a JSON schema (or undefined) for a name. */
+export function estimateSchemaTokens(names: Iterable<string>, schemaFor: (name: string) => unknown): number {
+  let chars = 0;
+  for (const name of names) {
+    const schema = schemaFor(name);
+    if (schema !== undefined) chars += JSON.stringify(schema).length;
+    chars += name.length;
+  }
+  return Math.round(chars / 4);
 }

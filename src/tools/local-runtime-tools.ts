@@ -190,3 +190,18 @@ export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
     ),
   }));
 }
+
+/**
+ * Zod schema for every local runtime tool, keyed by name — the SAME schema
+ * getLocalRuntimeTools() builds each tool with. call_tool (call-tool.ts) uses this
+ * to validate args_json before generic dispatch and to return the schema on a
+ * validation miss. Side-effect-free (captureLocalTools registers against a fake
+ * server); safe to call on demand.
+ */
+export function getLocalToolSchemas(): Map<string, z.ZodTypeAny> {
+  const map = new Map<string, z.ZodTypeAny>();
+  for (const localTool of captureLocalTools()) {
+    map.set(localTool.name, z.object(normalizeShapeForResponses(localTool.parameters)));
+  }
+  return map;
+}

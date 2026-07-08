@@ -214,6 +214,12 @@ export const EVENT_TYPES = [
   // surface and an A/B can attribute token/accuracy deltas. Sibling of
   // mcp_tool_scope; only emitted when a reduction occurred.
   'tool_jit_scope',
+  // Schema-on-demand surface (SCHEMA-ON-DEMAND-PLAN-2026-07-07): when the Codex lane
+  // moves discovery tools off the first-class schema surface into the catalog block
+  // (reachable via call_tool), this records the arm + first-class/catalog counts and
+  // estimated tokens so the A/B can attribute the token delta. Sibling of
+  // tool_jit_scope; pure telemetry, never alters dispatch.
+  'tool_search_scope',
   // Central tool-policy resolver: emitted at model-boundary construction after
   // allow/deny resolution so every brain can show which local tool surface it
   // actually received. Telemetry only; never alters dispatch.

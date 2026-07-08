@@ -31,6 +31,8 @@ import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
+import { resolveToolSearchDecision, resolveHotSet, buildToolCatalog, allRegistryNames } from './tool-catalog.js';
+import { buildCallTool } from '../tools/call-tool.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
@@ -1499,8 +1501,51 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   }
 
   const baseInstructions = harnessInstructions(rubricChoice.instructions, { sessionId: options.sessionId ?? undefined });
-  const instructions = codeModeMandate
-    ? () => `${baseInstructions()}\n\n${codeModeMandate}`
+
+  // Schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 1), behind
+  // CLEMMY_CODEX_TOOL_SEARCH (default OFF → this whole block is inert and the
+  // surface is byte-identical to before). When active on an interactive chat lane:
+  // first-class tools = structural + the session HOT SET (TOOL_JIT_MANDATED ∪ recall
+  // pins ∪ session LRU); every other discovery tool leaves the schema surface and
+  // appears only in the catalog block, reachable THIS turn via call_tool. The catalog
+  // is injected via the SAME instructions-trailer mechanism as codeModeMandate (a
+  // per-turn re-render), not baked into a separate cacheable prefix.
+  const searchDecision = resolveToolSearchDecision({ allowLane: options.allowToolJit === true, sessionId: options.sessionId });
+  let firstClassDiscovery = jitDiscoveryTools;
+  let callTool: Tool<RuntimeContextValue> | null = null;
+  let catalogBlock: string | null = null;
+  let searchFirstClassCount = 0;
+  let searchCatalogCount = 0;
+  let searchFirstClassTokens = 0;
+  let searchCatalogTokens = 0;
+  if (searchDecision.active) {
+    try {
+      const excludes = new Set(options.excludeToolNames ?? []);
+      const policyAllowed = new Set([...allRegistryNames()].filter((n) => !excludes.has(n)));
+      const searchQuery = [options.userInput, ...priorUserInputs.slice(0, 3)]
+        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+        .join('\n');
+      const hot = resolveHotSet(options.sessionId, searchQuery, { allowedNames: policyAllowed });
+      firstClassDiscovery = dedupedDiscoveryTools.filter((t) => hot.has((t as { name?: string }).name ?? ''));
+      callTool = buildCallTool();
+      const catalogText = buildToolCatalog({ allowedNames: policyAllowed });
+      searchCatalogCount = catalogText ? catalogText.split('\n').length : 0;
+      searchCatalogTokens = Math.round(catalogText.length / 4);
+      catalogBlock = [
+        '[tool-catalog] These built-in tools are AVAILABLE this turn but are NOT loaded as first-class tools (to save context). To use one, call `call_tool(name, args_json)` with the exact name below and a JSON args string — or call `tool_search(query)` first if you are unsure of the exact name or arguments. call_tool never prompts on its own: a read runs immediately, a write/send target gates for approval exactly as a direct call would. Your first-class tools (already loaded — call them directly) are not listed here.',
+        catalogText,
+      ].join('\n');
+    } catch {
+      // Never break construction — fall back to the full first-class surface.
+      firstClassDiscovery = jitDiscoveryTools;
+      callTool = null;
+      catalogBlock = null;
+    }
+  }
+
+  const instructionsTrailer = [codeModeMandate, catalogBlock].filter(Boolean).join('\n\n');
+  const instructions = instructionsTrailer
+    ? () => `${baseInstructions()}\n\n${instructionsTrailer}`
     : baseInstructions;
   const assembledTools = [
     plannerTool,
@@ -1508,8 +1553,37 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     buildAskUserQuestionTool(),
     buildOfferBackgroundTool(),
     runWorkerTool,
-    ...jitDiscoveryTools,
+    ...(callTool ? [callTool] : []),
+    ...firstClassDiscovery,
   ];
+  searchFirstClassCount = assembledTools.length;
+  searchFirstClassTokens = Math.round(
+    assembledTools.reduce((sum, t) => {
+      const anyT = t as { name?: string; parameters?: unknown };
+      return sum + JSON.stringify(anyT.parameters ?? {}).length + (anyT.name?.length ?? 0);
+    }, 0) / 4,
+  );
+  if (options.sessionId && (searchDecision.active || searchDecision.experiment)) {
+    try {
+      appendEvent({
+        sessionId: options.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'tool_search_scope',
+        data: {
+          arm: searchDecision.arm,
+          experiment: searchDecision.experiment,
+          active: searchDecision.active,
+          firstClassCount: searchFirstClassCount,
+          catalogCount: searchCatalogCount,
+          estFirstClassTokens: searchFirstClassTokens,
+          estCatalogTokens: searchCatalogTokens,
+        },
+      });
+    } catch {
+      // Telemetry never blocks agent construction.
+    }
+  }
   const toolPolicy = resolveEffectiveToolPolicy({
     surface: 'orchestrator',
     lane: options.allowToolJit === true ? 'chat' : 'execution',

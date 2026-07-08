@@ -154,6 +154,12 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   // background-offer code nudge — it can land on ANY turn after alignment and is NOT
   // evident from the message keywords, so CORE is the reliable fix (mirrors ask_user_question).
   'ask_user_question', 'request_approval', 'run_worker', 'offer_background',
+  // CALL_TOOL — the generic gated dispatcher for schema-on-demand (Phase 1). A
+  // structural execution primitive (like request_approval/run_worker): CORE so the
+  // registry's tier stays consistent. It is only ADDED to the surface when
+  // CLEMMY_CODEX_TOOL_SEARCH is on (assembled in orchestrator.ts), so listing it
+  // here is a no-op for the JIT keep-set otherwise (JIT only keeps tools present).
+  'call_tool',
   // CODE MODE — when present (CLEMMY_CODE_MODE=on), the programmatic-tool-calling
   // entry must stay reachable every turn; its value is data-heavy/multi-tool work
   // the message text won't always semantically match. No-op when off (JIT only
