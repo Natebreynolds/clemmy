@@ -17,7 +17,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 // eslint-disable-next-line import/first
 const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
 // eslint-disable-next-line import/first
-const { validateBatchPlan, runBatchPlan, certifyBatchPlan, formatBatchLedger, readBatchLedger } = await import('./batch-runner.js');
+const { validateBatchPlan, runBatchPlan, certifyBatchPlan, formatBatchLedger, readBatchLedger, _setBatchSleepForTests } = await import('./batch-runner.js');
 
 type FakeCall = { name: string; input: unknown };
 const calls: FakeCall[] = [];
@@ -137,4 +137,104 @@ test('certifyBatchPlan: judge unreachable → write/send fail CLOSED, read proce
   const read = await certifyBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'read things without a judge available', items });
   assert.equal(read.allow, true, 'read plan proceeds advisory');
   assert.equal(read.judged, false);
+});
+
+// ─── Rate-awareness (per-provider throttling) ─────────────────────────────────
+
+test('runBatchPlan: a rate-limit pauses the whole batch, does NOT consume the item retry, and does NOT count toward the halt', async () => {
+  calls.length = 0;
+  const delays: number[] = [];
+  _setBatchSleepForTests(async (ms) => { delays.push(ms); });
+  // 'r1' hits a 429 on its first TWO dispatch attempts, then succeeds. Each 429 is
+  // a BATCH-level pause + fresh re-run — the item's single transient retry is never
+  // spent, and rate-limits never count as consecutive failures (haltAfter=1 proves it).
+  let n = 0;
+  _setCodeModeToolsForTests(new Map([
+    ['read_file', fakeTool('read_file', () => { n += 1; if (n <= 2) throw new Error('HTTP 429 Too Many Requests'); return 'ok'; })],
+  ]) as never);
+  try {
+    const ledger = await runBatchPlan({
+      tool: 'read_file', sideEffect: 'read',
+      objective: 'rate-limit back-off should not halt or burn the retry',
+      items: [{ id: 'rl-1', args: { path: '/tmp/rl-1' } }],
+      concurrency: 1, haltAfterConsecutiveFailures: 1,
+    }, 'sess-ratelimit');
+    assert.equal(ledger.halted, false, 'rate-limits must NOT halt (they are not consecutive failures)');
+    assert.equal(ledger.succeeded, 1);
+    const rl1 = ledger.outcomes.find((o) => o.id === 'rl-1')!;
+    assert.equal(rl1.ok, true);
+    assert.equal(rl1.attempts, 1, 'the successful run used a FRESH attempt — the rate-limit did not consume the retry');
+    assert.equal(delays.length, 2, 'two 429s → two batch back-off pauses');
+    assert.ok(delays[0] >= 2000 && delays[0] <= 2600, `first back-off ≈ base 2s + jitter (got ${delays[0]})`);
+    assert.ok(delays[1] > delays[0] && delays[1] <= 60000, 'back-off grows exponentially, capped at 60s');
+  } finally {
+    _setBatchSleepForTests(null);
+  }
+});
+
+test('runBatchPlan: persistent rate-limiting halts after 5 back-offs with the throttling named', async () => {
+  calls.length = 0;
+  const delays: number[] = [];
+  _setBatchSleepForTests(async (ms) => { delays.push(ms); });
+  _setCodeModeToolsForTests(new Map([
+    ['read_file', fakeTool('read_file', () => { throw new Error('429 rate limit exceeded'); })],
+  ]) as never);
+  try {
+    const ledger = await runBatchPlan({
+      tool: 'read_file', sideEffect: 'read',
+      objective: 'a provider that never stops throttling must halt honestly',
+      items: [{ id: 'rl-forever', args: { path: '/tmp/rl-forever' } }],
+      concurrency: 1,
+    }, 'sess-ratelimit-halt');
+    assert.equal(ledger.halted, true);
+    assert.match(ledger.haltReason ?? '', /rate-limit|throttl|back-off/i, 'halt names the provider throttling');
+    assert.equal(delays.length, 5, 'at most 5 back-off pauses, then halt on the 6th');
+    assert.ok(delays.every((d) => d <= 60000), 'every back-off honors the 60s cap');
+    // A rate-limit that never resolves is not counted as a normal failure outcome.
+    assert.equal(ledger.outcomes.length, 0, 'the throttled item never produced a terminal failure outcome');
+  } finally {
+    _setBatchSleepForTests(null);
+  }
+});
+
+// ─── Idempotency (safe re-run of a partially-failed batch) ────────────────────
+
+test('runBatchPlan: a re-run skips an already-succeeded item but re-executes a failed one (idempotency)', async () => {
+  // Run A: dedup-ok succeeds, dedup-fail hard-fails.
+  calls.length = 0;
+  let failToggle = 0;
+  _setCodeModeToolsForTests(new Map([
+    ['read_file', fakeTool('read_file', (input) => {
+      const p = String(input.path);
+      if (p.includes('dedup-fail')) { failToggle += 1; if (failToggle === 1) throw new Error('permission denied'); return 'ok-on-retry'; }
+      return `contents of ${p}`;
+    })],
+  ]) as never);
+  const items = [
+    { id: 'dedup-ok', args: { path: '/tmp/dedup-ok' } },
+    { id: 'dedup-fail', args: { path: '/tmp/dedup-fail' } },
+  ];
+  const ledgerA = await runBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'first pass — one succeeds one fails', items, concurrency: 1 }, 'sess-dedup');
+  assert.equal(ledgerA.outcomes.find((o) => o.id === 'dedup-ok')!.ok, true);
+  assert.equal(ledgerA.outcomes.find((o) => o.id === 'dedup-fail')!.ok, false);
+  assert.ok(ledgerA.outcomes.every((o) => typeof o.idempotencyKey === 'string' && o.idempotencyKey.length > 0), 'every outcome carries an idempotency key');
+
+  // Run B: SAME plan. dedup-ok must be skipped (deduped); dedup-fail re-dispatched.
+  calls.length = 0;
+  const ledgerB = await runBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'retry the partially-failed batch', items, concurrency: 1 }, 'sess-dedup');
+  const okB = ledgerB.outcomes.find((o) => o.id === 'dedup-ok')!;
+  const failB = ledgerB.outcomes.find((o) => o.id === 'dedup-fail')!;
+  assert.equal(okB.deduped, true, 'the already-succeeded item is deduped, not re-run');
+  assert.equal(okB.ok, true, 'a deduped item counts as succeeded');
+  assert.match(okB.resultPreview ?? '', /^deduped: already executed in batch batch-/);
+  assert.equal(failB.deduped ?? false, false, 'the previously-FAILED item is NOT deduped');
+  assert.equal(failB.ok, true, 'the re-dispatched item now succeeds');
+  // Only the previously-failed item was actually dispatched in run B.
+  assert.equal(calls.length, 1, 'run B dispatched ONLY the failed item; the succeeded one was skipped');
+  assert.equal(String((calls[0].input as { path?: string }).path), '/tmp/dedup-fail');
+
+  // Ledger counts + format surface the dedup distinctly.
+  assert.equal(ledgerB.succeeded, 2, 'deduped + re-run both count as succeeded');
+  const text = formatBatchLedger(ledgerB);
+  assert.match(text, /1 deduped \(already executed in a prior batch: batch-/);
 });

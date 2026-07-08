@@ -27,7 +27,8 @@
  *      to the model, which must relay failures honestly; failed items are
  *      the ONLY place model reasoning re-enters (repair pass).
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 import { Agent, Runner } from '@openai/agents';
@@ -71,6 +72,12 @@ export interface BatchItemOutcome {
   ms: number;
   error?: string;
   resultPreview?: string;
+  /** Per-item idempotency key: sha1(operation-scope :: id :: JSON(args)). Persisted
+   *  so a later run can skip an already-succeeded identical item. */
+  idempotencyKey?: string;
+  /** True when this item was SKIPPED because an identical item already succeeded in
+   *  a recent batch (counts as succeeded, never dispatched). */
+  deduped?: boolean;
 }
 
 export interface BatchRunLedger {
@@ -217,6 +224,90 @@ function errorLooksTransient(message: string): boolean {
   return /timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed|429|rate.?limit|5\d\d|socket hang up|network/i.test(message);
 }
 
+/** A rate-limit / throttling error is handled DISTINCTLY from other transients: it
+ *  pauses the WHOLE batch with back-off rather than burning the item's single retry
+ *  or counting toward the consecutive-failure halt. Returns the parsed Retry-After
+ *  (ms, capped) when the provider gave one, else undefined. */
+function detectRateLimit(message: string): { error: string; retryAfterMs?: number } | null {
+  if (!/\b429\b|rate.?limit|too many requests|quota exceeded|throttl/i.test(message)) return null;
+  let retryAfterMs: number | undefined;
+  // "Retry-After: 12", "retry after 12s", "retry_after":"30" — seconds → ms.
+  const m = /retry[-_\s]?after["':\s]+(\d+)/i.exec(message);
+  if (m) retryAfterMs = Math.min(RATE_LIMIT_BACKOFF_CAP_MS, Math.max(0, Number.parseInt(m[1], 10) * 1000));
+  return { error: message.slice(0, 200), retryAfterMs };
+}
+
+const RATE_LIMIT_BACKOFF_CAP_MS = 60_000;
+const MAX_RATE_LIMIT_BACKOFFS = 5;
+
+/** Base back-off delay (ms). Env-overridable so tests keep the real timer SHORT
+ *  without mocking the clock (CLEMMY_BATCH_BACKOFF_BASE_MS). Default 2s. */
+function batchBackoffBaseMs(): number {
+  const raw = Number.parseInt(process.env.CLEMMY_BATCH_BACKOFF_BASE_MS ?? '', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2000;
+}
+
+/** Exponential back-off with jitter, capped; honors a server Retry-After when larger. */
+function backoffDelayMs(backoffCount: number, retryAfterMs: number): number {
+  const base = batchBackoffBaseMs();
+  const exp = Math.min(RATE_LIMIT_BACKOFF_CAP_MS, base * Math.pow(2, Math.max(0, backoffCount - 1)));
+  const jitter = Math.random() * Math.min(1000, exp * 0.25);
+  const computed = Math.min(RATE_LIMIT_BACKOFF_CAP_MS, exp + jitter);
+  return Math.max(computed, Math.min(RATE_LIMIT_BACKOFF_CAP_MS, retryAfterMs || 0));
+}
+
+/** Sleep seam — real timer in prod; tests inject a no-wait fn that captures delays. */
+let batchSleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms));
+export function _setBatchSleepForTests(fn: ((ms: number) => Promise<void>) | null): void {
+  batchSleep = fn ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+}
+
+// ─── Per-item idempotency (safe re-run of a partially-failed batch) ───────────
+
+const IDEMPOTENCY_WINDOW_MS = 48 * 60 * 60 * 1000; // 48h
+const IDEMPOTENCY_SCAN_MAX_FILES = 200;
+
+/** Stable operation scope for a plan — tool + slug + side-effect. The item id +
+ *  args make the rest of the key, so the SAME item re-run under the same operation
+ *  (e.g. retrying a halted batch) resolves to the same key even if the plan's item
+ *  set or objective wording changed. */
+function planScopeHash(plan: BatchPlan): string {
+  return createHash('sha1').update(`${plan.tool}::${plan.composioSlug ?? ''}::${plan.sideEffect}`).digest('hex');
+}
+
+function itemIdempotencyKey(scope: string, item: BatchPlanItem): string {
+  return createHash('sha1').update(`${scope}::${item.id}::${JSON.stringify(item.args)}`).digest('hex');
+}
+
+/** Map of idempotencyKey → sourceBatchId for every SUCCEEDED item across the recent
+ *  ledgers (last 200 files by mtime, finished within 48h). Best-effort; never throws.
+ *  Deduped items themselves count as succeeded, so they chain (A→B re-run stays safe). */
+function loadRecentSucceededKeys(): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    if (!existsSync(BATCH_RUNS_DIR)) return map;
+    const now = Date.now();
+    const files = readdirSync(BATCH_RUNS_DIR)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => {
+        try { return { f, mtime: statSync(path.join(BATCH_RUNS_DIR, f)).mtimeMs }; } catch { return { f, mtime: 0 }; }
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, IDEMPOTENCY_SCAN_MAX_FILES);
+    for (const { f } of files) {
+      try {
+        const led = JSON.parse(readFileSync(path.join(BATCH_RUNS_DIR, f), 'utf-8')) as BatchRunLedger;
+        const finishedMs = Date.parse(led.finishedAt ?? '');
+        if (Number.isFinite(finishedMs) && now - finishedMs > IDEMPOTENCY_WINDOW_MS) continue;
+        for (const o of led.outcomes ?? []) {
+          if (o.ok && o.idempotencyKey && !map.has(o.idempotencyKey)) map.set(o.idempotencyKey, led.batchId);
+        }
+      } catch { /* skip a corrupt ledger */ }
+    }
+  } catch { /* best-effort */ }
+  return map;
+}
+
 export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<BatchRunLedger> {
   const batchId = `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const startedAt = new Date().toISOString();
@@ -234,8 +325,25 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
     appendEvent({ sessionId, turn: 0, role: 'system', type: 'batch_started', data: { batchId, tool: plan.tool, slug: plan.composioSlug ?? null, sideEffect: plan.sideEffect, items: plan.items.length, concurrency } });
   } catch { /* telemetry never blocks */ }
 
-  const runItem = async (item: BatchPlanItem): Promise<BatchItemOutcome> => {
+  // Idempotency: a key per item + the set of keys that already SUCCEEDED recently,
+  // so re-running a partially-failed batch (the exact post-halt scenario) skips the
+  // items that already went through instead of double-executing them.
+  const scope = planScopeHash(plan);
+  const succeededKeys = loadRecentSucceededKeys();
+
+  // runItem returns EITHER a terminal outcome OR a rate-limit signal (the whole
+  // batch backs off and the item is re-run fresh — its single transient retry is
+  // NOT consumed and it does NOT count toward the consecutive-failure halt).
+  type ItemResult = { outcome: BatchItemOutcome } | { rateLimit: { error: string; retryAfterMs?: number } };
+
+  const runItem = async (item: BatchPlanItem): Promise<ItemResult> => {
     const t0 = Date.now();
+    const key = itemIdempotencyKey(scope, item);
+    // Dedup BEFORE any dispatch — an identical item already succeeded recently.
+    const priorBatch = succeededKeys.get(key);
+    if (priorBatch) {
+      return { outcome: { id: item.id, ok: true, attempts: 0, ms: 0, deduped: true, idempotencyKey: key, resultPreview: `deduped: already executed in batch ${priorBatch}` } };
+    }
     const args = plan.tool === 'composio_execute_tool'
       ? { tool_slug: plan.composioSlug, arguments: JSON.stringify(item.args) }
       : item.args;
@@ -250,39 +358,57 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
         // is an error banner — do not count those as success.
         if (/^⚠️|FAILED \(slug=|NOT CONNECTED/i.test(text)) {
           lastError = text.slice(0, 200);
+          const rl = detectRateLimit(text);
+          if (rl) return { rateLimit: rl };
           if (attempts < 2 && errorLooksTransient(text)) continue;
-          return { id: item.id, ok: false, attempts, ms: Date.now() - t0, error: lastError };
+          return { outcome: { id: item.id, ok: false, attempts, ms: Date.now() - t0, error: lastError, idempotencyKey: key } };
         }
-        return { id: item.id, ok: true, attempts, ms: Date.now() - t0, resultPreview: text };
+        return { outcome: { id: item.id, ok: true, attempts, ms: Date.now() - t0, resultPreview: text, idempotencyKey: key } };
       } catch (err) {
         lastError = (err instanceof Error ? err.message : String(err)).slice(0, 200);
+        const rl = detectRateLimit(lastError);
+        if (rl) return { rateLimit: rl };
         if (attempts < 2 && errorLooksTransient(lastError)) continue;
-        return { id: item.id, ok: false, attempts, ms: Date.now() - t0, error: lastError };
+        return { outcome: { id: item.id, ok: false, attempts, ms: Date.now() - t0, error: lastError, idempotencyKey: key } };
       }
     }
-    return { id: item.id, ok: false, attempts, ms: Date.now() - t0, error: lastError };
+    return { outcome: { id: item.id, ok: false, attempts, ms: Date.now() - t0, error: lastError, idempotencyKey: key } };
   };
 
-  let index = 0;
-  while (index < plan.items.length && !halted) {
-    const wave = plan.items.slice(index, index + concurrency);
-    index += wave.length;
+  const emitProgress = (outcome: BatchItemOutcome): void => {
+    const done = outcomes.length;
+    const failedSoFar = outcomes.filter((o) => !o.ok).length;
+    if (plan.items.length <= 60 || !outcome.ok || done % 5 === 0 || done === plan.items.length) {
+      try {
+        appendEvent({
+          sessionId, turn: 0, role: 'system', type: 'batch_progress',
+          data: { batchId, done, total: plan.items.length, failed: failedSoFar, itemId: outcome.id, ok: outcome.ok, ...(outcome.deduped ? { deduped: true } : {}) },
+        });
+      } catch { /* telemetry never blocks */ }
+    }
+  };
+
+  // Queue-based loop so rate-limited items can be re-queued at the FRONT after a
+  // batch-level back-off pause without losing their place or their retry.
+  const queue: BatchPlanItem[] = [...plan.items];
+  let backoffCount = 0;
+  while (queue.length > 0 && !halted) {
+    const wave = queue.splice(0, concurrency);
     const results = await Promise.all(wave.map((item) => runItem(item)));
-    for (const outcome of results) {
-      outcomes.push(outcome);
-      // Live progress for the chat activity strip: authoritative counts so the
-      // UI renders a real meter, not a guess. Every item for normal batches;
-      // throttled to every 5th (plus failures + the final item) on huge ones.
-      const done = outcomes.length;
-      const failedSoFar = outcomes.filter((o) => !o.ok).length;
-      if (plan.items.length <= 60 || !outcome.ok || done % 5 === 0 || done === plan.items.length) {
-        try {
-          appendEvent({
-            sessionId, turn: 0, role: 'system', type: 'batch_progress',
-            data: { batchId, done, total: plan.items.length, failed: failedSoFar, itemId: outcome.id, ok: outcome.ok },
-          });
-        } catch { /* telemetry never blocks */ }
+    const requeue: BatchPlanItem[] = [];
+    let maxRetryAfterMs = 0;
+    let sawRateLimit = false;
+    for (let i = 0; i < wave.length; i += 1) {
+      const r = results[i];
+      if ('rateLimit' in r) {
+        sawRateLimit = true;
+        requeue.push(wave[i]);
+        if (r.rateLimit.retryAfterMs) maxRetryAfterMs = Math.max(maxRetryAfterMs, r.rateLimit.retryAfterMs);
+        continue;
       }
+      const outcome = r.outcome;
+      outcomes.push(outcome);
+      emitProgress(outcome);
       if (outcome.ok) {
         consecutiveFailures = 0;
       } else {
@@ -296,6 +422,27 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
           break;
         }
       }
+    }
+    if (halted) break;
+    if (sawRateLimit) {
+      backoffCount += 1;
+      if (backoffCount > MAX_RATE_LIMIT_BACKOFFS) {
+        halted = true;
+        const notRun = queue.length + requeue.length;
+        haltReason = `provider rate-limiting persisted through ${MAX_RATE_LIMIT_BACKOFFS} back-off pauses — halting so the throttled provider is not hammered (${notRun} item(s) not executed; re-run is idempotent-safe)`;
+        break;
+      }
+      const delayMs = backoffDelayMs(backoffCount, maxRetryAfterMs);
+      // Tell the UI meter we're throttled + backing off (not a per-item update).
+      try {
+        appendEvent({
+          sessionId, turn: 0, role: 'system', type: 'batch_progress',
+          data: { batchId, done: outcomes.length, total: plan.items.length, failed: outcomes.filter((o) => !o.ok).length, throttled: true, backoffMs: delayMs, backoffCount, ok: true },
+        });
+      } catch { /* telemetry never blocks */ }
+      await batchSleep(delayMs);
+      // Re-queue the throttled items at the FRONT so they run next.
+      queue.unshift(...requeue);
     }
   }
 
@@ -355,6 +502,11 @@ export function formatBatchLedger(ledger: BatchRunLedger): string {
       for (const o of ok.slice(0, 60)) lines.push(`- ${o.id}: ${o.resultPreview}`);
       if (ok.length > 60) lines.push(`- … ${ok.length - 60} more in the ledger (${ledger.batchId})`);
     }
+  }
+  const deduped = ledger.outcomes.filter((o) => o.deduped);
+  if (deduped.length > 0) {
+    const sources = [...new Set(deduped.map((o) => (o.resultPreview ?? '').replace(/^deduped: already executed in batch /, '')).filter(Boolean))];
+    lines.push(`${deduped.length} deduped (already executed in a prior batch${sources.length ? `: ${sources.slice(0, 3).join(', ')}${sources.length > 3 ? ', …' : ''}` : ''}) — counted as succeeded, not re-dispatched.`);
   }
   if (ledger.haltReason) lines.push(`Halt reason: ${ledger.haltReason}`);
   const failures = ledger.outcomes.filter((o) => !o.ok);

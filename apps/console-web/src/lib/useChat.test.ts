@@ -54,6 +54,21 @@ test('reduceActivity: run_batch renders as ONE live meter row; per-item batchMod
   assert.equal(a[0].batch?.failed, 1);
 });
 
+test('reduceActivity: a throttled batch_progress flips the meter into backing-off; a normal update clears it', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('batch_started', { batchId: 'b2', items: 10, slug: 'GMAIL_SEND_EMAIL', sideEffect: 'send' }));
+  a = reduceActivity(a, ev('batch_progress', { batchId: 'b2', done: 4, total: 10, failed: 0, itemId: 'a@x.com', ok: true }));
+  assert.equal(a[0].batch?.throttled, undefined, 'a normal update has no throttled flag');
+
+  // Rate-limit back-off pause: counts unchanged, throttled flips on.
+  a = reduceActivity(a, ev('batch_progress', { batchId: 'b2', done: 4, total: 10, failed: 0, throttled: true, backoffMs: 2000, backoffCount: 1, ok: true }));
+  assert.deepEqual(a[0].batch, { done: 4, total: 10, failed: 0, throttled: true });
+
+  // The next real item update clears the throttled flag.
+  a = reduceActivity(a, ev('batch_progress', { batchId: 'b2', done: 5, total: 10, failed: 0, itemId: 'b@x.com', ok: true }));
+  assert.deepEqual(a[0].batch, { done: 5, total: 10, failed: 0 });
+});
+
 test('reduceActivity: tool rows carry the salient target and a composio call reads as its slug', () => {
   let a: ActivityItem[] = [];
   a = reduceActivity(a, ev('tool_called', {

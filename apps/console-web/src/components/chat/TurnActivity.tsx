@@ -55,6 +55,7 @@ function BatchRow({ a, now, live }: { a: ActivityItem; now: number; live: boolea
         <span className="shrink-0 tabular-nums text-faint">
           {b.done}/{b.total}
           {b.failed > 0 && <span className="text-danger"> · {b.failed} failed</span>}
+          {running && b.throttled && <span className="text-warning"> · throttled, backing off…</span>}
           {running && elapsedLabel(a.startedAt, now) && <span> · {elapsedLabel(a.startedAt, now)}</span>}
         </span>
         <StatusIcon status={a.status} />

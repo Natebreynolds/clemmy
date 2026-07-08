@@ -17,8 +17,9 @@ export interface ActivityItem {
   status: 'running' | 'done' | 'failed';
   /** Client-clock start, for the live per-row elapsed timer while running. */
   startedAt?: number;
-  /** kind 'batch' only: live meter state from authoritative batch_progress events. */
-  batch?: { done: number; total: number; failed: number };
+  /** kind 'batch' only: live meter state from authoritative batch_progress events.
+   *  `throttled` flips true while the runner is backing off a provider rate-limit. */
+  batch?: { done: number; total: number; failed: number; throttled?: boolean };
 }
 
 export interface ChatMessage {
@@ -134,7 +135,13 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       const total = typeof d.total === 'number' ? d.total : 0;
       const failed = typeof d.failed === 'number' ? d.failed : 0;
       const itemId = typeof d.itemId === 'string' ? d.itemId : '';
-      return prev.map((a) => (a.kind === 'batch' && a.id === id ? { ...a, batch: { done, total, failed }, ...(itemId ? { detail: itemId } : {}) } : a));
+      // A throttled event is a batch-level back-off pause (no per-item advance) —
+      // keep the counts, flip the meter into "throttled — backing off" until the
+      // next real item update clears it.
+      const throttled = d.throttled === true;
+      return prev.map((a) => (a.kind === 'batch' && a.id === id
+        ? { ...a, batch: { done, total, failed, ...(throttled ? { throttled: true } : {}) }, ...(itemId ? { detail: itemId } : {}) }
+        : a));
     }
     case 'batch_completed': {
       const id = `b-${typeof d.batchId === 'string' ? d.batchId : ''}`;
