@@ -702,3 +702,52 @@ test('asyncResultItemCount: counts items in an Apify dataset (partial-scrape che
   assert.equal(asyncResultItemCount({ results: new Array(3).fill(1) }), 3);
   assert.equal(asyncResultItemCount({ status: 'SUCCEEDED' }), null, 'no item list → null (no false count)');
 });
+
+// ─── Discovery-tax: composio_search_tools consults tool-choice memory FIRST ────
+const { getComposioRuntimeTools } = await import('./composio-tools.js');
+const { rememberToolChoice: rememberTC, updateToolChoiceOutcomeForIdentifier: bumpTC } = await import('../memory/tool-choice-store.js');
+
+function searchTool() {
+  const t = getComposioRuntimeTools().find((x) => (x as { name?: string }).name === 'composio_search_tools') as unknown as {
+    invoke: (ctx: unknown, input: string, details: unknown) => Promise<{ content?: Array<{ text?: string }> }>;
+  };
+  return t;
+}
+async function invokeSearch(query: string): Promise<string> {
+  const out = await searchTool().invoke({ context: { sessionId: 'sess-search' } }, JSON.stringify({ query, toolkit_slug: null, limit: null }), { toolCall: { callId: 'c1' } });
+  return out?.content?.[0]?.text ?? JSON.stringify(out);
+}
+
+test('composio_search_tools: a confident memory match returns the remembered slug and SKIPS discovery (zero network)', async () => {
+  // Seed the store with fragmented apify-facebook intents → one slug, many successes.
+  for (const intent of [
+    'apify run actor facebook page posts scraper public page url',
+    'apify facebook posts scraper actor search',
+  ]) rememberTC({ intent, description: 'Auto-remembered: this Composio slug satisfied the searched intent.', choice: { kind: 'composio', identifier: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', invocationTemplate: '{"actorId":"apify/facebook-posts-scraper"}' } });
+  for (let i = 0; i < 40; i += 1) bumpTC('APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', 'success');
+
+  // COMPOSIO_API_KEY is NOT set in this test home. If the short-circuit did NOT
+  // fire, the search would fall through to the credentials guard and return
+  // "not configured" — reaching NO network either way. So a result naming the
+  // remembered slug PROVES the memory path returned before any discovery.
+  const text = await invokeSearch('facebook public page latest posts scrape');
+  assert.match(text, /APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS/, 'returns the remembered slug');
+  assert.match(text, /memory|remembered/i, 'labels it as recalled from memory');
+  assert.doesNotMatch(text, /not configured/i, 'never reached the credentials/discovery path');
+});
+
+test('composio_search_tools: a query with NO confident memory falls through to normal discovery', async () => {
+  const text = await invokeSearch('brightspot cms publish an article revision');
+  assert.doesNotMatch(text, /APIFY_RUN_ACTOR/, 'unrelated query does not surface the apify memory');
+  // With no API key, the fall-through path is the credentials guard (no network).
+  assert.match(text, /not configured/i, 'a miss runs the normal (non-memory) path');
+});
+
+test('auto-remember fires for a BACKGROUND-lane success (lane-agnostic, just a sessionId)', async () => {
+  const intent = 'brightdata scrape a public company profile page';
+  const bgSession = 'background:bg-mrbklth2-3e2840';
+  noteComposioSearchIntent(bgSession, intent);
+  await maybeAutoRememberComposioChoice('BRIGHTDATA_SCRAPE_AS_MARKDOWN', { url: 'https://x.co' }, { successful: true, data: { markdown: 'hi' } }, bgSession);
+  const rec = recallToolChoice(intent);
+  assert.equal(rec?.choice?.identifier, 'BRIGHTDATA_SCRAPE_AS_MARKDOWN', 'a background-lane success is remembered too');
+});

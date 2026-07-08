@@ -20,7 +20,7 @@ import { parkComposioJob } from '../integrations/composio/job-watcher.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier } from '../memory/tool-choice-store.js';
+import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier, recallComposioForSearch } from '../memory/tool-choice-store.js';
 import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
@@ -1236,6 +1236,43 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
           }
         } catch { /* best-effort — a refresh failure must never break search */ }
       }
+      // DISCOVERY-TAX short-circuit (2026-07-08): a task family that has run many
+      // times (facebook scrape → sheets) re-ran composio_search_tools 4-5× across
+      // toolkits (~2 min) even though tool-choice memory already held the proven
+      // slug — recall missed because auto-remember fragments intents by search
+      // query. Consult the store FIRST: on a confident remembered match, return the
+      // slug(s) instantly with a "remembered from N successes" note and SKIP the
+      // live toolkit discovery entirely (zero network). Only for a general (no
+      // explicit toolkit) search — a targeted toolkit lookup is deliberate. Search
+      // still runs when there's no confident memory. Kill-switch:
+      // CLEMMY_COMPOSIO_SEARCH_RECALL=off restores the always-discover behavior.
+      if (!toolkit_slug && (process.env.CLEMMY_COMPOSIO_SEARCH_RECALL ?? 'on').toLowerCase() !== 'off') {
+        try {
+          const remembered = recallComposioForSearch(query);
+          if (remembered.length > 0) {
+            // Deliberately do NOT noteComposioSearchIntent here: that would key a
+            // NEW intent fragment off this phrasing on the next execute (more
+            // fragmentation), and outcomes already credit by slug on every execute.
+            return formatComposioToolOutput({
+              configured: true,
+              query,
+              fromMemory: true,
+              count: remembered.length,
+              matches: remembered.map((m) => ({
+                toolkit: m.slug.split('_')[0]?.toLowerCase() ?? '',
+                slug: m.slug,
+                name: m.slug,
+                score: 1,
+                description: `Remembered from ${m.successCount} prior success${m.successCount === 1 ? '' : 'es'} on this machine (matched intent "${m.intent}"). Call composio_execute_tool with this slug — no rediscovery needed.${m.invocationTemplate ? ` Prior args template: ${m.invocationTemplate.slice(0, 400)}` : ''}`,
+              })),
+              message:
+                `Matched ${remembered.length} tool(s) from tool-choice memory — skipped Composio discovery (saved a multi-call search). ` +
+                'If a remembered slug fails on execute, call composio_search_tools again with a more specific query, or tool_choice_invalidate to force fresh discovery.',
+            }, { context, details, toolName: 'composio_search_tools' });
+          }
+        } catch { /* memory consult is best-effort — fall through to live search */ }
+      }
+
       const credentials = getComposioCredentialStatus();
       if (!credentials.enabled) {
         return formatComposioToolOutput({

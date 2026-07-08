@@ -46,6 +46,7 @@ const {
   peekToolChoice,
   matchToolChoicesForStep,
   evidenceLooksFailedOrBlocked,
+  recallComposioForSearch,
 } = await import('./tool-choice-store.js');
 
 test('recallToolChoice returns null when there is no record', () => {
@@ -646,4 +647,54 @@ test('matchToolChoicesForStep drops a NET-NEGATIVE remembered choice so a broken
   const matches = matchToolChoicesForStep('List Airtable records for prospects.');
   assert.equal(matches.find((m) => m.identifier === 'AIRTABLE_LIST_RECORDS'), undefined,
     'the net-negative airtable choice is not bound to the step (dropped by the outcome floor)');
+});
+
+// ─── recallComposioForSearch — the discovery-tax killer ───────────────────────
+// The store fragments one slug across many auto-remembered search-query intents;
+// jaccard recall misses a prose query. recallComposioForSearch aggregates by slug
+// and matches the query against INTENT tokens (which carry the domain words).
+
+function rememberComposio(intent: string, slug: string, successCount: number): void {
+  rememberToolChoice({
+    intent,
+    description: 'Auto-remembered: this Composio slug satisfied the searched intent.',
+    choice: { kind: 'composio', identifier: slug, invocationTemplate: '{"a":1}' },
+  });
+  // Bump success outcomes so the choice is net-positive + carries a count.
+  for (let i = 0; i < successCount; i += 1) updateToolChoiceOutcomeForIdentifier(slug, 'success');
+}
+
+test('recallComposioForSearch: fragmented intents for ONE slug aggregate and match a prose query (jaccard recall misses)', () => {
+  // Three near-duplicate auto-remembered phrasings, all → the same slug.
+  rememberComposio('apify run actor facebook page posts scraper public page url', 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', 30);
+  rememberComposio('apify facebook posts scraper actor search', 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', 29);
+  rememberComposio('apify search actors facebook page posts scraper run actor', 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', 28);
+
+  const q = 'facebook public page latest posts scrape'; // the exact incident phrasing
+  // Old narrow recall misses (jaccard < 0.5 + fragment tie).
+  assert.equal(recallToolChoice(q), null, 'jaccard recall misses the prose query (the incident)');
+  // New matcher hits, aggregating success across all three fragments.
+  const hits = recallComposioForSearch(q);
+  assert.ok(hits.length >= 1);
+  assert.equal(hits[0].slug, 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS');
+  assert.ok(hits[0].successCount >= 87, `aggregate success across fragments (got ${hits[0].successCount})`);
+});
+
+test('recallComposioForSearch: a toolkit-named query matches on a single strong anchor', () => {
+  rememberComposio('firecrawl.search', 'FIRECRAWL_SEARCH', 6);
+  const hits = recallComposioForSearch('use firecrawl to search the web');
+  assert.ok(hits.some((h) => h.slug === 'FIRECRAWL_SEARCH'), 'the toolkit name (firecrawl) is a confident anchor');
+});
+
+test('recallComposioForSearch: an unrelated query does NOT match (search still runs)', () => {
+  rememberComposio('apify run actor facebook page posts scraper', 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS', 30);
+  assert.deepEqual(recallComposioForSearch('scrape linkedin company employee directory'), [], 'no shared domain anchor → miss');
+  // A lone generic verb overlap must not anchor either.
+  assert.deepEqual(recallComposioForSearch('search for something'), [], 'generic-only overlap → miss');
+});
+
+test('recallComposioForSearch: excludes a net-negative (broken) remembered path', () => {
+  rememberToolChoice({ intent: 'brokenapp export the widgets report', choice: { kind: 'composio', identifier: 'BROKENAPP_EXPORT_WIDGETS' } });
+  for (let i = 0; i < 5; i += 1) updateToolChoiceOutcomeForIdentifier('BROKENAPP_EXPORT_WIDGETS', 'failure');
+  assert.deepEqual(recallComposioForSearch('brokenapp export widgets report'), [], 'a net-negative path is never short-circuited onto');
 });

@@ -966,6 +966,100 @@ export function matchToolChoicesForStep(
   return out.slice(0, limit);
 }
 
+export interface RememberedComposioMatch {
+  /** The remembered Composio slug (e.g. APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS). */
+  slug: string;
+  /** The stored intent whose tokens matched (the strongest representative). */
+  intent: string;
+  invocationTemplate?: string;
+  /** Aggregate success count across EVERY stored intent that maps to this slug. */
+  successCount: number;
+  /** Distinctive choice tokens found in the search query. */
+  matched: string[];
+}
+
+/**
+ * The DISCOVERY-TAX killer: given a natural-language composio_search_tools query,
+ * return the CONFIDENT remembered Composio slug(s) so the search can short-circuit
+ * instead of re-running a 4-5-call API discovery loop for a task family that has
+ * run many times before.
+ *
+ * Why a dedicated matcher (not recallToolChoice or matchToolChoicesForStep):
+ *  - recallToolChoice uses jaccard over SLUGS with a 0.5 floor + strictly-beat-the-
+ *    runner-up guard. Auto-remember keys each record by the SEARCH QUERY, so one
+ *    slug fragments across many near-duplicate intents ("apify run actor facebook
+ *    page posts scraper …" × 4). A prose query jaccards below 0.5 AND the fragments
+ *    tie → recall MISSES. (Live 2026-07-08: recall was called, still missed.)
+ *  - matchToolChoicesForStep gates on the choice's IDENTITY tokens = the SLUG
+ *    (APIFY_RUN_ACTOR_…), which never contains the domain words ("facebook") → also
+ *    misses for composio.
+ * This matcher scores the query against each choice's INTENT tokens (which DO carry
+ * the domain words), AGGREGATES by slug (fragments reinforce instead of tie), and
+ * excludes net-negative procedures. Confidence: ≥2 distinctive tokens incl. a strong
+ * (non-weak) anchor, OR the query names the slug's toolkit prefix. Pure apart from
+ * reading the store.
+ */
+export function recallComposioForSearch(
+  query: string,
+  opts: { choices?: ToolChoiceRecord[]; limit?: number } = {},
+): RememberedComposioMatch[] {
+  const q = wordTokens(query);
+  if (q.size === 0) return [];
+  let records: ToolChoiceRecord[];
+  try {
+    records = opts.choices ?? listToolChoices();
+  } catch {
+    return [];
+  }
+  const outcomesOn = isProceduralOutcomesEnabled();
+
+  type Agg = { best: RememberedComposioMatch; totalSuccess: number; bestMatched: number };
+  const bySlug = new Map<string, Agg>();
+  for (const rec of records) {
+    const c = rec.choice;
+    if (!c || c.kind !== 'composio') continue;
+    if (placeholderChoiceString(c.identifier)) continue;
+    // Never short-circuit onto a net-negative (broken) remembered path.
+    if (outcomesOn && computeChoiceScore(c) < TOOL_CHOICE_SCORE_FLOOR) continue;
+
+    // Distinctive tokens live in the INTENT (the search query it was learned from),
+    // not the slug. Drop generic verbs/stopwords so a shared "search"/"get" can't anchor.
+    const choiceTokens = new Set<string>();
+    for (const t of wordTokens(rec.intent)) {
+      if (t.length >= 3 && !STEP_MATCH_GENERIC_TOKENS.has(t)) choiceTokens.add(t);
+    }
+    if (choiceTokens.size === 0) continue;
+    const matched = [...choiceTokens].filter((t) => q.has(t));
+    if (matched.length === 0) continue;
+    const hasStrong = matched.some((t) => !STEP_MATCH_WEAK_IDENTITY_TOKENS.has(t));
+    const toolkit = c.identifier.split('_')[0]?.toLowerCase() ?? '';
+    const namesToolkit = toolkit.length >= 4 && q.has(toolkit);
+    // Confident enough to SKIP live discovery: two distinctive domain tokens with a
+    // strong anchor, or the query explicitly names the slug's toolkit.
+    if (!((matched.length >= 2 && hasStrong) || namesToolkit)) continue;
+
+    const successCount = (c.successCount ?? 0);
+    const cand: RememberedComposioMatch = {
+      slug: c.identifier,
+      intent: rec.intent,
+      invocationTemplate: c.invocationTemplate,
+      successCount,
+      matched,
+    };
+    const prev = bySlug.get(c.identifier);
+    if (!prev) {
+      bySlug.set(c.identifier, { best: cand, totalSuccess: successCount, bestMatched: matched.length });
+    } else {
+      prev.totalSuccess += successCount;
+      if (matched.length > prev.bestMatched) { prev.best = cand; prev.bestMatched = matched.length; }
+    }
+  }
+
+  const results = [...bySlug.values()].map((a) => ({ ...a.best, successCount: a.totalSuccess }));
+  results.sort((x, y) => (y.matched.length - x.matched.length) || (y.successCount - x.successCount));
+  return results.slice(0, opts.limit ?? 3);
+}
+
 /** The `allowedTools` family a step should be locked to when bound to a choice.
  *  cli → run_shell_command; mcp → the mcp tool name; composio → the slug. */
 export function toolFamilyForChoice(choice: ToolChoiceRecordChoice): string[] {
