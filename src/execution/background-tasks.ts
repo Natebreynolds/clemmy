@@ -23,6 +23,7 @@ import { addNotification } from '../runtime/notifications.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { humanizeReportBody } from '../runtime/report-voice.js';
 import { getGoalPinForDelegation, getActiveGoalForSession } from '../agents/plan-proposals.js';
+import { deliverableProbesEnabled, probeSessionDeliverables } from './deliverable-probe.js';
 import { ExecutionStore } from './store.js';
 import type { AssistantResponse, RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -1395,8 +1396,38 @@ async function verifyBackgroundTaskDelivery(
   if (classified.outcome === 'blocked') return classified;
 
   const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+
+  // DELIVERABLE PROBE — deterministic readback of the artifacts THIS run produced
+  // (created sheet ids, written file paths, space views), gated to GOAL-BOUND
+  // background runs (the trust-critical lane: a bound goal contract exists). The fix
+  // for the 2026-07-08 "shipped 5 BLANK Google Sheets as done" — the judge only saw
+  // the model's claims. A CONFIRMED probe failure blocks completion with the SPECIFIC
+  // gap; passing/unprobeable findings are folded into the delivery judge's evidence
+  // so even the judge lane can't pass a hollow deliverable. Best-effort per class
+  // (an unprobeable artifact passes through). Kill: CLEMMY_DELIVERABLE_PROBES=off.
+  let probeEvidence = '';
+  if (deliverableProbesEnabled()) {
+    try {
+      const goal = getActiveGoalForSession(task.runSessionId);
+      if (goal) {
+        const plan = goal.approvedPlan ?? goal.plan;
+        const objective = [plan?.objective ?? '', ...((plan?.successCriteria ?? []) as string[])]
+          .filter((s) => typeof s === 'string' && s.trim())
+          .join('\n') || task.prompt || task.title || '';
+        const probe = await probeSessionDeliverables(task.runSessionId, objective);
+        if (probe.failures.length > 0) {
+          return coverageBlock ?? { outcome: 'blocked', reason: probe.summary.slice(0, 400) };
+        }
+        probeEvidence = probe.evidenceText;
+      }
+    } catch {
+      // A probe error must NEVER block a run — pass through to the judge as before.
+    }
+  }
+
   try {
-    const verdict = await verifyDelivered(task.prompt || task.title, finalText, {
+    const evidence = probeEvidence ? `${finalText}\n\n${probeEvidence}` : finalText;
+    const verdict = await verifyDelivered(task.prompt || task.title, evidence, {
       stoppedReason,
       ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
     });
