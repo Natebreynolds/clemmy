@@ -3860,7 +3860,16 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         stage: 'turn',
       },
       async () => {
-        const recallBudget = new RecallBudget(3, 60_000);
+        // Budget raised 3×60KB → 5×150KB via env (2026-07-08): the morning
+        // prospect workflow's tracker sheet grew past 60KB and the step could
+        // no longer page the full payload back in one turn — it punted with
+        // accounts:[] and the contract checker (rightly) halted the run. Data
+        // grows daily; a fixed 60KB budget is a cliff every long-lived source
+        // eventually walks off. Still bounded per turn to protect compaction.
+        const recallBudget = new RecallBudget(
+          recallBudgetMaxCalls(),
+          recallBudgetMaxBytes(),
+        );
         if (useToolWrapper) {
           return await withHarnessRunContext(
             { sessionId: options.sessionId, counter: toolCounter, recallBudget },
@@ -6258,3 +6267,16 @@ function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return `${s.slice(0, n - 1)}…`;
 }
+/** Per-turn recall_tool_result budget — env-tunable so grown data sources
+ *  (a daily-append tracker sheet) don't hit a hard cliff. Defaults sized to
+ *  page a ~150KB payload in one turn while still bounding re-inflation. */
+function recallBudgetMaxCalls(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_CALLS', '5') ?? '5', 10);
+  return Number.isFinite(raw) && raw >= 1 ? raw : 5;
+}
+function recallBudgetMaxBytes(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_BYTES', '150000') ?? '150000', 10);
+  return Number.isFinite(raw) && raw >= 10_000 ? raw : 150_000;
+}
+
+
