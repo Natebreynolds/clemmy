@@ -223,6 +223,95 @@ test('W1a: when every brain hits the transient error, fall through to the infra-
   assert.ok(asks.some((e) => (e.data as { source?: string } | undefined)?.source === 'infra_error_recovery'), 'emits the same infra ask on exhaustion');
 });
 
+// ─── Unattended infra self-heal (workflow/background) ──────────────────────
+test('unattended self-heal: a transient infra error auto-retries and recovers (no awaiting_user_input)', async () => {
+  resetEventLog();
+  // A background run session (id prefix is the unattended signal).
+  const sess = HarnessSession.create({ id: 'background:auto-recover-ok', kind: 'execution' });
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    calls += 1;
+    if (calls === 1) {
+      throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+    }
+    return { history: items, lastResponseId: undefined, finalOutput: { summary: 'recovered', reply: 'Done after the auto-retry', done: true, nextAction: 'completed', reason: null } } as never;
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run the enrichment step',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed', 'the run self-healed and completed');
+  assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 1, 'the self-heal is visible in the trace');
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'never asked an absent human');
+});
+
+test('unattended self-heal: a persistent infra error auto-retries twice then FAILS honestly (never asks, never fakes success)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ id: 'workflow:sched-x:enrich_missing_seo_once', kind: 'workflow' });
+  const runRunner: RunRunnerFn = async () => {
+    throw BoundaryError.from(new Error('backend 529 persistent'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'enrich missing seo',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'failed', 'exhausted budget → the run fails honestly');
+  assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 2, 'exactly two bounded auto-retries');
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'never wrote an awaiting_user_input');
+  const failed = listEventsForConv(sess.id, { types: ['run_failed'] });
+  assert.ok(failed.some((e) => (e.data as { reason?: string }).reason === 'infra_transient_unrecovered'), 'fails with the infra error named, not fake success');
+});
+
+test('unattended self-heal: interactive (attended) session is UNCHANGED — the infra ask still fires', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async () => {
+    throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'do a thing',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'a human IS present — keep asking');
+  assert.ok(
+    listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).some((e) => (e.data as { source?: string }).source === 'infra_error_recovery'),
+    'the infra ask is byte-identical to before',
+  );
+  assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 0, 'no auto-recover on an attended session');
+});
+
+test('unattended self-heal: CLEMMY_UNATTENDED_AUTO_RECOVER=off restores the ask even in a background run', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_UNATTENDED_AUTO_RECOVER;
+  process.env.CLEMMY_UNATTENDED_AUTO_RECOVER = 'off';
+  try {
+    const sess = HarnessSession.create({ id: 'background:killswitch-off', kind: 'execution' });
+    const runRunner: RunRunnerFn = async () => {
+      throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+    };
+    const result = await runConversation({
+      agent: makeAgentStub(),
+      sessionId: sess.id,
+      input: 'run the step',
+      makeRunner: makeRunnerStub,
+      runRunner,
+    });
+    assert.equal(result.status, 'awaiting_user_input', 'kill-switch off ⇒ legacy ask behavior');
+    assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 0, 'no auto-recover when disabled');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_UNATTENDED_AUTO_RECOVER; else process.env.CLEMMY_UNATTENDED_AUTO_RECOVER = prev;
+  }
+});
+
 test('W1a: a transient error AFTER an external_write does NOT switch brains (no double-act) — it asks', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

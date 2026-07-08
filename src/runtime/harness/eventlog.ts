@@ -250,6 +250,11 @@ export const EVENT_TYPES = [
   // {reason, kind, toModel, attempt}). Telemetry + the visible parity twin of the
   // workflow runner's step_advisory{reason:'brain_fallover'}.
   'brain_fallover',
+  // Unattended infra self-heal: a workflow/background run hit a transient infra
+  // error (5xx / timeout / tool-timeout) and, having no human to answer the
+  // "retry/switch/stop" ask, auto-retried the same failed call instead. Carries
+  // {kind, attempt, max}. Bounded — after the budget the run fails honestly.
+  'infra_auto_recover',
   // Parse-exhaustion recovery marker: a `conversation_completed` with
   // reason 'no_structured_output' (the internal "couldn't be structured"
   // apology) is being re-run once on the next brain. Appended BEFORE the

@@ -737,6 +737,10 @@ export interface RunTurnResult {
   /** The deferred ask's user-facing message, so the exhausted-fallover path emits
    *  the byte-identical ask the direct path would have. */
   infraTransientUserMessage?: string;
+  /** UNATTENDED self-heal (workflow/background): an infra error that would ask an
+   *  absent human instead auto-retries. The outer loop re-runs the SAME step with
+   *  `directive` (bounded by decideInfraRecovery). Never written for attended runs. */
+  infraAutoRetry?: { kind: string; directive: string };
 }
 
 // ---------- runConversation ----------
@@ -1635,8 +1639,28 @@ async function runConversationCore(
           continue;
         }
       }
-      // Brains exhausted / external write already happened / rebuild failed →
-      // emit the same infra-recovery ask the non-fallover path would have, then return.
+      // Brains exhausted / external write already happened / rebuild failed. In an
+      // UNATTENDED run there's no one to answer, so self-heal: auto-retry the same
+      // step (bounded) or fail honestly — never strand it on an ask.
+      const infraDecision = decideInfraRecovery(options.sessionId);
+      if (infraDecision === 'auto_retry') {
+        emitInfraAutoRecoverEvent(options.sessionId, turnResult.turn, turnResult.infraTransientKind, countInfraAutoRecover(options.sessionId) + 1);
+        nextInput = buildInfraRetryDirective(turnResult.infraTransientKind);
+        falloverReattempt = false;
+        continue;
+      }
+      if (infraDecision === 'exhausted') {
+        emitInfraUnrecovered(options.sessionId, turnResult.turn, turnResult.infraTransientKind, turnResult.error ?? '');
+        return {
+          sessionId: options.sessionId,
+          status: 'failed',
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+          error: turnResult.error,
+        };
+      }
+      // Attended: emit the same infra-recovery ask the non-fallover path would have.
       emitInfraTransientAsk(
         options.sessionId,
         turnResult.turn,
@@ -1653,6 +1677,19 @@ async function runConversationCore(
         lastTurn,
         error: turnResult.error,
       };
+    }
+
+    // UNATTENDED infra self-heal (handleRunError sites): a transient infra error /
+    // tool-timeout in a workflow/background run comes back as an auto-retry
+    // directive instead of an ask. Re-run the SAME step with it, recording the
+    // self-heal in the trace. Bounded by decideInfraRecovery — once the budget is
+    // spent handleRunError emits run_failed and returns 'failed' (no directive),
+    // so this never loops forever.
+    if (turnResult.infraAutoRetry) {
+      emitInfraAutoRecoverEvent(options.sessionId, turnResult.turn, turnResult.infraAutoRetry.kind, countInfraAutoRecover(options.sessionId) + 1);
+      nextInput = turnResult.infraAutoRetry.directive;
+      falloverReattempt = false;
+      continue;
     }
 
     // v0.5.19 F2 — elevate budget mid-conversation if the preflight
@@ -4733,6 +4770,14 @@ async function runConversationFromResumeCore(opts: {
       onChunk: opts.onChunk,
     });
     lastTurn = turnResult.turn;
+    // UNATTENDED infra self-heal (parity with runConversation): a transient infra
+    // error / tool-timeout on this resumed workflow/background step auto-retries
+    // instead of asking an absent human. Budget-bounded in handleRunError.
+    if (turnResult.infraAutoRetry) {
+      emitInfraAutoRecoverEvent(opts.sessionId, turnResult.turn, turnResult.infraAutoRetry.kind, countInfraAutoRecover(opts.sessionId) + 1);
+      resumeContinuationInput = turnResult.infraAutoRetry.directive;
+      continue;
+    }
     if (turnResult.status !== 'completed') {
       return {
         sessionId: opts.sessionId,
@@ -4911,6 +4956,72 @@ const TRANSIENT_FALLOVER_KINDS = new Set<string>([
   // brain often succeeds where this one hit an unexpected error (brain-switching-when-needed).
   'model.unknown',
 ]);
+
+// ── Unattended infra self-heal ────────────────────────────────────────────────
+// A workflow step or background task runs with NO human present, so an infra
+// "retry/switch/stop" ask strands it forever (Nathan's morning-prospect-prep died
+// at enrich_missing_seo_once "waiting for user input, which a background workflow
+// cannot provide", 2026-07-08). In an unattended run we AUTO-RETRY the same failed
+// call a bounded number of times, then FAIL honestly — never awaiting_user_input,
+// never fake success. Interactive chat/Discord/console keep the ask verbatim.
+// Kill-switch CLEMMY_UNATTENDED_AUTO_RECOVER=off restores the ask everywhere.
+const MAX_INFRA_AUTO_RECOVER = 2;
+
+function unattendedAutoRecoverEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_UNATTENDED_AUTO_RECOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** An unattended run has no human to answer an infra ask. Signalled by the run
+ *  session id prefix (`workflow:` / `background:`) — the robust allocation-time
+ *  signal — with an execution-kind fallback. Interactive sessions are attended. */
+function isUnattendedSession(sessionId: string): boolean {
+  if (sessionId.startsWith('workflow:') || sessionId.startsWith('background:')) return true;
+  try { return getSession(sessionId)?.kind === 'execution'; } catch { return false; }
+}
+
+function countInfraAutoRecover(sessionId: string): number {
+  try { return listEvents(sessionId, { types: ['infra_auto_recover'] }).length; } catch { return 0; }
+}
+
+type InfraRecoveryDecision = 'ask' | 'auto_retry' | 'exhausted';
+
+/** For an infra error about to prompt "retry/switch/stop": ASK (attended, or the
+ *  kill-switch is off), AUTO_RETRY (unattended + budget remains), or EXHAUSTED
+ *  (unattended + budget spent → fail honestly). */
+function decideInfraRecovery(sessionId: string): InfraRecoveryDecision {
+  if (!unattendedAutoRecoverEnabled()) return 'ask';
+  if (!isUnattendedSession(sessionId)) return 'ask';
+  return countInfraAutoRecover(sessionId) < MAX_INFRA_AUTO_RECOVER ? 'auto_retry' : 'exhausted';
+}
+
+/** The self-heal directive fed back into the loop — synthesizes what a human
+ *  typing "Retry" produces (re-issue the failed call via retry_context). */
+function buildInfraRetryDirective(kind: string): string {
+  return [
+    `The previous step hit a transient backend error (${kind}). This is an UNATTENDED run with no one to ask, so recover automatically.`,
+    'Retry the SAME failed call now: re-issue it exactly as before, using your retry_context (the last tool_called before the error). Do NOT ask the user, do NOT restart from the plan top, do NOT switch objective.',
+    'If it fails again the run stops and reports the infra error honestly.',
+  ].join(' ');
+}
+
+/** Record the self-heal in the trace (attempt is 1-based). Emitted by the loop
+ *  when the retry actually re-enters, so the count reflects real retries. */
+function emitInfraAutoRecoverEvent(sessionId: string, turn: number, kind: string, attempt: number): void {
+  safeAppend({
+    sessionId, turn, role: 'system', type: 'infra_auto_recover',
+    data: { kind, attempt, max: MAX_INFRA_AUTO_RECOVER, source: 'infra_auto_recover' },
+  });
+}
+
+/** Honest terminal failure for an unattended run whose auto-recovery budget is
+ *  spent. The workflow runner's step-failed retry/repair machinery escalates from
+ *  this run_failed — never an ask, never a fake completion. */
+function emitInfraUnrecovered(sessionId: string, turn: number, kind: string, error: string): void {
+  safeAppend({
+    sessionId, turn, role: 'system', type: 'run_failed',
+    data: { error: error || `Unrecovered transient backend error (${kind}).`, reason: 'infra_transient_unrecovered', kind },
+  });
+}
 
 /**
  * Emit the infra-error "retry / switch / stop" ask (the F4-twin recovery). Single
@@ -5115,6 +5226,19 @@ function handleRunError(
           }
         }
       } catch { /* best-effort */ }
+      // UNATTENDED self-heal: retry the timed-out call (bounded) or fail honestly
+      // instead of asking a human who isn't there.
+      const infraDecision = decideInfraRecovery(sessionId);
+      if (infraDecision === 'auto_retry') {
+        bumpTurnNumber(sessionId, turn);
+        return { sessionId, turn, status: 'failed', error: normalizeError(err), infraAutoRetry: { kind: 'tool.timeout', directive: buildInfraRetryDirective('tool.timeout') } };
+      }
+      if (infraDecision === 'exhausted') {
+        emitInfraUnrecovered(sessionId, turn, 'tool.timeout', normalizeError(err));
+        session.markStatus('failed');
+        bumpTurnNumber(sessionId, turn);
+        return { sessionId, turn, status: 'failed', error: normalizeError(err) };
+      }
       safeAppend({
         sessionId,
         turn,
@@ -5212,6 +5336,19 @@ function handleRunError(
           sessionId, turn, status: 'awaiting_user_input', error: message,
           infraTransientKind: err.kind, infraTransientUserMessage: err.userMessage ?? '',
         };
+      }
+      // UNATTENDED self-heal: a workflow/background run can't answer an ask, so
+      // auto-retry the same call (bounded) or fail honestly instead of stranding.
+      const infraDecision = decideInfraRecovery(sessionId);
+      if (infraDecision === 'auto_retry') {
+        bumpTurnNumber(sessionId, turn);
+        return { sessionId, turn, status: 'failed', error: message, infraAutoRetry: { kind: err.kind, directive: buildInfraRetryDirective(err.kind) } };
+      }
+      if (infraDecision === 'exhausted') {
+        emitInfraUnrecovered(sessionId, turn, err.kind, message);
+        session.markStatus('failed');
+        bumpTurnNumber(sessionId, turn);
+        return { sessionId, turn, status: 'failed', error: message };
       }
       emitInfraTransientAsk(sessionId, turn, err.kind, err.userMessage ?? '', err.operatorMessage, message);
       bumpTurnNumber(sessionId, turn);
