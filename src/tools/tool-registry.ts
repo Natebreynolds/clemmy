@@ -1,0 +1,323 @@
+/**
+ * Single Tool Registry — STEP 1 (transcription + advisory derivations).
+ *
+ * Per TOOL-REGISTRY-PLAN-2026-07-07.md. This file is the ONE place that records,
+ * for every built-in tool, which surfaces advertise it and how it is classified.
+ * In step 1 it is ADVISORY: nothing here is wired into a live consumer yet. The
+ * conformance test (tool-registry.test.ts) asserts that the DERIVATIONS below
+ * reproduce every existing hand-maintained list EXACTLY — so this registry is a
+ * verified mirror of current truth, and any future drift between a hand list and
+ * the registry fails CI.
+ *
+ * Design constraints carried from the plan's risk list:
+ *   - Everything is lazily evaluated: the registry is a self-contained array of
+ *     plain string/enum literals with NO cross-module imports, so it can never
+ *     participate in the sub-agents ← orchestrator ← workflow-step-agent import
+ *     cycle or hit a TDZ (risk #5). Derivations are plain functions.
+ *   - Unknown/absent side-effect must never ungate: `deriveNeedsApproval` defaults
+ *     anything that is not a pure `read` to "ask" (risk #2).
+ *   - Blocklists stay NEGATIVE: `blockedFor` is a subtractive property over the
+ *     derived full surface, never an allowlist (risk #1).
+ *
+ * FIELD PROVENANCE (where each value was transcribed from, 2026-07-07):
+ *   - name .......... the registered MCP tool name.
+ *   - sideEffect .... `classifyTool(name)` from tool-taxonomy.ts, with its
+ *                     `'execute'` kind folded into `'write'` (both gate identically).
+ *                     This is the CURRENT taxonomy verdict, quirks and all — it is a
+ *                     mirror, not a proposal.
+ *   - tier .......... `'core'` iff the name is in TOOL_JIT_MANDATED (tool-jit.ts);
+ *                     else `'discoverable'`. core = never JIT-pruned.
+ *   - lanes ......... which advertise surfaces list the name TODAY:
+ *                       orchestrator = orchestrator.ts discoveryTools (deduped)
+ *                       sdk-brain    = CLAUDE_AGENT_SDK_FULL_TOOLS
+ *                       sdk-worker   = CLAUDE_AGENT_SDK_WORKER_TOOLS
+ *                       code-mode    = code-mode-tool.ts READ_ONLY_TOOLS ∪ WRITE_TOOLS
+ *                       cli          = catalog.ts LOCAL_MCP_TOOL_NAMES
+ *                     (A tool can be MANDATED/core yet have empty lanes — e.g.
+ *                     draft_plan/goal_stale/request_approval are structural or
+ *                     added outside these allowlists.)
+ *   - sdkLayer ...... the FINEST Claude-Agent-SDK profile layer the name belongs to
+ *                     (claude-agent-sdk.ts). Profiles nest, so the four layers
+ *                     compose the four exported profiles — see deriveSdkProfile.
+ *   - codeMode ...... `'read'` (READ_ONLY_TOOLS) or `'write'` (WRITE_TOOLS) for the
+ *                     code-mode program allowlist; absent otherwise.
+ *   - featureGroup .. `'spaces-dock'` for WORKSPACE_DOCK_TOOLS (workspace-context.ts).
+ *   - blockedFor .... F1/F2 subtractive filters: `'workflow-step'` iff in
+ *                     WORKFLOW_STEP_BLOCKED_TOOL_NAMES; `'worker'` iff in that set
+ *                     OR the name is `notify_user` (workerBlockedToolNames = F1 ∪
+ *                     {notify_user}).
+ */
+
+export type ToolLane = 'orchestrator' | 'sdk-brain' | 'sdk-worker' | 'workflow-step' | 'code-mode' | 'cli';
+export type ToolSideEffect = 'read' | 'write' | 'send' | 'admin';
+export type ToolTier = 'core' | 'discoverable';
+/** Finest SDK profile layer. Profiles nest: read-only ⊂ authoring; worker =
+ *  read-only ∪ agentic; full = read-only ∪ authoring ∪ agentic ∪ full-extra. */
+export type SdkLayer = 'read-only' | 'authoring' | 'agentic' | 'full-extra';
+export type ToolFeatureGroup = 'spaces-dock';
+
+export interface ToolDecl {
+  name: string;
+  /** Effect class from the taxonomy (execute folded into write). Advisory in step 1. */
+  sideEffect: ToolSideEffect;
+  /** core = in TOOL_JIT_MANDATED (never JIT-pruned); discoverable = JIT-able. */
+  tier: ToolTier;
+  /** Advertise surfaces that list this tool today. */
+  lanes: ToolLane[];
+  /** Claude-Agent-SDK profile layer this tool sits in, if any. */
+  sdkLayer?: SdkLayer;
+  /** Code-mode program allowlist membership + direction, if any. */
+  codeMode?: 'read' | 'write';
+  /** Feature-bundle membership (A6-style pins). */
+  featureGroup?: ToolFeatureGroup;
+  /** Subtractive filters — NEGATIVE properties over the derived full surface. */
+  blockedFor?: Array<'worker' | 'workflow-step'>;
+  /** Optional explicit approval override; default derives from sideEffect. */
+  needsApproval?: boolean;
+}
+
+/**
+ * CURRENT truth for every built-in tool that appears in any advertise / JIT /
+ * code-mode surface (union of: catalog LOCAL_MCP_TOOL_NAMES, orchestrator
+ * discoveryTools, the four SDK profiles, TOOL_JIT_MANDATED, code-mode
+ * READ_ONLY_TOOLS/WRITE_TOOLS). Sorted by name. Generated by transcription from
+ * the sources above and locked by tool-registry.test.ts.
+ */
+export const TOOL_REGISTRY: ToolDecl[] = [
+  { name: 'add_cron_job', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], blockedFor: ['workflow-step', 'worker'] },
+  { name: 'agent_propose', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'agent_run_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'agent_runs_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'answer_check_in', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'ask_user_question', sideEffect: 'read', tier: 'core', lanes: ['sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'background_task_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'background_tasks_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'browser_harness_run', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'browser_harness_status', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'check_capability', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'check_delegation', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'clear_model_role', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring' },
+  { name: 'composio_execute_tool', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write' },
+  { name: 'composio_list_tools', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic' },
+  { name: 'composio_search_tools', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'read' },
+  { name: 'composio_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'convert_to_markdown', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'create_agent', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'create_plan', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'create_tool', sideEffect: 'admin', tier: 'discoverable', lanes: ['cli'], blockedFor: ['workflow-step', 'worker'] },
+  { name: 'cron_list', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'cron_progress_read', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'cron_progress_write', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'cron_run_history', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'delegate_task', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'delete_agent', sideEffect: 'admin', tier: 'discoverable', lanes: ['cli'], blockedFor: ['workflow-step', 'worker'] },
+  { name: 'desktop_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator'] },
+  { name: 'discover_work', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'dispatch_background_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'draft_goal_from_notes', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'draft_plan', sideEffect: 'read', tier: 'core', lanes: [] },
+  { name: 'execution_complete', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra' },
+  { name: 'execution_create', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'full-extra' },
+  { name: 'execution_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra' },
+  { name: 'execution_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra' },
+  { name: 'execution_mark_blocked', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra' },
+  { name: 'execution_update_step', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra' },
+  { name: 'focus_activate', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'focus_clear', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'focus_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'focus_park', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'focus_set', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'focus_touch', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'focus_update', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'git_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'goal_create', sideEffect: 'write', tier: 'core', lanes: ['sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'goal_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'goal_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'goal_stale', sideEffect: 'write', tier: 'core', lanes: [] },
+  { name: 'goal_update', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'hold_task_for_later', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'list_capabilities', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'list_files', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'list_pending_check_ins', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'list_plans', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'local_cli_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'read' },
+  { name: 'local_cli_probe', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'read' },
+  { name: 'mcp_add', sideEffect: 'admin', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'mcp_configure', sideEffect: 'admin', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'mcp_reconnect', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'mcp_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'memory_embed_backfill', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'memory_forget', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'memory_import', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'memory_list_facts', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'memory_pin', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'memory_read', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'memory_recall', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'memory_remember', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'memory_restore', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'memory_review_instructions', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'memory_search', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'memory_search_facts', sideEffect: 'read', tier: 'discoverable', lanes: ['sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'memory_self_heal', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'note_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'note_take', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'notify_user', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic', blockedFor: ['worker'] },
+  { name: 'offer_background', sideEffect: 'read', tier: 'core', lanes: ['cli'] },
+  { name: 'pending_action_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'pending_action_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'pending_action_queue', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'pending_action_record_result', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'ping', sideEffect: 'read', tier: 'discoverable', lanes: ['sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'propose_check_in_template', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'read_file', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'recall_tool_result', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'request_approval', sideEffect: 'write', tier: 'core', lanes: [] },
+  { name: 'resume_held_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'run_batch', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra' },
+  { name: 'run_shell_command', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write' },
+  { name: 'run_tool_program', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'run_worker', sideEffect: 'write', tier: 'core', lanes: ['sdk-brain'], sdkLayer: 'full-extra', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'schedule_list', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'session_history', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'session_pause', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'session_resume', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'set_model_role', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring' },
+  { name: 'set_timer', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'share_plan', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'skill_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'skill_read', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'source_map_upsert', sideEffect: 'write', tier: 'discoverable', lanes: ['sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'space_edit_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'space_edit_view', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'space_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock' },
+  { name: 'space_get_runner', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock' },
+  { name: 'space_get_view', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock' },
+  { name: 'space_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock' },
+  { name: 'space_publish', sideEffect: 'send', tier: 'discoverable', lanes: ['sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'space_refresh', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'space_revert_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'space_save', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'space_set_data', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'space_try_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock' },
+  { name: 'surface_plan', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'] },
+  { name: 'task_add', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'task_hygiene', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'task_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'task_update', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'team_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'team_message', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'team_pending_requests', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'team_reply', sideEffect: 'send', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'team_request', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'tool_choice_forget', sideEffect: 'write', tier: 'core', lanes: ['orchestrator'] },
+  { name: 'tool_choice_invalidate', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'tool_choice_recall', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'tool_choice_remember', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'] },
+  { name: 'tool_output_query', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'trigger_cron_job', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], blockedFor: ['workflow-step', 'worker'] },
+  { name: 'update_agent', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'update_plan_step', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'user_profile_read', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'user_profile_update', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'workflow_apply_contract_fixes', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'] },
+  { name: 'workflow_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'workflow_delete', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'] },
+  { name: 'workflow_edit_step', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'workflow_from_session', sideEffect: 'write', tier: 'discoverable', lanes: ['sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'workflow_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'workflow_import_framework', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'] },
+  { name: 'workflow_import_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'workflow_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'workflow_rerun_failed_items', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'workflow_run', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'workflow_run_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'workflow_schedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'workflow_set_enabled', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'workflow_unschedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'workflow_update', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'] },
+  { name: 'working_memory', sideEffect: 'write', tier: 'discoverable', lanes: ['sdk-brain', 'cli'], sdkLayer: 'authoring' },
+  { name: 'workspace_config', sideEffect: 'admin', tier: 'discoverable', lanes: ['orchestrator', 'cli'] },
+  { name: 'workspace_info', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'workspace_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only' },
+  { name: 'workspace_roots', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read' },
+  { name: 'write_file', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write' },
+];
+
+// ── Derivations (advisory in step 1; the conformance test locks them to reality) ──
+
+/** Lazily map over the registry so no module-eval-time constant graph forms. */
+function names(pred: (d: ToolDecl) => boolean): Set<string> {
+  const out = new Set<string>();
+  for (const d of TOOL_REGISTRY) if (pred(d)) out.add(d.name);
+  return out;
+}
+
+/** catalog.ts LOCAL_MCP_TOOL_NAMES (the CLI / workflow-architect allowlist). */
+export function deriveCatalogNames(): Set<string> {
+  return names((d) => d.lanes.includes('cli'));
+}
+
+/** orchestrator.ts deduped discoveryTools (the live-chat surface). */
+export function deriveOrchestratorDiscoveryNames(): Set<string> {
+  return names((d) => d.lanes.includes('orchestrator'));
+}
+
+/**
+ * One of the Claude-Agent-SDK tool profiles, reconstructed from sdkLayer.
+ * The profiles NEST exactly as the source lists spread into one another:
+ *   read-only : layer read-only
+ *   authoring : read-only ∪ authoring
+ *   agentic   : the shared execution bundle (layer agentic) — a sub-profile, not
+ *               a full brain surface; equals WORKER \ READ_ONLY in the source
+ *   worker    : read-only ∪ agentic
+ *   full      : read-only ∪ authoring ∪ agentic ∪ full-extra (every SDK tool)
+ */
+export function deriveSdkProfile(profile: 'read-only' | 'authoring' | 'agentic' | 'full' | 'worker'): Set<string> {
+  const inLayers = (layers: SdkLayer[]) => names((d) => d.sdkLayer != null && layers.includes(d.sdkLayer));
+  switch (profile) {
+    case 'read-only':
+      return inLayers(['read-only']);
+    case 'authoring':
+      return inLayers(['read-only', 'authoring']);
+    case 'agentic':
+      return inLayers(['agentic']);
+    case 'worker':
+      return inLayers(['read-only', 'agentic']);
+    case 'full':
+      return inLayers(['read-only', 'authoring', 'agentic', 'full-extra']);
+  }
+}
+
+/** TOOL_JIT_MANDATED / TOOL_JIT_CORE — never JIT-pruned. */
+export function deriveJitCore(): Set<string> {
+  return names((d) => d.tier === 'core');
+}
+
+/** code-mode-tool.ts READ_ONLY_TOOLS + WRITE_TOOLS. */
+export function deriveCodeModeSets(): { readOnly: Set<string>; write: Set<string> } {
+  return {
+    readOnly: names((d) => d.codeMode === 'read'),
+    write: names((d) => d.codeMode === 'write'),
+  };
+}
+
+/** workspace-context.ts WORKSPACE_DOCK_TOOLS (A6 feature bundle). */
+export function deriveWorkspaceDockNames(): Set<string> {
+  return names((d) => d.featureGroup === 'spaces-dock');
+}
+
+/** F1 — WORKFLOW_STEP_BLOCKED_TOOL_NAMES (registry-registered members only). */
+export function deriveWorkflowStepBlocked(): Set<string> {
+  return names((d) => (d.blockedFor ?? []).includes('workflow-step'));
+}
+
+/** F2 — workerBlockedToolNames = F1 ∪ {notify_user} (registry members only). */
+export function deriveWorkerBlocked(): Set<string> {
+  return names((d) => (d.blockedFor ?? []).includes('worker'));
+}
+
+/** Approval default (risk #2): anything not a pure read asks unless overridden. */
+export function deriveNeedsApproval(decl: ToolDecl): boolean {
+  if (decl.needsApproval != null) return decl.needsApproval;
+  return decl.sideEffect !== 'read';
+}
