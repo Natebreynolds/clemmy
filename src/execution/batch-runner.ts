@@ -338,13 +338,24 @@ export function readBatchLedger(batchId: string): BatchRunLedger | null {
   }
 }
 
-/** Compact model-facing summary: honest counts + every failed item id. */
+/** Compact model-facing summary: honest counts + every failed item id.
+ *  READ batches also return per-item result previews inline — without them the
+ *  model re-fetched every item to get the data it just batched (live Claude-lane
+ *  validation 2026-07-08: "run_batch only surfaces success/fail counts"). */
 export function formatBatchLedger(ledger: BatchRunLedger): string {
   const lines = [
     `Batch ${ledger.batchId}: ${ledger.succeeded}/${ledger.total} succeeded, ${ledger.failed} failed`
     + (ledger.halted ? `, HALTED (${ledger.total - ledger.outcomes.length} never attempted)` : '')
     + ` · ${ledger.sideEffect} · ${ledger.tool}${ledger.composioSlug ? `/${ledger.composioSlug}` : ''}`,
   ];
+  if (ledger.sideEffect === 'read') {
+    const ok = ledger.outcomes.filter((o) => o.ok && o.resultPreview);
+    if (ok.length > 0) {
+      lines.push('Results (preview per item; full payloads via tool_output_query on the item call ids):');
+      for (const o of ok.slice(0, 60)) lines.push(`- ${o.id}: ${o.resultPreview}`);
+      if (ok.length > 60) lines.push(`- … ${ok.length - 60} more in the ledger (${ledger.batchId})`);
+    }
+  }
   if (ledger.haltReason) lines.push(`Halt reason: ${ledger.haltReason}`);
   const failures = ledger.outcomes.filter((o) => !o.ok);
   if (failures.length > 0) {
