@@ -858,7 +858,7 @@ function publishCreateSucceeded(resultText: string): boolean {
  * Fail-open: any error yields an empty predicate, which only makes the gate
  * stricter (never crashes a tool call).
  */
-function buildPublishProvenance(sessionId: string, projectKey?: string): (target: string) => boolean {
+export function buildPublishProvenance(sessionId: string, projectKey?: string): (target: string) => boolean {
   const created = new Set<string>();
   let userBlob = '';
   // Part 2 (2026-06-21): destinations THIS project has successfully published to
@@ -895,6 +895,25 @@ function buildPublishProvenance(sessionId: string, projectKey?: string): (target
         if (names) {
           const res = stripAnsi(joinedEventText(d?.result, d?.preview, d?.output));
           if (!publishCreateSucceeded(res)) continue;
+          // LISTING-SHAPED output must NEVER confer blanket provenance (live
+          // 2026-07-08 clobber: `sites:create --name X … || sites:list --json`
+          // — the create FAILED, the fallback LIST exited 0 under the same
+          // callId, and this sweep harvested EVERY existing site's id/name as
+          // "created", handing the deploy stolen provenance onto an unrelated
+          // live site another task had just published). If the result is a
+          // multi-site listing (JSON array / >1 site_id), harvest ONLY the
+          // object whose "name" equals a REQUESTED create name — nothing else.
+          const body = res.replace(/^[\s\S]*?stdout:\s*/i, '');
+          const isListing = /^\s*\[/.test(body) || (res.match(/"site_id"\s*:/gi) ?? []).length > 1;
+          if (isListing) {
+            for (const name of names) {
+              const block = res.match(new RegExp(`\\{[^{}]*"name"\\s*:\\s*"${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^{}]*\\}`, 'i'))?.[0];
+              if (!block) continue;
+              created.add(name);
+              for (const m of block.matchAll(/"(?:id|site_id|name|site_name)"\s*:\s*"([\w.-]+)"/gi)) created.add(m[1].toLowerCase());
+            }
+            continue;
+          }
           for (const name of names) created.add(name);
           for (const m of res.matchAll(/"(?:id|site_id|name|site_name)"\s*:\s*"([\w.-]+)"/gi)) created.add(m[1].toLowerCase());
           for (const m of res.matchAll(/\b(?:project|site)\s+id\s*:\s*([A-Za-z0-9][\w.-]*)/gi)) created.add(m[1].toLowerCase());
