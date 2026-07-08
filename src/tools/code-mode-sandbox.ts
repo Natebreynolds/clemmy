@@ -48,6 +48,19 @@ export interface CodeModeOptions {
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_RPC = 200;
 const DEFAULT_MAX_RETURN = 16_000;
+// Consecutive-failure breaker (2026-07-08): a model-written program with a type
+// bug iterated a PATH STRING char-by-char — 199 one-character list_files calls,
+// every one failing, until the RPC budget finally stopped it 4 minutes later.
+// Failures are the signal a program is broken: after this many tool-call
+// failures IN A ROW (no intervening success), abort the program and hand the
+// last error back to the model so it can fix its code in seconds. A healthy
+// program that probes-and-misses resets the count on its first success.
+const DEFAULT_MAX_CONSECUTIVE_RPC_FAILURES = 10;
+
+function maxConsecutiveRpcFailures(): number {
+  const raw = Number.parseInt(process.env.CLEMMY_CODEMODE_FAIL_BREAKER ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_CONSECUTIVE_RPC_FAILURES;
+}
 
 // The blocked module set — shared by both blocker mechanisms below.
 const BLOCKED_RE = `/^(node:)?(fs|fs\\/promises|child_process|net|http|https|http2|dns|dns\\/promises|tls|dgram|cluster|worker_threads|module|vm|inspector|repl|v8|wasi|perf_hooks|trace_events|diagnostics_channel|os|readline|tty)$/`;
@@ -171,6 +184,12 @@ export async function runCodeModeProgram(
     });
 
     let settled = false;
+    let consecutiveRpcFailures = 0;
+    const failBreaker = maxConsecutiveRpcFailures();
+    // A dispatch that resolves AFTER finish() killed the child would write to a
+    // closed stdin — EPIPE arrives asynchronously on the stream and, unhandled,
+    // becomes an uncaughtException. Swallow it: the child is gone by design.
+    child.stdin.on('error', () => { /* child killed mid-write — expected */ });
     const finish = (r: CodeModeResult): void => {
       if (settled) return;
       settled = true;
@@ -204,8 +223,24 @@ export async function runCodeModeProgram(
           const id = msg.id; const method = msg.method; const args = msg.args;
           void Promise.resolve()
             .then(() => dispatch(method, args))
-            .then((res) => { try { child.stdin.write(JSON.stringify({ id, result: res ?? null }) + '\n'); } catch { /* child gone */ } })
-            .catch((e: unknown) => { try { child.stdin.write(JSON.stringify({ id, error: e instanceof Error ? e.message : String(e) }) + '\n'); } catch { /* child gone */ } });
+            .then((res) => {
+              consecutiveRpcFailures = 0;
+              try { child.stdin.write(JSON.stringify({ id, result: res ?? null }) + '\n'); } catch { /* child gone */ }
+            })
+            .catch((e: unknown) => {
+              const errMsg = e instanceof Error ? e.message : String(e);
+              consecutiveRpcFailures += 1;
+              if (consecutiveRpcFailures >= failBreaker) {
+                try { child.stdin.write(JSON.stringify({ id, error: errMsg }) + '\n'); } catch { /* ignore */ }
+                finish({
+                  ok: false,
+                  error: `code-mode program aborted: ${consecutiveRpcFailures} consecutive tool calls failed (last: ${method} → ${errMsg.slice(0, 300)}). The program is likely iterating bad input (e.g. a string where an array was intended) — fix the program and re-run.`,
+                  rpcCalls, logs,
+                });
+                return;
+              }
+              try { child.stdin.write(JSON.stringify({ id, error: errMsg }) + '\n'); } catch { /* child gone */ }
+            });
         } else if (msg.__cm === 'return') {
           const json = JSON.stringify(msg.value ?? null);
           const value = json.length > maxReturn ? JSON.parse(JSON.stringify(`${json.slice(0, maxReturn)}…[truncated ${json.length - maxReturn} chars]`)) : msg.value ?? null;

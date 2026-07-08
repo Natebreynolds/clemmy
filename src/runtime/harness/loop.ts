@@ -1270,6 +1270,37 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
   }
 }
 
+// The draft-present retry directive below EXPLICITLY forbids tool calls and
+// demands a user-facing text reply. A turn that receives such a directive and
+// answers with substantive zero-tool text has FULFILLED the contract — running
+// the zero-tool stall detectors against it makes the harness fight its own
+// instruction (observed sess-mrchgvkc 2026-07-08: the model presented the
+// requested email draft three times; STALL_ANNOUNCEMENT_PATTERN matched
+// "checking"/"I'll" INSIDE the quoted email body and the stall banner ate the
+// answer every time). Detection keys on the directive text itself so every
+// injection site — and any future one that speaks the same contract — inherits
+// the exemption without a parallel flag to keep in sync.
+const PLAIN_TEXT_CONTRACT_DIRECTIVE_PATTERN =
+  /\bdo not call (?:another|a) tool\b[\s\S]*\breply to the user now\b/i;
+
+export function isPlainTextContractDirective(input: unknown): boolean {
+  return typeof input === 'string' && PLAIN_TEXT_CONTRACT_DIRECTIVE_PATTERN.test(input);
+}
+
+/** Most recent stall-retry attempt that recorded the model's flagged output.
+ *  Used by the consistent-reply salvage: if the post-retry output matches this,
+ *  the model is repeating its answer, not stalling. */
+function latestStallRetryRawOutput(sessionId: string): string | undefined {
+  try {
+    const recent = listEvents(sessionId, { types: ['stall_retry_attempted'], limit: 5, desc: true });
+    for (const ev of recent) {
+      const raw = (ev.data as { rawOutput?: unknown })?.rawOutput;
+      if (typeof raw === 'string' && raw.trim()) return raw;
+    }
+  } catch { /* degraded eventlog — salvage simply won't fire */ }
+  return undefined;
+}
+
 /**
  * Build the synthetic user message that drives the stall retry.
  *
@@ -1579,6 +1610,11 @@ async function runConversationCore(
   while (stepIndex < maxSteps) {
     stepIndex += 1;
 
+    // True when THIS turn's input is a harness directive that forbids tool
+    // calls and demands a plain-text reply (the draft-present stall retry).
+    // The zero-tool stall detectors must not fire on a turn that complied.
+    const plainTextContractTurn = isPlainTextContractDirective(nextInput);
+
     // Baseline for the canSwitch guard: if this turn records an external_write,
     // we must NOT re-dispatch it to another brain (would double-act).
     const extWritesBefore = falloverCapable
@@ -1834,6 +1870,42 @@ async function runConversationCore(
     }
 
     if (!decision) {
+      // PLAIN-TEXT-CONTRACT FULFILLMENT (2026-07-08). This turn's input was a
+      // harness directive that said "do NOT call a tool — reply to the user
+      // NOW" (the draft-present stall retry). A zero-tool text reply is exactly
+      // what was demanded: deliver it. Without this, the reply falls through to
+      // evaluateProgress, where STALL_ANNOUNCEMENT_PATTERN can match verbs
+      // INSIDE the presented draft ("checking", "I'll") and flag compliance as
+      // a stall — the harness then re-issues the same directive, gets the same
+      // correct reply, and after MAX_STALL_RETRIES replaces the answer with the
+      // "unable to make progress" banner (sess-mrchgvkc: the Lloyd Baker draft
+      // was produced and discarded three times). A short generic ack ("OK.")
+      // is NOT compliance — it still falls through to the stall machinery.
+      if (plainTextContractTurn && (turnResult.toolCalls ?? 0) === 0 && typeof turnResult.finalOutput === 'string') {
+        const contractReply = turnResult.finalOutput.trim();
+        if (contractReply && (contractReply.length > 60 || !STALL_OUTPUT_PATTERN.test(contractReply))) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'conversation_completed',
+            data: {
+              steps: stepIndex,
+              reason: 'plain_text_contract_fulfilled',
+              summary: contractReply,
+              reply: contractReply,
+              delivered: true,
+            },
+          });
+          return {
+            sessionId: options.sessionId,
+            status: 'completed',
+            steps: stepIndex,
+            lastDecision,
+            lastTurn,
+          };
+        }
+      }
       // Malformed/unparseable-decision RECOVERY. Sub-agents are TOOLS here (no
       // SDK handoffs — see orchestrator.ts), so a null decision means the
       // Orchestrator itself produced output that didn't fit the decision schema.
@@ -1978,6 +2050,46 @@ async function runConversationCore(
             lastDecision,
             lastTurn,
           };
+        }
+        // SALVAGE, shape 2 (2026-07-08): A_zero_tools false-positive on a REAL
+        // answer. If the exhausted retry produced substantively the SAME text
+        // the detector flagged on the previous attempt, the model is not
+        // stalling — it is confidently repeating its answer because the prose
+        // IS the deliverable (a draft, a report, a found-nothing explanation).
+        // Deliver it instead of the "unable to make progress" banner. Guards:
+        // substantive length (a repeated one-line announcement stays a stall)
+        // and a whitespace-normalized prefix match against the prior attempt's
+        // recorded rawOutput (so an answer that CHANGED between attempts —
+        // i.e. the retry actually moved something — still asks the user).
+        // Shares the HARNESS_STALL_SALVAGE_REPLY kill-switch with shape 1.
+        if (salvageEnabled && stallInfo.signal === 'A_zero_tools') {
+          const finalText = typeof turnResult.finalOutput === 'string' ? turnResult.finalOutput.trim() : '';
+          const priorRaw = latestStallRetryRawOutput(options.sessionId);
+          const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
+          const priorProbe = priorRaw ? normalize(priorRaw).slice(0, 160) : '';
+          if (finalText.length >= 200 && priorProbe.length >= 80 && normalize(finalText).startsWith(priorProbe)) {
+            safeAppend({
+              sessionId: options.sessionId,
+              turn: turnResult.turn,
+              role: 'system',
+              type: 'conversation_completed',
+              data: {
+                steps: stepIndex,
+                reason: 'stall_consistent_reply_salvaged',
+                summary: finalText,
+                reply: finalText,
+                delivered: true,
+                stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
+              },
+            });
+            return {
+              sessionId: options.sessionId,
+              status: 'completed',
+              steps: stepIndex,
+              lastDecision,
+              lastTurn,
+            };
+          }
         }
         const askUserEnabled =
           (getRuntimeEnv('HARNESS_STALL_ASK_USER', 'on') ?? 'on').toLowerCase() !== 'off';
@@ -2889,20 +3001,48 @@ function deriveDecisionSummary(text: string): string {
  *  no-decision branch), which is the desired safety, not a parse failure. Fail-open
  *  applies to SUBSTANTIVE output; a recognized punt is never surfaced as the reply.
  *  Mirrors evaluateProgress's Signal A / A' text checks so there is one vocabulary. */
+// The announcement-stall heuristic only applies to SHORT text. A genuine punt
+// is 1–3 sentences of future tense ("Executing the Salesforce pull now — I'll
+// fetch 15 contacts"). Longer text that happens to contain a future-tense verb
+// or gerund is almost always a REAL answer quoting content — an email draft's
+// "the piece worth checking", a report's "I'll include the link". Testing the
+// pattern against unbounded text contradicted the FAIL-OPEN contract below and
+// nulled live answers into the D_decision_unparsed retry thrash (sess-mrcg3mtx
+// 2026-07-08: "Here's one example: To: lloyd@…" — the requested draft — was
+// nulled twice, burned 5 minutes of re-runs, and ended in the stall banner
+// instead of the answer).
+const ANNOUNCEMENT_STALL_MAX_CHARS = 300;
+
 function looksLikeZeroWorkStallText(trimmed: string): boolean {
   if (trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) return true;
-  if (STALL_ANNOUNCEMENT_PATTERN.test(trimmed) && !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)) return true;
+  if (
+    trimmed.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
+    STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
+    !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)
+  ) return true;
   // A HALLUCINATED TOOL CALL rendered as text — a tool-shaped heading
-  // ("**run_shell_command**") immediately followed by a fenced block. Live
-  // 2026-07-08: gpt-5.5 ended the Joshua Tree acceptance run by WRITING the
-  // netlify deploy invocation as markdown instead of calling the tool; under
-  // fail-open that prose completed the run with the site never deployed. Text
-  // whose substance is an intended-but-uncalled tool invocation is a punt —
-  // route it to the stall nudge ("call the tool for real"), never to the user
-  // as an answer. Narrow on purpose: tool-name-shaped heading + fence near the
-  // start, short body (a real reply that merely QUOTES a command is longer).
-  if (/^\s*(?:\*\*|`)?[a-z][a-z0-9_]*(?:__[a-z0-9_]+)?(?:\*\*|`)?\s*\n+\s*```/i.test(trimmed)
-    && trimmed.length < 2_000) return true;
+  // ("**run_shell_command**" or "**Tool Call: run_shell_command**") near the
+  // start, followed shortly by a fenced block. Live 2026-07-08: gpt-5.5 ended
+  // the Joshua Tree acceptance run by WRITING the netlify deploy invocation as
+  // markdown instead of calling the tool; under fail-open that prose completed
+  // the run with the site never deployed. A second live shape (sess-mrcg3mtx)
+  // opened with a lead-in sentence ("Let me find the correct file path.")
+  // before the fake transcript, so the heading may appear after a short
+  // preamble and a status line may sit between heading and fence. Text whose
+  // substance is an intended-but-uncalled tool invocation is a punt — route it
+  // to the stall nudge ("call the tool for real"), never to the user as an
+  // answer. Still narrow: heading within the first 200 chars, fence within 120
+  // chars of the heading, short body (a real reply that merely QUOTES a
+  // command is longer).
+  if (trimmed.length < 2_000) {
+    // Heading must be unmistakably tool-shaped: a **/`-wrapped name, an
+    // explicit "Tool Call:" prefix, or a bare snake_case name (≥1 underscore).
+    // A plain word before a fence ("Options:", "bash") never qualifies — real
+    // replies use those.
+    const transcript =
+      /(?:^|\n)\s*(?:(?:\*\*|`)(?:tool call:\s*)?[a-z][a-z0-9_]*(?:\*\*|`)|tool call:\s*[a-z][a-z0-9_]*|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)\s*\n[\s\S]{0,120}?```/i.exec(trimmed);
+    if (transcript && transcript.index <= 200) return true;
+  }
   return false;
 }
 
@@ -5961,8 +6101,12 @@ function evaluateProgress(opts: {
     // I'll …"), which legitimately has zero tools. Same suppression the
     // structured-decision path already applies (evaluateStructuredDecisionStall);
     // without it, converse-until-aligned replies false-fire a stall retry.
+    // Bounded to SHORT text (ANNOUNCEMENT_STALL_MAX_CHARS) for the same reason
+    // as looksLikeZeroWorkStallText: a long reply that contains a future-tense
+    // verb is quoting content (a draft, a report), not announcing a punt.
     if (
       trimmed &&
+      trimmed.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
       STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
       !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)
     ) {

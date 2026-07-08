@@ -209,13 +209,21 @@ test('embedErrorIsRetryable: retries genuine transient (timeout/5xx), NOT persis
 });
 
 test('breaker: a quota error opens the breaker IMMEDIATELY with a long cooldown', () => {
-  _resetEmbeddingHealthForTest();
-  _driveEmbedFailureForTest(new Error('Embeddings API 429: insufficient_quota — exceeded your current quota'));
-  const h = getEmbeddingHealth();
-  assert.equal(h.breakerOpen, true, 'one quota failure must open the breaker');
-  assert.equal(h.lastErrorClass, 'quota');
-  // ~1h cooldown, not the 5-min transient one.
-  assert.ok(h.cooldownUntilMs - Date.now() > 30 * 60_000, 'terminal cooldown should be far longer than transient');
+  // Pin the LEGACY breaker semantics with the local-fallback demotion off —
+  // with it on (the default), a quota open demotes to the local provider and
+  // deliberately clears this cooldown (see embeddings-demotion.test.ts).
+  process.env.CLEMMY_EMBED_LOCAL_FALLBACK = 'off';
+  try {
+    _resetEmbeddingHealthForTest();
+    _driveEmbedFailureForTest(new Error('Embeddings API 429: insufficient_quota — exceeded your current quota'));
+    const h = getEmbeddingHealth();
+    assert.equal(h.breakerOpen, true, 'one quota failure must open the breaker');
+    assert.equal(h.lastErrorClass, 'quota');
+    // ~1h cooldown, not the 5-min transient one.
+    assert.ok(h.cooldownUntilMs - Date.now() > 30 * 60_000, 'terminal cooldown should be far longer than transient');
+  } finally {
+    delete process.env.CLEMMY_EMBED_LOCAL_FALLBACK;
+  }
 });
 
 test('breaker: a single transient error does NOT open the breaker (needs 3)', () => {
@@ -228,13 +236,20 @@ test('breaker: a single transient error does NOT open the breaker (needs 3)', ()
 });
 
 test('breaker: success resets state and records lastSuccessAt', () => {
-  _resetEmbeddingHealthForTest();
-  _driveEmbedFailureForTest(new Error('Embeddings API 401: invalid_api_key'));
-  assert.equal(getEmbeddingHealth().breakerOpen, true);
-  _driveEmbedSuccessForTest();
-  const h = getEmbeddingHealth();
-  assert.equal(h.breakerOpen, false, 'success closes the breaker');
-  assert.equal(h.consecutiveFailures, 0);
-  assert.equal(h.lastErrorClass, null);
-  assert.ok(h.lastSuccessAt, 'lastSuccessAt is recorded');
+  // Legacy semantics — a terminal open would otherwise demote to local and
+  // clear the breaker (embeddings-demotion.test.ts covers that path).
+  process.env.CLEMMY_EMBED_LOCAL_FALLBACK = 'off';
+  try {
+    _resetEmbeddingHealthForTest();
+    _driveEmbedFailureForTest(new Error('Embeddings API 401: invalid_api_key'));
+    assert.equal(getEmbeddingHealth().breakerOpen, true);
+    _driveEmbedSuccessForTest();
+    const h = getEmbeddingHealth();
+    assert.equal(h.breakerOpen, false, 'success closes the breaker');
+    assert.equal(h.consecutiveFailures, 0);
+    assert.equal(h.lastErrorClass, null);
+    assert.ok(h.lastSuccessAt, 'lastSuccessAt is recorded');
+  } finally {
+    delete process.env.CLEMMY_EMBED_LOCAL_FALLBACK;
+  }
 });

@@ -1,7 +1,7 @@
 import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
-import { listBackgroundTasks, staleTaskKind, STALE_TASK_AGE_MS, type BackgroundTaskRecord, type StaleTaskKind } from './background-tasks.js';
+import { listBackgroundTasks, markBackgroundTaskFailed, staleTaskKind, STALE_TASK_AGE_MS, type BackgroundTaskRecord, type StaleTaskKind } from './background-tasks.js';
 import { ApprovalStore } from '../runtime/approval-store.js';
 
 /**
@@ -18,10 +18,14 @@ import { ApprovalStore } from '../runtime/approval-store.js';
  *     record says done, the user never heard.
  *
  * Background tasks had NO watchdog (workflows got `workflow-watchdog.ts`). This
- * is the minimal mirror: it OBSERVES the task store (never mutates task state,
- * so it can't regress execution) and emits ONE deduped notification per stuck
- * task. Delivery-aware, exactly like the workflow watchdog: a task with a
- * delivered terminal notification is never flagged.
+ * is the minimal mirror: it OBSERVES the task store and emits ONE deduped
+ * notification per stuck task. Delivery-aware, exactly like the workflow
+ * watchdog: a task with a delivered terminal notification is never flagged.
+ *
+ * One deliberate exception to observe-only (2026-07-08): a running task silent
+ * past the ESCALATION window is closed as `interrupted` — observing forever
+ * left zombies "running" on the board for days while this warn churned every
+ * tick. See escalateAfterMs().
  */
 
 const logger = pino({ name: 'clementine-next.background-task-watchdog' });
@@ -36,6 +40,20 @@ const RUNNING_GRACE_MS = 5 * 60_000;
 const DEFAULT_TERMINAL_UNDELIVERED_STALL_MS = 3 * 60_000;
 /** Upper bound — don't alert on the historical backlog of pre-watchdog tasks. */
 const DEFAULT_TERMINAL_UNDELIVERED_MAX_MS = 12 * 60 * 60_000;
+
+/** Escalation window (2026-07-08): a running task silent past THIS long is
+ *  closed as interrupted instead of warned forever — two live zombies were
+ *  warned "silent" 185 and 169 consecutive ticks while the board showed them
+ *  "running" for days. Override CLEMMY_BGTASK_ESCALATE_MS; CLEMMY_BGTASK_ESCALATE=off
+ *  restores observe-only. */
+const DEFAULT_ESCALATE_AFTER_MS = 6 * 60 * 60_000;
+function escalationEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BGTASK_ESCALATE', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+function escalateAfterMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BGTASK_ESCALATE_MS', '') || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_ESCALATE_AFTER_MS;
+}
 
 // Terminal states that should have reported back. 'aborted' (user cancelled —
 // they know) and 'interrupted' (daemon-restart transient, auto-resumed) are
@@ -219,8 +237,35 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
   }
 
   const stalled = findStalledBackgroundTasks(tasks, now, reportedBack, {}, resolvedApprovalIds);
+  const escalated: string[] = [];
   for (const task of stalled) {
     const minutes = Math.max(1, Math.round(task.ageMs / 60_000));
+    // ESCALATE, don't observe forever (2026-07-08): a task silent past the
+    // escalation window is dead — close it as interrupted so the board stops
+    // showing it "running" for days and this warn stops churning every tick.
+    // 'interrupted' keeps the boot-time auto-resume path available if the work
+    // is genuinely resumable. Exception intentionally narrow: running_stalled
+    // only — terminal/orphaned reasons have their own resolution paths.
+    if (escalationEnabled() && task.reason === 'running_stalled' && task.ageMs >= escalateAfterMs()) {
+      try {
+        markBackgroundTaskFailed(
+          task.id,
+          `Watchdog: silent for ${minutes} min with no progress — closed as interrupted so the board reflects reality. Re-run it if the work is still needed.`,
+          'interrupted',
+        );
+        escalated.push(task.id);
+        addNotification({
+          id: `bgtask-escalated-${task.id}`,
+          kind: 'execution',
+          title: `Closed a dead background task: ${task.title}`,
+          body: `Task \`${task.id}\` ("${task.title}") was silent for ${minutes} min — it was closed as interrupted. Re-run it if the work is still needed.`,
+          createdAt: new Date(now).toISOString(),
+          read: false,
+          metadata: { backgroundTaskId: task.id, escalated: true, ageMs: task.ageMs },
+        });
+        continue; // closed — no per-tick stalled alert for it anymore
+      } catch { /* store write failed — fall through to the plain alert */ }
+    }
     const alert = alertFor(task, minutes);
     addNotification({
       // Stable id → exactly one alert per stuck task per reason.
@@ -234,7 +279,7 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
     });
   }
   if (stalled.length > 0) {
-    logger.warn({ stalled: stalled.length, ids: stalled.map((s) => s.id) }, 'Background tasks went silent');
+    logger.warn({ stalled: stalled.length, escalated, ids: stalled.map((s) => s.id) }, 'Background tasks went silent');
   }
   // Proactive housekeeping: surface finished/parked tasks idle past the stale
   // threshold so the user is asked to archive them (reuses the snapshot above —

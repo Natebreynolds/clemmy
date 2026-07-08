@@ -74,3 +74,39 @@ test('a program that throws surfaces the error (not a crash)', async () => {
   assert.equal(r.ok, false);
   assert.match(r.error ?? '', /boom/);
 });
+
+// 2026-07-08 (sess-mrco803b): a program iterated a PATH STRING char-by-char —
+// 199 one-character list_files calls, all failing, for 4 minutes until the RPC
+// budget stopped it. The consecutive-failure breaker must abort a broken
+// program at ~10 failed calls and hand the error back to the model.
+test('failure breaker: 10 consecutive tool-call failures abort the program with a fix-your-program error', async () => {
+  let calls = 0;
+  const dispatch: CodeModeDispatch = async () => { calls++; throw new Error('ENOENT: no such directory "U"'); };
+  const r = await runCodeModeProgram(
+    // The observed bug shape: for..of over a string → one call per character.
+    `for (const dir of "/Users/nathan/some/path") { try { await clem.list_files({ directory: dir }); } catch { /* keep looping */ } } return 'done';`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, false, 'the broken program is aborted, not run to completion');
+  assert.match(r.error ?? '', /consecutive tool calls failed/i);
+  assert.ok(calls <= 12, `dispatch stopped near the breaker threshold, got ${calls}`);
+});
+
+test('failure breaker: intervening successes reset the count — a probe-and-miss program is NOT aborted', async () => {
+  let calls = 0;
+  const dispatch: CodeModeDispatch = async () => {
+    calls++;
+    if (calls % 3 === 0) return { ok: true };
+    throw new Error('miss');
+  };
+  const r = await runCodeModeProgram(
+    `let hits = 0;
+     for (let i = 0; i < 24; i++) { try { await clem.probe({ i }); hits++; } catch { /* expected misses */ } }
+     return { hits };`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, true, 'a program with periodic successes runs to completion');
+  assert.equal(calls, 24);
+});

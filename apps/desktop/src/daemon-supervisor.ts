@@ -51,13 +51,27 @@ export type SupervisorEvent =
   | { type: 'exit'; code: number | null; signal: NodeJS.Signals | null }
   | { type: 'restart-scheduled'; delayMs: number; attempt: number }
   | { type: 'restart-counter-reset'; reason: string; priorAttempts: number }
-  | { type: 'restart-skipped'; reason: string };
+  | { type: 'restart-skipped'; reason: string }
+  | { type: 'hung-restart'; misses: number; unresponsiveMs: number };
 
 const READINESS_TIMEOUT_MS = 90_000;
 const READINESS_POLL_MS = 250;
 const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 30_000;
+
+// ── Liveness watchdog (2026-07-08) ──────────────────────────────────────────
+// A synchronous fs call inside the daemon's event loop hung on a saturated
+// disk (OneDrive sync → open$NOCANCEL never returned): the process stayed
+// alive but every HTTP request, chat turn, and even SIGTERM handling froze —
+// indefinitely, until a human noticed. The supervisor only probed at BOOT, so
+// a daemon that hung after 'ready' was invisible. Keep probing /api/status for
+// the whole run; after LIVENESS_MAX_MISSES consecutive timeouts (~1 min of a
+// blocked loop) SIGKILL the child — a frozen loop can't process SIGTERM — and
+// let the existing exit→scheduleRestart path bring it back with backoff.
+const LIVENESS_PROBE_INTERVAL_MS = 20_000;
+const LIVENESS_PROBE_TIMEOUT_MS = 5_000;
+const LIVENESS_MAX_MISSES = 3;
 
 // supervisor.log is append-only and was never rotated — it grew unbounded
 // (30MB+ observed). Roll it at log-open when it exceeds this size, keeping one
@@ -166,6 +180,9 @@ export class DaemonSupervisor {
   private readyPromise: Promise<{ port: number; url: string }> | null = null;
   private readyResolve: ((info: { port: number; url: string }) => void) | null = null;
   private readyReject: ((err: Error) => void) | null = null;
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  private livenessMisses = 0;
+  private livenessProbeInFlight = false;
 
   constructor(private opts: SupervisorOptions) {
     if (!existsSync(opts.daemonProjectRoot)) {
@@ -333,18 +350,19 @@ export class DaemonSupervisor {
     this.logStream = createWriteStream(this.opts.logFile, { flags: 'a' });
     this.logStream.write(`\n=== Daemon started ${new Date().toISOString()} on port ${this.chosenPort} ===\n`);
 
+    // emit() is the SINGLE writer of log events to supervisor.log — writing
+    // here too (the pre-v0.5.21 direct write) duplicated every daemon line
+    // once emit() started mirroring log events into the file, silently
+    // doubling supervisor.log's growth (~11MB/day observed).
     this.child.stdout.on('data', (buf: Buffer) => {
-      const line = buf.toString();
-      this.logStream?.write(line);
-      this.emit({ type: 'log', stream: 'stdout', line });
+      this.emit({ type: 'log', stream: 'stdout', line: buf.toString() });
     });
     this.child.stderr.on('data', (buf: Buffer) => {
-      const line = buf.toString();
-      this.logStream?.write(line);
-      this.emit({ type: 'log', stream: 'stderr', line });
+      this.emit({ type: 'log', stream: 'stderr', line: buf.toString() });
     });
 
     this.child.on('exit', (code, signal) => {
+      this.stopLivenessWatchdog();
       this.emit({ type: 'exit', code, signal });
       this.logStream?.write(`=== Daemon exited (code=${code}, signal=${signal}) at ${new Date().toISOString()} ===\n`);
       this.logStream?.end();
@@ -364,6 +382,7 @@ export class DaemonSupervisor {
         this.lastReadyAt = Date.now();
         this.readyResolve?.(info);
         this.emit({ type: 'ready', port: info.port, url: info.url });
+        this.startLivenessWatchdog();
       },
       (err) => this.readyReject?.(err),
     );
@@ -371,9 +390,51 @@ export class DaemonSupervisor {
     return this.readyPromise;
   }
 
+  /** Ongoing hang detection — see the LIVENESS_* constants for the rationale.
+   *  Runs from 'ready' until exit/stop; a probe is a GET of the same minimal
+   *  /api/status route the boot readiness check uses. */
+  private startLivenessWatchdog(): void {
+    this.stopLivenessWatchdog();
+    this.livenessMisses = 0;
+    const url = `http://${WEBHOOK_HOST}:${this.chosenPort}/api/status`;
+    this.livenessTimer = setInterval(() => {
+      if (this.shuttingDown || !this.child) { this.stopLivenessWatchdog(); return; }
+      if (this.livenessProbeInFlight) return; // never stack probes
+      this.livenessProbeInFlight = true;
+      void fetch(url, { signal: AbortSignal.timeout(LIVENESS_PROBE_TIMEOUT_MS) })
+        .then((r) => {
+          this.livenessMisses = r.status === 200 ? 0 : this.livenessMisses + 1;
+        })
+        .catch(() => {
+          this.livenessMisses += 1;
+        })
+        .finally(() => {
+          this.livenessProbeInFlight = false;
+          if (this.livenessMisses < LIVENESS_MAX_MISSES || this.shuttingDown || !this.child) return;
+          const unresponsiveMs = this.livenessMisses * LIVENESS_PROBE_INTERVAL_MS;
+          this.emit({ type: 'hung-restart', misses: this.livenessMisses, unresponsiveMs });
+          this.logStream?.write(`=== Daemon HUNG (event loop unresponsive ~${Math.round(unresponsiveMs / 1000)}s) — force-restarting at ${new Date().toISOString()} ===\n`);
+          this.stopLivenessWatchdog();
+          // A frozen event loop cannot run its SIGTERM handler — go straight
+          // to SIGKILL; the child 'exit' handler schedules the restart with
+          // the normal backoff/caps.
+          try { this.child.kill('SIGKILL'); } catch { /* already gone */ }
+        });
+    }, LIVENESS_PROBE_INTERVAL_MS);
+    // Never keep the Electron main process alive just to poll the daemon.
+    this.livenessTimer.unref?.();
+  }
+
+  private stopLivenessWatchdog(): void {
+    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    this.livenessTimer = null;
+    this.livenessMisses = 0;
+  }
+
   /** Stop the daemon. Sends SIGTERM, escalates to SIGKILL after 5s. */
   async stop(): Promise<void> {
     this.shuttingDown = true;
+    this.stopLivenessWatchdog();
     const child = this.child;
     if (!child) return;
     return new Promise<void>((resolve) => {

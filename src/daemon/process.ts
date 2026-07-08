@@ -80,7 +80,54 @@ export function getDaemonStatus(): { running: boolean; pid: number | null; logFi
   return { running, pid: running ? pid : null, logFile: DAEMON_LOG_FILE };
 }
 
+// ── Last-resort crash guards (2026-07-08) ───────────────────────────────────
+// The daemon died with exit 1 when a ws WebSocket (Slack socket-mode reconnect)
+// emitted 'error' with no listener — "Opening handshake has timed out" became
+// an uncaughtException and took EVERY channel down mid-conversation. A transport
+// error on one reconnecting socket is never worth the whole daemon: the
+// socket-mode client has its own reconnect loop and every other subsystem is
+// healthy. Swallow exactly that class (log + let the socket self-heal); any
+// OTHER uncaught error still exits (state may be corrupt) — but now with a
+// structured log line first, and the supervisor restarts us cleanly.
+let crashGuardsRegistered = false;
+
+/** A transport error escaping the `ws` library's own event handling. These
+ *  sockets (Slack socket-mode, Discord gateway) all have reconnect machinery —
+ *  the escaped 'error' event is a plumbing leak, not a daemon-fatal state. */
+export function isSurvivableSocketError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  const stack = err instanceof Error ? (err.stack ?? '') : '';
+  return /opening handshake has timed out|websocket was closed before the connection was established/i.test(msg)
+    || /node_modules[\\/]+ws[\\/]+lib[\\/]+websocket\.js/.test(stack);
+}
+
+export function registerCrashGuards(): void {
+  if (crashGuardsRegistered) return;
+  crashGuardsRegistered = true;
+  process.on('uncaughtException', (err) => {
+    if (isSurvivableSocketError(err)) {
+      console.error('[daemon] survivable socket error (uncaughtException) — the connection will self-heal:', err instanceof Error ? err.message : err);
+      return;
+    }
+    console.error('[daemon] FATAL uncaughtException — exiting:', err);
+    try { clearDaemonPid(); } catch { /* best effort */ }
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    if (isSurvivableSocketError(reason)) {
+      console.error('[daemon] survivable socket error (unhandledRejection) — the connection will self-heal:', reason instanceof Error ? reason.message : reason);
+      return;
+    }
+    // Node's default is to crash on an unhandled rejection; keep that contract
+    // (the supervisor restarts us) but log a structured line first.
+    console.error('[daemon] FATAL unhandledRejection — exiting:', reason);
+    try { clearDaemonPid(); } catch { /* best effort */ }
+    process.exit(1);
+  });
+}
+
 export function registerShutdownHandlers(onShutdown: () => Promise<void>): void {
+  registerCrashGuards();
   let shuttingDown = false;
   const shutdown = (signal: string) => {
     if (shuttingDown) return;

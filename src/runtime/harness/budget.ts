@@ -195,9 +195,17 @@ export function modelContextLimit(modelId: string): number {
   // Try a prefix match for model variants we haven't enumerated
   // (e.g. "gpt-5.4-mini-2026-05" → "gpt-5.4-mini"). Pick the longest
   // matching known prefix to avoid e.g. "gpt-5.4" eating "gpt-5.4-mini".
+  // Case-insensitive, and an org-prefixed BYO id ("zai-org/GLM-5.2",
+  // "deepseek-ai/DeepSeek-V4") also matches on its bare model name — that
+  // exact shape fell to the conservative default in live logs and silently
+  // cut GLM's usable window from 1M to 128K.
+  const candidates = [normalizedId.toLowerCase()];
+  const slash = normalizedId.lastIndexOf('/');
+  if (slash >= 0) candidates.push(normalizedId.slice(slash + 1).toLowerCase());
   let bestKey: string | null = null;
   for (const key of MODEL_CONTEXT_LIMITS.keys()) {
-    if (normalizedId.startsWith(key) && (!bestKey || key.length > bestKey.length)) {
+    const lowerKey = key.toLowerCase();
+    if (candidates.some((c) => c.startsWith(lowerKey)) && (!bestKey || key.length > bestKey.length)) {
       bestKey = key;
     }
   }

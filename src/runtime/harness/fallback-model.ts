@@ -29,6 +29,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
+import { addNotification } from '../notifications.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.fallback-model' });
@@ -122,6 +123,80 @@ function authFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_AUTH_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+// ── Sticky dead-brain registry (2026-07-08) ────────────────────────────────
+// An auth-expired brain does NOT heal by itself — yet the chain re-tried the
+// dead brain on EVERY request, burning a full auth round-trip (or a 75s
+// first-byte wait) per turn before falling over. Live logs showed 25 such
+// fallovers over two days while both OAuth grants were dead: the user felt it
+// as "every turn is slow". Marking is per-LABEL with a cooldown, not forever:
+// re-auth can happen any time, so after the cooldown the brain gets one probe
+// again; the explicit re-auth/switch flows call reviveDeadBrains() so recovery
+// is instant. Only AUTH failures stick — overload/timeout/5xx stay per-request
+// (they genuinely heal in seconds). The user-facing surface is ONE operational
+// event + ONE error log per dead-marking, not a warning per turn.
+interface DeadBrainEntry { reason: string; since: number; until: number }
+const deadBrains = new Map<string, DeadBrainEntry>();
+
+function authDeadCooldownMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_AUTH_DEAD_BRAIN_COOLDOWN_MS', '900000') ?? '900000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 900_000; // default 15 min
+}
+
+export function markBrainAuthDead(label: string, reason: string, correlation?: { sessionId?: string; workflowRunId?: string }): void {
+  const now = Date.now();
+  const existing = deadBrains.get(label);
+  deadBrains.set(label, { reason, since: existing?.since ?? now, until: now + authDeadCooldownMs() });
+  if (existing) return; // already surfaced — just extend the cooldown
+  logger.error(
+    { brain: label, reason, cooldownMs: authDeadCooldownMs() },
+    'brain auth is dead — skipping this brain until re-auth (reconnect it from Settings → Models)',
+  );
+  recordOperationalEvent({
+    source: 'model',
+    type: 'brain_auth_dead',
+    severity: 'error',
+    actor: 'fallback-model',
+    sessionId: correlation?.sessionId,
+    workflowRunId: correlation?.workflowRunId,
+    payload: { brain: label, reason },
+  });
+  // ONE user-facing reconnect card per dead brain (stable id = at-most-once;
+  // addNotification dedupes on id). Chat keeps working on the fallover brain —
+  // this card is how the user learns WHY things route differently and what to
+  // press, instead of 25 silent per-turn log warnings.
+  try {
+    addNotification({
+      id: `brain-auth-dead-${label}`,
+      kind: 'system',
+      title: `Reconnect ${label} — its login expired`,
+      body: `The ${label} brain failed with "${reason}" and is paused until you reconnect it (Settings → Models). Conversations continue on the fallback brain meanwhile.`,
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { brain: label, reason, source: 'fallback-model' },
+    });
+  } catch { /* notification is best-effort */ }
+}
+
+export function isBrainAuthDead(label: string): boolean {
+  const entry = deadBrains.get(label);
+  if (!entry) return false;
+  if (Date.now() >= entry.until) { deadBrains.delete(label); return false; }
+  return true;
+}
+
+/** Called by the re-auth / brain-switch flows: a fresh grant (or an explicit
+ *  user choice) must get an immediate probe, not wait out the cooldown. */
+export function reviveDeadBrains(label?: string): void {
+  if (label === undefined) deadBrains.clear();
+  else deadBrains.delete(label);
+}
+
+/** True when this error is the auth class that should stick. */
+function isAuthDeadReason(err: unknown): boolean {
+  const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
+  return kind === 'model.auth_expired' || isAuthRecoverableError(err);
+}
+
 export function isFalloverError(err: unknown): boolean {
   const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
   if (kind === 'model.overloaded' || kind === 'model.http_5xx' || kind === 'model.transport_timeout') return true;
@@ -145,24 +220,43 @@ export class FallbackModel implements Model {
     return false;
   }
 
+  /** The chain minus brains whose auth is marked dead. Never empty: if EVERY
+   *  brain is marked dead, probe the full chain anyway — a token may have been
+   *  refreshed out-of-band, and a failed probe is better than no brain at all. */
+  private liveChain(): FallbackTarget[] {
+    const alive = this.chain.filter((t) => !isBrainAuthDead(t.label));
+    return alive.length > 0 ? alive : this.chain;
+  }
+
+  /** Sticky-mark a brain whose failure was an auth failure (dead until re-auth
+   *  or cooldown). Called on EVERY auth-class error — including the last brain's
+   *  — so the very next request routes around it. */
+  private markIfAuthDead(chain: FallbackTarget[], i: number, err: unknown): void {
+    if (!isAuthDeadReason(err)) return;
+    const reason = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
+    markBrainAuthDead(chain[i].label, reason, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
+  }
+
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     const forced = forcedOverloadDepth();
-    for (let i = 0; i < this.chain.length; i++) {
-      const isLast = i >= this.chain.length - 1;
+    const chain = this.liveChain();
+    for (let i = 0; i < chain.length; i++) {
+      const isLast = i >= chain.length - 1;
       if (i < forced && !isLast) {
-        logger.warn({ forced: true, from: this.chain[i].label, to: this.chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
+        logger.warn({ forced: true, from: chain[i].label, to: chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
         continue;
       }
       const { request: req, cleanup } = this.linkAbort(request);
       try {
-        const call = this.chain[i].getModel().getResponse(req);
+        const call = chain[i].getModel().getResponse(req);
         const result = await this.withFirstByteTimeout(call, isLast, () => cleanup(true));
         cleanup(false);
         return result;
       } catch (err) {
         cleanup(true); // release a hung request
+        this.markIfAuthDead(chain, i, err);
         if (this.isFalloverReason(err) && !isLast) {
-          this.logFallover(i, err);
+          this.logFallover(chain, i, err);
           continue;
         }
         throw err;
@@ -173,16 +267,17 @@ export class FallbackModel implements Model {
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     const forced = forcedOverloadDepth();
-    for (let i = 0; i < this.chain.length; i++) {
-      const isLast = i >= this.chain.length - 1;
+    const chain = this.liveChain();
+    for (let i = 0; i < chain.length; i++) {
+      const isLast = i >= chain.length - 1;
       if (i < forced && !isLast) {
-        logger.warn({ forced: true, from: this.chain[i].label, to: this.chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
+        logger.warn({ forced: true, from: chain[i].label, to: chain[i + 1].label }, 'FORCED overload (test knob) — falling back to the next brain');
         continue;
       }
       const { request: req, cleanup } = this.linkAbort(request);
       let yieldedAny = false;
       try {
-        const it = this.chain[i].getModel().getStreamedResponse(req)[Symbol.asyncIterator]();
+        const it = chain[i].getModel().getStreamedResponse(req)[Symbol.asyncIterator]();
         // First event raced against the first-byte fallover budget (non-last brains).
         const firstNext = it.next();
         firstNext.catch(() => {}); // a lost race must not throw unhandled
@@ -196,10 +291,11 @@ export class FallbackModel implements Model {
         return; // streamed to completion
       } catch (err) {
         cleanup(true); // release a hung brain
+        this.markIfAuthDead(chain, i, err);
         // Switch only if NOTHING reached the Runner yet (else we'd duplicate a
         // partially-streamed reply) and a next brain exists.
         if (!yieldedAny && this.isFalloverReason(err) && !isLast) {
-          this.logFallover(i, err);
+          this.logFallover(chain, i, err);
           continue;
         }
         throw err;
@@ -211,12 +307,12 @@ export class FallbackModel implements Model {
     return err instanceof FirstByteTimeoutError || this.shouldFallover(err);
   }
 
-  private logFallover(i: number, err: unknown): void {
+  private logFallover(chain: FallbackTarget[], i: number, err: unknown): void {
     const reason = err instanceof FirstByteTimeoutError ? 'first-byte-timeout' : (err instanceof BoundaryError ? err.kind : classifyModelError(err).kind);
     logger.warn(
       {
-        from: this.chain[i].label,
-        to: this.chain[i + 1].label,
+        from: chain[i].label,
+        to: chain[i + 1].label,
         reason,
       },
       'brain unavailable — falling over to the next brain',
@@ -229,8 +325,8 @@ export class FallbackModel implements Model {
       sessionId: this.opts.sessionId,
       workflowRunId: this.opts.workflowRunId,
       payload: {
-        from: this.chain[i].label,
-        to: this.chain[i + 1].label,
+        from: chain[i].label,
+        to: chain[i + 1].label,
         reason,
         stage: 'router',
       },

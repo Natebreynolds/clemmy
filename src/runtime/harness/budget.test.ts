@@ -284,3 +284,14 @@ test('checkBudget: result.reason is human-readable and includes percentage', () 
   // 100000 / 200000 = 50%
   assert.match(result.reason, /50%/);
 });
+
+// 2026-07-08: the live BYO id "zai-org/GLM-5.2" (org-prefixed, mixed case) fell
+// to the conservative 128K default — silently cutting GLM's usable window from
+// 1M. Org-prefixed and case-variant ids must resolve to their table entry.
+test('modelContextLimit: org-prefixed + mixed-case BYO ids resolve (zai-org/GLM-5.2 → 1M)', () => {
+  assert.equal(modelContextLimit('zai-org/GLM-5.2'), 1_000_000);
+  assert.equal(modelContextLimit('GLM-5.2'), 1_000_000);
+  assert.equal(modelContextLimit('deepseek-ai/DeepSeek-V4'), 128_000, 'deepseek prefix still matches through the org form');
+  // A genuinely unknown id still falls back conservatively.
+  assert.equal(modelContextLimit('totally-unknown-model'), 128_000);
+});

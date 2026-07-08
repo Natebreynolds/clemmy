@@ -153,7 +153,57 @@ function recordFailure(err: unknown): void {
     } else {
       logger.warn({ cls, failures: consecutiveFailures, cooldownMs: ms }, line);
     }
+    maybeDemoteToLocal(cls);
   }
+}
+
+// ── Local-fallback demotion (2026-07-08) ────────────────────────────────────
+// When the OpenAI embedder trips its breaker, recall used to degrade to
+// FTS-only for the whole cooldown (99 embedQuery failures over two live days —
+// the #1 recall pain). The daemon ships a zero-key local model, and the
+// backfill already re-embeds any row whose stored model/dim differs from the
+// active provider — so instead of degrading, DEMOTE to the local provider for
+// the rest of the process lifetime (one flip max — no OpenAI↔local churn; a
+// daemon restart gives OpenAI a fresh chance). The ~1k-chunk corpus re-embeds
+// locally within a few backfill ticks; hybrid recall's FTS half covers the
+// transition. Kill-switch CLEMMY_EMBED_LOCAL_FALLBACK=off restores FTS-only
+// degradation. A quota/auth breaker demotes on the FIRST open (it will not
+// heal by itself); a transient breaker demotes on the SECOND open in one
+// process (one bad network patch shouldn't flip providers).
+let demotedToLocal = false;
+let transientBreakerOpens = 0;
+
+function localFallbackEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_EMBED_LOCAL_FALLBACK', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+function maybeDemoteToLocal(cls: EmbedErrorClass): void {
+  if (demotedToLocal || !localFallbackEnabled()) return;
+  if (providerOverride() === 'openai') return; // an explicit force is honored
+  if (!localEmbeddingsAllowed()) return;
+  const terminal = cls === 'quota' || cls === 'auth';
+  if (!terminal) {
+    transientBreakerOpens++;
+    if (transientBreakerOpens < 2) return;
+  }
+  demotedToLocal = true;
+  // Recall/backfill consult the provider per call, so this takes effect on the
+  // very next embed. Warm the local model now so the first demoted query
+  // doesn't pay the load. Clear the breaker: it guarded the OPENAI provider,
+  // and holding it open would needlessly keep the LOCAL provider on FTS-only.
+  consecutiveFailures = 0;
+  cooldownUntilMs = 0;
+  void loadLocalProvider();
+  logger.error(
+    { cls, model: LOCAL_EMBEDDING_MODEL },
+    'OpenAI embedder demoted — semantic memory continues on the LOCAL embedding model for this daemon run (restart re-probes OpenAI). Fix billing/network to restore the OpenAI embedder.',
+  );
+}
+
+/** Test-only: reset the demotion state between cases. */
+export function _resetEmbedDemotionForTest(): void {
+  demotedToLocal = false;
+  transientBreakerOpens = 0;
 }
 
 export interface EmbeddingHealth {
@@ -292,6 +342,9 @@ export async function getEmbeddingProvider(): Promise<EmbeddingProvider | null> 
   if (embeddingsDisabledByEnv()) return null;
   const override = providerOverride();
   if (override === 'off') return null;
+  // A demoted OpenAI embedder routes to local for this process lifetime
+  // (breaker opened on quota/auth, or twice on transient — see recordFailure).
+  if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return loadLocalProvider();
   if (override !== 'local' && getOpenAiApiKey()) return OPENAI_PROVIDER;
   if (override === 'openai') return null; // forced openai but no key
   if (!localEmbeddingsAllowed()) return null;
@@ -306,6 +359,10 @@ function activeProviderSync(): EmbeddingProvider | null {
   if (embeddingsDisabledByEnv()) return null;
   const override = providerOverride();
   if (override === 'off') return null;
+  // Demoted → local only. Deliberately NOT falling back to OPENAI_PROVIDER
+  // while the local model is still loading: OpenAI is known-bad here, and a
+  // brief lexical-only window beats re-poisoning recall with timeouts.
+  if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return localProvider ?? null;
   if (override !== 'local' && getOpenAiApiKey()) return OPENAI_PROVIDER;
   if (override === 'openai') return null;
   if (!localEmbeddingsAllowed()) return null;

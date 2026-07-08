@@ -183,3 +183,92 @@ test('isFalloverError: a brain AUTH failure is recoverable → fall over to a va
     delete process.env.CLEMMY_AUTH_FALLOVER;
   }
 });
+
+// ─── Sticky dead-brain registry (2026-07-08) ────────────────────────────────
+// Live logs showed 25 auth_expired fallovers over two days: the chain re-tried
+// a dead-token brain on EVERY request before falling over. An auth failure
+// must stick — the next request skips the dead brain entirely.
+test('sticky auth-dead: after an auth failure, the NEXT request skips the dead brain entirely', async () => {
+  const { reviveDeadBrains, isBrainAuthDead } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let deadCalls = 0, liveCalls = 0;
+    const dead = model({ getResponse: async () => { deadCalls++; throw new Error('HTTP 401 Unauthorized'); } });
+    const live = model({ getResponse: async () => { liveCalls++; return resp('from live'); } });
+    const fb = withModelFallback([target('gpt-5.5-dead', dead), target('claude-live', live)]);
+    await fb.getResponse(req()); // first request: probes dead → falls over → marks dead
+    assert.equal(deadCalls, 1);
+    assert.equal(liveCalls, 1);
+    assert.equal(isBrainAuthDead('gpt-5.5-dead'), true, 'the auth failure stuck');
+    await fb.getResponse(req()); // second request: dead brain is SKIPPED
+    assert.equal(deadCalls, 1, 'the dead brain was not probed again');
+    assert.equal(liveCalls, 2);
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('sticky auth-dead: a transport timeout does NOT stick (transient failures stay per-request)', async () => {
+  const { reviveDeadBrains, isBrainAuthDead } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let flakyCalls = 0;
+    const flaky = model({ getResponse: async () => { flakyCalls++; throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'hung' }); } });
+    const live = model({ getResponse: async () => resp('rescued') });
+    const fb = withModelFallback([target('flaky', flaky), target('live', live)]);
+    await fb.getResponse(req());
+    assert.equal(isBrainAuthDead('flaky'), false, 'a timeout never sticks');
+    await fb.getResponse(req());
+    assert.equal(flakyCalls, 2, 'the flaky brain is probed again next request');
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('sticky auth-dead: when EVERY brain is marked dead, the full chain is probed anyway (never zero brains)', async () => {
+  const { reviveDeadBrains, markBrainAuthDead } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    markBrainAuthDead('a', 'model.auth_expired');
+    markBrainAuthDead('b', 'model.auth_expired');
+    let aCalls = 0;
+    const a = model({ getResponse: async () => { aCalls++; return resp('a recovered'); } });
+    const b = model({ getResponse: async () => resp('b') });
+    const res = await withModelFallback([target('a', a), target('b', b)]).getResponse(req());
+    assert.equal(aCalls, 1, 'an all-dead chain still probes (out-of-band re-auth recovers)');
+    assert.ok(JSON.stringify(res).includes('a recovered'));
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('sticky auth-dead: reviveDeadBrains() clears the mark (re-auth flow → immediate probe)', async () => {
+  const { reviveDeadBrains, markBrainAuthDead, isBrainAuthDead } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  markBrainAuthDead('gpt-5.5', 'model.auth_expired');
+  assert.equal(isBrainAuthDead('gpt-5.5'), true);
+  reviveDeadBrains('gpt-5.5');
+  assert.equal(isBrainAuthDead('gpt-5.5'), false);
+  markBrainAuthDead('x', 'model.auth_expired');
+  markBrainAuthDead('y', 'model.auth_expired');
+  reviveDeadBrains();
+  assert.equal(isBrainAuthDead('x'), false);
+  assert.equal(isBrainAuthDead('y'), false);
+});
+
+test('sticky auth-dead: the LAST brain failing with auth is marked too (next request routes around it)', async () => {
+  const { reviveDeadBrains, isBrainAuthDead } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    const ok = model({ getResponse: async () => resp('primary ok') });
+    const dead = model({ getResponse: async () => { throw new Error('HTTP 401 Unauthorized'); } });
+    // Force the primary to fail with overload so the LAST brain (auth-dead) is hit and throws.
+    const overloaded = model({ getResponse: async () => { throw overload(); } });
+    const fb = withModelFallback([target('primary', overloaded), target('last-dead', dead)]);
+    await assert.rejects(() => fb.getResponse(req()));
+    assert.equal(isBrainAuthDead('last-dead'), true, 'the last brain auth failure stuck');
+    void ok;
+  } finally {
+    reviveDeadBrains();
+  }
+});

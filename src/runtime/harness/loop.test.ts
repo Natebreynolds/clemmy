@@ -3703,6 +3703,124 @@ test('runConversation: a GENUINE punt (announcement, zero tools, no answer) is N
   assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'decision_json_salvaged'), 'an announcement punt is never salvaged');
 });
 
+// 2026-07-08 (sess-mrchgvkc, Lloyd Baker draft): the draft-present stall retry
+// says "Do NOT call another tool. Reply to the user NOW with the drafted
+// item(s)". The model complied — full draft, zero tools — but the announcement
+// heuristic matched "checking"/"I'll" INSIDE the email body and flagged the
+// compliant reply as a stall, three times, until the "unable to make progress"
+// banner replaced the answer. A zero-tool text reply to a plain-text-contract
+// directive is FULFILLMENT and must be delivered.
+// Deliberately in the 200–300 char window: long enough for the consistency
+// salvage, short enough that the (now length-bounded) announcement heuristic
+// still flags it — so these tests exercise the stall machinery, not the
+// parser fast-path. A LONGER draft now parses straight through (tested below).
+const PRESENTED_DRAFT =
+  'To: lloyd@example.com\nSubject: Quick market visibility question\n\n' +
+  'Lloyd, the piece worth checking now is whether your reputation carries into ' +
+  "AI-driven results. I'll include the full report link so you can see where " +
+  'you show up across Google.\n\nGood to send?';
+
+test('runConversation: a zero-tool text reply to the draft-present directive is DELIVERED (plain-text contract)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // Seed the draft-only-skill block so buildStallRetryMessage picks the
+  // draft-present directive on retry.
+  appendEvent({
+    sessionId: sess.id, turn: 1, role: 'Clem', type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', result: 'Tool call refused by harness: GOAL_FIDELITY_CHECK_FAILED: ... PRESENT the drafted item(s) to the user as your reply now ... then ask "Good to send?"' },
+  });
+  // The model presents the draft (announcement-verb-laden text, zero tools)
+  // every turn — exactly the live failure shape.
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: PRESENTED_DRAFT });
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'send the outreach batch',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  const delivered = completed.find((e) => (e.data as { reason?: string }).reason === 'plain_text_contract_fulfilled');
+  assert.ok(delivered, 'the compliant draft reply is delivered as fulfillment of the plain-text contract');
+  assert.match(String((delivered!.data as { reply?: string }).reply ?? ''), /Good to send\?/);
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
+});
+
+test('runConversation: a substantive answer repeated identically across stall retries is SALVAGED, not replaced by the banner', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // NO draft-only block seeded → the generic retry directive (demands a tool
+  // call) is used, so the plain-text-contract exemption never applies and the
+  // retries genuinely exhaust. The model confidently repeats the same
+  // substantive text — the prose IS the deliverable.
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: PRESENTED_DRAFT });
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'can I see the full draft please',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  const salvaged = completed.find((e) => (e.data as { reason?: string }).reason === 'stall_consistent_reply_salvaged');
+  assert.ok(salvaged, 'the consistent substantive reply is salvaged and delivered');
+  assert.match(String((salvaged!.data as { reply?: string }).reply ?? ''), /Good to send\?/);
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
+});
+
+// 2026-07-08 (sess-mrcg3mtx, "can i see 1 email example"): the announcement
+// heuristic nulled the model's REAL plain-text answer ("Here's one example:
+// To: lloyd@…") because the quoted draft contained "checking"/"I'll" — two
+// full re-runs, 5 minutes, then the banner. The heuristic must only fire on
+// SHORT text; a substantive reply that happens to contain a future-tense verb
+// parses straight through as the completed reply.
+test('toOrchestratorDecision: a LONG reply containing announcement verbs parses as the completed answer (not nulled)', () => {
+  const longDraft =
+    "Here's one example:\n\nTo: lloyd@example.com\nSubject: Lloyd Baker Injury Attorneys and AI search\n\n" +
+    'Lloyd, your firm already has the kind of reputation most firms want. The piece worth checking now is ' +
+    "whether that reputation carries into AI-driven results when clients ask full legal questions. I'll " +
+    'include the full report link so you can see where you show up across Google, local search, and the ' +
+    'new AI answers surface.\n\nGood to send?';
+  assert.ok(longDraft.length > 300, 'fixture must exceed the announcement bound');
+  const d = toOrchestratorDecision(longDraft);
+  assert.ok(d && d.done === true && d.nextAction === 'completed', 'a substantive reply is never a zero-work punt');
+  assert.match(d!.reply ?? '', /lloyd@example\.com/);
+  // A SHORT future-tense punt is still nulled to the stall path.
+  assert.equal(toOrchestratorDecision("I'll run the Outlook search now."), null);
+});
+
+test('toOrchestratorDecision: a hallucinated tool transcript AFTER a lead-in sentence is still a PUNT', () => {
+  const fake =
+    'Let me find the correct file path.\n\n**Tool Call: run_shell_command**\nStatus: Completed\n\nTerminal:\n' +
+    '```\nfind /Users/n/.clementine-next -iname "*market-leader*"\n```';
+  assert.equal(toOrchestratorDecision(fake), null, 'a lead-in sentence must not launder a fake transcript into a reply');
+  // A real reply with an "Options:"-style heading before a fence still completes.
+  const real = 'Options:\n\n```\nnpm run build\n```\nRun the first one and the site rebuilds.';
+  const d = toOrchestratorDecision(real);
+  assert.ok(d && d.done === true, 'a plain heading before a fence is a real reply, not a transcript');
+});
+
+test('runConversation: a SHORT announcement repeated across retries is still a stall — never salvaged', async () => {
+  // This file pins HARNESS_STALL_ASK_USER=off; restore the production default
+  // here so the test asserts the real exhaustion behavior (course-correct ask).
+  const prev = process.env.HARNESS_STALL_ASK_USER;
+  process.env.HARNESS_STALL_ASK_USER = 'on';
+  try {
+    resetEventLog();
+    const sess = HarnessSession.create({ kind: 'chat' });
+    // A genuine punt: one short future-tense line, repeated verbatim. The
+    // consistency salvage must NOT deliver it (length guard) — the user still
+    // gets the course-correct ask.
+    const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: "I'll run the Outlook search now." });
+    const result = await runConversation({
+      agent: makeAgentStub(), sessionId: sess.id, input: 'do the thing',
+      makeRunner: makeRunnerStub, runRunner,
+    });
+    assert.equal(result.status, 'awaiting_user_input');
+    const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+    assert.ok(!completed.some((e) => (e.data as { reason?: string }).reason === 'stall_consistent_reply_salvaged'), 'a repeated short punt is never salvaged');
+    assert.ok(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length >= 1, 'the course-correct ask still fires');
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_STALL_ASK_USER; else process.env.HARNESS_STALL_ASK_USER = prev;
+  }
+});
+
 // 2026-06-15 (scorpion-mailbox Brooke): an EMPTY/unstructured turn (items:1,
 // lastResponseId:null, zero tools) dropped straight to "couldn't be structured.
 // Please ask again." with no retry. It must be re-prompted instead.

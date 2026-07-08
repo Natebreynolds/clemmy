@@ -30,6 +30,7 @@ import { randomUUID } from 'node:crypto';
 import { setDefaultModelProvider } from '@openai/agents';
 import { getStoredCodexOAuthTokens, refreshStoredNativeOAuth, accessTokenExpMs } from '../auth-store.js';
 import { RouterModelProvider } from './router-model.js';
+import { reviveDeadBrains } from './fallback-model.js';
 import { maybeWrapDebate } from './debate-model.js';
 import { loadFreshClaudeAccessToken, claudeVaultFallbackReady } from '../claude-oauth.js';
 import { addNotification } from '../notifications.js';
@@ -276,9 +277,13 @@ function shouldRefresh(accessToken: string | undefined | null, lastRefreshIso: s
   return Date.now() - last > REFRESH_AFTER_MS;
 }
 
-/** Test helper — reset the module-level "configured" flag. */
+/** Reset the module-level "configured" flag so the next run re-registers the
+ *  provider. Called by every auth-change / brain-switch route — which is also
+ *  exactly when the sticky dead-brain registry must be cleared: a fresh grant
+ *  or an explicit user switch deserves an immediate probe, not a cooldown wait. */
 export function resetHarnessRuntimeConfig(): void {
   configured = false;
+  reviveDeadBrains();
 }
 
 /** Test helper — direct access to the staleness check. */
