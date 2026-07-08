@@ -10007,6 +10007,27 @@ export function registerConsoleRoutes(
   });
 
   /**
+   * User-initiated "continue in background" (the composer's SendToBack button —
+   * same mechanics as typing "background it"): detach the RUNNING turn to a
+   * durable background task that reads its own session history, continues where
+   * the foreground left off, and reports back to this chat. Frees the composer
+   * immediately for the next request.
+   */
+  app.post('/api/console/harness-sessions/:sessionId/background', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const detached = detachRunningTurnToBackground(req.params.sessionId);
+      if (!detached) {
+        res.status(409).json({ error: 'nothing running to move to the background' });
+        return;
+      }
+      res.json({ ok: true, taskId: detached.taskId, text: detached.text });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
    * Re-authenticate Codex via the DAEMON's proven native OAuth flow (the same
    * path as `clementine auth login-native`). The desktop RE-AUTHENTICATE button
    * calls this instead of the Electron-side codex-oauth.ts port — one OAuth

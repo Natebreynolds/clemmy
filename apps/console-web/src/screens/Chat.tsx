@@ -170,7 +170,7 @@ export function Chat() {
           </div>
         )}
 
-        <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} />
+        <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
 
         <div className="mt-4 flex flex-wrap justify-center gap-2">
           {SUGGESTIONS.map((s) => (
@@ -204,7 +204,7 @@ export function Chat() {
       </div>
       <div className={cn('border-t border-border bg-canvas/80 backdrop-blur')}>
         <div className="mx-auto w-full max-w-3xl px-8 py-4">
-          <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} />
+          <Composer busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
         </div>
       </div>
     </div>

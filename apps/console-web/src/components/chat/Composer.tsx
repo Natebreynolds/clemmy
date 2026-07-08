@@ -1,5 +1,5 @@
 import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent } from 'react';
-import { Paperclip, ArrowUp, Square, X, Loader2, FileText } from 'lucide-react';
+import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { uploadAttachment } from '@/lib/chat';
 import { cn } from '@/lib/cn';
@@ -20,11 +20,14 @@ export function Composer({
   busy,
   onSend,
   onStop,
+  onBackground,
   placeholder = 'Ask Clementine anything…',
 }: {
   busy: boolean;
   onSend: (input: { text: string; attachmentIds: string[]; attachmentNames: string[] }) => void;
   onStop: () => void;
+  /** Detach the running turn to a durable background task (keeps the chat free). */
+  onBackground?: () => void;
   placeholder?: string;
 }) {
   const [value, setValue] = useState('');
@@ -156,9 +159,22 @@ export function Composer({
         />
 
         {busy ? (
-          <Button variant="secondary" size="icon" onClick={onStop} aria-label="Stop" title="Stop">
-            <Square className="h-4 w-4" aria-hidden />
-          </Button>
+          <>
+            {onBackground && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={onBackground}
+                aria-label="Continue in background"
+                title="Continue in background — keeps working, reports back here, frees the chat"
+              >
+                <SendToBack className="h-4 w-4" aria-hidden />
+              </Button>
+            )}
+            <Button variant="secondary" size="icon" onClick={onStop} aria-label="Stop" title="Stop">
+              <Square className="h-4 w-4" aria-hidden />
+            </Button>
+          </>
         ) : (
           <Button size="icon" onClick={submit} disabled={!canSend} aria-label="Send" title="Send">
             <ArrowUp className="h-5 w-5" aria-hidden />

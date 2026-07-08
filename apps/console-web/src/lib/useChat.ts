@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { postChat, runHarnessStream, cancelSession, humanHarnessText, type StreamHandle } from './chat';
-import type { ApiError } from './api';
+import { apiPost, type ApiError } from './api';
 import type { HarnessEvent, PendingActionApprovalView } from './types';
 
 export type MessageStatus =
@@ -397,6 +397,28 @@ export function useChat(options?: UseChatOptions) {
     setBusy(false);
   }, []);
 
+  /** User-initiated "continue in background" (the ctrl+b model): detach the
+   *  running turn to a durable background task that picks up where the
+   *  foreground left off and reports back to this chat. The foreground bubble
+   *  closes honestly with the handoff message instead of "Stopped." */
+  const background = useCallback(async () => {
+    const sid = sessionIdRef.current;
+    const aid = activeAssistantId.current;
+    if (!sid) return;
+    try {
+      const out = await apiPost<{ ok: boolean; taskId: string; text: string }>(
+        `/api/console/harness-sessions/${encodeURIComponent(sid)}/background`, {});
+      streamRef.current?.stop();
+      streamRef.current = null;
+      if (aid) setMessages((prev) => prev.map((m) => (m.id === aid
+        ? { ...m, status: 'complete', progress: undefined, text: out.text || 'Moved to the background — it will report back here.' }
+        : m)));
+      setBusy(false);
+    } catch {
+      // Nothing detachable (turn already finishing) — leave the run alone.
+    }
+  }, []);
+
   const reset = useCallback(() => {
     streamRef.current?.stop();
     streamRef.current = null;
@@ -406,5 +428,5 @@ export function useChat(options?: UseChatOptions) {
     setBusy(false);
   }, []);
 
-  return { messages, busy, send, stop, reset, sessionId: sessionIdRef };
+  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef };
 }
