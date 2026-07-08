@@ -278,3 +278,19 @@ test('composio items: connected_account_id is ALWAYS present (strict nullable-re
   assert.equal(bad.failed, 1);
   assert.match(bad.outcomes[0].error ?? '', /InvalidToolInputError|An error occurred/);
 });
+
+test('a harness gate REFUSAL banner is a FAILED item — never a fake success (2026-07-08 "10 sent" lie, 8 were refused)', async () => {
+  calls.length = 0;
+  _setCodeModeToolsForTests(new Map([
+    ['composio_execute_tool', fakeTool('composio_execute_tool', () =>
+      'Tool call refused by harness: GOAL_FIDELITY_CHECK_FAILED: this irreversible composio_execute_tool was blocked')],
+  ]) as never);
+  const ledger = await runBatchPlan({
+    tool: 'composio_execute_tool', composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', sideEffect: 'send',
+    objective: 'verify gate refusals are honest failures',
+    items: [{ id: 'a@b.com', args: { to: 'a@b.com' } }],
+  }, 'sess-batch-test');
+  assert.equal(ledger.succeeded, 0);
+  assert.equal(ledger.failed, 1);
+  assert.match(ledger.outcomes[0].error ?? '', /GOAL_FIDELITY|refused/);
+});

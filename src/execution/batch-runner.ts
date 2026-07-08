@@ -308,8 +308,17 @@ function loadRecentSucceededKeys(): Map<string, string> {
   return map;
 }
 
-export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<BatchRunLedger> {
+export async function runBatchPlan(
+  plan: BatchPlan,
+  sessionId: string,
+  // Set ONLY by the run_batch action=execute path (an approved+certified plan).
+  // Carries the approved payloadHash so the write boundary can skip the per-item
+  // LLM judges: certification already judged these exact payloads and approval
+  // byte-pins them. Absent for READ plans and any other caller (full judging).
+  opts: { certified?: { payloadHash: string } } = {},
+): Promise<BatchRunLedger> {
   const batchId = `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const certifiedBatch = opts.certified ? { batchId, payloadHash: opts.certified.payloadHash } : undefined;
   const startedAt = new Date().toISOString();
   const serial = plan.sideEffect !== 'read';
   const concurrency = serial ? 1 : Math.max(1, Math.min(8, plan.concurrency ?? 4));
@@ -356,7 +365,7 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
     while (attempts < 2) {
       attempts += 1;
       try {
-        const out = await dispatchBatchItemTool(plan.tool, args, sessionId, counter);
+        const out = await dispatchBatchItemTool(plan.tool, args, sessionId, counter, certifiedBatch);
         const text = previewOf(out);
         // A "polite failure" comes back as a NORMAL result whose text is an
         // error banner — composio's ⚠️ banners AND the @openai/agents SDK's
@@ -364,7 +373,7 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
         // tool…"), which swallowed InvalidToolInputError for all 5 items of the
         // 2026-07-08 sheet batch while the ledger said 5/5 succeeded. Anchored
         // at the START of the text so results merely MENTIONING errors pass.
-        if (/^⚠️|^An error occurred while running the tool|^\s*(Error|InvalidToolInputError)\b|FAILED \(slug=|NOT CONNECTED/i.test(text)) {
+        if (/^⚠️|^An error occurred while running the tool|^\s*(Error|InvalidToolInputError)\b|^Tool call (?:refused|blocked) by harness|_CHECK_FAILED:|FAILED \(slug=|NOT CONNECTED/i.test(text)) {
           lastError = text.slice(0, 200);
           const rl = detectRateLimit(text);
           if (rl) return { rateLimit: rl };
