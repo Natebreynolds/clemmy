@@ -245,7 +245,7 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
 
 /** A local clem tool: route through wrapToolForHarness (the full bracket gate
  *  battery) under the shared run-context, exactly as before. */
-async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter): Promise<unknown> {
+async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }): Promise<unknown> {
   const real = (await realToolsByName()).get(method);
   if (!real || typeof real.invoke !== 'function') {
     throw new Error(`code-mode: unknown tool "${method}"`);
@@ -253,7 +253,10 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
   const runContext = { context: { sessionId } };
   const details = { toolCall: { callId } };
-  return withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000) }, () =>
+  // `certifiedBatch` is threaded into the run context ONLY on the batch runner's
+  // approved execute path (dispatchBatchItemTool passes it); the ad-hoc code-mode
+  // path leaves it undefined, so ad-hoc writes keep full per-item judging.
+  return withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000), ...(certifiedBatch ? { certifiedBatch } : {}) }, () =>
     wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
   );
 }
@@ -295,13 +298,14 @@ export async function dispatchBatchItemTool(
   args: unknown,
   sessionId: string,
   counter: ToolCallsCounter,
+  certifiedBatch?: { batchId: string; payloadHash: string },
 ): Promise<unknown> {
   const callId = `batch-${randomUUID()}`;
   try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
       ? await dispatchCodeModeMcpTool(method, args)
-      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
+      : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;
     try { return JSON.parse(out); } catch { return out; }

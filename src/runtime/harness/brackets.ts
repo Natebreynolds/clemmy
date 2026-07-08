@@ -712,6 +712,13 @@ export interface HarnessRunContext {
    *  so kill/pause/approval/recall reads still resolve to the real
    *  session. Falls back to sessionId when absent (byte-identical). */
   guardrailScopeId?: string;
+  /** Set ONLY by the batch runner's approved/certified execute path (never on
+   *  ad-hoc dispatches). When present, the batch plan already passed ONE
+   *  plan-level certification judge over these EXACT payloads, and the items are
+   *  byte-pinned by `payloadHash` at approval — so the per-item LLM boundary
+   *  judges (goal-fidelity, output-grounding) are redundant latency, not safety,
+   *  and are skipped. Every DETERMINISTIC gate still runs (see the write boundary). */
+  certifiedBatch?: { batchId: string; payloadHash: string };
 }
 
 /** CLEMMY_WORKER_THRASH_GUARD: per-worker loop-guard isolation + bounded
@@ -805,6 +812,20 @@ function backgroundOfferAlreadyMadeInSession(sessionId: string): boolean {
 // sequential path. Kill-switch CLEMMY_PARALLEL_PREWRITE_GATES (default on).
 export function parallelPreWriteGatesEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_PARALLEL_PREWRITE_GATES', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+// A CERTIFIED batch item (ctx.certifiedBatch set by the batch runner's approved
+// execute path) skips the per-item LLM boundary judges (goal-fidelity +
+// output-grounding). Safety: the batch plan already passed ONE certification
+// judge over these EXACT payloads, and approval byte-pins the items by
+// payloadHash — nothing the model does between certification and execution can
+// alter them, so a second per-item opinion adds ~10-15s×N latency, not safety
+// (live 2026-07-08: a 10-email send ran ~18s/item on repeated goal_fidelity
+// judging). Every DETERMINISTIC gate (taxonomy approval, destination, duplicate-
+// target, confirm-first, external_write ledger, guardrail counters) still runs.
+// Kill-switch CLEMMY_BATCH_SKIP_ITEM_JUDGE=off restores per-item judging.
+export function batchSkipItemJudgeEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BATCH_SKIP_ITEM_JUDGE', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 /** Start a gate's judge promise NOW (concurrently) while suppressing an
@@ -1311,14 +1332,38 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const preGateShape = classifyExternalWrite(tool.name, parsedInput);
     const preGateIrreversible = preGateShape.mutating && preGateShape.irreversible;
     const parallelGates = parallelPreWriteGatesEnabled();
-    const goalFidelityPromise = (parallelGates && preGateIrreversible && isGoalFidelityGateEnabled())
+    // CERTIFIED-BATCH item: skip the per-item LLM judges (goal-fidelity +
+    // output-grounding). Deterministic gates below are untouched. Emit the skip
+    // so the trace shows WHY no judge ran. Ad-hoc dispatches (no certifiedBatch)
+    // are unaffected — they judge as before.
+    const certifiedBatch = ctx?.certifiedBatch;
+    const skipItemJudge = Boolean(certifiedBatch) && batchSkipItemJudgeEnabled();
+    if (skipItemJudge && preGateIrreversible) {
+      try {
+        appendEvent({
+          sessionId: ctx!.sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: {
+            kind: 'batch_certified_judge_skip',
+            action: 'info',
+            toolName: tool.name,
+            judgeSkipped: 'batch_certified',
+            batchId: certifiedBatch!.batchId,
+            payloadHash: certifiedBatch!.payloadHash,
+          },
+        });
+      } catch { /* telemetry write must never block */ }
+    }
+    const goalFidelityPromise = (!skipItemJudge && parallelGates && preGateIrreversible && isGoalFidelityGateEnabled())
       // deferCommit: an eagerly-started judge must NOT persist its failure bump —
       // if an earlier gate short-circuits and this verdict is discarded, the bump
       // would leak and trip a premature "STOP" on retry (integrity audit #2.4).
       // The block branch below commits via verdict.commitFailure?.() only when reached.
       ? startGate(evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput, { deferCommit: true }))
       : null;
-    const preGateBody = (parallelGates && preGateIrreversible && isOutputGroundingGateEnabled())
+    const preGateBody = (!skipItemJudge && parallelGates && preGateIrreversible && isOutputGroundingGateEnabled())
       ? extractMessageBody(parsedInput) : '';
     const outputGroundingPromise = (preGateBody && preGateBody.trim().length > 0)
       ? startGate(evaluateOutputGrounding(ctx.sessionId, preGateBody, { kind: 'write', toolName: tool.name, deferCommit: true }))
@@ -1405,7 +1450,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // skill. Soft-blocks + reroutes BEFORE the write. Same irreversible-only
     // scope as grounding. Fail-open on any evaluation error.
     try {
-      if (isGoalFidelityGateEnabled()) {
+      // `skipItemJudge` short-circuits: a certified-batch item's payload was
+      // already judged at plan certification and byte-pinned at approval.
+      if (!skipItemJudge && isGoalFidelityGateEnabled()) {
         const shape = classifyExternalWrite(tool.name, parsedInput);
         if (shape.mutating && shape.irreversible) {
           // Consume the concurrently-started judge (or run inline when the
@@ -1491,7 +1538,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // recoverable), a no-source figure proceeds with an advisory recorded.
     // Deterministic pre-pass first → frequently no judge call at all. Fail-open.
     try {
-      if (isOutputGroundingGateEnabled()) {
+      // Skipped for a certified-batch item (same rationale as goal-fidelity).
+      if (!skipItemJudge && isOutputGroundingGateEnabled()) {
         const shape = classifyExternalWrite(tool.name, parsedInput);
         if (shape.mutating && shape.irreversible) {
           const body = extractMessageBody(parsedInput);

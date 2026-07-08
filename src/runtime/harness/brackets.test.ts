@@ -1474,3 +1474,72 @@ test('Inc A2: no offer nudge below the floor, with the kill-switch off, or in a 
     delete process.env.CLEMMY_BG_OFFER_NUDGE;
   }
 });
+
+// ─── Certified-batch item: skip the per-item LLM judge tax ─────────────────
+// A run_batch execute (approved + certified) byte-pins its payloads by
+// payloadHash, so re-judging each item at the write boundary is latency, not
+// safety. ctx.certifiedBatch skips goal-fidelity + output-grounding; every
+// deterministic gate still runs; ad-hoc dispatches keep full judging.
+async function runCertifiedSendProbe(opts: { certifiedBatch?: { batchId: string; payloadHash: string }; killSwitchOff?: boolean }) {
+  resetEventLog();
+  const { _setGoalFidelityJudgeForTests, _resetGoalFidelityStateForTests } = await import('./goal-fidelity-gate.js');
+  const saved: Record<string, string | undefined> = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_BATCH_SKIP_ITEM_JUDGE: process.env.CLEMMY_BATCH_SKIP_ITEM_JUDGE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  // Isolate goal-fidelity: the other two per-write judges are off so the counter
+  // reflects ONLY whether the goal-fidelity judge ran.
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  if (opts.killSwitchOff) process.env.CLEMMY_BATCH_SKIP_ITEM_JUDGE = 'off';
+  else delete process.env.CLEMMY_BATCH_SKIP_ITEM_JUDGE;
+  let judgeCalls = 0;
+  _resetGoalFidelityStateForTests();
+  _setGoalFidelityJudgeForTests(async () => { judgeCalls += 1; return { fulfills: true, gap: 'ok' }; });
+  try {
+    const sess = createSession({ kind: 'chat' }).id;
+    // A goal (re-derived from the user's ask) so the goal-fidelity judge WOULD fire.
+    appendEvent({ sessionId: sess, turn: 0, role: 'user', type: 'user_input_received', data: { text: 'Send 10 personalized intro emails to the prospect list I approved.' } });
+    let invoked = 0;
+    const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', invoke: async () => { invoked += 1; return 'OK sent'; } }, {});
+    const args = { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'a@firm.com', subject: 's', body: 'hello there, a personalized note for you' }) };
+    const counter = new ToolCallsCounter(100);
+    await withHarnessRunContext(
+      { sessionId: sess, counter, ...(opts.certifiedBatch ? { certifiedBatch: opts.certifiedBatch } : {}) },
+      () => (wrapped as unknown as { invoke: (rc: unknown, i: unknown, d: unknown) => Promise<unknown> })
+        .invoke({ context: { sessionId: sess } }, JSON.stringify(args), { toolCall: { callId: 'c-probe' } }),
+    );
+    const skipEvents = listEvents(sess, { types: ['guardrail_tripped'] })
+      .filter((e) => (e.data as { kind?: string }).kind === 'batch_certified_judge_skip');
+    return { invoked, judgeCalls, skipEvents };
+  } finally {
+    _setGoalFidelityJudgeForTests(null);
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+test('certified-batch item SKIPS the per-item goal-fidelity judge but still hits the write boundary', async () => {
+  const r = await runCertifiedSendProbe({ certifiedBatch: { batchId: 'batch-cert-1', payloadHash: 'ph-abc' } });
+  assert.equal(r.judgeCalls, 0, 'the per-item goal-fidelity judge was skipped for a certified item');
+  assert.equal(r.skipEvents.length, 1, 'the skip is visible in the trace');
+  assert.equal((r.skipEvents[0].data as { judgeSkipped?: string }).judgeSkipped, 'batch_certified');
+  assert.equal(r.invoked, 1, 'the write still executed through the boundary');
+});
+
+test('ad-hoc write (no certifiedBatch ctx) STILL runs the per-item goal-fidelity judge', async () => {
+  const r = await runCertifiedSendProbe({});
+  assert.equal(r.judgeCalls, 1, 'an uncertified write keeps full per-item judging');
+  assert.equal(r.skipEvents.length, 0, 'no skip event for an ad-hoc write');
+  assert.equal(r.invoked, 1);
+});
+
+test('kill-switch CLEMMY_BATCH_SKIP_ITEM_JUDGE=off restores per-item judging for a certified item', async () => {
+  const r = await runCertifiedSendProbe({ certifiedBatch: { batchId: 'batch-cert-2', payloadHash: 'ph-xyz' }, killSwitchOff: true });
+  assert.equal(r.judgeCalls, 1, 'kill-switch off ⇒ the judge runs even for a certified item');
+  assert.equal(r.skipEvents.length, 0, 'no skip event when disabled');
+});

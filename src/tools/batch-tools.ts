@@ -128,7 +128,10 @@ export function registerBatchTools(server: McpServer): void {
           const plan = record.payload as BatchPlan;
           const errors = validateBatchPlan(plan);
           if (errors.length > 0) return textResult(`Stored plan failed re-validation (${errors.join('; ')}) — do not execute; re-propose.`);
-          const ledger = await runBatchPlan(plan, sessionId);
+          // Certified + approved: the plan passed ONE certification judge over
+          // these exact payloads and approval byte-pins them by payloadHash, so
+          // the per-item LLM boundary judges are skipped at the write boundary.
+          const ledger = await runBatchPlan(plan, sessionId, { certified: { payloadHash: record.payloadHash } });
           try {
             recordPendingActionResult(record.id, ledger.failed === 0 && !ledger.halted ? 'executed' : 'failed',
               `${ledger.succeeded}/${ledger.total} succeeded, ${ledger.failed} failed${ledger.halted ? ', HALTED' : ''} (ledger ${ledger.batchId})`);
