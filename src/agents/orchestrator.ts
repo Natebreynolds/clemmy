@@ -1532,7 +1532,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       searchCatalogCount = catalogText ? catalogText.split('\n').length : 0;
       searchCatalogTokens = Math.round(catalogText.length / 4);
       catalogBlock = [
-        '[tool-catalog] These built-in tools are AVAILABLE this turn but are NOT loaded as first-class tools (to save context). To use one, call `call_tool(name, args_json)` with the exact name below and a JSON args string — or call `tool_search(query)` first if you are unsure of the exact name or arguments. call_tool never prompts on its own: a read runs immediately, a write/send target gates for approval exactly as a direct call would. Your first-class tools (already loaded — call them directly) are not listed here.',
+        // Leads with an unambiguous "you HAVE access" — live 2026-07-08 a model
+        // read the name-only listing as evidence it had NO tool access and
+        // refused the task outright (A_zero_tools stall). The catalog must be
+        // impossible to misread as a capability restriction.
+        '[tool-catalog] You HAVE FULL TOOL ACCESS this turn: your first-class tools (loaded above — call them directly), every built-in below, and your connected external MCP/composio tools. NEVER claim you lack tool access. The tools below are simply not schema-loaded yet (to save context): invoke one with `call_tool(name, args_json)` using its exact name and a JSON args string — or `tool_search(query)` first if unsure of the name or arguments. External MCP tools are callable the same way: `call_tool("<server>__<tool>", args_json)`. call_tool never prompts on its own: a read runs immediately, a write/send target gates for approval exactly as a direct call would.',
         catalogText,
       ].join('\n');
     } catch {

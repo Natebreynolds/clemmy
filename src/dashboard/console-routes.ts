@@ -9970,6 +9970,24 @@ export function registerConsoleRoutes(
         harnessSession?.clearInterruptState();
         harnessSession?.markStatus('cancelled');
       } catch { /* best effort */ }
+      // Cascade: any still-active background task this session spawned (or that
+      // runs AS this session) dies with the cancel. Without this the task row
+      // kept polling "Working now" on Home after the user explicitly cancelled
+      // the chat that owned it (live 2026-07-08 — zombie banner, uncancellable
+      // from the Tasks pane because the SESSION was already gone).
+      let cancelledTasks = 0;
+      try {
+        const { listBackgroundTasks, cancelBackgroundTask } = await import('../execution/background-tasks.js');
+        for (const task of listBackgroundTasks()) {
+          const t = task as { id: string; status: string; sessionId?: string; originSessionId?: string };
+          const linked = t.sessionId === sessionId || t.originSessionId === sessionId;
+          const active = t.status === 'pending' || t.status === 'running' || t.status === 'awaiting_approval';
+          if (linked && active) {
+            cancelBackgroundTask(t.id, 'Cancelled with its chat session from the desktop command center.');
+            cancelledTasks += 1;
+          }
+        }
+      } catch { /* best effort — the stale-runner sweeper still interrupts them later */ }
       appendHarnessEvent({
         sessionId,
         turn: 0,
@@ -9979,9 +9997,10 @@ export function registerConsoleRoutes(
           summary: 'Cancelled from the desktop command center.',
           reason: 'cancelled_by_user',
           approvalsCancelled: pending.length,
+          backgroundTasksCancelled: cancelledTasks,
         },
       });
-      res.json({ ok: true, sessionId, cancelledApprovals: pending.length });
+      res.json({ ok: true, sessionId, cancelledApprovals: pending.length, cancelledTasks });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

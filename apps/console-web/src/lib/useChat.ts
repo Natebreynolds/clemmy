@@ -299,6 +299,13 @@ export function useChat(options?: UseChatOptions) {
           progress: undefined,
         });
       }
+    } else if (ev.type === 'stall_retry_attempted') {
+      // The streamed draft was a DETECTED-BAD reply (e.g. the model claiming it
+      // has no tools while the surface is attached). Never leave it on screen
+      // as if it were an answer — clear it and show the retry honestly
+      // (live 2026-07-08: a flaked "I can't execute this" reply stayed visible
+      // while the retry was already succeeding underneath).
+      patch(assistantId, { text: '', progress: 'First attempt came back malformed — retrying now…' });
     } else if (ev.type === 'run_failed') {
       const errStr = String(d.error ?? '').trim();
       const text = !errStr || looksRawError(errStr) ? GENERIC_TURN_ERROR : `Something went wrong: ${errStr}`;
