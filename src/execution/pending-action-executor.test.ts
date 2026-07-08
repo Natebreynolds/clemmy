@@ -1,0 +1,78 @@
+/**
+ * Run: npx tsx --test src/execution/pending-action-executor.test.ts
+ *
+ * P0c: an APPROVED single-call pending action fires the EXACT stored payload
+ * server-side (the model can't swap it), records the outcome, and gates on
+ * approval / run_batch.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-pae-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+
+const { queuePendingAction, markPendingActionApprovalResolved, getPendingAction } = await import('../runtime/harness/pending-actions.js');
+const { executeApprovedPendingActionCall } = await import('./pending-action-executor.js');
+
+test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
+
+function queueSingleCall() {
+  return queuePendingAction({
+    title: "Judge couldn't verify: c@firm.com",
+    summary: 'goal-fidelity judge outage — queued for one-tap approval',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'c@firm.com', subject: 's', body: 'hello' }) },
+    sessionId: 'sess-pae',
+    createdBy: 'judge_fail_approval',
+  });
+}
+
+test('approved single-call executes the EXACT stored payload via the dispatcher', async () => {
+  const record = queueSingleCall();
+  markPendingActionApprovalResolved(record.id, 'approved');
+
+  const dispatched: Array<{ toolName: string; payload: unknown; certifiedBatch: unknown }> = [];
+  const res = await executeApprovedPendingActionCall(record.id, {
+    sessionId: 'sess-pae',
+    dispatch: async (toolName, payload, _sessionId, certifiedBatch) => {
+      dispatched.push({ toolName, payload, certifiedBatch });
+      return 'OK sent';
+    },
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 'executed');
+  assert.equal(dispatched.length, 1, 'fired exactly once');
+  assert.equal(dispatched[0].toolName, 'composio_execute_tool', 'the exact stored tool');
+  assert.deepEqual(dispatched[0].payload, record.payload, 'the byte-identical stored payload — not reconstructed');
+  // The dispatch carries the payloadHash so the write boundary skips the (failed) judge.
+  assert.equal((dispatched[0].certifiedBatch as { payloadHash?: string }).payloadHash, record.payloadHash);
+  assert.equal(getPendingAction(record.id)?.status, 'executed', 'the card is marked executed');
+});
+
+test('a NOT-approved pending action is not executed', async () => {
+  const record = queueSingleCall(); // status stays 'queued'
+  let fired = false;
+  const res = await executeApprovedPendingActionCall(record.id, { dispatch: async () => { fired = true; return 'x'; } });
+  assert.equal(res.ok, false);
+  assert.equal(res.status, 'skipped');
+  assert.equal(fired, false, 'never dispatched without approval');
+});
+
+test('a run_batch pending action defers to the run_batch executor', async () => {
+  const record = queuePendingAction({
+    title: 'Batch send', summary: 'run_batch plan', kind: 'external_send',
+    toolName: 'run_batch', payload: { tool: 'composio_execute_tool', items: [] }, sessionId: 'sess-pae',
+  });
+  markPendingActionApprovalResolved(record.id, 'approved');
+  let fired = false;
+  const res = await executeApprovedPendingActionCall(record.id, { dispatch: async () => { fired = true; return 'x'; } });
+  assert.equal(res.status, 'skipped');
+  assert.equal(fired, false, 'run_batch is not fired by the single-call executor');
+  assert.match(res.resultSummary, /run_batch action=execute/);
+});

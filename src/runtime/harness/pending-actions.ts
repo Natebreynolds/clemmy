@@ -181,6 +181,29 @@ export function listPendingActions(filter: {
     .slice(0, limit);
 }
 
+/** Statuses where an action is still "open" — queued or somewhere in the
+ *  approval lifecycle, but not yet terminal (executed/failed/cancelled/rejected/
+ *  expired). Used for dedup: an open card for the same payload should not be
+ *  minted twice (the judge-fail-approval batch-loop guard). */
+const OPEN_PENDING_STATUSES: ReadonlySet<PendingActionStatus> = new Set([
+  'queued', 'approval_requested', 'approved',
+]);
+
+/** Compute the payloadHash the way queuePendingAction does (stable over key
+ *  order) so callers can dedup BEFORE minting. */
+export function pendingActionPayloadHash(toolName: string, payload: unknown): string {
+  return shortHash({ toolName, payload });
+}
+
+/** An OPEN pending action for the exact same tool + payload, if one already
+ *  exists — so a repeated judge-failure on the same call (a batch loop) reuses
+ *  the one card instead of minting a stack of duplicates. */
+export function findOpenPendingActionByPayload(toolName: string, payload: unknown): PendingActionRecord | null {
+  const hash = pendingActionPayloadHash(toolName, payload);
+  return listPendingActions({ status: 'all', limit: 100 })
+    .find((record) => record.payloadHash === hash && OPEN_PENDING_STATUSES.has(record.status)) ?? null;
+}
+
 function updatePendingAction(
   id: string,
   status: PendingActionStatus,

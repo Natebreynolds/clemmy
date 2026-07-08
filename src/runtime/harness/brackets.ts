@@ -18,6 +18,7 @@ import {
   isConfirmFirstEnabled,
   ConfirmFirstRequiredError,
 } from './confirm-first-gate.js';
+import { queuePendingAction, findOpenPendingActionByPayload } from './pending-actions.js';
 import {
   isGroundingGateEnabled,
   extractDuplicateIdentityKeys,
@@ -828,6 +829,60 @@ export function batchSkipItemJudgeEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BATCH_SKIP_ITEM_JUDGE', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+// A JUDGE FAILURE on an irreversible action must MINT a pending-approval card,
+// never silently refuse (P0c). Live 2026-07-08: goal-fidelity judge timeouts
+// refused 8 of 10 approved emails with a "GOAL_FIDELITY_CHECK_FAILED" string
+// buried in the tool results — the user lost the sends without ever being asked.
+// Default on. Kill-switch CLEMMY_JUDGE_FAIL_APPROVAL=off restores plain refusal.
+export function judgeFailApprovalEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_JUDGE_FAIL_APPROVAL', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Queue (or reuse) a one-tap pending-approval card for a call an LLM judge
+ * COULDN'T verify (timeout/outage), so the user is asked instead of losing the
+ * send to a buried refusal. The card's payload is the EXACT tool + args, so the
+ * approved-execution path fires byte-identical (the model can't swap it). Dedup:
+ * an open card for the same payload is reused, never re-minted (batch loops).
+ * Returns the pending-action id, or null when disabled / on any error (caller
+ * then falls back to today's plain refusal).
+ */
+export function mintJudgeFailApproval(input: {
+  sessionId: string;
+  toolName: string;
+  payload: unknown;
+  judge: string;
+  judgeFailureReason: string;
+  targetSummary?: string;
+}): string | null {
+  if (!judgeFailApprovalEnabled()) return null;
+  try {
+    const existing = findOpenPendingActionByPayload(input.toolName, input.payload);
+    if (existing) return existing.id; // dedup — one card per payload
+    const shape = classifyExternalWrite(input.toolName, input.payload);
+    const isSend = /SEND|EMAIL|PUBLISH|POST|MESSAGE|SLACK|TWEET|DM\b/i.test(shape.shapeKey ?? input.toolName);
+    const targetSummary = input.targetSummary
+      || extractDuplicateIdentityKeys(input.payload).slice(0, 5).join(', ')
+      || 'this action';
+    const record = queuePendingAction({
+      title: `Judge couldn't verify: ${targetSummary}`.slice(0, 160),
+      summary: `The ${input.judge} judge couldn't run (${input.judgeFailureReason}), so this irreversible ${input.toolName} was NOT sent unverified — approve to fire the exact queued call, or deny to drop it.`,
+      kind: isSend ? 'external_send' : 'external_write',
+      toolName: input.toolName,
+      payload: input.payload,
+      targetSummary,
+      preview: JSON.stringify(input.payload).slice(0, 800),
+      risk: 'Irreversible external action that the automated fidelity judge could not verify before sending.',
+      rollback: isSend ? 'Sends are irreversible once delivered.' : 'Depends on the target tool.',
+      sessionId: input.sessionId,
+      createdBy: 'judge_fail_approval',
+    });
+    return record.id;
+  } catch {
+    return null; // never let the mint failure change the refusal path
+  }
+}
+
 /** Start a gate's judge promise NOW (concurrently) while suppressing an
  *  unhandled-rejection if an earlier gate blocks and this one is never awaited.
  *  The original promise is returned so the gate's own block still awaits it and
@@ -1460,6 +1515,20 @@ export function wrapToolForHarness<T extends WrappableTool>(
           const verdict = await (goalFidelityPromise ?? evaluateGoalFidelity(ctx.sessionId, tool.name, parsedInput));
           if (verdict.action === 'block') {
             verdict.commitFailure?.(); // commit the deferred failure bump only now that we actually surface it (#2.4)
+            // JUDGE-FAIL APPROVAL (P0c): a JUDGE OUTAGE (not a genuine verdict)
+            // that blocks an irreversible action mints a one-tap pending-approval
+            // card for the EXACT call — never a silent refusal buried in the tool
+            // result. A genuine GAP verdict keeps refusing exactly as before.
+            const mintedPendingId = verdict.judgeUnavailable
+              ? mintJudgeFailApproval({
+                  sessionId: ctx.sessionId,
+                  toolName: tool.name,
+                  payload: parsedInput,
+                  judge: 'goal-fidelity',
+                  judgeFailureReason: verdict.reason,
+                  targetSummary: verdict.targets.slice(0, 5).join(', '),
+                })
+              : null;
             try {
               appendEvent({
                 sessionId: ctx.sessionId,
@@ -1475,6 +1544,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   reason: verdict.reason,
                   failureCount: verdict.failureCount ?? 1,
                   blockKind: verdict.blockKind ?? 'other',
+                  ...(verdict.judgeUnavailable ? { judgeUnavailable: true } : {}),
+                  ...(mintedPendingId ? { pendingActionId: mintedPendingId, judgeFailApproval: true } : {}),
                 },
               });
             } catch { /* telemetry write must never block */ }
@@ -1485,6 +1556,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               targets: verdict.targets,
               failureCount: verdict.failureCount ?? 1,
               blockKind: verdict.blockKind,
+              ...(mintedPendingId ? { pendingActionId: mintedPendingId } : {}),
             });
           } else if (verdict.mode === 'advisory') {
             // Skill-less goal-alignment MISS → INFORM, do not block (north-star:

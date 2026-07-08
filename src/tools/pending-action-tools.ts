@@ -132,6 +132,25 @@ export function registerPendingActionTools(server: McpServer): void {
   );
 
   server.tool(
+    'pending_action_execute',
+    [
+      'Fire the exact stored tool call of an APPROVED single-call pending action (e.g. a card minted because a fidelity judge could not verify a send).',
+      'The server executes the byte-identical queued payload through the gated write boundary — you cannot alter it. Use this after the user approves such a card; do NOT re-issue the underlying send yourself.',
+      'run_batch plans are executed via run_batch action=execute instead.',
+    ].join(' '),
+    {
+      id: z.string().min(1),
+      sessionId: z.string().optional(),
+    },
+    async ({ id, sessionId }) => {
+      const { executeApprovedPendingActionCall } = await import('../execution/pending-action-executor.js');
+      const result = await executeApprovedPendingActionCall(id, { sessionId: currentSessionId(sessionId) ?? undefined });
+      maybeLog(currentSessionId(sessionId), 'result', { pendingActionId: id, status: result.status });
+      return textResult(result.resultSummary);
+    },
+  );
+
+  server.tool(
     'pending_action_record_result',
     'After executing or cancelling a queued action, record the outcome so Clementine can report back and avoid duplicate sends/writes.',
     {

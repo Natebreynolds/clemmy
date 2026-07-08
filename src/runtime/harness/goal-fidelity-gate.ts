@@ -587,6 +587,11 @@ export interface GoalFidelityGateResult {
   /** Why the block fired: 'present_for_approval' (draft-only skill — present the
    *  draft + ask, do NOT count as a failure) vs 'other' (genuine violation). */
   blockKind?: 'present_for_approval' | 'other';
+  /** True when this block is a JUDGE FAILURE (timeout/outage) fail-closing a
+   *  send-burst — NOT a genuine fidelity verdict. The caller mints a one-tap
+   *  pending-approval card for the exact call instead of a silent refusal
+   *  (P0c: a judge that couldn't run must ask, never lose the send). */
+  judgeUnavailable?: boolean;
   /** Set ONLY when evaluated with { deferCommit: true } (the parallel pre-write
    *  path): persists the failure increment. The caller invokes it exactly when it
    *  actually surfaces this block — so an eagerly-started verdict that is DISCARDED
@@ -691,6 +696,9 @@ export async function evaluateGoalFidelity(
         gap: `The goal-fidelity judge was unavailable (${judgeFailure}) while a same-shape send-burst is in flight. Approve to continue the batch, or stop it — I will not send the rest unverified.`,
         targets,
         blockKind: 'present_for_approval',
+        // JUDGE OUTAGE, not a verdict → the caller mints a pending-approval card
+        // for this exact call instead of a silent refusal.
+        judgeUnavailable: true,
       };
     }
     return { action: 'allow', mode: 'judge', reason: `goal-fidelity judge unavailable (${judgeFailure}) — fail open`, targets };
@@ -769,8 +777,26 @@ export class GoalFidelityCheckFailedError extends Error {
   public readonly targets: string[];
   public readonly failureCount: number;
   public readonly blockKind: 'present_for_approval' | 'other';
-  constructor(opts: { toolName: string; reason: string; gap?: string; targets: string[]; failureCount: number; blockKind?: 'present_for_approval' | 'other' }) {
+  public readonly pendingActionId?: string;
+  constructor(opts: { toolName: string; reason: string; gap?: string; targets: string[]; failureCount: number; blockKind?: 'present_for_approval' | 'other'; pendingActionId?: string }) {
     const blockKind = opts.blockKind ?? 'other';
+    // JUDGE-FAIL APPROVAL (P0c): the judge couldn't run, so the send was refused
+    // AND queued as a one-tap approval card. Tell the user, don't retry — it fires
+    // when they approve. This overrides the generic recovery guidance below.
+    if (opts.pendingActionId) {
+      super(
+        `GOAL_FIDELITY_CHECK_FAILED: the goal-fidelity judge could not run, so I did NOT send this ${opts.toolName} unverified. ` +
+          `I've queued it for the user's one-tap approval — pending action ${opts.pendingActionId}. ` +
+          `TELL THE USER a review card is waiting (it will send the exact queued call when they approve) and do NOT retry the send yourself.`,
+      );
+      this.name = 'GoalFidelityCheckFailedError';
+      this.toolName = opts.toolName;
+      this.targets = opts.targets;
+      this.failureCount = opts.failureCount;
+      this.blockKind = blockKind;
+      this.pendingActionId = opts.pendingActionId;
+      return;
+    }
     // Draft-only-skill block: the skill drafts + presents but does not itself
     // send. The recovery is NOT "rebuild and retry the write" (the old generic
     // suffix, which is meaningless here — there is no fixed payload to retry and
