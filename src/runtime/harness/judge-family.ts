@@ -57,8 +57,14 @@ export function judgeCrossFamilyEnabled(): boolean {
  *  their call sites, so a slow checker should degrade to "not judged" instead
  *  of adding unbounded latency to chat or irreversible-write gates. */
 export function boundaryJudgeTimeoutMs(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_TIMEOUT_MS', '12000') ?? '12000', 10);
-  return Number.isFinite(raw) && raw >= 1000 ? raw : 12000;
+  // Default raised 12s -> 25s (2026-07-08): live metrics showed 7 of 9 boundary
+  // judge calls timing out with avg 14.7s / max 18.7s on gpt-5.4-mini during a
+  // degraded-network evening — the verdicts were VALID (invalid: 0), the judge
+  // was simply hung up on right before answering, silently downgrading
+  // completion/grounding checks to advisory 78% of the time. 25s covers the
+  // observed p100 with margin while still bounding a truly hung call.
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BOUNDARY_JUDGE_TIMEOUT_MS', '25000') ?? '25000', 10);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 25000;
 }
 
 export async function withJudgeTimeout<T>(work: Promise<T>, timeoutMs = boundaryJudgeTimeoutMs()): Promise<T | null> {
