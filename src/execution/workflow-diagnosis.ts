@@ -467,12 +467,13 @@ function diagnoseCodifiedStepFailure(input: DiagnoseInput): WorkflowDiagnosis | 
  *                      error) → fail-open to today's behavior; auto-heal is
  *                      already bounded, backed up, and (new) auto-reverted on
  *                      a re-run that doesn't stick.
- *  Human-approved `apply fix` is NOT judged — the human is the judge. */
-const HealVetoSchema = z.object({
-  approve: z.boolean(),
-  reason: z.string(),
-});
-
+ *  Human-approved `apply fix` is NOT judged — the human is the judge.
+ *
+ *  Verdict is PLAIN TEXT, parsed deterministically ("APPROVE: reason" /
+ *  "VETO: reason") — the boundary-judge sweep from 2e10714e/2538d916/2d30ba09.
+ *  No outputType, so provider shape-validation can't reject a valid verdict and
+ *  misreport the judge as unavailable; a no-marker response fails-open exactly
+ *  like today's null-output path (auto-heal stays bounded + auto-reverted). */
 export async function judgeHealCrossFamily(
   diagnosis: WorkflowDiagnosis,
   stepPrompt: string | undefined,
@@ -496,11 +497,11 @@ export async function judgeHealCrossFamily(
         'For an input-binding change: approve ONLY when the new binding points at a source that plausibly supplies the right value for this step, or a default that is a reasonable, safe value — NOT a guess that would feed the step wrong data.',
         'For an allowed-tools change: approve ONLY when the added tool is one the step genuinely needs for its stated job and does not newly enable an unintended external action (a send/publish the step should not perform).',
         'For uncodify_step: approve ONLY when the step was previously auto-codified and the fix restores the preserved model step instead of weakening the workflow.',
-        'When uncertain, REJECT — a rejected fix is offered to the human instead of lost.',
+        'When uncertain, VETO — a vetoed fix is offered to the human instead of lost.',
+        'Reply with EXACTLY ONE LINE and nothing else: either "APPROVE: <one-sentence reason>" or "VETO: <one-sentence reason>".',
       ].join('\n'),
       model: judge.modelId,
       modelSettings: { reasoning: { effort: 'low' } },
-      outputType: normalizeZodForCodexStrict(HealVetoSchema) as typeof HealVetoSchema,
       tools: [],
     });
     const prompt = [
@@ -511,9 +512,15 @@ export async function judgeHealCrossFamily(
       diagnosis.fix.newOutputContractJson ? `Proposed new output contract: ${diagnosis.fix.newOutputContractJson.slice(0, 1500)}` : '',
     ].filter(Boolean).join('\n\n');
     const result = await withJudgeTimeout(run(agent, prompt));
-    const out = result?.finalOutput as z.infer<typeof HealVetoSchema> | undefined;
-    if (!out) return { verdict: 'unavailable', reason: 'judge timeout' };
-    return out.approve ? { verdict: 'approve', reason: out.reason } : { verdict: 'veto', reason: out.reason };
+    const raw = String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? '').trim();
+    if (!raw) return { verdict: 'unavailable', reason: 'judge timeout' };
+    const match = /^\s*(APPROVE|VETO)\s*:?\s*(.*)$/im.exec(raw);
+    // No marker → treat as unavailable (fail-open), same as today's null-output path.
+    if (!match) return { verdict: 'unavailable', reason: `judge returned no APPROVE/VETO verdict (got: ${raw.slice(0, 120)})` };
+    const reason = (match[2] || '').trim().slice(0, 400);
+    return match[1].toUpperCase() === 'APPROVE'
+      ? { verdict: 'approve', reason }
+      : { verdict: 'veto', reason };
   } catch (err) {
     return { verdict: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
   }

@@ -1,11 +1,8 @@
 import { Agent, Runner } from '@openai/agents';
-import { z } from 'zod';
 import { MODELS } from '../../config.js';
 import { listPlanProposals, setWorkflowPendingInputValues, supersedePlanProposal, type PlanProposal } from '../../agents/plan-proposals.js';
 import { resumeWorkflowRun } from '../../tools/workflow-run-queue.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
-import type { RuntimeContextValue } from '../../types.js';
-import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
 import { runPlanFirstPreflight } from './plan-first.js';
 import { extractNamedResource } from '../../memory/focus.js';
 
@@ -104,16 +101,27 @@ export interface PlanContinuityClassification {
   reason: string;
 }
 
-const ClassificationSchema = z.object({
-  kind: z.enum(['answers', 'new_topic', 'resume', 'abandon']).describe(
-    'How the new message relates to the open plan that is awaiting answers.',
-  ),
-  answers: z.string().nullable().describe(
-    'When kind is answers (or resume with answers folded in), the extracted answers to the open questions, in the user\'s own terms. Null otherwise.',
-  ),
-  confidence: z.number().min(0).max(1).describe('0..1 confidence in the kind label.'),
-  reason: z.string().describe('One short sentence explaining the classification.'),
-});
+/**
+ * Parse the classifier's PLAIN-TEXT verdict. The marker keyword carries the
+ * `kind`; the tail carries the extracted answers (for ANSWERS/RESUME) or a
+ * short reason (for NEW_TOPIC/ABANDON). Deterministic, no schema to reject a
+ * cosmetically-off-but-valid verdict — the same treatment the boundary judges
+ * got (2e10714e/2538d916). Returns null when no marker is present, so the
+ * caller applies its existing fail-SAFE "treat as answer" default. Pure +
+ * exported for unit tests.
+ */
+export function parsePlanContinuityVerdict(
+  raw: string,
+): { kind: PlanContinuityKind; answers?: string; reason: string } | null {
+  const match = /^\s*(ANSWERS|RESUME|NEW[\s_-]?TOPIC|ABANDON)\s*:?\s*(.*)$/im.exec(raw);
+  if (!match) return null;
+  const token = match[1].toUpperCase().replace(/[\s-]/g, '_');
+  const tail = (match[2] || '').trim().slice(0, 600);
+  if (token === 'ANSWERS') return { kind: 'answers', answers: tail || undefined, reason: tail || 'answers' };
+  if (token === 'RESUME') return { kind: 'resume', answers: tail || undefined, reason: tail || 'resume' };
+  if (token === 'NEW_TOPIC') return { kind: 'new_topic', reason: tail || 'new topic' };
+  return { kind: 'abandon', reason: tail || 'abandon' };
+}
 
 /**
  * Build the classifier prompt. Pure + exported so it can be unit-tested
@@ -143,15 +151,19 @@ export function buildClassifierPrompt(plan: PlanProposal, message: string): stri
   ].join('\n');
 }
 
-function buildClassifierAgent(): Agent<RuntimeContextValue, typeof ClassificationSchema> {
-  return new Agent<RuntimeContextValue, typeof ClassificationSchema>({
+function buildClassifierAgent(): Agent {
+  return new Agent({
     name: 'PlanContinuityClassifier',
     instructions: [
       'You classify how a user\'s new message relates to a plan that is awaiting their answers.',
-      'Return only the structured classification. Do not call tools. Do not execute anything.',
-    ].join('\n\n'),
+      'Reply with EXACTLY ONE LINE and nothing else, one of:',
+      '"ANSWERS: <the answers the message supplies to the open questions, in the user\'s own words>" — use whenever the message plausibly maps to the open questions (bias toward this);',
+      '"RESUME: <any answers folded in, else leave blank>" — the user is explicitly returning to / continuing this plan ("let\'s get back on that", "continue that");',
+      '"NEW_TOPIC: <one short reason>" — a clearly different request, unrelated to the open questions;',
+      '"ABANDON: <one short reason>" — the user wants to drop the plan ("never mind", "forget it", "cancel that").',
+      'Do not call tools. Do not execute anything.',
+    ].join('\n'),
     model: MODELS.fast,
-    outputType: normalizeZodForCodexStrict(ClassificationSchema) as typeof ClassificationSchema,
     tools: [],
   });
 }
@@ -171,21 +183,24 @@ export async function classifyAgainstPlan(
     const result = await runner.run(buildClassifierAgent(), buildClassifierPrompt(plan, message), {
       maxTurns: 1,
     });
-    const parsed = ClassificationSchema.safeParse(result.finalOutput);
-    if (!parsed.success) {
+    const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
+    const parsed = parsePlanContinuityVerdict(raw);
+    if (!parsed) {
       return applySelfContainedGuard(plan, message, {
         kind: 'answers',
         answers: message,
         confidence: 0.3,
-        reason: 'classifier output did not parse — defaulting to treat as answer',
+        reason: 'classifier output had no marker — defaulting to treat as answer',
       });
     }
-    const data = parsed.data;
+    // Confidence is set in code (a parsed marker is a confident label); it is
+    // informational here — no consumer branches on it, and the self-contained
+    // guard only clamps it upward when it downgrades answers→new_topic.
     return applySelfContainedGuard(plan, message, {
-      kind: data.kind,
-      answers: data.answers ?? undefined,
-      confidence: data.confidence,
-      reason: data.reason,
+      kind: parsed.kind,
+      answers: parsed.answers,
+      confidence: 0.8,
+      reason: parsed.reason,
     });
   } catch {
     return applySelfContainedGuard(plan, message, {
@@ -198,25 +213,41 @@ export async function classifyAgainstPlan(
 }
 
 // ── workflow-input continuity ────────────────────────────────────────────
-// A pending workflow run needs NAMED input values. The classifier returns an
-// ARRAY of {name,value} pairs (named properties fill reliably under codex
-// strict mode, unlike an open map — the same lesson as the workflow_run bug)
-// plus an intent label so a clear pivot or "never mind" doesn't get parsed as
-// a value.
+// A pending workflow run needs NAMED input values. The classifier answers in
+// PLAIN TEXT — a `kind` marker on the first line, then one `name: value` line
+// per supplied input using ONLY the known required names. This removed the last
+// structured output from this hot-path file: an ARRAY-of-{name,value} schema
+// (already a workaround for codex-strict open-map failures) could still reject
+// a valid extraction on provider-shape validation and strand a waiting run.
+// Because the required names are KNOWN, we parse each by scanning for its line
+// prefix — robust even when a value contains ':' or '=' (e.g. a URL).
 
-const WorkflowInputClassificationSchema = z.object({
-  kind: z.enum(['answers', 'new_topic', 'abandon']).describe(
-    'How the new message relates to the workflow we are waiting to run: answers=it supplies input value(s); new_topic=a clearly different request; abandon=drop the run.',
-  ),
-  values: z.array(
-    z.object({
-      name: z.string().describe('Exactly one of the required input names listed.'),
-      value: z.string().describe('The value the user supplied for that input.'),
-    }),
-  ).describe('Input name/value pairs extracted from the message. Empty array if none.'),
-  confidence: z.number().min(0).max(1).describe('0..1 confidence in the kind label.'),
-  reason: z.string().describe('One short sentence explaining the classification.'),
-});
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Parse the workflow-input verdict. First recognized marker sets the kind; for
+ * ANSWERS, each required name is pulled from its own `name: value` line. Returns
+ * null when no marker is present (caller applies its single-input fail-SAFE
+ * default). Pure + exported for unit tests.
+ */
+export function parseWorkflowInputVerdict(
+  raw: string,
+  allowedNames: string[],
+): { kind: 'answers' | 'new_topic' | 'abandon'; values: Record<string, string> } | null {
+  const marker = /^\s*(ANSWERS|NEW[\s_-]?TOPIC|ABANDON)\b/im.exec(raw);
+  if (!marker) return null;
+  const token = marker[1].toUpperCase().replace(/[\s-]/g, '_');
+  const kind = token === 'ANSWERS' ? 'answers' : token === 'ABANDON' ? 'abandon' : 'new_topic';
+  const values: Record<string, string> = {};
+  if (kind === 'answers') {
+    for (const name of allowedNames) {
+      const line = new RegExp(`^\\s*${escapeRegExp(name)}\\s*[:=]\\s*(.+)$`, 'im').exec(raw);
+      const value = line?.[1]?.trim();
+      if (value) values[name] = value.slice(0, 2000);
+    }
+  }
+  return { kind, values };
+}
 
 export function buildWorkflowInputClassifierPrompt(
   workflowName: string,
@@ -230,24 +261,23 @@ export function buildWorkflowInputClassifierPrompt(
     '',
     `The user's new message:\n${message}`,
     '',
-    'Choose exactly one kind:',
-    '- answers: the message supplies value(s) for one or more of the required inputs. Put each into values as {name, value}, using ONLY the names listed above. If a single input is needed and the whole message is plainly that value, return it as that input.',
-    '- new_topic: a clearly different request, unrelated to the inputs the workflow needs.',
-    '- abandon: the user wants to drop the run ("never mind", "forget it", "cancel that").',
+    'Reply in PLAIN TEXT. Put a marker on the FIRST line — one of ANSWERS, NEW_TOPIC, or ABANDON:',
+    '- ANSWERS: the message supplies value(s) for one or more of the required inputs. After the marker line, add ONE line per supplied value in the form "name: value", using ONLY the input names listed above. If a single input is needed and the whole message is plainly that value, return it on its line.',
+    '- NEW_TOPIC: a clearly different request, unrelated to the inputs the workflow needs.',
+    '- ABANDON: the user wants to drop the run ("never mind", "forget it", "cancel that").',
     '',
-    'Bias toward "answers" whenever the message plausibly supplies a needed value. Normalize obvious wrappers (e.g. "use https://x.com" → value "https://x.com").',
+    'Bias toward ANSWERS whenever the message plausibly supplies a needed value. Normalize obvious wrappers (e.g. "use https://x.com" → value "https://x.com"). Output nothing but the marker line and any value lines.',
   ].join('\n');
 }
 
-function buildWorkflowInputClassifierAgent(): Agent<RuntimeContextValue, typeof WorkflowInputClassificationSchema> {
-  return new Agent<RuntimeContextValue, typeof WorkflowInputClassificationSchema>({
+function buildWorkflowInputClassifierAgent(): Agent {
+  return new Agent({
     name: 'WorkflowInputClassifier',
     instructions: [
       'You extract workflow input values from a user message and classify intent.',
-      'Return only the structured classification. Do not call tools. Do not execute anything.',
+      'Reply in plain text: a kind marker (ANSWERS / NEW_TOPIC / ABANDON) on the first line, then one "name: value" line per supplied input. Do not call tools. Do not execute anything.',
     ].join('\n\n'),
     model: MODELS.fast,
-    outputType: normalizeZodForCodexStrict(WorkflowInputClassificationSchema) as typeof WorkflowInputClassificationSchema,
     tools: [],
   });
 }
@@ -283,19 +313,18 @@ export async function classifyWorkflowInputAnswers(
       buildWorkflowInputClassifierPrompt(workflowName, missingInputs, message),
       { maxTurns: 1 },
     );
-    const parsed = WorkflowInputClassificationSchema.safeParse(result.finalOutput);
-    if (!parsed.success) return singleInputFallback();
-    const allowed = new Set(missingInputs);
-    const values: Record<string, string> = {};
-    for (const pair of parsed.data.values) {
-      if (allowed.has(pair.name) && pair.value.trim().length > 0) values[pair.name] = pair.value.trim();
-    }
+    const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
+    const parsed = parseWorkflowInputVerdict(raw, missingInputs);
+    if (!parsed) return singleInputFallback();
+    const values = parsed.values;
     // The model said "answers" but didn't map a value, and only one input is
     // outstanding → take the whole message as that value.
-    if (parsed.data.kind === 'answers' && Object.keys(values).length === 0 && missingInputs.length === 1) {
+    if (parsed.kind === 'answers' && Object.keys(values).length === 0 && missingInputs.length === 1) {
       values[missingInputs[0]] = message.trim();
     }
-    return { kind: parsed.data.kind, values, confidence: parsed.data.confidence, reason: parsed.data.reason };
+    // Confidence is informational (no consumer branches on it); a parsed marker
+    // is a confident label.
+    return { kind: parsed.kind, values, confidence: 0.8, reason: `classified as ${parsed.kind}` };
   } catch {
     return singleInputFallback();
   }

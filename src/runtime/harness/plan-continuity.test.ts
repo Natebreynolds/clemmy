@@ -21,7 +21,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const { surfaceAskingPlan, surfacePlan, listPlanProposals, supersedePlanProposal, rejectPlanProposal, surfaceWorkflowPendingInputs, setWorkflowPendingInputValues, getPlanProposal } =
   await import('../../agents/plan-proposals.js');
-const { findOpenQuestionPlan, findOpenWorkflowPendingInputs, buildClassifierPrompt, buildWorkflowInputClassifierPrompt, applySelfContainedGuard } =
+const { findOpenQuestionPlan, findOpenWorkflowPendingInputs, buildClassifierPrompt, buildWorkflowInputClassifierPrompt, applySelfContainedGuard, parsePlanContinuityVerdict, parseWorkflowInputVerdict } =
   await import('./plan-continuity.js');
 
 const SHEET_ID = '1AbcD_efGhIjKlMnOpQrStUvWxYz0123456789xyz';
@@ -241,6 +241,52 @@ test('buildWorkflowInputClassifierPrompt includes workflow name, missing inputs,
   assert.match(prompt, /audit-brief/);
   assert.match(prompt, /url, topic/);
   assert.match(prompt, /use https:\/\/revill\.co\.uk/);
+});
+
+// ─── plain-text verdict parsers (pure — the schema→marker conversion) ──────
+//
+// These pin the deterministic parse that replaced the zod outputTypes: the
+// marker carries the kind, the tail carries answers/reason, no-marker → null
+// (caller applies its existing fail-SAFE "treat as answer" default), and
+// lengths are clamped in code so a verbose-but-valid verdict is never rejected.
+
+test('parsePlanContinuityVerdict: ANSWERS carries the extracted answers in the tail', () => {
+  const out = parsePlanContinuityVerdict('ANSWERS: last quarter, closed-won only, a new sheet');
+  assert.deepEqual(out, { kind: 'answers', answers: 'last quarter, closed-won only, a new sheet', reason: 'last quarter, closed-won only, a new sheet' });
+});
+
+test('parsePlanContinuityVerdict: RESUME with an empty tail yields no answers (caller falls back to raw input)', () => {
+  const out = parsePlanContinuityVerdict('RESUME:');
+  assert.equal(out!.kind, 'resume');
+  assert.equal(out!.answers, undefined);
+});
+
+test('parsePlanContinuityVerdict: NEW_TOPIC / "NEW TOPIC" / ABANDON, case-insensitive', () => {
+  assert.equal(parsePlanContinuityVerdict('new_topic: unrelated ask')!.kind, 'new_topic');
+  assert.equal(parsePlanContinuityVerdict('NEW TOPIC: unrelated ask')!.kind, 'new_topic');
+  assert.equal(parsePlanContinuityVerdict('Abandon: never mind')!.kind, 'abandon');
+});
+
+test('parsePlanContinuityVerdict: no marker → null (caller keeps its fail-safe default)', () => {
+  assert.equal(parsePlanContinuityVerdict('sure, sounds good'), null);
+  assert.equal(parsePlanContinuityVerdict(''), null);
+});
+
+test('parseWorkflowInputVerdict: ANSWERS pulls each named value, tolerating a colon in the value', () => {
+  const raw = 'ANSWERS\nurl: https://revill.co.uk\ntopic: SEO';
+  const out = parseWorkflowInputVerdict(raw, ['url', 'topic']);
+  assert.deepEqual(out, { kind: 'answers', values: { url: 'https://revill.co.uk', topic: 'SEO' } });
+});
+
+test('parseWorkflowInputVerdict: only allowed names are captured; unknown lines ignored', () => {
+  const out = parseWorkflowInputVerdict('ANSWERS\nurl: https://x.com\nnonsense: foo', ['url']);
+  assert.deepEqual(out!.values, { url: 'https://x.com' });
+});
+
+test('parseWorkflowInputVerdict: NEW_TOPIC / ABANDON carry no values; no marker → null', () => {
+  assert.deepEqual(parseWorkflowInputVerdict('NEW_TOPIC: different ask', ['url']), { kind: 'new_topic', values: {} });
+  assert.deepEqual(parseWorkflowInputVerdict('ABANDON: forget it', ['url']), { kind: 'abandon', values: {} });
+  assert.equal(parseWorkflowInputVerdict('https://x.com', ['url']), null);
 });
 
 // ─── classifier prompt builder (pure) ──────────────────────────
