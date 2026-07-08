@@ -2,8 +2,14 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import type { Tool } from '@openai/agents';
-import { getComputerTools } from './computer-tools.js';
-import { getComposioRuntimeTools } from './composio-tools.js';
+import { getComputerTools, WRITE_FILE_PARAMS, RUN_SHELL_COMMAND_PARAMS } from './computer-tools.js';
+import {
+  getComposioRuntimeTools,
+  COMPOSIO_STATUS_PARAMS,
+  COMPOSIO_LIST_TOOLS_PARAMS,
+  COMPOSIO_SEARCH_TOOLS_PARAMS,
+  COMPOSIO_EXECUTE_TOOL_PARAMS,
+} from './composio-tools.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
@@ -43,37 +49,53 @@ function previewArgs(input: unknown): Record<string, unknown> {
  * SDK's async `canUseTool` (see claude-agent-sdk.ts); the gates here are the
  * automated safety floor that runs post-approval.
  *
- * The MCP-facing input schemas below MIRROR the `parameters` of the source
- * `tool()` defs (computer-tools.ts / composio-tools.ts). They shape only what
- * Claude sees; the real gated `execute` re-validates internally on `.invoke`.
+ * The MCP-facing input schemas below are DERIVED from the SAME authoritative Zod
+ * shapes the source tool() defs register with (computer-tools.ts / composio-tools.ts)
+ * — no hand-mirrored copy, so a base-tool param change can never drift out of the
+ * gated lane (TOOL-REGISTRY-PLAN C3; the drift here caused ~⅔ InvalidToolInputError
+ * on Claude gated calls). They shape only what Claude sees; the real gated `execute`
+ * re-validates internally on `.invoke`. A conformance test pins the derived field
+ * set to each base tool's registered schema.
+ *
+ * GATED TRANSFORM: every base field that is nullable-but-NOT-optional is loosened to
+ * ALSO be optional here, so the Agent SDK may OMIT it (Claude follows this looser MCP
+ * schema and routinely drops such fields); the handler then fills the key with null
+ * before the base tool's STRICT inner validate runs. Required (non-nullable) base
+ * fields stay required. `overrides` re-declares the few fields whose gated variant
+ * INTENTIONALLY differs from the base — an explicit documented transform, not a fork.
  */
-const GATED_TOOL_SCHEMAS: Record<string, z.ZodRawShape> = {
-  run_shell_command: {
-    command: z.string().min(1),
-    cwd: z.string().nullable().optional(),
-    timeout_ms: z.number().min(1000).max(120000).nullable().optional(),
-  },
-  write_file: {
-    path: z.string().min(1),
-    content: z.string(),
-    mode: z.enum(['create', 'append', 'overwrite']).nullable().optional(),
-  },
-  composio_status: {},
-  composio_search_tools: {
-    query: z.string().min(1),
-    toolkit_slug: z.string().min(1).nullable().optional(),
-    limit: z.number().int().positive().max(50).nullable().optional(),
-  },
-  composio_list_tools: {
-    toolkit_slug: z.string().min(1),
-    limit: z.number().int().positive().max(200).nullable().optional(),
-  },
-  composio_execute_tool: {
-    tool_slug: z.string().min(1),
-    arguments: z.string(),
-    connected_account_id: z.string().nullable().optional(),
-  },
-};
+function toGatedShape(base: z.ZodRawShape, overrides: z.ZodRawShape = {}): z.ZodRawShape {
+  const out: Record<string, z.ZodTypeAny> = {};
+  for (const [key, raw] of Object.entries(base)) {
+    const schema = raw as z.ZodTypeAny;
+    const nullableNotOptional = schema.safeParse(null).success && !schema.safeParse(undefined).success;
+    out[key] = nullableNotOptional ? schema.optional() : schema;
+  }
+  return { ...out, ...(overrides as Record<string, z.ZodTypeAny>) };
+}
+
+// LAZILY evaluated + memoized (plan risk #5): computed on first registration, NOT
+// at module load, because composio-tools transitively imports this module — reading
+// its exported PARAMS at eval time hits a TDZ. By first-call time every module is
+// initialized. Consumers (registerGatedMutatingTools + the conformance test) call
+// getGatedToolSchemas().
+let _gatedToolSchemas: Record<string, z.ZodRawShape> | null = null;
+export function getGatedToolSchemas(): Record<string, z.ZodRawShape> {
+  if (!_gatedToolSchemas) {
+    _gatedToolSchemas = {
+      run_shell_command: toGatedShape(RUN_SHELL_COMMAND_PARAMS),
+      write_file: toGatedShape(WRITE_FILE_PARAMS),
+      composio_status: toGatedShape(COMPOSIO_STATUS_PARAMS),
+      composio_search_tools: toGatedShape(COMPOSIO_SEARCH_TOOLS_PARAMS),
+      composio_list_tools: toGatedShape(COMPOSIO_LIST_TOOLS_PARAMS),
+      // DOCUMENTED DIVERGENCE: the gated executor always needs a JSON args string, so
+      // `arguments` stays REQUIRED here even though the base declares it `.nullable()`
+      // for strict-mode uniformity. connected_account_id keeps the standard loosening.
+      composio_execute_tool: toGatedShape(COMPOSIO_EXECUTE_TOOL_PARAMS, { arguments: z.string() }),
+    };
+  }
+  return _gatedToolSchemas;
+}
 
 /** Pre-content counter cap. Each MCP handler call is ONE gated unit, so a fresh
  *  per-call counter never trips the per-turn cap (the Agent SDK bounds its own
@@ -110,7 +132,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
     if (t && typeof t.name === 'string') byName.set(t.name, t);
   }
 
-  for (const [name, shape] of Object.entries(GATED_TOOL_SCHEMAS)) {
+  for (const [name, shape] of Object.entries(getGatedToolSchemas())) {
     const realTool = byName.get(name);
     if (!realTool || typeof realTool.invoke !== 'function') continue;
     const wrapped = wrapToolForHarness(realTool as never) as InvokableTool;

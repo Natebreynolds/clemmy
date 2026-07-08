@@ -55,6 +55,29 @@ const DEFAULT_DYNAMIC_TOTAL_LIMIT = 120;
 const DEFAULT_SEARCH_TOOLKIT_LIMIT = 250;
 const DEFAULT_SEARCH_TOTAL_LIMIT = 25;
 
+/** Authoritative parameter shapes — the SINGLE SOURCE for the composio broker
+ *  tools. The tool() defs below build their `parameters` from these, and the gated
+ *  MCP lane (gated-mutating-tools.ts) derives its Claude-facing schema from them,
+ *  so the two can never drift (TOOL-REGISTRY-PLAN C3). */
+export const COMPOSIO_STATUS_PARAMS = {} satisfies z.ZodRawShape;
+
+export const COMPOSIO_LIST_TOOLS_PARAMS = {
+  toolkit_slug: z.string().min(1),
+  limit: z.number().int().positive().max(200).nullable(),
+} satisfies z.ZodRawShape;
+
+export const COMPOSIO_SEARCH_TOOLS_PARAMS = {
+  query: z.string().min(1),
+  toolkit_slug: z.string().min(1).nullable(),
+  limit: z.number().int().positive().max(50).nullable(),
+} satisfies z.ZodRawShape;
+
+export const COMPOSIO_EXECUTE_TOOL_PARAMS = {
+  tool_slug: z.string().min(1),
+  arguments: z.string().nullable(),
+  connected_account_id: z.string().nullable(),
+} satisfies z.ZodRawShape;
+
 type SuppressedConnectedToolkit = ConnectedToolkit & { suppression: { reason?: string; suppressUntil: string } };
 
 // Composio slug → ToolKind classification lives in agents/tool-taxonomy.ts
@@ -1151,7 +1174,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
   const composio_status = tool({
     name: 'composio_status',
     description: 'Inspect whether Composio is configured and list active third-party app connections available to Clementine.',
-    parameters: z.object({}),
+    parameters: z.object(COMPOSIO_STATUS_PARAMS),
     execute: async (_input, context, details) => {
       const credentials = await getComposioRuntimeStatus();
       const connections = credentials.enabled ? await listUsableConnectedToolkits() : [];
@@ -1166,10 +1189,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
   const composio_list_tools = tool({
     name: 'composio_list_tools',
     description: 'List available Composio tools for one connected toolkit slug, such as gmail, slack, notion, github, or googlecalendar.',
-    parameters: z.object({
-      toolkit_slug: z.string().min(1),
-      limit: z.number().int().positive().max(200).nullable(),
-    }),
+    parameters: z.object(COMPOSIO_LIST_TOOLS_PARAMS),
     execute: async ({ toolkit_slug, limit }, context, details) => {
       const tools = await listComposioToolkitTools(toolkit_slug, limit ?? 80);
       // Deposit real schemas — upgrades pre-dispatch validation to
@@ -1199,11 +1219,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
   const composio_search_tools = tool({
     name: 'composio_search_tools',
     description: 'Search Composio for the right action slug. Use this BEFORE concluding an action is unavailable — Composio exposes hundreds of actions per toolkit and Clementine intentionally does not inject every action schema into every call. Query with plain English ("outlook list unread messages today", "drive search by name", "gmail mark as read"). Returns slugs to pass to `composio_execute_tool`.',
-    parameters: z.object({
-      query: z.string().min(1),
-      toolkit_slug: z.string().min(1).nullable(),
-      limit: z.number().int().positive().max(50).nullable(),
-    }),
+    parameters: z.object(COMPOSIO_SEARCH_TOOLS_PARAMS),
     execute: async ({ query, toolkit_slug, limit }, context, details) => {
       // (B) v0.5.64 — a re-search REFRESHES the cache. If this exact intent
       // already has an ACTIVE cached choice, a deliberate re-search is a
@@ -1393,11 +1409,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
   const composio_execute_tool = tool({
     name: 'composio_execute_tool',
     description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Never invent slugs — always call `composio_search_tools` first with a plain-English query, then pass the returned slug here. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy.',
-    parameters: z.object({
-      tool_slug: z.string().min(1),
-      arguments: z.string().nullable(),
-      connected_account_id: z.string().nullable(),
-    }),
+    parameters: z.object(COMPOSIO_EXECUTE_TOOL_PARAMS),
     // Taxonomy reads `tool_slug` from args to decide read-vs-send, so
     // GOOGLESHEETS_BATCH_GET autos through while GMAIL_SEND_EMAIL pauses
     // (or autos in YOLO).

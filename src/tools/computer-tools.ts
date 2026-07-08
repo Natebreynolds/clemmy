@@ -832,6 +832,22 @@ function listDirectory(dir: string, limit: number): string {
   return shown.join('\n') || '(empty)';
 }
 
+/** Authoritative parameter shapes — the SINGLE SOURCE for write_file /
+ *  run_shell_command. The tool() defs below build their `parameters` from these,
+ *  and the gated MCP lane (gated-mutating-tools.ts) derives its Claude-facing
+ *  schema from them too, so the two can never drift (TOOL-REGISTRY-PLAN C3). */
+export const WRITE_FILE_PARAMS = {
+  path: z.string().min(1),
+  content: z.string(),
+  mode: z.enum(['create', 'append', 'overwrite']).nullable(),
+} satisfies z.ZodRawShape;
+
+export const RUN_SHELL_COMMAND_PARAMS = {
+  command: z.string().min(1),
+  cwd: z.string().nullable(),
+  timeout_ms: z.number().min(1000).max(120000).nullable(),
+} satisfies z.ZodRawShape;
+
 export function getComputerTools(): Tool<RuntimeContextValue>[] {
   const formatToolOutput = (toolName: string, runContext: unknown, details: unknown, output: string): string =>
     formatRecallableToolText(redactSensitiveText(output), {
@@ -957,11 +973,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       'Installed skill source files under ~/.clementine-next/skills/<skill>/ are read-only; generated artifacts belong under output/, outputs/, runs/, artifacts/, reports/, or tmp/.',
       'Auto-approved for allowed local paths; destructive/system paths remain blocked by the path boundary.',
     ].join('\n'),
-    parameters: z.object({
-      path: z.string().min(1),
-      content: z.string(),
-      mode: z.enum(['create', 'append', 'overwrite']).nullable(),
-    }),
+    parameters: z.object(WRITE_FILE_PARAMS),
     needsApproval: needsApprovalForWriteFile(),
     execute: async (input) => {
       const filePath = resolveAllowedPath(input.path);
@@ -1011,11 +1023,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       '',
       'CWD GUIDANCE: leave `cwd` null unless you have a specific reason to be elsewhere. On macOS, paths under ~/Desktop, ~/Documents, ~/Downloads, and iCloud Drive are TCC-protected from sandboxed-app children: child Node CLIs (sf, npm, etc.) spawned there throw EPERM on getcwd. The default cwd (Clementine\'s base directory, which the daemon already has TCC access to) is safe and works for tool invocations that don\'t actually depend on file context (CLI calls, API queries, etc.). Pass an explicit `cwd` only when the command genuinely needs to run in a specific project directory configured in WORKSPACE_DIRS.',
     ].join('\n'),
-    parameters: z.object({
-      command: z.string().min(1),
-      cwd: z.string().nullable(),
-      timeout_ms: z.number().min(1000).max(120000).nullable(),
-    }),
+    parameters: z.object(RUN_SHELL_COMMAND_PARAMS),
     needsApproval: needsApprovalForShellSmart(),
     execute: async (input, runContext, details) => {
       if (shellMutatesMemoryStore(input.command)) {

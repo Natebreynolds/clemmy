@@ -17,10 +17,13 @@ process.env.CLEMENTINE_MCP_GATED_MUTATIONS = 'on';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { z } from 'zod';
 
 const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const destination = await import('../runtime/harness/destination-gate.js');
-const { registerGatedMutatingTools, gatedMutationsEnabled } = await import('./gated-mutating-tools.js');
+const { registerGatedMutatingTools, gatedMutationsEnabled, getGatedToolSchemas } = await import('./gated-mutating-tools.js');
+const { getComputerTools } = await import('./computer-tools.js');
+const { getComposioRuntimeTools } = await import('./composio-tools.js');
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown>;
 
@@ -83,6 +86,59 @@ test('gate bridge: the destination gate FIRES when Claude calls run_shell_comman
   // textResult shape ({ content: [{ type:'text', text }] }), not command output.
   const text = (out as { content?: Array<{ text?: string }> })?.content?.[0]?.text ?? '';
   assert.ok(text.length > 0, 'bridge returns the gate block as a tool result');
+});
+
+// ─── C3 conformance: gated schema is DERIVED from the base tool, never a fork ──
+
+type JsonSchema = { properties?: Record<string, unknown>; required?: string[] };
+
+function isNullableProp(p: unknown): boolean {
+  const o = p as { type?: unknown; anyOf?: Array<{ type?: unknown }> } | undefined;
+  if (!o) return false;
+  if (o.type === 'null') return true;
+  if (Array.isArray(o.type) && o.type.includes('null')) return true;
+  if (Array.isArray(o.anyOf) && o.anyOf.some((x) => x?.type === 'null')) return true;
+  return false;
+}
+
+test('gated schema field set matches each registered base tool + non-nullable base fields stay required (anti-drift)', () => {
+  const base = new Map<string, JsonSchema>();
+  for (const t of [...getComputerTools(), ...getComposioRuntimeTools()] as Array<{ name?: string; parameters?: JsonSchema }>) {
+    if (t?.name && t.parameters) base.set(t.name, t.parameters);
+  }
+  const gatedSchemas = getGatedToolSchemas();
+  for (const [name, shape] of Object.entries(gatedSchemas)) {
+    const gated = z.toJSONSchema(z.object(shape)) as JsonSchema;
+    const b = base.get(name);
+    assert.ok(b, `base tool ${name} must be registered`);
+    // FIELD SET must match the base tool exactly — a base param add/remove/rename
+    // that a hand-mirror would miss (the ⅔ InvalidToolInputError class) fails here.
+    assert.deepEqual(
+      Object.keys(gated.properties ?? {}).sort(),
+      Object.keys(b!.properties ?? {}).sort(),
+      `${name}: gated field set must equal the base tool's`,
+    );
+    // Every truly-mandatory (non-nullable) base-required field stays required.
+    const gatedReq = new Set(gated.required ?? []);
+    for (const f of b!.required ?? []) {
+      if (!isNullableProp(b!.properties?.[f])) {
+        assert.ok(gatedReq.has(f), `${name}.${f} is a non-nullable base-required field and must stay required in the gated schema`);
+      }
+    }
+  }
+});
+
+test('gated transform: nullable base fields are loosened to optional; the documented arguments divergence is required', () => {
+  const gated = getGatedToolSchemas();
+  const shellSchema = z.toJSONSchema(z.object(gated.run_shell_command)) as JsonSchema;
+  // command is non-nullable → required; cwd/timeout_ms are nullable → optional.
+  assert.ok((shellSchema.required ?? []).includes('command'));
+  assert.ok(!(shellSchema.required ?? []).includes('cwd'), 'nullable base field is optional in the gated MCP schema');
+  assert.ok(!(shellSchema.required ?? []).includes('timeout_ms'));
+  // Documented divergence: composio_execute_tool.arguments stays REQUIRED.
+  const execSchema = z.toJSONSchema(z.object(gated.composio_execute_tool)) as JsonSchema;
+  assert.ok((execSchema.required ?? []).includes('arguments'), 'the gated executor requires an args string (documented override)');
+  assert.ok(!(execSchema.required ?? []).includes('connected_account_id'), 'connected_account_id keeps the standard loosening');
 });
 
 test.after(() => {
