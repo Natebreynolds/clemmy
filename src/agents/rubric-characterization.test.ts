@@ -31,11 +31,13 @@ const GOLDEN = {
   // 2026-06-28 (Inc A): OFFER BACKGROUND line now routes via the structured
   // `offer_background` tool → background / hold_task_for_later / now (both lanes:
   // HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
-  instructions: { len: 36547, sha16: 'aa7d70ea1fc38652' },
+  // 2026-07-08: DECISION_CONTRACT swapped from the OrchestratorDecision JSON
+  // envelope to the plain-text MARKER contract (ASK:/CONTINUE:/no-marker).
+  instructions: { len: 36209, sha16: '1cd224b72ac8212d' },
   native: { len: 35312, sha16: 'd5f7444d3490299e' },
   claudeBrain: { len: 4813, sha16: 'fa006f0bbc934c99' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8651, sha16: '459c05c40e15f069' },
+  lean: { len: 8313, sha16: 'aadb106041567382' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -74,8 +76,8 @@ test('lean variant: registered behind the variant switch, materially leaner, kee
   // Genuinely a prune: well under half the legacy size.
   assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.length * 2 < renderClemRubric('codex').length, 'lean must be far smaller than legacy');
   // Load-bearing rules survive the prune (composition invariants):
-  //  - the OrchestratorDecision JSON contract (the @openai/agents loop parses it),
-  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('Return an OrchestratorDecision'), 'lean must keep the decision contract');
+  //  - the plain-text marker DECISION_CONTRACT (the loop parses text + a marker),
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('END YOUR TURN WITH PLAIN TEXT'), 'lean must keep the decision contract');
   //  - the anti-narration opener (the narrate-instead-of-call guard),
   assert.ok(ORCHESTRATOR_INSTRUCTIONS_LEAN.includes('CALL TOOLS'), 'lean must keep the anti-narration rule');
   //  - the execution-lane + fan-out Codex essentials the gates rely on,
@@ -130,12 +132,12 @@ test('two-lane invariant: native = instructions MINUS the decision-JSON contract
   // Order-independent: assert the delta CONTAINS the decision-contract markers,
   // not that they sit at a specific index (a reordered contract array must still pass).
   assert.ok(
-    contractBlocks.some((b) => b.startsWith('Return an OrchestratorDecision')),
+    contractBlocks.some((b) => b.startsWith('END YOUR TURN WITH PLAIN TEXT')),
     `the delta must contain the decision-contract opener; got: ${JSON.stringify(contractBlocks.map((b) => b.slice(0, 32)))}`,
   );
   assert.ok(
-    contractBlocks.some((b) => b.startsWith('Set `reply: null`')),
-    'the delta must contain the reply:null decision-contract line',
+    contractBlocks.some((b) => b.startsWith('One OPTIONAL marker')),
+    'the delta must contain the marker-contract line',
   );
   // Reconstruct: HEAD blocks + TAIL blocks (contract removed) === native, block-for-block.
   assert.deepEqual(
@@ -148,14 +150,14 @@ test('two-lane invariant: native = instructions MINUS the decision-JSON contract
 test('two-lane invariant: the decision-JSON contract NEVER leaks into the native lane', () => {
   // The narrate-instead-of-call root cause: the native (Claude SDK) lane was fed
   // the decision-JSON contract and copied it as text. It must stay absent.
-  for (const marker of ['Return an OrchestratorDecision', 'nextAction', 'awaiting_approval']) {
+  for (const marker of ['END YOUR TURN WITH PLAIN TEXT', 'ASK: <question>', 'CONTINUE: <note>']) {
     assert.ok(
       !ORCHESTRATOR_BEHAVIOR_NATIVE.includes(marker),
       `native rubric must not contain decision-contract marker ${JSON.stringify(marker)}`,
     );
   }
-  // ...but the Codex lane MUST carry it (the @openai/agents loop parses it).
-  assert.ok(ORCHESTRATOR_INSTRUCTIONS.includes('Return an OrchestratorDecision'));
+  // ...but the Codex lane MUST carry it (the loop parses the marker + text).
+  assert.ok(ORCHESTRATOR_INSTRUCTIONS.includes('END YOUR TURN WITH PLAIN TEXT'));
 });
 
 // --- Token-budget guard ----------------------------------------------------

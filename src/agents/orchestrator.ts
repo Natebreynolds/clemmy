@@ -170,6 +170,17 @@ function workerBrainFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
+/** Plain-text DECISION contract (default ON): the Orchestrator emits plain text +
+ *  an optional one-line marker (ASK:/CONTINUE:) instead of the structured
+ *  OrchestratorDecision JSON envelope — so a turn can NEVER fail on output shape
+ *  (the 2026-07-08 landing-page D_decision_unparsed class). With the SDK
+ *  outputType dropped the model is free to end its turn with just text, which the
+ *  loop parses (parseDecisionText). `=off` restores the JSON outputType (the loop
+ *  still parses the object shape either way, so this is a pure emergency revert). */
+function plaintextDecisionEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_PLAINTEXT_DECISION', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
 interface ChatWorkerModelRoute {
   model?: string;
   trace?: {
@@ -674,7 +685,7 @@ export function recentConversationTextsForFanout(
 }
 
 export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOptions = {}): Promise<
-  Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>
+  Agent<RuntimeContextValue, any>
 > {
   // Phase 3 architecture (2026-05-20, "single agent"): the Orchestrator
   // IS the agent. Sub-agents are gone. The Orchestrator carries the
@@ -1615,7 +1626,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
-  return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
+  return new Agent<RuntimeContextValue, any>({
     name: 'Clem',
     handoffDescription:
       'Routes work. Plans, decides, and hands off to sub-agents. Cannot mutate state directly.',
@@ -1642,7 +1653,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // optional fields as nullable). Without this, .nullish() reply
     // produces a JSON schema with reply absent from required, which
     // Codex rejects under SDK 0.11.5 strict mode.
-    outputType: normalizeZodForCodexStrict(OrchestratorDecisionSchema) as typeof OrchestratorDecisionSchema,
+    // Plain-text DECISION contract (default): NO structured outputType — the
+    // model ends its turn with plain text + an optional marker, which the loop
+    // parses. Dropping the JSON response_format is what makes an unparseable
+    // decision impossible. `CLEMMY_PLAINTEXT_DECISION=off` restores the envelope.
+    ...(plaintextDecisionEnabled()
+      ? {}
+      : { outputType: normalizeZodForCodexStrict(OrchestratorDecisionSchema) as typeof OrchestratorDecisionSchema }),
     // T2.1 — wrapToolForHarness adds the per-tool timeout + mid-turn
     // kill check + pre-increment limit check. No-op when
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even

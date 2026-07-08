@@ -63,7 +63,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
@@ -2373,7 +2373,7 @@ test('runConversation: abandoned nextAction marks the conversation completed', a
   assert.equal(completedEvents[0].data.reason, 'abandoned_by_orchestrator');
 });
 
-test('runConversation: a malformed finalOutput with ZERO tool work counts as completed without recursion', async () => {
+test('runConversation: a non-envelope plain-text final output is a VALID completed reply (fail-open)', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([{ finalOutput: 'a plain string, not a Decision' }]);
   const result = await runConversation({
@@ -2383,17 +2383,75 @@ test('runConversation: a malformed finalOutput with ZERO tool work counts as com
     makeRunner: makeRunnerStub,
     runRunner: runner,
   });
+  // NEW CONTRACT (plain-text marker): any non-empty text without a marker is a
+  // valid completed reply — never dropped as 'no_structured_output', never
+  // retried as D_decision_unparsed.
   assert.equal(result.status, 'completed');
-  assert.equal(result.steps, 1);
   const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  assert.equal(completedEvents[0].data.reason, 'no_structured_output');
-  // No-regression: a zero-tool malformed null must NOT engage the
-  // did-work-then-malformed retry (that recovery is gated on toolCalls>0).
+  assert.notEqual(completedEvents[0].data.reason, 'no_structured_output');
+  assert.equal(completedEvents[0].data.reply, 'a plain string, not a Decision');
   const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
   assert.equal(
     retries.filter((e) => (e.data as { signal?: string }).signal === 'D_decision_unparsed').length,
     0,
-    'zero-tool malformed null should not fire the D_decision_unparsed retry',
+    'non-empty output must never fire the D_decision_unparsed retry',
+  );
+});
+
+// ─── Plain-text marker contract: parse table ──────────────────────────────
+test('toOrchestratorDecision: plain-text marker parse table (ASK / CONTINUE / no-marker / case / whitespace)', () => {
+  // No marker → the whole text is the completed, user-facing reply (fail-open).
+  const plain = toOrchestratorDecision('Here is your answer: 42.');
+  assert.equal(plain?.done, true);
+  assert.equal(plain?.nextAction, 'completed');
+  assert.equal(plain?.reply, 'Here is your answer: 42.');
+
+  // ASK: marker → pause for the user; body is the question.
+  const ask = toOrchestratorDecision('ASK: Which environment — staging or prod?');
+  assert.equal(ask?.done, false);
+  assert.equal(ask?.nextAction, 'awaiting_user_input');
+  assert.equal(ask?.reply, 'Which environment — staging or prod?');
+
+  // CONTINUE: marker → keep looping (not done, no user-facing reply).
+  const cont = toOrchestratorDecision('CONTINUE: scraped page 1, fetching page 2');
+  assert.equal(cont?.done, false);
+  assert.equal(cont?.nextAction, 'awaiting_handoff_result');
+  assert.equal(cont?.reply, null);
+
+  // Lowercase marker (case-insensitive).
+  const lower = toOrchestratorDecision('ask: what timezone?');
+  assert.equal(lower?.nextAction, 'awaiting_user_input');
+  assert.equal(lower?.reply, 'what timezone?');
+
+  // Leading whitespace/newlines before the marker.
+  const pad = toOrchestratorDecision('\n\n   CONTINUE: still working');
+  assert.equal(pad?.nextAction, 'awaiting_handoff_result');
+  assert.equal(pad?.done, false);
+
+  // A model still emitting the JSON envelope is parsed as the decision (back-compat).
+  const json = toOrchestratorDecision('{"summary":"s","reply":"Done.","done":true,"nextAction":"completed","reason":null}');
+  assert.equal(json?.done, true);
+  assert.equal(json?.reply, 'Done.');
+});
+
+test('toOrchestratorDecision: a 40KB no-marker body is ONE valid completed reply (never unparseable)', () => {
+  const huge = 'The full report follows.\n\n' + 'x'.repeat(40_000);
+  const decision = toOrchestratorDecision(huge);
+  assert.ok(decision, 'a giant body must never parse to null');
+  assert.equal(decision?.done, true);
+  assert.equal(decision?.nextAction, 'completed');
+  assert.equal(decision?.reply, huge, 'the entire body is the reply — not truncated, not dropped');
+  // Summary is derived IN CODE (first sentence / ≤200 chars), never demanded.
+  assert.ok((decision?.summary?.length ?? 0) <= 200);
+});
+
+test('toOrchestratorDecision: empty / recovery-sentinel output stays null (stall-retry path unchanged)', () => {
+  assert.equal(toOrchestratorDecision(''), null);
+  assert.equal(toOrchestratorDecision('   \n  '), null);
+  assert.equal(
+    toOrchestratorDecision("Clementine produced a response that couldn't be structured. Please ask again."),
+    null,
+    'the empty-turn sentinel stays null so the existing stall-retry path handles it',
   );
 });
 
@@ -2501,20 +2559,21 @@ test('runConversation: malformed decision AFTER real tool work RETRIES instead o
     runRunner,
   });
 
-  // The unparseable-decision retry fired exactly once, with our signal.
+  // NEW CONTRACT: the inline deliverable IS a valid reply — the run completes on
+  // the FIRST turn with ZERO D_decision_unparsed retries (this is the exact
+  // landing-page failure class the plain-text contract eliminates).
   const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
   const unparsed = retries.filter((e) => (e.data as { signal?: string }).signal === 'D_decision_unparsed');
-  assert.equal(unparsed.length, 1, 'expected exactly one D_decision_unparsed retry');
+  assert.equal(unparsed.length, 0, 'no unparseable-decision retry — inline output is delivered as the reply');
 
-  // And the conversation RECOVERED — finished on the retry turn, not died.
   assert.equal(result.status, 'completed');
-  assert.equal(result.lastDecision?.done, true);
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   assert.notEqual(
     completed[0].data.reason,
     'no_structured_output',
-    'did-work-then-malformed must recover, not die with no_structured_output',
+    'did-work-then-inline-deliverable completes, never dies with no_structured_output',
   );
+  assert.match(String(completed[0].data.reply ?? ''), /the whole site inlined/);
 });
 
 test('runConversation: sub-agent stall ("Continuing." with zero tool calls) is flagged as sub_agent_stalled', async () => {
@@ -2619,7 +2678,10 @@ test('runConversation: a short SUBSTANTIVE reply is NOT flagged as a stall', asy
     runRunner: runner,
   });
   const completedEvents = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  assert.equal(completedEvents[0].data.reason, 'no_structured_output');
+  // NEW CONTRACT: a substantive terse reply is delivered as the completed reply,
+  // not routed through the malformed 'no_structured_output' path.
+  assert.notEqual(completedEvents[0].data.reason, 'sub_agent_stalled');
+  assert.equal(completedEvents[0].data.reply, 'Added 5 rows to the sheet.');
   assert.equal(completedEvents[0].data.summary, 'Added 5 rows to the sheet.');
 });
 
@@ -2749,25 +2811,25 @@ test('runConversation: Signal D fires when sub-agent emits OrchestratorDecision 
     nextAction: 'awaiting_user_input',
   });
   const runner = scriptedRunner([{ finalOutput: decisionJson }]);
-  await runConversation({
+  const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'draft something',
     makeRunner: makeRunnerStub,
     runRunner: runner,
   });
+  // NEW CONTRACT: a model still emitting the JSON envelope is PARSED into the
+  // decision (a graceful transition), not flagged as a stall. Here the decision
+  // is awaiting_user_input, so the run surfaces the question and pauses.
   const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
-  // Like Signal A above: the auto-retry causes the detector to fire
-  // once per stalled turn. Assert the first signal is classified
-  // correctly — the retry-count assertion is in the new
-  // "stall triggers one auto-retry" test below.
-  assert.ok(stuckEvents.length >= 1);
-  assert.equal((stuckEvents[0].data as { signal: string }).signal, 'D_decision_json');
-  // The visible summary should be the model's reply (since it had a
-  // usable one) — surfaced through the detector instead of silently
-  // returned as-is.
-  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  assert.match(completed[0].data.summary as string, /draft|ship it/i);
+  assert.ok(
+    !stuckEvents.some((e) => (e.data as { signal?: string }).signal === 'D_decision_json'),
+    'a valid JSON decision is used, not flagged as a stall',
+  );
+  assert.equal(result.status, 'awaiting_user_input');
+  const asks = listEventsForConv(sess.id, { types: ['awaiting_user_input'] });
+  assert.ok(asks.length >= 1, 'the question was surfaced');
+  assert.match(String((asks[0].data as { question?: string }).question ?? ''), /draft|ship it/i);
 });
 
 test('runConversation: a real "Added 5 rows" reply does NOT fire any stall signal', async () => {
@@ -3508,10 +3570,9 @@ test('runConversation: a coherent reply that failed strict parse is salvaged + d
   });
   assert.equal(result.status, 'completed');
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
-  const salvaged = completed.find((e) => (e.data as { reason?: string }).reason === 'decision_json_salvaged');
-  assert.ok(salvaged, 'the answer was salvaged and delivered');
-  assert.match(String((salvaged!.data as { summary?: string }).summary ?? ''), /Brooke/);
-  // Must NOT have surfaced the confusing "unable to make progress" prompt.
+  // NEW CONTRACT: the JSON envelope is parsed directly into the decision and its
+  // reply delivered — no 'salvage' detour, no confusing "unable to make progress".
+  assert.match(String(completed[0].data.reply ?? completed[0].data.summary ?? ''), /Brooke/);
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0);
 });
 

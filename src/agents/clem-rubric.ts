@@ -67,16 +67,19 @@ export const ORCH_BEHAVIOR_HEAD = [
   "Never fabricate. Never emit text like \"Handed off to X\", \"Transferred to Y\", \"I'll do that next\" without an actual tool call in the same turn. If you're not calling a tool, either (a) you have all the answers and you're done — reply with the outcome, or (b) you genuinely cannot proceed — call `ask_user_question` with what's missing. Past-tense narrative (\"I completed\", \"I searched\", \"I sent\") MUST be backed by tool_returned events earlier in the same turn.",
 ];
 
-// --- DECISION_CONTRACT: the @openai/agents OrchestratorDecision JSON contract
-// (Codex/headless ONLY). The native Claude SDK lane OMITS this — feeding it the
-// contract mis-steered the model into narrating tool calls (commit 437e161).
+// --- DECISION_CONTRACT: the plain-text MARKER contract (Codex/headless lane).
+// Replaced the @openai/agents OrchestratorDecision JSON envelope (2026-07-08):
+// the JSON shape broke whenever the model emitted a deliverable inline, dying as
+// "response couldn't be structured". Now the turn output is just TEXT + an optional
+// one-line marker, parsed by regex and clamped in code (loop.ts parseDecisionText)
+// — nothing to fail on shape. The native Claude SDK lane still OMITS this block.
 export const ORCHESTRATOR_DECISION_CONTRACT = [
-  "Return an OrchestratorDecision. Required fields:",
-  "  - `summary` — INTERNAL one-line log of what you did this turn (\"Searched Outlook for Marlow, created Friday calendar event, opened Salesforce task\"). Never shown to the user.",
-  "  - `reply` — what the user reads. Must contain the actual answer/result/follow-up question. NOT a meta-description. For \"find Marlow's email\" → reply contains the sender, subject, date, link. For \"schedule daily briefing\" → reply confirms what got scheduled and how to disable. The surface renders empty replies as \"(Done.)\" — that's a visible bug.",
-  "  - `done` — true when the user's request is fully handled OR you're waiting for them (approval / user input). false only if you're about to make MORE tool calls in a follow-up turn (rare in the single-agent model — usually you finish in one turn).",
-  "  - `nextAction` — `completed` when done, `awaiting_approval` if a mutating tool just paused, `awaiting_user_input` if you called ask_user_question, `abandoned` only if the request is genuinely impossible.",
-  "Set `reply: null` ONLY when `nextAction` is `awaiting_approval` or `awaiting_user_input` — the approval/question text is already in front of the user. Every other case requires a non-empty `reply`.",
+  "END YOUR TURN WITH PLAIN TEXT — no JSON, no envelope. What you write IS what the user reads: the actual answer/result (for \"find Marlow's email\" → sender, subject, date, link; for \"schedule daily briefing\" → what got scheduled and how to disable). Put any large deliverable in FILES via the file tools, not inline.",
+  "One OPTIONAL marker on the FIRST line controls the loop:",
+  "  ASK: <question>  — you need the user to continue (a clarifying question, or an approval you can't self-serve). The rest of the line is the question.",
+  "  CONTINUE: <note> — you still have MORE tool calls to make next turn (rare — usually you finish in one turn). The note is an internal reason, not shown.",
+  "  (no marker)      — DEFAULT: you're DONE. The whole text is your reply.",
+  "Never end with an empty turn. If you took action, state the outcome; if you're blocked, use ASK:. Do not narrate a marker you didn't act on.",
 ];
 
 // --- TAIL: shared behavioral rubric (both lanes) ---
@@ -127,9 +130,8 @@ export const CLAUDE_BRAIN_RUBRIC = CLAUDE_BRAIN_RUBRIC_LINES.join('\n\n');
 //     toolset+reuse-proven-choice),
 //   - PLUS two tight Codex-lane essentials the Claude-brain rubric omits but the
 //     Codex lane's GATES rely on (execution-wrap, run_worker fan-out),
-//   - PLUS the OrchestratorDecision JSON contract VERBATIM (load-bearing — the
-//     @openai/agents loop parses it; dropping it mis-steers the model, commit
-//     437e161),
+//   - PLUS the plain-text marker DECISION_CONTRACT (the loop parses text + a
+//     one-line marker now; the old JSON-envelope rationale no longer applies),
 //   - PLUS the proven TAIL (close-the-loop + compacted-context recall) verbatim.
 //
 // NOT wired as the default. It is registered in orchestrator.ts's

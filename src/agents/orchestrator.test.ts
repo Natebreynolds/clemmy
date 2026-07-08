@@ -92,18 +92,34 @@ test('OrchestratorDecisionSchema rejects unknown nextAction values', () => {
   );
 });
 
-test('Orchestrator builds the Clem single-agent with structured outputType', async () => {
+test('Orchestrator builds the Clem single-agent with the plain-text decision contract (no structured outputType)', async () => {
   const agent = await buildOrchestratorAgent();
   assert.equal(agent.name, 'Clem');
-  assert.ok(agent.outputType, 'expected structured outputType to be set');
-  const parsed = (agent.outputType as z.ZodTypeAny).safeParse({
-    summary: 'verified the structured output schema',
-    reply: null,
-    done: false,
-    nextAction: 'awaiting_user_input',
-    reason: null,
-  });
-  assert.equal(parsed.success, true);
+  // Default (CLEMMY_PLAINTEXT_DECISION on): NO structured decision schema — the
+  // model ends its turn with plain text + an optional marker, so a turn can never
+  // fail on output shape. `agent.outputType` is text, not the decision Zod schema.
+  const outputType = agent.outputType as unknown;
+  assert.ok(
+    outputType == null || outputType === 'text' || typeof (outputType as { safeParse?: unknown }).safeParse !== 'function',
+    'expected no structured decision schema under the plain-text contract',
+  );
+
+  // Emergency revert restores the structured envelope.
+  process.env.CLEMMY_PLAINTEXT_DECISION = 'off';
+  try {
+    const legacy = await buildOrchestratorAgent();
+    assert.ok(legacy.outputType, 'CLEMMY_PLAINTEXT_DECISION=off restores the structured outputType');
+    const parsed = (legacy.outputType as z.ZodTypeAny).safeParse({
+      summary: 'verified the structured output schema',
+      reply: null,
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: null,
+    });
+    assert.equal(parsed.success, true);
+  } finally {
+    delete process.env.CLEMMY_PLAINTEXT_DECISION;
+  }
 });
 
 test('Orchestrator instructions stay dynamic and include same-session completed actions', async () => {

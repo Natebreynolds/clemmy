@@ -2790,31 +2790,135 @@ async function withActiveTurnHeartbeat<T>(
   }
 }
 
-function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
-  if (!value || typeof value !== 'object') return null;
-  const v = value as Record<string, unknown>;
-  if (typeof v.summary !== 'string') return null;
-  if (typeof v.done !== 'boolean') return null;
-  if (typeof v.nextAction !== 'string') return null;
-  const validActions: ReadonlySet<string> = new Set([
-    'awaiting_user_input',
-    'awaiting_approval',
-    'awaiting_handoff_result',
-    'completed',
-    'abandoned',
-  ]);
-  if (!validActions.has(v.nextAction)) return null;
-  const rawReply = typeof v.reply === 'string' && v.reply.trim() ? v.reply : null;
+const VALID_DECISION_ACTIONS: ReadonlySet<string> = new Set([
+  'awaiting_user_input',
+  'awaiting_approval',
+  'awaiting_handoff_result',
+  'completed',
+  'abandoned',
+]);
+
+/** Legacy structured-envelope path: a fully-formed `{summary, done, nextAction, …}`
+ *  object (the SDK's outputType result, or a JSON-envelope a model still emits).
+ *  Kept so any lane/test still handing back the object shape parses identically. */
+function decisionFromObject(value: Record<string, unknown>): OrchestratorDecisionShape | null {
+  if (typeof value.summary !== 'string') return null;
+  if (typeof value.done !== 'boolean') return null;
+  if (typeof value.nextAction !== 'string') return null;
+  if (!VALID_DECISION_ACTIONS.has(value.nextAction)) return null;
+  const rawReply = typeof value.reply === 'string' && value.reply.trim() ? value.reply : null;
   return {
-    summary: v.summary,
+    summary: value.summary,
     // Strip internal context/memory/focus bookkeeping the model sometimes
     // narrates INTO the user-facing reply (e.g. "I checked the active context…
     // not the stale Revill audit thread"). reply is the answer, not plumbing.
     reply: rawReply ? scrubInternalNarration(rawReply) : null,
-    done: v.done,
-    nextAction: v.nextAction as OrchestratorDecisionShape['nextAction'],
-    reason: typeof v.reason === 'string' ? v.reason : null,
+    done: value.done,
+    nextAction: value.nextAction as OrchestratorDecisionShape['nextAction'],
+    reason: typeof value.reason === 'string' ? value.reason : null,
   };
+}
+
+// ── Plain-text marker contract (replaces the structured DECISION ENVELOPE) ─────
+// The model's turn output is an optional ONE-LINE marker + free-text body, parsed
+// by regex and clamped in code — the same doctrine that hardened the judges (one
+// marker, nothing to fail on shape). Claude Code never emits "response couldn't be
+// structured" because its final output is just text; this is that contract.
+//
+//   ASK: <question>   → pause for the user (awaiting_user_input); body = question
+//   CONTINUE: <why>   → keep looping (not done); body is an internal note
+//   (no marker)       → DONE; the ENTIRE text is the user-facing reply
+//
+// FAIL-OPEN is the whole point: ANY non-empty text without a recognized marker is
+// a VALID completed reply, so an unparseable decision is IMPOSSIBLE for non-empty
+// output (the 2026-07-08 landing-page D_decision_unparsed failure class). Empty /
+// recovery-sentinel output returns null → the existing stall-retry path (unchanged).
+const ASK_DECISION_MARKER = /^\s*ASK:\s*([\s\S]+)$/i;
+const CONTINUE_DECISION_MARKER = /^\s*CONTINUE:\s*([\s\S]*)$/i;
+
+/** Telemetry-only summary derived IN CODE (first sentence, else first 200 chars) —
+ *  never demanded from the model. */
+function deriveDecisionSummary(text: string): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  const firstSentence = collapsed.match(/^.*?[.!?](?=\s|$)/)?.[0]?.trim();
+  const base = firstSentence && firstSentence.length >= 12 ? firstSentence : collapsed;
+  return base.slice(0, 200);
+}
+
+/** A bare zero-work stall announcement ("Continuing.", "OK.", or a future-tense
+ *  "I'll pull the records now" with nothing done) — NOT a real deliverable. These
+ *  defer to the existing toolCalls-aware stall detector (evaluateProgress in the
+ *  no-decision branch), which is the desired safety, not a parse failure. Fail-open
+ *  applies to SUBSTANTIVE output; a recognized punt is never surfaced as the reply.
+ *  Mirrors evaluateProgress's Signal A / A' text checks so there is one vocabulary. */
+function looksLikeZeroWorkStallText(trimmed: string): boolean {
+  if (trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) return true;
+  if (STALL_ANNOUNCEMENT_PATTERN.test(trimmed) && !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)) return true;
+  return false;
+}
+
+/** Parse the model's plain-text turn output into a decision. Never returns a
+ *  "malformed" verdict for substantive non-empty text — see FAIL-OPEN above. */
+function parseDecisionText(text: string): OrchestratorDecisionShape | null {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed === STRUCTURED_OUTPUT_RECOVERY_FALLBACK) return null;
+
+  // Back-compat / graceful transition: a model still emitting the JSON envelope
+  // as text parses cleanly rather than being shown to the user as raw JSON.
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === 'object') {
+        const obj = decisionFromObject(parsed as Record<string, unknown>);
+        if (obj) return obj;
+      }
+    } catch { /* not a decision envelope — fall through to the marker contract */ }
+  }
+
+  const ask = trimmed.match(ASK_DECISION_MARKER);
+  const cont = trimmed.match(CONTINUE_DECISION_MARKER);
+  // A recognized zero-work punt (no explicit marker) defers to the stall path.
+  // Explicit ASK:/CONTINUE: markers are intentional and always honored.
+  if (!ask && !cont && looksLikeZeroWorkStallText(trimmed)) return null;
+  if (ask && ask[1].trim()) {
+    const question = ask[1].trim();
+    return {
+      summary: deriveDecisionSummary(question),
+      reply: scrubInternalNarration(question) || question,
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'ask',
+    };
+  }
+
+  if (cont) {
+    const why = cont[1].trim() || 'Continuing.';
+    // done:false + awaiting_handoff_result is the loop's existing "keep looping"
+    // shape — it skips the completion + missing-reply paths and recurses.
+    return {
+      summary: deriveDecisionSummary(why),
+      reply: null,
+      done: false,
+      nextAction: 'awaiting_handoff_result',
+      reason: why.slice(0, 400),
+    };
+  }
+
+  // No marker → the whole body IS the completed, user-facing reply.
+  const reply = scrubInternalNarration(trimmed) || trimmed;
+  return {
+    summary: deriveDecisionSummary(trimmed),
+    reply,
+    done: true,
+    nextAction: 'completed',
+    reason: null,
+  };
+}
+
+export function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
+  if (typeof value === 'string') return parseDecisionText(value);
+  if (value && typeof value === 'object') return decisionFromObject(value as Record<string, unknown>);
+  return null;
 }
 
 // ---------- public API ----------
