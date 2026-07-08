@@ -145,6 +145,13 @@ export interface EnqueueDurableChatTaskInput {
    */
   composedPrompt?: string;
   /**
+   * Rich goal contract for the run (objective/criteria/next actions). When
+   * absent, a default goal is bound from `message` — EVERY durable task is
+   * goal-bound at creation (completion validation + deliverable probes +
+   * single-owner resume all key off it).
+   */
+  goal?: { objective: string; successCriteria?: string[]; nextActions?: string[] };
+  /**
    * The interactive session that spawned this task. REQUIRED for report-back —
    * the daemon feeds the result back into this session's transcript on
    * completion. Without it the result is notification-only.
@@ -185,6 +192,22 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',
   });
+  // GOAL-BIND AT CREATION — a property of backgrounding itself, not of which
+  // path queued it. Live 2026-07-08: an auto-promoted task ran with NO goal
+  // (only two of five entry paths bound one), so no completion validation and
+  // no deliverable probes ran — a zero-tools hallucination marked itself
+  // "done" having done nothing, and single-owner resume didn't apply either.
+  // Callers with richer contracts pass `goal`; everyone else gets the message
+  // as the objective. Best-effort like bindBackgroundRunGoal itself.
+  try {
+    bindBackgroundRunGoal(task.runSessionId, {
+      objective: input.goal?.objective ?? stripBackgroundPrefix(input.message) ?? input.message,
+      successCriteria: input.goal?.successCriteria,
+      nextActions: input.goal?.nextActions,
+      originatingRequest: input.message,
+      channel: input.channel,
+    });
+  } catch { /* prompt-only fallback — never blocks the task */ }
   // Kick the daemon to drain THIS task now rather than on its next 15s tick — the
   // single choke point for every create path (dispatch_background_task, chat/mobile/
   // discord auto-promotion), so a backgrounded task actually fires, turns RUNNING on
@@ -269,9 +292,7 @@ export function detachRunningTurnToBackground(sessionId: string): BackgroundItRe
     `Your progress so far is recorded in session "${sessionId}". Call session_history with that id FIRST to see what is already done, then continue from there — do NOT redo completed work.`,
     'Work through to completion, then report the result back.',
   ].join('\n');
-  const task = enqueueDurableChatTask({ message: objective, composedPrompt, sessionId, source: 'desktop' });
-  // Goal-bind so the background run works until its criteria hold + reports back (Inc B).
-  try { bindBackgroundRunGoal(task.runSessionId, { objective, originatingRequest: objective }); } catch { /* best effort */ }
+  const task = enqueueDurableChatTask({ message: objective, composedPrompt, sessionId, source: 'desktop', goal: { objective } });
   return {
     handled: true,
     taskId: task.id,

@@ -7,7 +7,7 @@ import {
 } from '../execution/background-task-status.js';
 import { enqueueDurableChatTask } from '../execution/background-promote.js';
 import type { BackgroundTaskRecord } from '../execution/background-tasks.js';
-import { bindBackgroundRunGoal, holdTaskForLater, listHeldTasks, getHeldTask } from '../agents/plan-proposals.js';
+import { getActiveGoalForSession, holdTaskForLater, listHeldTasks, getHeldTask } from '../agents/plan-proposals.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -168,18 +168,15 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         channel: originRoute.channel,
         source: originRoute.source,
         maxMinutes: max_minutes ?? undefined,
+        // Rich contract rides through enqueue's goal-bind-at-creation (the
+        // single mechanism every entry path now shares).
+        goal: {
+          objective,
+          successCriteria: success_criteria ?? undefined,
+          nextActions: planToNextActions(plan),
+        },
       });
-
-      // Bind a durable goal contract to the task's RUN session so the unattended
-      // run is goal-DRIVEN: it works until the success criteria validate (not one
-      // pass) and reports back against them — "have the goal defined" before
-      // backgrounding. Best-effort; on failure the task still runs on its prompt.
-      const goal = bindBackgroundRunGoal(task.runSessionId, {
-        objective,
-        successCriteria: success_criteria ?? undefined,
-        nextActions: planToNextActions(plan),
-        originatingRequest: objective,
-      });
+      const goal = getActiveGoalForSession(task.runSessionId);
 
       return textResult(
         `Dispatched "${task.title}" to the background (task ${task.id})`

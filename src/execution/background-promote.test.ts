@@ -184,3 +184,13 @@ test('detachRunningTurnToBackground: null when there is nothing to background', 
   const sess = createSession({ kind: 'chat' });
   assert.equal(detachRunningTurnToBackground(sess.id), null, 'no objective → null (caller treats as a normal turn)');
 });
+
+test('EVERY durable task is goal-bound at creation — including the auto-promote path (2026-07-08 zero-goal done-with-nothing)', async () => {
+  const { enqueueDurableChatTask } = await import('./background-promote.js');
+  const { getActiveGoalForSession } = await import('../agents/plan-proposals.js');
+  const task = enqueueDurableChatTask({ message: 'pull 10 keyword volumes and write them to a sheet', sessionId: 'sess-goalbind-test', source: 'desktop' });
+  const goal = getActiveGoalForSession(task.runSessionId);
+  assert.ok(goal, 'a task enqueued with NO explicit goal input must still get a bound goal contract');
+  const obj = (goal!.approvedPlan ?? goal!.plan).objective ?? '';
+  assert.match(obj, /keyword volumes/i, 'default goal objective derives from the message');
+});
