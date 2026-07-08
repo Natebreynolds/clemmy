@@ -30,7 +30,7 @@ import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
-import { dispatchBatchItemTool } from './code-mode-tool.js';
+import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
 import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 
@@ -66,7 +66,7 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
     name: 'call_tool',
     description: DESCRIPTION,
     parameters: z.object({
-      name: z.string().min(1).describe('Exact built-in tool name from the catalog to invoke.'),
+      name: z.string().min(1).describe('Exact tool name to invoke: a built-in from the catalog, OR a connected external MCP tool as <server>__<tool> (e.g. dataforseo__serp_organic_live_advanced).'),
       args_json: z.string().describe('JSON object string of the target tool\'s arguments. Use "{}" for no args.'),
     }),
     // needsApproval intentionally omitted → false. Gate decisions come from the
@@ -76,19 +76,28 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
       if (!target) return JSON.stringify({ error: 'bad_request', detail: 'name is required' });
 
       // 1. Authority — never escalate past the curated orchestrator surface.
-      const allowed = deriveOrchestratorDiscoveryNames();
-      const policy = resolveEffectiveToolPolicy({
-        surface: 'orchestrator',
-        lane: 'chat',
-        tools: [{ name: target }],
-        allowedToolNames: [...allowed],
-        reason: 'call_tool generic dispatch',
-      });
-      if (policy.tools.length === 0) {
-        return JSON.stringify({
-          error: 'not_reachable',
-          detail: `"${target}" is not a callable tool on this surface. Use tool_search to find the right tool.`,
+      // External MCP names (<server>__<tool>) are admitted here and enforced
+      // DOWNSTREAM: dispatchBatchItemTool resolves them against the session's
+      // connected MCP scope (unknown/unconnected servers error honestly) and
+      // routes approval through decideToolApproval on the inner name — the
+      // same contract as run_batch/run_tool_program. Refusing them here was a
+      // live Phase-1 gap (2026-07-08): the model fell back to hand-rolling the
+      // provider's REST API through shell calls, slower and less gated.
+      if (!isMcpNamespacedTool(target)) {
+        const allowed = deriveOrchestratorDiscoveryNames();
+        const policy = resolveEffectiveToolPolicy({
+          surface: 'orchestrator',
+          lane: 'chat',
+          tools: [{ name: target }],
+          allowedToolNames: [...allowed],
+          reason: 'call_tool generic dispatch',
         });
+        if (policy.tools.length === 0) {
+          return JSON.stringify({
+            error: 'not_reachable',
+            detail: `"${target}" is not a callable tool on this surface. Use tool_search to find the right tool, or a connected external MCP tool as <server>__<tool>.`,
+          });
+        }
       }
 
       // 2. Parse args_json.

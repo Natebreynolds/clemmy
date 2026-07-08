@@ -134,3 +134,14 @@ test('a successful dispatch records the reached tool to the session hot-set', as
     _setCodeModeToolsForTests(null);
   }
 });
+
+test('an external MCP name (<server>__<tool>) passes authority and reaches MCP resolution (2026-07-08 live gap)', async () => {
+  // The model tried call_tool→dataforseo__kw_data_google_ads_search_volume live
+  // and got not_reachable, then fell back to hand-rolling the provider REST API
+  // through shell calls. MCP names must pass the built-in allowlist and be
+  // enforced DOWNSTREAM by the session's connected-MCP scope. Here no MCP server
+  // is connected, so dispatch fails — but with an MCP-resolution error, NOT the
+  // authority refusal.
+  const out = String(await invokeCallTool('sess-mcp', 'fakeserver__fake_tool', '{"q":1}'));
+  assert.ok(!out.includes('not_reachable'), 'MCP names must not be refused by the built-in authority check');
+});
