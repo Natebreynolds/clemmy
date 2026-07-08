@@ -1368,6 +1368,19 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
           const { prewarmMcpServers } = await import('../runtime/mcp-servers.js');
           const { attempts, allConnected } = await prewarmMcpServers();
           logger.info({ attempts, allConnected }, 'MCP pre-warm complete');
+          // Prime the semantic tool-vector cache too. Connect alone left the
+          // FIRST scoped turn paying listTools + embedTexts over every external
+          // tool description cold — measured live at ~45s of "Starting up…"
+          // (2026-07-08, 25-keyword smoke). Vectors cache by content hash for
+          // the daemon lifetime, so one throwaway rank here makes the first
+          // real turn's scope resolution embed only its query.
+          const [{ getOrCreateExternalMcpServers }, { rankToolsBySemantic }] = await Promise.all([
+            import('../runtime/mcp-servers.js'),
+            import('../runtime/mcp-tool-rank.js'),
+          ]);
+          const externalTools = await getOrCreateExternalMcpServers().listTools();
+          await rankToolsBySemantic('warmup: prime external tool vectors', externalTools as never);
+          logger.info({ toolCount: externalTools.length }, 'MCP pre-warm: tool vectors primed');
         } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'MCP pre-warm failed (servers connect on first use)');
         }
