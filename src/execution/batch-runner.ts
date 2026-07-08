@@ -31,12 +31,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { Agent, Runner } from '@openai/agents';
-import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import { dispatchBatchItemTool, READ_ONLY_TOOLS, isMcpNamespacedTool } from '../tools/code-mode-tool.js';
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 
 const logger = pino({ name: 'clementine-next.batch-runner' });
@@ -140,16 +138,6 @@ export function validateBatchPlan(plan: BatchPlan): string[] {
 
 // ─── Certification judge (ONE model call for the whole plan) ────────────────
 
-// NO length caps on judge text: a verbose-but-valid verdict must never be
-// rejected on cosmetics (live 2026-07-07: sonnet's reason overflowed a .max(400)
-// → schema invalid → "judge unavailable" → send plan failed CLOSED five times).
-// Lengths are clamped in code after parse; the schema only pins the SHAPE.
-const BatchVerdictSchema = z.object({
-  allow: z.boolean(),
-  reason: z.string(),
-  concerns: z.array(z.string()).nullable().optional(),
-});
-
 export interface BatchCertification {
   allow: boolean;
   reason: string;
@@ -166,27 +154,34 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
     `SAMPLED PAYLOADS (${sample.length} of ${plan.items.length}):`,
     JSON.stringify(sample, null, 1).slice(0, 12_000),
   ].join('\n');
+  // PLAIN-TEXT verdict, parsed deterministically. Structured output was a
+  // load-bearing dependency on this safety path and it flaked twice live on
+  // 2026-07-07/08 (".max() overflow" then provider-shape validation failures)
+  // — each flake failing a WRITE plan closed. A one-line text contract has no
+  // schema to fail: first line "ALLOW: <reason>" or "DENY: <reason>"; any
+  // response without that marker throws → retry → fail-closed. Deterministic
+  // checks stay primary (validateBatchPlan); the judge is a second opinion.
   const runJudgeOnce = async (): Promise<BatchCertification> => {
-    const agent = new Agent<unknown, typeof BatchVerdictSchema>({
+    const agent = new Agent({
       name: 'Batch Plan Judge',
       model: resolveRoleModel('judge').modelId,
       instructions: [
         'You certify a BATCH PLAN before deterministic execution: one tool, N pre-baked payloads, executed with no further review.',
         'ALLOW only when the sampled payloads actually accomplish the stated objective and nothing in them looks misdirected: wrong recipients/targets for the objective, placeholder or template-variable text left in ({{name}}, TODO, lorem), payloads inconsistent with each other, or a scope wider than the objective states.',
-        'You are the ONLY review these payloads get — when unsure on a write/send plan, set allow=false and say why.',
-        'Keep reason to 1–2 sentences and each concern to one line.',
+        'You are the ONLY review these payloads get — when unsure on a write/send plan, DENY and say why.',
+        'Reply with EXACTLY ONE LINE and nothing else: either "ALLOW: <one-sentence reason>" or "DENY: <one-sentence reason>".',
       ].join(' '),
-      outputType: normalizeZodForCodexStrict(BatchVerdictSchema) as typeof BatchVerdictSchema,
+      tools: [],
     });
     const runner = new Runner({ workflowName: 'clementine-batch-certify' });
     const result = await runner.run(agent, input);
-    const final = (result as { finalOutput?: z.infer<typeof BatchVerdictSchema> }).finalOutput;
-    if (!final || typeof final.allow !== 'boolean') throw new Error('judge returned no verdict');
-    // Clamp in code — length is presentation, never validity.
+    const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
+    const match = /^\s*(ALLOW|DENY)\s*:?\s*(.*)$/im.exec(raw);
+    if (!match) throw new Error(`judge returned no ALLOW/DENY verdict (got: ${raw.slice(0, 120)})`);
     return {
-      allow: final.allow,
-      reason: (final.reason ?? '').slice(0, 400),
-      concerns: (final.concerns ?? []).filter((c): c is string => typeof c === 'string').slice(0, 8).map((c) => c.slice(0, 200)),
+      allow: match[1].toUpperCase() === 'ALLOW',
+      reason: (match[2] || '').slice(0, 400),
+      concerns: [],
       judged: true,
     };
   };
