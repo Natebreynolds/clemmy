@@ -3,7 +3,6 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { Agent, run } from '@openai/agents';
-import { z } from 'zod';
 import { BASE_DIR, MODELS, getRuntimeEnv } from '../config.js';
 import {
   backupMemoryDb,
@@ -16,7 +15,6 @@ import { canMergeEntitySafe, extractAnchors } from './memory-merge.js';
 import { appendHygieneAudit, readHygieneAudit, type HygieneAuditEntry } from './hygiene-audit.js';
 import { readFactRecallTrace, type FactRecallSurface } from './recall-trace.js';
 import { isSelfReferentialTool } from './reflection.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 
 const logger = pino({ name: 'clementine-next.memory.self-heal' });
 
@@ -529,11 +527,17 @@ export function detectMemoryHealCandidates(opts: CandidateOptions = {}): Propose
   return opts.persistProposals === false ? deduped : upsertProposals(deduped);
 }
 
-const MemoryFixVetoSchema = z.object({
-  approve: z.boolean(),
-  reason: z.string(),
-});
-
+/**
+ * Cross-family VETO judge for an automated memory fix. Verdict is PLAIN TEXT,
+ * parsed deterministically ("APPROVE: reason" / "VETO: reason") — the
+ * boundary-judge sweep from 2e10714e/2538d916. No outputType, so a provider's
+ * shape-validation can't reject a valid verdict and misreport the judge.
+ *
+ * FAILS CLOSED (unlike the workflow HealVeto): a no-marker / empty / errored
+ * response returns 'unavailable', and the caller skips the fix while
+ * memorySelfHealJudgeRequired() is on (a memory mutation is never applied
+ * unverified). That skip semantics is UNCHANGED from the outputType era.
+ */
 export async function judgeMemoryFixCrossFamily(fix: ProposedMemoryFix): Promise<{ verdict: 'approve' | 'veto' | 'unavailable'; reason?: string }> {
   if (!memorySelfHealJudgeRequired()) return { verdict: 'unavailable', reason: 'memory fix judge disabled' };
   if (fix.kind !== 'merge_duplicate' && fix.kind !== 'supersede_stale_fact') return { verdict: 'approve', reason: 'deterministic fix kind' };
@@ -553,11 +557,11 @@ export async function judgeMemoryFixCrossFamily(fix: ProposedMemoryFix): Promise
         'Approve only if the evidence supports the exact proposed memory mutation and the fix cannot reasonably erase distinct user knowledge.',
         'For duplicate merges, approve only when the two facts express the same durable fact about the same entity. Reject if they may refer to different clients, people, accounts, dates, resources, or requirements.',
         'For supersession, approve only when a newer direct/high-trust fact clearly replaces an older lower-trust derived fact about the same property. Reject user-vs-user ambiguity.',
-        'When uncertain, reject. A rejected memory fix is skipped, not lost.',
+        'When uncertain, VETO — a vetoed memory fix is skipped, not lost.',
+        'Reply with EXACTLY ONE LINE and nothing else: either "APPROVE: <one-sentence reason>" or "VETO: <one-sentence reason>".',
       ].join('\n'),
       model: judge.modelId,
       modelSettings: { reasoning: { effort: 'low' } },
-      outputType: normalizeZodForCodexStrict(MemoryFixVetoSchema) as typeof MemoryFixVetoSchema,
       tools: [],
     });
     const rows = fix.targetIds.map((id) => rowById(id)).filter((r): r is ConsolidatedFactRow => Boolean(r));
@@ -569,12 +573,29 @@ export async function judgeMemoryFixCrossFamily(fix: ProposedMemoryFix): Promise
       ...rows.map((r) => `#${r.id} kind=${r.kind} trust=${r.trust_level ?? 'null'} pinned=${r.pinned} active=${r.active}: ${r.content.slice(0, MAX_JUDGED_TEXT)}`),
     ].join('\n');
     const result = await withJudgeTimeout(run(agent, prompt));
-    const out = result?.finalOutput as z.infer<typeof MemoryFixVetoSchema> | undefined;
-    if (!out) return { verdict: 'unavailable', reason: 'judge timeout' };
-    return out.approve ? { verdict: 'approve', reason: out.reason } : { verdict: 'veto', reason: out.reason };
+    return parseMemoryVetoVerdict(String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? ''));
   } catch (err) {
     return { verdict: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * Parse the judge's ONE-LINE plain-text verdict deterministically:
+ *   "APPROVE: <reason>" → approve · "VETO: <reason>" → veto
+ * Case-insensitive, tolerates leading whitespace and a missing colon. Anything
+ * else — empty output or a response with no APPROVE/VETO marker — is
+ * 'unavailable', which the caller treats as a FAIL-CLOSED skip (a memory
+ * mutation is never applied on an unreadable verdict). Nothing to fail on shape.
+ */
+export function parseMemoryVetoVerdict(raw: string): { verdict: 'approve' | 'veto' | 'unavailable'; reason?: string } {
+  const text = (raw ?? '').trim();
+  if (!text) return { verdict: 'unavailable', reason: 'judge timeout' };
+  const match = /^\s*(APPROVE|VETO)\s*:?\s*(.*)$/im.exec(text);
+  if (!match) return { verdict: 'unavailable', reason: `judge returned no APPROVE/VETO verdict (got: ${text.slice(0, 120)})` };
+  const reason = (match[2] || '').trim().slice(0, 400);
+  return match[1].toUpperCase() === 'APPROVE'
+    ? { verdict: 'approve', reason }
+    : { verdict: 'veto', reason };
 }
 
 function requireRow(id: number): ConsolidatedFactRow | null {

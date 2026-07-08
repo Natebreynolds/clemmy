@@ -33,6 +33,7 @@ const {
   runMemorySelfHeal,
   revertMemoryHeal,
   listProposedMemoryFixes,
+  parseMemoryVetoVerdict,
   _memorySelfHealTest,
 } = await import('./self-heal.js');
 
@@ -298,4 +299,45 @@ test('supersession parser keeps correction subject stable', () => {
   assert.equal(p?.subject, 'nathan');
   assert.equal(p?.property, 'preference');
   assert.equal(p?.value, 'wednesday calls');
+});
+
+// ─── plain-text VETO marker parse (converted from MemoryFixVetoSchema) ──────
+test('parseMemoryVetoVerdict: APPROVE / VETO markers, case + whitespace tolerant', () => {
+  assert.deepEqual(parseMemoryVetoVerdict('APPROVE: same durable fact about the same client'),
+    { verdict: 'approve', reason: 'same durable fact about the same client' });
+  assert.deepEqual(parseMemoryVetoVerdict('VETO: these may be two different accounts'),
+    { verdict: 'veto', reason: 'these may be two different accounts' });
+  // lowercase marker
+  assert.equal(parseMemoryVetoVerdict('veto: distinct people').verdict, 'veto');
+  // leading whitespace/newlines + a missing colon
+  assert.equal(parseMemoryVetoVerdict('\n  APPROVE newer high-trust correction').verdict, 'approve');
+  // first line wins when the model adds trailing lines
+  assert.equal(parseMemoryVetoVerdict('VETO: ambiguous\nfurther notes').verdict, 'veto');
+});
+
+test('parseMemoryVetoVerdict: FAILS CLOSED — no marker / empty output → unavailable (never a silent apply)', () => {
+  assert.equal(parseMemoryVetoVerdict('Sure, this looks fine to merge.').verdict, 'unavailable', 'no marker → unavailable');
+  assert.equal(parseMemoryVetoVerdict('').verdict, 'unavailable', 'empty → unavailable');
+  assert.equal(parseMemoryVetoVerdict('   \n  ').verdict, 'unavailable', 'whitespace-only → unavailable');
+});
+
+test('applyMemoryFix: an "unavailable" verdict is a FAIL-CLOSED skip (the fix is NOT applied)', async () => {
+  const keep = rememberFact({ kind: 'project', content: 'Revill Law Firm SEO report lives at revill-lawfirm.com/report.', score: 5, importance: 8 });
+  const drop = rememberFact({ kind: 'project', content: 'The Revill Law Firm SEO report is at revill-lawfirm.com/report.', score: 1, importance: 6 });
+  setEmbedding(keep.id, [1, 0, 0, 0]);
+  setEmbedding(drop.id, [0.999, 0.001, 0, 0]);
+  const candidates = detectMemoryHealCandidates({ nowIso: '2026-07-08T12:00:00.000Z' });
+  const fix = candidates.find((c) => c.kind === 'merge_duplicate');
+  assert.ok(fix, 'a duplicate merge was proposed');
+  // Fail-closed only applies while the judge is REQUIRED (its normal default).
+  process.env.CLEMMY_MEMORY_SELF_HEAL_JUDGE = 'on';
+  try {
+    const res = await applyMemoryFix(fix!, {
+      nowIso: '2026-07-08T12:01:00.000Z',
+      judge: async () => ({ verdict: 'unavailable', reason: 'judge timeout' }),
+    });
+    assert.equal(res.ok, false, 'an unreadable/unavailable verdict skips the mutation (fail closed)');
+  } finally {
+    process.env.CLEMMY_MEMORY_SELF_HEAL_JUDGE = 'off';
+  }
 });

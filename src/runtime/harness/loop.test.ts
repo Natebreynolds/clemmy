@@ -1673,7 +1673,7 @@ test('runConversation: completed decision with empty reply is retried, not shown
 
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 2, 'one retry should recover the missing reply');
-  assert.match(inputs.at(-1) ?? '', /reply` was empty/);
+  assert.match(inputs.at(-1) ?? '', /NO visible answer/);
   const guardrails = listEventsForConv(sess.id, { types: ['guardrail_tripped'] });
   assert.ok(guardrails.some((e) => (e.data as { kind?: string }).kind === 'completed_without_reply'));
   const stepEvents = listEventsForConv(sess.id, { types: ['conversation_step'] });

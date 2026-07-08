@@ -1132,13 +1132,12 @@ function userVisibleStepDecision(
 function buildMissingReplyRetryMessage(decision: OrchestratorDecisionShape, path: 'conversation' | 'resume'): string {
   const internal = JSON.stringify((decision.summary ?? '').slice(0, 700));
   return [
-    'Your previous structured decision marked nextAction=completed, but `reply` was empty.',
-    'That leaves the user with no visible answer. Do NOT expose this diagnostic text to the user.',
-    `Internal summary for context (${path} path): ${internal}.`,
-    'Return the exact structured decision object again with a concise, non-empty, user-facing `reply`.',
+    'Your previous turn ended as completed but produced NO visible answer for the user.',
+    'Do NOT expose this diagnostic text to the user.',
+    `Internal note for context (${path} path): ${internal}.`,
+    'Reply again with the actual answer as plain text — that text IS what the user reads (no JSON, no marker needed for a finished answer).',
     'If the latest user message was only a greeting or small talk, reply naturally and ask what they would like to work on.',
-    'If real work was completed, put the actual result/evidence in `reply`.',
-    'Use `summary` only for internal notes.',
+    'If real work was completed, state the actual result/evidence.',
   ].join(' ');
 }
 
@@ -1859,7 +1858,7 @@ async function runConversationCore(
         });
         const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
         if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        nextInput = 'Your previous response could not be parsed into the required structured decision. Re-issue it now as the exact decision object (summary, reply, done, nextAction, reason) — keep the reply concise and put any large deliverable in FILES via the file tools, never inline in the reply. If the task is NOT finished, set done:false and take the next concrete action now (write the files, run the shell/CLI command, deploy) — do not stop at a plan; keep going until the actual deliverable exists.';
+        nextInput = 'Your previous response could not be parsed into the required structured decision. Re-issue your turn as PLAIN TEXT — no JSON: end with your answer for the user, or a leading `ASK: <question>` if you need me, or `CONTINUE: <why>` if you have more tool calls to make. Keep the reply concise and put any large deliverable in FILES via the file tools, never inline. If the task is NOT finished, take the next concrete action now (write the files, run the shell/CLI command, deploy) — do not stop at a plan; keep going until the actual deliverable exists.';
         continue;
       }
       // Retry budget exhausted, or genuinely nothing to recurse on. End cleanly.
@@ -2031,7 +2030,7 @@ async function runConversationCore(
         });
         const backoffMs = STALL_RETRY_BACKOFF_MS[stallRetriesUsed - 1] ?? 1000;
         if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        nextInput = 'Your previous response could not be parsed into the required structured decision — it came back empty or malformed. Re-issue it now as the exact decision object (summary, reply, done, nextAction, reason). If the task is NOT finished, set done:false and take the next concrete action — call the tool you need now.';
+        nextInput = 'Your previous response could not be parsed into the required structured decision — it came back empty or malformed. Re-issue your turn as PLAIN TEXT (no JSON): end with your answer, or a leading `ASK: <question>` / `CONTINUE: <why>` marker. If the task is NOT finished, take the next concrete action — call the tool you need now.';
         continue;
       }
 

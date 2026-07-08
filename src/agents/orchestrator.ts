@@ -69,12 +69,12 @@ import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
  * as a parallel-fan-out leaf invoked via `run_worker(prompt)` for
  * N-independent-items work.
  *
- * outputType is structured (OrchestratorDecisionSchema) so the loop
- * can reason over `done` / `nextAction` without parsing free text.
- * Per the SDK, structured output disables parallel_tool_calls on this
- * agent — Worker fan-out happens via parallel tool calls to
- * run_worker, which IS parallelizable because run_worker is a tool,
- * not a handoff.
+ * The turn output is PLAIN TEXT + an optional one-line marker (ASK: /
+ * CONTINUE:), parsed by the loop (parseDecisionText). The structured
+ * OrchestratorDecisionSchema/outputType is retained only for the
+ * emergency CLEMMY_PLAINTEXT_DECISION=off revert. Worker fan-out
+ * happens via parallel tool calls to run_worker, which IS
+ * parallelizable because run_worker is a tool, not a handoff.
  *
  * Input + output guardrails come from the harness registry so the
  * SDK enforces policy_violation / missing_capability before any
