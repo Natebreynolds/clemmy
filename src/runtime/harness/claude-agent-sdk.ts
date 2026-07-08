@@ -12,6 +12,7 @@ import type {
   SDKSystemMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { BASE_DIR, PKG_DIR, getRuntimeEnv } from '../../config.js';
+import { deriveSdkProfile } from '../../tools/tool-registry.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { scheduleReflection } from '../../memory/reflection.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
@@ -215,185 +216,37 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
   }) as CanUseTool;
 }
 
-export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
-  'ping',
-  // Converse-first: the Claude brain's rubric says to ask ONE clarifying question
-  // up front for an ambiguous / multi-step request — but it had NO tool to do it, so
-  // it fell through to execution (2026-07-01: it proceeded where the Codex brain asked).
-  // In READ_ONLY so it flows into every profile (a read-only brain can still ask).
-  // It is a terminal-after-tool (below): calling it stops the turn + surfaces the
-  // question, and the user's next message answers it.
-  'ask_user_question',
-  'memory_search',
-  'memory_read',
-  'memory_recall',
-  'memory_list_facts',
-  'memory_search_facts',
-  // Local-only memory writes are safe in the "read-only" Claude brain profile:
-  // they do not touch external systems, but they preserve core chat semantics
-  // for explicit "remember this" requests across model backends.
-  'memory_remember',
-  'task_list',
-  'workspace_roots',
-  'workspace_list',
-  'workspace_info',
-  // Read a Workspace (interactive surface) + list them — a dock chat runs under
-  // session "space-<slug>" and must be able to read the workspace it edits.
-  // space_get_view returns the actual line-numbered view HTML (space_get does not),
-  // so the model can craft a verbatim space_edit_view find string instead of
-  // shelling out to read_file/grep the view.
-  'space_get',
-  'space_get_view',
-  'space_get_runner',
-  'space_list',
-  'list_files',
-  'read_file',
-  'git_status',
-  'mcp_status',
-  'composio_status',
-  'user_profile_read',
-  'session_history',
-  'agent_runs_recent',
-  'agent_run_get',
-  'background_tasks_recent',
-  'background_task_status',
-  'dispatch_background_task',
-  'hold_task_for_later',
-  'resume_held_task',
-  'team_list',
-  'team_pending_requests',
-  'check_delegation',
-  'pending_action_list',
-  'pending_action_get',
-  'skill_list',
-  'skill_read',
-  // Schema-on-demand discovery entry (read-only): search the built-in tool
-  // catalog by intent. SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 0. In READ_ONLY so
-  // it flows into every profile (a read-only brain can still discover a tool).
-  'tool_search',
-  'tool_choice_recall',
-  // Recall the verbatim / sliced payload of a clipped tool result (read-only).
-  'recall_tool_result',
-  'tool_output_query',
-] as const;
+// ── SDK tool profiles — DERIVED from the single tool registry ──────────────────
+// TOOL-REGISTRY-PLAN-2026-07-07.md, step 2: the hand-maintained profile arrays
+// were deleted; membership + nesting now come from deriveSdkProfile(...) over the
+// registry's `sdkLayer` field. The per-tool rationale that used to live in these
+// comments is now on each registry row. Frozen at module load — tool-registry.ts
+// imports nothing (a leaf), so no import cycle forms; a conformance test still pins
+// each profile's known-critical members. Names + `readonly string[]` shape are
+// preserved so every importer is untouched.
+//
+// Profiles NEST exactly as the source lists spread into one another:
+//   read-only ⊂ authoring;  agentic = the shared execution bundle;
+//   worker = read-only ∪ agentic;  full = read-only ∪ authoring ∪ agentic ∪ full-extra.
 
-export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS = [
-  ...CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
-  // Local Clementine memory / planning state. These never touch external
-  // systems, but they let Claude act like a real selected brain instead of a
-  // read-only analyst.
-  'memory_remember',
-  'source_map_upsert',
-  'working_memory',
-  'note_create',
-  'note_take',
-  'task_add',
-  'task_update',
-  'goal_create',
-  'goal_update',
-  'create_plan',
-  'update_plan_step',
-  // Role routing is local env state and is the chat surface for "use Claude for
-  // design" / "make Opus the judge".
-  'set_model_role',
-  'clear_model_role',
-  // Workflow authoring and queueing are local Clementine state. The workflow
-  // runner still owns execution-time write/send gates.
-  'workflow_list',
-  'workflow_get',
-  'workflow_create',
-  'workflow_from_session',
-  'workflow_update',
-  'workflow_edit_step',
-  'workflow_set_enabled',
-  'workflow_run',
-  'workflow_run_status',
-  'workflow_rerun_failed_items',
-  'workflow_schedule',
-  'workflow_unschedule',
-  // Editing a Workspace is LOCAL Clementine state (the view + its data runners),
-  // like workflow authoring above. space_edit_view/space_save change the local
-  // view; space_refresh re-pulls its data. Without these in the surface, a Claude
-  // dock turn can't persist a workspace edit and wrongly writes a scratch file.
-  'space_edit_view',
-  'space_edit_runner',
-  'space_revert_runner',
-  'space_save',
-  'space_refresh',
-  // space_try_runner dry-runs a candidate data runner (no persist) so the model
-  // iterates inside the surface instead of `node data/x.mjs` in the shell;
-  // space_set_data commits a known inline dataset (the one-row-fix path).
-  'space_try_runner',
-  'space_set_data',
-  // space_publish exports a static share-ready snapshot into the workspace's
-  // own publish/ dir (local write only; the deploy step is separately gated).
-  'space_publish',
-  // Durable team-agent coordination is local Clementine state. Keep these in
-  // the full/local-authoring brain profile so Claude can create and hand off
-  // work through the same substrate as Codex/GLM.
-  'team_message',
-  'team_request',
-  'team_reply',
-  'agent_propose',
-  'create_agent',
-  'update_agent',
-  'delegate_task',
-  // Pending-action queue is local state: it prepares an exact payload and asks
-  // once before the separately gated execution tool runs.
-  'pending_action_queue',
-  'pending_action_record_result',
-] as const;
+/** Read-only brain surface (flows into every profile). */
+export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS: readonly string[] = Object.freeze([...deriveSdkProfile('read-only')]);
 
-// Mutating tools exposed through the harness gate chain (gated-mutating-tools.ts)
-// + the async approval gate (claude-agent-approval.ts). Shared by the brain
-// (full) and worker (scoped) agentic profiles.
-const AGENTIC_EXECUTION_TOOLS = [
-  'run_shell_command',
-  'write_file',
-  'composio_search_tools',
-  'composio_list_tools',
-  'composio_execute_tool',
-  'local_cli_list',
-  'local_cli_probe',
-  // Surface-to-user channel. A workflow "notify"/report step (and agentic
-  // workers) need this to actually deliver — it's registered on the MCP server
-  // (registerAutonomyActionTools) but was absent from the allowlist, so a Claude
-  // notify step blocked with no tool to call.
-  'notify_user',
-] as const;
+/** Local-authoring surface (read-only + local memory/planning/workflow/space authoring). */
+export const CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS: readonly string[] = Object.freeze([...deriveSdkProfile('authoring')]);
 
-/** Full agentic surface for the Claude BRAIN: local-authoring + execution tools
- *  + the gated mutating surface. Execution lanes let the execution-wrap gate be
- *  satisfied and batch fan-out wrap. */
-export const CLAUDE_AGENT_SDK_FULL_TOOLS = [
-  ...CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
-  ...AGENTIC_EXECUTION_TOOLS,
-  'execution_create',
-  'execution_list',
-  'execution_get',
-  'execution_update_step',
-  'execution_mark_blocked',
-  'execution_complete',
-  // Fan-out primitive — BRAIN ONLY (deliberately NOT in AGENTIC_EXECUTION_TOOLS, so a
-  // WORKER never gets run_worker → no worker-spawns-worker recursion). Lets a Claude
-  // brain parallelize N independent items instead of processing them sequentially and
-  // blowing its per-query turn budget.
-  'run_worker',
-  // Deterministic same-shape-N executor — BRAIN ONLY, same rationale as run_worker
-  // (a worker handles ONE item; it never batches). Reason-once/certify-once/execute-
-  // N-deterministically for baked-arg batches (send N emails, update N records).
-  'run_batch',
-] as const;
+// The shared mutating execution bundle (formerly AGENTIC_EXECUTION_TOOLS) is no
+// longer a standalone constant — FULL and WORKER derive it directly via
+// deriveSdkProfile('full') / ('worker'). deriveSdkProfile('agentic') still returns
+// the bundle if a future caller needs it.
 
-/** Scoped agentic surface for a Claude WORKER (one parent-planned item). The
- *  PARENT owns the execution lane + batch approval, so a worker gets the gated
- *  mutating tools but NOT execution_create / workflow authoring. The shared
- *  parent session means the parent's execution lane + plan-scope cover the
- *  worker's gated writes. */
-export const CLAUDE_AGENT_SDK_WORKER_TOOLS = [
-  ...CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
-  ...AGENTIC_EXECUTION_TOOLS,
-] as const;
+/** Full agentic surface for the Claude BRAIN: authoring + execution + the gated
+ *  mutating surface + brain-only fan-out (run_worker/run_batch) and execution lanes. */
+export const CLAUDE_AGENT_SDK_FULL_TOOLS: readonly string[] = Object.freeze([...deriveSdkProfile('full')]);
+
+/** Scoped agentic surface for a Claude WORKER (read-only + the shared execution
+ *  bundle; the parent owns the execution lane + batch approval). */
+export const CLAUDE_AGENT_SDK_WORKER_TOOLS: readonly string[] = Object.freeze([...deriveSdkProfile('worker')]);
 
 export type ClaudeAgentSdkToolProfile = 'read_only' | 'local_authoring' | 'full' | 'worker';
 

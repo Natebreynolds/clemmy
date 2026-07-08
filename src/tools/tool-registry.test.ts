@@ -80,36 +80,75 @@ function orchestratorDiscoveryNamesFromSource(): Set<string> {
 // NEW phantom (or an eventual real registration) trips this test.
 const KNOWN_UNREGISTERED_BLOCKLIST = new Set<string>(['propose_plan']);
 
-// ── conformance: each hand-maintained list == its registry derivation ─────────
+// ── conformance ───────────────────────────────────────────────────────────────
+//
+// The catalog surface (LOCAL_MCP_TOOL_NAMES) and the four SDK profiles are now
+// DERIVED from the registry (step 2 slice 1): each exported constant IS
+// deriveCatalogNames()/deriveSdkProfile(...). A set-equality check against the
+// derivation would be a tautology, so those flipped surfaces get INVARIANT tests
+// instead — the live exported surface must contain its known-critical members (a
+// registry edit that drops one fails here) and honor the nesting/exclusion rules.
+// The hand-maintained lists further down keep full set-equality conformance.
 
-test('catalog LOCAL_MCP_TOOL_NAMES == deriveCatalogNames()', () => {
-  assertSetEqual(deriveCatalogNames(), asSet(LOCAL_MCP_TOOL_NAMES), 'catalog / cli lane');
+test('catalog surface contains its known-critical members', () => {
+  const catalog = asSet(LOCAL_MCP_TOOL_NAMES);
+  for (const n of ['memory_recall', 'memory_remember', 'run_batch', 'workflow_create', 'pending_action_queue', 'tool_search', 'composio_execute_tool', 'notify_user', 'browser_harness_run', 'goal_create']) {
+    assert.ok(catalog.has(n), `catalog (LOCAL_MCP_TOOL_NAMES) must include ${n}`);
+  }
 });
 
 test('orchestrator discoveryTools == deriveOrchestratorDiscoveryNames()', () => {
   assertSetEqual(deriveOrchestratorDiscoveryNames(), orchestratorDiscoveryNamesFromSource(), 'orchestrator discovery');
 });
 
-test('SDK read-only profile == deriveSdkProfile("read-only")', () => {
-  assertSetEqual(deriveSdkProfile('read-only'), asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS), 'sdk read-only');
-});
-
-test('SDK local-authoring profile == deriveSdkProfile("authoring")', () => {
-  assertSetEqual(deriveSdkProfile('authoring'), asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS), 'sdk authoring');
-});
-
-test('SDK full (brain) profile == deriveSdkProfile("full")', () => {
-  assertSetEqual(deriveSdkProfile('full'), asSet(CLAUDE_AGENT_SDK_FULL_TOOLS), 'sdk full');
-});
-
-test('SDK worker profile == deriveSdkProfile("worker")', () => {
-  assertSetEqual(deriveSdkProfile('worker'), asSet(CLAUDE_AGENT_SDK_WORKER_TOOLS), 'sdk worker');
-});
-
-test('SDK agentic bundle == deriveSdkProfile("agentic") (== WORKER \\ READ_ONLY)', () => {
+test('SDK read-only profile: critical reads present, write/execution primitives absent', () => {
   const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
-  const expected = new Set([...asSet(CLAUDE_AGENT_SDK_WORKER_TOOLS)].filter((n) => !ro.has(n)));
-  assertSetEqual(deriveSdkProfile('agentic'), expected, 'sdk agentic bundle');
+  for (const n of ['memory_recall', 'read_file', 'ask_user_question', 'tool_search', 'recall_tool_result', 'skill_read']) {
+    assert.ok(ro.has(n), `read-only must include ${n}`);
+  }
+  for (const n of ['write_file', 'run_shell_command', 'run_worker', 'composio_execute_tool']) {
+    assert.ok(!ro.has(n), `read-only must NOT include the write/execution tool ${n}`);
+  }
+});
+
+test('SDK local-authoring ⊇ read-only + its authoring members', () => {
+  const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
+  const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
+  for (const n of ro) assert.ok(auth.has(n), `authoring must be a superset of read-only (missing ${n})`);
+  for (const n of ['workflow_create', 'goal_create', 'space_save', 'pending_action_queue', 'set_model_role']) {
+    assert.ok(auth.has(n), `authoring must include ${n}`);
+  }
+});
+
+test('SDK full (brain) ⊇ authoring + execution + brain-only fan-out', () => {
+  const auth = asSet(CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS);
+  const full = asSet(CLAUDE_AGENT_SDK_FULL_TOOLS);
+  for (const n of auth) assert.ok(full.has(n), `full must be a superset of authoring (missing ${n})`);
+  for (const n of ['run_worker', 'run_batch', 'write_file', 'run_shell_command', 'composio_execute_tool', 'execution_create', 'notify_user']) {
+    assert.ok(full.has(n), `full must include ${n}`);
+  }
+});
+
+test('SDK worker == read-only ∪ agentic; brain-only fan-out excluded', () => {
+  const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
+  const worker = asSet(CLAUDE_AGENT_SDK_WORKER_TOOLS);
+  const agentic = deriveSdkProfile('agentic');
+  // The defining nesting relationship (not a hardcoded list → not brittle).
+  assertSetEqual(worker, new Set([...ro, ...agentic]), 'worker == read-only ∪ agentic');
+  for (const n of ['composio_execute_tool', 'write_file', 'notify_user', 'memory_recall']) {
+    assert.ok(worker.has(n), `worker must include ${n}`);
+  }
+  // A worker must NEVER get the fan-out/batch/execution primitives (no worker-spawns-worker).
+  for (const n of ['run_worker', 'run_batch', 'execution_create']) {
+    assert.ok(!worker.has(n), `worker must NOT include the brain-only primitive ${n}`);
+  }
+});
+
+test('SDK agentic bundle contains the shared execution tools', () => {
+  const agentic = deriveSdkProfile('agentic');
+  for (const n of ['run_shell_command', 'write_file', 'composio_execute_tool', 'composio_search_tools', 'local_cli_probe', 'notify_user']) {
+    assert.ok(agentic.has(n), `agentic bundle must include ${n}`);
+  }
 });
 
 test('TOOL_JIT_MANDATED == deriveJitCore()', () => {
