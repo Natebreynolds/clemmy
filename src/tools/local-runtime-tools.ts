@@ -30,6 +30,7 @@ import { registerStepResultTool } from './step-result-tool.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
+import { registerToolSearchTool } from './tool-search-tool.js';
 import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerVaultTools } from './vault-tools.js';
@@ -142,6 +143,9 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerExecutionTools(server);
   registerProfileTools(server);
   registerRecallTools(server);
+  // Schema-on-demand discovery entry — read-only catalog search
+  // (SCHEMA-ON-DEMAND-PLAN-2026-07-07). Additive + dormant in Phase 0.
+  registerToolSearchTool(server);
   registerCapabilityTools(server);
   registerCliTools(server);
   registerSkillTools(server);

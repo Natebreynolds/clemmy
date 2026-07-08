@@ -115,6 +115,9 @@ export const LOCAL_MCP_TOOL_NAMES = [
   'tool_choice_invalidate',
   'skill_list',
   'skill_read',
+  // Schema-on-demand discovery entry (read-only) — search the built-in tool
+  // catalog by intent. SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 0.
+  'tool_search',
   'workflow_schedule',
   'workflow_unschedule',
   'schedule_list',

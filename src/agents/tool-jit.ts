@@ -136,6 +136,10 @@ export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
   'set_model_role', 'clear_model_role', 'tool_choice_recall', 'tool_choice_remember', 'tool_choice_invalidate', 'tool_choice_forget',
   // DISCOVERY + acquisition escape-hatch (keeps every EXTERNAL tool reachable) + local CLI probe + skills.
   'composio_search_tools', 'composio_execute_tool', 'local_cli_list', 'local_cli_probe', 'skill_list', 'skill_read',
+  // BUILT-IN discovery: tool_search ranks the tool catalog and returns schemas on
+  // demand. Structural CORE seed for schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07)
+  // — never JIT-pruned, so the escape-hatch to any built-in is always present.
+  'tool_search',
   // FILES + shell (the local-work backbone).
   'read_file', 'write_file', 'list_files', 'run_shell_command',
   // profile READ (cheaper than asking the user).

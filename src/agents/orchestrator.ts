@@ -1171,6 +1171,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'mcp_configure',
       'skill_list',
       'skill_read',
+      // Schema-on-demand discovery entry (read-only): search the full built-in
+      // tool catalog by intent. SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 0 —
+      // additive + dormant (the model can search; nothing is deferred yet).
+      'tool_search',
       'local_cli_list',
       'local_cli_probe',
       'tool_choice_recall',

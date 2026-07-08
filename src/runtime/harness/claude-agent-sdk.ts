@@ -267,6 +267,10 @@ export const CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS = [
   'pending_action_get',
   'skill_list',
   'skill_read',
+  // Schema-on-demand discovery entry (read-only): search the built-in tool
+  // catalog by intent. SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 0. In READ_ONLY so
+  // it flows into every profile (a read-only brain can still discover a tool).
+  'tool_search',
   'tool_choice_recall',
   // Recall the verbatim / sliced payload of a clipped tool result (read-only).
   'recall_tool_result',

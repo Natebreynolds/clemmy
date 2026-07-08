@@ -31,6 +31,7 @@ import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
 import { registerRecallTools } from './recall-tools.js';
+import { registerToolSearchTool } from './tool-search-tool.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
 import { codeModeEnabled, codeModeDescription, runCodeModeForSession } from './code-mode-tool.js';
 import { ensureToolDirectories, textResult } from './shared.js';
@@ -158,6 +159,9 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   // 25-row `sf data query`) the harness clipped — without them it hits the same
   // "tool not found" the @openai/agents lane was fixed for.
   registerRecallTools(server);
+  // Schema-on-demand discovery entry — read-only search over the built-in tool
+  // catalog (SCHEMA-ON-DEMAND-PLAN-2026-07-07). Additive + dormant in Phase 0.
+  registerToolSearchTool(server);
   registerDynamicTools(server);
   // Agent SDK lane only: expose the mutating tools (shell/composio/write) through
   // the full harness gate chain so the Claude Agent SDK can execute them safely.
