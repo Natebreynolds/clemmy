@@ -1648,6 +1648,8 @@ async function runConversationCore(
         falloverReattempt = false;
         continue;
       }
+      // The turn is ENDING here (ask/exhausted) — register any in-flight tool.
+      recordOrphanedToolInFlight(options.sessionId, turnResult.turn);
       if (infraDecision === 'exhausted') {
         emitInfraUnrecovered(options.sessionId, turnResult.turn, turnResult.infraTransientKind, turnResult.error ?? '');
         return {
@@ -4965,9 +4967,18 @@ const TRANSIENT_FALLOVER_KINDS = new Set<string>([
 // never fake success. Interactive chat/Discord/console keep the ask verbatim.
 // Kill-switch CLEMMY_UNATTENDED_AUTO_RECOVER=off restores the ask everywhere.
 const MAX_INFRA_AUTO_RECOVER = 2;
+// Attended lanes (interactive chat/Discord/console) get ONE silent auto-retry
+// before the "Retry/Switch/Stop" ask — a 30s transport blip mid-flow should not
+// interrupt the user (live 2026-07-08). A second failure still asks (a human IS
+// here). Unattended keeps its 2 auto-retries then fails honestly.
+const ATTENDED_QUIET_RETRY_BUDGET = 1;
 
 function unattendedAutoRecoverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_UNATTENDED_AUTO_RECOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+function attendedQuietRetryEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_ATTENDED_QUIET_RETRY', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 /** An unattended run has no human to answer an infra ask. Signalled by the run
@@ -4984,23 +4995,157 @@ function countInfraAutoRecover(sessionId: string): number {
 
 type InfraRecoveryDecision = 'ask' | 'auto_retry' | 'exhausted';
 
-/** For an infra error about to prompt "retry/switch/stop": ASK (attended, or the
- *  kill-switch is off), AUTO_RETRY (unattended + budget remains), or EXHAUSTED
- *  (unattended + budget spent → fail honestly). */
+/**
+ * For an infra error about to prompt "retry/switch/stop":
+ *  - UNATTENDED (workflow/background): AUTO_RETRY up to MAX_INFRA_AUTO_RECOVER,
+ *    then EXHAUSTED (fail honestly — no human to ask).
+ *  - ATTENDED (interactive): ONE silent AUTO_RETRY, then ASK (a human is here).
+ *  Either lane's auto-retry is gated by its own kill-switch.
+ */
 function decideInfraRecovery(sessionId: string): InfraRecoveryDecision {
-  if (!unattendedAutoRecoverEnabled()) return 'ask';
-  if (!isUnattendedSession(sessionId)) return 'ask';
-  return countInfraAutoRecover(sessionId) < MAX_INFRA_AUTO_RECOVER ? 'auto_retry' : 'exhausted';
+  if (isUnattendedSession(sessionId)) {
+    if (!unattendedAutoRecoverEnabled()) return 'ask';
+    return countInfraAutoRecover(sessionId) < MAX_INFRA_AUTO_RECOVER ? 'auto_retry' : 'exhausted';
+  }
+  // Attended: quiet-retry once, then ask — never 'exhausted' (the user answers).
+  if (!attendedQuietRetryEnabled()) return 'ask';
+  return countInfraAutoRecover(sessionId) < ATTENDED_QUIET_RETRY_BUDGET ? 'auto_retry' : 'ask';
 }
 
 /** The self-heal directive fed back into the loop — synthesizes what a human
- *  typing "Retry" produces (re-issue the failed call via retry_context). */
+ *  typing "Retry" produces (re-issue the failed call via retry_context). Works
+ *  for both lanes: an attended quiet-retry and an unattended auto-recovery. */
 function buildInfraRetryDirective(kind: string): string {
   return [
-    `The previous step hit a transient backend error (${kind}). This is an UNATTENDED run with no one to ask, so recover automatically.`,
-    'Retry the SAME failed call now: re-issue it exactly as before, using your retry_context (the last tool_called before the error). Do NOT ask the user, do NOT restart from the plan top, do NOT switch objective.',
-    'If it fails again the run stops and reports the infra error honestly.',
+    `The previous step hit a transient backend error (${kind}). Recover automatically — retry the SAME failed call now.`,
+    'Re-issue it exactly as before, using your retry_context (the last tool_called before the error). Do NOT ask the user, do NOT restart from the plan top, do NOT switch objective.',
+    'If it fails again I will surface the choice.',
   ].join(' ');
+}
+
+// ── Stranded-tool reunification ───────────────────────────────────────────────
+// A turn can DIE on an infra error (transport timeout) while a long tool call is
+// still IN FLIGHT — live 2026-07-08: a Discord turn died on model.transport_timeout
+// while its run_batch executed 20+ min under provider throttle; the batch finished
+// 7/8 but the dead turn never reported it ("only 1 email sent" confusion). We
+// register the in-flight call at death and, once it completes, fire a follow-up
+// report turn so the session self-reports — attended and unattended.
+
+/** Kill-switch (default on) for stranded-tool reunification. */
+function orphanToolReunifyEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_ORPHAN_TOOL_REUNIFY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** An orphan whose tool completed after its turn died — max age before we give up
+ *  waiting (a never-completing tool must not linger forever). */
+const ORPHAN_TOOL_MAX_AGE_MS = 30 * 60_000;
+
+/**
+ * Register any tool call left IN FLIGHT (a `tool_called` this turn with no matching
+ * `tool_returned`) when the turn dies on an infra error. Idempotent: an already-
+ * registered callId is not re-recorded, and a surviving turn never calls this — so
+ * there is no double-fire. Best-effort; never throws into the death path.
+ */
+export function recordOrphanedToolInFlight(sessionId: string, turn: number): void {
+  if (!orphanToolReunifyEnabled()) return;
+  try {
+    const events = listEvents(sessionId);
+    const returned = new Set<string>();
+    const alreadyRegistered = new Set<string>();
+    for (const e of events) {
+      if (e.type === 'tool_returned') {
+        const cid = String((e.data as { callId?: unknown } | undefined)?.callId ?? '');
+        if (cid) returned.add(cid);
+      } else if (e.type === 'orphaned_tool_inflight') {
+        const cid = String((e.data as { callId?: unknown } | undefined)?.callId ?? '');
+        if (cid) alreadyRegistered.add(cid);
+      }
+    }
+    for (const e of events) {
+      if (e.type !== 'tool_called' || e.turn !== turn) continue;
+      const data = (e.data ?? {}) as { callId?: unknown; tool?: unknown };
+      const callId = String(data.callId ?? '');
+      if (!callId || returned.has(callId) || alreadyRegistered.has(callId)) continue;
+      safeAppend({
+        sessionId, turn, role: 'system', type: 'orphaned_tool_inflight',
+        data: { callId, toolName: String(data.tool ?? ''), at: new Date().toISOString() },
+      });
+      alreadyRegistered.add(callId);
+    }
+  } catch { /* best-effort — a death path must never throw */ }
+}
+
+export interface OrphanedToolReport {
+  callId: string;
+  toolName: string;
+  /** The follow-up system-turn directive: "your <tool> completed — report it now". */
+  directive: string;
+}
+
+/** One-line result summary for the report directive — a run_batch's ledger counts
+ *  or a plain tool_returned preview. */
+function summarizeOrphanCompletion(toolName: string, returnedData: unknown, batchData: unknown): string {
+  if (batchData && typeof batchData === 'object') {
+    const b = batchData as { total?: number; succeeded?: number; failed?: number; halted?: boolean; batchId?: string };
+    return `${b.succeeded ?? 0}/${b.total ?? 0} succeeded${b.failed ? `, ${b.failed} failed` : ''}${b.halted ? ' (HALTED)' : ''}${b.batchId ? ` — ledger ${b.batchId}` : ''}`;
+  }
+  const d = (returnedData ?? {}) as { preview?: unknown; result?: unknown };
+  const text = typeof d.preview === 'string' ? d.preview : typeof d.result === 'string' ? d.result : '';
+  return text ? text.slice(0, 400) : `${toolName} completed`;
+}
+
+function buildOrphanReportDirective(toolName: string, resultSummary: string): string {
+  return [
+    `Your \`${toolName}\` call from an earlier turn — interrupted by a transient error before it could report — has now COMPLETED.`,
+    `Result: ${resultSummary}`,
+    'Report the actual outcome to the user NOW (what really happened — how many items succeeded/failed), since the interrupted turn never posted it. Do not re-run the call.',
+  ].join('\n');
+}
+
+/**
+ * Reunify completed stranded tools into report directives. For each registered
+ * `orphaned_tool_inflight` not yet reported: if the tool has since completed (a
+ * `tool_returned` for its callId, or — for run_batch — a `batch_completed` after
+ * it), emit `orphaned_tool_reported` (dedup) and return a report directive. An
+ * orphan whose tool never completes within ORPHAN_TOOL_MAX_AGE_MS is dropped
+ * (marked reported with expired:true) so it can't linger. Idempotent: a second
+ * drain returns nothing for an already-reported orphan. The daemon/next-turn poke
+ * fires a report turn (runConversation) per returned directive.
+ */
+export function drainOrphanedToolCompletions(sessionId: string): OrphanedToolReport[] {
+  const reports: OrphanedToolReport[] = [];
+  if (!orphanToolReunifyEnabled()) return reports;
+  let events: EventRow[];
+  try { events = listEvents(sessionId); } catch { return reports; }
+  const reported = new Set(
+    events.filter((e) => e.type === 'orphaned_tool_reported')
+      .map((e) => String((e.data as { callId?: unknown } | undefined)?.callId ?? '')),
+  );
+  const orphans = events
+    .filter((e) => e.type === 'orphaned_tool_inflight')
+    .map((e) => ({
+      callId: String((e.data as { callId?: unknown } | undefined)?.callId ?? ''),
+      toolName: String((e.data as { toolName?: unknown } | undefined)?.toolName ?? ''),
+      atMs: Date.parse(e.createdAt),
+      turn: e.turn,
+    }))
+    .filter((o) => o.callId && !reported.has(o.callId));
+  for (const orphan of orphans) {
+    const returnedEvent = events.find((e) => e.type === 'tool_returned' && String((e.data as { callId?: unknown } | undefined)?.callId ?? '') === orphan.callId);
+    const batchDone = orphan.toolName === 'run_batch'
+      ? events.filter((e) => e.type === 'batch_completed' && Date.parse(e.createdAt) >= orphan.atMs).slice(-1)[0]
+      : undefined;
+    if (returnedEvent || batchDone) {
+      safeAppend({ sessionId, turn: orphan.turn, role: 'system', type: 'orphaned_tool_reported', data: { callId: orphan.callId, toolName: orphan.toolName } });
+      const summary = summarizeOrphanCompletion(orphan.toolName, returnedEvent?.data, batchDone?.data);
+      reports.push({ callId: orphan.callId, toolName: orphan.toolName, directive: buildOrphanReportDirective(orphan.toolName, summary) });
+      continue;
+    }
+    if (Number.isFinite(orphan.atMs) && Date.now() - orphan.atMs > ORPHAN_TOOL_MAX_AGE_MS) {
+      safeAppend({ sessionId, turn: orphan.turn, role: 'system', type: 'orphaned_tool_reported', data: { callId: orphan.callId, toolName: orphan.toolName, expired: true } });
+    }
+  }
+  return reports;
 }
 
 /** Record the self-heal in the trace (attempt is 1-based). Emitted by the loop
@@ -5232,6 +5377,7 @@ function handleRunError(
         bumpTurnNumber(sessionId, turn);
         return { sessionId, turn, status: 'failed', error: normalizeError(err), infraAutoRetry: { kind: 'tool.timeout', directive: buildInfraRetryDirective('tool.timeout') } };
       }
+      recordOrphanedToolInFlight(sessionId, turn);
       if (infraDecision === 'exhausted') {
         emitInfraUnrecovered(sessionId, turn, 'tool.timeout', normalizeError(err));
         session.markStatus('failed');
@@ -5343,6 +5489,9 @@ function handleRunError(
         bumpTurnNumber(sessionId, turn);
         return { sessionId, turn, status: 'failed', error: message, infraAutoRetry: { kind: err.kind, directive: buildInfraRetryDirective(err.kind) } };
       }
+      // The turn is ENDING (ask/exhausted) — register any tool still in flight so
+      // its eventual result is reunified into a report turn (never orphaned).
+      recordOrphanedToolInFlight(sessionId, turn);
       if (infraDecision === 'exhausted') {
         emitInfraUnrecovered(sessionId, turn, err.kind, message);
         session.markStatus('failed');

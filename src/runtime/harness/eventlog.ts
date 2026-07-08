@@ -255,6 +255,13 @@ export const EVENT_TYPES = [
   // "retry/switch/stop" ask, auto-retried the same failed call instead. Carries
   // {kind, attempt, max}. Bounded — after the budget the run fails honestly.
   'infra_auto_recover',
+  // Stranded-tool reunification: a turn DIED on an infra error while a tool
+  // (e.g. a run_batch) was still IN FLIGHT. `orphaned_tool_inflight` {callId,
+  // toolName} registers it at death; once the tool completes, drainOrphanedTool-
+  // Completions emits `orphaned_tool_reported` {callId} (dedup) and fires a
+  // follow-up report turn so the session self-reports the result to the user.
+  'orphaned_tool_inflight',
+  'orphaned_tool_reported',
   // Parse-exhaustion recovery marker: a `conversation_completed` with
   // reason 'no_structured_output' (the internal "couldn't be structured"
   // apology) is being re-run once on the next brain. Appended BEFORE the

@@ -31,6 +31,7 @@ import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.
 import { processWorkflowSchedules, reapStaleWorkflowRuns } from '../execution/workflow-scheduler.js';
 import { syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
+import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
 import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
@@ -1495,6 +1496,9 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       if (tickCount % 4 === 0) {
         await processGoalResumptions();
       }
+      // Reunify tools left in flight when a turn died on an infra error — fire a
+      // follow-up report turn once the tool (e.g. a long run_batch) completes.
+      await processOrphanedToolReports();
       await processProactiveBriefs(assistant);
       // Evaluate user-defined check-in templates — fires open
       // questions through the existing check-in path when their

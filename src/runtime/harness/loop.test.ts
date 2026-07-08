@@ -63,7 +63,7 @@ import { Agent, RunContext, RunState, type AgentInputItem, type Runner } from '@
 
 const { resetEventLog, requestKill, listEvents, createSession, appendEvent } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, drainOrphanedToolCompletions } = await import('./loop.js');
 type RunRunnerFn = import('./loop.js').RunRunnerFn;
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded } = await import('./brackets.js');
@@ -268,10 +268,12 @@ test('unattended self-heal: a persistent infra error auto-retries twice then FAI
   assert.ok(failed.some((e) => (e.data as { reason?: string }).reason === 'infra_transient_unrecovered'), 'fails with the infra error named, not fake success');
 });
 
-test('unattended self-heal: interactive (attended) session is UNCHANGED — the infra ask still fires', async () => {
+test('attended quiet retry: a transient blip retries ONCE silently, THEN asks on the second failure', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
+  let calls = 0;
   const runRunner: RunRunnerFn = async () => {
+    calls += 1;
     throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
   };
   const result = await runConversation({
@@ -281,12 +283,31 @@ test('unattended self-heal: interactive (attended) session is UNCHANGED — the 
     makeRunner: makeRunnerStub,
     runRunner,
   });
-  assert.equal(result.status, 'awaiting_user_input', 'a human IS present — keep asking');
+  // First failure → ONE silent retry (no ask); second failure → the ask.
+  assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 1, 'exactly one silent quiet-retry');
+  assert.equal(calls, 2, 'the turn was retried once before asking');
+  assert.equal(result.status, 'awaiting_user_input', 'a human IS present — ask after the quiet retry fails');
   assert.ok(
     listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).some((e) => (e.data as { source?: string }).source === 'infra_error_recovery'),
-    'the infra ask is byte-identical to before',
+    'the infra ask still fires (byte-identical) on the second failure',
   );
-  assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 0, 'no auto-recover on an attended session');
+});
+
+test('attended quiet retry: CLEMMY_ATTENDED_QUIET_RETRY=off restores the immediate ask (no silent retry)', async () => {
+  resetEventLog();
+  const prev = process.env.CLEMMY_ATTENDED_QUIET_RETRY;
+  process.env.CLEMMY_ATTENDED_QUIET_RETRY = 'off';
+  try {
+    const sess = HarnessSession.create({ kind: 'chat' });
+    const runRunner: RunRunnerFn = async () => {
+      throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
+    };
+    const result = await runConversation({ agent: makeAgentStub(), sessionId: sess.id, input: 'do a thing', makeRunner: makeRunnerStub, runRunner });
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(listEventsForConv(sess.id, { types: ['infra_auto_recover'] }).length, 0, 'kill-switch off ⇒ no quiet retry, immediate ask');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_ATTENDED_QUIET_RETRY; else process.env.CLEMMY_ATTENDED_QUIET_RETRY = prev;
+  }
 });
 
 test('unattended self-heal: CLEMMY_UNATTENDED_AUTO_RECOVER=off restores the ask even in a background run', async () => {
@@ -1443,7 +1464,10 @@ test('A2#3: an UNHANDLED model HTTP status (422) becomes a recoverable ask + bra
     agent: makeAgentStub(), sessionId: sess.id, input: 'do thing',
     makeRunner: makeRunnerStub, runRunner,
   });
-  assert.equal(result.status, 'awaiting_user_input', 'recoverable — not a dead session');
+  // Recoverable: the first attended infra error queues a silent quiet-retry
+  // (infraAutoRetry) — not a dead session. (The retry→ask flow is exercised at
+  // the runConversation level.)
+  assert.ok(result.infraAutoRetry, 'recoverable — a quiet-retry is queued, not a dead session');
   const reloaded = HarnessSession.load(sess.id);
   assert.notEqual(reloaded!.sessionRow.status, 'failed', 'session is NOT marked failed');
 });
@@ -1466,15 +1490,13 @@ test('a NON-Error transient throw (the [object Object] class) becomes a retry pr
     runRunner,
   });
 
-  // Fix 2: a transient infra error offers retry/switch/stop instead of dying.
-  assert.ok(['completed', 'awaiting_user_input'].includes(result.status));
+  // Fix 2: a transient infra error is RECOVERABLE instead of dying — the first
+  // attended failure queues a silent quiet-retry (infraAutoRetry). No crash.
+  assert.ok(result.infraAutoRetry, 'a transient error is recoverable (quiet-retry), not a crash');
   // Fix 1: whatever is surfaced is READABLE — never the literal "[object Object]".
   assert.ok(!/\[object Object\]/.test(result.error ?? ''), 'error must be readable, not [object Object]');
   const failed = listEvents(sess.id, { types: ['run_failed'] });
   assert.equal(failed.length, 0, 'a recoverable transient error does NOT emit a terminal run_failed');
-  const awaiting = listEvents(sess.id, { types: ['awaiting_user_input'] });
-  assert.equal(awaiting.length, 1);
-  assert.match(String((awaiting[0].data as { question?: string }).question ?? ''), /retry/i);
 });
 
 test('throws when sessionId does not exist', async () => {
@@ -3890,4 +3912,65 @@ test('plain-text decision: a hallucinated tool call as markdown is a PUNT, not a
   const real = `The site is live at https://example.netlify.app — I deployed it with netlify deploy after building all sections. ${'Detail. '.repeat(300)}`;
   const d = toOrchestratorDecision(real);
   assert.ok(d && d.done === true && (d.reply ?? '').includes('live'), 'prose replies keep completing');
+});
+
+// ─── Stranded-tool reunification: a turn dies mid-tool, the tool completes later ─
+test('orphaned tool: a turn death with a tool IN FLIGHT registers it; a completed batch drains into a report turn (once)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' }).id;
+  // A run_batch call was issued on turn 3 and never returned (the turn died on an
+  // infra timeout while it kept executing).
+  appendEvent({ sessionId: sess, turn: 3, role: 'Clem', type: 'tool_called', data: { tool: 'run_batch', callId: 'c-batch-1', arguments: '{}' } });
+  recordOrphanedToolInFlight(sess, 3);
+  assert.equal(listEvents(sess, { types: ['orphaned_tool_inflight'] }).length, 1, 'the in-flight tool was registered at death');
+
+  // Not yet complete → drain produces nothing.
+  assert.equal(drainOrphanedToolCompletions(sess).length, 0, 'nothing to report until the tool completes');
+
+  // The batch finishes (7/8) minutes later — its own event lands on the session.
+  appendEvent({ sessionId: sess, turn: 3, role: 'system', type: 'batch_completed', data: { batchId: 'batch-xyz', total: 8, succeeded: 7, failed: 1, halted: false } });
+
+  const reports = drainOrphanedToolCompletions(sess);
+  assert.equal(reports.length, 1, 'the completed batch drains into ONE report');
+  assert.equal(reports[0].toolName, 'run_batch');
+  assert.match(reports[0].directive, /7\/8 succeeded/, 'the report carries the real result');
+  assert.match(reports[0].directive, /Report the actual outcome to the user/i);
+  assert.equal(listEvents(sess, { types: ['orphaned_tool_reported'] }).length, 1, 'marked reported');
+
+  // No double-fire: a second drain reports nothing.
+  assert.equal(drainOrphanedToolCompletions(sess).length, 0, 'already reported — no double-fire');
+});
+
+test('orphaned tool: a SURVIVED turn (tool returned) registers no orphan and drains nothing', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sess, turn: 1, role: 'Clem', type: 'tool_called', data: { tool: 'composio_execute_tool', callId: 'c-ok', arguments: '{}' } });
+  appendEvent({ sessionId: sess, turn: 1, role: 'tool', type: 'tool_returned', data: { tool: 'composio_execute_tool', callId: 'c-ok', result: 'sent' } });
+  // Even if recordOrphanedToolInFlight runs (it never does on a survived turn),
+  // the returned call is not registered.
+  recordOrphanedToolInFlight(sess, 1);
+  assert.equal(listEvents(sess, { types: ['orphaned_tool_inflight'] }).length, 0, 'a returned call is never an orphan');
+  assert.equal(drainOrphanedToolCompletions(sess).length, 0);
+});
+
+test('orphaned tool: the sweep driver fires ONE report turn per completed orphan', async () => {
+  resetEventLog();
+  const { sweepOrphanedToolReports } = await import('../../execution/orphan-tool-reports.js');
+  const sess = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sess, turn: 2, role: 'Clem', type: 'tool_called', data: { tool: 'run_batch', callId: 'c-sweep', arguments: '{}' } });
+  recordOrphanedToolInFlight(sess, 2);
+  appendEvent({ sessionId: sess, turn: 2, role: 'system', type: 'batch_completed', data: { batchId: 'b1', total: 3, succeeded: 3, failed: 0 } });
+
+  const fired: Array<{ sessionId: string; directive: string }> = [];
+  const result = sweepOrphanedToolReports({
+    now: () => Date.now(),
+    recentSessionIds: () => [sess],
+    drain: (id) => drainOrphanedToolCompletions(id),
+    fire: (sessionId, report) => { fired.push({ sessionId, directive: report.directive }); },
+  });
+  assert.equal(result.fired, 1, 'one report turn fired');
+  assert.equal(fired[0].sessionId, sess);
+  assert.match(fired[0].directive, /3\/3 succeeded/);
+  // Idempotent across ticks: a second sweep fires nothing.
+  assert.equal(sweepOrphanedToolReports({ now: () => Date.now(), recentSessionIds: () => [sess], drain: (id) => drainOrphanedToolCompletions(id), fire: () => { throw new Error('should not fire'); } }).fired, 0);
 });
