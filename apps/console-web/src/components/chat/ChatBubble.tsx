@@ -163,14 +163,31 @@ export function ChatBubble({
           ) : thinking && message.text ? (
             // Mid-stream: render plain (linkified) text + a live caret. Full
             // markdown formatting is applied once the reply lands (below).
-            <p className="whitespace-pre-wrap text-body-lg leading-relaxed text-fg">
-              {linkify(message.text)}
-              <span
-                aria-hidden
-                className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[0.2em] rounded-full bg-primary"
-                style={{ animation: 'dot-pulse 1.2s ease-in-out infinite' }}
-              />
-            </p>
+            // The background control stays available HERE too — brains that
+            // stream text immediately (Claude) skip the pre-text state, which
+            // made the bubble button vanish for them (live 2026-07-08).
+            <div>
+              <p className="whitespace-pre-wrap text-body-lg leading-relaxed text-fg">
+                {linkify(message.text)}
+                <span
+                  aria-hidden
+                  className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[0.2em] rounded-full bg-primary"
+                  style={{ animation: 'dot-pulse 1.2s ease-in-out infinite' }}
+                />
+              </p>
+              {onBackground && (
+                <div className="mt-1.5 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={onBackground}
+                    title="Continue in background — keeps working, reports back here, frees the chat"
+                    className="shrink-0 rounded border border-border px-2 py-0.5 text-caption text-muted transition-colors hover:border-primary/40 hover:text-fg cursor-pointer"
+                  >
+                    ⇥ background
+                  </button>
+                </div>
+              )}
+            </div>
           ) : (
             <div className={cn('text-body-lg leading-relaxed', message.status === 'failed' ? 'text-danger' : 'text-fg')}>
               <Markdown text={message.text} />
