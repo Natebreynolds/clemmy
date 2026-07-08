@@ -180,10 +180,15 @@ export interface ToolSearchDecision {
   experiment: boolean;
 }
 
-/** Global switch. DEFAULT OFF this phase — off ⇒ byte-identical first-class surface. */
+/** Global switch. DEFAULT ON since v1.3.0 — validated live (cold-tool discovery
+ *  via tool_search→call_tool, gate parity keyed on inner names, −67% schema
+ *  tokens/turn) with zero tool-calling regressions. The model drives with the
+ *  FULL surface name-visible instead of JIT pruning-by-guess; the harness
+ *  constrains effects (gates), not methods. Kill-switch: =off ⇒ byte-identical
+ *  pre-1.3 first-class surface. */
 export function codexToolSearchEnabled(): boolean {
-  const v = (getRuntimeEnv('CLEMMY_CODEX_TOOL_SEARCH', 'off') || 'off').trim().toLowerCase();
-  return v === 'on' || v === '1' || v === 'true' || v === 'yes';
+  const v = (getRuntimeEnv('CLEMMY_CODEX_TOOL_SEARCH', 'on') || 'on').trim().toLowerCase();
+  return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
 }
 
 /** Per-session A/B experiment switch (independent of the global flag). Default OFF. */

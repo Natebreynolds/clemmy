@@ -43,6 +43,7 @@ export function registerBatchTools(server: McpServer): void {
       'USE THIS instead of calling the same tool item-by-item whenever you have 3+ items whose arguments you can fully materialize up front (send N emails, update N records, create N tasks, pull N reports). Use run_worker instead when each item needs its own REASONING.',
       'action=propose: submit the full plan. READ plans certify + execute immediately. WRITE/SEND plans queue as ONE pending action for approval — after it is approved, call action=execute with the pending_action_id.',
       'Writes/sends execute serially with per-call runtime gates intact; the loop halts after consecutive failures instead of replaying a systemic error. The ledger lists every failed item — report failures to the user honestly.',
+      'HARD LIMITS (visible by design): max 500 items per plan (split larger jobs into consecutive plans); read concurrency max 8. Provider rate-limits auto-back-off (batch pauses, no items lost); re-running a partial batch is idempotent-safe — already-succeeded items are skipped, never re-executed.',
     ].join(' '),
     {
       action: z.enum(['propose', 'execute', 'status']),
