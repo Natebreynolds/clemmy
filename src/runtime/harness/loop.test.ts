@@ -3793,3 +3793,12 @@ test('speed: a hanging embeddings provider cannot gate model dispatch (fire-and-
     _setEmbeddingProviderForTest(undefined as never);
   }
 });
+
+test('plain-text decision: a hallucinated tool call as markdown is a PUNT, not a completed reply (2026-07-08 Joshua Tree deploy)', () => {
+  const fake = '**run_shell_command**\n```\ncd /Users/n/Projects/site && netlify deploy --dir "." --prod\n```';
+  assert.equal(toOrchestratorDecision(fake), null, 'tool-shaped heading + fence must route to the stall nudge');
+  // A real reply that mentions a command inline (longer, prose-led) still completes.
+  const real = `The site is live at https://example.netlify.app — I deployed it with netlify deploy after building all sections. ${'Detail. '.repeat(300)}`;
+  const d = toOrchestratorDecision(real);
+  assert.ok(d && d.done === true && (d.reply ?? '').includes('live'), 'prose replies keep completing');
+});

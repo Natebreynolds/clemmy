@@ -2854,6 +2854,17 @@ function deriveDecisionSummary(text: string): string {
 function looksLikeZeroWorkStallText(trimmed: string): boolean {
   if (trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) return true;
   if (STALL_ANNOUNCEMENT_PATTERN.test(trimmed) && !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)) return true;
+  // A HALLUCINATED TOOL CALL rendered as text — a tool-shaped heading
+  // ("**run_shell_command**") immediately followed by a fenced block. Live
+  // 2026-07-08: gpt-5.5 ended the Joshua Tree acceptance run by WRITING the
+  // netlify deploy invocation as markdown instead of calling the tool; under
+  // fail-open that prose completed the run with the site never deployed. Text
+  // whose substance is an intended-but-uncalled tool invocation is a punt —
+  // route it to the stall nudge ("call the tool for real"), never to the user
+  // as an answer. Narrow on purpose: tool-name-shaped heading + fence near the
+  // start, short body (a real reply that merely QUOTES a command is longer).
+  if (/^\s*(?:\*\*|`)?[a-z][a-z0-9_]*(?:__[a-z0-9_]+)?(?:\*\*|`)?\s*\n+\s*```/i.test(trimmed)
+    && trimmed.length < 2_000) return true;
   return false;
 }
 
