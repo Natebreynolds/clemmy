@@ -835,6 +835,21 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
   return options.desc ? mapped.reverse() : mapped;
 }
 
+/** Count events of a given type for a session — an authoritative tally (e.g.
+ *  live `tool_called` count for a background run) without materializing rows.
+ *  Zero on any error, so a caller can use it inline for a best-effort stat. */
+export function countEvents(sessionId: string, type: EventType): number {
+  try {
+    const db = openEventLog();
+    const row = db
+      .prepare('SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND type = ?')
+      .get(sessionId, type) as { n: number } | undefined;
+    return Number.isFinite(row?.n) ? row!.n : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export function getLatestEventSeq(sessionId: string): number {
   const db = openEventLog();
   const row = db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE session_id = ?')

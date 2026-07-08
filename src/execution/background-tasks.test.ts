@@ -171,6 +171,126 @@ test('resumeInterruptedBackgroundTasks ignores non-restart interrupted tasks', (
   assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, undefined);
 });
 
+test('P0 single ownership: a goal-bound interrupted run resumes IN PLACE — one executor, zero clones', async () => {
+  const { createGoalContract } = await import('../agents/plan-proposals.js');
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+
+  const task = createBackgroundTask({
+    title: 'Scorpion Facebook post rundown',
+    prompt: 'pull the last 5 Scorpion Facebook posts and their content',
+    source: 'desktop',
+  });
+  // Bind an ACTIVE goal contract to the task's OWN run session — exactly what a
+  // detached / goal-bound background run does (see bindBackgroundRunGoal). This
+  // is the "run has its own resume path" signal.
+  const goal = createGoalContract({
+    objective: 'pull the last 5 Scorpion Facebook posts and their content',
+    sessionId: task.runSessionId,
+    origin: { kind: 'background' },
+  });
+  assert.ok(goal, 'goal contract created on the run session');
+
+  // Simulate the daemon restart: running task → interrupted.
+  markBackgroundTaskRunning(task.id);
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  const resumed = resumeInterruptedBackgroundTasks({ cap: 2 });
+  assert.equal(resumed, 1, 'the interrupted goal-bound task is resumed');
+
+  // ZERO new task records: no "Resume X" clone was spawned to compete with the
+  // goal-bound run — the objective has exactly ONE executor.
+  const afterTasks = listBackgroundTasks({ includeArchived: true });
+  assert.equal(afterTasks.length, before + 1, 'no clone record was created (only the original exists)');
+  assert.ok(!afterTasks.some((t) => t.resumedFromTaskId === task.id), 'nothing points back at the original as a clone');
+
+  // The SAME record is re-driven on its own run session.
+  const reattached = getBackgroundTask(task.id);
+  assert.equal(reattached?.status, 'pending', 'the same task is re-queued in place (drain re-drives it)');
+  assert.equal(reattached?.runSessionId, task.runSessionId, 'same run session — not a fresh one');
+  assert.equal(reattached?.resumedIntoTaskId, undefined, 'no carry-forward stamp (not a clone)');
+  assert.equal(reattached?.resumeCount, 1, 'resumeCount bumped so the crash cap still bounds it');
+  assert.ok(reattached?.continueResolution, 'carries a continuation marker to resume from prior session state');
+
+  // Kill-switch: with single-owner resume OFF, the same shape clones as before
+  // (resumeCount is 1 after the in-place reattach, still under the cap).
+  process.env.CLEMMY_BG_SINGLE_OWNER_RESUME = 'off';
+  try {
+    markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+    resumeInterruptedBackgroundTasks({ cap: 2 });
+    const cloned = getBackgroundTask(task.id);
+    assert.ok(cloned?.resumedIntoTaskId, 'kill-switch off ⇒ a clone is stamped again (legacy path)');
+  } finally {
+    delete process.env.CLEMMY_BG_SINGLE_OWNER_RESUME;
+  }
+});
+
+test('P3/P4 cockpit: toolCallCount is truthful; Tools feed keeps real calls, drops reflection/housekeeping', async () => {
+  const { getBackgroundTaskStatus } = await import('./background-task-status.js');
+  const task = createBackgroundTask({ title: 'Cockpit stats task', prompt: 'do work', source: 'desktop' });
+  const sid = task.runSessionId;
+  createSession({ id: sid, kind: 'execution', title: 'Cockpit stats task' });
+  const call = (tool: string, callId: string) => appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'tool_called', data: { tool, callId } });
+  const ret = (tool: string, callId: string, result = 'ok') => appendEvent({ sessionId: sid, turn: 1, role: 'Clem', type: 'tool_returned', data: { tool, callId, result } });
+
+  // Two REAL tool calls (with returns) + three housekeeping/reflection calls.
+  call('composio_execute_tool', 'c1'); ret('composio_execute_tool', 'c1');
+  call('run_batch', 'c2'); ret('run_batch', 'c2');
+  call('reflection', 'c3'); ret('reflection', 'c3');
+  call('session_history', 'c4'); ret('session_history', 'c4');
+  call('composio_status', 'c5'); ret('composio_status', 'c5');
+
+  const detail = getBackgroundTaskStatus(task.id);
+  assert.ok(detail, 'status resolves');
+  // P3: the tally counts ALL tool_called events (parity with the live "N tool
+  // calls" check-in counter) — NOT the old NDJSON phase==='start' filter (0).
+  assert.equal(detail!.toolCallCount, 5, 'toolCallCount counts every tool_called event');
+  // P4: the human-facing feed keeps the real calls and drops reflection +
+  // session_history + *_status housekeeping noise.
+  const names = detail!.toolEvents.map((event) => event.toolName).sort();
+  assert.deepEqual(names, ['composio_execute_tool', 'run_batch'], 'feed shows only real, named tool calls');
+});
+
+test('P2 report-back: desktop task defaults to origin-chat; completion is terminal-delivered, never queued/leaked', async () => {
+  const { listQueuedNotificationDeliveries } = await import('../runtime/notifications.js');
+
+  const task = createBackgroundTask({
+    title: 'Desktop Scorpion rundown',
+    prompt: 'pull the last 5 Scorpion Facebook posts',
+    source: 'desktop',
+    originSessionId: 'sess-p2-origin',
+  });
+  // (b) an explicit target is resolved AT CREATION — desktop chat origin → origin_chat.
+  assert.deepEqual(task.reportBackTarget, { type: 'origin_chat' }, 'desktop task defaults to origin-chat');
+
+  markBackgroundTaskDone(task.id, 'here is the rundown of the 5 posts');
+
+  const done = listNotifications(500).find(
+    (n) => n.metadata?.backgroundTaskId === task.id && n.title.startsWith('Background task completed'),
+  );
+  assert.ok(done, 'completion notification exists');
+  // (c) ACTUAL send outcome: delivered to origin-chat (terminal), not an eternal 'queued'.
+  assert.ok(done!.deliveredAt, 'completion is marked delivered (terminal)');
+  assert.deepEqual(done!.deliveredDestinations, ['origin-chat'], 'delivered to origin-chat');
+  // It never resolves an external destination, so it can't leak to a Discord/Slack DM fallback…
+  assert.equal(getNotificationDestinationsForRecord(done!).length, 0, 'zero external destinations resolved');
+  // …and it is not sitting in the external delivery queue waiting forever.
+  assert.ok(
+    !listQueuedNotificationDeliveries().some((job) => job.notificationId === done!.id),
+    'origin-chat report is not enqueued for external delivery',
+  );
+});
+
+test('P2 channels: origin-chat is always an available target; the enumerated key round-trips', async () => {
+  const { listReportBackChannelOptions, setBackgroundTaskReportBackTarget } = await import('./background-tasks.js');
+  const options = listReportBackChannelOptions();
+  assert.ok(options.some((o) => o.key === 'origin_chat'), 'origin-chat is always enumerated');
+
+  // A task whose target is set via the enumerated key persists that target.
+  const task = createBackgroundTask({ title: 'Channel key task', prompt: 'do work', source: 'discord' });
+  const updated = setBackgroundTaskReportBackTarget(task.id, { type: 'origin_chat' });
+  assert.deepEqual(updated?.reportBackTarget, { type: 'origin_chat' }, 'origin_chat target persists');
+});
+
 // ─── sticky approval: launching a background task IS the approval ──────
 //
 // A background-task worker run is autonomous-by-default — the user

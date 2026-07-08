@@ -9,11 +9,20 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR, MODELS } from '../config.js';
+import {
+  BASE_DIR,
+  MODELS,
+  DISCORD_BOT_TOKEN,
+  DISCORD_DM_ALLOWED_USERS,
+  DISCORD_ENABLED,
+  SLACK_ALLOWED_USERS,
+  SLACK_BOT_TOKEN,
+  SLACK_ENABLED,
+} from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { humanizeReportBody } from '../runtime/report-voice.js';
-import { getGoalPinForDelegation } from '../agents/plan-proposals.js';
+import { getGoalPinForDelegation, getActiveGoalForSession } from '../agents/plan-proposals.js';
 import { ExecutionStore } from './store.js';
 import type { AssistantResponse, RunStoppedReason } from '../types.js';
 import type { ClementineAssistant } from '../assistant/core.js';
@@ -159,6 +168,11 @@ export interface CreateBackgroundTaskInput {
 }
 
 export type BackgroundReportBackTarget =
+  // The in-app chat that spawned the task (desktop/console/mobile). Report-back
+  // is delivered INTO that session's transcript (enqueueBackgroundTaskOutcomeTurn)
+  // — there is NO external push, so this must never fall through to a Discord/Slack
+  // DM (the live 2026-07-08 "cockpit says no target but it went to Discord" defect).
+  | { type: 'origin_chat' }
   | { type: 'discord_user'; userId: string }
   | { type: 'discord_channel'; channelId: string }
   | { type: 'slack_user'; userId: string }
@@ -325,6 +339,7 @@ function parseTaskChannelForNotification(channel?: string): {
 
 function normalizeReportBackTarget(target: BackgroundReportBackTarget | undefined): BackgroundReportBackTarget | undefined {
   if (!target) return undefined;
+  if (target.type === 'origin_chat') return { type: 'origin_chat' };
   if (target.type === 'discord_user') {
     const userId = target.userId.trim();
     return userId ? { type: 'discord_user', userId } : undefined;
@@ -342,7 +357,7 @@ function normalizeReportBackTarget(target: BackgroundReportBackTarget | undefine
   return channelId ? { type: 'slack_channel', channelId, ...(threadTs ? { threadTs } : {}) } : undefined;
 }
 
-function defaultReportBackTarget(input: { source?: BackgroundTaskRecord['source']; userId?: string; channel?: string }): BackgroundReportBackTarget | undefined {
+function defaultReportBackTarget(input: { source?: BackgroundTaskRecord['source']; userId?: string; channel?: string; originSessionId?: string }): BackgroundReportBackTarget | undefined {
   const source = input.source;
   const userId = input.userId?.trim();
   const channel = parseTaskChannelForNotification(input.channel);
@@ -361,11 +376,34 @@ function defaultReportBackTarget(input: { source?: BackgroundTaskRecord['source'
     }
   }
 
+  // Discord background work reports back to the channel/DM it was started in.
+  if (source === 'discord') {
+    if (channel.discordChannelId) return { type: 'discord_channel', channelId: channel.discordChannelId };
+    if (userId) return { type: 'discord_user', userId };
+  }
+
+  // Default = the origin channel of the session it was born from. An in-app chat
+  // (desktop/console/mobile/gateway) reports back INTO that chat, so a desktop
+  // task no longer resolves to "no explicit target" and silently leaks to a
+  // Discord DM. Only tasks with a real origin session get this; a headless
+  // cron/workflow spawn (no origin session) still returns undefined and falls to
+  // the configured Discord/Slack fallback, which is the desired "you set the cron
+  // from Discord, output shows in Discord" behavior.
+  if (input.originSessionId && input.originSessionId.trim()) {
+    return { type: 'origin_chat' };
+  }
+
   return undefined;
 }
 
 function reportBackTargetMetadata(target: BackgroundReportBackTarget | undefined): Record<string, unknown> {
   if (!target) return {};
+  if (target.type === 'origin_chat') {
+    // In-app report-back: tag the type only. Deliberately NO discord/slack ids,
+    // so notification routing resolves ZERO external destinations and the delivery
+    // record settles terminal ("sent to origin chat") instead of queued forever.
+    return { reportBackTargetType: target.type, reportBackTargetId: 'origin-chat' };
+  }
   if (target.type === 'discord_user') {
     return {
       reportBackTargetType: target.type,
@@ -399,7 +437,7 @@ function taskNotificationMetadata(task: BackgroundTaskRecord, extra: Record<stri
   const channel = parseTaskChannelForNotification(task.channel);
   const allowDiscordCheckIns = loadProactivityPolicy().allowDiscordCheckIns;
   const reportBackTarget = normalizeReportBackTarget(task.reportBackTarget)
-    ?? defaultReportBackTarget({ source: task.source, userId: task.userId, channel: task.channel });
+    ?? defaultReportBackTarget({ source: task.source, userId: task.userId, channel: task.channel, originSessionId: task.originSessionId });
   const targetMetadata = reportBackTargetMetadata(reportBackTarget);
   return {
     backgroundTaskId: task.id,
@@ -435,6 +473,91 @@ export function setBackgroundTaskReportBackTarget(
   const normalized = normalizeReportBackTarget(target);
   if (!normalized) return null;
   return updateBackgroundTask(id, { reportBackTarget: normalized });
+}
+
+/** Stable key for a report-back target — the value the console picker sends and
+ *  the identity used to mark the current selection. */
+export function reportBackTargetKey(target: BackgroundReportBackTarget): string {
+  switch (target.type) {
+    case 'origin_chat': return 'origin_chat';
+    case 'discord_user': return `discord_user:${target.userId}`;
+    case 'discord_channel': return `discord_channel:${target.channelId}`;
+    case 'slack_user': return `slack_user:${target.userId}`;
+    case 'slack_channel': return target.threadTs ? `slack_channel:${target.channelId}:${target.threadTs}` : `slack_channel:${target.channelId}`;
+  }
+}
+
+/** Human label for a report-back target, for the cockpit display. */
+export function describeReportBackTarget(target: BackgroundReportBackTarget): string {
+  switch (target.type) {
+    case 'origin_chat': return 'Originating chat';
+    case 'discord_user': return 'Discord DM';
+    case 'discord_channel': return `Discord channel ${target.channelId}`;
+    case 'slack_user': return 'Slack DM';
+    case 'slack_channel': return `Slack channel ${target.channelId}`;
+  }
+}
+
+/** The EFFECTIVE report-back target for a task: its explicit target if set,
+ *  otherwise the resolved default for its source/origin. Never guesses ids the
+ *  task doesn't carry. */
+export function resolveReportBackTarget(
+  task: Pick<BackgroundTaskRecord, 'reportBackTarget' | 'source' | 'userId' | 'channel' | 'originSessionId'>,
+): BackgroundReportBackTarget | undefined {
+  return normalizeReportBackTarget(task.reportBackTarget)
+    ?? defaultReportBackTarget({ source: task.source, userId: task.userId, channel: task.channel, originSessionId: task.originSessionId });
+}
+
+export interface ReportBackChannelOption {
+  /** Stable key the /report-back-target POST accepts. */
+  key: string;
+  type: BackgroundReportBackTarget['type'];
+  /** Human label for the picker. */
+  label: string;
+  /** Only connected/available channels are enumerated, so this is always true —
+   *  emitted explicitly for the console picker's contract. */
+  connected: boolean;
+  /** True when this option is the task's current/effective target. */
+  isDefault: boolean;
+  /** The concrete target this option sets. */
+  target: BackgroundReportBackTarget;
+}
+
+/**
+ * Enumerate the report-back channels available as targets, discovered at RUNTIME
+ * (never hardcoded ids): the originating chat is always available; a Discord or
+ * Slack DM only when that surface is connected AND we know a user id to DM. When
+ * a task is supplied, its effective target is flagged `selected`. This is the
+ * source of truth for GET /api/console/report-back/channels.
+ */
+export function listReportBackChannelOptions(
+  task?: Pick<BackgroundTaskRecord, 'reportBackTarget' | 'source' | 'userId' | 'channel' | 'originSessionId'>,
+): ReportBackChannelOption[] {
+  const options: ReportBackChannelOption[] = [
+    { key: 'origin_chat', type: 'origin_chat', label: 'Originating chat', connected: true, isDefault: false, target: { type: 'origin_chat' } },
+  ];
+  if (DISCORD_ENABLED && DISCORD_BOT_TOKEN && DISCORD_DM_ALLOWED_USERS.length > 0) {
+    const userId = DISCORD_DM_ALLOWED_USERS[0];
+    options.push({ key: `discord_user:${userId}`, type: 'discord_user', label: 'Discord DM', connected: true, isDefault: false, target: { type: 'discord_user', userId } });
+  }
+  if (SLACK_ENABLED && SLACK_BOT_TOKEN && SLACK_ALLOWED_USERS.length > 0) {
+    const userId = SLACK_ALLOWED_USERS[0];
+    options.push({ key: `slack_user:${userId}`, type: 'slack_user', label: 'Slack DM', connected: true, isDefault: false, target: { type: 'slack_user', userId } });
+  }
+  const effective = task ? resolveReportBackTarget(task) : undefined;
+  if (effective) {
+    const effectiveKey = reportBackTargetKey(effective);
+    let matched = false;
+    for (const option of options) {
+      if (reportBackTargetKey(option.target) === effectiveKey) { option.isDefault = true; matched = true; }
+    }
+    // A configured explicit target that isn't one of the runtime-discovered
+    // options (e.g. a specific channel) is still surfaced as the current one.
+    if (!matched) {
+      options.push({ key: effectiveKey, type: effective.type, label: describeReportBackTarget(effective), connected: true, isDefault: true, target: effective });
+    }
+  }
+  return options;
 }
 
 function emitBackgroundTaskCheckIn(
@@ -736,7 +859,7 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     userId: input.userId,
     channel: input.channel,
     reportBackTarget: normalizeReportBackTarget(input.reportBackTarget)
-      ?? defaultReportBackTarget({ source: input.source ?? 'gateway', userId: input.userId, channel: input.channel }),
+      ?? defaultReportBackTarget({ source: input.source ?? 'gateway', userId: input.userId, channel: input.channel, originSessionId: input.originSessionId }),
     requestedModel: input.model,
     model: input.model,
     maxMinutes: Math.max(1, Math.min(240, Math.floor(input.maxMinutes ?? 60))),
@@ -1392,11 +1515,88 @@ export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): n
   let resumedCount = 0;
   for (const task of listBackgroundTasks({ status: 'interrupted' })) {
     if (task.error !== DAEMON_RESTART_INTERRUPT_REASON) continue;
-    if (task.resumedIntoTaskId) continue;          // already carried forward
+    if (task.resumedIntoTaskId) continue;          // already carried forward (clone path)
     if ((task.resumeCount ?? 0) >= cap) continue;  // give up after cap retries
+    // SINGLE OWNERSHIP (P0, live 2026-07-08): a task whose RUN session carries
+    // its own resume path — an active goal contract bound to `background:<id>`
+    // (every detached / goal-bound background run has one, see
+    // bindBackgroundRunGoal) — must be resumed IN PLACE: same task id, same run
+    // session, no "Resume X" clone. Cloning here spawned a SECOND executor on a
+    // fresh run session ALONGSIDE the still-active goal/run, so one objective ran
+    // twice (and re-cloned on every restart — bg-mrbkxeoe then bg-mrblgh1r off
+    // one original). Only a run with NO such path falls back to the fresh-clone
+    // resume (the legacy cron/autonomous case with no goal binding).
+    if (runHasOwnResumePath(task.runSessionId)) {
+      if (reattachInterruptedTaskInPlace(task.id)) resumedCount += 1;
+      continue;
+    }
     if (resumeBackgroundTask(task.id)) resumedCount += 1;
   }
   return resumedCount;
+}
+
+/** Kill-switch (default ON) for the single-owner in-place resume. `=off` reverts
+ *  to the legacy clone-on-restart behavior for every interrupted task. */
+function singleOwnerResumeEnabled(): boolean {
+  return (process.env.CLEMMY_BG_SINGLE_OWNER_RESUME ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+/**
+ * Does this run session already own a resume path, so re-cloning it as a fresh
+ * task would double-drive the objective? True when an active goal contract is
+ * bound to the run session (`background:<id>`). The goal contract IS the durable
+ * unit of a detached / goal-bound background run: its run session holds the
+ * partial progress and its criteria gate completion, so the run is resumed in
+ * place on the SAME session rather than forked into a clone. Best-effort — a
+ * reader failure falls back to the legacy clone path (never worse than before).
+ */
+function runHasOwnResumePath(runSessionId: string): boolean {
+  if (!singleOwnerResumeEnabled()) return false;
+  try {
+    return getActiveGoalForSession(runSessionId) != null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reattach an interrupted, goal-bound task to its own resuming run instead of
+ * cloning it: flip the SAME record back to `pending` (so the drain re-drives it
+ * on its existing run session `background:<id>`), clear the interrupt error, and
+ * carry a continuation marker so the worker resumes from prior session state
+ * (buildWorkerContinuePrompt) rather than restarting the original prompt. The
+ * resumeCount bump keeps the crash cap meaningful (a run that reliably kills the
+ * daemon still stops after `cap` in-place resumes). No new task record, exactly
+ * one executor.
+ */
+function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null {
+  const task = getBackgroundTask(id);
+  if (!task) return null;
+  const updated = updateBackgroundTask(id, {
+    status: 'pending',
+    error: undefined,
+    startedAt: undefined,
+    completedAt: undefined,
+    resumeCount: (task.resumeCount ?? 0) + 1,
+    continueResolution: {
+      queuedAt: nowIso(),
+      reason: 'Resumed in place after a daemon restart (single owner — no clone).',
+      auto: true,
+    },
+  });
+  if (updated) {
+    addNotification({
+      id: `${Date.now()}-background-${updated.id}-reattached`,
+      kind: 'execution',
+      title: `Background task resuming: ${updated.title}`,
+      body: `Task ${updated.id} was interrupted by a restart and is resuming on its own run — no duplicate was created.`,
+      createdAt: nowIso(),
+      read: false,
+      silent: true,
+      metadata: taskNotificationMetadata(updated, { status: 'pending', reattachedInPlace: true }),
+    });
+  }
+  return updated;
 }
 
 export function queueBackgroundTaskApprovalResolution(approvalId: string, approved: boolean): BackgroundTaskRecord | null {

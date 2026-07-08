@@ -1,7 +1,11 @@
 import { useCallback, useRef, useState } from 'react';
 import { postChat, runHarnessStream, cancelSession, humanHarnessText, type StreamHandle } from './chat';
 import { apiPost, type ApiError } from './api';
+import { humanToolLabel, salientArgDetail } from './toolLabels';
 import type { HarnessEvent, PendingActionApprovalView } from './types';
+
+// Re-exported for callers that historically imported it from here.
+export { salientArgDetail };
 
 export type MessageStatus =
   | 'thinking' | 'complete' | 'failed' | 'stopped'
@@ -68,41 +72,6 @@ const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (De
  *  transport code, embedded JSON, or just very long — swap those for a calm line. */
 function looksRawError(s: string): boolean {
   return s.length > 200 || /at\s+\w+\s+\(|stack|ECONN|ETIMEDOUT|\{"/.test(s);
-}
-
-/** The one salient thing this call is ABOUT — recipient, keyword, path, query —
- *  so the strip narrates "sending email → paul@…" instead of a bare wrench name.
- *  Best-effort over the event's truncated args preview; '' when nothing salient. */
-export function salientArgDetail(argsRaw: unknown): string {
-  if (typeof argsRaw !== 'string' || !argsRaw) return '';
-  let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(argsRaw) as Record<string, unknown>; } catch { return ''; }
-  // composio_execute_tool nests the real payload under `arguments` (a JSON string).
-  if (typeof parsed.arguments === 'string') {
-    try { parsed = { ...parsed, ...(JSON.parse(parsed.arguments) as Record<string, unknown>) }; } catch { /* keep outer */ }
-  }
-  const SALIENT_KEYS = ['to', 'recipient', 'recipient_email', 'recipients', 'subject', 'keyword', 'keywords', 'query', 'q', 'path', 'url', 'target', 'domain', 'name', 'title'];
-  for (const key of SALIENT_KEYS) {
-    const v = parsed[key];
-    const text = typeof v === 'string' ? v : Array.isArray(v) ? v.filter((x) => typeof x === 'string').join(', ') : '';
-    if (text.trim()) return text.trim().slice(0, 64);
-  }
-  return '';
-}
-
-/** Human label for a tool call: composio calls read as their inner slug
- *  ("outlook send email"), MCP calls drop the server prefix, underscores drop. */
-function humanToolLabel(tool: string, argsRaw: unknown): string {
-  if (tool === 'composio_execute_tool' && typeof argsRaw === 'string') {
-    try {
-      const slug = (JSON.parse(argsRaw) as { tool_slug?: unknown }).tool_slug;
-      if (typeof slug === 'string' && slug) return slug.replace(/_/g, ' ').toLowerCase();
-    } catch { /* fall through */ }
-  }
-  // `server__tool` names render as "server · tool"; `mcp__server__tool` drops
-  // the mcp prefix first. Single underscores become spaces.
-  const stripped = tool.replace(/^mcp__/, '');
-  return stripped.split('__').map((part) => part.replace(/_/g, ' ')).filter(Boolean).join(' · ');
 }
 
 /** Fold one harness event into the turn's activity list. Returns the SAME array

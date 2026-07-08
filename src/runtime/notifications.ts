@@ -280,6 +280,19 @@ export function addNotification(item: NotificationRecord): void {
   )) {
     return;
   }
+
+  // Origin-chat report-back has NO external destination — the outcome is
+  // delivered into the originating session's transcript, not pushed anywhere.
+  // Record it as terminally delivered ("sent to origin chat") and skip the
+  // external delivery queue, so it never sits "queued" forever waiting for a
+  // destination that will never come, and never leaks to a Discord/Slack DM
+  // fallback (the 2026-07-08 desktop-task defect).
+  const isOriginChatReport = item.metadata?.reportBackTargetType === 'origin_chat';
+  if (isOriginChatReport && !item.deliveredAt) {
+    item.deliveredAt = item.createdAt;
+    item.deliveredDestinations = ['origin-chat'];
+  }
+
   items.push(item);
   saveNotifications(items);
 
@@ -288,7 +301,7 @@ export function addNotification(item: NotificationRecord): void {
   // tool-progress) to Discord and other external destinations. They
   // still land in notifications.json so the Activity panel sees them,
   // and the actionBus emit below still fires for live dashboard updates.
-  if (!item.silent) {
+  if (!item.silent && !isOriginChatReport) {
     const queue = loadDeliveryQueue();
     queue.push({
       notificationId: item.id,
@@ -623,8 +636,12 @@ export function requeueNotificationDelivery(notificationId: string): void {
  *      could trigger hours of work and never hear a peep.
  */
 export function getNotificationDestinationsForRecord(notification: NotificationRecord): NotificationDestination[] {
-  const configured = listNotificationDestinations().filter((entry) => entry.enabled);
   const metadata = notification.metadata ?? {};
+  // Origin-chat report-back is delivered into the chat transcript, not pushed to
+  // any external surface — resolve ZERO destinations so it never falls through to
+  // the Discord/Slack DM fallback below.
+  if (metadata.reportBackTargetType === 'origin_chat') return [];
+  const configured = listNotificationDestinations().filter((entry) => entry.enabled);
   const explicitDiscordUserId = typeof metadata.discordUserId === 'string' ? metadata.discordUserId : '';
   const explicitDiscordChannelId = typeof metadata.discordChannelId === 'string' ? metadata.discordChannelId : '';
   const explicitSlackUserId = typeof metadata.slackUserId === 'string' ? metadata.slackUserId : '';

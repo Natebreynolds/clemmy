@@ -92,6 +92,23 @@ export interface BackgroundTaskNotification {
   deliveryError?: string;
   deliveredDestinations?: string[];
   read?: boolean;
+  /** Terminal/interim delivery state the backend persists ('sent' | 'failed' |
+   *  'pending' | 'queued' | …). Optional — the drawer derives a state from the
+   *  timestamp/error fields when it's absent, so older rows still render truthfully. */
+  state?: string;
+  /** Human channel label the delivery landed on, e.g. "Discord DM" (optional). */
+  channelLabel?: string;
+}
+
+/** A place a background task can report its result back to. Fed to the drawer's
+ *  report-back dropdown by GET /api/console/report-back/channels. `connected`
+ *  channels are selectable; exactly one is `isDefault` (the resolved target when
+ *  no explicit one is set — usually the originating chat). */
+export interface ReportBackChannel {
+  key: string;
+  label: string;
+  connected: boolean;
+  isDefault: boolean;
 }
 
 export interface BackgroundToolEvent {
@@ -174,6 +191,27 @@ export const repostBackgroundTaskResult = (id: string, target: BackgroundReportB
   apiPost<{ ok: boolean; notificationId?: string; reason?: string }>(
     `/api/console/background-tasks/${encodeURIComponent(id)}/repost-result`,
     target,
+  );
+
+/** The report-back channels the user can pick from (origin chat, Discord DM,
+ *  Slack DM, …). 404s until the backend ships the endpoint — callers fall back
+ *  to the legacy free-text target controls when this rejects. */
+export const listReportBackChannels = () =>
+  apiGet<{ channels: ReportBackChannel[] }>('/api/console/report-back/channels');
+
+/** Save the chosen report-back channel by KEY (the dropdown path). Posts to the
+ *  same target endpoint the legacy object path uses; the backend accepts either. */
+export const setBackgroundTaskReportBackChannel = (id: string, key: string) =>
+  apiPost<{ ok: boolean; reason?: string }>(
+    `/api/console/background-tasks/${encodeURIComponent(id)}/report-back-target`,
+    { key },
+  );
+
+/** Re-send the task's result to a channel by KEY (the dropdown path). */
+export const repostBackgroundTaskResultByChannel = (id: string, key: string) =>
+  apiPost<{ ok: boolean; notificationId?: string; reason?: string }>(
+    `/api/console/background-tasks/${encodeURIComponent(id)}/repost-result`,
+    { key },
   );
 
 // Queue visibility: the sub-task queue of one workflow run (each step/forEach

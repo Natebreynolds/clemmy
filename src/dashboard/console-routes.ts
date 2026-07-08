@@ -253,6 +253,9 @@ import {
   restoreBackgroundTask,
   resumeBackgroundTask,
   setBackgroundTaskReportBackTarget,
+  resolveReportBackTarget,
+  describeReportBackTarget,
+  listReportBackChannelOptions,
   staleTaskKind,
   truncateResultBody,
 } from '../execution/background-tasks.js';
@@ -2302,7 +2305,16 @@ function reportBackString(input: unknown, ...keys: string[]): string {
 }
 
 function parseBackgroundReportBackTarget(input: unknown): BackgroundReportBackTarget | null {
+  // Accept an enumerated channel KEY (from GET /api/console/report-back/channels)
+  // as an alternative to the explicit {type, …ids} shape.
+  const key = reportBackString(input, 'key', 'channel', 'channelKey');
+  if (key) {
+    if (key === 'origin_chat' || key === 'origin-chat') return { type: 'origin_chat' };
+    const option = listReportBackChannelOptions().find((entry) => entry.key === key);
+    if (option) return option.target;
+  }
   const type = reportBackString(input, 'type');
+  if (type === 'origin_chat') return { type: 'origin_chat' };
   if (type === 'discord_user') {
     const userId = reportBackString(input, 'userId', 'user_id');
     return userId ? { type, userId } : null;
@@ -7951,9 +7963,12 @@ export function registerConsoleRoutes(
       const startMs = Date.parse(task.startedAt ?? task.createdAt);
       const endMs = task.completedAt ? Date.parse(task.completedAt) : Date.now();
       const elapsedMs = Number.isFinite(startMs) ? Math.max(0, endMs - startMs) : undefined;
-      // Each tool call emits a 'start' phase then an 'end'/'error' — count starts
-      // so paired events aren't double-counted (tool-observability.ts phases).
-      const toolCallCount = (detail?.toolEvents ?? []).filter((event) => event.phase === 'start').length;
+      // Count the CURRENT run session's tool_called events (authoritative — this
+      // is what the check-ins report as "N tool calls"). The old count filtered
+      // the NDJSON feed to phase==='start', but background runs emit only 'end'
+      // rows there, so it always read 0 while the check-in said 11 (live
+      // 2026-07-08). detail.toolCallCount comes straight from the harness log.
+      const toolCallCount = detail?.toolCallCount ?? 0;
       let tokensUsed: number | undefined;
       try {
         const { sumUsageTokensForSource } = await import('../runtime/usage-log.js');
@@ -7966,7 +7981,32 @@ export function registerConsoleRoutes(
         ...(tokensUsed !== undefined ? { tokensUsed } : {}),
         running: !task.completedAt,
       };
-      res.json({ task: { ...task, resultFull }, detail, vitals });
+      // Resolved report-back target: the task's explicit target, or the default
+      // for its origin (desktop chat → origin-chat), plus the connected channels
+      // it could be switched to. Lets the cockpit show a real target instead of
+      // "No explicit target".
+      const effectiveTarget = resolveReportBackTarget(task);
+      const reportBack = {
+        target: effectiveTarget ?? null,
+        label: effectiveTarget ? describeReportBackTarget(effectiveTarget) : 'Not routed (no origin or connected channel)',
+        explicit: Boolean(task.reportBackTarget),
+        channels: listReportBackChannelOptions(task),
+      };
+      res.json({ task: { ...task, resultFull }, detail, vitals, reportBack });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Enumerate the report-back channels available as targets (runtime-discovered:
+  // origin chat always; Discord/Slack DM only when connected + a user id is
+  // known). Optional ?taskId=… flags the task's current selection.
+  app.get('/api/console/report-back/channels', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const taskId = typeof req.query.taskId === 'string' ? req.query.taskId : '';
+      const task = taskId ? getBackgroundTask(taskId) : null;
+      res.json({ channels: listReportBackChannelOptions(task ?? undefined) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -14,7 +14,8 @@ import { runHarnessStream, humanHarnessText } from '@/lib/chat';
 import { apiGet } from '@/lib/api';
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
-import { StatusPill } from '@/components/ui/StatusPill';
+import { humanToolLabel, salientArgDetail, isHousekeepingTool } from '@/lib/toolLabels';
+import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
 import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
@@ -22,11 +23,15 @@ import { RunAgentsPanel } from '@/components/board/RunAgentsPanel';
 import {
   cardTone,
   getBackgroundTaskDetail,
+  listReportBackChannels,
   repostBackgroundTaskResult,
+  repostBackgroundTaskResultByChannel,
+  setBackgroundTaskReportBackChannel,
   setBackgroundTaskReportBackTarget,
   sourceLabel,
   type BackgroundReportBackTarget,
   type BackgroundReportBackTargetType,
+  type BackgroundTaskNotification,
   type BoardButtonIntent,
   type BoardCard,
 } from '@/lib/board';
@@ -180,7 +185,7 @@ function formatTokens(n?: number): string {
 }
 
 function reportBackTargetText(target?: BackgroundReportBackTarget): string {
-  if (!target) return 'No explicit target';
+  if (!target) return 'this chat';
   if (target.type === 'slack_user') return `Slack DM ${target.userId ?? ''}`.trim();
   if (target.type === 'slack_channel') return `Slack channel ${target.channelId ?? ''}${target.threadTs ? ` · ${target.threadTs}` : ''}`.trim();
   if (target.type === 'discord_user') return `Discord DM ${target.userId ?? ''}`.trim();
@@ -206,12 +211,30 @@ function buildReportBackTarget(type: BackgroundReportBackTargetType, value: stri
   return { type, channelId: trimmed };
 }
 
-function receiptToneFromError(notification: { deliveryError?: string; deliveredAt?: string; deliveredDestinations?: string[] }): 'success' | 'warning' | 'danger' | 'neutral' {
-  const delivered = Boolean(notification.deliveredAt) || Boolean(notification.deliveredDestinations?.length);
-  if (notification.deliveryError && delivered) return 'warning';
-  if (notification.deliveryError) return 'danger';
-  if (delivered) return 'success';
-  return 'neutral';
+/**
+ * Render a delivery entry by its TRUE state, not a perpetual "queued" chip.
+ * Prefers the backend-persisted `state` when present, else derives one from the
+ * timestamp/error fields so older rows still read truthfully:
+ *   sent → "delivered to Discord DM · 9:31 PM"   failed → the reason
+ *   pending → "sending…"
+ */
+function deliveryView(n: BackgroundTaskNotification): { tone: Tone; label: string; detail: string } {
+  const state = String(n.state ?? '').toLowerCase();
+  const hasLanded = Boolean(n.deliveredAt) || Boolean(n.deliveredDestinations?.length);
+  const isFailed = state === 'failed' || state === 'error' || (!state && Boolean(n.deliveryError) && !hasLanded);
+  const isSent = state === 'sent' || state === 'delivered' || (!state && hasLanded);
+  const dest = n.deliveredDestinations?.join(', ') || n.channelLabel || '';
+  const when = n.deliveredAt ? formatTime(n.deliveredAt) : '';
+
+  if (isFailed) {
+    return { tone: 'danger', label: 'failed', detail: n.deliveryError || 'Couldn’t deliver.' };
+  }
+  if (isSent) {
+    const detail = [dest ? `delivered to ${dest}` : 'delivered', when].filter(Boolean).join(' · ');
+    // A row that landed but still carries an error was retried — flag it amber.
+    return { tone: n.deliveryError ? 'warning' : 'success', label: 'delivered', detail };
+  }
+  return { tone: 'neutral', label: 'sending…', detail: 'Sending…' };
 }
 
 export function LiveTraceDrawer({
@@ -232,6 +255,7 @@ export function LiveTraceDrawer({
   const [targetThreadTs, setTargetThreadTs] = useState('');
   const [targetKey, setTargetKey] = useState('');
   const [targetNotice, setTargetNotice] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
+  const [channelKey, setChannelKey] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   // A finished run loses its `sourceKind === 'workflow'` tag but still carries a
@@ -254,6 +278,15 @@ export function LiveTraceDrawer({
     { enabled: isBackground },
   );
   const taskDetail = backgroundDetail.data;
+
+  // Report-back channels for the dropdown. Fetched once (interval 0) so a 404
+  // — until the backend ships the endpoint — doesn't spam. On any error we fall
+  // back to the legacy free-text target controls so the drawer never breaks.
+  const channelsQ = usePoll(['report-back-channels'], listReportBackChannels, 0, { enabled: isBackground });
+  const channels = channelsQ.data?.channels ?? [];
+  const useChannelDropdown = isBackground && channelsQ.isSuccess && channels.length > 0;
+  const connectedChannels = useMemo(() => channels.filter((c) => c.connected), [channels]);
+  const selectedChannel = channels.find((c) => c.key === channelKey);
 
   // Tick a 1s clock while a background task is still running so the elapsed
   // vitals timer moves between the 4s detail polls (server sends the authoritative
@@ -289,6 +322,16 @@ export function LiveTraceDrawer({
     () => buildReportBackTarget(targetType, targetId, targetThreadTs),
     [targetId, targetThreadTs, targetType],
   );
+
+  // Preselect the default channel once channels load (and there's no pick yet).
+  useEffect(() => {
+    if (!useChannelDropdown || channelKey) return;
+    const preferred = channels.find((c) => c.isDefault && c.connected)
+      ?? channels.find((c) => c.isDefault)
+      ?? connectedChannels[0]
+      ?? channels[0];
+    if (preferred) setChannelKey(preferred.key);
+  }, [useChannelDropdown, channelKey, channels, connectedChannels]);
 
   const saveTarget = async () => {
     if (!cockpitTarget) {
@@ -326,11 +369,58 @@ export function LiveTraceDrawer({
     }
   };
 
+  const saveChannel = async () => {
+    if (!channelKey) {
+      setTargetNotice({ tone: 'danger', text: 'Pick a channel first.' });
+      return;
+    }
+    try {
+      const response = await setBackgroundTaskReportBackChannel(card.id, channelKey);
+      if (!response.ok) {
+        setTargetNotice({ tone: 'danger', text: response.reason ?? 'Could not save target.' });
+        return;
+      }
+      setTargetNotice({ tone: 'success', text: 'Report-back target saved.' });
+      void backgroundDetail.refetch();
+    } catch (err) {
+      setTargetNotice({ tone: 'danger', text: err instanceof Error ? err.message : 'Could not save target.' });
+    }
+  };
+
+  const repostChannel = async () => {
+    if (!channelKey) {
+      setTargetNotice({ tone: 'danger', text: 'Pick a channel first.' });
+      return;
+    }
+    try {
+      const response = await repostBackgroundTaskResultByChannel(card.id, channelKey);
+      if (!response.ok) {
+        setTargetNotice({ tone: 'danger', text: response.reason ?? 'Could not repost result.' });
+        return;
+      }
+      setTargetNotice({ tone: 'success', text: 'Result queued for delivery.' });
+      void backgroundDetail.refetch();
+    } catch (err) {
+      setTargetNotice({ tone: 'danger', text: err instanceof Error ? err.message : 'Could not repost result.' });
+    }
+  };
+
+  // The session whose live event feed this drawer shows. Background tasks run
+  // under a dedicated `runSessionId` — NOT their origin/chat `sessionId` — so we
+  // stream that; otherwise the cockpit shows chat-reflection noise while the
+  // Goal card (which already keys off the run session) shows the real work. This
+  // is the unification: cockpit + the SAME live feed the goal/trace view shows.
+  const traceSessionId = isWorkflow
+    ? null
+    : isBackground
+      ? (taskDetail?.task.runSessionId || card.sessionId)
+      : card.sessionId;
+
   // Harness SSE for background / run / execution.
   useEffect(() => {
-    if (isWorkflow || !card.sessionId) return;
+    if (!traceSessionId) return;
     setRawHarness([]);
-    const handle = runHarnessStream(card.sessionId, {
+    const handle = runHarnessStream(traceSessionId, {
       onEvent: (ev) => {
         setRawHarness((prev) => (prev.length > 400 ? [...prev.slice(-400), ev] : [...prev, ev]));
         const text = humanHarnessText(ev.data, '');
@@ -338,7 +428,7 @@ export function LiveTraceDrawer({
       },
     });
     return () => handle.stop();
-  }, [card.sessionId, isWorkflow]);
+  }, [traceSessionId]);
 
   // Run-events poll for workflow cards.
   useEffect(() => {
@@ -380,7 +470,11 @@ export function LiveTraceDrawer({
     : rawHarness.flatMap((ev) => {
         const m = HARNESS_MILESTONES[ev.type];
         if (!m) return [];
-        const detail = ev.type.startsWith('tool') ? toolName(ev.data) : humanHarnessText(ev.data, '').slice(0, 140);
+        const tName = toolName(ev.data);
+        // Hide the brain's own bookkeeping ("reflection end", tool-choice scoring)
+        // — those aren't actions the user asked for.
+        if (ev.type.startsWith('tool') && isHousekeepingTool(tName)) return [];
+        const detail = ev.type.startsWith('tool') ? humanToolLabel(tName) : humanHarnessText(ev.data, '').slice(0, 140);
         return [{ key: `h-${ev.seq}`, icon: m.icon, label: m.label, detail, time: ev.createdAt, tone: m.tone }];
       });
 
@@ -450,7 +544,12 @@ export function LiveTraceDrawer({
                   {taskDetail.vitals?.tokensUsed !== undefined && (
                     <CockpitMetric label="Tokens" value={formatTokens(taskDetail.vitals.tokensUsed)} />
                   )}
-                  <CockpitMetric label="Report back" value={reportBackTargetText(taskDetail.task.reportBackTarget)} />
+                  <CockpitMetric
+                    label="Report back"
+                    value={useChannelDropdown
+                      ? (selectedChannel?.label ?? channels.find((c) => c.isDefault)?.label ?? 'this chat')
+                      : reportBackTargetText(taskDetail.task.reportBackTarget)}
+                  />
                   <CockpitMetric label="Updated" value={formatTime(taskDetail.task.updatedAt)} />
                 </div>
 
@@ -487,34 +586,54 @@ export function LiveTraceDrawer({
                   <div className="mb-2 flex items-center gap-2 text-small font-semibold text-fg">
                     <Send className="h-4 w-4" aria-hidden /> Report-back target
                   </div>
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    <Select value={targetType} onChange={(e) => setTargetType(e.target.value as BackgroundReportBackTargetType)} aria-label="Report-back target type">
-                      <option value="slack_user">Slack DM</option>
-                      <option value="slack_channel">Slack channel</option>
-                      <option value="discord_user">Discord DM</option>
-                      <option value="discord_channel">Discord channel</option>
-                    </Select>
-                    <Input
-                      value={targetId}
-                      onChange={(e) => setTargetId(e.target.value)}
-                      placeholder={targetType.endsWith('_user') ? 'User ID' : 'Channel ID'}
-                      aria-label="Report-back target ID"
-                    />
-                    {targetType === 'slack_channel' && (
+                  {useChannelDropdown ? (
+                    <>
+                      <p className="mb-2 text-caption text-muted">
+                        Reports back to:{' '}
+                        <span className="font-semibold text-fg">{selectedChannel?.label ?? 'this chat'}</span>
+                      </p>
+                      <Select
+                        value={channelKey}
+                        onChange={(e) => setChannelKey(e.target.value)}
+                        aria-label="Report-back channel"
+                      >
+                        {channels.map((c) => (
+                          <option key={c.key} value={c.key} disabled={!c.connected}>
+                            {c.label}{c.isDefault ? ' (default)' : ''}{c.connected ? '' : ' — not connected'}
+                          </option>
+                        ))}
+                      </Select>
+                    </>
+                  ) : (
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <Select value={targetType} onChange={(e) => setTargetType(e.target.value as BackgroundReportBackTargetType)} aria-label="Report-back target type">
+                        <option value="slack_user">Slack DM</option>
+                        <option value="slack_channel">Slack channel</option>
+                        <option value="discord_user">Discord DM</option>
+                        <option value="discord_channel">Discord channel</option>
+                      </Select>
                       <Input
-                        value={targetThreadTs}
-                        onChange={(e) => setTargetThreadTs(e.target.value)}
-                        placeholder="Thread timestamp"
-                        aria-label="Slack thread timestamp"
-                        className="sm:col-span-2"
+                        value={targetId}
+                        onChange={(e) => setTargetId(e.target.value)}
+                        placeholder={targetType.endsWith('_user') ? 'User ID' : 'Channel ID'}
+                        aria-label="Report-back target ID"
                       />
-                    )}
-                  </div>
+                      {targetType === 'slack_channel' && (
+                        <Input
+                          value={targetThreadTs}
+                          onChange={(e) => setTargetThreadTs(e.target.value)}
+                          placeholder="Thread timestamp"
+                          aria-label="Slack thread timestamp"
+                          className="sm:col-span-2"
+                        />
+                      )}
+                    </div>
+                  )}
                   <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <Button size="sm" variant="secondary" onClick={() => void saveTarget()}>
+                    <Button size="sm" variant="secondary" onClick={() => void (useChannelDropdown ? saveChannel() : saveTarget())}>
                       <Save className="h-4 w-4" aria-hidden /> Save target
                     </Button>
-                    <Button size="sm" onClick={() => void repostResult()} disabled={!taskResult}>
+                    <Button size="sm" onClick={() => void (useChannelDropdown ? repostChannel() : repostResult())} disabled={!taskResult}>
                       <Send className="h-4 w-4" aria-hidden /> Repost result
                     </Button>
                     {targetNotice && (
@@ -537,18 +656,24 @@ export function LiveTraceDrawer({
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div>
                     <div className="mb-1 text-small font-semibold text-fg">Tools</div>
-                    {taskDetail.detail.toolEvents.length === 0 ? (
-                      <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No tool events.</div>
-                    ) : (
-                      <ul className="space-y-1.5">
-                        {taskDetail.detail.toolEvents.slice(-5).map((event) => (
-                          <li key={`${event.at}-${event.toolName}-${event.phase ?? ''}`} className="rounded-md border border-border px-2.5 py-2 text-caption">
-                            <div className="truncate font-semibold text-fg">{event.toolName} {event.phase ?? ''}</div>
-                            <div className="truncate text-faint">{event.outcome ?? event.errorMessage ?? event.argsSummary ?? formatTime(event.at)}</div>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
+                    {(() => {
+                      // Hide the brain's own bookkeeping (reflection, tool-choice
+                      // scoring); show real tools humanized like the chat strip.
+                      const realTools = taskDetail.detail.toolEvents.filter((e) => !isHousekeepingTool(e.toolName));
+                      if (realTools.length === 0) {
+                        return <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No tool events.</div>;
+                      }
+                      return (
+                        <ul className="space-y-1.5">
+                          {realTools.slice(-5).map((event) => (
+                            <li key={`${event.at}-${event.toolName}-${event.phase ?? ''}`} className="rounded-md border border-border px-2.5 py-2 text-caption">
+                              <div className="truncate font-semibold text-fg">{humanToolLabel(event.toolName, event.argsSummary)}</div>
+                              <div className="truncate text-faint">{event.errorMessage ?? (salientArgDetail(event.argsSummary) || event.outcome || formatTime(event.at))}</div>
+                            </li>
+                          ))}
+                        </ul>
+                      );
+                    })()}
                   </div>
                   <div>
                     <div className="mb-1 text-small font-semibold text-fg">Delivery</div>
@@ -556,17 +681,18 @@ export function LiveTraceDrawer({
                       <div className="rounded-md border border-border px-3 py-2 text-caption text-faint">No notifications.</div>
                     ) : (
                       <ul className="space-y-1.5">
-                        {taskDetail.detail.notifications.slice(-5).map((notification) => (
-                          <li key={notification.id} className="rounded-md border border-border px-2.5 py-2 text-caption">
-                            <div className="flex items-center justify-between gap-2">
-                              <div className="min-w-0 truncate font-semibold text-fg">{notification.title}</div>
-                              <StatusPill tone={receiptToneFromError(notification)}>
-                                {notification.deliveryError ? 'issue' : notification.deliveredAt ? 'sent' : 'queued'}
-                              </StatusPill>
-                            </div>
-                            <div className="truncate text-faint">{notification.deliveryError ?? notification.deliveredDestinations?.join(', ') ?? formatTime(notification.createdAt)}</div>
-                          </li>
-                        ))}
+                        {taskDetail.detail.notifications.slice(-5).map((notification) => {
+                          const dv = deliveryView(notification);
+                          return (
+                            <li key={notification.id} className="rounded-md border border-border px-2.5 py-2 text-caption">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0 truncate font-semibold text-fg">{notification.title}</div>
+                                <StatusPill tone={dv.tone}>{dv.label}</StatusPill>
+                              </div>
+                              <div className="truncate text-faint">{dv.detail}</div>
+                            </li>
+                          );
+                        })}
                       </ul>
                     )}
                   </div>
@@ -620,7 +746,7 @@ export function LiveTraceDrawer({
 
         <footer className="flex items-center justify-between border-t border-border px-5 py-3">
           <span className="text-caption text-faint">
-            {isWorkflow ? `${rawWorkflow.length} events · polling` : card.sessionId ? `${rawHarness.length} events · live` : 'No live session'}
+            {isWorkflow ? `${rawWorkflow.length} events · polling` : traceSessionId ? `${rawHarness.length} events · live` : 'No live session'}
           </span>
           <button onClick={() => setShowRaw((v) => !v)} className="text-caption font-semibold text-primary hover:underline">
             {showRaw ? 'Show timeline' : 'Show raw events'}
