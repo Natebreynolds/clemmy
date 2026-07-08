@@ -224,6 +224,83 @@ test('P0 single ownership: a goal-bound interrupted run resumes IN PLACE — one
   }
 });
 
+test('single ownership: a DOUBLE interrupt (reattach → interrupt → boot) keeps ONE record, re-enqueued, zero clones', async () => {
+  const { createGoalContract } = await import('../agents/plan-proposals.js');
+  const drainKicks: Array<number | undefined> = [];
+  registerBackgroundDrainKick((limit) => drainKicks.push(limit));
+  try {
+    const before = listBackgroundTasks({ includeArchived: true }).length;
+    const task = createBackgroundTask({ title: 'Double-interrupt goal task', prompt: 'do the durable thing', source: 'desktop' });
+    assert.ok(createGoalContract({ objective: 'do the durable thing', sessionId: task.runSessionId, origin: { kind: 'background' } }), 'goal bound');
+
+    // Bounce 1: running → interrupted → boot auto-resume reattaches in place.
+    markBackgroundTaskRunning(task.id);
+    markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+    resumeInterruptedBackgroundTasks({ cap: 5 });
+    let live = getBackgroundTask(task.id);
+    assert.equal(live?.status, 'pending', 'reattached in place (pending)');
+    assert.equal(live?.resumeCount, 1);
+    assert.ok(drainKicks.length >= 1, 'reattach handed the task back to the runner (drain kick)');
+
+    // Bounce 2: the reattached task ran again then got interrupted again.
+    markBackgroundTaskRunning(task.id);
+    markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+    resumeInterruptedBackgroundTasks({ cap: 5 });
+
+    // Exactly ONE record for THIS objective — no "Resume X" clone across bounces.
+    // (Other leftover interrupted tasks in the shared temp home may clone; assert
+    // specifically that nothing forked off OUR task.)
+    const after = listBackgroundTasks({ includeArchived: true });
+    assert.ok(!after.some((t) => t.resumedFromTaskId === task.id), 'nothing points back at our original as a clone');
+    live = getBackgroundTask(task.id);
+    assert.equal(live?.status, 'pending', 'the ONE record is queued for the runner');
+    assert.equal(live?.resumedIntoTaskId, undefined, 'no carry-forward stamp (reattached, not cloned)');
+    assert.equal(live?.resumeCount, 2, 'resumeCount bumped each bounce (crash cap still bounds it)');
+  } finally {
+    registerBackgroundDrainKick(() => {});
+  }
+});
+
+test('manual resume: a goal-bound interrupted task reattaches SAME id and re-enqueues (no clone)', async () => {
+  const { createGoalContract } = await import('../agents/plan-proposals.js');
+  const drainKicks: Array<number | undefined> = [];
+  registerBackgroundDrainKick((limit) => drainKicks.push(limit));
+  try {
+    const before = listBackgroundTasks({ includeArchived: true }).length;
+    const task = createBackgroundTask({ title: 'Manual-resume goal task', prompt: 'resume me from the board', source: 'desktop' });
+    assert.ok(createGoalContract({ objective: 'resume me from the board', sessionId: task.runSessionId, origin: { kind: 'background' } }), 'goal bound');
+    markBackgroundTaskRunning(task.id);
+    markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+
+    // The board resume route calls resumeBackgroundTask directly (no boot drain).
+    const resumed = resumeBackgroundTask(task.id);
+    assert.equal(resumed?.id, task.id, 'manual resume reattaches the SAME task id, not a clone');
+    assert.equal(resumed?.status, 'pending', 're-queued for the runner');
+    assert.ok(drainKicks.length >= 1, 'manual reattach kicked the drain so it re-enters the runner immediately');
+    const after = listBackgroundTasks({ includeArchived: true });
+    assert.equal(after.length, before + 1, 'no clone record created by the manual route');
+    assert.ok(!after.some((t) => t.resumedFromTaskId === task.id), 'no "Resume X" clone from the manual route');
+  } finally {
+    registerBackgroundDrainKick(() => {});
+  }
+});
+
+test('manual resume: double-clone guard returns the live clone instead of spawning a second (non-goal task)', () => {
+  const before = listBackgroundTasks({ includeArchived: true }).length;
+  const task = createBackgroundTask({ title: 'Non-goal resume task', prompt: 'clone me once', source: 'cli' });
+  markBackgroundTaskFailed(task.id, 'Daemon restarted while task was running.', 'interrupted');
+  // First resume clones (no goal → legacy fresh-clone path).
+  const clone = resumeBackgroundTask(task.id);
+  assert.ok(clone && clone.id !== task.id, 'non-goal task clones');
+  assert.equal(getBackgroundTask(task.id)?.resumedIntoTaskId, clone!.id);
+  // A second resume of the SAME original must NOT spawn a second clone while the
+  // first is still live — it returns the existing one (the bg-mrbqlkpv double-clone).
+  const again = resumeBackgroundTask(task.id);
+  assert.equal(again?.id, clone!.id, 'second resume returns the existing live clone, not a new one');
+  const after = listBackgroundTasks({ includeArchived: true });
+  assert.equal(after.length, before + 2, 'exactly one clone exists (original + one clone), not two');
+});
+
 test('P3/P4 cockpit: toolCallCount is truthful; Tools feed keeps real calls, drops reflection/housekeeping', async () => {
   const { getBackgroundTaskStatus } = await import('./background-task-status.js');
   const task = createBackgroundTask({ title: 'Cockpit stats task', prompt: 'do work', source: 'desktop' });

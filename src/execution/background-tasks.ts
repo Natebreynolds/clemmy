@@ -1497,6 +1497,12 @@ export function cancelBackgroundTask(id: string, reason = 'Cancelled by user.'):
   return markBackgroundTaskFailed(id, reason, 'aborted');
 }
 
+/** Task statuses that mean a resume clone is STILL live (an executor exists or is
+ *  queued) — used to stop a second clone spawning while the first is in flight. */
+const LIVE_TASK_STATUSES: readonly BackgroundTaskStatus[] = [
+  'pending', 'running', 'cancelling', 'awaiting_approval', 'awaiting_input', 'awaiting_continue',
+];
+
 export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
   const task = getBackgroundTask(id);
   if (!task) return null;
@@ -1505,6 +1511,23 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
   }
   if (task.status !== 'interrupted' && task.status !== 'failed' && task.status !== 'aborted') {
     return null;
+  }
+  // SINGLE OWNERSHIP: a run that owns its own resume path (an active goal contract
+  // bound to its run session) is resumed IN PLACE — same id, same run session,
+  // handed straight back to the runner — so a goal-bound objective can never have
+  // two executors. Shared by the boot auto-resumer AND the manual board resume
+  // route, so the manual route stops cloning goal-bound tasks (live 2026-07-08).
+  if (runHasOwnResumePath(task.runSessionId)) {
+    return reattachInterruptedTaskInPlace(task.id);
+  }
+  // Double-clone guard: if this task was already carried forward into a clone that
+  // is STILL live, hand back that clone instead of spawning a second one. The
+  // manual resume route ignored `resumedIntoTaskId`, so it re-cloned a task the
+  // boot auto-resumer had already carried forward (bg-mrbqlkpv → bg-mrbqprgv then
+  // → bg-mrbr8za2, two executors on one objective).
+  if (task.resumedIntoTaskId) {
+    const existing = getBackgroundTask(task.resumedIntoTaskId);
+    if (existing && LIVE_TASK_STATUSES.includes(existing.status)) return existing;
   }
   const resumed = createBackgroundTask({
     title: `Resume ${task.title}`,
@@ -1529,6 +1552,11 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
   // Stamp the original so the boot-time auto-resumer (and the UI) can tell
   // it's already been carried forward and won't re-spawn it.
   updateBackgroundTask(task.id, { resumedIntoTaskId: resumed.id });
+  // Hand the clone back to the runner now instead of waiting on the 15s tick. The
+  // boot path also drains on setImmediate, but the MANUAL resume route runs at
+  // runtime with no boot drain — without this the clone sat pending. Idempotent:
+  // the drain is guarded by backgroundProcessorInFlight + markRunning(pending).
+  requestBackgroundDrain(1);
   return resumed;
 }
 
@@ -1548,19 +1576,11 @@ export function resumeInterruptedBackgroundTasks(opts: { cap?: number } = {}): n
     if (task.error !== DAEMON_RESTART_INTERRUPT_REASON) continue;
     if (task.resumedIntoTaskId) continue;          // already carried forward (clone path)
     if ((task.resumeCount ?? 0) >= cap) continue;  // give up after cap retries
-    // SINGLE OWNERSHIP (P0, live 2026-07-08): a task whose RUN session carries
-    // its own resume path — an active goal contract bound to `background:<id>`
-    // (every detached / goal-bound background run has one, see
-    // bindBackgroundRunGoal) — must be resumed IN PLACE: same task id, same run
-    // session, no "Resume X" clone. Cloning here spawned a SECOND executor on a
-    // fresh run session ALONGSIDE the still-active goal/run, so one objective ran
-    // twice (and re-cloned on every restart — bg-mrbkxeoe then bg-mrblgh1r off
-    // one original). Only a run with NO such path falls back to the fresh-clone
-    // resume (the legacy cron/autonomous case with no goal binding).
-    if (runHasOwnResumePath(task.runSessionId)) {
-      if (reattachInterruptedTaskInPlace(task.id)) resumedCount += 1;
-      continue;
-    }
+    // resumeBackgroundTask owns the SINGLE-OWNERSHIP decision (reattach a
+    // goal-bound run in place vs. fresh-clone a non-goal run) so the boot
+    // auto-resumer and the manual board route stay identical. Cloning a
+    // goal-bound task here spawned a SECOND executor alongside its still-active
+    // goal/run (bg-mrbkxeoe/bg-mrblgh1r off one original, live 2026-07-08).
     if (resumeBackgroundTask(task.id)) resumedCount += 1;
   }
   return resumedCount;
@@ -1626,6 +1646,13 @@ function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null
       silent: true,
       metadata: taskNotificationMetadata(updated, { status: 'pending', reattachedInPlace: true }),
     });
+    // Hand the reattached task back to the runner. Updating the JSON to `pending`
+    // alone relied on the next drain tick; a manual resume (runtime, drain kick
+    // registered) now re-enters immediately, and on boot the setImmediate drain
+    // still covers it (the kick is a no-op until registered). Idempotent — the
+    // drain is guarded by backgroundProcessorInFlight and markRunning(pending),
+    // so a task already being drained is never double-run.
+    requestBackgroundDrain(1);
   }
   return updated;
 }
