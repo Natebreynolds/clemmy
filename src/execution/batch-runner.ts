@@ -344,8 +344,12 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
     if (priorBatch) {
       return { outcome: { id: item.id, ok: true, attempts: 0, ms: 0, deduped: true, idempotencyKey: key, resultPreview: `deduped: already executed in batch ${priorBatch}` } };
     }
+    // composio_execute_tool's schema is strict nullable-but-REQUIRED: every key
+    // must be present (null allowed, absent NOT). Omitting connected_account_id
+    // failed ALL items of the 2026-07-08 sheet batch in milliseconds with
+    // InvalidToolInputError — before any network call.
     const args = plan.tool === 'composio_execute_tool'
-      ? { tool_slug: plan.composioSlug, arguments: JSON.stringify(item.args) }
+      ? { tool_slug: plan.composioSlug, arguments: JSON.stringify(item.args), connected_account_id: null }
       : item.args;
     let attempts = 0;
     let lastError = '';
@@ -354,9 +358,13 @@ export async function runBatchPlan(plan: BatchPlan, sessionId: string): Promise<
       try {
         const out = await dispatchBatchItemTool(plan.tool, args, sessionId, counter);
         const text = previewOf(out);
-        // A composio "polite failure" comes back as a normal result whose text
-        // is an error banner — do not count those as success.
-        if (/^⚠️|FAILED \(slug=|NOT CONNECTED/i.test(text)) {
+        // A "polite failure" comes back as a NORMAL result whose text is an
+        // error banner — composio's ⚠️ banners AND the @openai/agents SDK's
+        // defaultToolErrorFunction ("An error occurred while running the
+        // tool…"), which swallowed InvalidToolInputError for all 5 items of the
+        // 2026-07-08 sheet batch while the ledger said 5/5 succeeded. Anchored
+        // at the START of the text so results merely MENTIONING errors pass.
+        if (/^⚠️|^An error occurred while running the tool|^\s*(Error|InvalidToolInputError)\b|FAILED \(slug=|NOT CONNECTED/i.test(text)) {
           lastError = text.slice(0, 200);
           const rl = detectRateLimit(text);
           if (rl) return { rateLimit: rl };

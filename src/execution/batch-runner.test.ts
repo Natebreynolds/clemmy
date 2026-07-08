@@ -238,3 +238,43 @@ test('runBatchPlan: a re-run skips an already-succeeded item but re-executes a f
   const text = formatBatchLedger(ledgerB);
   assert.match(text, /1 deduped \(already executed in a prior batch: batch-/);
 });
+
+test('composio items: connected_account_id is ALWAYS present (strict nullable-required schema) and SDK error banners are FAILURES', async () => {
+  calls.length = 0;
+  _setCodeModeToolsForTests(new Map([
+    ['composio_execute_tool', fakeTool('composio_execute_tool', (input) => {
+      // The real tool's parser rejects ABSENT keys before any network call —
+      // mirror that contract so composition drift fails this test.
+      if (!('connected_account_id' in input)) {
+        return 'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool';
+      }
+      return JSON.stringify({ data: { ok: true } });
+    })],
+  ]) as never);
+  const ledger = await runBatchPlan({
+    tool: 'composio_execute_tool',
+    composioSlug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    sideEffect: 'write',
+    objective: 'verify composio composition satisfies the strict schema',
+    items: [{ id: 'sheet-a', args: { title: 'A' } }, { id: 'sheet-b', args: { title: 'B' } }],
+  }, 'sess-batch-test');
+  assert.equal(ledger.succeeded, 2, 'both items must dispatch with the full strict key set');
+  assert.equal(ledger.failed, 0);
+
+  // Now the classifier: a tool that ALWAYS returns the SDK banner must be an
+  // honest failure, never a fake success (the 2026-07-08 "5/5 succeeded" lie).
+  _setCodeModeToolsForTests(new Map([
+    ['composio_execute_tool', fakeTool('composio_execute_tool', () =>
+      'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool')],
+  ]) as never);
+  const bad = await runBatchPlan({
+    tool: 'composio_execute_tool',
+    composioSlug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    sideEffect: 'write',
+    objective: 'verify SDK error banners are counted as failures',
+    items: [{ id: 'sheet-c', args: { title: 'C' } }],
+  }, 'sess-batch-test');
+  assert.equal(bad.succeeded, 0, 'an SDK error banner result must NOT count as success');
+  assert.equal(bad.failed, 1);
+  assert.match(bad.outcomes[0].error ?? '', /InvalidToolInputError|An error occurred/);
+});
