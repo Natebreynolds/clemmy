@@ -50,7 +50,13 @@ function blockKindsFor(sessionId: string): string[] {
 
 const send = (to: string) => ({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ recipient_email: to, subject: 's', body: 'b' }) });
 
-test('GATE-PARITY: a program looping batch sends trips confirm-first (same as a discrete loop)', async () => {
+test('GATE-SUPERSEDED (2026-07-08): an in-program send is REFUSED before any gate — a program can never loop sends at all', async () => {
+  // This test used to assert confirm-first parity for an 8-send in-program
+  // loop. The code-mode send guard (606a2245) made that scenario impossible
+  // BY DESIGN: an irreversible send inside run_tool_program is refused before
+  // it fires (code programs die at the 60s cap mid-batch and lose sends), with
+  // a redirect to run_batch — a strictly stronger guarantee than confirm-first
+  // catching the batch at send #N.
   setBaselineEnv();
   process.env.CLEMMY_CONFIRM_FIRST = 'on';
   resetEventLog();
@@ -58,11 +64,38 @@ test('GATE-PARITY: a program looping batch sends trips confirm-first (same as a 
   const sess = createSession({ kind: 'chat' });
   const counter = (await import('../runtime/harness/brackets.js')).ToolCallsCounter;
   const shared = new counter(1000);
-  // 8 distinct-recipient sends in a loop (the confirm-first-batch shape).
+  let refusals = 0;
   for (let i = 1; i <= 8; i += 1) {
-    try { await dispatchCodeModeTool('composio_execute_tool', send(`r${i}@b.com`), sess.id, shared); } catch { /* gate block surfaces as throw — expected */ }
+    try {
+      await dispatchCodeModeTool('composio_execute_tool', send(`r${i}@b.com`), sess.id, shared);
+    } catch (err) {
+      if (err instanceof Error && /run_batch/.test(err.message) && /irreversible external send/.test(err.message)) refusals += 1;
+    }
   }
-  assert.ok(blockKindsFor(sess.id).includes('confirm_first_required'), 'confirm-first must fire for an in-program batch, same as discrete calls');
+  assert.equal(refusals, 8, 'every in-program send is refused with the run_batch redirect — none reach the gates');
+  const writes = listEvents(sess.id, { types: ['external_write'] });
+  assert.equal(writes.length, 0, 'no send ever fired, so no external_write was recorded');
+  _setCodeModeToolsForTests(null);
+});
+
+test('GATE-PARITY: an in-program reversible-write loop is refused at the 3rd mutation (run_batch redirect)', async () => {
+  // Reversible writes may run singly in a program (gated normally), but a
+  // LOOP of them dies at the 60s cap just like sends — the escalation guard
+  // refuses the 3rd mutating call in one program run.
+  setBaselineEnv();
+  resetEventLog();
+  injectFakes();
+  const sess = createSession({ kind: 'chat' });
+  const counter = (await import('../runtime/harness/brackets.js')).ToolCallsCounter;
+  const shared = new counter(1000);
+  const update = (n: number) => ({ tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: JSON.stringify({ record: n }) });
+  await dispatchCodeModeTool('composio_execute_tool', update(1), sess.id, shared);
+  await dispatchCodeModeTool('composio_execute_tool', update(2), sess.id, shared);
+  await assert.rejects(
+    () => dispatchCodeModeTool('composio_execute_tool', update(3), sess.id, shared),
+    /run_batch/,
+    'the 3rd mutating call in one program run must be refused toward run_batch',
+  );
   _setCodeModeToolsForTests(null);
 });
 
@@ -82,11 +115,13 @@ test('GATE-PARITY: a wrong/implicit-destination publish inside a program hard-bl
 });
 
 test('TELEMETRY: each in-program call emits codeMode-tagged tool_called/tool_returned (trace visibility)', async () => {
-  setBaselineEnv(); // gates off + writes on → the send executes cleanly
+  setBaselineEnv(); // gates off + writes on → a reversible write executes cleanly
   resetEventLog();
   injectFakes();
   const sess = createSession({ kind: 'chat' });
-  await dispatchCodeModeTool('composio_execute_tool', send('a@b.com'), sess.id);
+  // A reversible UPDATE, not a send — sends are refused in code mode by design
+  // (606a2245), so telemetry visibility is proven on a call that executes.
+  await dispatchCodeModeTool('composio_execute_tool', { tool_slug: 'AIRTABLE_UPDATE_RECORD', arguments: JSON.stringify({ record: 1 }) }, sess.id);
   const called = listEvents(sess.id, { types: ['tool_called'] }).filter((e) => (e.data as { codeMode?: boolean }).codeMode);
   const returned = listEvents(sess.id, { types: ['tool_returned'] }).filter((e) => (e.data as { codeMode?: boolean }).codeMode);
   assert.ok(called.length >= 1, 'an in-program clem call emits a codeMode-tagged tool_called');
