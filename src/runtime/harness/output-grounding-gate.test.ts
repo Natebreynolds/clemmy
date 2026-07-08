@@ -30,6 +30,7 @@ const {
   OutputGroundingCheckFailedError,
   _setOutputGroundingJudgeForTests,
   _resetOutputGroundingStateForTests,
+  parseOutputGroundingVerdict,
 } = await import('./output-grounding-gate.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
@@ -257,4 +258,47 @@ test('deferCommit (#2.4 leak fix): an eagerly-evaluated bounce does NOT persist 
   } finally {
     _setOutputGroundingJudgeForTests(null);
   }
+});
+
+// ─── Plain-text verdict parser (schema-free; feed fake finalOutput strings) ───
+
+test('parseOutputGroundingVerdict: GROUNDED → grounded, no offending figures', () => {
+  const v = parseOutputGroundingVerdict('GROUNDED: every figure traces to the pulled rows');
+  assert.equal(v?.verdict, 'grounded');
+  assert.deepEqual(v?.offending, []);
+  assert.match(v!.reason, /traces to the pulled rows/);
+});
+
+test('parseOutputGroundingVerdict: CONTRADICTED with a FIGURES tail → blocked + offending figures', () => {
+  const v = parseOutputGroundingVerdict('CONTRADICTED: report says $24.5K spend but rows total $11K | FIGURES: $24.5K; 320%');
+  assert.equal(v?.verdict, 'contradicted');
+  assert.equal(v?.reason, 'report says $24.5K spend but rows total $11K');
+  assert.deepEqual(v?.offending.map((o) => o.figure), ['$24.5K', '320%']);
+  assert.ok(v?.offending.every((o) => o.kind === 'contradicted'));
+});
+
+test('parseOutputGroundingVerdict: UNVERIFIABLE maps offending kind to no_source', () => {
+  const v = parseOutputGroundingVerdict('UNVERIFIABLE: no source produces this | FIGURES: 8,400 leads');
+  assert.equal(v?.verdict, 'unverifiable');
+  assert.deepEqual(v?.offending.map((o) => o.figure), ['8,400 leads']);
+  assert.equal(v?.offending[0].kind, 'no_source');
+});
+
+test('parseOutputGroundingVerdict: FIGURES tail is optional', () => {
+  const v = parseOutputGroundingVerdict('CONTRADICTED: the total is off');
+  assert.equal(v?.verdict, 'contradicted');
+  assert.deepEqual(v?.offending, []);
+});
+
+test('parseOutputGroundingVerdict: no marker → null (caller records invalid)', () => {
+  assert.equal(parseOutputGroundingVerdict('looks fine numerically'), null);
+  assert.equal(parseOutputGroundingVerdict(''), null);
+  assert.equal(parseOutputGroundingVerdict(undefined), null);
+});
+
+test('parseOutputGroundingVerdict: reason + figures clamped in code, figures capped at 8', () => {
+  const many = Array.from({ length: 20 }, (_, i) => `f${i}`).join('; ');
+  const v = parseOutputGroundingVerdict(`CONTRADICTED: ${'y'.repeat(900)} | FIGURES: ${many}`);
+  assert.equal(v!.reason.length, 400);
+  assert.equal(v!.offending.length, 8);
 });

@@ -185,6 +185,18 @@ export interface GroundingVerdict {
 
 export type GroundingJudgeFn = (payload: string, sources: GroundingSource[]) => Promise<GroundingVerdict>;
 
+/** Parse the judge's ONE-LINE plain-text verdict — "GROUNDED: <why>" /
+ *  "UNGROUNDED: <contradiction>" — into the verdict shape. Returns null on a
+ *  no-marker response (caller records 'invalid' + throws → fail-open). Reason is
+ *  clamped in code, never validated. Exported so the parser is unit-testable with
+ *  fake finalOutput strings. */
+export function parseGroundingVerdict(finalOutput: unknown): GroundingVerdict | null {
+  const raw = String(finalOutput ?? '').trim();
+  const match = /^\s*(GROUNDED|UNGROUNDED)\s*:?\s*(.*)$/im.exec(raw);
+  if (!match) return null;
+  return { grounded: match[1].toUpperCase() === 'GROUNDED', reason: (match[2] || '').slice(0, 400) };
+}
+
 // Test injection seam — brackets.ts integration tests stub the judge.
 let judgeOverride: GroundingJudgeFn | null = null;
 export function _setGroundingJudgeForTests(fn: GroundingJudgeFn | null): void { judgeOverride = fn; }
@@ -193,27 +205,30 @@ export function _setGroundingJudgeForTests(fn: GroundingJudgeFn | null): void { 
  *  (caller converts to fail-open). Dynamic imports keep brackets.ts free of
  *  an SDK dependency at module load. */
 async function runGroundingJudge(payload: string, sources: GroundingSource[]): Promise<GroundingVerdict> {
-  const [{ Agent, Runner }, { z }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
+  const [{ Agent, Runner }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
-    import('zod'),
-    import('../schema-normalizer.js'),
     import('./debate-model.js'),
     import('./judge-family.js'),
   ]);
-  const VerdictSchema = z.object({
-    grounded: z.boolean().describe('False ONLY on a concrete contradiction between the payload and the target\'s source artifacts (or between the sources themselves) on a load-bearing fact.'),
-    reason: z.string().describe('One short sentence: the specific contradiction, or why the payload is consistent.'),
-  });
+  // PLAIN-TEXT verdict, parsed deterministically — same treatment the batch
+  // certify (2e10714e) and goal-fidelity (2538d916) judges got after structured
+  // output flaked live on the safety path (schema validation rejecting VALID
+  // verdicts → judge "unavailable"). One line, two markers, a regex: nothing
+  // left to fail on presentation.
   const routing = resolveBoundaryJudge();
   const agent = new Agent({
     name: 'GroundingJudge',
-    instructions: 'Verify outgoing external-write payloads against the session\'s own source artifacts. Output only the structured verdict.',
+    instructions: [
+      'Verify an outgoing external-write payload against the session\'s own source artifacts.',
+      'Reply with EXACTLY ONE LINE and nothing else, one of:',
+      '"GROUNDED: <one short sentence why the payload is consistent>" — use this unless there is a CONCRETE contradiction between the payload and the target\'s source artifacts (or between the sources themselves) on a load-bearing fact;',
+      '"UNGROUNDED: <the specific contradiction found>" — a load-bearing fact in the payload contradicts the sources.',
+    ].join(' '),
     // Cross-family boundary judge (a Codex/GLM brain is not graded by its own
     // family); falls open to the brain-family-safe cheap id (routing.modelId, never
     // a repurposed BYO fast slot) when no different family is available.
     model: routing.model ?? routing.modelId,
     modelSettings: { reasoning: { effort: 'low' } },
-    outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],
   });
   const runner = new Runner({ workflowName: 'clementine-grounding-judge' });
@@ -237,13 +252,14 @@ async function runGroundingJudge(payload: string, sources: GroundingSource[]): P
       record('timeout');
       throw new Error('grounding judge timed out');
     }
-    const parsed = VerdictSchema.safeParse(result.finalOutput);
-    if (!parsed.success) {
+    const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
+    const verdict = parseGroundingVerdict(raw);
+    if (!verdict) {
       record('invalid');
-      throw new Error('grounding judge output did not parse');
+      throw new Error(`grounding judge returned no GROUNDED/UNGROUNDED verdict (got: ${raw.slice(0, 120)})`);
     }
-    record(parsed.data.grounded ? 'passed' : 'blocked');
-    return parsed.data;
+    record(verdict.grounded ? 'passed' : 'blocked');
+    return verdict;
   } catch (err) {
     if (!recorded) record('error');
     throw err;

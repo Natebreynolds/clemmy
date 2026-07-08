@@ -1,9 +1,7 @@
 import { Agent, Runner } from '@openai/agents';
-import { z } from 'zod';
 import { MODELS } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
-import { normalizeZodForCodexStrict } from '../schema-normalizer.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
 import { recordJudgeMetric, withJudgeTimeout, type JudgeMetricOutcome } from './judge-family.js';
 
@@ -31,12 +29,14 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- Audit ONLY the deliverables the objective actually names. Do NOT invent extra deliverables (an "audit artifact", a "decision document", a saved file) that the user never asked for — demanding unnamed artifacts trains the assistant to write filler evidence files instead of doing work.',
   '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
   '',
-  'Output ONLY a JSON object on one line with no prose: {"done": <boolean>, "reason": "<one short sentence naming the missing evidence or the artifact that satisfied the objective>"}.',
+  'Reply with EXACTLY ONE LINE and nothing else, one of:',
+  '  "DONE: <one short sentence naming the artifact/URL/result that satisfied the objective>";',
+  '  "INCOMPLETE: <one short sentence naming the missing evidence>".',
   '',
   'Examples:',
-  '  {"done": true, "reason": "Spreadsheet created at /Users/me/Q3.xlsx with URL returned"}',
-  '  {"done": false, "reason": "Assistant proposed steps but no artifact or URL was produced"}',
-  '  {"done": false, "reason": "Two of three deliverables remain — emails drafted but no send confirmation evidence"}',
+  '  DONE: Spreadsheet created at /Users/me/Q3.xlsx with URL returned',
+  '  INCOMPLETE: Assistant proposed steps but no artifact or URL was produced',
+  '  INCOMPLETE: Two of three deliverables remain — emails drafted but no send confirmation evidence',
 ].join('\n');
 
 /**
@@ -215,13 +215,21 @@ export type ObjectiveJudgeFn = (
   skillContext?: SkillExecutionContext,
 ) => Promise<ObjectiveJudgeVerdict>;
 
-const VerdictSchema = z.object({
-  done: z.boolean().describe('True only when the objective is satisfied with verifiable evidence (artifact, URL, file path, emitted result) — not a promise or plan.'),
-  reason: z.string().describe('One short sentence naming the missing evidence, or the artifact that satisfied the objective.'),
-});
+// PLAIN-TEXT verdict, parsed deterministically — same treatment the batch certify
+// (2e10714e) and goal-fidelity (2538d916) judges got after structured output flaked
+// live on the safety path. One line, two markers ("DONE:" / "INCOMPLETE:"), a regex:
+// nothing left to reject a valid verdict on presentation. Returns null on no marker
+// so each caller applies its OWN fail semantics (strict throws → not-passed; the
+// interactive judge fails open → done:true), preserving both directions unchanged.
+export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string } | null {
+  const raw = String(finalOutput ?? '').trim();
+  const match = /^\s*(DONE|INCOMPLETE|NOT[- ]?DONE)\s*:?\s*(.*)$/im.exec(raw);
+  if (!match) return null;
+  return { done: match[1].toUpperCase() === 'DONE', reason: (match[2] || '').slice(0, 400) };
+}
 
-function buildJudgeAgent(routing?: BoundaryJudgeRouting): Agent<RuntimeContextValue, typeof VerdictSchema> {
-  return new Agent<RuntimeContextValue, typeof VerdictSchema>({
+function buildJudgeAgent(routing?: BoundaryJudgeRouting): Agent<RuntimeContextValue> {
+  return new Agent<RuntimeContextValue>({
     name: 'ObjectiveCompletionJudge',
     instructions: JUDGE_SYSTEM_PROMPT,
     // Cross-family boundary judge (avoids the brain self-grading); falls open to
@@ -232,7 +240,6 @@ function buildJudgeAgent(routing?: BoundaryJudgeRouting): Agent<RuntimeContextVa
     // deep chain-of-thought — low reasoning effort cuts the largest chunk of
     // per-call latency on this hot path (the judge runs on most action turns).
     modelSettings: { reasoning: { effort: 'low' } },
-    outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],
   });
 }
@@ -349,13 +356,13 @@ export async function judgeObjectiveCompleteStrict(
       record('timeout');
       throw new Error('judge timed out');
     }
-    const parsed = VerdictSchema.safeParse(result.finalOutput);
-    if (!parsed.success) {
+    const verdict = parseCompletionVerdict(result.finalOutput);
+    if (!verdict) {
       record('invalid');
       throw new Error('judge output did not parse');
     }
-    record(parsed.data.done ? 'passed' : 'blocked');
-    return { done: parsed.data.done, reason: parsed.data.reason };
+    record(verdict.done ? 'passed' : 'blocked');
+    return { done: verdict.done, reason: verdict.reason };
   } catch (err) {
     if (!recorded) record('error');
     throw err;
@@ -395,13 +402,13 @@ export async function judgeObjectiveComplete(
       record('timeout');
       return { done: true, reason: 'judge timed out — accepting completion', failedOpen: true };
     }
-    const parsed = VerdictSchema.safeParse(result.finalOutput);
-    if (!parsed.success) {
+    const verdict = parseCompletionVerdict(result.finalOutput);
+    if (!verdict) {
       record('invalid');
       return { done: true, reason: 'judge output did not parse — accepting completion', failedOpen: true };
     }
-    record(parsed.data.done ? 'passed' : 'blocked');
-    return { done: parsed.data.done, reason: parsed.data.reason, selfJudge: routing?.selfJudge === true };
+    record(verdict.done ? 'passed' : 'blocked');
+    return { done: verdict.done, reason: verdict.reason, selfJudge: routing?.selfJudge === true };
   } catch {
     if (!recorded) record('error');
     return { done: true, reason: 'judge unavailable — accepting completion', failedOpen: true };

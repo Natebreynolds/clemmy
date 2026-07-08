@@ -276,6 +276,36 @@ export interface OutputGroundingVerdict {
 
 export type OutputGroundingJudgeFn = (claims: NumericClaim[], sources: GroundingSource[]) => Promise<OutputGroundingVerdict>;
 
+/** Parse the judge's ONE-LINE plain-text verdict into the verdict shape:
+ *  "GROUNDED: <why>" / "CONTRADICTED: <reason> | FIGURES: a; b" /
+ *  "UNVERIFIABLE: <why> | FIGURES: a; b". The offending FIGURES tail is optional;
+ *  only the figure strings are consumed downstream (kind is derived from the
+ *  marker, note is advisory). Returns null on a no-marker response (caller records
+ *  'invalid'). All text clamped in code, never validated. Exported for unit tests. */
+export function parseOutputGroundingVerdict(finalOutput: unknown): OutputGroundingVerdict | null {
+  const raw = String(finalOutput ?? '').trim();
+  const match = /^\s*(GROUNDED|CONTRADICTED|UNVERIFIABLE)\s*:?\s*(.*)$/im.exec(raw);
+  if (!match) return null;
+  const marker = match[1].toUpperCase();
+  const figSplit = (match[2] || '').split(/\|\s*FIGURES\s*:?/i);
+  const reason = (figSplit[0] || '').trim().slice(0, 400);
+  // Semicolon-separated only — figures themselves contain commas ("8,400", "$1,000").
+  const figures = (figSplit[1] ?? '')
+    .split(';')
+    .map((f) => f.trim().slice(0, 60))
+    .filter(Boolean)
+    .slice(0, 8);
+  const verdictKind: OutputGroundingRollup =
+    marker === 'GROUNDED' ? 'grounded' : marker === 'UNVERIFIABLE' ? 'unverifiable' : 'contradicted';
+  return {
+    verdict: verdictKind,
+    offending: verdictKind === 'grounded'
+      ? []
+      : figures.map((figure) => ({ figure, kind: verdictKind === 'contradicted' ? 'contradicted' : 'no_source', note: '' })),
+    reason,
+  };
+}
+
 let judgeOverride: OutputGroundingJudgeFn | null = null;
 export function _setOutputGroundingJudgeForTests(fn: OutputGroundingJudgeFn | null): void { judgeOverride = fn; }
 
@@ -308,29 +338,29 @@ export function buildOutputGroundingPrompt(claims: NumericClaim[], sources: Grou
 }
 
 async function runOutputGroundingJudge(claims: NumericClaim[], sources: GroundingSource[]): Promise<OutputGroundingVerdict> {
-  const [{ Agent, Runner }, { z }, { normalizeZodForCodexStrict }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
+  const [{ Agent, Runner }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
-    import('zod'),
-    import('../schema-normalizer.js'),
     import('./debate-model.js'),
     import('./judge-family.js'),
   ]);
-  const VerdictSchema = z.object({
-    verdict: z.enum(['grounded', 'contradicted', 'unverifiable']).describe("'contradicted' if any figure conflicts with a source; 'unverifiable' if a load-bearing figure has no plausible source; else 'grounded'."),
-    offending: z.array(z.object({
-      figure: z.string().describe('The figure as written, e.g. "$24.5K".'),
-      kind: z.enum(['contradicted', 'no_source']),
-      note: z.string().describe('One short phrase: the conflicting source value, or why no source.'),
-    })).describe('Only the figures that failed; empty when grounded.'),
-    reason: z.string().describe('One short sentence: the contradiction found, or why the figures are consistent.'),
-  });
+  // PLAIN-TEXT verdict, parsed deterministically — same treatment the batch
+  // certify (2e10714e) and goal-fidelity (2538d916) judges got. One line, three
+  // markers, an optional "| FIGURES:" list carrying the offending figures (the
+  // only offending field consumed downstream). A regex parses it; no schema left
+  // to reject a valid verdict on presentation.
   const routing = resolveBoundaryJudge();
   const agent = new Agent({
     name: 'OutputGroundingJudge',
-    instructions: "Verify a deliverable's numeric claims against the session's own captured tool results. Accept derived/rounded/aggregated figures. Output only the structured verdict.",
+    instructions: [
+      "Verify a deliverable's numeric claims against the session's own captured tool results. Accept derived/rounded/aggregated figures (fail open when the sources are silent or ambiguous).",
+      'Reply with EXACTLY ONE LINE and nothing else, one of:',
+      '"GROUNDED: <one short sentence why the figures are consistent>";',
+      '"CONTRADICTED: <the contradiction found> | FIGURES: <the failing figures, semicolon-separated, e.g. $24.5K; 18%>" — a figure conflicts with a source value that no rounding/aggregation reconciles;',
+      '"UNVERIFIABLE: <why> | FIGURES: <the unsourced figures, semicolon-separated>" — a load-bearing figure has NO plausible source.',
+      'Omit the "| FIGURES:" part for GROUNDED.',
+    ].join(' '),
     model: routing.model ?? routing.modelId,
     modelSettings: { reasoning: { effort: 'low' } },
-    outputType: normalizeZodForCodexStrict(VerdictSchema) as typeof VerdictSchema,
     tools: [],
   });
   const runner = new Runner({ workflowName: 'clementine-output-grounding-judge' });
@@ -354,13 +384,14 @@ async function runOutputGroundingJudge(claims: NumericClaim[], sources: Groundin
       record('timeout');
       throw new Error('output-grounding judge timed out');
     }
-    const parsed = VerdictSchema.safeParse(result.finalOutput);
-    if (!parsed.success) {
+    const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
+    const verdict = parseOutputGroundingVerdict(raw);
+    if (!verdict) {
       record('invalid');
-      throw new Error('output-grounding judge output did not parse');
+      throw new Error(`output-grounding judge returned no GROUNDED/CONTRADICTED/UNVERIFIABLE verdict (got: ${raw.slice(0, 120)})`);
     }
-    record(parsed.data.verdict === 'grounded' ? 'passed' : (parsed.data.verdict === 'unverifiable' ? 'advisory' : 'blocked'));
-    return parsed.data;
+    record(verdict.verdict === 'grounded' ? 'passed' : (verdict.verdict === 'unverifiable' ? 'advisory' : 'blocked'));
+    return verdict;
   } catch (err) {
     if (!recorded) record('error');
     throw err;

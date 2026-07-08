@@ -29,6 +29,7 @@ const {
   _resetGroundingStateForTests,
   _resetDuplicateStateForTests,
   GroundingCheckFailedError,
+  parseGroundingVerdict,
 } = await import('./grounding-gate.js');
 
 test.after(() => {
@@ -187,4 +188,34 @@ test('detectDuplicateTarget: a multi-recipient send trips on ANY recipient alrea
   });
   assert.equal(res.duplicate, true);
   assert.equal(res.target, 'already@x.com');
+});
+
+// ─── Plain-text verdict parser (schema-free; feed fake finalOutput strings) ───
+
+test('parseGroundingVerdict: GROUNDED marker → grounded verdict + reason', () => {
+  const v = parseGroundingVerdict('GROUNDED: the amounts match the CRM rows');
+  assert.deepEqual(v, { grounded: true, reason: 'the amounts match the CRM rows' });
+});
+
+test('parseGroundingVerdict: UNGROUNDED marker → blocked verdict + contradiction', () => {
+  const v = parseGroundingVerdict('UNGROUNDED: payload says $24.5K but sources total $11K');
+  assert.equal(v?.grounded, false);
+  assert.match(v!.reason, /\$24\.5K/);
+});
+
+test('parseGroundingVerdict: tolerant of leading space, no colon, lowercase, surrounding prose', () => {
+  assert.equal(parseGroundingVerdict('  grounded consistent with the sources')?.grounded, true);
+  assert.equal(parseGroundingVerdict('UNGROUNDED - wrong recipient domain')?.grounded, false);
+});
+
+test('parseGroundingVerdict: no marker → null (caller records invalid + fails open)', () => {
+  assert.equal(parseGroundingVerdict('I think this looks fine to me'), null);
+  assert.equal(parseGroundingVerdict(''), null);
+  assert.equal(parseGroundingVerdict(undefined), null);
+});
+
+test('parseGroundingVerdict: reason is clamped in code, never validated', () => {
+  const v = parseGroundingVerdict(`GROUNDED: ${'x'.repeat(900)}`);
+  assert.equal(v?.grounded, true);
+  assert.equal(v!.reason.length, 400);
 });

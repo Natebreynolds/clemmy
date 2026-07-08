@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS } = await import('./objective-judge.js');
+const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, parseCompletionVerdict } = await import('./objective-judge.js');
 
 const baseGate = {
   optIn: true,
@@ -215,4 +215,36 @@ test('JUDGE_SYSTEM_PROMPT: rubric audits only NAMED deliverables and yields on a
   assert.match(JUDGE_SYSTEM_PROMPT, /Do NOT invent extra deliverables/);
   assert.match(JUDGE_SYSTEM_PROMPT, /bare conversational follow-up/);
   assert.doesNotMatch(JUDGE_SYSTEM_PROMPT, /lean toward not-done/, 'the loop-forever-on-ambiguity rule is gone');
+});
+
+// ─── Plain-text verdict parser (schema-free; feed fake finalOutput strings) ───
+
+test('parseCompletionVerdict: DONE marker → done:true + reason', () => {
+  const v = parseCompletionVerdict('DONE: Spreadsheet created at /Users/me/Q3.xlsx with URL returned');
+  assert.equal(v?.done, true);
+  assert.match(v!.reason, /Q3\.xlsx/);
+});
+
+test('parseCompletionVerdict: INCOMPLETE marker → done:false + missing evidence', () => {
+  const v = parseCompletionVerdict('INCOMPLETE: Assistant proposed steps but no artifact or URL was produced');
+  assert.equal(v?.done, false);
+  assert.match(v!.reason, /no artifact/);
+});
+
+test('parseCompletionVerdict: tolerant of NOT-DONE alias, no colon, lowercase, whitespace', () => {
+  assert.equal(parseCompletionVerdict('  done  everything shipped')?.done, true);
+  assert.equal(parseCompletionVerdict('NOT-DONE: still missing the send confirmation')?.done, false);
+  assert.equal(parseCompletionVerdict('not done: nothing produced')?.done, false);
+});
+
+test('parseCompletionVerdict: no marker → null (caller applies its own fail semantics)', () => {
+  assert.equal(parseCompletionVerdict('It seems like the work is finished'), null);
+  assert.equal(parseCompletionVerdict(''), null);
+  assert.equal(parseCompletionVerdict(undefined), null);
+});
+
+test('parseCompletionVerdict: reason clamped in code, never validated', () => {
+  const v = parseCompletionVerdict(`DONE: ${'z'.repeat(900)}`);
+  assert.equal(v?.done, true);
+  assert.equal(v!.reason.length, 400);
 });
