@@ -20,6 +20,7 @@ let annotateSpawnError: typeof import('./computer-tools.js').annotateSpawnError;
 let isProtectedInstalledSkillSourcePath: typeof import('./computer-tools.js').isProtectedInstalledSkillSourcePath;
 let resolveAllowedCwd: typeof import('./computer-tools.js').resolveAllowedCwd;
 let shellWritesInstalledSkillSource: typeof import('./computer-tools.js').shellWritesInstalledSkillSource;
+let WRITE_FILE_MAX_CONTENT_BYTES: number;
 
 before(async () => {
   ({
@@ -29,6 +30,7 @@ before(async () => {
     isProtectedInstalledSkillSourcePath,
     resolveAllowedCwd,
     shellWritesInstalledSkillSource,
+    WRITE_FILE_MAX_CONTENT_BYTES,
   } = await import('./computer-tools.js'));
 });
 
@@ -119,7 +121,7 @@ function writeTool(): Extract<ReturnType<typeof getComputerTools>[number], { nam
   return getComputerTools().find((tool) => tool.name === 'write_file') as Extract<ReturnType<typeof getComputerTools>[number], { name: 'write_file' }>;
 }
 
-async function invokeWrite(input: { path: string; content: string; mode: 'create' | 'append' | 'overwrite' | null }): Promise<string> {
+async function invokeWrite(input: { path: string; content: string; mode?: 'create' | 'append' | 'overwrite' | null; append?: boolean | null }): Promise<string> {
   const tool = writeTool() as unknown as {
     invoke: (runContext: unknown, input: string, details: unknown) => Promise<string>;
   };
@@ -169,6 +171,71 @@ test('write_file append creates a missing file', async () => {
   assert.equal(existsSync(file), false);
   assert.equal(await invokeWrite({ path: file, content: 'created by append', mode: 'append' }), `Appended ${file} (17 chars).`);
   assert.equal(readFileSync(file, 'utf-8'), 'created by append\n');
+});
+
+// ─── Chunked-by-construction: append flag + visible size cap ──────────────────
+
+test('write_file append:true appends (creating if absent) — the chunk continuation path', async () => {
+  const file = path.join(tmpHome, 'chunked.html');
+  // First chunk with append:false starts the file fresh (overwrite semantics).
+  assert.equal(await invokeWrite({ path: file, content: '<html>', mode: null, append: false }), `Overwrote ${file} (6 chars).`);
+  // Continuation chunks with append:true.
+  assert.equal(await invokeWrite({ path: file, content: '<body>', mode: null, append: true }), `Appended ${file} (6 chars).`);
+  assert.equal(await invokeWrite({ path: file, content: '</body></html>', mode: null, append: true }), `Appended ${file} (14 chars).`);
+  assert.equal(readFileSync(file, 'utf-8'), '<html>\n<body>\n</body></html>\n');
+});
+
+test('write_file append:true creates the file when absent', async () => {
+  const file = path.join(tmpHome, 'chunk-fresh.txt');
+  assert.equal(existsSync(file), false);
+  assert.equal(await invokeWrite({ path: file, content: 'first chunk', mode: null, append: true }), `Appended ${file} (11 chars).`);
+  assert.equal(readFileSync(file, 'utf-8'), 'first chunk\n');
+});
+
+test('write_file append:false starts a fresh file even when one exists (chunk-restart)', async () => {
+  const file = path.join(tmpHome, 'restart.txt');
+  assert.equal(await invokeWrite({ path: file, content: 'stale partial', mode: null }), `Wrote ${file} (13 chars).`);
+  assert.equal(await invokeWrite({ path: file, content: 'fresh start', mode: null, append: false }), `Overwrote ${file} (11 chars).`);
+  assert.equal(readFileSync(file, 'utf-8'), 'fresh start\n');
+});
+
+test('write_file REFUSES content over the ~24KB cap and writes NOTHING', async () => {
+  const file = path.join(tmpHome, 'toobig.html');
+  const oversize = 'x'.repeat(WRITE_FILE_MAX_CONTENT_BYTES + 1);
+  const out = await invokeWrite({ path: file, content: oversize, mode: null });
+  assert.match(out, /Refused: content is \d+ bytes, over the 24000-byte/);
+  assert.match(out, /NOTHING was written/);
+  assert.match(out, /append:false.*append:true/s, 'refusal instructs the append-chunk protocol');
+  assert.equal(existsSync(file), false, 'the file must not exist after a refused oversize write');
+});
+
+test('write_file cap boundary is exact: 24000 bytes writes, 24001 refuses', async () => {
+  const atCap = path.join(tmpHome, 'atcap.txt');
+  const overCap = path.join(tmpHome, 'overcap.txt');
+  // Exactly at the cap → written (ASCII: 1 char = 1 byte).
+  const exact = 'a'.repeat(WRITE_FILE_MAX_CONTENT_BYTES);
+  assert.equal(await invokeWrite({ path: atCap, content: exact, mode: null }), `Wrote ${atCap} (${WRITE_FILE_MAX_CONTENT_BYTES} chars).`);
+  assert.equal(existsSync(atCap), true);
+  // One byte over → refused.
+  assert.match(await invokeWrite({ path: overCap, content: exact + 'a', mode: null }), /Refused: content is 24001 bytes/);
+  assert.equal(existsSync(overCap), false);
+});
+
+test('write_file cap counts UTF-8 BYTES, not characters (multibyte content)', async () => {
+  const file = path.join(tmpHome, 'multibyte.txt');
+  // '€' is 3 UTF-8 bytes. 8001 of them = 24003 bytes > cap, though only 8001 chars.
+  const euros = '€'.repeat(8001);
+  assert.ok(euros.length < WRITE_FILE_MAX_CONTENT_BYTES, 'fewer CHARS than the cap');
+  assert.match(await invokeWrite({ path: file, content: euros, mode: null }), /Refused: content is 24003 bytes/);
+  assert.equal(existsSync(file), false);
+});
+
+test('write_file append:null with mode is byte-identical to prior behavior (backward compatible)', async () => {
+  const file = path.join(tmpHome, 'compat.txt');
+  // No append field at all → mode drives it exactly as before.
+  assert.equal(await invokeWrite({ path: file, content: 'hello', mode: null }), `Wrote ${file} (5 chars).`);
+  assert.match(await invokeWrite({ path: file, content: 'again', mode: null }), /Refused to overwrite existing file/);
+  assert.equal(readFileSync(file, 'utf-8'), 'hello\n');
 });
 
 test('write_file warns that raw workspace files still require space_save', async () => {

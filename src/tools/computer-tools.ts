@@ -836,10 +836,22 @@ function listDirectory(dir: string, limit: number): string {
  *  run_shell_command. The tool() defs below build their `parameters` from these,
  *  and the gated MCP lane (gated-mutating-tools.ts) derives its Claude-facing
  *  schema from them too, so the two can never drift (TOOL-REGISTRY-PLAN C3). */
+/** Visible per-call content cap for write_file (UTF-8 bytes). Large artifacts must
+ *  be produced in append-mode CHUNKS so a single giant emission never hits the model
+ *  token cliff (the 2026-07-08 landing-page build died 3× on one-shot writes). Stated
+ *  in the tool description (visible-limits doctrine). ~24KB. */
+export const WRITE_FILE_MAX_CONTENT_BYTES = 24_000;
+
 export const WRITE_FILE_PARAMS = {
   path: z.string().min(1),
   content: z.string(),
   mode: z.enum(['create', 'append', 'overwrite']).nullable(),
+  // Chunked-by-construction: append:true appends (creating if absent) — the
+  // continuation call for a large file. append:false starts the file fresh
+  // (overwrite). Omitted/null → fall back to `mode` (backward compatible — a
+  // caller that never sends `append` behaves exactly as before, so it is OPTIONAL,
+  // unlike the always-present `mode`).
+  append: z.boolean().nullable().optional(),
 } satisfies z.ZodRawShape;
 
 export const RUN_SHELL_COMMAND_PARAMS = {
@@ -970,12 +982,23 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       'mode=create or null creates a new file and refuses to replace an existing one.',
       'mode=append appends content to the existing file, adding a newline boundary when needed.',
       'mode=overwrite replaces the entire file; use only when the user asks to replace it or after reading the current file and preparing the full replacement.',
+      `SIZE LIMIT: content is capped at ${WRITE_FILE_MAX_CONTENT_BYTES} bytes (~24KB) PER CALL — a larger emission is REFUSED and nothing is written. To produce a big file (a full HTML page, a long report), write it in CHUNKS: send the first ~20KB with append:false (starts the file), then continue the rest with append:true calls (each ≤24KB) until it is complete. This keeps any single response well under the model token cliff.`,
+      'append:true appends this content (creating the file if absent) — the continuation call. append:false starts the file fresh (overwrite). Leave append null to use `mode`.',
       'Installed skill source files under ~/.clementine-next/skills/<skill>/ are read-only; generated artifacts belong under output/, outputs/, runs/, artifacts/, reports/, or tmp/.',
       'Auto-approved for allowed local paths; destructive/system paths remain blocked by the path boundary.',
     ].join('\n'),
     parameters: z.object(WRITE_FILE_PARAMS),
     needsApproval: needsApprovalForWriteFile(),
     execute: async (input) => {
+      // VISIBLE SIZE CAP (checked BEFORE any filesystem side effect → nothing is
+      // written on refusal). Forces large artifacts into append-mode chunks.
+      const contentBytes = Buffer.byteLength(input.content, 'utf8');
+      if (contentBytes > WRITE_FILE_MAX_CONTENT_BYTES) {
+        return [
+          `Refused: content is ${contentBytes} bytes, over the ${WRITE_FILE_MAX_CONTENT_BYTES}-byte (~24KB) per-call cap for write_file. NOTHING was written.`,
+          `Write this file in append-mode CHUNKS: send the first ~20KB with append:false (starts the file), then continue the remaining content with append:true calls (each ≤${WRITE_FILE_MAX_CONTENT_BYTES} bytes) until the file is complete. Split at a natural boundary (a tag, a line) — the chunks are concatenated verbatim.`,
+        ].join(' ');
+      }
       const filePath = resolveAllowedPath(input.path);
       if (isProtectedInstalledSkillSourcePath(filePath)) {
         return [
@@ -985,7 +1008,11 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       }
       const teamNotice = typedClementineStateWriteNotice(filePath);
       if (teamNotice) return teamNotice;
-      const mode = input.mode ?? 'create';
+      // The explicit `append` flag wins over `mode`: true → append (create if
+      // absent), false → overwrite (start a fresh chunked file). null → use `mode`.
+      const mode = input.append === true ? 'append'
+        : input.append === false ? 'overwrite'
+        : (input.mode ?? 'create');
       mkdirSync(path.dirname(filePath), { recursive: true });
       const exists = existsSync(filePath);
       if (exists && !statSync(filePath).isFile()) return `Refused to write ${filePath}: target exists and is not a file.`;

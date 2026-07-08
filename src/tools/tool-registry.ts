@@ -250,7 +250,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'workspace_info', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'Get detailed info about a local project including README, CLAUDE.md, manifest, and struct…' },
   { name: 'workspace_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', description: 'List local projects found in configured workspace directories.' },
   { name: 'workspace_roots', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'read-only', codeMode: 'read', description: 'List directories Clementine is allowed to inspect or operate in.' },
-  { name: 'write_file', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write', description: 'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path.' },
+  { name: 'write_file', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'code-mode', 'cli'], sdkLayer: 'agentic', codeMode: 'write', description: 'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path (content capped ~24KB/call — write big files in append:true chunks).' },
 ];
 
 // ── Derivations (advisory in step 1; the conformance test locks them to reality) ──
