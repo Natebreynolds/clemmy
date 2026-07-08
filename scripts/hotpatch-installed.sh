@@ -101,3 +101,16 @@ echo "Revert if anything goes sideways:"
 echo "  rsync -a --delete \"$BACKUP/dist/\" \"$INSTALLED_DIST/\""
 echo "  killall Clementine && open -a Clementine"
 echo "──────────────────────────────────────────────────────────────"
+
+# Re-sign with the local Developer ID so the app keeps a STABLE identity across
+# hotpatches — rsync into the bundle breaks the shipped signature, and macOS
+# TCC re-prompts "access data from other apps" on EVERY relaunch of an
+# identity-less app (recurring popup, 2026-07-07/08). With a stable Developer
+# ID signature the user's Allow sticks. No-op if the cert is absent.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application: Nathan Reynolds"; then
+  codesign --force --deep --preserve-metadata=entitlements \
+    --sign "Developer ID Application: Nathan Reynolds (4AR3Y8XD72)" \
+    /Applications/Clementine.app >/dev/null 2>&1 \
+    && echo "  ✓ re-signed (stable identity — TCC grant persists)" \
+    || echo "  ⚠ re-sign failed (popup may recur until a signed release installs)"
+fi
