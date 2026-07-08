@@ -64,9 +64,9 @@ test('boundaryJudgeTimeoutMs defaults to a bounded hot-path cap and rejects tiny
   const prev = process.env.CLEMMY_BOUNDARY_JUDGE_TIMEOUT_MS;
   try {
     delete process.env.CLEMMY_BOUNDARY_JUDGE_TIMEOUT_MS;
-    assert.equal(boundaryJudgeTimeoutMs(), 12000);
+    assert.equal(boundaryJudgeTimeoutMs(), 25000);
     process.env.CLEMMY_BOUNDARY_JUDGE_TIMEOUT_MS = '250';
-    assert.equal(boundaryJudgeTimeoutMs(), 12000);
+    assert.equal(boundaryJudgeTimeoutMs(), 25000);
     process.env.CLEMMY_BOUNDARY_JUDGE_TIMEOUT_MS = '1500';
     assert.equal(boundaryJudgeTimeoutMs(), 1500);
   } finally {
