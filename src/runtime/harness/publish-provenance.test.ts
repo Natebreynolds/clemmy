@@ -54,3 +54,9 @@ test('a genuine single-site create result still confers provenance (unchanged pa
   assert.equal(has('fresh-site'), true);
   assert.equal(has('bbbb2222'), true);
 });
+
+test('run_batch gets the long-executor timeout tier, never the 60s default (2026-07-08 false-kill)', async () => {
+  const { timeoutForTool, DEFAULT_TIMEOUTS_MS } = await import('./brackets.js');
+  assert.equal(timeoutForTool('run_batch'), DEFAULT_TIMEOUTS_MS.shell);
+  assert.ok(timeoutForTool('run_batch') >= 600_000);
+});

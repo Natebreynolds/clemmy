@@ -403,6 +403,17 @@ export function timeoutForTool(toolName: string): number {
   ) {
     return DEFAULT_TIMEOUTS_MS.externalApi;
   }
+  // run_batch executes N gated external calls in a deterministic loop — a
+  // legitimate batch runs for MINUTES by design (writes serial, reads in
+  // waves, rate-limit backoff pauses). Default 60s false-killed a live 8-item
+  // batch 2026-07-08: the tool call "timed out" at 60s and paused the run on
+  // ask-user while the batch itself COMPLETED 8/8 twenty seconds later. Same
+  // shell-tier budget as the other long-running executors; the batch runner's
+  // own halting rules (consecutive failures, backoff caps) bound the true
+  // worst case well below it.
+  if (toolName === 'run_batch') {
+    return DEFAULT_TIMEOUTS_MS.shell;
+  }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
   if (toolName.includes('__')) {
     return DEFAULT_TIMEOUTS_MS.mcp;
