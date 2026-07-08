@@ -1330,10 +1330,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'workflow_unschedule',
       'workflow_import_framework',
       'workflow_import_status',
-      // Goals
+      // Capture a proven ad-hoc session as a reusable workflow — reachable by the
+      // Claude brain + CLI but missing HERE until the 2026-07-08 registry
+      // conformance sweep (the drift class this list is famous for).
+      'workflow_from_session',
+      // Goals — goal_create was ALSO missing here (chat could read/update goals
+      // but never create one); found by the same conformance sweep.
+      'goal_create',
       'goal_get',
       'goal_list',
       'goal_update',
+      // Memory plumbing present on the Claude/CLI surfaces but absent here
+      // (same sweep): source-map provenance writes + the working-memory pad.
+      'source_map_upsert',
+      'working_memory',
       // Executions (full surface — read + tracked-write)
       'execution_update_step',
       'execution_mark_blocked',
