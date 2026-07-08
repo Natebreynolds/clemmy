@@ -197,7 +197,7 @@ export function Chat() {
             <AttentionStrip needsYou={needsYou} workingNow={workingNow} onDismiss={dismissCard} />
           )}
           {chat.messages.map((m) => (
-            <ChatBubble key={m.id} message={m} onApprove={approveLast} onReject={rejectLast} />
+            <ChatBubble key={m.id} message={m} onApprove={approveLast} onReject={rejectLast} onBackground={chat.background} />
           ))}
           <div ref={bottomRef} />
         </div>

@@ -112,10 +112,13 @@ export function ChatBubble({
   message,
   onApprove,
   onReject,
+  onBackground,
 }: {
   message: ChatMessage;
   onApprove: () => void;
   onReject: () => void;
+  /** Detach THIS running turn to a durable background task (shown while thinking). */
+  onBackground?: () => void;
 }) {
   const isUser = message.role === 'user';
   // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
@@ -145,7 +148,17 @@ export function ChatBubble({
           {thinking && !message.text ? (
             <div className="flex items-center gap-2 text-body text-muted">
               <ThinkingDots />
-              <span>{message.progress ?? 'Thinking…'}</span>
+              <span className="min-w-0 flex-1">{message.progress ?? 'Thinking…'}</span>
+              {onBackground && (
+                <button
+                  type="button"
+                  onClick={onBackground}
+                  title="Continue in background — keeps working, reports back here, frees the chat"
+                  className="shrink-0 rounded border border-border px-2 py-0.5 text-caption text-muted transition-colors hover:border-primary/40 hover:text-fg cursor-pointer"
+                >
+                  ⇥ background
+                </button>
+              )}
             </div>
           ) : thinking && message.text ? (
             // Mid-stream: render plain (linkified) text + a live caret. Full

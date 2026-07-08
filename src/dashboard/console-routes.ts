@@ -9143,14 +9143,22 @@ export function registerConsoleRoutes(
           meta: execution.nextStep ? `next: ${execution.nextStep}` : execution.status,
           panel: 'activity',
         })),
-        ...activeHarnessSessions.map((session) => ({
-          kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
-          title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine run'),
-          meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
-          panel: 'activity',
-          actionKind: 'harness-session',
-          sessionId: session.id,
-        })),
+        ...activeHarnessSessions
+          // A background task's RUN session would double-list the same work —
+          // the task row above already covers it (live 2026-07-08: one
+          // detached task showed as two identical "Working now" rows).
+          .filter((session) => !backgroundTasks.some((task) => {
+            const t = task as { runSessionId?: string; sessionId?: string };
+            return t.runSessionId === session.id || (t.sessionId === session.id && task.status === 'running');
+          }))
+          .map((session) => ({
+            kind: isDiscordHarnessSession(session) ? 'discord' : session.kind,
+            title: session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine run'),
+            meta: `${harnessSessionSourceLabel(session)} · ${session.status} · ${session.updatedAt.slice(11, 16)}`,
+            panel: 'activity',
+            actionKind: 'harness-session',
+            sessionId: session.id,
+          })),
       ].map((item) => ({ ...item, title: trimConsoleTitle(item.title, 140), meta: trimConsoleTitle(item.meta || '', 100) }));
 
       const recentCompleted = [

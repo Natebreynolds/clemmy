@@ -220,8 +220,21 @@ function resolveBackgroundableObjective(sessionId: string): string | null {
   try {
     const inputs = listEvents(sessionId, { types: ['user_input_received'] })
       .map((e) => String((e.data as { text?: string } | undefined)?.text ?? '').trim())
-      .filter((t) => t.length > 0 && !detectBackgroundItIntent(t));
-    return inputs.length > 0 ? inputs[inputs.length - 1] : null;
+      .filter((t) => t.length > 0 && !detectBackgroundItIntent(t))
+      // Synthetic harness inputs (stall-retry directives etc.) are not the
+      // user's ask — they'd hijack the objective the same way a short answer did.
+      .filter((t) => !/^Your previous response could not be parsed/i.test(t));
+    if (inputs.length === 0) return null;
+    // The TASK statement is almost never the LAST message — clarification
+    // answers land after it ("Facebook please" became a background task title,
+    // live 2026-07-08). Anchor on the most SUBSTANTIVE recent input (longest of
+    // the last 6) and append any later short answers as qualifiers, so the
+    // objective reads "pull the last 5 social posts… — Facebook please".
+    const recent = inputs.slice(-6);
+    let anchorIdx = 0;
+    for (let i = 1; i < recent.length; i += 1) if (recent[i].length > recent[anchorIdx].length) anchorIdx = i;
+    const qualifiers = recent.slice(anchorIdx + 1).filter((t) => t.length <= 120);
+    return qualifiers.length > 0 ? `${recent[anchorIdx]} — ${qualifiers.join('; ')}` : recent[anchorIdx];
   } catch {
     return null;
   }
