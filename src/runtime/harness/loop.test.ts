@@ -4336,3 +4336,47 @@ test('AWAITING judge verdict yields awaiting_user_input with the reply delivered
   assert.equal(completed.data.delivered, true, 'the pause reply is DELIVERED, never eaten');
   assert.equal((completed.data as { awaitingUser?: boolean }).awaitingUser, true);
 });
+
+test('consent-then-re-ask: a short affirmation followed by ANOTHER direction question auto-proceeds instead of halting', async () => {
+  // Live 2026-07-09: "send out 20 of them please" → Clem asked which 20 →
+  // "that sounds perfect" → Clem asked AGAIN (background/hold/now?). The
+  // second ask must auto-resolve — approve-once-then-run.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // Prior turn asked a question (the one the user is now affirming).
+  appendEvent({ sessionId: sess.id, turn: 0, role: 'Clem', type: 'awaiting_user_input', data: { question: 'Should I send the next 20?' } });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'asked venue', reply: 'Want me to run it in the background, hold it, or do it now?', done: false, nextAction: 'awaiting_user_input', reason: null } },
+    { finalOutput: { summary: 'ran it', reply: 'Done — batch queued for its approval card.', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'that sounds perfect',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.steps, 2, 'the re-ask was auto-continued, not halted');
+  assert.equal(result.status, 'completed');
+  const reconciled = listEvents(sess.id, { types: ['heartbeat'] })
+    .filter((e) => (e.data as { kind?: string }).kind === 'consent_reask_reconciled');
+  assert.equal(reconciled.length, 1);
+});
+
+test('consent-then-re-ask: a NON-affirmation reply still halts on a follow-up question', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({ sessionId: sess.id, turn: 0, role: 'Clem', type: 'awaiting_user_input', data: { question: 'Should I send the next 20?' } });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'asked', reply: 'Which mailbox should I send from?', done: false, nextAction: 'awaiting_user_input', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'actually only send 5, and skip the law firms',
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'a qualified reply is NOT consent — the question halts');
+  assert.equal(result.steps, 1);
+});

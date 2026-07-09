@@ -993,6 +993,32 @@ function yoloAutoResolvedAskThisTurn(sessionId: string, turn: number): boolean {
 }
 
 /**
+ * A short, unqualified affirmation — the user saying yes to the previous
+ * question without adding constraints ("that sounds perfect", "yes", "go
+ * ahead"). Deliberately strict: any number, name, or qualifier in the reply
+ * means the user CHANGED something, and a follow-up question stays legitimate.
+ * Pure + exported for tests.
+ */
+const AFFIRMATION_RE = /^(?:yes|yeah|yep|yup|sure|ok(?:ay)?|sounds (?:good|great|perfect)|that sounds (?:good|great|perfect)|perfect|great|go ahead|go for it|do it|please do|proceed|approved?|confirm(?:ed)?|lgtm|👍|✅)[.! ]*$/i;
+
+export function isShortAffirmation(text: string | null | undefined): boolean {
+  const t = (text ?? '').trim();
+  return t.length > 0 && t.length <= 40 && AFFIRMATION_RE.test(t);
+}
+
+/** Did an EARLIER turn of this session end asking the user a question?
+ *  (The consent-then-re-ask guard needs proof the affirmation was answering
+ *  something.) */
+function priorTurnAskedQuestion(sessionId: string, currentTurn: number): boolean {
+  try {
+    return listEvents(sessionId, { types: ['awaiting_user_input'] })
+      .some((evt) => evt.turn < currentTurn);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * v0.5.19 F1 — build the preflight-block system message that gets
  * injected when the gate at `runTurn` projects the next turn would
  * exceed budget. The v1 message named `propose_plan` and
@@ -1642,6 +1668,9 @@ async function runConversationCore(
   // of how the request was phrased.
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
+  // Consent-then-re-ask guard: at most ONE auto-proceed per conversation so a
+  // genuinely open follow-up question can still halt on the next iteration.
+  let consentReAskContinuationUsed = false;
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
   // Inc A code trigger: fire the "offer to move this to the background" nudge at
@@ -2876,6 +2905,33 @@ async function runConversationCore(
           },
         });
         nextInput = 'You already auto-resolved that approval question under YOLO standing approval — do NOT wait for the user. Proceed with your best default and keep going until the work is done, then report what you did.';
+        continue;
+      }
+      // CONSENT-THEN-RE-ASK guard (2026-07-09, live: user said "send out 20 of
+      // them please", Clem asked which 20, user said "that sounds perfect",
+      // Clem asked AGAIN — "run in background, hold, or do it now?"). When THIS
+      // conversation began with the user's short unqualified affirmation of the
+      // PREVIOUS turn's question, a fresh direction-question is a re-ask of
+      // granted consent — approve-once-then-run says proceed with the default.
+      // Deterministic + bounded (once per conversation); the send-batch
+      // approval card remains the real gate for anything irreversible.
+      if (
+        !consentReAskContinuationUsed
+        && isShortAffirmation(options.input)
+        && priorTurnAskedQuestion(options.sessionId, turnResult.turn)
+      ) {
+        consentReAskContinuationUsed = true;
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'heartbeat',
+          data: {
+            kind: 'consent_reask_reconciled',
+            message: 'User already affirmed the previous question — proceeding with the default instead of re-asking.',
+          },
+        });
+        nextInput = 'The user ALREADY approved your previous question with their last message. That approval covers this — do NOT ask another question. Proceed NOW with the sensible default (run the work right here unless it clearly must be backgrounded), complete it, and report the result. Any genuinely irreversible batch still goes through its one approval card.';
         continue;
       }
       // DELIVER the question (review/live fix 2026-06-14). The model can ask a
