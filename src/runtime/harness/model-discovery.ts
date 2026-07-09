@@ -120,13 +120,24 @@ async function discoverOpenAi(): Promise<DiscoveredModel[]> {
   return filterOpenAiChatModelIds(ids).sort().map((id) => ({ id, label: labelForModelId(id) }));
 }
 
+const FAILURE_RETRY_MS = 60 * 1000;
+
 async function refresh(): Promise<void> {
   const [anthropic, openai] = await Promise.allSettled([discoverAnthropic(), discoverOpenAi()]);
+  // A refresh that produced NOTHING (both failed, or both came back empty —
+  // the boot-time shape: the daemon's first settings poll fires while network/
+  // keys are still settling) must NOT claim the full TTL: stamping 6h on a
+  // failure locked the picker to presets-only for the whole session (live
+  // 2026-07-09: three freshly-dropped gpt-5.6 models invisible all day).
+  // Back-date the stamp so the next poll retries within a minute; a refresh
+  // with ANY real result keeps the full TTL.
+  const nextAnthropic = anthropic.status === 'fulfilled' ? anthropic.value : cache.anthropic;
+  const nextOpenai = openai.status === 'fulfilled' ? openai.value : cache.openai;
+  const producedAnything = nextAnthropic.length > 0 || nextOpenai.length > 0;
   cache = {
-    // A failed fetch keeps the PREVIOUS discovery (still fresher than nothing).
-    anthropic: anthropic.status === 'fulfilled' ? anthropic.value : cache.anthropic,
-    openai: openai.status === 'fulfilled' ? openai.value : cache.openai,
-    fetchedAt: Date.now(),
+    anthropic: nextAnthropic,
+    openai: nextOpenai,
+    fetchedAt: producedAnything ? Date.now() : Date.now() - (TTL_MS - FAILURE_RETRY_MS),
   };
 }
 
