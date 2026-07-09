@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import {
   findStalledBackgroundTasks,
   reportedBackTaskIdsFrom,
+  watchdogAlertIdsFrom,
   type BackgroundTaskWatchdogView,
 } from './background-task-watchdog.js';
 
@@ -99,11 +100,27 @@ test('reportedBackTaskIdsFrom: only DELIVERED, non-watchdog notifications count'
   const ids = reportedBackTaskIdsFrom([
     { id: 'n1', deliveredAt: ago(MIN), metadata: { backgroundTaskId: 'delivered' } },
     { id: 'n2', metadata: { backgroundTaskId: 'persisted-not-delivered' } }, // no deliveredAt → excluded
+    { id: 'n2b', silent: true, deliveredAt: ago(MIN), metadata: { backgroundTaskId: 'silent-lifecycle' } }, // queued/check-in card → excluded
     { id: 'bgtask-stalled-terminal_undelivered-x', deliveredAt: ago(MIN), metadata: { backgroundTaskId: 'x' } }, // the watchdog's own alert → excluded
     { id: 'n3', deliveredDestinations: ['discord'], metadata: { backgroundTaskId: 'via-destinations' } },
   ]);
   assert.ok(ids.has('delivered'));
   assert.ok(ids.has('via-destinations'));
   assert.ok(!ids.has('persisted-not-delivered'));
+  assert.ok(!ids.has('silent-lifecycle'));
   assert.ok(!ids.has('x'), "watchdog's own alert must not mask a lost result");
+});
+
+test('watchdogAlertIdsFrom indexes existing watchdog alerts so repeat log spam can be suppressed', () => {
+  const ids = watchdogAlertIdsFrom([
+    { id: 'bgtask-stalled-terminal_undelivered-x' },
+    { id: 'bgtask-escalated-y' },
+    { id: 'bgtask-report-replay-z-done' },
+    { id: '1783537566599-background-z-done' },
+    { id: undefined },
+  ]);
+  assert.ok(ids.has('bgtask-stalled-terminal_undelivered-x'));
+  assert.ok(ids.has('bgtask-escalated-y'));
+  assert.ok(ids.has('bgtask-report-replay-z-done'));
+  assert.ok(!ids.has('1783537566599-background-z-done'));
 });

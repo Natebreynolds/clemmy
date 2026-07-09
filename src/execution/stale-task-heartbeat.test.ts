@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import type { BackgroundTaskRecord } from './background-tasks.js';
@@ -63,6 +63,19 @@ test('dedup: a second sweep in the same 7-day window does not add another nudge'
   const before = stalePrompts().length;
   runStaleTaskHeartbeat([rec({ id: 'f1', title: 'old enrichment', status: 'done' })], NOW);
   assert.equal(stalePrompts().length, before, 'same-week bucket id → no duplicate nudge');
+});
+
+test('dedup survives notification pruning because the heartbeat marker is durable', () => {
+  const weekNow = NOW + STALE_TASK_AGE_MS;
+  const task = rec({ id: 'pruned-1', title: 'old pruned task', status: 'done' });
+  const first = runStaleTaskHeartbeat([task], weekNow);
+  assert.equal(first.stale, 1);
+  assert.equal(stalePrompts().some((n) => n.id === `bgtask-stale-prompt-${Math.floor(weekNow / STALE_TASK_AGE_MS)}`), true);
+
+  writeFileSync(path.join(TMP_HOME, 'state', 'notifications.json'), '[]', 'utf-8');
+  const second = runStaleTaskHeartbeat([task], weekNow);
+  assert.equal(second.stale, 1);
+  assert.equal(stalePrompts().length, 0, 'pruned notification is not recreated every watchdog tick');
 });
 
 test('active (pending/running) and fresh tasks never trigger a nudge', () => {

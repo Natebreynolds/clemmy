@@ -27,7 +27,9 @@
 import { existsSync } from 'node:fs';
 import type { GoalEvidence } from '../agents/plan-proposals.js';
 import {
+  judgeGoalCriteriaStrict,
   judgeObjectiveCompleteStrict,
+  type CriterionJudgeVerdict,
   type ObjectiveJudgeVerdict,
 } from '../runtime/harness/objective-judge.js';
 
@@ -115,6 +117,11 @@ export interface ValidateGoalDeps {
    *  infra failure → validateGoal resolves to pass:false + judgeFailedOpen).
    *  Pass a throwing fake in tests to exercise the fail-open path. */
   judge?: (objective: string, evidenceText: string) => Promise<ObjectiveJudgeVerdict>;
+  /** Injectable PER-CRITERION judge (one call, one verdict per criterion);
+   *  defaults to judgeGoalCriteriaStrict. When only `judge` is injected (test
+   *  fakes), the legacy whole-checklist path runs instead — an injected fake
+   *  must never be silently bypassed by a real model call. */
+  judgeCriteria?: (objective: string, criteria: string[], evidenceText: string) => Promise<CriterionJudgeVerdict[]>;
   fileExists?: (p: string) => boolean;
 }
 
@@ -215,19 +222,30 @@ export async function validateGoal(
 
   let judgeFailedOpen = false;
   if (fuzzy.length > 0) {
-    // One judge call for all fuzzy criteria: the objective is rendered as an
-    // explicit checklist of the PARKED criteria so the audit-checklist rubric
-    // checks exactly what the user blessed.
-    const checklistObjective = [
-      input.objective,
-      '',
-      'The objective is complete ONLY when ALL of these success criteria are met:',
-      ...fuzzy.map((c, i) => `${i + 1}. ${c}`),
-    ].join('\n');
+    // ONE judge call for all fuzzy criteria. With the per-criterion judge the
+    // call returns an individual MET/UNMET per parked criterion (real
+    // granularity for successRatePercent + failedDirectives); the legacy
+    // whole-checklist call remains for single criteria and injected `judge`
+    // fakes (a test fake must never be bypassed by a real model call).
+    const judgeCriteria = deps.judgeCriteria ?? (deps.judge ? null : judgeGoalCriteriaStrict);
     try {
-      const verdict = await judge(checklistObjective, input.evidenceText);
-      for (const criterion of fuzzy) {
-        perCriterion.push({ criterion, pass: verdict.done, method: 'judge', detail: verdict.reason });
+      if (judgeCriteria && fuzzy.length > 1) {
+        const verdicts = await judgeCriteria(input.objective, fuzzy, input.evidenceText);
+        fuzzy.forEach((criterion, i) => {
+          const v = verdicts[i];
+          perCriterion.push({ criterion, pass: v?.pass === true, method: 'judge', detail: v?.note });
+        });
+      } else {
+        const checklistObjective = [
+          input.objective,
+          '',
+          'The objective is complete ONLY when ALL of these success criteria are met:',
+          ...fuzzy.map((c, i) => `${i + 1}. ${c}`),
+        ].join('\n');
+        const verdict = await judge(checklistObjective, input.evidenceText);
+        for (const criterion of fuzzy) {
+          perCriterion.push({ criterion, pass: verdict.done, method: 'judge', detail: verdict.reason });
+        }
       }
     } catch (err) {
       judgeFailedOpen = true;

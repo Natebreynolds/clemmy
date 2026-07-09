@@ -13,11 +13,18 @@ import { rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/clemmy-test-batch-runner';
 process.env.CLEMENTINE_HOME = TEST_HOME;
+// The certify test asserts fail-closed semantics when NO judge is reachable.
+// The dev shell may carry live provider keys — strip them so the judge path
+// errors deterministically instead of making a real model call.
+delete process.env.OPENAI_API_KEY;
+delete process.env.ANTHROPIC_API_KEY;
 
 // eslint-disable-next-line import/first
 const { _setCodeModeToolsForTests } = await import('../tools/code-mode-tool.js');
 // eslint-disable-next-line import/first
-const { validateBatchPlan, runBatchPlan, certifyBatchPlan, formatBatchLedger, readBatchLedger, _setBatchSleepForTests } = await import('./batch-runner.js');
+const { validateBatchPlan, prepareBatchPlanForExecution, runBatchPlan, certifyBatchPlan, parseBatchCertificationVerdict, formatBatchLedger, readBatchLedger, _setBatchSleepForTests, _setCertifyJudgeForTests } = await import('./batch-runner.js');
+// eslint-disable-next-line import/first
+const { rememberToolSchema, resetToolSchemaCache } = await import('../tools/composio-schema-cache.js');
 
 type FakeCall = { name: string; input: unknown };
 const calls: FakeCall[] = [];
@@ -54,6 +61,25 @@ test('validateBatchPlan: catches the shapes that must never execute', () => {
   const emptyErrs = validateBatchPlan(emptyArgs as never);
   assert.ok(emptyErrs.some((e) => /EMPTY args/.test(e)), 'empty args must be named precisely');
   assert.ok(!emptyErrs.some((e) => /duplicates another/.test(e)), 'empty-args message must win over the duplicate check');
+  const sameComposioNullAccount = {
+    tool: 'composio_execute_tool',
+    composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    sideEffect: 'send' as const,
+    objective: 'send duplicate-check emails',
+    items: [
+      { id: 'one', args: { to_email: 'a@example.com', subject: 'Hi', body: 'Body' }, connectedAccountId: null },
+      { id: 'two', args: { to_email: 'a@example.com', subject: 'Hi', body: 'Body' } },
+    ],
+  };
+  assert.ok(validateBatchPlan(sameComposioNullAccount as never).some((e) => /duplicates another/.test(e)), 'null and absent connected account dispatch identically');
+  const differentComposioAccount = {
+    ...sameComposioNullAccount,
+    items: [
+      { id: 'one', args: { to_email: 'a@example.com', subject: 'Hi', body: 'Body' }, connectedAccountId: 'ca_1' },
+      { id: 'two', args: { to_email: 'a@example.com', subject: 'Hi', body: 'Body' }, connectedAccountId: 'ca_2' },
+    ],
+  };
+  assert.deepEqual(validateBatchPlan(differentComposioAccount as never), [], 'different connected accounts are distinct dispatches');
 });
 
 test('runBatchPlan: read batch executes every item, ledger honest, zero model involvement', async () => {
@@ -130,13 +156,49 @@ test('runBatchPlan: a composio polite-failure result counts as a FAILED item, no
 });
 
 test('certifyBatchPlan: judge unreachable → write/send fail CLOSED, read proceeds advisory', async () => {
-  const items = [{ id: 'a', args: { x: 1 } }];
-  const send = await certifyBatchPlan({ tool: 'composio_execute_tool', composioSlug: 'S', sideEffect: 'send', objective: 'send things without a judge available', items });
-  assert.equal(send.allow, false, 'send plan must refuse when the judge cannot run');
-  assert.match(send.reason, /fail-closed/);
-  const read = await certifyBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'read things without a judge available', items });
-  assert.equal(read.allow, true, 'read plan proceeds advisory');
-  assert.equal(read.judged, false);
+  // Deterministic "unreachable" judge: every attempt throws (the dev machine's
+  // real OAuth logins would otherwise make this a live model call).
+  let attempts = 0;
+  _setCertifyJudgeForTests(async () => { attempts += 1; throw new Error('provider unreachable (test)'); });
+  try {
+    const items = [{ id: 'a', args: { x: 1 } }];
+    const send = await certifyBatchPlan({ tool: 'composio_execute_tool', composioSlug: 'S', sideEffect: 'send', objective: 'send things without a judge available', items });
+    assert.equal(send.allow, false, 'send plan must refuse when the judge cannot run');
+    assert.match(send.reason, /fail-closed/);
+    assert.equal(attempts, 2, 'one retry before fail-closed');
+    const read = await certifyBatchPlan({ tool: 'read_file', sideEffect: 'read', objective: 'read things without a judge available', items });
+    assert.equal(read.allow, true, 'read plan proceeds advisory');
+    assert.equal(read.judged, false);
+  } finally {
+    _setCertifyJudgeForTests(null);
+  }
+});
+
+test('parseBatchCertificationVerdict: accepts marker and legacy structured verdicts without SDK schema dependency', () => {
+  const allow = parseBatchCertificationVerdict('ALLOW: sampled payloads satisfy the objective');
+  assert.deepEqual(allow, {
+    allow: true,
+    reason: 'sampled payloads satisfy the objective',
+    concerns: [],
+    judged: true,
+  });
+
+  const deny = parseBatchCertificationVerdict({
+    allow: false,
+    reason: 'recipient list exceeds the objective',
+    concerns: ['wrong audience', 'placeholder text'],
+  });
+  assert.deepEqual(deny, {
+    allow: false,
+    reason: 'recipient list exceeds the objective',
+    concerns: ['wrong audience', 'placeholder text'],
+    judged: true,
+  });
+
+  const fenced = parseBatchCertificationVerdict('```json\n{"verdict":"allowed","summary":"read-only plan is scoped correctly"}\n```');
+  assert.equal(fenced?.allow, true);
+  assert.equal(fenced?.reason, 'read-only plan is scoped correctly');
+  assert.equal(parseBatchCertificationVerdict('looks good to me'), null);
 });
 
 // ─── Rate-awareness (per-provider throttling) ─────────────────────────────────
@@ -277,6 +339,84 @@ test('composio items: connected_account_id is ALWAYS present (strict nullable-re
   assert.equal(bad.succeeded, 0, 'an SDK error banner result must NOT count as success');
   assert.equal(bad.failed, 1);
   assert.match(bad.outcomes[0].error ?? '', /InvalidToolInputError|An error occurred/);
+});
+
+test('prepareBatchPlanForExecution: unwraps nested composio wrapper and maps Outlook to -> to_email before certification', () => {
+  resetToolSchemaCache();
+  const prepared = prepareBatchPlanForExecution({
+    tool: 'composio_execute_tool',
+    composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    sideEffect: 'send',
+    objective: 'send one email with repaired outlook arguments',
+    items: [{
+      id: 'a@example.com',
+      args: {
+        tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+        arguments: JSON.stringify({ to: 'a@example.com', subject: 'Hello', body: 'Body' }),
+        connected_account_id: 'ca_outlook_123',
+      },
+    }],
+  });
+  assert.deepEqual(prepared.errors, []);
+  assert.ok(prepared.repairs.some((r: string) => /unwrapped nested composio_execute_tool/.test(r)));
+  assert.ok(prepared.repairs.some((r: string) => /to_email/.test(r)));
+  assert.deepEqual(prepared.plan.items[0].args, { subject: 'Hello', body: 'Body', to_email: 'a@example.com' });
+  assert.equal(prepared.plan.items[0].connectedAccountId, 'ca_outlook_123');
+  assert.deepEqual(validateBatchPlan(prepared.plan), []);
+});
+
+test('prepareBatchPlanForExecution: schema-required to_email gets repaired without hard-coding the slug', () => {
+  resetToolSchemaCache();
+  rememberToolSchema('ACME_MAIL_SEND', {
+    type: 'object',
+    required: ['to_email', 'subject', 'body'],
+    properties: {
+      to_email: { type: 'string' },
+      subject: { type: 'string' },
+      body: { type: 'string' },
+    },
+  });
+  const prepared = prepareBatchPlanForExecution({
+    tool: 'composio_execute_tool',
+    composioSlug: 'ACME_MAIL_SEND',
+    sideEffect: 'send',
+    objective: 'send one email with schema-grounded aliases',
+    items: [{ id: 'b@example.com', args: { to: 'b@example.com', subject: 'Hi', body: 'Body' } }],
+  });
+  assert.deepEqual(prepared.errors, []);
+  assert.deepEqual(prepared.plan.items[0].args, { subject: 'Hi', body: 'Body', to_email: 'b@example.com' });
+});
+
+test('prepareBatchPlanForExecution: does not rename Gmail-style to when schema does not ask for to_email', () => {
+  resetToolSchemaCache();
+  const prepared = prepareBatchPlanForExecution({
+    tool: 'composio_execute_tool',
+    composioSlug: 'GMAIL_SEND_EMAIL',
+    sideEffect: 'send',
+    objective: 'send one email without over-normalizing gmail args',
+    items: [{ id: 'c@example.com', args: { to: 'c@example.com', subject: 'Hi', body: 'Body' } }],
+  });
+  assert.deepEqual(prepared.errors, []);
+  assert.deepEqual(prepared.repairs, []);
+  assert.deepEqual(prepared.plan.items[0].args, { to: 'c@example.com', subject: 'Hi', body: 'Body' });
+});
+
+test('prepareBatchPlanForExecution: mismatched nested composio wrapper is rejected before execution', () => {
+  resetToolSchemaCache();
+  const prepared = prepareBatchPlanForExecution({
+    tool: 'composio_execute_tool',
+    composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    sideEffect: 'send',
+    objective: 'reject mismatched wrapped tool slug',
+    items: [{
+      id: 'wrong',
+      args: {
+        tool_slug: 'GMAIL_SEND_EMAIL',
+        arguments: JSON.stringify({ to: 'a@example.com', subject: 'Hello', body: 'Body' }),
+      },
+    }],
+  });
+  assert.ok(prepared.errors.some((e: string) => /does not match plan composioSlug/.test(e)));
 });
 
 test('a harness gate REFUSAL banner is a FAILED item — never a fake success (2026-07-08 "10 sent" lie, 8 were refused)', async () => {

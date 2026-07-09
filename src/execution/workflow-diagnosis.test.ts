@@ -39,6 +39,7 @@ const {
   detectProseSelfReportedFailure,
   diagnoseWorkflowBlock,
   prependRootCauseBlock,
+  _testOnly_sanitizeWorkflowDiagnosisOutput,
 } = mod;
 const { writeWorkflow, readWorkflow } = await import('../memory/workflow-store.js');
 
@@ -221,6 +222,27 @@ test('renderLegibleOutcome: blocked + auto-applicable diagnosis offers the fix c
   assert.match(out.title, /needs attention/i);
   assert.match(out.body, /couldn't finish/);
   assert.match(out.body, /apply fix fix-abc123/);
+});
+
+test('workflow diagnosis sanitizer accepts fenced schema-drifted JSON', () => {
+  const diagnosis = _testOnly_sanitizeWorkflowDiagnosisOutput('```json\n' + JSON.stringify({
+    summary: 'The output contract was too strict for valid data.',
+    root_cause: 'The step returned records, but not every record has a phone field.',
+    fix: {
+      kind: 'edit contract',
+      step_id: 'fetch_records',
+      description: 'Loosen the contract so phone is optional.',
+      outputContract: { type: 'array', min_items: { '': 1 } },
+    },
+    confidence: 'HIGH',
+  }) + '\n```');
+  assert.ok(diagnosis);
+  assert.equal(diagnosis.fix.kind, 'edit_contract');
+  assert.equal(diagnosis.fix.stepId, 'fetch_records');
+  assert.equal(diagnosis.confidence, 'high');
+  assert.equal(diagnosis.fix.autoApplicable, true);
+  assert.deepEqual(sanitizeOutputContract(diagnosis.fix.newOutputContractJson), { type: 'array', min_items: { '': 1 } });
+  assert.equal(fixIsAutoApplicable(diagnosis.fix), true);
 });
 
 test('diagnoseWorkflowBlock classifies missing local MCP tools as runtime/manual, not reconnect_service', async () => {

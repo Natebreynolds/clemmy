@@ -8,13 +8,13 @@
  * so a completed/failed run is NEVER blocked or wrongly silenced by a hiccup.
  *
  * Mirrors judgeObjectiveComplete (objective-judge.ts): bare Agent+Runner on
- * MODELS.fast, maxTurns:1, no tools, zod outputType, try/catch fail-open.
+ * MODELS.fast, maxTurns:1, no tools, Clementine-owned parse/sanitize, try/catch fail-open.
  */
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import { MODELS, ASSISTANT_NAME, OWNER_NAME } from '../config.js';
 import { loadUserProfile, DEFAULT_USER_PROFILE, type UserProfile } from '../runtime/user-profile.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 
 // Bodies above this just get delivered verbatim — not worth a rewrite call.
 const MAX_BODY = 8000;
@@ -65,7 +65,7 @@ function buildVoicePrompt(p: UserProfile, name: string | null, lane: VoiceRewrit
     '2. ADD NOTHING you cannot ground in the report below.',
     `3. DO NOT CHANGE THE VERDICT. ${verdictLine}`,
     'Set `nothingHappened` true ONLY for a routine, all-clear run that found nothing new and did nothing meaningful; false if anything was found/changed/sent/drafted or needs review. On a needs-attention or failed report it is ALWAYS false.',
-    'Output ONLY the rewritten message in `message` — no headers, no quotes, no notes about what you changed.',
+    'Return ONLY JSON: {"message":"rewritten report text","nothingHappened":true|false}. No markdown fences unless the runtime forces them.',
   ].join('\n');
 }
 
@@ -93,6 +93,45 @@ export function applyVoiceGuards(
   return { message, nothingHappened };
 }
 
+function parseVoiceJson(value: unknown): unknown | null {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const candidate = extractJsonCandidate(value);
+  if (!candidate) return null;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeVoiceOutput(value: unknown): { message: string; nothingHappened: boolean } | null {
+  if (typeof value === 'string') {
+    const parsed = parseVoiceJson(value);
+    if (!parsed) {
+      const message = value.trim();
+      return message ? { message, nothingHappened: false } : null;
+    }
+    value = parsed;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  const rawMessage = obj.message ?? obj.text ?? obj.reply ?? obj.output;
+  const message = typeof rawMessage === 'string' ? rawMessage.trim() : '';
+  if (!message) return null;
+  const rawNoop = obj.nothingHappened ?? obj.nothing_happened ?? obj.noop ?? obj.silent;
+  const nothingHappened = typeof rawNoop === 'boolean'
+    ? rawNoop
+    : typeof rawNoop === 'string'
+      ? /^(true|yes|1)$/i.test(rawNoop.trim())
+      : false;
+  return { message, nothingHappened };
+}
+
+export function _testOnly_sanitizeVoiceOutput(value: unknown): { message: string; nothingHappened: boolean } | null {
+  return sanitizeVoiceOutput(value);
+}
+
 export async function rewriteInClementineVoice(body: string, opts: VoiceRewriteOpts): Promise<VoiceRewriteResult> {
   const text = (body ?? '').trim();
   if (!text || text.length > MAX_BODY) return { message: body, nothingHappened: false };
@@ -103,7 +142,6 @@ export async function rewriteInClementineVoice(body: string, opts: VoiceRewriteO
       name: 'ClementineVoiceRewrite',
       instructions: buildVoicePrompt(profile, name, opts.lane),
       model: MODELS.fast,
-      outputType: normalizeZodForCodexStrict(VoiceSchema) as typeof VoiceSchema,
       tools: [],
     });
     const result = await new Runner({ workflowName: 'clementine-voice-rewrite' }).run(
@@ -111,7 +149,7 @@ export async function rewriteInClementineVoice(body: string, opts: VoiceRewriteO
       `Workflow: ${opts.workflowName}\n\nReport to rewrite (keep every fact, just warm the tone):\n${text}`,
       { maxTurns: 1 },
     );
-    const parsed = VoiceSchema.safeParse(result.finalOutput);
+    const parsed = VoiceSchema.safeParse(sanitizeVoiceOutput((result as { finalOutput?: unknown }).finalOutput));
     if (!parsed.success) return { message: body, nothingHappened: false };
     return applyVoiceGuards(parsed.data, body, opts.lane);
   } catch {

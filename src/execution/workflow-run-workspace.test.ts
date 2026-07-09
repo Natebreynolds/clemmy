@@ -20,6 +20,7 @@ const {
   summarizeToolOutput,
   runWorkspaceDir,
   recordStepOutput,
+  stepOutputArtifactRelPath,
 } = await import('./workflow-run-workspace.js');
 
 test.after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
@@ -90,6 +91,10 @@ test('recordStepOutput persists every step as an inspectable work product', () =
   // The file holds the full work product.
   const full = readFileSync(path.join(runWorkspaceDir(wf, run), 'artifacts/step-pull.json'), 'utf-8');
   assert.match(full, /prospects/);
+});
+
+test('stepOutputArtifactRelPath matches the persisted step output location', () => {
+  assert.equal(stepOutputArtifactRelPath('fetch accounts'), 'artifacts/step-fetch-accounts.json');
 });
 
 test('summarizeToolOutput describes shape without dumping content', () => {

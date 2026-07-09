@@ -76,7 +76,8 @@ export type WorkflowEventKind =
   | 'approval_requested'  // workflow waiting on user approval
   | 'approval_granted'    // user said yes
   | 'approval_rejected'   // user said no
-  | 'transcript_chunk';   // streaming text from LLM, for live UI
+  | 'transcript_chunk'    // streaming text from LLM, for live UI
+  | 'verdict_recorded';   // T3-B4 verdict door: end-of-run judge verdict (target/goal), one canonical record
 
 /**
  * STATE pillar (Loop Engineering): a comparable record of ONE attempt at a step,

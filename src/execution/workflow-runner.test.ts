@@ -55,6 +55,7 @@ const {
   applyContractToPrompt,
   describeOutputShape,
   isTransientStepError,
+  runWithStepRetry,
   creationTestVerdict,
   shouldHaltResumeForSideEffect,
   stepSideEffectClass,
@@ -71,7 +72,15 @@ const {
   detectEmptyDeliverableReads,
   stepConsumesOutput,
   summarizeRunArtifacts,
+  looksLikeWorkflowStepStructuralResultMiss,
+  WorkflowStepStructuralResultError,
+  isWorkflowStepStructuralResultError,
 } = await import('./workflow-runner.js');
+// The workflow watcher would otherwise place a REAL judge call from any
+// multi-step test run (live OAuth tokens make the judge reachable on dev
+// machines). Silent-on-track stub = the byte-identical no-steer path.
+const { _setWorkflowWatcherForTests } = await import('./workflow-runner.js');
+_setWorkflowWatcherForTests(async () => ({ onTrack: true, miss: '', steer: '' }));
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
 const { clearStepWatermark, readSeenItemKeys } = await import('./workflow-watermark-store.js');
@@ -124,6 +133,11 @@ function withEnv(over: Record<string, string | undefined>, fn: () => void): void
       else process.env[key] = prev[key];
     }
   }
+}
+
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
 }
 
 test('reapResolvedParkedRuns keeps a run parked while its approval is pending, re-admits once resolved', () => {
@@ -617,6 +631,61 @@ test('describeStepNonCompletion: an unknown future status still yields a non-emp
   assert.match(msg, /some_new_status/);
 });
 
+test('looksLikeWorkflowStepStructuralResultMiss: catches no-live-tool and result-channel prose', () => {
+  assert.equal(
+    looksLikeWorkflowStepStructuralResultMiss(
+      'This execution context has no live tool access, so I cannot call workflow_step_result for this step.',
+    ),
+    true,
+  );
+  assert.equal(
+    looksLikeWorkflowStepStructuralResultMiss(
+      "I can't continue the workflow step from that interrupted tool state here. Please rerun the step so I can call workflow_step_result.",
+    ),
+    true,
+  );
+  assert.equal(
+    looksLikeWorkflowStepStructuralResultMiss(
+      "I can't complete this step because workflow_step_result is not exposed in this text-only subprocess.",
+    ),
+    true,
+  );
+  assert.equal(
+    looksLikeWorkflowStepStructuralResultMiss({ blocked: true, reason: 'source returned no rows' }),
+    false,
+    'honest structured blockers must flow through as step data, not a harness structural miss',
+  );
+  assert.equal(looksLikeWorkflowStepStructuralResultMiss('{"accounts":[]}'), false);
+});
+
+test('runWithStepRetry: workflow structural result miss is retryable when opted in', async () => {
+  let attempts = 0;
+  const retryReasons: string[] = [];
+  const out = await runWithStepRetry(
+    async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new WorkflowStepStructuralResultError(
+          'find_or_create_tracker',
+          'This execution context has no live tool access, so I cannot call workflow_step_result.',
+        );
+      }
+      return { ok: true };
+    },
+    {
+      budget: 1,
+      backoffBaseMs: 1,
+      isRetryable: isWorkflowStepStructuralResultError,
+      onRetry: ({ err }) => retryReasons.push(isWorkflowStepStructuralResultError(err) ? 'structural_result' : 'other'),
+      sleep: async () => undefined,
+    },
+  );
+
+  assert.deepEqual(out, { ok: true });
+  assert.equal(attempts, 2);
+  assert.deepEqual(retryReasons, ['structural_result']);
+});
+
 // ---------------------------------------------------------------------------
 // Gap E — enqueueWorkflowOutcomeTurn: re-enter the origin chat in-context.
 // ---------------------------------------------------------------------------
@@ -772,6 +841,85 @@ test('bindStepContext carries dependsOn outputs even without explicit step input
   assert.match(rendered, /fetch_accounts/);
   assert.match(rendered, /example\.com/);
   assert.doesNotMatch(rendered, /unrelated/);
+});
+
+test('renderStepContextBlock offloads large upstream values to the run workspace with a read_file path', () => {
+  const rows = Array.from({ length: 260 }, (_, i) => ({
+    id: `A${i}`,
+    domain: `domain-${i}.example.com`,
+    notes: `context payload ${i} ${'x'.repeat(70)}`,
+  }));
+  const lastNeedle = 'domain-259.example.com';
+  const largeOutput = { rows, count: rows.length };
+  assert.ok(JSON.stringify(largeOutput).length > 8000, 'fixture must exceed inline context clip threshold');
+
+  const bound = workflowRunnerInternalsForTest.bindStepContext(
+    { id: 'select', prompt: 'Select the best accounts.', dependsOn: ['fetch_accounts'] },
+    {
+      inputs: {},
+      stepOutputs: { fetch_accounts: largeOutput },
+      workflowSlug: 'context-offload-workflow',
+      runId: 'run-context-offload',
+    } as never,
+  );
+
+  assert.ok(bound);
+  const rendered = workflowRunnerInternalsForTest.renderStepContextBlock(bound, {
+    workflowName: 'context-offload-workflow',
+    runId: 'run-context-offload',
+    nowIso: '2026-07-09T00:00:00.000Z',
+  });
+
+  assert.match(rendered, /__clementine_context_ref/);
+  assert.match(rendered, /workspace_artifact_query/);
+  assert.match(rendered, /read_file/);
+  assert.doesNotMatch(rendered, new RegExp(lastNeedle), 'large tail data should live in the artifact, not the prompt');
+
+  const pathMatch = rendered.match(/"path": "([^"]+)"/);
+  assert.ok(pathMatch?.[1], 'offloaded context must include an absolute artifact path');
+  const artifact = readFileSync(pathMatch[1], 'utf-8');
+  assert.match(artifact, new RegExp(lastNeedle), 'artifact carries the exact full upstream payload');
+});
+
+test('final synthesis and goal evidence render large completed outputs as queryable step artifacts', () => {
+  const rows = Array.from({ length: 260 }, (_, i) => ({
+    id: `A${i}`,
+    domain: `domain-${i}.example.com`,
+    notes: `synthesis payload ${i} ${'x'.repeat(70)}`,
+  }));
+  const lastNeedle = 'domain-259.example.com';
+  const largeOutput = { rows, count: rows.length };
+  const workflowName = 'synthesis-artifact-workflow';
+  const runId = 'run-synthesis-artifact';
+  finalizeStepOutput(
+    workflowName,
+    runId,
+    { id: 'fetch_accounts', prompt: 'Fetch accounts.' } as never,
+    largeOutput,
+  );
+
+  const opts = { workflowName, runId, nowIso: '2026-07-09T00:00:00.000Z' };
+  const rendered = workflowRunnerInternalsForTest.formatStepOutputs(
+    [{ id: 'fetch_accounts', prompt: 'Fetch accounts.' }] as never,
+    { fetch_accounts: largeOutput },
+    opts,
+  );
+
+  assert.match(rendered, /__clementine_context_ref/);
+  assert.match(rendered, /workspace_artifact_query/);
+  assert.match(rendered, /artifacts\/step-fetch_accounts\.json/);
+  assert.doesNotMatch(rendered, new RegExp(lastNeedle), 'large tail data should stay in the artifact during synthesis');
+
+  const pathMatch = rendered.match(/"path": "([^"]+)"/);
+  assert.ok(pathMatch?.[1], 'synthesis handoff must include an absolute artifact path');
+  const artifact = readFileSync(pathMatch[1], 'utf-8');
+  assert.match(artifact, new RegExp(lastNeedle), 'artifact carries the exact full completed step output');
+
+  const evidence = workflowRunnerInternalsForTest.buildGoalEvidenceText('Final summary.', { fetch_accounts: largeOutput }, opts);
+  assert.match(evidence, /workspace_artifact_query/);
+  assert.match(evidence, /Artifact:/);
+  assert.match(evidence, /Preview:/);
+  assert.doesNotMatch(evidence, new RegExp(lastNeedle), 'goal evidence stays bounded and points to the artifact');
 });
 
 test('workflow step model route uses the intent-bound worker model and trace metadata', () => {
@@ -1175,9 +1323,11 @@ test('forEach batches an oversized fan-out and still attempts every item', async
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   try {
     const qualityAdvisories: Array<{ kind: string; note: string }> = [];
     const ctx = {
@@ -1207,18 +1357,19 @@ test('forEach batches an oversized fan-out and still attempts every item', async
   } finally {
     if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
     else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
-    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
-    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
-    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
-    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
 test('forEach resolves {{steps.x.output.path}} sources at runtime', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   try {
     const ctx = {
       workflow: { name: 'Path ForEach Test', steps: [] },
@@ -1243,18 +1394,19 @@ test('forEach resolves {{steps.x.output.path}} sources at runtime', async () => 
     const started = readWorkflowEvents('foreach-path-test', 'fp-1').filter((e) => e.kind === 'item_started');
     assert.deepEqual(started.map((e) => e.itemKey), ['r1', 'r2']);
   } finally {
-    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
-    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
-    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
-    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
 test('forEachNewOnly watermarks completed items and retries failed items on the next run', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   const workflowSlug = 'foreach-watermark-test';
   const stepId = 'blast';
   clearStepWatermark(workflowSlug, stepId);
@@ -1300,10 +1452,9 @@ test('forEachNewOnly watermarks completed items and retries failed items on the 
     assert.deepEqual([...readSeenItemKeys(workflowSlug, stepId)].sort(), ['a', 'b', 'c']);
   } finally {
     clearStepWatermark(workflowSlug, stepId);
-    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
-    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
-    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
-    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
@@ -1311,9 +1462,11 @@ test('forEach batching resumes after already-completed items and drains remainin
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   try {
     const qualityAdvisories: Array<{ kind: string; note: string }> = [];
     const completedItems = new Map<string, unknown>([
@@ -1355,10 +1508,9 @@ test('forEach batching resumes after already-completed items and drains remainin
   } finally {
     if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
     else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
-    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
-    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
-    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
-    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
@@ -1366,9 +1518,11 @@ test('forEach batching attributes item failures to their original keys across wi
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   try {
     const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
     const ctx = {
@@ -1403,19 +1557,20 @@ test('forEach batching attributes item failures to their original keys across wi
   } finally {
     if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
     else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
-    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS;
-    else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
-    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW;
-    else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
 test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds BY DEFAULT (flag unset)', async () => {
   const prevH = process.env.WORKFLOW_USE_HARNESS;
   const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevL = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   delete process.env.CLEMMY_FOREACH_ITEM_RETRY; // default-ON: retry is the shipped behavior
   try {
     const attempts: Record<string, number> = {};
@@ -1449,18 +1604,21 @@ test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds BY DEFAULT
     const retried = readWorkflowEvents('w1b-item-retry', 'w1b-1').find((e) => e.kind === 'item_retry');
     assert.equal(retried?.itemKey, 'd', 'an item_retry advisory was recorded');
   } finally {
-    if (prevH === undefined) delete process.env.WORKFLOW_USE_HARNESS; else process.env.WORKFLOW_USE_HARNESS = prevH;
-    if (prevB === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW; else process.env.CLEMMY_HARNESS_WORKFLOW = prevB;
-    if (prevR === undefined) delete process.env.CLEMMY_FOREACH_ITEM_RETRY; else process.env.CLEMMY_FOREACH_ITEM_RETRY = prevR;
+    restoreEnv('WORKFLOW_USE_HARNESS', prevH);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevB);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevL);
+    restoreEnv('CLEMMY_FOREACH_ITEM_RETRY', prevR);
   }
 });
 
 test('W1b: CLEMMY_FOREACH_ITEM_RETRY=off is the kill-switch — a transient item failure is NOT retried', async () => {
   const prevH = process.env.WORKFLOW_USE_HARNESS;
   const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
+  const prevL = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   const prevR = process.env.CLEMMY_FOREACH_ITEM_RETRY;
   process.env.WORKFLOW_USE_HARNESS = 'off';
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   process.env.CLEMMY_FOREACH_ITEM_RETRY = 'off'; // explicit kill-switch
   try {
     const attempts: Record<string, number> = {};
@@ -1492,9 +1650,10 @@ test('W1b: CLEMMY_FOREACH_ITEM_RETRY=off is the kill-switch — a transient item
     assert.equal(attempts.d, 1, 'item d ran exactly once (no retry when flag off)');
     assert.equal(readWorkflowEvents('w1b-flagoff', 'w1b-off-1').some((e) => e.kind === 'item_retry'), false, 'no item_retry when flag off');
   } finally {
-    if (prevH === undefined) delete process.env.WORKFLOW_USE_HARNESS; else process.env.WORKFLOW_USE_HARNESS = prevH;
-    if (prevB === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW; else process.env.CLEMMY_HARNESS_WORKFLOW = prevB;
-    if (prevR === undefined) delete process.env.CLEMMY_FOREACH_ITEM_RETRY; else process.env.CLEMMY_FOREACH_ITEM_RETRY = prevR;
+    restoreEnv('WORKFLOW_USE_HARNESS', prevH);
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevB);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevL);
+    restoreEnv('CLEMMY_FOREACH_ITEM_RETRY', prevR);
   }
 });
 
@@ -1583,8 +1742,10 @@ test('workflow conversion: a plain step routes through the GATED harness loop wh
 test('executeStep: legacy plain deliverable step records inferred output-contract advisory', async () => {
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
   process.env.WORKFLOW_USE_HARNESS = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   try {
     const qualityAdvisories: Array<{ kind: string; note: string }> = [];
     const ctx = {
@@ -1612,8 +1773,9 @@ test('executeStep: legacy plain deliverable step records inferred output-contrac
       .find((ev) => ev.kind === 'step_advisory' && ev.meta?.reason === 'inferred_output_contract');
     assert.equal(event?.stepId, 'lead_list');
   } finally {
-    if (prevBridgeHarness === undefined) delete process.env.CLEMMY_HARNESS_WORKFLOW; else process.env.CLEMMY_HARNESS_WORKFLOW = prevBridgeHarness;
-    if (prevWorkflowHarness === undefined) delete process.env.WORKFLOW_USE_HARNESS; else process.env.WORKFLOW_USE_HARNESS = prevWorkflowHarness;
+    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
@@ -2621,4 +2783,79 @@ test('phantomBlockedOutput: blocked shape names the step and its side-effect cla
   const write = phantomBlockedOutput({ id: 'save', sideEffect: 'write', prompt: '' });
   assert.match(write.reason, /write step/);
   assert.match(write.reason, /write was not actually performed/);
+});
+
+// ─── WATCHER (workflow mount): trajectory steer at step boundaries ───────────
+
+test('applyWatcherSteerToPrompt: appends the trajectory block only when a steer is pending', async () => {
+  const { applyWatcherSteerToPrompt } = await import('./workflow-runner.js');
+  assert.equal(applyWatcherSteerToPrompt({}, 'do the step'), 'do the step', 'no steer → byte-identical');
+  const steered = applyWatcherSteerToPrompt({ watcherSteer: 'criterion 2 untouched. Address it before drafting.' }, 'do the step');
+  assert.match(steered, /TRAJECTORY CHECK/);
+  assert.match(steered, /criterion 2 untouched/);
+  assert.match(steered, /remain authoritative/);
+});
+
+test('renderWatcherWorkflowDigest: completed outputs clipped, remaining steps named as NOT drift', async () => {
+  const { renderWatcherWorkflowDigest } = await import('./workflow-runner.js');
+  const digest = renderWatcherWorkflowDigest(
+    [{ id: 'pull' }, { id: 'enrich' }, { id: 'send' }],
+    { pull: { rows: 12, note: 'x'.repeat(500) }, enrich: 'twelve rows enriched' },
+  );
+  assert.match(digest.summary, /2 of 3 steps completed/);
+  assert.match(digest.summary, /step "pull"/);
+  assert.match(digest.summary, /Steps still to run \(NOT drift[^)]*\): send/);
+  assert.ok(digest.summary.length < 1200, 'outputs are clipped');
+  assert.match(digest.latest, /completed step "enrich"/);
+});
+
+test('workflow watcher: drift at a step boundary records a steer advisory with the right cadence and digest', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { _setWorkflowWatcherForTests: setWatcher } = await import('./workflow-runner.js');
+  const slug = 'watcher-steer-runner';
+  const workflowName = 'Watcher Steer Runner';
+  const runId = `watcher-steer-${Date.now()}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Three-step chain to exercise the step-boundary watcher.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'a', prompt: 'Step A.', deterministic: { runner: 'emit.mjs' }, sideEffect: 'read' },
+      { id: 'b', prompt: 'Step B.', dependsOn: ['a'], deterministic: { runner: 'emit.mjs' }, sideEffect: 'read' },
+      { id: 'c', prompt: 'Step C.', dependsOn: ['b'], deterministic: { runner: 'emit.mjs' }, sideEffect: 'read' },
+    ],
+  });
+  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'emit.mjs'),
+    'process.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
+    'utf-8',
+  );
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow: workflowName, status: 'queued', inputs: {}, createdAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  const digestsSeen: Array<{ summary: string; count: number }> = [];
+  setWatcher(async (input) => {
+    digestsSeen.push({ summary: input.toolCallSummary, count: input.toolCallCount });
+    return { onTrack: false, miss: 'the enrichment ignored the stated goal', steer: 'Re-anchor on the goal before the final step.' };
+  });
+  try {
+    await processWorkflowRuns({} as never);
+  } finally {
+    setWatcher(async () => ({ onTrack: true, miss: '', steer: '' }));
+  }
+
+  // Cadence: default interval 2 over 3 sequential steps → exactly ONE check
+  // (after step 2; never after the final step — end-of-run judges own that).
+  assert.equal(digestsSeen.length, 1, `expected one watcher check, saw ${digestsSeen.length}`);
+  assert.equal(digestsSeen[0].count, 2, 'checked at the 2-completed-steps boundary');
+  assert.match(digestsSeen[0].summary, /Steps still to run[^:]*: c/, 'digest names the remaining step');
+  const events = readWorkflowEvents(slug, runId);
+  const steer = events.find((e) => e.kind === 'step_advisory' && (e.meta as { reason?: string } | undefined)?.reason === 'watcher_steer');
+  assert.ok(steer, `expected a watcher_steer advisory, got kinds: ${events.map((e) => e.kind).join(', ')}`);
+  assert.match(String((steer!.meta as { steer?: string }).steer ?? ''), /Re-anchor on the goal/);
 });

@@ -1,7 +1,18 @@
 import pino from 'pino';
-import { getRuntimeEnv } from '../config.js';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
-import { listBackgroundTasks, markBackgroundTaskFailed, staleTaskKind, STALE_TASK_AGE_MS, type BackgroundTaskRecord, type StaleTaskKind } from './background-tasks.js';
+import {
+  listBackgroundTasks,
+  markBackgroundTaskFailed,
+  replayBackgroundTaskReportBack,
+  staleTaskKind,
+  STALE_TASK_AGE_MS,
+  type BackgroundTaskRecord,
+  type StaleTaskKind,
+} from './background-tasks.js';
 import { ApprovalStore } from '../runtime/approval-store.js';
 
 /**
@@ -29,6 +40,7 @@ import { ApprovalStore } from '../runtime/approval-store.js';
  */
 
 const logger = pino({ name: 'clementine-next.background-task-watchdog' });
+const STALE_HEARTBEAT_STATE_FILE = path.join(BASE_DIR, 'state', 'background-task-stale-heartbeat.json');
 
 /** Floor for "a running/pending task with no maxMinutes budget is stuck". */
 const DEFAULT_RUNNING_STALL_MS = 30 * 60_000;
@@ -163,17 +175,30 @@ export function findStalledBackgroundTasks(
  * Exported for tests.
  */
 export function reportedBackTaskIdsFrom(
-  notifications: Array<{ id?: string; deliveredAt?: string; deliveredDestinations?: string[]; metadata?: Record<string, unknown> }>,
+  notifications: Array<{ id?: string; deliveredAt?: string; deliveredDestinations?: string[]; silent?: boolean; metadata?: Record<string, unknown> }>,
 ): Set<string> {
   const out = new Set<string>();
   for (const n of notifications) {
     if (typeof n.id === 'string' && n.id.startsWith('bgtask-stalled-')) continue;
+    if (n.silent) continue;
     const delivered = Boolean(n.deliveredAt) || (Array.isArray(n.deliveredDestinations) && n.deliveredDestinations.length > 0);
     if (!delivered) continue;
     const id = n.metadata?.backgroundTaskId;
     if (typeof id === 'string' && id) out.add(id);
   }
   return out;
+}
+
+export function watchdogAlertIdsFrom(
+  notifications: Array<{ id?: string }>,
+): Set<string> {
+  return new Set(
+    notifications
+      .map((n) => n.id)
+      .filter((id): id is string => typeof id === 'string' && (
+        id.startsWith('bgtask-stalled-') || id.startsWith('bgtask-escalated-') || id.startsWith('bgtask-report-replay-')
+      )),
+  );
 }
 
 function isEnabled(): boolean {
@@ -218,11 +243,17 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
   } catch {
     return { stalled: 0 };
   }
+  let notifications: ReturnType<typeof loadNotifications>;
   let reportedBack: Set<string>;
+  let existingWatchdogAlerts: Set<string>;
   try {
-    reportedBack = reportedBackTaskIdsFrom(loadNotifications());
+    notifications = loadNotifications();
+    reportedBack = reportedBackTaskIdsFrom(notifications);
+    existingWatchdogAlerts = watchdogAlertIdsFrom(notifications);
   } catch {
+    notifications = [];
     reportedBack = new Set<string>();
+    existingWatchdogAlerts = new Set<string>();
   }
   // Approval ids the store has RESOLVED (any non-pending status) — lets the
   // watchdog spot a background task orphaned on an already-decided approval.
@@ -238,6 +269,8 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
 
   const stalled = findStalledBackgroundTasks(tasks, now, reportedBack, {}, resolvedApprovalIds);
   const escalated: string[] = [];
+  const surfaced: string[] = [];
+  const repeatSuppressed: string[] = [];
   for (const task of stalled) {
     const minutes = Math.max(1, Math.round(task.ageMs / 60_000));
     // ESCALATE, don't observe forever (2026-07-08): a task silent past the
@@ -254,8 +287,9 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
           'interrupted',
         );
         escalated.push(task.id);
+        const escalationId = `bgtask-escalated-${task.id}`;
         addNotification({
-          id: `bgtask-escalated-${task.id}`,
+          id: escalationId,
           kind: 'execution',
           title: `Closed a dead background task: ${task.title}`,
           body: `Task \`${task.id}\` ("${task.title}") was silent for ${minutes} min — it was closed as interrupted. Re-run it if the work is still needed.`,
@@ -263,13 +297,28 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
           read: false,
           metadata: { backgroundTaskId: task.id, escalated: true, ageMs: task.ageMs },
         });
+        if (!existingWatchdogAlerts.has(escalationId)) surfaced.push(task.id);
         continue; // closed — no per-tick stalled alert for it anymore
       } catch { /* store write failed — fall through to the plain alert */ }
     }
+    if (task.reason === 'terminal_undelivered') {
+      const replay = replayBackgroundTaskReportBack(task.id, { reason: 'watchdog_terminal_undelivered', now: new Date(now).toISOString() });
+      const replayId = replay.notificationId ?? `bgtask-report-replay-${task.id}`;
+      if (replay.ok) {
+        if (existingWatchdogAlerts.has(replayId)) repeatSuppressed.push(task.id);
+        else surfaced.push(task.id);
+        continue;
+      }
+      // If the task vanished or became non-terminal between snapshot and repair,
+      // fall through to the older diagnostic alert below.
+    }
     const alert = alertFor(task, minutes);
+    const alertId = `bgtask-stalled-${task.reason}-${task.id}`;
+    if (existingWatchdogAlerts.has(alertId)) repeatSuppressed.push(task.id);
+    else surfaced.push(task.id);
     addNotification({
       // Stable id → exactly one alert per stuck task per reason.
-      id: `bgtask-stalled-${task.reason}-${task.id}`,
+      id: alertId,
       kind: 'execution',
       title: alert.title,
       body: alert.body,
@@ -278,8 +327,13 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
       metadata: { backgroundTaskId: task.id, stalled: true, reason: task.reason, ageMs: task.ageMs },
     });
   }
-  if (stalled.length > 0) {
-    logger.warn({ stalled: stalled.length, escalated, ids: stalled.map((s) => s.id) }, 'Background tasks went silent');
+  if (surfaced.length > 0 || escalated.length > 0) {
+    logger.warn({
+      stalled: surfaced.length,
+      escalated,
+      repeatSuppressed: repeatSuppressed.length,
+      ids: surfaced,
+    }, 'Background tasks went silent');
   }
   // Proactive housekeeping: surface finished/parked tasks idle past the stale
   // threshold so the user is asked to archive them (reuses the snapshot above —
@@ -292,6 +346,69 @@ export function runBackgroundTaskWatchdog(now: number = Date.now()): { stalled: 
  *  itself, though it only runs while the watchdog is enabled). */
 function staleHeartbeatEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_STALE_TASK_HEARTBEAT', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+interface StaleHeartbeatState {
+  weeks?: Record<string, {
+    at: string;
+    stale: number;
+    finished: number;
+    parked: number;
+    idsHash: string;
+  }>;
+}
+
+function loadStaleHeartbeatState(): StaleHeartbeatState {
+  try {
+    if (!existsSync(STALE_HEARTBEAT_STATE_FILE)) return {};
+    const parsed = JSON.parse(readFileSync(STALE_HEARTBEAT_STATE_FILE, 'utf-8'));
+    return parsed && typeof parsed === 'object' ? parsed as StaleHeartbeatState : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveStaleHeartbeatState(state: StaleHeartbeatState): void {
+  try {
+    mkdirSync(path.dirname(STALE_HEARTBEAT_STATE_FILE), { recursive: true });
+    const tmp = `${STALE_HEARTBEAT_STATE_FILE}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf-8');
+    renameSync(tmp, STALE_HEARTBEAT_STATE_FILE);
+  } catch {
+    // Best-effort dedupe marker only; notification delivery remains canonical.
+  }
+}
+
+function staleIdsHash(ids: string[]): string {
+  return createHash('sha256').update(ids.join('\n')).digest('hex').slice(0, 16);
+}
+
+function recordStaleHeartbeatSurface(weekIndex: number, args: {
+  now: number;
+  stale: number;
+  finished: number;
+  parked: number;
+  ids: string[];
+}): void {
+  const state = loadStaleHeartbeatState();
+  const weeks = state.weeks ?? {};
+  weeks[String(weekIndex)] = {
+    at: new Date(args.now).toISOString(),
+    stale: args.stale,
+    finished: args.finished,
+    parked: args.parked,
+    idsHash: staleIdsHash(args.ids),
+  };
+  const floor = weekIndex - 12;
+  for (const key of Object.keys(weeks)) {
+    const parsed = Number.parseInt(key, 10);
+    if (Number.isFinite(parsed) && parsed < floor) delete weeks[key];
+  }
+  saveStaleHeartbeatState({ weeks });
+}
+
+function staleHeartbeatAlreadySurfaced(weekIndex: number): boolean {
+  return Boolean(loadStaleHeartbeatState().weeks?.[String(weekIndex)]);
 }
 
 /**
@@ -316,10 +433,12 @@ export function runStaleTaskHeartbeat(tasks: BackgroundTaskRecord[], now: number
   const notificationId = `bgtask-stale-prompt-${weekIndex}`;
   let alreadyNotified = false;
   try {
-    alreadyNotified = loadNotifications().some((n) => n.id === notificationId);
+    alreadyNotified = staleHeartbeatAlreadySurfaced(weekIndex) || loadNotifications().some((n) => n.id === notificationId);
   } catch {
     // addNotification is still authoritative; this only suppresses duplicate logs.
   }
+  if (alreadyNotified) return { stale: stale.length };
+
   const preview = stale.slice(0, 5).map((s) => `• ${s.task.title}`).join('\n');
   const more = stale.length > 5 ? `\n…and ${stale.length - 5} more` : '';
   addNotification({
@@ -334,6 +453,13 @@ export function runStaleTaskHeartbeat(tasks: BackgroundTaskRecord[], now: number
     read: false,
     metadata: { staleTaskPrompt: true, staleCount: stale.length, finished, parked, staleTaskIds: stale.map((s) => s.task.id) },
   });
-  if (!alreadyNotified) logger.info({ stale: stale.length, finished, parked }, 'Stale background tasks surfaced for review');
+  recordStaleHeartbeatSurface(weekIndex, {
+    now,
+    stale: stale.length,
+    finished,
+    parked,
+    ids: stale.map((s) => s.task.id).sort(),
+  });
+  logger.info({ stale: stale.length, finished, parked }, 'Stale background tasks surfaced for review');
   return { stale: stale.length };
 }

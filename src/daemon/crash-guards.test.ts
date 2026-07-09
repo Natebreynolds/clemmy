@@ -21,6 +21,15 @@ test('isSurvivableSocketError: any error surfaced from ws/lib/websocket.js is su
   assert.equal(isSurvivableSocketError(err), true);
 });
 
+test('isSurvivableSocketError: observed daemon startup write EPIPE is survivable', () => {
+  assert.equal(isSurvivableSocketError(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })), true);
+  assert.equal(isSurvivableSocketError(new Error('Error: write EPIPE')), true);
+});
+
+test('isSurvivableSocketError: connection reset by code is survivable even without a ws stack', () => {
+  assert.equal(isSurvivableSocketError(Object.assign(new Error('socket closed'), { code: 'ECONNRESET' })), true);
+});
+
 test('isSurvivableSocketError: ordinary errors are NOT survivable — the daemon must still crash on real bugs', () => {
   assert.equal(isSurvivableSocketError(new Error('Cannot read properties of undefined')), false);
   assert.equal(isSurvivableSocketError(new TypeError('x is not a function')), false);

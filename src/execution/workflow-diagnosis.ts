@@ -31,7 +31,7 @@ import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { MODELS, getRuntimeEnv } from '../config.js';
 import { STATE_DIR } from '../memory/db.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { readWorkflow, type WorkflowDefinition, type WorkflowStepInput, type WorkflowStepInputBinding, type WorkflowStepOutputContract } from '../memory/workflow-store.js';
 import { prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
@@ -338,6 +338,123 @@ export const WorkflowDiagnosisSchema = z.object({
 });
 export type WorkflowDiagnosis = z.infer<typeof WorkflowDiagnosisSchema>;
 
+function parseDiagnosisJson(value: unknown): unknown | null {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const candidate = extractJsonCandidate(value);
+  if (!candidate) return null;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function compactString(value: unknown, max = 4000): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, max) : '';
+}
+
+function stringFrom(obj: Record<string, unknown>, keys: string[], max = 4000): string {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.trim()) return compactString(value, max);
+  }
+  return '';
+}
+
+function nullableString(value: unknown, max = 8000): string | null {
+  const s = compactString(value, max);
+  return s || null;
+}
+
+function nullableText(value: unknown, max = 10_000): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : null;
+}
+
+function jsonPayloadString(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() || null;
+  if (value && typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function normalizeFixKind(value: unknown): WorkflowDiagnosis['fix']['kind'] {
+  const raw = compactString(value, 80).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return (FIX_KINDS as readonly string[]).includes(raw) ? raw as WorkflowDiagnosis['fix']['kind'] : 'manual';
+}
+
+function booleanFrom(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (/^(true|yes|1)$/i.test(value.trim())) return true;
+    if (/^(false|no|0)$/i.test(value.trim())) return false;
+  }
+  return null;
+}
+
+function inferAutoApplicable(fix: WorkflowDiagnosis['fix'], raw: unknown): boolean {
+  const explicit = booleanFrom(raw);
+  if (explicit !== null) return explicit;
+  if (fix.kind === 'edit_step') return Boolean(fix.newStepPrompt);
+  if (fix.kind === 'edit_contract') return Boolean(sanitizeOutputContract(fix.newOutputContractJson));
+  if (fix.kind === 'edit_input') return Boolean(sanitizeStepInputs(fix.newInputsJson));
+  if (fix.kind === 'edit_binding') return Boolean(sanitizeAllowedTools(fix.newAllowedToolsJson));
+  if (fix.kind === 'uncodify_step') return true;
+  return false;
+}
+
+function normalizeConfidence(value: unknown): WorkflowDiagnosis['confidence'] {
+  const raw = compactString(value, 40).toLowerCase();
+  if (raw === 'high' || raw === 'medium' || raw === 'low') return raw;
+  return 'medium';
+}
+
+function sanitizeWorkflowDiagnosisOutput(value: unknown): WorkflowDiagnosis | null {
+  const parsed = parseDiagnosisJson(value);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  const fixObj = (obj.fix && typeof obj.fix === 'object' && !Array.isArray(obj.fix))
+    ? obj.fix as Record<string, unknown>
+    : obj;
+  const kind = normalizeFixKind(fixObj.kind ?? fixObj.fixKind ?? fixObj.action);
+  const stepId = stringFrom(fixObj, ['stepId', 'step_id', 'targetStep', 'target_step', 'step'], 200)
+    || stringFrom(obj, ['stepId', 'step_id', 'blockedStepId', 'blocked_step_id'], 200);
+  if (!stepId) return null;
+
+  const fix: WorkflowDiagnosis['fix'] = {
+    kind,
+    stepId,
+    description: stringFrom(fixObj, ['description', 'summary', 'reason', 'fix'], 1000)
+      || stringFrom(obj, ['fixDescription', 'fix_description'], 1000)
+      || 'Workflow Doctor proposed a fix.',
+    newStepPrompt: nullableText(fixObj.newStepPrompt ?? fixObj.new_step_prompt ?? fixObj.prompt ?? fixObj.replacementPrompt),
+    newOutputContractJson: jsonPayloadString(fixObj.newOutputContractJson ?? fixObj.new_output_contract_json ?? fixObj.outputContract ?? fixObj.output_contract),
+    newInputsJson: jsonPayloadString(fixObj.newInputsJson ?? fixObj.new_inputs_json ?? fixObj.inputs ?? fixObj.inputBindings ?? fixObj.input_bindings),
+    newAllowedToolsJson: jsonPayloadString(fixObj.newAllowedToolsJson ?? fixObj.new_allowed_tools_json ?? fixObj.allowedTools ?? fixObj.allowed_tools),
+    service: nullableString(fixObj.service ?? fixObj.provider, 200),
+    autoApplicable: false,
+  };
+  fix.autoApplicable = inferAutoApplicable(fix, fixObj.autoApplicable ?? fixObj.auto_applicable);
+
+  const candidate: WorkflowDiagnosis = {
+    summary: stringFrom(obj, ['summary', 'message', 'diagnosis'], 1000) || fix.description,
+    rootCause: stringFrom(obj, ['rootCause', 'root_cause', 'cause', 'reason'], 1500) || fix.description,
+    fix,
+    confidence: normalizeConfidence(obj.confidence),
+  };
+  const checked = WorkflowDiagnosisSchema.safeParse(candidate);
+  return checked.success ? checked.data : null;
+}
+
+export function _testOnly_sanitizeWorkflowDiagnosisOutput(value: unknown): WorkflowDiagnosis | null {
+  return sanitizeWorkflowDiagnosisOutput(value);
+}
+
 const DOCTOR_INSTRUCTIONS = [
   'You are the Workflow Doctor. A step of an automated workflow blocked instead of completing. Diagnose the ROOT cause and propose ONE concrete fix.',
   'You are given the blocked steps in execution order — the FIRST is the ROOT (the earliest failure). Diagnose THAT one. Later steps usually just inherited the failure, and their stated reasons are often GUESSES or even wrong (a downstream agent may invent a plausible-sounding blocker like "shell needs approval" when the truth is "the upstream step never produced my input"). Trust the root step + the tool errors over downstream rationalizations.',
@@ -356,6 +473,7 @@ const DOCTOR_INSTRUCTIONS = [
   '- Genuinely needs human judgment: kind=manual. autoApplicable=false.',
   'When kind=edit_step, newStepPrompt MUST be the COMPLETE replacement prompt for that step (not a diff), preserving the original intent and output contract, fixing only what caused the block. Set autoApplicable=true only then.',
   'Set confidence honestly. If the reason is vague, say so and prefer a conservative fix.',
+  'Return ONLY JSON with keys: summary, rootCause, fix, confidence. Do not wrap it in prose.',
 ].join('\n\n');
 
 export interface DiagnoseInput {
@@ -544,7 +662,6 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
     instructions: DOCTOR_INSTRUCTIONS,
     model: MODELS.fast,
     modelSettings: { reasoning: { effort: 'low' } },
-    outputType: normalizeZodForCodexStrict(WorkflowDiagnosisSchema) as typeof WorkflowDiagnosisSchema,
     tools: [],
   });
   const prompt = [
@@ -566,8 +683,7 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
 
   try {
     const result = await run(agent, prompt);
-    const out = result.finalOutput as WorkflowDiagnosis | undefined;
-    return out ?? null;
+    return sanitizeWorkflowDiagnosisOutput((result as { finalOutput?: unknown }).finalOutput);
   } catch (err) {
     logger.warn({ err, workflow: input.workflow.name, step: primary.stepId }, 'workflow diagnosis failed');
     return null;

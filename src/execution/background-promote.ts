@@ -42,15 +42,26 @@ import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-p
  */
 export function hasDurableExecutionIntent(message: string): boolean {
   const lower = message.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (/^\/?(background|bg)\b/.test(lower)) return true;
-  if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(lower)) return true;
-  if (/\b(?:move|take|send|put)\s+(?:this|it|that|the request|the task)\s+(?:to|into)\s+the\s+background\b/.test(lower)) return true;
-  if (/\b(?:do|finish)\s+(?:this|it|that|the request|the task)\s+in\s+the\s+background\b/.test(lower)) return true;
-  if (/\b(keep working|don't stop|do not stop|long-running|longer running|overnight|take your time)\b/.test(lower)) return true;
-  if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(lower)) {
-    return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(lower);
+  const intentText = stripNegatedDurableIntent(lower);
+  if (/^\/?(background|bg)\b/.test(intentText)) return true;
+  if (/\b(run|queue|start).{0,40}\b(background|overnight|as a job)\b/.test(intentText)) return true;
+  if (/\b(?:move|take|send|put)\s+(?:this|it|that|the request|the task)\s+(?:to|into)\s+the\s+background\b/.test(intentText)) return true;
+  if (/\b(?:do|finish)\s+(?:this|it|that|the request|the task)\s+in\s+the\s+background\b/.test(intentText)) return true;
+  if (/\b(keep working|don't stop|do not stop|long-running|longer running|overnight|take your time)\b/.test(intentText)) return true;
+  if (/\b(from start to finish|end to end|get it done|finish this|finish it all)\b/.test(intentText)) {
+    return /\b(build|implement|migrate|refactor|wire|ship|deploy|fix|create|set up|setup|finish)\b/.test(intentText);
   }
   return hasAutomaticDataPipelineShape(lower);
+}
+
+function stripNegatedDurableIntent(lower: string): string {
+  return lower
+    .replace(/\b(?:do not|don't|dont|never)\b[^.?!;]{0,180}\b(?:background|overnight|as a job|background tasks?)\b/g, ' ')
+    .replace(/\b(?:do not|don't|dont|never)\s+(?:run|queue|start|launch|create|move|take|send|put|do|finish)\b.{0,80}\b(?:background|overnight|as a job|background tasks?)\b/g, ' ')
+    .replace(/\bwithout\s+(?:running|queueing|queuing|starting|launching|creating|moving|taking|sending|putting|doing|finishing)\b.{0,80}\b(?:background|overnight|as a job|background tasks?)\b/g, ' ')
+    .replace(/\bno\s+background\s+tasks?\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function hasAutomaticDataPipelineShape(lower: string): boolean {

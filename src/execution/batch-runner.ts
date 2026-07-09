@@ -35,8 +35,13 @@ import { Agent, Runner } from '@openai/agents';
 import { BASE_DIR } from '../config.js';
 import { dispatchBatchItemTool, READ_ONLY_TOOLS, isMcpNamespacedTool } from '../tools/code-mode-tool.js';
 import { ToolCallsCounter } from '../runtime/harness/brackets.js';
-import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { codexSafeFast } from '../runtime/harness/model-roles.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
+import { recordJudgeMetric, withJudgeHedge, type JudgeMetricOutcome } from '../runtime/harness/judge-family.js';
+import type { BoundaryJudgeRouting } from '../runtime/harness/debate-model.js';
+import { normalizeComposioBatchItemArgs, validateComposioArgs } from '../tools/composio-batch-validator.js';
+import { getCachedToolSchema } from '../tools/composio-schema-cache.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 
 const logger = pino({ name: 'clementine-next.batch-runner' });
 
@@ -49,6 +54,8 @@ export interface BatchPlanItem {
   id: string;
   /** FULLY materialized tool arguments for this item — nothing resolved later. */
   args: Record<string, unknown>;
+  /** Optional Composio wrapper account id recovered from a model-supplied item wrapper. */
+  connectedAccountId?: string | null;
 }
 
 export interface BatchPlan {
@@ -99,6 +106,72 @@ export interface BatchRunLedger {
 
 const MAX_ITEMS = 500;
 
+export interface PreparedBatchPlan {
+  plan: BatchPlan;
+  repairs: string[];
+  errors: string[];
+}
+
+function cloneBatchPlan(plan: BatchPlan): BatchPlan {
+  return {
+    ...plan,
+    items: Array.isArray(plan.items)
+      ? plan.items.map((item) => ({
+          ...item,
+          args: item && typeof item.args === 'object' && item.args !== null && !Array.isArray(item.args)
+            ? { ...item.args }
+            : item.args,
+        }))
+      : plan.items,
+  };
+}
+
+function knownRequiredComposioFields(toolSlug: string): string[] {
+  if (/^OUTLOOK(?:_|$).*SEND.*EMAIL$/i.test(toolSlug)) return ['to_email', 'subject', 'body'];
+  return [];
+}
+
+function itemSignature(item: BatchPlanItem): string {
+  return JSON.stringify({
+    args: item.args,
+    connectedAccountId: item.connectedAccountId ?? null,
+  });
+}
+
+export function prepareBatchPlanForExecution(plan: BatchPlan): PreparedBatchPlan {
+  const prepared = cloneBatchPlan(plan);
+  const repairs: string[] = [];
+  const errors: string[] = [];
+  if (prepared.tool !== 'composio_execute_tool' || typeof prepared.composioSlug !== 'string' || !Array.isArray(prepared.items)) {
+    return { plan: prepared, repairs, errors };
+  }
+  const slug = prepared.composioSlug.trim();
+  const schema = getCachedToolSchema(slug);
+  prepared.composioSlug = slug;
+  prepared.items = prepared.items.map((item, index) => {
+    if (!item || typeof item.args !== 'object' || item.args === null || Array.isArray(item.args)) return item;
+    const normalized = normalizeComposioBatchItemArgs(slug, item.args, schema);
+    for (const err of normalized.errors) errors.push(`items[${index}] ("${item.id ?? ''}"): ${err}`);
+    for (const repair of normalized.repairs) repairs.push(`items[${index}] ("${item.id ?? ''}"): ${repair}`);
+    const next: BatchPlanItem = { ...item, args: normalized.args };
+    if (normalized.connectedAccountId !== undefined) next.connectedAccountId = normalized.connectedAccountId;
+
+    const validation = validateComposioArgs(slug, next.args, schema);
+    if (validation.error) {
+      errors.push(`items[${index}] ("${item.id ?? ''}") failed ${validation.mode} validation: ${validation.error.reason}`);
+    }
+    const required = knownRequiredComposioFields(slug);
+    if (required.length > 0) {
+      const missing = required.filter((key) => !(key in next.args));
+      if (missing.length > 0) {
+        errors.push(`items[${index}] ("${item.id ?? ''}") missing required field(s) for ${slug}: ${missing.join(', ')}`);
+      }
+    }
+    return next;
+  });
+  return { plan: prepared, repairs, errors };
+}
+
 // ─── Validation (pure, deterministic) ────────────────────────────────────────
 
 export function validateBatchPlan(plan: BatchPlan): string[] {
@@ -134,7 +207,7 @@ export function validateBatchPlan(plan: BatchPlan): string[] {
         // args empty. Name it precisely so it's a one-shot fix, not a loop.
         errors.push(`items[${index}] ("${item.id ?? ''}") has EMPTY args — put this item's real tool arguments in args (the id is only a label), e.g. {"keywords":["${item.id ?? 'value'}"], …}`);
       } else {
-        const sig = JSON.stringify(item.args);
+        const sig = itemSignature(item);
         if (seenArgs.has(sig)) errors.push(`items[${index}] duplicates another item's exact args — a batch must not repeat identical calls`);
         else seenArgs.add(sig);
       }
@@ -150,6 +223,81 @@ export interface BatchCertification {
   reason: string;
   concerns: string[];
   judged: boolean;
+}
+
+/** Typed judge failures so the metric lane can distinguish a hung call from a
+ *  malformed verdict from a transport error (all still retry → fail-closed). */
+class BatchJudgeTimeoutError extends Error {
+  constructor() { super('certification judge timed out'); }
+}
+class BatchJudgeInvalidError extends Error {}
+
+/** Test seam (same pattern as _setBatchSleepForTests): replaces ONE judge
+ *  attempt, so tests exercise retry → fail-closed deterministically without a
+ *  live provider — the dev machine's real OAuth logins otherwise make the
+ *  "judge unreachable" test silently place a real model call. */
+let certifyJudgeOverride: (() => Promise<BatchCertification>) | null = null;
+export function _setCertifyJudgeForTests(fn: (() => Promise<BatchCertification>) | null): void {
+  certifyJudgeOverride = fn;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function certificationBool(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, '-');
+  if (/^(true|yes|allow|allowed|approve|approved|pass|passed|ok)$/.test(normalized)) return true;
+  if (/^(false|no|deny|denied|refuse|refused|block|blocked|fail|failed)$/.test(normalized)) return false;
+  return null;
+}
+
+function certificationConcerns(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === 'string' ? item.trim().slice(0, 300) : ''))
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function certificationObject(obj: Record<string, unknown>): BatchCertification | null {
+  let allow = certificationBool(obj.allow ?? obj.allowed ?? obj.ok ?? obj.pass ?? obj.passed);
+  if (allow === null) allow = certificationBool(obj.verdict ?? obj.status ?? obj.result ?? obj.kind);
+  if (allow === null) return null;
+  const reasonValue = obj.reason ?? obj.rationale ?? obj.explanation ?? obj.summary;
+  const reason = typeof reasonValue === 'string' && reasonValue.trim()
+    ? reasonValue.trim().slice(0, 400)
+    : allow ? 'batch plan allowed' : 'batch plan denied';
+  return {
+    allow,
+    reason,
+    concerns: certificationConcerns(obj.concerns),
+    judged: true,
+  };
+}
+
+export function parseBatchCertificationVerdict(finalOutput: unknown): BatchCertification | null {
+  if (isRecord(finalOutput)) return certificationObject(finalOutput);
+  const raw = String(finalOutput ?? '').trim();
+  const match = /^\s*(ALLOW|DENY)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
+  if (match) {
+    return {
+      allow: match[1].toUpperCase() === 'ALLOW',
+      reason: (match[2] || '').trim().slice(0, 400),
+      concerns: [],
+      judged: true,
+    };
+  }
+  const json = extractJsonCandidate(raw);
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    return isRecord(parsed) ? certificationObject(parsed) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertification> {
@@ -168,41 +316,84 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
   // schema to fail: first line "ALLOW: <reason>" or "DENY: <reason>"; any
   // response without that marker throws → retry → fail-closed. Deterministic
   // checks stay primary (validateBatchPlan); the judge is a second opinion.
-  const runJudgeOnce = async (): Promise<BatchCertification> => {
+  //
+  // Routed through the BOUNDARY judge lane (cross-family + flagship-downshift +
+  // wall-clock cap), not a raw role-model id: a judge role pinned to a flagship
+  // used to ride every certification (the 2026-07-07 Opus-pin incident class),
+  // and an unbounded call here means a hung provider parks an approved WRITE
+  // batch fail-closed. Each attempt is timeout-capped; a timeout counts as the
+  // attempt's failure and flows into the existing retry → fail-closed contract.
+  const startedAt = Date.now();
+  let routing: BoundaryJudgeRouting | undefined;
+  const record = (outcome: JudgeMetricOutcome) => {
+    recordJudgeMetric({
+      lane: 'certify',
+      outcome,
+      durationMs: Date.now() - startedAt,
+      modelId: routing?.modelId,
+      judgeFamily: routing?.judgeFamily,
+      brainFamily: routing?.brainFamily,
+      selfJudge: routing?.selfJudge,
+    });
+  };
+  const runJudgeOnce = async (r?: BoundaryJudgeRouting): Promise<BatchCertification> => {
+    if (certifyJudgeOverride) return certifyJudgeOverride();
     const agent = new Agent({
       name: 'Batch Plan Judge',
-      model: resolveRoleModel('judge').modelId,
+      model: r?.model ?? r?.modelId ?? routing?.model ?? routing?.modelId ?? codexSafeFast(),
       instructions: [
         'You certify a BATCH PLAN before deterministic execution: one tool, N pre-baked payloads, executed with no further review.',
         'ALLOW only when the sampled payloads actually accomplish the stated objective and nothing in them looks misdirected: wrong recipients/targets for the objective, placeholder or template-variable text left in ({{name}}, TODO, lorem), payloads inconsistent with each other, or a scope wider than the objective states.',
         'You are the ONLY review these payloads get — when unsure on a write/send plan, DENY and say why.',
         'Reply with EXACTLY ONE LINE and nothing else: either "ALLOW: <one-sentence reason>" or "DENY: <one-sentence reason>".',
       ].join(' '),
+      // Binary verdict against an explicit rubric — same low-effort setting as
+      // the other boundary lanes; the scrutiny lives in the rubric + sampling.
+      modelSettings: { reasoning: { effort: 'low' } },
       tools: [],
     });
     const runner = new Runner({ workflowName: 'clementine-batch-certify' });
-    const result = await runner.run(agent, input);
+    const result = await runner.run(agent, input, { maxTurns: 1 });
     const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
-    const match = /^\s*(ALLOW|DENY)\s*:?\s*(.*)$/im.exec(raw);
-    if (!match) throw new Error(`judge returned no ALLOW/DENY verdict (got: ${raw.slice(0, 120)})`);
-    return {
-      allow: match[1].toUpperCase() === 'ALLOW',
-      reason: (match[2] || '').slice(0, 400),
-      concerns: [],
-      judged: true,
-    };
+    const verdict = parseBatchCertificationVerdict(raw);
+    if (!verdict) throw new BatchJudgeInvalidError(`judge returned no ALLOW/DENY verdict (got: ${raw.slice(0, 120)})`);
+    return verdict;
+  };
+  const runJudgeAttempt = async (): Promise<BatchCertification> => {
+    if (certifyJudgeOverride) return certifyJudgeOverride();
+    const { resolveBoundaryJudgeHedge } = await import('../runtime/harness/debate-model.js');
+    const primary = routing;
+    const hedgeRouting = primary ? resolveBoundaryJudgeHedge(primary) : null;
+    const raced = await withJudgeHedge(
+      () => runJudgeOnce(primary),
+      hedgeRouting ? () => runJudgeOnce(hedgeRouting) : null,
+    );
+    if (raced.value) {
+      if (raced.winner === 'hedge' && hedgeRouting) routing = hedgeRouting;
+      return raced.value;
+    }
+    if (raced.errors.length === 0) throw new BatchJudgeTimeoutError();
+    const invalid = raced.errors.find((err) => err instanceof BatchJudgeInvalidError);
+    if (invalid) throw invalid;
+    throw raced.errors[0] instanceof Error ? raced.errors[0] : new Error(String(raced.errors[0]));
   };
   try {
+    const { resolveBoundaryJudge } = await import('../runtime/harness/debate-model.js');
+    routing = resolveBoundaryJudge();
+    let verdict: BatchCertification;
     try {
-      return await runJudgeOnce();
+      verdict = await runJudgeAttempt();
     } catch (firstErr) {
       // ONE retry before any fail-closed: a schema/transport blip on a single
       // call must not park an entire approved batch (live 2026-07-07: five
       // consecutive verdict-shape rejections parked 5 emails).
       logger.warn({ err: firstErr instanceof Error ? firstErr.message : String(firstErr) }, 'batch certify judge attempt 1 failed — retrying once');
-      return await runJudgeOnce();
+      verdict = await runJudgeAttempt();
     }
+    record(verdict.allow ? 'passed' : 'blocked');
+    return verdict;
   } catch (err) {
+    record(err instanceof BatchJudgeTimeoutError ? 'timeout' : err instanceof BatchJudgeInvalidError ? 'invalid' : 'error');
     const message = err instanceof Error ? err.message : String(err);
     // Fail-CLOSED for irreversible plans, advisory for reads (Wave 0 semantics).
     if (plan.sideEffect === 'read') {
@@ -276,7 +467,7 @@ function planScopeHash(plan: BatchPlan): string {
 }
 
 function itemIdempotencyKey(scope: string, item: BatchPlanItem): string {
-  return createHash('sha1').update(`${scope}::${item.id}::${JSON.stringify(item.args)}`).digest('hex');
+  return createHash('sha1').update(`${scope}::${item.id}::${itemSignature(item)}`).digest('hex');
 }
 
 /** Map of idempotencyKey → sourceBatchId for every SUCCEEDED item across the recent
@@ -358,7 +549,7 @@ export async function runBatchPlan(
     // failed ALL items of the 2026-07-08 sheet batch in milliseconds with
     // InvalidToolInputError — before any network call.
     const args = plan.tool === 'composio_execute_tool'
-      ? { tool_slug: plan.composioSlug, arguments: JSON.stringify(item.args), connected_account_id: null }
+      ? { tool_slug: plan.composioSlug, arguments: JSON.stringify(item.args), connected_account_id: item.connectedAccountId ?? null }
       : item.args;
     let attempts = 0;
     let lastError = '';

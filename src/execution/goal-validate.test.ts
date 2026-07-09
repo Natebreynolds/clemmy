@@ -236,3 +236,54 @@ test('toGoalEvidence maps verdicts to store rows with attempt + timestamp', asyn
   assert.equal(rows[0].pass, false);
   assert.equal(rows[0].method, 'judge');
 });
+
+// ─── Per-criterion judge path (real granularity, one call) ───
+
+test('validateGoal: injected judgeCriteria gives INDIVIDUAL verdicts — partial credit is real', async () => {
+  const { validateGoal } = await import('./goal-validate.js');
+  const seen: { criteria?: string[] } = {};
+  const result = await validateGoal(
+    { objective: 'do three things', successCriteria: ['thing one done', 'thing two done', 'thing three done'], evidenceText: 'one and three are done with URLs' },
+    {
+      judgeCriteria: async (_obj, criteria) => {
+        seen.criteria = criteria;
+        return [
+          { pass: true, note: 'url present' },
+          { pass: false, note: 'no evidence for two' },
+          { pass: true, note: 'url present' },
+        ];
+      },
+      fileExists: () => false,
+    },
+  );
+  assert.equal(seen.criteria?.length, 3, 'ONE call carried all fuzzy criteria');
+  assert.equal(result.pass, false);
+  assert.equal(result.criteriaMet, 2);
+  assert.equal(result.criteriaTotal, 3);
+  assert.equal(result.successRatePercent, 67);
+  assert.equal(result.failedDirectives?.length, 1);
+  assert.match(result.failedDirectives?.[0]?.fix ?? '', /thing two/);
+});
+
+test('validateGoal: judgeCriteria infra failure → all fuzzy skipped + judgeFailedOpen (fail-strict preserved)', async () => {
+  const { validateGoal } = await import('./goal-validate.js');
+  const result = await validateGoal(
+    { objective: 'do two things', successCriteria: ['a done', 'b done'], evidenceText: 'evidence' },
+    { judgeCriteria: async () => { throw new Error('judge timed out'); }, fileExists: () => false },
+  );
+  assert.equal(result.pass, false);
+  assert.equal(result.judgeFailedOpen, true);
+  assert.ok(result.perCriterion.every((c) => c.method === 'skipped'));
+});
+
+test('validateGoal: only legacy judge injected → whole-checklist path still used (fakes never bypassed)', async () => {
+  const { validateGoal } = await import('./goal-validate.js');
+  let checklistSeen = '';
+  const result = await validateGoal(
+    { objective: 'obj', successCriteria: ['c1', 'c2'], evidenceText: 'evidence' },
+    { judge: async (objective) => { checklistSeen = objective; return { done: true, reason: 'all met' }; }, fileExists: () => false },
+  );
+  assert.match(checklistSeen, /1\. c1/);
+  assert.equal(result.pass, true);
+  assert.equal(result.perCriterion.length, 2);
+});

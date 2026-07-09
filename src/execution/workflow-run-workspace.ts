@@ -199,6 +199,10 @@ function nextArtifactIndex(workflowName: string, runId: string): number {
   return readWorkspaceManifest(workflowName, runId).length + 1;
 }
 
+export function stepOutputArtifactRelPath(stepId: string): string {
+  return path.join('artifacts', `step-${safeSegment(stepId, 'step')}.json`);
+}
+
 function safeStringify(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2) ?? String(value);
@@ -222,7 +226,7 @@ export function recordStepOutput(args: {
   nowIso: string;
 }): WorkspaceArtifact {
   ensureRunWorkspace(args.workflowName, args.runId);
-  const rel = path.join('artifacts', `step-${safeSegment(args.stepId, 'step')}.json`);
+  const rel = stepOutputArtifactRelPath(args.stepId);
   const serialized = safeStringify(args.output);
   const entry: WorkspaceArtifact = {
     path: rel,

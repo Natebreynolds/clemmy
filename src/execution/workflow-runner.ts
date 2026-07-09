@@ -36,7 +36,16 @@ import {
   expireGoal,
 } from '../agents/plan-proposals.js';
 import { loadSkill } from '../memory/skill-store.js';
-import { anchorRunGoal, recordStepOutput, writeWorkspaceCheckerReport } from './workflow-run-workspace.js';
+import {
+  anchorRunGoal,
+  offloadContextValue,
+  recordStepOutput,
+  runWorkspaceDir,
+  runWorkspaceOffloadEnabled,
+  stepOutputArtifactRelPath,
+  summarizeToolOutput,
+  writeWorkspaceCheckerReport,
+} from './workflow-run-workspace.js';
 import { checkerReportFromVerdict } from './workflow-run-checker.js';
 import {
   appendWorkflowEvent,
@@ -91,12 +100,14 @@ import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
 import { verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
-import { deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
+import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
+import { runWatcherJudge, watcherJudgeEnabled, watcherWorkflowIntervalSteps, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn } from '../runtime/harness/watcher-judge.js';
 import { inferOutputContractFromPrompt } from './workflow-deliverable-hints.js';
 import { judgeStepSkillExecution } from './workflow-step-judge.js';
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { rewriteInClementineVoice } from './voice-rewrite.js';
+import { looksLikeToolUnavailableSelfReport } from '../runtime/harness/tool-unavailable-text.js';
 import { reportedBackRunIdsFrom } from './workflow-watchdog.js';
 import {
   recallWorkflowPatterns,
@@ -606,6 +617,45 @@ export function describeStepNonCompletion(status: string, error?: string): strin
   }
 }
 
+const WORKFLOW_STEP_RESULT_CHANNEL_UNAVAILABLE_PATTERN =
+  /\b(?:workflow_step_result[\s\S]{0,180}(?:not\s+(?:available|exposed|accessible|callable)|unavailable|missing|cannot|can't|could\s+not|couldn't|unable|no\s+(?:live\s+)?tool|without\s+(?:live\s+)?tool)|(?:cannot|can't|could\s+not|couldn't|unable\s+to|not\s+able\s+to)[\s\S]{0,180}(?:workflow_step_result|step\s+result\s+tool|result\s+tool))\b/i;
+
+const WORKFLOW_INTERRUPTED_TOOL_STATE_PATTERN =
+  /\b(?:interrupted\s+tool\s+state|from\s+that\s+interrupted\s+tool\s+state|(?:rerun|re-run)\s+the\s+(?:workflow\s+)?step)\b/i;
+
+/**
+ * A workflow-step agent is not done when it writes prose explaining that tools
+ * or the workflow_step_result result channel are unavailable. That is a
+ * structural harness failure, not step data; the step boundary should retry or
+ * fall over to another brain instead of feeding the prose into output contracts.
+ */
+export function looksLikeWorkflowStepStructuralResultMiss(output: unknown): boolean {
+  if (typeof output !== 'string') return false;
+  const text = output.replace(/\s+/g, ' ').trim();
+  if (!text) return false;
+  return looksLikeToolUnavailableSelfReport(text)
+    || WORKFLOW_STEP_RESULT_CHANNEL_UNAVAILABLE_PATTERN.test(text)
+    || WORKFLOW_INTERRUPTED_TOOL_STATE_PATTERN.test(text);
+}
+
+export class WorkflowStepStructuralResultError extends Error {
+  constructor(
+    public readonly stepId: string,
+    public readonly rawOutput: string,
+  ) {
+    const clipped = rawOutput.replace(/\s+/g, ' ').trim().slice(0, 280);
+    super(
+      `workflow step "${stepId}" completed without workflow_step_result and self-reported a missing tool/result channel: ${clipped}`,
+    );
+    this.name = 'WorkflowStepStructuralResultError';
+  }
+}
+
+export function isWorkflowStepStructuralResultError(err: unknown): err is WorkflowStepStructuralResultError {
+  return err instanceof WorkflowStepStructuralResultError
+    || Boolean(err && typeof err === 'object' && (err as { name?: unknown }).name === 'WorkflowStepStructuralResultError');
+}
+
 /**
  * Cheap template renderer. Supports:
  *   {{date}}                  → today (UTC date)
@@ -712,6 +762,25 @@ export function applyGoalFeedbackToPrompt(
     'The previous run of this workflow completed but FAILED external goal validation:',
     feedback,
     'Address these gaps in this attempt — do not repeat the prior output unchanged.',
+  ].join('\n');
+}
+
+/** Mid-run WATCHER steer (watcher-judge.ts): a trajectory check at the last
+ *  step boundary found the run confidently drifting from its goal — surface
+ *  the one-sentence correction to the NEXT step. Advisory: the step decides
+ *  how it applies; absent steer → prompt byte-identical. Exported for tests. */
+export function applyWatcherSteerToPrompt(
+  ctx: Pick<StepExecutionContext, 'watcherSteer'>,
+  rendered: string,
+): string {
+  const steer = ctx.watcherSteer?.trim();
+  if (!steer) return rendered;
+  return [
+    rendered,
+    '',
+    '=== TRAJECTORY CHECK (an independent watcher compared the run so far against its goal) ===',
+    steer,
+    'Address this in this step if it applies to your work — the goal and step instructions above remain authoritative.',
   ].join('\n');
 }
 
@@ -1115,6 +1184,19 @@ interface StepExecutionContext {
   // still mark the terminal run `needsAttention` so they cannot be counted as
   // clean success in the ledger.
   qualityAdvisories: WorkflowQualityAdvisory[];
+  // DEFERRED advisory judges: detection-only per-item/per-step judge calls
+  // (skill-execution, SDK-lane output grounding) are pushed here instead of
+  // being awaited inline — an advisory that can't change the step's output
+  // must not add judge latency (5–25s/call) to every fan-out item's critical
+  // path. executeWorkflow awaits allSettled(pendingAdvisories) ONCE before
+  // returning, so every advisory still lands before qualityAdvisories is read.
+  // Absent (older ctx creations) ⇒ the call sites await inline as before.
+  pendingAdvisories?: Array<Promise<void>>;
+  // Mid-run WATCHER steer for THIS batch's steps: a step-boundary trajectory
+  // check found the run drifting from its goal — the one-sentence correction
+  // is appended to the batch's step prompts (applyWatcherSteerToPrompt) and
+  // cleared for the next round. Advisory only; absent → prompts unchanged.
+  watcherSteer?: string;
   // Creation-time test mode: read-only steps run for real but a forEach fans
   // out over only the FIRST item (bounded cost — we just need to confirm the
   // step returns data, not process the whole batch). No-op for normal runs.
@@ -1522,6 +1604,8 @@ export const workflowRunnerInternalsForTest = {
   getWorkflowHarnessSession,
   awaitDeclarativeStepApproval,
   bindStepContext,
+  buildGoalEvidenceText,
+  formatStepOutputs,
   renderStepContextBlock,
   renderWorkflowOriginLineageBlock,
   hasCompletedUpstreamMutation: (steps: WorkflowStepInput[], blockedStepId: string, completedStepIds: Set<string>) =>
@@ -1593,7 +1677,7 @@ async function runStepViaHarness(
     // authoritative data the step can use even if a template token typo
     // dropped a value from the prose — it cannot be falsely starved.
     const message = useWorkflowStepAgent() && stepContext
-      ? `${proseMessage}\n\n${renderStepContextBlock(stepContext)}`
+      ? `${proseMessage}\n\n${renderStepContextBlock(stepContext, { workflowName, runId: workflowRunId })}`
       : proseMessage;
     // Flag-gated (WORKFLOW_STEP_AGENT): the constrained step agent emits
     // structured output via workflow_step_result and CANNOT re-trigger
@@ -1859,6 +1943,9 @@ async function runStepViaHarness(
       throw new Error(
         `workflow step "${step.id}" did not complete (status: ${result.status}): ${describeStepNonCompletion(result.status, result.error)}`,
       );
+    }
+    if (looksLikeWorkflowStepStructuralResultMiss(prose)) {
+      throw new WorkflowStepStructuralResultError(step.id, prose);
     }
     return { output: guardPhantom(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
   } finally {
@@ -2342,7 +2429,7 @@ async function executeStepVerified(
       // contract, 4xx) repeats identically on any model — fail fast, don't burn the
       // whole chain. Parse-failure used to fall over NOWHERE — the workflow lane
       // died on it (2026-06-29 gap analysis).
-      if (!isTransientStepError(err) && !isUnparseableToolCallError(err)) throw err;
+      if (!isTransientStepError(err) && !isUnparseableToolCallError(err) && !isWorkflowStepStructuralResultError(err)) throw err;
       lastErr = err;
     }
   }
@@ -2380,7 +2467,7 @@ async function runStepVerifiedAttempt(
       isRetryable: (err) =>
         !(err instanceof ParkRunSignal) &&
         !(err instanceof WorkflowRunCancelledError) &&
-        isTransientStepError(err) &&
+        (isTransientStepError(err) || isWorkflowStepStructuralResultError(err)) &&
         // Bug #8: never transient-retry a step whose send already fired — a retry
         // re-prompts the session from turn 0 and re-issues the send. Surface the
         // error instead (mirrors the forEach itemSendAlreadyFired guard). #2.2
@@ -2390,11 +2477,11 @@ async function runStepVerifiedAttempt(
           kind: 'step_retry',
           stepId: step.id,
           error: err instanceof Error ? err.message : String(err),
-          meta: { attempt, budget: b, delayMs, reason: 'transient' },
+          meta: { attempt, budget: b, delayMs, reason: isWorkflowStepStructuralResultError(err) ? 'structural_result' : 'transient' },
         });
         logger.warn(
           { stepId: step.id, attempt, budget: b, delayMs, err: err instanceof Error ? err.message : String(err) },
-          'workflow step failed transiently — retrying after backoff',
+          'workflow step failed with a retryable step-boundary error — retrying after backoff',
         );
       },
       afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
@@ -3115,7 +3202,7 @@ export async function executeStep(
               ctx,
               applyWorkflowPatternHint(
                 ctx,
-                applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent))),
+                applyWatcherSteerToPrompt(ctx, applyGoalFeedbackToPrompt(ctx, applyContractToPrompt(step, applySkillToPrompt(step, itemIntent)))),
               ),
             );
             let output: unknown;
@@ -3177,7 +3264,7 @@ export async function executeStep(
               isRetryable: (err) =>
                 !(err instanceof ParkRunSignal)
                 && !(err instanceof WorkflowRunCancelledError)
-                && isTransientStepError(err)
+                && (isTransientStepError(err) || isWorkflowStepStructuralResultError(err))
                 // double-act guard: never re-run an item that already wrote externally.
                 && !itemSendAlreadyFired(ctx.runId, step.id, key),
               onRetry: ({ attempt, budget, delayMs, err }) => {
@@ -3186,7 +3273,7 @@ export async function executeStep(
                   stepId: step.id,
                   itemKey: key,
                   error: err instanceof Error ? err.message : String(err),
-                  meta: { attempt, budget, delayMs, reason: 'transient' },
+                  meta: { attempt, budget, delayMs, reason: isWorkflowStepStructuralResultError(err) ? 'structural_result' : 'transient' },
                 });
               },
               afterBackoff: () => throwIfWorkflowRunCancelled(ctx.runId),
@@ -3198,11 +3285,13 @@ export async function executeStep(
             // on a judge verdict (a confident-but-wrong judge can't drop a good
             // item). The terminal run may still be marked needsAttention so the
             // advisory is not counted as clean success. Fail-open; no-op for items
-            // without usesSkill.
-            await noteStepSkillAdvisory(step, itemSessionId, output, itemIntent, ctx, key);
+            // without usesSkill. DEFERRED (ctx.pendingAdvisories): a verdict that
+            // can't change this item's output must not add judge latency to the
+            // item's critical path — the run joins all advisories once at the end.
+            await deferAdvisory(ctx, noteStepSkillAdvisory(step, itemSessionId, output, itemIntent, ctx, key));
             // Move 3: the Claude SDK lane's pure-text output skips runConversation's
             // content grounding — verify its figures per item (detection-only).
-            if (itemLane === 'claude_sdk') await noteStepOutputGroundingAdvisory(step, itemSessionId, output, ctx, key);
+            if (itemLane === 'claude_sdk') await deferAdvisory(ctx, noteStepOutputGroundingAdvisory(step, itemSessionId, output, ctx, key));
             appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
               kind: 'item_completed',
               stepId: step.id,
@@ -3300,9 +3389,12 @@ export async function executeStep(
     kind: 'step_started',
     stepId: step.id,
   });
-  const prompt = applyGoalFeedbackToPrompt(
+  const prompt = applyWatcherSteerToPrompt(
     ctx,
-    applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, undefined, resolveWorkflowStepProjectContext(step, ctx.workflow)))),
+    applyGoalFeedbackToPrompt(
+      ctx,
+      applyContractToPrompt(step, applySkillToPrompt(step, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, undefined, resolveWorkflowStepProjectContext(step, ctx.workflow)))),
+    ),
   );
   const promptedWithPatterns = applyWorkflowOriginLineage(ctx, applyWorkflowPatternHint(ctx, prompt));
   let output: unknown;
@@ -3363,7 +3455,7 @@ export async function executeStep(
   // quality advisory that rides along with the delivered output. It never
   // fails the step or hides the deliverable; terminal accounting may still mark
   // the run needsAttention so the miss is not treated as clean success.
-  await noteStepSkillAdvisory(step, stepSessionId, output, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, undefined, resolveWorkflowStepProjectContext(step, ctx.workflow)), ctx);
+  await deferAdvisory(ctx, noteStepSkillAdvisory(step, stepSessionId, output, renderTemplate(step.prompt, ctx.inputs, ctx.stepOutputs, undefined, resolveWorkflowStepProjectContext(step, ctx.workflow)), ctx));
 
   // DETERMINISTIC skill-execution FLOOR (hard). The advisory above is detection-
   // only; this HARD-fails a `usesSkill` step whose skill ships a RENDERER that
@@ -3402,6 +3494,51 @@ export async function executeStep(
  * `usesSkill`, and wholly fail-open (any error is swallowed). `itemKey` set for
  * forEach items.
  */
+/** Test seam for the workflow watcher (same pattern as _setBatchSleepForTests):
+ *  replaces the trajectory-check call so tests exercise steer injection and
+ *  silence deterministically without a live judge. */
+let workflowWatcherOverride: WatcherJudgeFn | null = null;
+export function _setWorkflowWatcherForTests(fn: WatcherJudgeFn | null): void {
+  workflowWatcherOverride = fn;
+}
+
+/** Compact trajectory digest for the workflow watcher: completed step outputs
+ *  (clipped) + which steps REMAIN — the remaining list is load-bearing, it is
+ *  what lets the watcher treat mid-run incompleteness as expected, not drift. */
+export function renderWatcherWorkflowDigest(
+  steps: Array<{ id?: string }>,
+  stepOutputs: Record<string, unknown>,
+): { summary: string; latest: string } {
+  const clip = (v: unknown): string => {
+    const s = typeof v === 'string' ? v : JSON.stringify(v ?? '');
+    return (s ?? '').replace(/\s+/g, ' ').slice(0, 220);
+  };
+  const completed = steps.filter((s) => s.id && stepOutputs[s.id] !== undefined);
+  const remaining = steps.filter((s) => s.id && stepOutputs[s.id] === undefined).map((s) => s.id);
+  const lines = completed.map((s) => `step "${s.id}": ${clip(stepOutputs[s.id as string])}`);
+  const summary = [
+    `${completed.length} of ${steps.length} steps completed.`,
+    ...lines,
+    remaining.length ? `Steps still to run (NOT drift — they have not executed yet): ${remaining.join(', ')}` : 'All steps completed.',
+  ].join('\n');
+  const last = completed[completed.length - 1];
+  const latest = last?.id ? `completed step "${last.id}": ${clip(stepOutputs[last.id])}` : '(no steps completed yet)';
+  return { summary, latest };
+}
+
+/** Defer a detection-only advisory judge off the step/item critical path.
+ *  With ctx.pendingAdvisories present the promise is parked (joined once by
+ *  executeWorkflow before advisories are read); without it, awaited inline —
+ *  byte-identical to the old behavior for ctx creations that don't opt in. */
+async function deferAdvisory(ctx: StepExecutionContext, work: Promise<void>): Promise<void> {
+  const safe = work.catch(() => { /* advisories are best-effort by contract */ });
+  if (ctx.pendingAdvisories) {
+    ctx.pendingAdvisories.push(safe);
+    return;
+  }
+  await safe;
+}
+
 async function noteStepSkillAdvisory(
   step: WorkflowStepInput,
   sessionId: string,
@@ -3549,12 +3686,60 @@ export function decideBatchSettlement(
   return { completions, parkedSteps, failures, action };
 }
 
-function formatStepOutputs(steps: WorkflowStepInput[], stepOutputs: Record<string, unknown>): string {
+function stringifyForPrompt(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function stepOutputArtifactRefForPrompt(
+  stepId: string,
+  value: unknown,
+  opts?: StepContextRenderOptions,
+): unknown | null {
+  if (!opts || !runWorkspaceOffloadEnabled() || serializedContextLength(value) <= STEP_CONTEXT_VALUE_CLIP) {
+    return null;
+  }
+
+  const workspacePath = stepOutputArtifactRelPath(stepId);
+  const absolutePath = path.join(runWorkspaceDir(opts.workflowName, opts.runId), workspacePath);
+  if (existsSync(absolutePath)) {
+    return {
+      __clementine_context_ref: true,
+      present: true,
+      summary: summarizeToolOutput(value),
+      bytes: Buffer.byteLength(stringifyForPrompt(value), 'utf-8'),
+      path: absolutePath,
+      workspacePath,
+      instruction:
+        'This completed step output is present but too large to inline. Call workspace_artifact_query on this path for exact rows/fields/pages, or read_file for raw JSON.',
+    };
+  }
+
+  return contextValueForPrompt(value, `step.${stepId}.output`, opts);
+}
+
+function stepOutputValueForPrompt(
+  stepId: string,
+  value: unknown,
+  opts?: StepContextRenderOptions,
+): unknown {
+  return stepOutputArtifactRefForPrompt(stepId, value, opts) ?? clipForContext(value);
+}
+
+function formatStepOutputs(
+  steps: WorkflowStepInput[],
+  stepOutputs: Record<string, unknown>,
+  opts?: StepContextRenderOptions,
+): string {
   return steps
     .filter((step) => stepOutputs[step.id] !== undefined)
     .map((step) => {
-      const out = stepOutputs[step.id];
-      return `## ${step.id}\n${typeof out === 'string' ? out : JSON.stringify(out, null, 2)}`;
+      const out = stepOutputValueForPrompt(step.id, stepOutputs[step.id], opts);
+      return `## ${step.id}\n${stringifyForPrompt(out)}`;
     })
     .join('\n\n');
 }
@@ -4004,6 +4189,21 @@ async function executeWorkflow(
   const stepOutputs: Record<string, unknown> = Object.fromEntries(resume.completedSteps);
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
+  // Detection-only advisory judges run OFF the step/item critical path and are
+  // joined once before this function returns (see deferAdvisory).
+  const pendingAdvisories: Array<Promise<void>> = [];
+
+  // WATCHER (workflow mount) state — see the step-boundary check below.
+  // Disabled for partial single-step TRY runs (no full trajectory to judge).
+  const watcherEnabled = watcherJudgeEnabled() && !targetStepId;
+  const WATCHER_STEP_INTERVAL = watcherWorkflowIntervalSteps();
+  const workflowWatcherFn = workflowWatcherOverride ?? runWatcherJudge;
+  const watcherObjective = buildWorkflowObjective(workflow, inputs);
+  const watcherCriteria = workflow.goal?.successCriteria?.length ? workflow.goal.successCriteria : undefined;
+  let watcherLastCheckedAtSteps = 0;
+  let watcherInjections = 0;
+  let watcherChecks = 0;
+  let watcherSteer: string | undefined;
 
   // Anchor the shared run workspace on this run's goal — the objective + learned
   // success criteria every step/agent references, and the file the checker agent
@@ -4109,7 +4309,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint, originSessionId,
+        workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -4134,10 +4334,13 @@ async function executeWorkflow(
         throwIfWorkflowRunCancelled(runId);
         const completedItems = resume.completedItems.get(step.id) ?? new Map();
         const output = await executeStepVerified(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, goalFeedback, learnedPatternHint, originSessionId,
+          workflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId,
+          ...(watcherSteer ? { watcherSteer } : {}),
         });
         return { step, output };
       }));
+      // A steer applies to exactly ONE batch — consumed above, cleared here.
+      watcherSteer = undefined;
 
       const decision = decideBatchSettlement(batch, settled);
       for (const done of decision.completions) {
@@ -4165,6 +4368,43 @@ async function executeWorkflow(
         throw new Error(messages.length === 1 ? messages[0] : `Workflow batch failed: ${messages.join('; ')}`);
       }
       completedStepIds = new Set(Object.keys(stepOutputs));
+
+      // WATCHER (workflow mount): at a step boundary with steps still ahead,
+      // one trajectory check judges the run so far against the workflow's goal
+      // (watcher-judge.ts — the same core as the chat mount). BLOCKING here on
+      // purpose, unlike chat: steps run for minutes, so a ~10s check between
+      // steps is negligible while letting the steer land on the VERY NEXT
+      // step's prompt instead of one step late. Fail-open + silent when
+      // on-track/unsure; ≤ MAX_WATCHER_INJECTIONS steers per run.
+      if (
+        watcherEnabled
+        && completedStepIds.size < steps.length
+        && watcherInjections < MAX_WATCHER_INJECTIONS
+        && watcherChecks < MAX_WATCHER_CHECKS
+        && completedStepIds.size - watcherLastCheckedAtSteps >= WATCHER_STEP_INTERVAL
+      ) {
+        watcherChecks += 1;
+        watcherLastCheckedAtSteps = completedStepIds.size;
+        try {
+          const digest = renderWatcherWorkflowDigest(steps, stepOutputs);
+          const verdict = await workflowWatcherFn({
+            objective: watcherObjective,
+            ...(watcherCriteria ? { successCriteria: watcherCriteria } : {}),
+            toolCallSummary: digest.summary,
+            latestAssistantNote: digest.latest,
+            toolCallCount: completedStepIds.size,
+          });
+          if (verdict && !verdict.onTrack) {
+            watcherInjections += 1;
+            watcherSteer = `${verdict.miss}. ${verdict.steer}`;
+            appendWorkflowEvent(workflowSlug, runId, {
+              kind: 'step_advisory',
+              stepId: '(watcher)',
+              meta: { reason: 'watcher_steer', miss: verdict.miss, steer: verdict.steer, injection: watcherInjections, afterSteps: completedStepIds.size },
+            });
+          }
+        } catch { /* the watcher is silent on any failure */ }
+      }
     }
   }
   // Clear the step tracker before the synthesis pass + final cleanup
@@ -4183,7 +4423,7 @@ async function executeWorkflow(
       kind: 'step_started',
       stepId: '__synthesis__',
     });
-    const stepOutputsAsText = formatStepOutputs(workflow.steps, stepOutputs);
+    const stepOutputsAsText = formatStepOutputs(workflow.steps, stepOutputs, { workflowName: workflowSlug, runId });
     const synthesisPrompt = renderTemplate(workflow.synthesis.prompt, inputs, stepOutputs, undefined, resolveWorkflowStepProjectContext({}, workflow));
     const synthesisStep: WorkflowStepInput = {
       id: '__synthesis__',
@@ -4232,13 +4472,13 @@ async function executeWorkflow(
           isRetryable: (err) =>
             !(err instanceof ParkRunSignal) &&
             !(err instanceof WorkflowRunCancelledError) &&
-            isTransientStepError(err),
+            (isTransientStepError(err) || isWorkflowStepStructuralResultError(err)),
           onRetry: ({ attempt, budget: b, delayMs, err }) => {
             appendWorkflowEvent(workflowSlug, runId, {
               kind: 'step_retry',
               stepId: '__synthesis__',
               error: err instanceof Error ? err.message : String(err),
-              meta: { attempt, budget: b, delayMs, reason: 'transient' },
+              meta: { attempt, budget: b, delayMs, reason: isWorkflowStepStructuralResultError(err) ? 'structural_result' : 'transient' },
             });
           },
           afterBackoff: () => throwIfWorkflowRunCancelled(runId),
@@ -4252,7 +4492,7 @@ async function executeWorkflow(
       let lastErr: unknown = err;
       // Step-boundary brain fallover, mirroring executeStepVerified. Synthesis
       // is read-only, so there is no external-write guard to respect.
-      if (workflowBrainFalloverEnabled() && (isTransientStepError(err) || isUnparseableToolCallError(err))) {
+      if (workflowBrainFalloverEnabled() && (isTransientStepError(err) || isUnparseableToolCallError(err) || isWorkflowStepStructuralResultError(err))) {
         const currentProvider = resolveProvider(synthesisStep.model ?? MODELS.primary) as BrainProviderClass;
         for (const target of falloverBrainModelIds(currentProvider)) {
           appendWorkflowEvent(workflowSlug, runId, {
@@ -4295,12 +4535,18 @@ async function executeWorkflow(
       : synthesisOutput != null
         ? JSON.stringify(synthesisOutput, null, 2)
         : '';
-    finalOutput = synthesisText || formatStepOutputs(workflow.steps, stepOutputs);
+    finalOutput = synthesisText || formatStepOutputs(workflow.steps, stepOutputs, { workflowName: workflowSlug, runId });
     throwIfWorkflowRunCancelled(runId);
     finalizeStepOutput(workflowSlug, runId, synthesisStep, finalOutput);
   } else {
-    finalOutput = formatStepOutputs(workflow.steps, stepOutputs);
+    finalOutput = formatStepOutputs(workflow.steps, stepOutputs, { workflowName: workflowSlug, runId });
   }
+
+  // Join the deferred detection-only advisory judges (skill-execution,
+  // SDK-lane grounding) so every advisory lands in qualityAdvisories before
+  // callers read it. They ran concurrently with the steps that spawned them —
+  // by now most have already settled, so this await is usually instant.
+  if (pendingAdvisories.length > 0) await Promise.allSettled(pendingAdvisories);
 
   // Record string-coerced step outputs on the run record for the
   // dashboard's recent-runs display (which expects strings).
@@ -4425,6 +4671,21 @@ function useWorkflowStepAgent(): boolean {
 // needs a precise large subfield, declare an explicit `inputs.from` binding
 // or split the upstream step output into smaller structured values.
 const STEP_CONTEXT_VALUE_CLIP = 8000;
+
+interface StepContextRenderOptions {
+  workflowName: string;
+  runId: string;
+  nowIso?: string;
+}
+
+function serializedContextLength(value: unknown): number {
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return 0;
+  }
+}
+
 function clipForContext(value: unknown): unknown {
   let json: string;
   try { json = JSON.stringify(value); } catch { return '[unserializable]'; }
@@ -4437,16 +4698,52 @@ function clipForContext(value: unknown): unknown {
   const head = 6000, tail = 1500;
   return `[clipped to a head+tail preview of ${json.length} chars — declare an explicit inputs.from binding for the precise full value]\n${json.slice(0, head)}\n…[${json.length - head - tail} chars omitted from the middle]…\n${json.slice(json.length - tail)}`;
 }
-function renderStepContextBlock(ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown; project?: WorkflowStepProjectContext }): string {
+
+function contextValueForPrompt(
+  value: unknown,
+  key: string,
+  opts?: StepContextRenderOptions,
+): unknown {
+  if (!opts || !runWorkspaceOffloadEnabled() || serializedContextLength(value) <= STEP_CONTEXT_VALUE_CLIP) {
+    return clipForContext(value);
+  }
+  try {
+    const offloaded = offloadContextValue({
+      workflowName: opts.workflowName,
+      runId: opts.runId,
+      key,
+      value,
+      nowIso: opts.nowIso ?? new Date().toISOString(),
+    });
+    const absolutePath = path.join(runWorkspaceDir(opts.workflowName, opts.runId), offloaded.path);
+    return {
+      __clementine_context_ref: true,
+      present: true,
+      summary: offloaded.summary,
+      bytes: offloaded.bytes,
+      path: absolutePath,
+      workspacePath: offloaded.path,
+      instruction:
+        'This value is present but too large to inline. Prefer workspace_artifact_query on this path to pull exact rows/fields/pages. Use read_file with max_chars 50000 only when you need raw JSON text.',
+    };
+  } catch {
+    return clipForContext(value);
+  }
+}
+
+function renderStepContextBlock(
+  ctx: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown; project?: WorkflowStepProjectContext },
+  opts?: StepContextRenderOptions,
+): string {
   const payload: Record<string, unknown> = {
-    input: Object.fromEntries(Object.entries(ctx.values).map(([k, v]) => [k, clipForContext(v)])),
-    upstream: Object.fromEntries(Object.entries(ctx.upstream).map(([k, v]) => [k, clipForContext(v)])),
+    input: Object.fromEntries(Object.entries(ctx.values).map(([k, v]) => [k, contextValueForPrompt(v, `input.${k}`, opts)])),
+    upstream: Object.fromEntries(Object.entries(ctx.upstream).map(([k, v]) => [k, contextValueForPrompt(v, `upstream.${k}`, opts)])),
   };
   if (ctx.project !== undefined) payload.project = ctx.project;
-  if (ctx.item !== undefined) payload.item = clipForContext(ctx.item);
+  if (ctx.item !== undefined) payload.item = contextValueForPrompt(ctx.item, 'item', opts);
   return [
     '=== STEP CONTEXT (structured, authoritative) ===',
-    'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step; `project` is the required local workspace when present. Use it over prose. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
+    'This is real workflow data. `input` contains declared step inputs; `upstream` contains outputs from every completed dependsOn step; `project` is the required local workspace when present. Use it over prose. If a value is a __clementine_context_ref, it is present and offloaded; call workspace_artifact_query on its path for exact rows/fields/pages, or read_file for raw JSON. If a value you need is empty/absent here, call workflow_step_result({"blocked":true,"reason":"<what is missing>"}) instead of guessing or fabricating.',
     JSON.stringify(payload, null, 2),
     '=== END STEP CONTEXT ===',
   ].join('\n');
@@ -4913,10 +5210,38 @@ function finishWorkflowActivityRun(
 
 /** Evidence the validator judges: the final deliverable + a truncated
  *  per-step ledger (so a criterion about an intermediate step is checkable). */
-function buildGoalEvidenceText(finalOutput: string, stepOutputs: Record<string, unknown>): string {
+function compactEvidencePreview(value: unknown, maxChars: number): string {
+  const text = stringifyForPrompt(value).replace(/\s+/g, ' ').trim();
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars)}…`;
+}
+
+function formatStepOutputEvidence(
+  stepId: string,
+  output: unknown,
+  opts?: StepContextRenderOptions,
+): string {
+  const preview = compactEvidencePreview(output, 700);
+  const ref = stepOutputArtifactRefForPrompt(stepId, output, opts);
+  if (ref && typeof ref === 'object') {
+    const rec = ref as { path?: unknown; workspacePath?: unknown; summary?: unknown; bytes?: unknown };
+    return [
+      `${summarizeToolOutput(output)}.`,
+      `Artifact: ${String(rec.path ?? rec.workspacePath ?? '(unavailable)')}.`,
+      `Query with workspace_artifact_query for exact rows/fields/pages.`,
+      `Preview: ${preview}`,
+    ].join(' ');
+  }
+  return preview;
+}
+
+function buildGoalEvidenceText(
+  finalOutput: string,
+  stepOutputs: Record<string, unknown>,
+  opts?: StepContextRenderOptions,
+): string {
   const stepLines = Object.entries(stepOutputs)
     .slice(0, 20)
-    .map(([id, out]) => `- ${id}: ${String(out).slice(0, 400)}`);
+    .map(([id, out]) => `- ${id}: ${formatStepOutputEvidence(id, out, opts)}`);
   return [
     'FINAL OUTPUT:',
     (finalOutput || '(empty)').slice(0, 6000),
@@ -5453,6 +5778,14 @@ async function processOneRunFile(
             isPartialRun: Boolean(run.targetStepId),
           });
         } catch { /* fail-open: a target-judge error never affects a completed run */ }
+        // Verdict door (T3-B4): one canonical audit row per judge decision —
+        // recorded only when the judge actually evaluated (skips are not verdicts).
+        if (targetVerdict?.judged) {
+          appendWorkflowEvent(workflow.name, run.id, {
+            kind: 'verdict_recorded',
+            meta: { door: 'workflow_target', pass: targetVerdict.reached, reason: targetVerdict.gap.slice(0, 400) },
+          });
+        }
         if (targetVerdict && targetVerdict.judged && !targetVerdict.reached) {
           qualityAdvisories.push({
             stepId: '(workflow target)',
@@ -5487,7 +5820,19 @@ async function processOneRunFile(
         goalVerdict = await validateGoal({
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
-          evidenceText: buildGoalEvidenceText(finalOutput, stepOutputs),
+          evidenceText: buildGoalEvidenceText(finalOutput, rawStepOutputs, { workflowName: workflow.name, runId: run.id }),
+        });
+        // Verdict door (T3-B4): one canonical audit row per judge decision.
+        appendWorkflowEvent(workflow.name, run.id, {
+          kind: 'verdict_recorded',
+          meta: {
+            door: 'goal_validation',
+            pass: goalVerdict.pass,
+            reason: (goalVerdict.advice ?? (goalVerdict.pass ? 'all criteria met' : '')).slice(0, 400),
+            failedOpen: goalVerdict.judgeFailedOpen ?? false,
+            criteriaMet: goalVerdict.criteriaMet ?? null,
+            criteriaTotal: goalVerdict.criteriaTotal ?? null,
+          },
         });
         goalFeedbackNext = renderGoalFeedback(goalVerdict);
         // Auto-checker: reuse the verdict just computed (no second judge call)

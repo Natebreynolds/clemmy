@@ -71,6 +71,10 @@ test('hasDurableExecutionIntent fires on explicit durable intent and broad data 
   assert.equal(hasDurableExecutionIntent('end to end encryption — how does it work?'), false); // no build verb
   assert.equal(hasDurableExecutionIntent('research Salesforce and Airtable integration options'), false);
   assert.equal(hasDurableExecutionIntent('pull 5 salesforce accounts for me please just as a test'), false);
+  assert.equal(
+    hasDurableExecutionIntent('Reply exactly HOTPATCH_SMOKE_OK. Do not call tools, send messages, modify files, or start background tasks.'),
+    false,
+  );
 });
 
 test('shouldPromoteToDurable requires intent AND a non-empty instruction', () => {
@@ -88,6 +92,10 @@ test('shouldPromoteToDurable requires intent AND a non-empty instruction', () =>
   assert.equal(shouldPromoteToDurable('bg:'), false);
   assert.equal(shouldPromoteToDurable('  /bg   '), false);
   assert.equal(shouldPromoteToDurable('move this to the background'), false);
+  assert.equal(
+    shouldPromoteToDurable('Reply exactly HOTPATCH_SMOKE_OK. Do not call tools, send messages, modify files, or start background tasks.'),
+    false,
+  );
   // No intent → never promote.
   assert.equal(shouldPromoteToDurable('build me a site'), false);
 });

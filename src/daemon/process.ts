@@ -86,18 +86,28 @@ export function getDaemonStatus(): { running: boolean; pid: number | null; logFi
 // an uncaughtException and took EVERY channel down mid-conversation. A transport
 // error on one reconnecting socket is never worth the whole daemon: the
 // socket-mode client has its own reconnect loop and every other subsystem is
-// healthy. Swallow exactly that class (log + let the socket self-heal); any
-// OTHER uncaught error still exits (state may be corrupt) — but now with a
-// structured log line first, and the supervisor restarts us cleanly.
+// healthy. Same for a leaked broken-pipe/reset event: the live v1.3.1 daemon
+// printed "Unhandled 'error' event ... write EPIPE" during startup and got
+// killed out from under an otherwise recoverable boot. Swallow exactly these
+// transport classes (log + let the owner reconnect/close); any OTHER uncaught
+// error still exits (state may be corrupt) — but now with a structured log line
+// first, and the supervisor restarts us cleanly.
 let crashGuardsRegistered = false;
 
-/** A transport error escaping the `ws` library's own event handling. These
- *  sockets (Slack socket-mode, Discord gateway) all have reconnect machinery —
- *  the escaped 'error' event is a plumbing leak, not a daemon-fatal state. */
+/** A transport error escaping a socket/pipe owner's own event handling. These
+ *  sockets (Slack socket-mode, Discord gateway, stdio/MCP streams) all have an
+ *  owning component that can reconnect, close, or retry. The escaped 'error'
+ *  event is a plumbing leak, not a daemon-fatal state. */
 export function isSurvivableSocketError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   const stack = err instanceof Error ? (err.stack ?? '') : '';
-  return /opening handshake has timed out|websocket was closed before the connection was established/i.test(msg)
+  const code = err && typeof err === 'object' && 'code' in err
+    ? String((err as { code?: unknown }).code ?? '')
+    : '';
+  return code === 'EPIPE'
+    || code === 'ECONNRESET'
+    || /\b(?:EPIPE|ECONNRESET)\b/i.test(msg)
+    || /opening handshake has timed out|websocket was closed before the connection was established/i.test(msg)
     || /node_modules[\\/]+ws[\\/]+lib[\\/]+websocket\.js/.test(stack);
 }
 

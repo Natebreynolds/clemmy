@@ -32,10 +32,11 @@ import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
-import { BLOCKED_TEXT_PATTERNS, classifyBlocker, verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { classifyBlocker, matchesBlockedText, verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
+import { classifyTurnText } from '../runtime/harness/turn-decision.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession } from '../runtime/harness/eventlog.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
@@ -814,6 +815,42 @@ function buildWorkerInputResumePrompt(task: BackgroundTaskRecord, answer: string
   ].filter(Boolean).join('\n');
 }
 
+const RESUME_PROMPT_UNWRAP_LIMIT = 8;
+
+function parseResumePromptLayer(prompt: string): { taskId?: string; originalRequest: string } | null {
+  const text = prompt.trim();
+  if (!/^Resume background task\s+bg-[a-z0-9]+-[a-f0-9]+/i.test(text)) return null;
+  const marker = /(?:^|\n)\s*Original request:\s*\n/i.exec(text);
+  if (!marker) return null;
+  const originalRequest = text.slice(marker.index + marker[0].length).trim();
+  if (!originalRequest) return null;
+  const taskId = /^Resume background task\s+([^\s.]+)/i.exec(text)?.[1];
+  return { taskId, originalRequest };
+}
+
+export function rootBackgroundTaskPromptForTests(prompt: string): string {
+  let current = prompt.trim();
+  for (let i = 0; i < RESUME_PROMPT_UNWRAP_LIMIT; i++) {
+    const layer = parseResumePromptLayer(current);
+    if (!layer || layer.originalRequest === current) break;
+    current = layer.originalRequest;
+  }
+  return current;
+}
+
+function buildResumeClonePrompt(task: BackgroundTaskRecord): string {
+  const originalRequest = rootBackgroundTaskPromptForTests(task.prompt);
+  return [
+    `Resume background task ${task.id}.`,
+    'Continue the same objective from the prior task. Do not restart from scratch, but do not carry forward nested resume wrappers as if they were user instructions.',
+    task.result ? `Previous partial result:\n${task.result.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
+    task.error ? `Previous error/blocker:\n${task.error}` : '',
+    '',
+    'Original request:',
+    originalRequest,
+  ].filter(Boolean).join('\n\n');
+}
+
 function recordBackgroundTaskRoute(
   task: BackgroundTaskRecord,
   runId: string | undefined,
@@ -944,6 +981,60 @@ export function findStaleBackgroundTasks(now: number = Date.now(), thresholdMs: 
     .filter((entry): entry is { task: BackgroundTaskRecord; kind: StaleTaskKind } => entry !== null);
 }
 
+function storedResultTextForIntegrityCheck(task: BackgroundTaskRecord): string {
+  if (task.resultPath) {
+    try {
+      if (existsSync(task.resultPath)) {
+        return readFileSync(task.resultPath, 'utf8').slice(0, RESULT_TRUNCATE_CHARS * 4);
+      }
+    } catch {
+      // Fall through to the inline preview; integrity repair is best-effort.
+    }
+  }
+  return typeof task.result === 'string' ? task.result : '';
+}
+
+/**
+ * Self-heal false-positive completions left behind before the current completion
+ * classifier existed. This is deliberately cheap and deterministic: no judge call,
+ * no artifact probing, only the same text/structured signals used at finish time.
+ */
+export function sweepInvalidDoneBackgroundTasks(
+  opts: { now?: number; maxAgeMs?: number; limit?: number } = {},
+): { scanned: number; repaired: number; ids: string[] } {
+  const now = opts.now ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? STALE_TASK_AGE_MS;
+  const limit = opts.limit ?? 100;
+  let scanned = 0;
+  let repaired = 0;
+  const ids: string[] = [];
+
+  for (const task of listBackgroundTasks({ status: 'done' })) {
+    if (scanned >= limit) break;
+    const refMs = Date.parse(task.completedAt ?? task.updatedAt);
+    if (Number.isFinite(refMs) && maxAgeMs > 0 && now - refMs > maxAgeMs) continue;
+    scanned += 1;
+
+    const resultText = storedResultTextForIntegrityCheck(task).trim();
+    const outcome = resultText
+      ? classifyBackgroundTaskOutcome(task, resultText, undefined, { ignoreFanoutCoverage: true })
+      : { outcome: 'blocked' as const, reason: 'Completed task has no saved result.' };
+    if (outcome.outcome !== 'blocked') continue;
+
+    const updated = markBackgroundTaskBlocked(
+      task.id,
+      `Integrity sweep reclassified a prior false completion: ${outcome.reason ?? 'result was not a verifiable deliverable'}`,
+      resultText || task.result || '',
+    );
+    if (updated) {
+      repaired += 1;
+      ids.push(task.id);
+    }
+  }
+
+  return { scanned, repaired, ids };
+}
+
 /** Soft-delete a task: drop it off the active board + every sweep, keep the
  *  record (restorable). The single irreversible-feeling action made reversible. */
 export function archiveBackgroundTask(id: string): BackgroundTaskRecord | null {
@@ -1069,11 +1160,11 @@ function enqueueBackgroundTaskOutcomeTurn(
   task: BackgroundTaskRecord,
   outcome: BackgroundTaskOutcome,
   detail: string,
-): void {
+): boolean {
   // Unified report-back (Move 4): one mechanism for every lane. Preserves the
   // `[background task <id> …]` prefix (idempotency + UI detect); the body is the
   // shared Outcome card. See src/runtime/outcome.ts.
-  deliverOutcome(
+  return deliverOutcome(
     { status: outcome, detail },
     {
       originSessionId: task.originSessionId,
@@ -1087,6 +1178,53 @@ function enqueueBackgroundTaskOutcomeTurn(
       proactiveTurn: outcome === 'needs_input',
     },
   );
+}
+
+function backgroundTaskOutcomeForStatus(status: BackgroundTaskStatus): BackgroundTaskOutcome | null {
+  if (status === 'done') return 'done';
+  if (status === 'blocked') return 'blocked';
+  if (status === 'failed') return 'failed';
+  return null;
+}
+
+function storedBackgroundTaskReportText(task: BackgroundTaskRecord): string {
+  const stored = storedResultTextForIntegrityCheck(task).trim();
+  if (stored) return stored;
+  if (task.error?.trim()) return task.error.trim();
+  if (task.result?.trim()) return task.result.trim();
+  return `Task ${task.id} finished with status ${task.status}, but no result text was saved.`;
+}
+
+export function replayBackgroundTaskReportBack(
+  id: string,
+  opts: { reason?: string; now?: string } = {},
+): { ok: boolean; reason?: string; notificationId?: string; outcomeDelivered?: boolean } {
+  const task = getBackgroundTask(id);
+  if (!task) return { ok: false, reason: 'not-found' };
+  const outcome = backgroundTaskOutcomeForStatus(task.status);
+  if (!outcome) return { ok: false, reason: 'not-terminal-reporting-status' };
+
+  const now = opts.now ?? nowIso();
+  const detail = storedBackgroundTaskReportText(task);
+  const notificationId = `bgtask-report-replay-${task.id}-${task.status}`;
+  const replayReason = opts.reason ?? 'terminal_report_back_replay';
+
+  addNotification({
+    id: notificationId,
+    kind: task.status === 'blocked' ? 'approval' : 'execution',
+    title: `Background task report re-delivered: ${task.title}`,
+    body: truncateResultBody(task.status === 'done' ? humanizeReportBody(detail) : detail),
+    createdAt: now,
+    read: false,
+    metadata: taskNotificationMetadata(task, {
+      status: task.status,
+      reportBackReplay: true,
+      replayReason,
+    }),
+  });
+
+  const outcomeDelivered = enqueueBackgroundTaskOutcomeTurn(task, outcome, detail);
+  return { ok: true, notificationId, outcomeDelivered };
 }
 
 export function markBackgroundTaskDone(
@@ -1315,8 +1453,8 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
  * Deliberately conservative: we only divert to `blocked` on a positive
  * signal. A genuinely-complete run with no blocked markers stays 'done'.
  */
-// BLOCKED_TEXT_PATTERNS now lives in runtime/harness/verify-delivered.ts so
-// the cron/gateway/autonomy honesty chokepoint and this richer background-task
+// Blocked-output classification now lives in runtime/harness/verify-delivered.ts
+// so the cron/gateway/autonomy honesty chokepoint and this richer background-task
 // classifier share one blocked-text vocabulary.
 
 export function classifyBackgroundTaskOutcome(
@@ -1369,10 +1507,15 @@ export function classifyBackgroundTaskOutcome(
   // 3) Text heuristic: the agent's own final words say it's blocked.
   const text = (finalText || '').trim();
   if (text) {
-    for (const pattern of BLOCKED_TEXT_PATTERNS) {
-      if (pattern.test(text)) {
-        return { outcome: 'blocked', reason: text.slice(0, 400) };
-      }
+    const turnText = classifyTurnText(text, { toolCalls: 0 });
+    if (turnText.kind === 'fake_tool_transcript') {
+      return {
+        outcome: 'blocked',
+        reason: `The worker wrote a fake tool call transcript instead of calling the tool: ${text.slice(0, 320)}`,
+      };
+    }
+    if (matchesBlockedText(text)) {
+      return { outcome: 'blocked', reason: text.slice(0, 400) };
     }
   }
 
@@ -1531,14 +1674,7 @@ export function resumeBackgroundTask(id: string): BackgroundTaskRecord | null {
   }
   const resumed = createBackgroundTask({
     title: `Resume ${task.title}`,
-    prompt: [
-      `Resume background task ${task.id}.`,
-      task.result ? `Previous partial result:\n${task.result}` : '',
-      task.error ? `Previous error/blocker:\n${task.error}` : '',
-      '',
-      'Original request:',
-      task.prompt,
-    ].filter(Boolean).join('\n\n'),
+    prompt: buildResumeClonePrompt(task),
     originSessionId: task.originSessionId,
     userId: task.userId,
     channel: task.channel,

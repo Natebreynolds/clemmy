@@ -17,6 +17,7 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-bgtasks-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_HARNESS_BACKGROUND = 'off';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
@@ -48,15 +49,19 @@ const {
   markBackgroundTaskRunning,
   truncateResultBody,
   backgroundHeartbeatInternalsForTest,
+  rootBackgroundTaskPromptForTests,
+  sweepInvalidDoneBackgroundTasks,
+  replayBackgroundTaskReportBack,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../runtime/harness/fanout-ledger.js');
-const { createSession, appendEvent, getSession } = await import('../runtime/harness/eventlog.js');
+const { createSession, appendEvent, getSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { listNotifications, getNotificationDestinationsForRecord } = await import('../runtime/notifications.js');
 const { markBackgroundTaskBlocked } = await import('./background-tasks.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
+const { runBackgroundTaskWatchdog } = await import('./background-task-watchdog.js');
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
@@ -301,6 +306,23 @@ test('manual resume: double-clone guard returns the live clone instead of spawni
   assert.equal(after.length, before + 2, 'exactly one clone exists (original + one clone), not two');
 });
 
+test('resumeBackgroundTask flattens nested resume wrappers to the root original request', () => {
+  const rootPrompt = 'task please: fetch 10 keyword volumes and write the sheet.';
+  const original = createBackgroundTask({ title: 'Restart smoke', prompt: rootPrompt, source: 'desktop' });
+  markBackgroundTaskFailed(original.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  const first = resumeBackgroundTask(original.id)!;
+  assert.ok(first.id !== original.id, 'first non-goal resume creates a clone');
+  markBackgroundTaskFailed(first.id, 'Daemon restarted while task was running.', 'interrupted');
+
+  const second = resumeBackgroundTask(first.id)!;
+  assert.ok(second.id !== first.id, 'second interrupted clone creates another clone');
+  assert.equal(rootBackgroundTaskPromptForTests(second.prompt), rootPrompt);
+  assert.equal((second.prompt.match(/Original request:/g) ?? []).length, 1, 'resume prompt carries one root request block');
+  assert.doesNotMatch(second.prompt, /Original request:\s*\n\s*Resume background task/i, 'root request must not be another resume wrapper');
+  assert.match(second.prompt, /Continue the same objective from the prior task/);
+});
+
 test('P3/P4 cockpit: toolCallCount is truthful; Tools feed keeps real calls, drops reflection/housekeeping', async () => {
   const { getBackgroundTaskStatus } = await import('./background-task-status.js');
   const task = createBackgroundTask({ title: 'Cockpit stats task', prompt: 'do work', source: 'desktop' });
@@ -355,6 +377,71 @@ test('P2 report-back: desktop task defaults to origin-chat; completion is termin
     !listQueuedNotificationDeliveries().some((job) => job.notificationId === done!.id),
     'origin-chat report is not enqueued for external delivery',
   );
+});
+
+test('report-back replay: terminal task with lost notification re-delivers result into origin chat', async () => {
+  createSession({ id: 'sess-replay-origin', kind: 'chat', title: 'Replay origin' });
+  const task = createBackgroundTask({
+    title: 'Replay me',
+    prompt: 'produce the saved result',
+    source: 'desktop',
+    originSessionId: 'sess-replay-origin',
+  });
+  updateBackgroundTask(task.id, {
+    status: 'done',
+    completedAt: '2026-07-08T19:06:06.000Z',
+    result: 'rescued report body',
+  });
+
+  const replay = replayBackgroundTaskReportBack(task.id, { now: '2026-07-08T19:10:06.000Z', reason: 'test_lost_report' });
+  assert.equal(replay.ok, true);
+  assert.equal(replay.outcomeDelivered, true);
+
+  const note = listNotifications(500).find((n) => n.id === replay.notificationId);
+  assert.ok(note, 'stable replay notification exists');
+  assert.equal(note!.metadata?.reportBackReplay, true);
+  assert.ok(note!.deliveredAt, 'origin-chat replay is terminal-delivered');
+  assert.deepEqual(note!.deliveredDestinations, ['origin-chat']);
+
+  const synthetic = listEvents('sess-replay-origin', { types: ['user_input_received'], limit: 10 })
+    .find((event) => event.data?.source === 'outcome' && event.data?.sourceId === task.id);
+  assert.ok(synthetic, 'result was injected back into the origin harness session');
+  assert.match(String(synthetic!.data?.text ?? ''), /rescued report body/);
+});
+
+test('watchdog repairs a terminal-undelivered task by replaying the saved report-back', async () => {
+  const now = Date.parse('2026-07-08T19:10:06.000Z');
+  createSession({ id: 'sess-watchdog-replay-origin', kind: 'chat', title: 'Watchdog replay origin' });
+  const task = createBackgroundTask({
+    title: 'Watchdog replay',
+    prompt: 'save the report',
+    source: 'desktop',
+    originSessionId: 'sess-watchdog-replay-origin',
+  });
+  updateBackgroundTask(task.id, {
+    status: 'done',
+    completedAt: '2026-07-08T19:06:06.000Z',
+    result: 'watchdog rescued body',
+  });
+
+  const result = runBackgroundTaskWatchdog(now);
+  assert.equal(result.stalled, 1);
+
+  const note = listNotifications(500).find((n) => n.id === `bgtask-report-replay-${task.id}-done`);
+  assert.ok(note, 'watchdog created a stable replay notification');
+  assert.equal(note!.metadata?.reportBackReplay, true);
+  assert.equal(note!.metadata?.replayReason, 'watchdog_terminal_undelivered');
+  assert.deepEqual(note!.deliveredDestinations, ['origin-chat']);
+  assert.equal(
+    listNotifications(500).some((n) => n.id === `bgtask-stalled-terminal_undelivered-${task.id}`),
+    false,
+    'watchdog did not emit the old vague stalled alert when replay worked',
+  );
+
+  const synthetic = listEvents('sess-watchdog-replay-origin', { types: ['user_input_received'], limit: 10 })
+    .find((event) => event.data?.source === 'outcome' && event.data?.sourceId === task.id);
+  assert.ok(synthetic, 'watchdog replay injected the saved result into the origin session');
+  assert.match(String(synthetic!.data?.text ?? ''), /watchdog rescued body/);
 });
 
 test('P2 channels: origin-chat is always an available target; the enumerated key round-trips', async () => {
@@ -905,6 +992,50 @@ test('classifyBackgroundTaskOutcome: self-declared no-result text → blocked', 
   );
   assert.equal(outcome.outcome, 'blocked', 'a clean stop with no verified deliverable is not a completed background task');
   assert.match(outcome.reason ?? '', /without a number/i);
+});
+
+test('classifyBackgroundTaskOutcome: fake tool transcript is blocked, not reported done', () => {
+  const fake = "**Tool: read**\n\n*(No `path` provided in the assistant's tool call — the harness will supply required params.)*";
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-fake-tool-bg' },
+    fake,
+  );
+  assert.equal(outcome.outcome, 'blocked', 'a fake tool transcript is not a background-task deliverable');
+  assert.match(outcome.reason ?? '', /fake tool call transcript/i);
+});
+
+test('sweepInvalidDoneBackgroundTasks reclassifies prior fake-transcript completions as blocked', () => {
+  const task = createBackgroundTask({ title: 'Bad historical completion', prompt: 'Read the transcript and save analysis JSON.' });
+  const fake = "**Tool: read**\n\n*(No `path` provided in the assistant's tool call — the harness will supply required params.)*";
+  markBackgroundTaskDone(task.id, fake);
+
+  const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
+
+  assert.ok(repaired.ids.includes(task.id));
+  assert.ok(repaired.repaired >= 1);
+  const updated = getBackgroundTask(task.id);
+  assert.equal(updated?.status, 'blocked');
+  assert.match(updated?.error ?? '', /Integrity sweep reclassified/i);
+  assert.match(updated?.result ?? '', /Tool: read/i);
+});
+
+test('sweepInvalidDoneBackgroundTasks leaves genuine completions alone', () => {
+  const task = createBackgroundTask({ title: 'Good historical completion', prompt: 'Create the report.' });
+  markBackgroundTaskDone(task.id, 'Done — I created the report, saved it to /tmp/report.md, and verified the file exists.');
+
+  const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
+
+  assert.equal(repaired.ids.includes(task.id), false);
+  assert.equal(getBackgroundTask(task.id)?.status, 'done');
+});
+
+test('classifyBackgroundTaskOutcome: self-reported no tool access is blocked, not reported done', () => {
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-no-tool-bg' },
+    'Nothing new - this environment has no tool access (Composio, Google Sheets, DataForSEO, or file I/O are not exposed to me here), so I cannot fetch search volumes, create a Google Sheet, or verify anything.',
+  );
+  assert.equal(outcome.outcome, 'blocked', 'a no-tool-access self-report is not a background-task deliverable');
+  assert.match(outcome.reason ?? '', /no tool access/i);
 });
 
 test('classifyBackgroundTaskOutcome: a genuinely-complete run still reports done', () => {

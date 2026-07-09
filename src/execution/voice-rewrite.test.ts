@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVoiceGuards } from './voice-rewrite.js';
+import { applyVoiceGuards, _testOnly_sanitizeVoiceOutput } from './voice-rewrite.js';
 
 // These cover the verdict-preservation guards that run AFTER the model call —
 // the part that must never let a tone pass turn a snag/failure into "all set"
@@ -89,4 +89,17 @@ test('null result falls back to original body', () => {
   const out = applyVoiceGuards(null, 'Original report.', 'done');
   assert.equal(out.message, 'Original report.');
   assert.equal(out.nothingHappened, false);
+});
+
+test('sanitizeVoiceOutput accepts fenced JSON and schema aliases', () => {
+  const out = _testOnly_sanitizeVoiceOutput('```json\n{"text":"Hey Nate — inbox is clear.","nothing_happened":"true"}\n```');
+  assert.deepEqual(out, { message: 'Hey Nate — inbox is clear.', nothingHappened: true });
+});
+
+test('sanitizeVoiceOutput treats plain text as a safe non-silent rewrite', () => {
+  const out = _testOnly_sanitizeVoiceOutput('Hey Nate — processed 4 messages and flagged 1 for reply.');
+  assert.deepEqual(out, {
+    message: 'Hey Nate — processed 4 messages and flagged 1 for reply.',
+    nothingHappened: false,
+  });
 });

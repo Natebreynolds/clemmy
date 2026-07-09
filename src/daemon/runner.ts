@@ -11,11 +11,12 @@ import { processCalendarMonitor } from '../agents/calendar-monitor.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
-import { MODELS, getRuntimeEnv } from '../config.js';
+import { MODELS, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
-import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, registerBackgroundDrainKick } from '../execution/background-tasks.js';
+import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks } from '../execution/background-tasks.js';
 import { processWorkflowRuns, reconcilePendingWorkflowRuns, reapResolvedParkedRuns } from '../execution/workflow-runner.js';
 import { runWorkflowWatchdog } from '../execution/workflow-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
@@ -54,6 +55,7 @@ import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflec
 import { decayAndEvictFacts } from '../memory/facts.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { autoCleanSafeMemory } from '../autoresearch/memory-apply.js';
+import { setDaemonRuntimePhase, withDaemonRuntimePhase } from './phase.js';
 import {
   CRON_FILE,
 } from '../memory/vault.js';
@@ -136,6 +138,42 @@ const NO_DESTINATION_RETRY_MS = (() => {
   const minutes = parseInt(getRuntimeEnv('NOTIFICATION_NO_DESTINATION_RETRY_MINUTES') ?? '', 10);
   return (Number.isFinite(minutes) && minutes > 0 ? minutes : 15) * 60_000;
 })();
+
+interface BootModelWarmupGate {
+  run: boolean;
+  harnessConfigured: boolean;
+  directOpenAiKey: boolean;
+  reason?: string;
+}
+
+type ConfigureHarnessRuntimeFn = typeof configureHarnessRuntime;
+type ReadOpenAiApiKeyFn = typeof getOpenAiApiKey;
+
+export async function resolveBootModelWarmupGate(
+  configure: ConfigureHarnessRuntimeFn = configureHarnessRuntime,
+  readOpenAiApiKey: ReadOpenAiApiKeyFn = getOpenAiApiKey,
+): Promise<BootModelWarmupGate> {
+  const directOpenAiKey = Boolean(readOpenAiApiKey().trim());
+  try {
+    const auth = await configure();
+    if (auth.ok) {
+      return { run: true, harnessConfigured: true, directOpenAiKey };
+    }
+    return {
+      run: directOpenAiKey,
+      harnessConfigured: false,
+      directOpenAiKey,
+      reason: auth.reason,
+    };
+  } catch (err) {
+    return {
+      run: directOpenAiKey,
+      harnessConfigured: false,
+      directOpenAiKey,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1004,6 +1042,7 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
 }
 
 export async function startDaemon(assistant: ClementineAssistant): Promise<void> {
+  setDaemonRuntimePhase('daemon.boot.start', { build: describeBuild() });
   // Surface exactly which build is running so a stale packaged bundle
   // can't masquerade as the latest src silently (see build-info.ts).
   logger.info({ build: getBuildInfo() }, `Clementine daemon build: ${describeBuild()}`);
@@ -1062,15 +1101,18 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const sweptRuns = sweepStaleRuns();
   const sweptExecutions = sweepStaleExecutions();
   const sweptApprovals = sweepStaleApprovals();
+  const repairedDoneTasks = (getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() === 'off'
+    ? { repaired: 0, ids: [] as string[] }
+    : sweepInvalidDoneBackgroundTasks();
   // On boot, the heartbeat sweeper is the most important one — any
   // execution that was mid-cycle when the previous daemon died has a
   // stale heartbeat and the dashboard would otherwise report it as
   // still working.
   const sweptCrashed = sweepCrashedExecutions();
   const sweptBlocked = sweepStaleBlockedExecutions();
-  if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptCrashed > 0 || sweptBlocked > 0) {
+  if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptCrashed > 0 || sweptBlocked > 0 || repairedDoneTasks.repaired > 0) {
     logger.warn(
-      { sweptRuns, sweptExecutions, sweptApprovals, sweptCrashed, sweptBlocked },
+      { sweptRuns, sweptExecutions, sweptApprovals, sweptCrashed, sweptBlocked, repairedDoneTasks },
       'Auto-closed stale runs / executions / approvals on daemon start',
     );
   }
@@ -1189,7 +1231,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const deliveryTimer = setInterval(() => {
     if (deliveryInFlight) return;
     deliveryInFlight = true;
-    processNotificationDeliveries(assistant)
+    withDaemonRuntimePhase('daemon.timer.notification_delivery', {}, () => processNotificationDeliveries(assistant))
       .catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
@@ -1209,7 +1251,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // itself has an in-flight guard, so explicit approval kicks and this
   // timer cannot double-run the same task.
   const drainBackgroundTasks = () => {
-    processBackgroundTasks(assistant).catch((err) => {
+    withDaemonRuntimePhase('daemon.timer.background_tasks', {}, () => processBackgroundTasks(assistant)).catch((err) => {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
         'Independent background task tick failed',
@@ -1225,7 +1267,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // guarded inside processBackgroundTasks, so a kick can never double-run a task.
   registerBackgroundDrainKick((limit) => {
     setImmediate(() => {
-      processBackgroundTasks(assistant, limit ?? 1).catch((err) => {
+      withDaemonRuntimePhase('daemon.kick.background_tasks', { limit: limit ?? 1 }, () => processBackgroundTasks(assistant, limit ?? 1)).catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
           'Immediate background drain kick failed',
@@ -1242,7 +1284,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // REAL result back to the origin session on completion. The exec binds the record's
   // connectionId (executeComposioTool's 3rd arg). Fail-open.
   const tickComposioJobs = () => {
-    processComposioJobWatchTick((slug, args, connectionId) => executeComposioTool(slug, args, connectionId))
+    withDaemonRuntimePhase('daemon.timer.composio_job_watch', {}, () => processComposioJobWatchTick((slug, args, connectionId) => executeComposioTool(slug, args, connectionId)))
       .catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
@@ -1260,13 +1302,17 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // observe-only bookkeeping and always runs. Hourly + once shortly after boot
   // so a fresh install has scores as soon as it has outcomes. Never throws.
   const tickRoutePolicy = () => {
-    const result = runRoutePolicyJob();
-    if (result) {
-      logger.info(
-        { policyVersion: result.policyVersion, rows: result.rowsWritten, windowDays: result.windowDays },
-        'route-policy job rebuilt model_route_policy',
-      );
-    }
+    void withDaemonRuntimePhase('daemon.timer.route_policy', {}, async () => {
+      const result = runRoutePolicyJob();
+      if (result) {
+        logger.info(
+          { policyVersion: result.policyVersion, rows: result.rowsWritten, windowDays: result.windowDays },
+          'route-policy job rebuilt model_route_policy',
+        );
+      }
+    }).catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'route-policy job failed');
+    });
   };
   const routePolicyBootTimer = setTimeout(tickRoutePolicy, 90_000);
   routePolicyBootTimer.unref?.();
@@ -1278,25 +1324,27 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // main loop being starved: a run stuck `queued` with no signal. It
   // only observes + notifies (deduped), never mutates run state.
   const tickWatchdog = () => {
-    try {
-      runWorkflowWatchdog();
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Workflow watchdog tick failed',
-      );
-    }
-    // Same safety net for background TASKS (a task that died mid-run or whose
-    // terminal notification was lost would otherwise go silent — no watchdog
-    // existed for tasks before). Observe-only + deduped, like the workflow one.
-    try {
-      runBackgroundTaskWatchdog();
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Background-task watchdog tick failed',
-      );
-    }
+    void withDaemonRuntimePhase('daemon.timer.watchdogs', {}, async () => {
+      try {
+        runWorkflowWatchdog();
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Workflow watchdog tick failed',
+        );
+      }
+      // Same safety net for background TASKS (a task that died mid-run or whose
+      // terminal notification was lost would otherwise go silent — no watchdog
+      // existed for tasks before). Observe-only + deduped, like the workflow one.
+      try {
+        runBackgroundTaskWatchdog();
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Background-task watchdog tick failed',
+        );
+      }
+    });
   };
   const watchdogTimer = setInterval(tickWatchdog, 60_000);
   watchdogTimer.unref?.();
@@ -1329,26 +1377,37 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       void (async () => {
         try {
           const warmupSessionId = `warmup-${Date.now()}`;
-          // Establish the harness run context so the BYO/Claude SDK usage
-          // recorders (which read sessionId from harnessRunContextStorage, not
-          // the bare ModelRequest) tag this as kind:'warmup' instead of falling
-          // back to 'unknown'/'other' — keeping warmup isolated from the
-          // interactive-chat cache-hit-rate on every lane, not just Codex.
-          await withHarnessRunContext(
-            { sessionId: warmupSessionId, counter: new ToolCallsCounter(8) },
-            () => assistant.getRuntime().run({
-              instructions: 'Reply with the single word: ok',
-              // Warm the BRAIN's actual model, not MODELS.fast: the provider prompt
-              // cache is keyed per-model, so priming the fast slot never helped the
-              // first real (brain) turn — and a repurposed BYO fast slot (e.g.
-              // glm-5.2) turned this boot ping into an unintended BYO call. The brain
-              // model is what the first turn will actually use.
-              model: resolveRoleModel('brain').modelId,
-              prompt: 'ok',
-              sessionId: warmupSessionId,
-            }),
-          );
-          logger.info('boot warmup: model path warmed');
+          const warmupGate = await resolveBootModelWarmupGate();
+          if (!warmupGate.run) {
+            logger.info(
+              { reason: warmupGate.reason ?? 'model runtime is not configured' },
+              'boot warmup: model path skipped',
+            );
+          } else {
+            // Establish the harness run context so the BYO/Claude SDK usage
+            // recorders (which read sessionId from harnessRunContextStorage, not
+            // the bare ModelRequest) tag this as kind:'warmup' instead of falling
+            // back to 'unknown'/'other' — keeping warmup isolated from the
+            // interactive-chat cache-hit-rate on every lane, not just Codex.
+            await withHarnessRunContext(
+              { sessionId: warmupSessionId, counter: new ToolCallsCounter(8) },
+              () => assistant.getRuntime().run({
+                instructions: 'Reply with the single word: ok',
+                // Warm the BRAIN's actual model, not MODELS.fast: the provider prompt
+                // cache is keyed per-model, so priming the fast slot never helped the
+                // first real (brain) turn — and a repurposed BYO fast slot (e.g.
+                // glm-5.2) turned this boot ping into an unintended BYO call. The brain
+                // model is what the first turn will actually use.
+                model: resolveRoleModel('brain').modelId,
+                prompt: 'ok',
+                sessionId: warmupSessionId,
+              }),
+            );
+            logger.info(
+              { harnessConfigured: warmupGate.harnessConfigured, directOpenAiKey: warmupGate.directOpenAiKey },
+              'boot warmup: model path warmed',
+            );
+          }
         } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'boot warmup: model ping failed');
         }
@@ -1364,34 +1423,50 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     }, 5_000).unref?.();
   }
 
-  // MCP pre-warm (sess-mqg8wdw1): connect the user's external MCP servers while
-  // the boot loop is IDLE, so a cold connect handshake never races a turn's
-  // synchronous better-sqlite3 work, times out at 30s, and degrades the server
-  // — which (because the SDK awaits listTools() before the first model request)
-  // stalled whole turns pre-content. Fired after the 5s boot-warmup window, off
-  // the hot path (unref'd), retried internally so a single starved attempt
-  // recovers. Connections persist for the daemon lifetime. Disable with
-  // CLEMMY_MCP_PREWARM=off (falls back to lazy connect-on-first-use).
-  if ((getRuntimeEnv('CLEMMY_MCP_PREWARM', 'on') ?? 'on').toLowerCase() !== 'off') {
+  // MCP pre-warm (sess-mqg8wdw1): connect scoped external MCP servers while the
+  // boot loop is IDLE, so a cold handshake does not race a turn. Default is now
+  // scoped/demand-driven: explicit CLEMMY_MCP_PREWARM_SERVERS, otherwise healthy
+  // remembered MCP servers, otherwise one configured server only. The legacy
+  // all-external warm remains available with CLEMMY_MCP_PREWARM=all.
+  if (!['off', '0', 'false', 'no'].includes((getRuntimeEnv('CLEMMY_MCP_PREWARM', 'scoped') ?? 'scoped').toLowerCase())) {
     setTimeout(() => {
       void (async () => {
         try {
-          const { prewarmMcpServers } = await import('../runtime/mcp-servers.js');
-          const { attempts, allConnected } = await prewarmMcpServers();
-          logger.info({ attempts, allConnected }, 'MCP pre-warm complete');
+          const {
+            getOrCreateExternalMcpServers,
+            prewarmMcpServers,
+            resolveMcpPrewarmSelection,
+          } = await import('../runtime/mcp-servers.js');
+          const selection = resolveMcpPrewarmSelection();
+          if (selection.mode === 'off' || selection.mode === 'none') {
+            logger.info({ reason: selection.reason }, 'MCP pre-warm skipped');
+            return;
+          }
+
+          const { attempts, allConnected, target, serverSlugs } = await prewarmMcpServers({
+            allowedServerSlugs: selection.mode === 'scoped' ? selection.allowedServerSlugs ?? [] : undefined,
+          });
+          logger.info({ attempts, allConnected, target, serverSlugs, reason: selection.reason }, 'MCP pre-warm complete');
           // Prime the semantic tool-vector cache too. Connect alone left the
-          // FIRST scoped turn paying listTools + embedTexts over every external
-          // tool description cold — measured live at ~45s of "Starting up…"
-          // (2026-07-08, 25-keyword smoke). Vectors cache by content hash for
-          // the daemon lifetime, so one throwaway rank here makes the first
-          // real turn's scope resolution embed only its query.
-          const [{ getOrCreateExternalMcpServers }, { rankToolsBySemantic }] = await Promise.all([
-            import('../runtime/mcp-servers.js'),
-            import('../runtime/mcp-tool-rank.js'),
-          ]);
-          const externalTools = await getOrCreateExternalMcpServers().listTools();
+          // FIRST scoped turn paying listTools + embedTexts cold. Prime only the
+          // same target set we warmed; listing all external tools here would
+          // reintroduce the all-server startup boot this path is avoiding.
+          const { rankToolsBySemantic } = await import('../runtime/mcp-tool-rank.js');
+          const externalTools = target === 'all'
+            ? await getOrCreateExternalMcpServers().listTools()
+            : serverSlugs.length > 0
+              ? await getOrCreateExternalMcpServers({
+                  reason: 'boot MCP vector prime',
+                  allowedServerSlugs: serverSlugs,
+                  maxTools: Number.MAX_SAFE_INTEGER,
+                }).listTools()
+              : [];
+          if (externalTools.length === 0) {
+            logger.info({ target, serverSlugs }, 'MCP pre-warm: no tool vectors to prime');
+            return;
+          }
           await rankToolsBySemantic('warmup: prime external tool vectors', externalTools as never);
-          logger.info({ toolCount: externalTools.length }, 'MCP pre-warm: tool vectors primed');
+          logger.info({ target, serverSlugs, toolCount: externalTools.length }, 'MCP pre-warm: tool vectors primed');
         } catch (err) {
           logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'MCP pre-warm failed (servers connect on first use)');
         }
@@ -1408,14 +1483,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   const workflowRunLane = (getRuntimeEnv('CLEMMY_WORKFLOW_RUN_LANE', 'on') ?? 'on').toLowerCase() !== 'off';
   if (workflowRunLane) {
     const drainWorkflowRunsTick = () => {
-      // P0 parking: re-admit any run whose approvals have resolved (no-op
-      // when WORKFLOW_APPROVAL_PARKING is off) BEFORE draining, so a freed
-      // parked run is picked up in the same tick. setImmediate below also
-      // runs this on boot, covering approvals resolved during downtime.
-      try { reapResolvedParkedRuns(); } catch (err) {
-        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns tick failed');
-      }
-      processWorkflowRuns(assistant).catch((err) => {
+      withDaemonRuntimePhase('daemon.timer.workflow_runs', {}, async () => {
+        // P0 parking: re-admit any run whose approvals have resolved (no-op
+        // when WORKFLOW_APPROVAL_PARKING is off) BEFORE draining, so a freed
+        // parked run is picked up in the same tick. setImmediate below also
+        // runs this on boot, covering approvals resolved during downtime.
+        try { reapResolvedParkedRuns(); } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns tick failed');
+        }
+        await processWorkflowRuns(assistant);
+      }).catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
           'Independent workflow-run drain tick failed',
@@ -1432,36 +1509,39 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
 
   while (true) {
     tickCount++;
-    await processCronSchedules(assistant, state);
-    await processCronTriggers(assistant);
+    setDaemonRuntimePhase('daemon.loop.tick', { tickCount });
+    await withDaemonRuntimePhase('daemon.loop.cron_schedules', { tickCount }, () => processCronSchedules(assistant, state));
+    await withDaemonRuntimePhase('daemon.loop.cron_triggers', { tickCount }, () => processCronTriggers(assistant));
     // Match workflows with trigger.schedule against the wall clock and
     // enqueue runs. processWorkflowRuns (below) then drains the queue.
-    await processWorkflowSchedules();
+    await withDaemonRuntimePhase('daemon.loop.workflow_schedules', { tickCount }, () => processWorkflowSchedules());
     // T2.1: keep the trigger registry in sync with each enabled workflow's
     // declared event/webhook triggers so fireWorkflowSystemEvent / the
     // /api/hooks/workflows route can match them. Cheap (no-op upserts are
     // skipped) and best-effort.
-    try { syncWorkflowTriggerRegistry(); } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'syncWorkflowTriggerRegistry tick failed');
-    }
+    await withDaemonRuntimePhase('daemon.loop.workflow_trigger_registry', { tickCount }, async () => {
+      try { syncWorkflowTriggerRegistry(); } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'syncWorkflowTriggerRegistry tick failed');
+      }
+    });
     // Workspaces: silently refresh any scheduled data sources (no LLM).
     // Flag-gated (CLEMENTINE_SPACES, default off) — no-op when disabled.
     if (isSpacesEnabled()) {
-      await processSpaceSchedules().catch((err) => {
+      await withDaemonRuntimePhase('daemon.loop.space_schedules', { tickCount }, () => processSpaceSchedules()).catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'processSpaceSchedules tick failed');
       });
       // Paused-build auto-retry: a workspace parked by a TRANSIENT build-time
       // failure re-pulls its sources (2 attempts, spaced) and reactivates on
       // success instead of stranding until the user notices the banner.
-      await retryPausedSpaces().catch((err) => {
+      await withDaemonRuntimePhase('daemon.loop.space_retry_paused', { tickCount }, () => retryPausedSpaces()).catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'retryPausedSpaces tick failed');
       });
       // First-ten-minutes activation: once-ever SUGGEST when the user has zero
       // workspaces but a usable connection ("I can build you a Deal Board").
       // Deterministic + marker-guarded + probe-throttled; never auto-builds.
-      await maybeOfferStarterWorkspace({
+      await withDaemonRuntimePhase('daemon.loop.space_starter_offer', { tickCount }, () => maybeOfferStarterWorkspace({
         listConnectedSlugs: async () => (await listUsableConnectedToolkits()).map((t) => t.slug).filter(Boolean),
-      }).catch((err) => {
+      })).catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'starter-workspace offer check failed');
       });
     }
@@ -1472,31 +1552,37 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       // P0 parking: re-admit resolved parked runs on the inline path too
       // (no-op when WORKFLOW_APPROVAL_PARKING is off). Keeps parking
       // correct even when the independent run lane is disabled.
-      try { reapResolvedParkedRuns(); } catch (err) {
-        logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns inline tick failed');
-      }
-      await processWorkflowRuns(assistant);
+      await withDaemonRuntimePhase('daemon.loop.workflow_runs_inline', { tickCount }, async () => {
+        try { reapResolvedParkedRuns(); } catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reapResolvedParkedRuns inline tick failed');
+        }
+        await processWorkflowRuns(assistant);
+      });
     }
     const proactivity = getProactivityPolicySnapshot();
 
     // Run monitors every 4 ticks (~60s) - they have their own internal rate limiting.
     if (proactivity.proactiveWorkAllowed && tickCount % 4 === 0) {
-      processMonitors();
+      await withDaemonRuntimePhase('daemon.loop.monitors', { tickCount }, async () => {
+        processMonitors();
+      });
       // C2 ambient inbox watch (general, read-only, default ON; kill-switch
       // CLEMMY_INBOX_MONITOR=off). Self-rate-limited (own cadence) + surface-only;
       // fire-and-forget so its mailbox reads never block the tick. Best-effort.
-      void processInboxMonitor().catch((err) => logger.warn({ err }, 'inbox monitor tick failed'));
+      void withDaemonRuntimePhase('daemon.fire_and_forget.inbox_monitor', { tickCount }, () => processInboxMonitor())
+        .catch((err) => logger.warn({ err }, 'inbox monitor tick failed'));
       // C2 ambient calendar watch — same pattern (general, read-only, default ON;
       // kill-switch CLEMMY_CALENDAR_MONITOR=off). Self-rate-limited; fire-and-forget.
-      void processCalendarMonitor().catch((err) => logger.warn({ err }, 'calendar monitor tick failed'));
+      void withDaemonRuntimePhase('daemon.fire_and_forget.calendar_monitor', { tickCount }, () => processCalendarMonitor())
+        .catch((err) => logger.warn({ err }, 'calendar monitor tick failed'));
     }
 
     if (proactivity.proactiveWorkAllowed) {
-      await processExecutionController(assistant);
+      await withDaemonRuntimePhase('daemon.loop.execution_controller', { tickCount }, () => processExecutionController(assistant));
       // Autonomy v1 (processAgentAutonomy) was deleted in Phase-2 Wave 2 — v2
       // owns every standing agent (AUTONOMY_V2_AGENTS) and self-driving goals
       // own the rest. Only v2 + goals run the standing-work cadence now.
-      await processAgentAutonomyV2();
+      await withDaemonRuntimePhase('daemon.loop.agent_autonomy_v2', { tickCount }, () => processAgentAutonomyV2());
       // Self-driving goals (A2): re-enter active goals due for a heartbeat.
       // Inside proactiveWorkAllowed ⇒ quiet hours pause resumption for free
       // (the autonomous-hours window, reusing proactivity-policy). ~60s scan
@@ -1504,16 +1590,16 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       // principled replacement for processAgentAutonomy{,V2} — do NOT add new
       // standing-work features to those two engines; land them as goals here.
       if (tickCount % 4 === 0) {
-        await processGoalResumptions();
+        await withDaemonRuntimePhase('daemon.loop.goal_resumptions', { tickCount }, () => processGoalResumptions());
       }
       // Reunify tools left in flight when a turn died on an infra error — fire a
       // follow-up report turn once the tool (e.g. a long run_batch) completes.
-      await processOrphanedToolReports();
-      await processProactiveBriefs(assistant);
+      await withDaemonRuntimePhase('daemon.loop.orphaned_tool_reports', { tickCount }, () => processOrphanedToolReports());
+      await withDaemonRuntimePhase('daemon.loop.proactive_briefs', { tickCount }, () => processProactiveBriefs(assistant));
       // Evaluate user-defined check-in templates — fires open
       // questions through the existing check-in path when their
       // trigger (schedule / condition) is hot and cooldown elapsed.
-      const checkInResult = processProactiveCheckIns();
+      const checkInResult = await withDaemonRuntimePhase('daemon.loop.proactive_check_ins', { tickCount }, async () => processProactiveCheckIns());
       if (checkInResult.fired.length > 0) {
         logger.info({
           fired: checkInResult.fired.length,
@@ -1533,9 +1619,9 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       // execution gets at most one entry per UTC day per pause window.
       annotateDueExecutionsAsPolicyPaused(proactivity);
     }
-    await processMemoryMaintenance(tickCount);
-    await processRecursiveReflectionTick(state);
-    await processMemoryHygieneTick(state);
+    await withDaemonRuntimePhase('daemon.loop.memory_maintenance', { tickCount }, () => processMemoryMaintenance(tickCount));
+    await withDaemonRuntimePhase('daemon.loop.recursive_reflection', { tickCount }, () => processRecursiveReflectionTick(state));
+    await withDaemonRuntimePhase('daemon.loop.memory_hygiene', { tickCount }, () => processMemoryHygieneTick(state));
     // Notification delivery used to run inline here. It now ticks on
     // its own independent setInterval above, so deliveries keep
     // flowing while this loop is parked on a long workflow / cron /
@@ -1545,23 +1631,30 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // ≈ 15 minutes, which is plenty fast for dashboard correctness without
     // hammering disk.
     if (tickCount % 60 === 0) {
-      const sweptRuns = sweepStaleRuns();
-      const sweptExecutions = sweepStaleExecutions();
-      const sweptApprovals = sweepStaleApprovals();
-      const sweptBlocked = sweepStaleBlockedExecutions();
-      if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptBlocked > 0) {
-        logger.warn({ sweptRuns, sweptExecutions, sweptApprovals, sweptBlocked }, 'Periodic stale-record sweep auto-closed records');
-      }
+      await withDaemonRuntimePhase('daemon.loop.stale_record_sweep', { tickCount }, async () => {
+        const sweptRuns = sweepStaleRuns();
+        const sweptExecutions = sweepStaleExecutions();
+        const sweptApprovals = sweepStaleApprovals();
+        const sweptBlocked = sweepStaleBlockedExecutions();
+        const repairedDoneTasks = (getRuntimeEnv('CLEMMY_BGTASK_INTEGRITY_SWEEP', 'on') ?? 'on').toLowerCase() === 'off'
+          ? { repaired: 0, ids: [] as string[] }
+          : sweepInvalidDoneBackgroundTasks();
+        if (sweptRuns > 0 || sweptExecutions > 0 || sweptApprovals > 0 || sweptBlocked > 0 || repairedDoneTasks.repaired > 0) {
+          logger.warn({ sweptRuns, sweptExecutions, sweptApprovals, sweptBlocked, repairedDoneTasks }, 'Periodic stale-record sweep auto-closed records');
+        }
+      });
     }
     // Heartbeat sweep runs FASTER than the others (every ~5 min instead
     // of every ~15) because its whole purpose is to catch crashed
     // controller cycles quickly. tickCount * sleep(15s) = tickCount in
     // 15-second units, so 20 ticks ≈ 5 min.
     if (tickCount % 20 === 0) {
-      const sweptCrashed = sweepCrashedExecutions();
-      if (sweptCrashed > 0) {
-        logger.warn({ sweptCrashed }, 'Heartbeat sweep auto-failed crashed executions');
-      }
+      await withDaemonRuntimePhase('daemon.loop.crashed_execution_sweep', { tickCount }, async () => {
+        const sweptCrashed = sweepCrashedExecutions();
+        if (sweptCrashed > 0) {
+          logger.warn({ sweptCrashed }, 'Heartbeat sweep auto-failed crashed executions');
+        }
+      });
     }
     // Reap terminal workflow run records older than 7 days. Without
     // this, processWorkflowRuns re-reads every completed run file every
@@ -1569,17 +1662,19 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     // 1440 files re-parsed on every 15s tick, slowly browning out the
     // main loop. Hourly cadence keeps disk traffic minimal.
     if (tickCount % 240 === 0) {
-      try {
-        const reaped = reapStaleWorkflowRuns();
-        if (reaped.deleted > 0) {
-          logger.info(reaped, 'Reaped stale workflow run records');
+      await withDaemonRuntimePhase('daemon.loop.workflow_run_reaper', { tickCount }, async () => {
+        try {
+          const reaped = reapStaleWorkflowRuns();
+          if (reaped.deleted > 0) {
+            logger.info(reaped, 'Reaped stale workflow run records');
+          }
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Workflow run reaper failed',
+          );
         }
-      } catch (err) {
-        logger.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          'Workflow run reaper failed',
-        );
-      }
+      });
     }
     // Persist a daemon-alive heartbeat. Two cadences:
     //   - tick 1 (15s after boot): immediate write so a quick restart
@@ -1592,9 +1687,12 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     //     Keeps disk traffic minimal while staying inside cron's
     //     minute-resolution gap detection threshold.
     if (tickCount === 1 || tickCount % 4 === 0) {
-      state.lastHealthyTickAt = new Date().toISOString();
-      saveState(state);
+      await withDaemonRuntimePhase('daemon.loop.persist_heartbeat', { tickCount }, async () => {
+        state.lastHealthyTickAt = new Date().toISOString();
+        saveState(state);
+      });
     }
+    setDaemonRuntimePhase('daemon.loop.sleep', { tickCount });
     await sleep(15_000);
   }
 }
