@@ -19,12 +19,55 @@
  * agent/execution sessions have their own resume paths and are never touched.
  * Entirely best-effort and flag-gated (CLEMMY_CHAT_RESTART_RECOVERY).
  */
-import { listSessions, appendEvent, type SessionRow } from './eventlog.js';
+import { listSessions, listEvents, appendEvent, type SessionRow } from './eventlog.js';
 import { HarnessSession } from './session.js';
 import { addNotification } from '../notifications.js';
 
 function enabled(): boolean {
   return (process.env.CLEMMY_CHAT_RESTART_RECOVERY ?? 'on').toLowerCase() !== 'off';
+}
+
+// ── Auto-resume (2026-07-09) ─────────────────────────────────────────────────
+// Surfacing the banner closed the SILENT-death gap; auto-resume closes the
+// still-waiting gap: a run interrupted by a restart (crash, update, watchdog)
+// used to sit parked until the user noticed and typed `continue` — verified
+// live that the resume itself works on a healthy daemon. Resume AUTOMATICALLY
+// when it is provably safe:
+//   - the interrupted turn recorded NO external_write since the in-flight
+//     marker (a resume can never double-act a send/write it can't see), and
+//   - the interruption is fresh (age cap — don't resurrect ancient runs), and
+//   - bounded per boot (a restart loop must not fan out resumes).
+// Ineligible runs keep today's banner + manual `continue` exactly as-is.
+// Kill-switch CLEMMY_CHAT_AUTO_RESUME=off restores banner-only for all.
+const AUTO_RESUME_MAX_PER_BOOT = 3;
+const AUTO_RESUME_MAX_AGE_MS = 2 * 60 * 60_000;
+const AUTO_RESUME_REPLY =
+  'This run was interrupted by a restart — resuming it automatically now. (Reply `stop` if you no longer want it.)';
+
+function autoResumeEnabled(): boolean {
+  return (process.env.CLEMMY_CHAT_AUTO_RESUME ?? 'on').toLowerCase() !== 'off';
+}
+
+/** A dispatcher the daemon supplies at boot: run one continuation turn on the
+ *  session through the normal harness spine. Injected (not imported) so this
+ *  module stays free of the respond-bridge dependency. */
+export type ResumeDispatcher = (sessionId: string, directive: string) => Promise<void>;
+
+export const AUTO_RESUME_DIRECTIVE = [
+  'The previous run in this session was interrupted by a daemon restart and has been automatically resumed.',
+  'Pick up exactly where you left off using the replayed conversation, tool outputs, and audit log — do not restart from scratch.',
+  'If the task was already effectively complete, deliver the final answer now.',
+].join('\n');
+
+/** External-write check: TRUE when the interrupted window recorded any
+ *  external_write event — those runs are never auto-resumed (double-act risk). */
+function hadExternalWriteSince(sessionId: string, sinceIso: string): boolean {
+  try {
+    const writes = listEvents(sessionId, { types: ['external_write'] });
+    return writes.some((ev) => String(ev.createdAt ?? '') >= sinceIso);
+  } catch {
+    return true; // can't prove safety → keep the manual banner
+  }
 }
 
 /**
@@ -66,6 +109,10 @@ export interface RestartRecoveryRecord {
   noticeRecorded: boolean;
   notified: boolean;
   markerCleared: boolean;
+  /** True when this run met the safety bar and a resume was dispatched. */
+  autoResumed: boolean;
+  /** Why auto-resume did NOT run (for the boot log / forensics). */
+  autoResumeSkipped?: 'disabled' | 'no_dispatcher' | 'external_write' | 'too_old' | 'boot_cap';
   errors: string[];
 }
 
@@ -102,7 +149,10 @@ function buildReplayPrimer(sessionId: string, inFlightSince: string): string {
  * so report-back never fails silently, send a bounded notification, and clear the
  * marker. Returns a structured recovery summary. Never throws.
  */
-export function recoverInterruptedChatRuns(now: () => number = Date.now): RestartRecoverySummary {
+export function recoverInterruptedChatRuns(
+  now: () => number = Date.now,
+  dispatchResume?: ResumeDispatcher,
+): RestartRecoverySummary {
   if (!enabled()) return { enabled: false, scanned: 0, recovered: 0, notified: 0, records: [] };
 
   let rows;
@@ -114,6 +164,7 @@ export function recoverInterruptedChatRuns(now: () => number = Date.now): Restar
 
   let recovered = 0;
   let notified = 0;
+  let autoResumes = 0;
   const records: RestartRecoveryRecord[] = [];
   for (const row of rows) {
     let sess: HarnessSession | null = null;
@@ -144,8 +195,19 @@ export function recoverInterruptedChatRuns(now: () => number = Date.now): Restar
       noticeRecorded: false,
       notified: false,
       markerCleared: false,
+      autoResumed: false,
       errors: [],
     };
+
+    // Auto-resume decision (see the safety bar above). Decided up front so the
+    // in-session notice tells the truth about what happens next.
+    const ageMs = now() - Date.parse(since);
+    if (!autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
+    else if (!dispatchResume) record.autoResumeSkipped = 'no_dispatcher';
+    else if (autoResumes >= AUTO_RESUME_MAX_PER_BOOT) record.autoResumeSkipped = 'boot_cap';
+    else if (!Number.isFinite(ageMs) || ageMs > AUTO_RESUME_MAX_AGE_MS) record.autoResumeSkipped = 'too_old';
+    else if (hadExternalWriteSince(row.id, since)) record.autoResumeSkipped = 'external_write';
+    const willAutoResume = record.autoResumeSkipped === undefined;
 
     try {
       record.snapshotItemsBefore = sess.toInputItems().length;
@@ -157,7 +219,9 @@ export function recoverInterruptedChatRuns(now: () => number = Date.now): Restar
       record.errors.push(`replay_primer: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    // Non-silent in-session notice (the dock replays it; `continue` resumes).
+    // Non-silent in-session notice (the dock replays it). The text tells the
+    // truth about what happens next: auto-resuming, or waiting for `continue`.
+    const noticeReply = willAutoResume ? AUTO_RESUME_REPLY : INTERRUPTED_REPLY;
     try {
       appendEvent({
         sessionId: row.id,
@@ -167,9 +231,11 @@ export function recoverInterruptedChatRuns(now: () => number = Date.now): Restar
         data: {
           steps: 0,
           reason: 'interrupted_by_restart',
-          summary: INTERRUPTED_REPLY,
-          reply: INTERRUPTED_REPLY,
+          summary: noticeReply,
+          reply: noticeReply,
           interruptedAt: since,
+          autoResume: willAutoResume,
+          ...(record.autoResumeSkipped ? { autoResumeSkipped: record.autoResumeSkipped } : {}),
           replayPrepared: record.replayPrepared,
           replayPrimerChanged: record.replayPrimerChanged,
           snapshotItemsBefore: record.snapshotItemsBefore,
@@ -184,7 +250,10 @@ export function recoverInterruptedChatRuns(now: () => number = Date.now): Restar
 
     const tick = now();
     // Bounded proactive notification so the user is told even off-session.
-    if (notified < MAX_NOTIFICATIONS) {
+    // An auto-resumed run notifies only if the resume FAILS (below) — a
+    // successful resume delivers its own answer, and "it broke + it's fixed"
+    // as two pings is noise.
+    if (!willAutoResume && notified < MAX_NOTIFICATIONS) {
       try {
         addNotification({
           id: `${tick}-chat-interrupted-${row.id}`,
@@ -213,6 +282,38 @@ export function recoverInterruptedChatRuns(now: () => number = Date.now): Restar
       record.errors.push('marker_clear: failed');
     }
 
+    // Dispatch the resume AFTER the marker is cleared (a resume that itself gets
+    // interrupted re-marks in-flight and is re-evaluated — including the
+    // external-write guard — on the next boot; naturally bounded). Fire-and-
+    // forget: boot must not block on model turns. A dispatch FAILURE falls back
+    // to the manual banner + notification so the user is never left waiting on
+    // a resume that silently died.
+    if (willAutoResume && dispatchResume) {
+      autoResumes += 1;
+      record.autoResumed = true;
+      const sessionId = row.id;
+      void dispatchResume(sessionId, AUTO_RESUME_DIRECTIVE).catch(() => {
+        try {
+          appendEvent({
+            sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'conversation_completed',
+            data: { steps: 0, reason: 'interrupted_by_restart', summary: INTERRUPTED_REPLY, reply: INTERRUPTED_REPLY, autoResume: false, autoResumeFailed: true },
+          });
+          addNotification({
+            id: `${now()}-chat-resume-failed-${sessionId}`,
+            kind: 'system',
+            title: 'Automatic resume failed — a chat task needs you',
+            body: `${INTERRUPTED_REPLY} (session ${sessionId})`,
+            createdAt: new Date(now()).toISOString(),
+            read: false,
+            metadata: { sessionId, reason: 'auto_resume_failed' },
+          });
+        } catch { /* best-effort fallback */ }
+      });
+    }
+
     recovered += 1;
     records.push(record);
   }
@@ -223,9 +324,13 @@ export function recoverInterruptedChatRuns(now: () => number = Date.now): Restar
 /**
  * Back-compat wrapper used by daemon boot logging. Prefer
  * recoverInterruptedChatRuns() when the caller needs a visible recovery plan.
+ * Pass `dispatchResume` to enable safe auto-resume (see the safety bar above).
  */
-export function reportInterruptedChatRuns(now: () => number = Date.now): number {
-  const summary = recoverInterruptedChatRuns(now);
+export function reportInterruptedChatRuns(
+  now: () => number = Date.now,
+  dispatchResume?: ResumeDispatcher,
+): number {
+  const summary = recoverInterruptedChatRuns(now, dispatchResume);
   return summary.recovered;
 }
 

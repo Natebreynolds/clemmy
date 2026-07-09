@@ -77,6 +77,9 @@ export async function uploadAttachment(file: File): Promise<AttachResult> {
 export interface StreamHandle {
   promise: Promise<{ ok: boolean; error: string | null }>;
   stop: () => void;
+  /** Highest event seq delivered so far — the resume cursor for a late-recovery
+   *  watch after the stream gives up (the run may still finish server-side). */
+  getLastSeq: () => number;
 }
 
 /**
@@ -88,10 +91,22 @@ export function runHarnessStream(
   sessionId: string,
   opts: { sinceSeq?: number; onEvent: (ev: HarnessEvent) => void },
 ): StreamHandle {
-  const MAX_RECONNECTS = 5;
+  // Reconnect budget (2026-07-09): a daemon RESTART takes 10–30s+ (longer on a
+  // slow disk), and the event stream is losslessly resumable via sinceSeq — so
+  // giving up after ~5 EventSource errors (~15s) converted every mid-turn
+  // restart into a permanent "I lost the live connection", even when the run
+  // recovered and completed server-side (verified live: kill -9 mid-run → the
+  // run resumed and finished; the old client would never have shown it). Ride
+  // through outages up to RECONNECT_WINDOW_MS, recreating the EventSource with
+  // backoff; a CLOSED source is reconnected, not treated as fatal.
+  const RECONNECT_WINDOW_MS = 120 * 1000;
+  const RECONNECT_BASE_DELAY_MS = 1_000;
+  const RECONNECT_MAX_DELAY_MS = 8_000;
   const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
   let lastSeq = Number(opts.sinceSeq) || 0;
   let attempts = 0;
+  let outageStartedAt = 0; // 0 = healthy; else Date.now() of the first error in this outage
+  let reconnectPending = false; // one reconnect cycle at a time
   let es: EventSource | null = null;
   let closed = false;
   let sawEvent = false;
@@ -157,27 +172,34 @@ export function runHarnessStream(
         const payload = JSON.parse((e as MessageEvent).data) as { events?: HarnessEvent[] };
         for (const ev of payload.events ?? []) { handleEvent(ev); if (closed) break; }
         attempts = 0;
+        outageStartedAt = 0; // replay delivered — the connection is healthy again
       } catch { /* ignore */ }
     });
     es.addEventListener('event', (e) => {
+      outageStartedAt = 0;
       try { handleEvent(JSON.parse((e as MessageEvent).data) as HarnessEvent); } catch { /* ignore */ }
     });
     es.onerror = () => {
-      if (closed) return;
-      if (es && es.readyState === EventSource.CLOSED) {
-        void pollReplayFallback().finally(() => {
-          if (!closed && !sawTerminal) failStream(sawEvent ? 'connection closed before the turn finished' : 'connection closed before any reply');
-        });
-        return;
-      }
+      if (closed || reconnectPending) return;
+      reconnectPending = true;
+      if (outageStartedAt === 0) outageStartedAt = Date.now();
       attempts += 1;
-      if (attempts > MAX_RECONNECTS) {
-        void pollReplayFallback().finally(() => {
-          if (!closed && !sawTerminal) failStream('could not reconnect to the live stream');
-        });
-        return;
-      }
-      // EventSource auto-reconnects; our handlers stay attached.
+      // Between attempts, poll the replay endpoint — it both bridges an SSE-only
+      // failure AND picks up a terminal event the moment the daemon is back, so
+      // a run that finished during the outage completes the stream normally.
+      void pollReplayFallback().finally(() => {
+        if (closed || sawTerminal) { reconnectPending = false; return; }
+        if (Date.now() - outageStartedAt >= RECONNECT_WINDOW_MS) {
+          reconnectPending = false;
+          failStream(sawEvent ? 'connection lost before the turn finished' : 'connection lost before any reply');
+          return;
+        }
+        const delay = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * Math.pow(2, Math.min(attempts - 1, 3)));
+        setTimeout(() => {
+          reconnectPending = false;
+          if (!closed && !sawTerminal) connect();
+        }, delay);
+      });
     };
   };
 
@@ -187,5 +209,46 @@ export function runHarnessStream(
   return {
     promise,
     stop: () => { if (!closed) { streamError = ''; finish(); } },
+    getLastSeq: () => lastSeq,
   };
+}
+
+/**
+ * Late-recovery watch (2026-07-09): after a stream gives up, the run frequently
+ * FINISHES server-side (restart recovery resumes it; the daemon just came back
+ * after the reconnect window). Poll the session slowly for a terminal event and
+ * deliver it, so "Stopped" is replaced by the real answer instead of stranding
+ * a completed run invisibly. Bounded; stops on the first terminal event.
+ */
+export function watchForLateCompletion(
+  sessionId: string,
+  sinceSeq: number,
+  onEvent: (ev: HarnessEvent) => void,
+  opts: { intervalMs?: number; maxAttempts?: number } = {},
+): { cancel: () => void } {
+  const intervalMs = opts.intervalMs ?? 15_000;
+  const maxAttempts = opts.maxAttempts ?? 40; // ~10 minutes
+  let cancelled = false;
+  let lastSeq = sinceSeq;
+  let attempt = 0;
+  const tick = async () => {
+    if (cancelled) return;
+    attempt += 1;
+    try {
+      const url = withToken(`/api/sessions/${encodeURIComponent(sessionId)}/events/recent?sinceSeq=${lastSeq}&limit=500`);
+      const res = await fetch(url, { credentials: 'same-origin', headers: { accept: 'application/json' } });
+      const data = (await res.json().catch(() => ({}))) as { events?: HarnessEvent[] };
+      for (const ev of data.events ?? []) {
+        if (ev && typeof ev.seq === 'number' && ev.seq > 0) {
+          if (ev.seq <= lastSeq) continue;
+          lastSeq = ev.seq;
+        }
+        onEvent(ev);
+        if (isTerminalEvent(ev.type)) { cancelled = true; return; }
+      }
+    } catch { /* daemon still down — keep watching */ }
+    if (!cancelled && attempt < maxAttempts) setTimeout(() => { void tick(); }, intervalMs);
+  };
+  setTimeout(() => { void tick(); }, intervalMs);
+  return { cancel: () => { cancelled = true; } };
 }

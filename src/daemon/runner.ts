@@ -1028,11 +1028,21 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
     logger.warn({ autoResumed }, 'Auto-resumed interrupted background tasks on boot');
   }
   // Chat runs execute in-process with no resumer; a restart mid-run would
-  // otherwise die SILENTLY. Surface each interrupted chat run (non-silent
-  // notice + notification + "reply continue") so report-back never fails.
-  const recoveredChats = reportInterruptedChatRuns();
+  // otherwise die SILENTLY. Surface each interrupted chat run, and — when the
+  // interrupted turn provably made no external writes — RESUME it automatically
+  // through the same harness spine a user's `continue` uses (2026-07-09: users
+  // sat on "reply continue" banners after every restart; the resume path itself
+  // was live-verified to work). Write-touched / stale runs keep the manual banner.
+  const recoveredChats = reportInterruptedChatRuns(Date.now, async (sessionId, directive) => {
+    await respondPreferHarness('background', {
+      sessionId,
+      channel: 'daemon',
+      message: directive,
+      model: MODELS.primary,
+    }, (req) => assistant.respond(req));
+  });
   if (recoveredChats > 0) {
-    logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart');
+    logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart (safe ones auto-resumed)');
   }
   const reconciledHarnessSessions = reconcileDormantTerminalWorkSessions();
   if (reconciledHarnessSessions.reconciled > 0) {

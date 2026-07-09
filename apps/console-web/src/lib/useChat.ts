@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
-import { postChat, runHarnessStream, cancelSession, humanHarnessText, type StreamHandle } from './chat';
+import { postChat, runHarnessStream, watchForLateCompletion, cancelSession, humanHarnessText, type StreamHandle } from './chat';
 import { apiPost, type ApiError } from './api';
 import { humanToolLabel, salientArgDetail } from './toolLabels';
 import type { HarnessEvent, PendingActionApprovalView } from './types';
@@ -241,6 +241,7 @@ export function useChat(options?: UseChatOptions) {
   const sessionIdRef = useRef<string | null>(options?.initialSessionId ?? null);
   const streamRef = useRef<StreamHandle | null>(null);
   const activeAssistantId = useRef<string | null>(null);
+  const lateWatchRef = useRef<{ cancel: () => void } | null>(null);
 
   const patch = useCallback((id: string, fields: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...fields } : m)));
@@ -315,6 +316,10 @@ export function useChat(options?: UseChatOptions) {
 
     const userId = nextId();
     const assistantId = nextId();
+    // A new turn owns the session's event stream — a still-running late watch
+    // from a previous stopped turn would misattribute this turn's events.
+    lateWatchRef.current?.cancel();
+    lateWatchRef.current = null;
     activeAssistantId.current = assistantId;
     setMessages((prev) => [
       ...prev,
@@ -337,9 +342,14 @@ export function useChat(options?: UseChatOptions) {
         setMessages((prev) => prev.map((m) => {
           if (m.id !== assistantId) return m;
           if (m.status && m.status !== 'thinking') return m; // a terminal event already landed
-          const note = 'I lost the live connection before this finished. Check Inbox for the latest, or say “continue”.';
+          const note = 'I lost the live connection — still watching for the result in the background. Say “continue” to nudge it, or check Inbox.';
           return { ...m, text: m.text ? `${m.text}\n\n${note}` : note, status: 'stopped', progress: undefined };
         }));
+        // The run often FINISHES server-side after a restart (restart recovery /
+        // auto-resume) — keep a slow watch on the session and deliver the real
+        // result over the "stopped" note instead of stranding a completed run.
+        // (Any prior watch was cancelled at the top of this send.)
+        lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev));
       }
     } catch (err) {
       const e = err as ApiError;

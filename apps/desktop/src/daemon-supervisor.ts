@@ -60,18 +60,28 @@ const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 30_000;
 
-// ── Liveness watchdog (2026-07-08) ──────────────────────────────────────────
+// ── Liveness watchdog (2026-07-08; retuned 2026-07-09) ─────────────────────
 // A synchronous fs call inside the daemon's event loop hung on a saturated
 // disk (OneDrive sync → open$NOCANCEL never returned): the process stayed
 // alive but every HTTP request, chat turn, and even SIGTERM handling froze —
 // indefinitely, until a human noticed. The supervisor only probed at BOOT, so
 // a daemon that hung after 'ready' was invisible. Keep probing /api/status for
-// the whole run; after LIVENESS_MAX_MISSES consecutive timeouts (~1 min of a
-// blocked loop) SIGKILL the child — a frozen loop can't process SIGTERM — and
-// let the existing exit→scheduleRestart path bring it back with backoff.
+// the whole run; after LIVENESS_MAX_MISSES consecutive timeouts SIGKILL the
+// child — a frozen loop can't process SIGTERM — and let the existing
+// exit→scheduleRestart path bring it back with backoff.
+//
+// RETUNE (live false-positive, 2026-07-09 03:22Z): the v1.3.1 values (5s
+// timeout × 3 misses, no grace) SIGKILLed a BUSY-but-alive daemon — boot
+// warmup (route-policy rebuild, local embedding model load) starved three
+// short probes while a real chat POST was being served seconds later. A
+// watchdog that manufactures the exact mid-run restarts it exists to prevent
+// is worse than none. New bar: a probe gets 15s (an intermittently-busy loop
+// can answer; a frozen one cannot), FOUR consecutive misses (~80s of sustained
+// unresponsiveness), and NO verdicts during the post-ready warmup grace.
 const LIVENESS_PROBE_INTERVAL_MS = 20_000;
-const LIVENESS_PROBE_TIMEOUT_MS = 5_000;
-const LIVENESS_MAX_MISSES = 3;
+const LIVENESS_PROBE_TIMEOUT_MS = 15_000;
+const LIVENESS_MAX_MISSES = 4;
+const LIVENESS_GRACE_AFTER_READY_MS = 180_000;
 
 // supervisor.log is append-only and was never rotated — it grew unbounded
 // (30MB+ observed). Roll it at log-open when it exceeds this size, keeping one
@@ -396,9 +406,14 @@ export class DaemonSupervisor {
   private startLivenessWatchdog(): void {
     this.stopLivenessWatchdog();
     this.livenessMisses = 0;
+    const readyAt = Date.now();
     const url = `http://${WEBHOOK_HOST}:${this.chosenPort}/api/status`;
     this.livenessTimer = setInterval(() => {
       if (this.shuttingDown || !this.child) { this.stopLivenessWatchdog(); return; }
+      // Warmup grace: boot does legitimately heavy work (embedding model load,
+      // policy rebuilds) that can starve probes without being a hang. Probes
+      // still run (so the miss counter is warm), but no verdict fires yet.
+      if (Date.now() - readyAt < LIVENESS_GRACE_AFTER_READY_MS) { this.livenessMisses = 0; }
       if (this.livenessProbeInFlight) return; // never stack probes
       this.livenessProbeInFlight = true;
       void fetch(url, { signal: AbortSignal.timeout(LIVENESS_PROBE_TIMEOUT_MS) })
