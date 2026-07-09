@@ -466,3 +466,14 @@ test('needsApprovalFromTaxonomy: worker sub-runs inherit harness plan scope', as
 process.on('exit', () => {
   try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
 });
+
+test('decideToolApproval: run_batch never takes the per-tool interrupt — approval lives on the pending action (sess-mrdy6vip double-approval)', () => {
+  const propose = decideToolApproval({
+    toolName: 'run_batch',
+    args: { action: 'propose', plan: { tool: 'composio_execute_tool', composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', sideEffect: 'send', objective: 'send 10 emails', items: [] } },
+  });
+  assert.equal(propose.needsApproval, false, 'propose only validates + queues');
+  assert.equal(propose.reason, 'pending-action-owned');
+  const execute = decideToolApproval({ toolName: 'run_batch', args: { action: 'execute', pending_action_id: 'pa-1' } });
+  assert.equal(execute.needsApproval, false, 'execute self-refuses unless the pending action is APPROVED');
+});

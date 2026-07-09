@@ -539,6 +539,7 @@ export interface ApprovalDecision {
     | 'workspace-policy'
     | 'yolo-policy'
     | 'strict-policy'
+    | 'pending-action-owned'
     | 'unknown';
   kind: ToolKind;
 }
@@ -556,6 +557,18 @@ export function decideToolApproval(input: ApprovalDecisionInput): ApprovalDecisi
   // verb and would otherwise count as `write`).
   if (NEVER_GATE_LOCAL_MEMORY.has(input.toolName)) {
     return { needsApproval: false, reason: 'read-always-auto', kind };
+  }
+
+  // run_batch's approval contract lives on the QUEUED PENDING ACTION, never
+  // on the tool call: propose/status only validate + certify + queue (no
+  // external effect), and execute refuses server-side unless the pending
+  // action is already APPROVED (byte-pinned payload). A per-tool interrupt
+  // here is the DOUBLE-approval users hit on send batches — one card to
+  // propose, a second to approve the queued plan (live 2026-07-09
+  // sess-mrdy6vip: four cards for one 10-email batch). Same class as the
+  // 2026-06-17 double-approval fix above.
+  if (input.toolName === 'run_batch') {
+    return { needsApproval: false, reason: 'pending-action-owned', kind };
   }
 
   if (kind === 'admin') {
