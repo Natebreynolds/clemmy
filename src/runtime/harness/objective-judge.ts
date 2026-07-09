@@ -30,14 +30,17 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
   '- Audit ONLY the deliverables the objective actually names. Do NOT invent extra deliverables (an "audit artifact", a "decision document", a saved file) that the user never asked for — demanding unnamed artifacts trains the assistant to write filler evidence files instead of doing work.',
   '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
+  '- AWAITING THE USER: if the response asks the user a genuine direction or authorization question — which option to take, whether to proceed with an external action (sending, posting, deleting), or scope the objective left open — that question IS this turn\'s deliverable. The assistant must NOT take consequential external actions without the user\'s go-ahead, so demanding it "finish" instead of asking would be wrong. This includes an honest partial-progress report that pauses for the user\'s decision.',
   '',
   'Reply with EXACTLY ONE LINE and nothing else, one of:',
   '  "DONE: <one short sentence naming the artifact/URL/result that satisfied the objective>";',
+  '  "AWAITING: <one short sentence naming the decision the user was asked to make>";',
   '  "INCOMPLETE: <one short sentence naming the missing evidence>".',
   '',
   'Examples:',
   '  DONE: Spreadsheet created at /Users/me/Q3.xlsx with URL returned',
   '  DONE: The requested analysis is fully present in the response with its supporting figures',
+  '  AWAITING: Assistant asked whether to send the 55 prepared emails now or review them first',
   '  INCOMPLETE: Assistant proposed steps but did not produce the deliverable the objective named',
   '  INCOMPLETE: Two of three deliverables remain — emails drafted but no send confirmation evidence',
 ].join('\n');
@@ -70,6 +73,14 @@ export interface ObjectiveJudgeVerdict {
    */
   failedOpen?: boolean;
   selfJudge?: boolean;
+  /**
+   * The judge ruled the turn's deliverable is a genuine direction/authorization
+   * question to the user (AWAITING verdict). Treated as done for bounce purposes;
+   * the caller should yield the turn as awaiting_user_input, never continue past
+   * the question (sess-mrds80fu: a bounced approval question became 10 unapproved
+   * emails).
+   */
+  awaitingUser?: boolean;
 }
 
 export interface ObjectiveJudgeGateInput {
@@ -234,12 +245,17 @@ export type ObjectiveJudgeFn = (
 // nothing left to reject a valid verdict on presentation. Returns null on no marker
 // so each caller applies its OWN fail semantics (strict throws → not-passed; the
 // interactive judge fails open → done:true), preserving both directions unchanged.
-export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string } | null {
+export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string; awaitingUser?: boolean } | null {
   if (isRecord(finalOutput)) return parseCompletionObject(finalOutput);
   const raw = String(finalOutput ?? '').trim();
-  const match = /^\s*(DONE|INCOMPLETE|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
+  const match = /^\s*(DONE|AWAITING|INCOMPLETE|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
   if (match) {
-    return { done: match[1].toUpperCase() === 'DONE', reason: (match[2] || '').trim().slice(0, 400) };
+    const marker = match[1].toUpperCase();
+    const reason = (match[2] || '').trim().slice(0, 400);
+    // AWAITING = the deliverable is a question to the user. Done for bounce
+    // purposes (never scold-continue past it); the caller yields awaiting-user.
+    if (marker === 'AWAITING') return { done: true, awaitingUser: true, reason };
+    return { done: marker === 'DONE', reason };
   }
   const json = extractJsonCandidate(raw);
   if (!json) return null;
@@ -377,7 +393,7 @@ class JudgeVerdictParseError extends Error {}
 
 interface CompletionJudgeRun {
   /** Parsed verdict from the first attempt to answer, or null. */
-  verdict: { done: boolean; reason: string } | null;
+  verdict: { done: boolean; reason: string; awaitingUser?: boolean } | null;
   /** null-verdict cause for metrics/fail semantics: pure deadline miss vs
    *  parse failure vs transport error. */
   failure: 'timeout' | 'invalid' | 'error' | null;
@@ -583,7 +599,7 @@ export async function judgeObjectiveCompleteStrict(
       run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
     );
   }
-  return { done: run.verdict.done, reason: run.verdict.reason };
+  return { done: run.verdict.done, reason: run.verdict.reason, ...(run.verdict.awaitingUser ? { awaitingUser: true } : {}) };
 }
 
 /**
@@ -609,5 +625,42 @@ export async function judgeObjectiveComplete(
           : 'judge unavailable — accepting completion';
     return { done: true, reason: why, failedOpen: true };
   }
-  return { done: run.verdict.done, reason: run.verdict.reason, selfJudge: run.routing?.selfJudge === true };
+  return {
+    done: run.verdict.done,
+    reason: run.verdict.reason,
+    selfJudge: run.routing?.selfJudge === true,
+    ...(run.verdict.awaitingUser ? { awaitingUser: true } : {}),
+  };
+}
+
+/**
+ * Deterministic detector for a DIRECTION-SEEKING question — a reply whose
+ * closing move asks the user to choose, confirm, or authorize the next step.
+ * Deliberately narrower than "ends with a question mark": a polite "anything
+ * else?" tail does not count; "do you want me to send the 55 emails?" does.
+ * Pure + exported for tests. Used by the loop's ask-first invariant to convert
+ * a completed-tagged question turn into awaiting_user_input BEFORE the
+ * completion judge can bounce it (sess-mrds80fu: that bounce escalated a
+ * permission question into unapproved sends).
+ */
+const DIRECTION_QUESTION_RE = new RegExp(
+  [
+    String.raw`\b(?:do|would|should|shall|can|could)\s+(?:you|i|we)\b[^?]{0,200}\?`,
+    String.raw`\bwant\s+me\s+to\b[^?]{0,200}\?`,
+    String.raw`\bwould\s+you\s+like\b[^?]{0,200}\?`,
+    String.raw`\b(?:which|what)\s+(?:one|option|approach|order|account|list|version)\b[^?]{0,200}\?`,
+    String.raw`\b(?:confirm|approve|authorize|green[- ]?light|go[- ]?ahead)\b[^?]{0,200}\?`,
+    String.raw`\b(?:proceed|continue|resume|send|post|publish|delete)\b[^?]{0,120}\?`,
+    String.raw`\bor\s+(?:should|do|would)\b[^?]{0,200}\?`,
+  ].join('|'),
+  'i',
+);
+
+export function isDirectionSeekingQuestion(reply?: string | null): boolean {
+  const text = (reply ?? '').trim();
+  if (!text || !text.includes('?')) return false;
+  // Only the CLOSING move counts — a question answered mid-reply followed by a
+  // delivered artifact is not a pause. Inspect the final ~400 chars.
+  const tail = text.slice(-400);
+  return DIRECTION_QUESTION_RE.test(tail);
 }

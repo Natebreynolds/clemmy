@@ -182,11 +182,20 @@ export async function validateGoal(
   if (criteria.length === 0) {
     try {
       const verdict = await judge(input.objective, input.evidenceText);
-      const perCriterion: GoalCriterionVerdict[] = [{ criterion: input.objective, pass: verdict.done, method: 'judge', detail: verdict.reason }];
+      // AWAITING is done:true for the CHAT bounce lane, but for a parked GOAL
+      // it means "paused for the user's decision" — the work has NOT happened.
+      // Banking it as satisfied would clear the goal on the strength of a
+      // question ("shall I proceed with the send?") and the work never runs
+      // (adversarial review, 2026-07-09). Not-pass keeps the goal pinned.
+      const pass = verdict.done && !verdict.awaitingUser;
+      const detail = verdict.awaitingUser
+        ? `awaiting the user's decision — goal stays pinned: ${verdict.reason}`
+        : verdict.reason;
+      const perCriterion: GoalCriterionVerdict[] = [{ criterion: input.objective, pass, method: 'judge', detail }];
       return {
-        pass: verdict.done,
+        pass,
         perCriterion,
-        advice: verdict.done ? undefined : verdict.reason,
+        advice: pass ? undefined : detail,
         ...scoreGoalVerdicts(perCriterion),
       };
     } catch (err) {
@@ -243,8 +252,12 @@ export async function validateGoal(
           ...fuzzy.map((c, i) => `${i + 1}. ${c}`),
         ].join('\n');
         const verdict = await judge(checklistObjective, input.evidenceText);
+        // AWAITING = paused for the user, not satisfied (same guard as the
+        // criteria-less lane above) — a goal never clears on a question.
+        const pass = verdict.done && !verdict.awaitingUser;
+        const detail = verdict.awaitingUser ? `awaiting the user's decision: ${verdict.reason}` : verdict.reason;
         for (const criterion of fuzzy) {
-          perCriterion.push({ criterion, pass: verdict.done, method: 'judge', detail: verdict.reason });
+          perCriterion.push({ criterion, pass, method: 'judge', detail });
         }
       }
     } catch (err) {

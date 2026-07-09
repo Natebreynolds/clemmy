@@ -27,6 +27,7 @@ import {
   judgeObjectiveComplete,
   composeJudgedObjective,
   isPromiseShapedReply,
+  isDirectionSeekingQuestion,
   type SkillExecutionContext,
   type ObjectiveJudgeFn,
 } from './objective-judge.js';
@@ -1061,6 +1062,19 @@ export async function respondViaClaudeAgentSdkBrain(
     // workflow" / "I sent the emails" with no artifact). On a "not done" verdict,
     // do ONE bounded continuation. Fail-open (a judge error ⇒ treat as done;
     // never wedge). Kill-switch CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE.
+    // ASK-FIRST invariant (parity with loop.ts, sess-mrds80fu): a reply whose
+    // closing move asks the user for direction/authorization is this turn's
+    // deliverable — flip to awaiting-input and never judge it, instead of the
+    // judge scolding the question into autonomous execution.
+    if (
+      completionJudgeEnabled() &&
+      modeCanAuthorOrExecute(mode) &&
+      !resultIsAwaitingInput() &&
+      !result.limitHit &&
+      isDirectionSeekingQuestion(result.text)
+    ) {
+      result = { ...result, stoppedReason: 'awaiting-input' };
+    }
     if (
       completionJudgeEnabled() &&
       modeCanAuthorOrExecute(mode) &&
@@ -1088,6 +1102,19 @@ export async function respondViaClaudeAgentSdkBrain(
           const verdict = await judgeImpl(objective, result.text || '', skillContext);
           done = verdict.done;
           reason = verdict.reason;
+          // AWAITING: the judge ruled the reply pauses for the user — flip to
+          // awaiting-input and stop judging (parity with loop.ts).
+          if (verdict.awaitingUser) {
+            result = { ...result, stoppedReason: 'awaiting-input' };
+            break;
+          }
+          // A selfJudge NOT-DONE (same family as the brain) gets ONE bounce,
+          // never two — the second disagreement is accepted with the advisory
+          // tag (parity with loop.ts; sess-mrds80fu).
+          if (!done && verdict.selfJudge && i >= 1) {
+            completionVerification = { selfJudge: true };
+            break;
+          }
           // Tag the completion's verification confidence (only when accepting).
           if (verdict.done && (verdict.failedOpen || verdict.selfJudge)) {
             completionVerification = { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge };
@@ -1104,8 +1131,9 @@ export async function respondViaClaudeAgentSdkBrain(
         const contResult = await runContinuation({
           prompt:
             `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
-            `Original request: "${request.message}". Continue now and FINISH it — produce the concrete ` +
-            `artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
+            `Original request: "${request.message}". ` +
+            `IMPORTANT: if finishing requires the USER'S decision or authorization — sending, posting, or deleting something external, or scope left open — do NOT proceed on your own; end your reply with the concrete question for the user. That is a correct, complete answer. ` +
+            `Otherwise continue now and FINISH it — produce the concrete artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
           ...cleanContinuationRunOptions(),
         });
         continuationsUsed += 1;

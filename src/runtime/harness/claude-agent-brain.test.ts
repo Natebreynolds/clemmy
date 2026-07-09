@@ -447,7 +447,8 @@ test('full mode: completion judge bounces a not-done turn into ONE continuation,
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-judge' });
 
   assert.equal(prompts.length, 2, 'one continuation fired after the not-done verdict');
-  assert.match(prompts[1], /Continue now and FINISH it/);
+  assert.match(prompts[1], /continue now and FINISH it/i);
+  assert.match(prompts[1], /do NOT proceed on your own/i, 'continuation permits asking before external actions');
   assert.match(res.text, /Sent all 3 emails/);
 });
 

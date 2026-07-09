@@ -45,7 +45,7 @@ import {
   predictTurnCost,
 } from './budget.js';
 import { MODELS } from '../../config.js';
-import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
+import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, isDirectionSeekingQuestion, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import {
@@ -2287,6 +2287,43 @@ async function runConversationCore(
       };
     }
 
+    // ASK-FIRST invariant (2026-07-09, sess-mrds80fu). A completed-tagged turn
+    // whose CLOSING move is a direction/authorization question to the user is a
+    // conversational beat — the question IS the deliverable. Downgrade it to
+    // awaiting_user_input BEFORE the completion judge can see it: the judge's
+    // "only asked a follow-up question" bounce scolded the agent past its own
+    // permission question and into 10 unapproved external sends. Deterministic,
+    // code-level, monotonic (only ever downgrades completed → awaiting), same
+    // conservative shape as the done-invariant below.
+    // Scoped to exactly the turns the completion judge would audit (same gate
+    // as shouldRunObjectiveJudge minus the budget): a casual conversational
+    // question ("what would you like to work on?") keeps its completed status.
+    // GOAL sessions are exempt (adversarial review, 2026-07-09): an approved
+    // goal run already carries the user's authorization, and its stage reports
+    // habitually end "shall I continue?" — parking an UNATTENDED resume on
+    // that rhetorical question would regress approve-once-then-run. The goal
+    // contract's own validation owns completion there.
+    const askFirstEligible = objectiveJudgeOptIn
+      && (objectiveJudgeActionIntent || totalToolCalls >= OBJECTIVE_JUDGE_WORK_THRESHOLD)
+      && !safeActiveGoal(options.sessionId);
+    if (
+      askFirstEligible
+      && decision.done
+      && decision.nextAction === 'completed'
+      && isDirectionSeekingQuestion(decision.reply || decision.summary)
+    ) {
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'ask_first_invariant',
+          message: 'Completed-tagged reply closes with a direction/authorization question — honoring awaiting_user_input; the question is the deliverable.',
+        },
+      });
+      decision.nextAction = 'awaiting_user_input';
+    }
     // Done-invariant guardrail (Done? node). `done` and `nextAction` are
     // INDEPENDENT schema fields, so the model can emit the contradiction
     // `done:true` + `nextAction:awaiting_*` — declaring finished while also
@@ -2553,7 +2590,79 @@ async function runConversationCore(
         const skillGap = (getRuntimeEnv('HARNESS_SKILL_EXEC_GATE', 'on') ?? 'on').toLowerCase() !== 'off'
           ? skillExecutionShortfall(options.sessionId)
           : null;
-        if (!verdict.done || skillGap) {
+        // AWAITING verdict: the judge ruled the reply's question/pause IS the
+        // deliverable (backstop for shapes the deterministic ask-first invariant
+        // can't classify, e.g. an honest partial-progress report). Yield to the
+        // user — never continue past a question awaiting their call. Runs AFTER
+        // the deterministic skill floor (a skill shortfall still bounces), and
+        // synthesizes the awaiting_user_input event so ?-less pause replies are
+        // DELIVERED verbatim on every surface instead of respond-bridge falling
+        // back to a stale session-wide question (adversarial review 2026-07-09).
+        if (verdict.awaitingUser && !skillGap) {
+          const awaitingSummary = (decision.reply && decision.reply.trim() ? decision.reply : decision.summary) ?? '';
+          const askedThisTurn = (() => {
+            try {
+              return listEvents(options.sessionId, { types: ['awaiting_user_input'] })
+                .some((e) => e.turn === turnResult.turn);
+            } catch { return false; }
+          })();
+          if (!askedThisTurn) {
+            safeAppend({
+              sessionId: options.sessionId,
+              turn: turnResult.turn,
+              role: 'Clem',
+              type: 'awaiting_user_input',
+              data: { question: awaitingSummary, source: 'judge_awaiting_verdict' },
+            });
+          }
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'conversation_completed',
+            data: {
+              steps: stepIndex,
+              summary: awaitingSummary,
+              internalSummary: decision.summary,
+              reply: decision.reply ?? null,
+              delivered: true,
+              awaitingUser: true,
+              ...(completionVerification ? { verification: completionVerification } : {}),
+            },
+          });
+          return {
+            sessionId: options.sessionId,
+            status: 'awaiting_user_input',
+            steps: stepIndex,
+            lastDecision: decision,
+            lastTurn,
+          };
+        }
+        // A selfJudge NOT-DONE is the brain's own family grading its homework —
+        // flagged lower-confidence BY CONTRACT (no cross-family judge available).
+        // It gets ONE bounce (with the ask-permitting continuation text below),
+        // never two: the second disagreement becomes advisory. Full-advisory
+        // would disable the completion net for every single-provider install;
+        // two hard self-bounces is what drove sess-mrds80fu into unapproved
+        // sends. The delivery gate below still applies its deterministic
+        // honesty checks either way.
+        const selfJudgeAdvisory = !verdict.done && verdict.selfJudge === true && !skillGap
+          && objectiveJudgeContinuations >= 1;
+        if (selfJudgeAdvisory) {
+          safeAppend({
+            sessionId: options.sessionId,
+            turn: turnResult.turn,
+            role: 'system',
+            type: 'heartbeat',
+            data: {
+              kind: 'self_judge_advisory',
+              steps: stepIndex,
+              message: 'Same-family completion judge disagreed — recorded as advisory, not bounced (no cross-family judge available).',
+              reason: verdict.reason,
+            },
+          });
+        }
+        if ((!verdict.done && !selfJudgeAdvisory) || skillGap) {
           // A deterministic skill-execution shortfall overrides the LLM verdict
           // with a script-specific reason; otherwise use the judge's reason.
           const judgeReason = skillGap
@@ -2591,9 +2700,10 @@ async function runConversationCore(
               ].join(' ')
             : [
             `You marked this objective complete, but an independent verification check found it is NOT finished: ${judgeReason}.`,
-            'First try to finish it yourself — produce the real artifact and verifiable evidence (a URL, file path, or emitted result). Prefer doing the work over asking.',
-            'But FIRST, if the failure names a DISCOVERABLE value — a 404 / "not found", a wrong or missing slug/team/account/id, a missing arg — find the right value with the tool\'s OWN discovery command (e.g. `netlify api listAccountsForUser`, `<cli> whoami`/`status`/`list`) or by recalling your saved tool-choice, then retry ONCE with it. That is recoverable, NOT a dead end: giving up on it — or asking the user for a value the tool can report itself — is a loop failure, not honesty.',
-            'Only do NOT loop on a GENUINE dead end: a tool truly unavailable, an external service down, or an input the system genuinely cannot provide — after a real discover-and-retry has actually failed. Then STOP and report the SPECIFIC blocker — set nextAction=awaiting_user_input with a concrete question, or nextAction=abandoned if it is truly impossible. A blocked task reported honestly is correct; silently re-declaring "complete" without the artifact is not.',
+            'IMPORTANT: if finishing requires the USER\'S decision or authorization — sending, posting, or deleting something external, choosing between options, or scope the user left open — do NOT proceed on your own. Set nextAction=awaiting_user_input with the concrete question. Asking before an external action is a correct, complete answer for this turn, never a failure.',
+            'Otherwise try to finish it yourself — produce the real artifact and verifiable evidence (a URL, file path, or emitted result).',
+            'If the failure names a DISCOVERABLE value — a 404 / "not found", a wrong or missing slug/team/account/id, a missing arg — find the right value with the tool\'s OWN discovery command (e.g. `netlify api listAccountsForUser`, `<cli> whoami`/`status`/`list`) or by recalling your saved tool-choice, then retry ONCE with it. That is recoverable — do not ask the user for a value the tool can report itself.',
+            'Do NOT loop on a GENUINE dead end: a tool truly unavailable, an external service down, or an input the system genuinely cannot provide — after a real discover-and-retry has actually failed. Then STOP and report the SPECIFIC blocker — set nextAction=awaiting_user_input with a concrete question, or nextAction=abandoned if it is truly impossible. A blocked task reported honestly is correct; silently re-declaring "complete" without the artifact is not.',
             'Only set nextAction=completed once the real artifact or verifiable evidence genuinely exists.',
           ].join(' ');
           continue;
@@ -6201,6 +6311,22 @@ function extractApprovalSubject(info: InterruptionInfo): string {
     const verb = humanizeComposioSlug(slug);
     if (innerSubject) return `${verb}: ${truncate(innerSubject, 100)}`;
     return verb || info.toolName;
+  }
+
+  // run_batch: the plan carries everything a human needs — side effect, item
+  // count, target tool, objective. The generic branch used to render the
+  // literal "run_batch: propose", which is how a user got a naked Approve
+  // button for 10 outbound emails (2026-07-09, sess-mrds80fu).
+  if (info.toolName === 'run_batch') {
+    const plan = (args.plan ?? null) as { sideEffect?: string; items?: unknown[]; composioSlug?: string; tool?: string; objective?: string } | null;
+    if (plan && typeof plan === 'object') {
+      const count = Array.isArray(plan.items) ? plan.items.length : 0;
+      const sideEffect = typeof plan.sideEffect === 'string' ? plan.sideEffect : 'write';
+      const target = (typeof plan.composioSlug === 'string' && plan.composioSlug ? humanizeComposioSlug(plan.composioSlug) : plan.tool) || 'batch';
+      const objective = typeof plan.objective === 'string' ? plan.objective : '';
+      return truncate(`Batch ${sideEffect} · ${count} × ${target}${objective ? ` — ${objective}` : ''}`, 140);
+    }
+    return 'run_batch plan';
   }
 
   // run_shell_command: show the command itself, truncated. Append a

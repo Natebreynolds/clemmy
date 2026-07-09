@@ -4250,3 +4250,89 @@ test('orphaned tool: the sweep driver fires ONE report turn per completed orphan
   // Idempotent across ticks: a second sweep fires nothing.
   assert.equal(sweepOrphanedToolReports({ now: () => Date.now(), recentSessionIds: () => [sess], drain: (id) => drainOrphanedToolCompletions(id), fire: () => { throw new Error('should not fire'); } }).fired, 0);
 });
+
+// ─── Ask-first contract (2026-07-09 sess-mrds80fu regression fixtures) ────────
+// Live incident: the completion judge bounced a permission question ("want me
+// to send the 55?"), the scold-continuation pushed the agent from asking into
+// doing, and YOLO waved the send through. These pin the three loop-side fixes.
+
+test('ask-first invariant: a completed-tagged direction question yields awaiting_user_input and NEVER reaches the judge', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: {
+      summary: 'Resumed the email thread and asked how to proceed',
+      reply: 'Yes — we’re on the 60 market-leader reactivation emails.\n\nDo you want me to pick up by sending the 55 send-ready emails now, or review the drafts first?',
+      done: true, nextAction: 'completed', reason: null } },
+  ]);
+  let judgeInvoked = false;
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'hey can we get back to those 60 emails we were working on yesterday',
+    judgeCompletion: true,
+    judgeFn: async () => { judgeInvoked = true; return { done: false, reason: 'Assistant only asked a follow-up question' }; },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_user_input', 'the question IS the deliverable — turn yields to the user');
+  assert.equal(result.steps, 1, 'no scold-continuation');
+  assert.equal(judgeInvoked, false, 'deterministic invariant fires BEFORE the completion judge');
+  const tripped = listEvents(sess.id, { types: ['guardrail_tripped'] })
+    .filter((e) => (e.data as { kind?: string }).kind === 'ask_first_invariant');
+  assert.equal(tripped.length, 1, 'invariant recorded for the audit trail');
+});
+
+test('selfJudge NOT-DONE gets exactly ONE bounce; the second disagreement is advisory', async () => {
+  // Refined after adversarial review: full-advisory would disable the
+  // completion net for every single-provider install, while TWO hard
+  // self-bounces is what drove sess-mrds80fu into unapproved sends. The
+  // contract is one bounce (with the ask-permitting text), then advisory.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: { summary: 'built it', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
+    { finalOutput: { summary: 'still done', reply: 'Done — report saved to /tmp/report.md with the figures.', done: true, nextAction: 'completed', reason: null } },
+  ]);
+  let judgeCalls = 0;
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build me a research report on solar adoption',
+    judgeCompletion: true,
+    judgeFn: async () => { judgeCalls += 1; return { done: false, reason: 'wants more evidence', selfJudge: true }; },
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.steps, 2, 'exactly one bounce — the second self-disagreement must not force a third turn');
+  assert.equal(judgeCalls, 2);
+  const advisories = listEvents(sess.id, { types: ['heartbeat'] })
+    .filter((e) => (e.data as { kind?: string }).kind === 'self_judge_advisory');
+  assert.equal(advisories.length, 1, 'second disagreement recorded as advisory');
+  assert.notEqual(result.status, 'failed');
+});
+
+test('AWAITING judge verdict yields awaiting_user_input with the reply delivered', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runner = scriptedRunner([
+    { finalOutput: {
+      summary: 'partial progress, needs a decision',
+      reply: 'Progress report: 10 of 60 sent. The remaining 50 are staged and need your go/no-go before anything else goes out.',
+      done: true, nextAction: 'completed', reason: null } },
+  ]);
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'finish the reactivation email batch',
+    judgeCompletion: true,
+    judgeFn: async () => ({ done: true, awaitingUser: true, reason: 'assistant paused for the user\'s send decision' }),
+    makeRunner: makeRunnerStub,
+    runRunner: runner,
+  });
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.steps, 1);
+  const completed = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+  assert.equal(completed.data.delivered, true, 'the pause reply is DELIVERED, never eaten');
+  assert.equal((completed.data as { awaitingUser?: boolean }).awaitingUser, true);
+});

@@ -296,3 +296,32 @@ test('parseCriteriaVerdicts: out-of-range and duplicate indices ignored, prose a
   const v = parseCriteriaVerdicts(raw, 2);
   assert.deepEqual(v?.map((x) => x.pass), [true, false]);
 });
+
+// ─── AWAITING verdict + direction-seeking question (2026-07-09 sess-mrds80fu) ───
+
+test('parseCompletionVerdict: AWAITING maps to done + awaitingUser (never a bounce)', () => {
+  const v = parseCompletionVerdict('AWAITING: Assistant asked whether to send the 55 prepared emails now');
+  assert.equal(v?.done, true);
+  assert.equal(v?.awaitingUser, true);
+  assert.match(v?.reason ?? '', /55 prepared emails/);
+  // DONE / INCOMPLETE keep their exact prior shape (no awaitingUser leak).
+  assert.equal(parseCompletionVerdict('DONE: saved')?.awaitingUser, undefined);
+  assert.equal(parseCompletionVerdict('INCOMPLETE: nothing produced')?.awaitingUser, undefined);
+});
+
+test('isDirectionSeekingQuestion: catches the sess-mrds80fu approval question; ignores polite tails', async () => {
+  const { isDirectionSeekingQuestion } = await import('./objective-judge.js');
+  // The exact shape that got bounced live: a resume + a go/no-go question.
+  assert.equal(isDirectionSeekingQuestion(
+    'Yes — we’re on the 60 market-leader reactivation emails.\n\nDo you want me to pick up by **sending the 55 send-ready emails now**, or review the drafts first?',
+  ), true);
+  assert.equal(isDirectionSeekingQuestion('Should I send these to the full list or just the top 10?'), true);
+  assert.equal(isDirectionSeekingQuestion('Which account should I use for the export?'), true);
+  assert.equal(isDirectionSeekingQuestion('The report is ready at /tmp/report.md. OK to publish it to the site?'), true);
+  // NOT direction-seeking: statements, rhetorical/polite tails, no question mark.
+  assert.equal(isDirectionSeekingQuestion('Done — report saved to /tmp/report.md.'), false);
+  assert.equal(isDirectionSeekingQuestion('Done — report saved. Anything else?'), false);
+  assert.equal(isDirectionSeekingQuestion('I sent the 10 emails.'), false);
+  assert.equal(isDirectionSeekingQuestion(''), false);
+  assert.equal(isDirectionSeekingQuestion(null), false);
+});

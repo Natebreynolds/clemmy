@@ -47,6 +47,11 @@ export const BLOCKED_TEXT_PATTERNS: RegExp[] = [
   /\bneed (more|additional|your) (input|information|access|approval|credentials)\b/i,
   /\bwaiting (on|for) (your|user|the user)\b/i,
   /\bblocked (on|by)\b/i,
+  // "Execution 0e30… marked blocked" / "the execution is blocked" — the shape
+  // sess-mrds80fu's honest partial-progress report used; the old patterns only
+  // matched "blocked on/by" and "I'm blocked", so the honesty backstop missed it.
+  /\bexecution (?:is |was |remains |marked )?blocked\b/i,
+  /\bstatus:\s*blocked\b/i,
   /\bmissing (data|access|credentials|the required)\b/i,
   /\bi('?m| am)\s+stopping\b[\s\S]{0,160}\bwithout\b[\s\S]{0,80}\b(number|result|deliverable|answer|verified)\b/i,
   /\bnothing that satisfies (the )?success (criterion|criteria)\b/i,
@@ -192,6 +197,19 @@ export async function verifyDelivered(
 
   const judge = opts.judgeFn ?? judgeObjectiveComplete;
   const verdict = await judge(objective, text); // itself fail-open on error
+  // AWAITING = the reply pauses for the user's decision. On the unattended
+  // lanes that call this chokepoint (cron/background/gateway report-back),
+  // banking it as a clean delivery would silently report success while the
+  // work sits paused — surface it as needs-input so the report-back relays
+  // the question (adversarial review, 2026-07-09).
+  if (verdict.awaitingUser) {
+    return {
+      delivered: false,
+      status: 'blocked',
+      reason: (verdict.reason || text).slice(0, 400),
+      blockerType: 'needs_user_input',
+    };
+  }
   if (verdict.done) {
     return verdict.failedOpen || verdict.selfJudge
       ? { ...DELIVERED, verification: { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge } }
