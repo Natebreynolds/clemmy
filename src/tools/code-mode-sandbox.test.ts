@@ -110,3 +110,69 @@ test('failure breaker: intervening successes reset the count — a probe-and-mis
   assert.equal(r.ok, true, 'a program with periodic successes runs to completion');
   assert.equal(calls, 24);
 });
+
+// ─── Strategic-wave Track 4: partial results, idle deadline, progress, concurrency ───
+
+test('partial results: a program killed mid-run returns what its completed calls produced', async () => {
+  let n = 0;
+  const dispatch: CodeModeDispatch = async () => {
+    n++;
+    if (n <= 5) return { item: n };
+    await new Promise((r) => setTimeout(r, 60_000)); // call 6 hangs forever
+    return null;
+  };
+  const r = await runCodeModeProgram(
+    `const out = []; for (let i = 0; i < 10; i++) { out.push(await clem.fetch_item({ i })); } return out;`,
+    dispatch,
+    { timeoutMs: 30_000, idleTimeoutMs: 2_500 },
+  );
+  assert.equal(r.ok, false, 'the hung program is killed');
+  assert.match(r.error ?? '', /idle for 2500ms/);
+  assert.ok(r.partial, 'partials are attached to the failure');
+  assert.equal(r.partial!.completed, 5, 'the five completed fetches are reported');
+  assert.match(r.partial!.recent.at(-1)!.preview, /"item":5/, 'result previews survive');
+});
+
+test('idle deadline: a SLOW but ACTIVE program is NOT killed at the idle window', async () => {
+  // Each call takes ~1.2× the idle window — activity (RPC completions) must
+  // keep resetting the deadline; only a genuinely silent program dies.
+  const dispatch: CodeModeDispatch = async () => { await new Promise((r) => setTimeout(r, 1_200)); return 'ok'; };
+  const r = await runCodeModeProgram(
+    `const a = await clem.slow({}); const b = await clem.slow({}); const c = await clem.slow({}); return [a, b, c];`,
+    dispatch,
+    { timeoutMs: 30_000, idleTimeoutMs: 3_000 },
+  );
+  assert.equal(r.ok, true, `active program ran to completion (got: ${r.error ?? 'ok'})`);
+  assert.deepEqual(r.value, ['ok', 'ok', 'ok']);
+});
+
+test('clem.progress() narrates without consuming the RPC budget', async () => {
+  const seen: string[] = [];
+  const dispatch: CodeModeDispatch = async () => 'data';
+  const r = await runCodeModeProgram(
+    `await clem.progress('1/2 fetched'); const x = await clem.get({}); await clem.progress('2/2 fetched'); return x;`,
+    dispatch,
+    { timeoutMs: 15_000, onProgress: (m) => seen.push(m) },
+  );
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen, ['1/2 fetched', '2/2 fetched']);
+  assert.equal(r.rpcCalls, 1, 'progress calls are not tool calls');
+});
+
+test('dispatch concurrency is capped host-side (Promise.all does not stampede)', async () => {
+  let inFlight = 0; let peak = 0;
+  const dispatch: CodeModeDispatch = async () => {
+    inFlight++; peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 120));
+    inFlight--;
+    return 'ok';
+  };
+  const r = await runCodeModeProgram(
+    `return (await Promise.all(Array.from({ length: 24 }, (_, i) => clem.hit({ i })))).length;`,
+    dispatch,
+    { timeoutMs: 30_000 },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.value, 24, 'every call still completes');
+  assert.ok(peak <= 8, `in-flight dispatches capped at 8, saw ${peak}`);
+});

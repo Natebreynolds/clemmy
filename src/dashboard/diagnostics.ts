@@ -24,6 +24,7 @@ import { readCachedScan } from '../runtime/cli-discovery.js';
 import { redactSensitiveText, redactSensitiveValue } from '../runtime/security.js';
 import { getEmbeddingHealth, readEmbeddingStats, countUnembeddedActiveFacts } from '../memory/embeddings.js';
 import { getResolverStats } from '../memory/reflection.js';
+import { openEventLog } from '../runtime/harness/eventlog.js';
 
 const SUPERVISOR_LOG_PATH = path.join(BASE_DIR, 'logs', 'desktop', 'supervisor.log');
 const TOOL_EVENTS_DIR = path.join(BASE_DIR, 'state', 'tool-events');
@@ -43,6 +44,18 @@ export interface DiagnosticsSummary {
   /** Semantic-memory (embeddings) health — surfaces a quota/auth outage that
    *  was previously silent (recall degrades to FTS with no signal). */
   semanticMemory: SemanticMemoryHealth;
+  /** Which lane served turns (turn_model_routed events) — the measurement
+   *  window for retiring the legacy respond lanes: subtraction is gated on a
+   *  sustained zero legacy count here (strategic-wave Track 3/B5). */
+  routeHealth: RouteHealth;
+}
+
+export interface RouteHealth {
+  windowDays: number;
+  counts: Array<{ routeKind: string; surface: string; count: number }>;
+  legacyTotal: number;
+  /** One-liner for the panel: legacy-lane retirement readiness. */
+  detail: string;
 }
 
 export interface SemanticMemoryHealth {
@@ -302,6 +315,33 @@ function readSemanticMemoryHealth(): SemanticMemoryHealth {
   };
 }
 
+const ROUTE_HEALTH_WINDOW_DAYS = 7;
+
+export function readRouteHealth(windowDays: number = ROUTE_HEALTH_WINDOW_DAYS): RouteHealth {
+  try {
+    const db = openEventLog();
+    const cutoff = new Date(Date.now() - windowDays * 24 * 60 * 60_000).toISOString();
+    const rows = db.prepare(`
+      SELECT json_extract(data_json,'$.routeKind') AS routeKind,
+             COALESCE(json_extract(data_json,'$.surface'), 'unknown') AS surface,
+             COUNT(*) AS count
+      FROM events
+      WHERE type = 'turn_model_routed' AND created_at > ?
+      GROUP BY 1, 2
+      ORDER BY 3 DESC
+    `).all(cutoff) as Array<{ routeKind: string | null; surface: string; count: number }>;
+    const counts = rows.map((r) => ({ routeKind: r.routeKind ?? 'unknown', surface: r.surface, count: r.count }));
+    const legacyTotal = counts.filter((r) => r.routeKind === 'legacy').reduce((n, r) => n + r.count, 0);
+    const total = counts.reduce((n, r) => n + r.count, 0);
+    const detail = legacyTotal === 0
+      ? `0 legacy-routed turns of ${total} in ${windowDays}d — legacy lanes are dark (retirement evidence accumulating).`
+      : `${legacyTotal} legacy-routed turn(s) of ${total} in ${windowDays}d on: ${[...new Set(counts.filter((r) => r.routeKind === 'legacy').map((r) => r.surface))].join(', ')} — investigate before any legacy deletion.`;
+    return { windowDays, counts, legacyTotal, detail };
+  } catch (err) {
+    return { windowDays, counts: [], legacyTotal: -1, detail: `route health unavailable: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 export function collectDiagnostics(): DiagnosticsSummary {
   const servers = redactSensitiveValue(listMcpServerHealth());
   const mcpSummary: McpHealthSummary = {
@@ -323,5 +363,6 @@ export function collectDiagnostics(): DiagnosticsSummary {
     },
     storage: readStorageStats(),
     semanticMemory: readSemanticMemoryHealth(),
+    routeHealth: readRouteHealth(),
   };
 }

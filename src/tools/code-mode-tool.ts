@@ -17,7 +17,8 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRunContextStorage } from '../runtime/harness/brackets.js';
-import { appendEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent, writeToolOutput } from '../runtime/harness/eventlog.js';
+import { deriveCodeModeSets } from './tool-registry.js';
 import { runCodeModeProgram, type CodeModeResult } from './code-mode-sandbox.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
 // import would form a registry ↔ code-mode-tool cycle (registry exposes
@@ -93,9 +94,9 @@ export function codeModeMandateDirective(opts: {
   // only sharpens the rule with the concrete count, it no longer gates it.
   const rule = [
     `BATCH-SHAPE RULE — external data-fetch tools are in scope this turn (${fetchTools}). Pick the lane by the SHAPE of the work:`,
-    '(a) 3+ same-shape items whose tool arguments you can FULLY MATERIALIZE right now (send N drafted emails, update N records with known values, pull N known lookups) → `run_batch` ONE plan: certified once, then executed deterministically with zero model calls between items — the fastest and most auditable lane. ANY batch of external SENDS/WRITES MUST use run_batch — never loop sends yourself and never put sends in run_tool_program (it is capped at 60s and will lose a partial batch).',
+    '(a) 3+ same-shape items whose tool arguments you can FULLY MATERIALIZE right now (send N drafted emails, update N records with known values, pull N known lookups) → `run_batch` ONE plan: certified once, then executed deterministically with zero model calls between items — the fastest and most auditable lane. ANY batch of external SENDS/WRITES MUST use run_batch — never loop sends yourself and never put sends in run_tool_program (its program ceiling will lose a partial batch).',
     '(b) 3+ independent items that each need their own REASONING/discovery (research each firm, judge each doc) → FAN OUT: `run_worker` once PER ITEM, in parallel, each with a complete job packet — do NOT grind the items one-by-one in your own context;',
-    '(c) several DIFFERENT read-only fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result. run_tool_program is READ-ONLY aggregation and 60s-capped — no sends/writes inside it;',
+    '(c) several DIFFERENT read-only fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result. run_tool_program is READ-ONLY aggregation with an activity-based deadline — no sends/writes inside it;',
     '(d) a SINGLE read → call the tool directly.',
   ].join(' ');
   if (opts.fanoutPreferred && opts.multiItem) {
@@ -107,25 +108,20 @@ export function codeModeMandateDirective(opts: {
   return rule;
 }
 
-/** Phase 2 mutating surface. Each routes through wrapToolForHarness, so the
- *  write-boundary gates cover it with NO new gate code. run_worker is excluded
- *  (worker-of-worker recursion is out of scope for v1). */
-export const WRITE_TOOLS = new Set<string>([
-  'composio_execute_tool', 'write_file', 'run_shell_command',
-]);
+// Registry-derived surfaces (step-2 flip, strategic-wave Track 1a): the
+// hand-curated sets are gone — the registry's `codeModeAccess` axis is the one
+// truth, proven set-equal by the conformance test before the flip. Adding a
+// tool to code mode is now ONE registry field, not a second hand list.
+// run_worker stays excluded via the registry (worker-of-worker recursion is
+// out of scope); every write here still routes through wrapToolForHarness so
+// the write-boundary gates cover it with NO new gate code.
+const codeModeSets = deriveCodeModeSets();
 
-/** The Phase-1 read-only surface a code-mode program may call. Every name here is
- *  non-mutating; a write/send tool (composio_execute_tool, write_file, …) is
- *  DELIBERATELY excluded until Phase 2 routes its gates through this path. */
-export const READ_ONLY_TOOLS = new Set<string>([
-  'memory_recall', 'memory_search', 'memory_read', 'memory_search_facts',
-  'read_file', 'list_files', 'workspace_roots',
-  'composio_search_tools', 'composio_status',
-  'tool_output_query', 'recall_tool_result',
-  'user_profile_read', 'session_history',
-  'skill_list', 'skill_read',
-  'local_cli_list', 'local_cli_probe',
-]);
+/** Phase 2 mutating surface (registry-derived). */
+export const WRITE_TOOLS: ReadonlySet<string> = codeModeSets.write;
+
+/** The Phase-1 read-only surface a code-mode program may call (registry-derived). */
+export const READ_ONLY_TOOLS: ReadonlySet<string> = codeModeSets.readOnly;
 
 type InvokableTool = { name: string; invoke?: (ctx: unknown, input: string, details: unknown) => Promise<unknown> };
 
@@ -178,7 +174,34 @@ export function isCodeModeToolAllowed(method: string): boolean {
  *  block surfaces here as a thrown error the program/model can recover from.
  *  Shares `counter` across the program's calls (loop-guard + batch parity).
  *  Exported for tests. */
+/** `clem.describe('tool_name')` — in-program schema lookup (strategic-wave
+ *  Track 4). Programs are written blind against `clem.<tool>(args)`; the
+ *  arg-shape bug class ({directory} vs {path}) costs a failed call + retry.
+ *  describe() answers from host memory at zero context cost. Never throws —
+ *  an unknown name reports allowed:false so the program can branch. */
+export async function describeCodeModeTool(name: unknown): Promise<unknown> {
+  const toolName = typeof name === 'string' ? name : String((name as { tool?: unknown; name?: unknown })?.tool ?? (name as { name?: unknown })?.name ?? '');
+  if (!toolName) return { error: 'describe: pass a tool name string, e.g. clem.describe("list_files")' };
+  const allowed = isCodeModeToolAllowed(toolName);
+  if (isMcpNamespacedTool(toolName)) {
+    return { name: toolName, allowed, source: 'mcp', note: 'external MCP tool — args follow the server\'s schema; a destructive call is still gated' };
+  }
+  const byName = await realToolsByName();
+  const t = byName.get(toolName) as (InvokableTool & { description?: string; parameters?: unknown }) | undefined;
+  if (!t) return { name: toolName, allowed: false, error: 'unknown tool — check the name (see the run_tool_program description for the built-in surface)' };
+  return {
+    name: toolName,
+    allowed,
+    source: 'local',
+    ...(allowed ? {} : { note: WRITE_TOOLS.has(toolName) ? 'writes are disabled in code mode right now' : 'not in the code-mode allowlist' }),
+    description: typeof t.description === 'string' ? t.description.slice(0, 600) : undefined,
+    parameters: t.parameters ?? undefined,
+  };
+}
+
 export async function dispatchCodeModeTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter): Promise<unknown> {
+  // Host-answered helpers — never tool dispatches, never gated, never counted.
+  if (method === 'describe') return describeCodeModeTool(args);
   if (!isCodeModeToolAllowed(method)) {
     const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
     throw new Error(`code-mode: tool "${method}" is not available — ${why}`);
@@ -199,7 +222,7 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
       if (shape.mutating && shape.irreversible) {
         throw new Error(
           `code-mode: refusing an irreversible external send (${shape.shapeKey ?? method}) inside run_tool_program — `
-          + 'code programs are capped at 60s and would lose or partially-complete a batch of sends. '
+          + 'a code program\'s deadline would lose or partially-complete a batch of sends. '
           + 'Use run_batch for sends: propose ONE plan (tool composio_execute_tool, sideEffect "send", one item per recipient with fully-baked args), it certifies once, queues ONE approval, then executes deterministically with per-item gating and an honest ledger.',
         );
       }
@@ -214,7 +237,7 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
         if (soFar > 2) {
           throw new Error(
             `code-mode: refusing the ${soFar}rd/th mutating call (${shape.shapeKey ?? method}) in ONE program — `
-            + 'a mutation loop cannot finish inside the 60s program cap and dies mid-batch, losing track of completed writes. '
+            + 'a mutation loop cannot finish inside the program deadline and dies mid-batch, losing track of completed writes. '
             + 'Use run_batch: one plan, one item per record, certified once, executed deterministically with a per-item ledger.',
           );
         }
@@ -319,7 +342,42 @@ export async function dispatchBatchItemTool(
  *  so loop-guard + batch gates see the program as a single turn (gate-parity). */
 export async function runCodeModeForSession(program: string, sessionId: string): Promise<CodeModeResult> {
   const counter = new ToolCallsCounter(1000);
-  return runCodeModeProgram(program, (method, args) => dispatchCodeModeTool(method, args, sessionId, counter));
+  const startedAt = Date.now();
+  const result = await runCodeModeProgram(
+    program,
+    (method, args) => dispatchCodeModeTool(method, args, sessionId, counter),
+    {
+      // clem.progress('…') → the same live-activity spine batch uses, so a long
+      // program reads as supervised instead of a frozen spinner.
+      onProgress: (message) => {
+        try { appendEvent({ sessionId, turn: 0, role: 'system', type: 'codemode_progress', data: { message } }); } catch { /* narration never blocks */ }
+      },
+      // Oversized return → park the FULL value in the tool-output store and hand
+      // the model a recall_tool_result handle instead of a mid-structure cut.
+      onLargeResult: (fullJson) => {
+        try {
+          const handle = `codemode-result-${randomUUID()}`;
+          writeToolOutput({ sessionId, callId: handle, tool: 'run_tool_program', output: fullJson });
+          return handle;
+        } catch { return null; }
+      },
+    },
+  );
+  // ONE summary event per program — the adoption/efficiency measurement the
+  // mandate's DELETE-WHEN-VALIDATED note is waiting on.
+  try {
+    appendEvent({
+      sessionId, turn: 0, role: 'system', type: 'codemode_program_summary',
+      data: {
+        ok: result.ok,
+        rpcCalls: result.rpcCalls,
+        durationMs: Date.now() - startedAt,
+        ...(result.partial ? { completed: result.partial.completed, failed: result.partial.failed } : {}),
+        ...(result.ok ? {} : { error: (result.error ?? '').slice(0, 300) }),
+      },
+    });
+  } catch { /* telemetry never blocks */ }
+  return result;
 }
 
 export function codeModeDescription(): string {
@@ -336,8 +394,9 @@ export function codeModeDescription(): string {
       ? 'Writes ARE allowed and pass the SAME approval/grounding/destination gates as a normal tool call — a blocked write throws inside your program (catch it or let it surface).'
       : 'Local writes are off, but MCP reads work; a destructive MCP tool is still blocked by its approval gate.',
     'Example: `const [a,b] = await Promise.all([clem["dataforseo__serp_organic_live_advanced"]({...}), clem["dataforseo__serp_organic_live_advanced"]({...})]); return { aTop: a.items?.[0], bTop: b.items?.[0] };`',
-    'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Bounded time + tool-call budget.',
-    'HARD LIMIT: this program is killed at 60 seconds and is for READ-ONLY aggregation. NEVER loop irreversible external SENDS/writes (email send, publish) inside it — a batch of gated sends cannot finish in 60s, so it dies mid-batch and loses track of what was sent. For ANY batch of sends/writes use `run_batch` instead (it certifies once, then runs a deterministic per-item loop with its own budget and an honest ledger). An irreversible send attempted here is refused.',
+    'Helpers: `await clem.describe("tool_name")` returns a tool\'s arg schema (check before guessing arg shapes); `await clem.progress("34/60 fetched")` narrates status to the user (free — not a tool call).',
+    'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Tool-call budget applies; a program is killed after ~20s with NO tool activity (an actively-fetching program can run to a ~3-minute ceiling). If it is killed mid-run you receive the completed calls\' results as PARTIAL RESULTS — salvage them, only redo what is missing.',
+    'HARD LIMIT: this is for READ-ONLY aggregation. NEVER loop irreversible external SENDS/writes (email send, publish) inside it — a batch of gated sends cannot finish inside the program ceiling, so it dies mid-batch and loses track of what was sent. For ANY batch of sends/writes use `run_batch` instead (it certifies once, then runs a deterministic per-item loop with its own budget and an honest ledger). An irreversible send attempted here is refused.',
   ].join(' ');
 }
 
@@ -354,6 +413,16 @@ export function buildCodeModeTool() {
       const result = await runCodeModeForSession(program, sessionId);
       if (result.ok) {
         return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}`;
+      }
+      // A failed program still hands over what its completed calls produced —
+      // salvage beats redoing every fetch (Track 4: partial results).
+      if (result.partial && result.partial.completed > 0) {
+        return [
+          `code-mode program failed: ${result.error}`,
+          `PARTIAL RESULTS SALVAGED — ${result.partial.completed} call(s) completed, ${result.partial.failed} failed before the abort. Most recent completed results (previews):`,
+          JSON.stringify(result.partial.recent.filter((r) => r.ok).slice(-10)),
+          'Use these instead of re-fetching; only redo what is missing.',
+        ].join('\n');
       }
       return `code-mode program failed: ${result.error}`;
     },

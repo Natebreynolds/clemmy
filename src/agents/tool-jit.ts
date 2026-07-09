@@ -27,6 +27,7 @@ import pino from 'pino';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import { getRuntimeEnv } from '../config.js';
 import { WORKSPACE_DOCK_TOOLS } from '../spaces/workspace-context.js';
+import { deriveJitCore } from '../tools/tool-registry.js';
 import { matchToolChoicesForStep } from '../memory/tool-choice-store.js';
 
 const logger = pino({ name: 'clementine-next.tool-jit' });
@@ -103,76 +104,20 @@ export function resolveToolJitDecision(opts: { allowLane: boolean; sessionId?: s
  * them back when relevant. A test asserts MANDATED ⊆ exposed even under a zero-score
  * ranker (tool-jit.test.ts); keep this in sync with the rubric.
  */
-export const TOOL_JIT_MANDATED: ReadonlySet<string> = new Set<string>([
-  // FOCUS hygiene — rubric: focus_get at the START of every turn; a focus correction
-  // / park / clear can land on ANY turn and is NOT evident from the message text.
-  'focus_get', 'focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear',
-  // EXECUTION lane — write-gating before mutating composio; closing out an execution
-  // started on an EARLIER turn ("done", "ship it") is not evident from this message.
-  'execution_create', 'execution_list', 'execution_get', 'execution_update_step', 'execution_complete', 'execution_mark_blocked',
-  // PLAN coherence — create/list/update + the planner preview tools.
-  'create_plan', 'list_plans', 'update_plan_step', 'draft_plan', 'share_plan', 'surface_plan',
-  // GOALS — first-class long-running outcomes (the /goal spine + self-drive). A goal
-  // create/update/check can land on ANY turn and is NOT evident from the message
-  // keywords (same rationale as focus_*/plan_*). They were JIT-prunable, so on a
-  // large multi-MCP surface the ranker dropped them and the brain reported "the
-  // goals tool isn't available" (observed 2026-06-30: 47 tools dropped, 0 goal
-  // tools surfaced). CORE is the reliable fix. (Absent goal_* are a no-op — JIT
-  // only keeps tools already in the surface.)
-  'goal_create', 'goal_update', 'goal_get', 'goal_list', 'goal_stale',
-  // PRE-WRITE ritual + self-correcting memory.
-  'memory_review_instructions', 'memory_forget',
-  // QUEUED EXECUTION gate — exact payload object before approval/execution.
-  'pending_action_queue', 'pending_action_list', 'pending_action_get', 'pending_action_record_result',
-  // MEMORY recall + write (the ever-learning core).
-  'memory_recall', 'memory_search', 'memory_read', 'memory_remember',
-  // RETRY / continuation correctness (resource-fingerprint + infra-retry rules read these).
-  'session_history', 'recall_tool_result', 'tool_output_query',
-  // cwd SAFETY before shell.
-  'workspace_roots',
-  // structural OUTPUT channel that must survive.
-  'notify_user',
-  // named-model routing + tool-choice correction (cache fixes can land on any turn).
-  'set_model_role', 'clear_model_role', 'tool_choice_recall', 'tool_choice_remember', 'tool_choice_invalidate', 'tool_choice_forget',
-  // DISCOVERY + acquisition escape-hatch (keeps every EXTERNAL tool reachable) + local CLI probe + skills.
-  'composio_search_tools', 'composio_execute_tool', 'local_cli_list', 'local_cli_probe', 'skill_list', 'skill_read',
-  // BUILT-IN discovery: tool_search ranks the tool catalog and returns schemas on
-  // demand. Structural CORE seed for schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07)
-  // — never JIT-pruned, so the escape-hatch to any built-in is always present.
-  'tool_search',
-  // FILES + shell (the local-work backbone).
-  'read_file', 'write_file', 'list_files', 'run_shell_command',
-  // profile READ (cheaper than asking the user).
-  'user_profile_read',
-  // the user's REAL browser. MEASURED (measure-tool-jit-accuracy.ts): "log into my
-  // LinkedIn…" scores these at NOISE level (0.155 / 0.19 cosine) — the canonical
-  // "log into my X" trigger doesn't semantically match the browser-harness tool
-  // text, so retrieval can't be trusted to surface them. CORE is the reliable fix.
-  'browser_harness_status', 'browser_harness_run',
-  // conversation primitives (also added structurally outside JIT — belt-and-suspenders).
-  // offer_background is the proactive run-in-bg/hold/now offer + the target of the
-  // background-offer code nudge — it can land on ANY turn after alignment and is NOT
-  // evident from the message keywords, so CORE is the reliable fix (mirrors ask_user_question).
-  'ask_user_question', 'request_approval', 'run_worker', 'offer_background',
-  // CALL_TOOL — the generic gated dispatcher for schema-on-demand (Phase 1). A
-  // structural execution primitive (like request_approval/run_worker): CORE so the
-  // registry's tier stays consistent. It is only ADDED to the surface when
-  // CLEMMY_CODEX_TOOL_SEARCH is on (assembled in orchestrator.ts), so listing it
-  // here is a no-op for the JIT keep-set otherwise (JIT only keeps tools present).
-  'call_tool',
-  // CODE MODE — when present (CLEMMY_CODE_MODE=on), the programmatic-tool-calling
-  // entry must stay reachable every turn; its value is data-heavy/multi-tool work
-  // the message text won't always semantically match. No-op when off (JIT only
-  // keeps tools that are in the surface).
-  'run_tool_program',
-  // BATCH — the deterministic same-shape-N executor. Same class as run_worker/
-  // run_tool_program: an execution PRIMITIVE the model reaches for on any turn
-  // with 3+ bakeable items, NOT something the message keywords name (live
-  // 2026-07-07: a fresh chat had run_batch pruned off the surface and the model
-  // reported it "not exposed", falling back to run_tool_program). CORE is the
-  // reliable fix.
-  'run_batch',
-]);
+/**
+ * TOOL_JIT_MANDATED — the always-loaded CORE, never JIT-pruned.
+ *
+ * DERIVED from the single tool registry (TOOL-REGISTRY-PLAN-2026-07-07, step 2):
+ * the hand-maintained set was deleted; membership is now every registry tool with
+ * `tier: 'core'` (deriveJitCore). Add or change a tool's core status in ONE place
+ * — tool-registry.ts. The per-tool rationale (which JIT-pruning incidents made each
+ * one mandated) lives with its registry entry / git history. Frozen at module load;
+ * tool-registry.ts imports nothing (a leaf), so this cannot form an import cycle.
+ *
+ * A test asserts MANDATED ⊆ exposed even under a zero-score ranker
+ * (tool-jit.test.ts); the registry conformance test pins the SET.
+ */
+export const TOOL_JIT_MANDATED: ReadonlySet<string> = deriveJitCore();
 
 /**
  * The always-loaded CORE — never JIT-gated. CORE === MANDATED today; kept as a

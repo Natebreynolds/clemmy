@@ -178,6 +178,12 @@ export const EVENT_TYPES = [
   'batch_progress',
   'batch_item_failed',
   'batch_completed',
+  // Code-mode program visibility (Track 4): clem.progress('…') narration lines
+  // from inside a running program, and ONE per-program summary {ok, rpcCalls,
+  // durationMs, completed/failed} — the adoption/efficiency measurement the
+  // code-mode mandate's DELETE-WHEN-VALIDATED note waits on.
+  'codemode_progress',
+  'codemode_program_summary',
   // NON-halting record that, in YOLO, an approval-shaped ask_user_question was
   // auto-resolved (standing approval) and the run proceeded instead of pausing.
   // Distinct from awaiting_user_input precisely so it does NOT halt the loop.

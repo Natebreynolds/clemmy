@@ -28,6 +28,12 @@
 import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { readGuardrailState, writeGuardrailState } from './eventlog.js';
+import {
+  deriveGuardrailIdempotent,
+  deriveGuardrailMutating,
+  deriveGuardrailCacheSafeReads,
+  deriveGuardrailReadMutators,
+} from '../../tools/tool-registry.js';
 import { MUTATING_VERBS } from './execution-gate.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
@@ -105,41 +111,36 @@ function persistTracker(sessionId: string, tracker: SessionTrackerState): void {
 // Tool classification
 // ─────────────────────────────────────────────────────────────────
 
+// Registry-derived (step-2 flip): the loopClass/cacheSafeRead/readMutatedBy
+// axes on ToolDecl are the one truth — a NEW mutating tool declared in the
+// registry lands here automatically, closing the "absent from MUTATING_TOOLS
+// → loose loop thresholds" runaway-write gap the registry plan flagged.
+// Set-equality was proven by the conformance test before the flip.
+//
+// UNION for byte-identity (no threshold regression): a few members are real
+// tools that ride the default-include worker/workflow-step lanes but sit on NO
+// advertise surface, so they're outside the registry's membership scope — union
+// them here rather than expand the registry ahead of a consumer flip (team-lead
+// 2026-07-09). The conformance test pins these as the ONLY out-of-registry
+// members (KNOWN_UNREGISTERED_GUARDRAIL), so a NEW divergence fails CI.
+
 /** Read-only tools that are safe to retry. Looping on these wastes
  *  budget but doesn't corrupt state, so thresholds are looser. */
-const IDEMPOTENT_TOOLS = new Set<string>([
-  'read_file', 'list_files', 'workspace_info', 'workspace_list', 'workspace_roots',
-  'git_status',
-  'memory_search', 'memory_recall', 'memory_read', 'memory_list_facts',
-  'composio_search_tools', 'composio_list_tools', 'composio_status',
-  'tool_choice_recall',
-  'session_history', 'agent_runs_recent', 'agent_run_get', 'background_tasks_recent', 'background_task_status',
-  'goal_list', 'goal_get', 'task_list',
-  'list_plans', 'discover_work',
-  'user_profile_read',
-  'focus_get', 'focus_list', 'focus_inspect',
-  'recall_tool_result',
-  'skill_list', 'skill_read',
-  'workflow_list', 'workflow_get', 'workflow_run_status',
+export const IDEMPOTENT_TOOLS: ReadonlySet<string> = new Set<string>([
+  ...deriveGuardrailIdempotent(),
+  // Real focus-tools reads (focus-tools.ts, registered via local-runtime-tools)
+  // reachable on the default-include worker/workflow-step lanes; off every
+  // advertise surface → outside registry scope. Loose idempotent thresholds, as before.
+  'focus_list', 'focus_inspect',
 ]);
 
 /** Mutating tools — looping on these CAN corrupt state (duplicate
  *  writes, double-sent messages, etc.). Tighter thresholds. */
-const MUTATING_TOOLS = new Set<string>([
-  'write_file', 'replace_file',
-  'composio_execute_tool',
-  'run_shell_command',
-  'memory_remember', 'memory_forget',
-  'task_add', 'task_update',
-  'goal_create', 'goal_update',
-  'note_create', 'note_take',
-  'workflow_run',
-  'workflow_rerun_failed_items',
-  'execution_update_step', 'execution_complete', 'execution_mark_blocked',
-  'focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear',
-  'tool_choice_remember', 'tool_choice_invalidate',
-  'notify_user', 'ask_user_question',
-  'request_approval',
+export const MUTATING_TOOLS: ReadonlySet<string> = new Set<string>([
+  ...deriveGuardrailMutating(),
+  // Dead entry (no such tool is registered); retained for byte-identity with the
+  // pre-flip set. Safe to prune once confirmed unused.
+  'replace_file',
 ]);
 
 // ─────────────────────────────────────────────────────────────────
@@ -155,13 +156,7 @@ const MUTATING_TOOLS = new Set<string>([
 // agent_run_get), git_status. Nudging toward a cached copy of those would point
 // her at STALE data. So the allowlist contains only reads whose result is stable
 // for the life of a task absent an IN-SESSION mutation we can observe:
-const CACHE_SAFE_READS = new Set<string>([
-  'read_file', 'list_files',
-  'skill_read', 'skill_list',
-  'composio_search_tools', 'composio_list_tools',
-  'memory_search', 'memory_recall',
-  'focus_get',
-]);
+export const CACHE_SAFE_READS: ReadonlySet<string> = deriveGuardrailCacheSafeReads();
 
 // In-session mutators per cache-safe read: if any of these ran AFTER the prior
 // identical read and BEFORE this one, the cached copy may be stale → suppress
@@ -169,13 +164,7 @@ const CACHE_SAFE_READS = new Set<string>([
 // has no in-session writer, so its cache never invalidates. Conservative: a
 // write to ANY path invalidates a read_file cache (the intervening tool's path
 // args aren't tracked here), so we under-nudge rather than serve stale.
-const READ_MUTATORS: Record<string, ReadonlySet<string>> = {
-  read_file: new Set(['write_file', 'replace_file', 'run_shell_command']),
-  list_files: new Set(['write_file', 'replace_file', 'run_shell_command']),
-  focus_get: new Set(['focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear']),
-  memory_search: new Set(['memory_remember', 'memory_forget']),
-  memory_recall: new Set(['memory_remember', 'memory_forget']),
-};
+export const READ_MUTATORS: Record<string, ReadonlySet<string>> = deriveGuardrailReadMutators();
 
 // ─────────────────────────────────────────────────────────────────
 // composio_execute_tool is a GATEWAY: it wraps a read (AIRTABLE_LIST_RECORDS,

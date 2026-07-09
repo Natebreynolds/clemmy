@@ -164,3 +164,17 @@ test('run_tool_program surface follows CLEMMY_CODE_MODE: absent when off, presen
     if (prev === undefined) delete process.env.CLEMMY_CODE_MODE; else process.env.CLEMMY_CODE_MODE = prev;
   }
 });
+
+// ─── Track 4: clem.describe + result handles ───
+test('clem.describe returns schema info for a local tool and never dispatches it', async () => {
+  const { describeCodeModeTool } = await import('./code-mode-tool.js');
+  const d = await describeCodeModeTool('list_files') as { name: string; allowed: boolean; source: string; parameters?: unknown };
+  assert.equal(d.name, 'list_files');
+  assert.equal(d.allowed, true);
+  assert.equal(d.source, 'local');
+  const unknown = await describeCodeModeTool('no_such_tool_xyz') as { allowed: boolean; error?: string };
+  assert.equal(unknown.allowed, false);
+  assert.match(unknown.error ?? '', /unknown tool/);
+  const mcp = await describeCodeModeTool('dataforseo__serp_organic_live_advanced') as { source: string };
+  assert.equal(mcp.source, 'mcp');
+});

@@ -32,6 +32,7 @@ import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.j
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
 import { resolveToolSearchDecision, resolveHotSet, buildToolCatalog, allRegistryNames } from './tool-catalog.js';
+import { deriveOrchestratorDiscoveryNames } from '../tools/tool-registry.js';
 import { buildCallTool } from '../tools/call-tool.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
@@ -1170,277 +1171,22 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   //   - skill_list / skill_read: on-demand skill instruction loading
   //   - tool_choice_recall / _remember / _invalidate: per-machine memory
   //     of which tool actually works for a given intent
-  const discoveryTools: Tool<RuntimeContextValue>[] = (
-    [
-      'composio_search_tools',
-      'composio_execute_tool',
-      'desktop_status',
-      // MCP self-heal surface: diagnose (status), recover (reconnect), and
-      // create/edit server configs (add/configure — approval-gated). Secrets are
-      // entered by the user in the dashboard, never by these tools.
-      'mcp_status',
-      'mcp_reconnect',
-      'mcp_add',
-      'mcp_configure',
-      'skill_list',
-      'skill_read',
-      // Schema-on-demand discovery entry (read-only): search the full built-in
-      // tool catalog by intent. SCHEMA-ON-DEMAND-PLAN-2026-07-07, Phase 0 —
-      // additive + dormant (the model can search; nothing is deferred yet).
-      'tool_search',
-      'local_cli_list',
-      'local_cli_probe',
-      'tool_choice_recall',
-      'tool_choice_remember',
-      'tool_choice_invalidate',
-      // Model-role routing — lets chat honor requests like "use Claude for
-      // design" by writing the same CLEMMY_MODEL_ROLES registry the Models UI
-      // writes. Keep the clear path on the surface too so the user can revert
-      // an intent-scoped rule without opening Settings.
-      'set_model_role',
-      'clear_model_role',
-      // user_profile_read added 2026-05-20 after the agent asked the
-      // user for their timezone — which is already saved in the
-      // profile. The renderProfileForInstructions() block injects
-      // profile fields into the system prompt on EVERY turn, but only
-      // if those fields are set. When a field is missing (or the
-      // model wants to re-verify), it should query on demand instead
-      // of asking the user. Read-only — fits the Orchestrator's
-      // discovery surface cleanly.
-      'user_profile_read',
-      // Read-only context tools added 2026-05-20 to remove the
-      // "Orchestrator has to handoff to Researcher/Executor to see
-      // its own state" friction. Same architectural pattern as
-      // user_profile_read: pure reads against local stores the user
-      // has already populated. Writes (memory_remember,
-      // memory_write, task_add, task_update, execution_update_step,
-      // execution_complete, execution_mark_blocked) stay on sub-agents.
-      'memory_recall',
-      'memory_search',
-      'memory_read',
-      'task_list',
-      'execution_create',
-      'execution_list',
-      'execution_get',
-      // Phase 3: action tools (formerly split across sub-agents) now
-      // live directly on the agent. The agent calls them in sequence
-      // to complete multi-step work without delegating.
-      // Memory writes
-      'memory_remember',
-      'memory_list_facts',
-      // memory_forget added 2026-05-21 after sess-mpf4pkru where the
-      // agent reported it couldn't delete fact #16 because the tool
-      // wasn't on its surface. Cleanup capability is load-bearing for
-      // the "ever-learning" loop — Clementine has to be able to correct
-      // her own memory, not just write to it.
-      'memory_forget',
-      // memory_pin / memory_restore added 2026-06-12: memory_forget refuses a
-      // PINNED standing instruction and tells the model to memory_pin
-      // pinned=false FIRST — but memory_pin was registered (memory-tools.ts)
-      // and NOT on this surface, so that recovery path dead-ended and the
-      // model fell back to raw `sqlite3` against memory.db (bypassing every
-      // guard). memory_restore (reactivate a soft-deleted fact) closes the
-      // inverse gap. Same omission class as the workspace/browser-harness
-      // blocks above. The catalog.ts LOCAL_MCP_TOOL_NAMES list is a DIFFERENT
-      // surface (CLI / workflow-architect) — THIS curated list is what the
-      // harness orchestrator actually gets.
-      'memory_pin',
-      'memory_restore',
-      // Audited memory self-heal control: list/dry-run/run/revert the bounded
-      // proposal loop through the same MCP guard surface instead of falling
-      // back to raw files or sqlite when memory drift needs review.
-      'memory_self_heal',
-      // Workspace + files
-      'workspace_config',
-      'workspace_roots',
-      'workspace_list',
-      'workspace_info',
-      'list_files',
-      'read_file',
-      'write_file',
-      'git_status',
-      // Workspaces (Spaces) — agent-authored interactive surfaces. These ARE
-      // registered in allCoreTools (local-runtime-tools.ts, gated by
-      // isSpacesEnabled, default-ON) but were never in this allowlist, so the
-      // workspace dock / re-engage turn ran on the orchestrator and self-
-      // reported "space_save is not exposed in this run" — then wrote the
-      // dataset to /tmp and reported a blocker instead of refreshing the
-      // surface. Same omission class as the workflow_* block below. byName
-      // no-ops to undefined (→ filtered out) when spaces are disabled, so this
-      // is safe with the flag off.
-      'space_get',
-      // space_get_view returns the actual line-numbered view HTML (space_get does
-      // NOT), so the model reads a view via the sanctioned tool instead of
-      // defecting to read_file/grep in the shell. byName no-ops when spaces off.
-      'space_get_view',
-      'space_get_runner',
-      'space_list',
-      'space_save',
-      'space_edit_view',
-      'space_edit_runner',
-      'space_revert_runner',
-      'space_refresh',
-      // space_try_runner dry-runs a candidate runner (no persist) so the model
-      // stops emulating it with `node data/x.mjs` in the shell; space_set_data
-      // commits a known inline dataset. byName no-ops when spaces off.
-      'space_try_runner',
-      'space_set_data',
-      // Team-agent coordination — durable local specialists + request/delegation
-      // queues. These tools are registered in the local runtime, but the chat
-      // orchestrator must explicitly carry them on its curated surface; otherwise
-      // team-agent requests degrade into shell/file spelunking.
-      'team_list',
-      'team_message',
-      'team_request',
-      'team_pending_requests',
-      'team_reply',
-      'agent_propose',
-      'create_agent',
-      'update_agent',
-      'delegate_task',
-      'check_delegation',
-      // Pending-action queue — the "ready to execute?" substrate. The model
-      // prepares exact irreversible/external payloads here, asks once, then
-      // executes the queued payload after approval.
-      'pending_action_queue',
-      'pending_action_list',
-      'pending_action_get',
-      'pending_action_record_result',
-      // Shell (approval-gated by taxonomy for mutating commands)
-      'run_shell_command',
-      // Code Mode (Lane C) — programmatic tool calling. byName no-ops to undefined
-      // (→ filtered out) when CLEMMY_CODE_MODE is off (the tool isn't in
-      // getCoreTools then), so this is safe + byte-identical with the flag off.
-      // Without this the curated surface omitted it and the model self-reported
-      // "run_tool_program is not in my tool surface" even with the flag on.
-      'run_tool_program',
-      // Deterministic batch executor. SAME omission class as run_tool_program
-      // above: registered in getLocalRuntimeTools but absent from this curated
-      // discovery allowlist, so it never reached the agent and the model
-      // reported run_batch "not exposed" and tunneled through code mode instead
-      // (live 2026-07-07). Mandated CORE keeps it through JIT once it's here.
-      'run_batch',
-      // Tasks (writes)
-      'task_add',
-      'task_update',
-      'task_hygiene',
-      // Workflows — full surface added 2026-05-21. Catalog had these
-      // registered but the orchestrator's discoveryTools array never
-      // included them, so the agent couldn't actually create the
-      // workflows it was being asked for (sess-mpf4pkru self-reported
-      // "those tools aren't on my surface" — that was accurate, not
-      // a hallucination). workflow_create defines the WHAT,
-      // workflow_schedule sets the WHEN, the rest is full CRUD so
-      // the agent can list/update/delete its own workflows without
-      // sub-agent handoff.
-      'workflow_create',
-      'workflow_list',
-      'workflow_get',
-      'workflow_run',
-      'workflow_run_status',
-      'workflow_rerun_failed_items',
-      'workflow_update',
-      'workflow_edit_step',
-      'workflow_delete',
-      'workflow_set_enabled',
-      'workflow_schedule',
-      'workflow_unschedule',
-      'workflow_import_framework',
-      'workflow_import_status',
-      // Capture a proven ad-hoc session as a reusable workflow — reachable by the
-      // Claude brain + CLI but missing HERE until the 2026-07-08 registry
-      // conformance sweep (the drift class this list is famous for).
-      'workflow_from_session',
-      // Goals — goal_create was ALSO missing here (chat could read/update goals
-      // but never create one); found by the same conformance sweep.
-      'goal_create',
-      'goal_get',
-      'goal_list',
-      'goal_update',
-      // Memory plumbing present on the Claude/CLI surfaces but absent here
-      // (same sweep): source-map provenance writes + the working-memory pad.
-      'source_map_upsert',
-      'working_memory',
-      // Executions (full surface — read + tracked-write)
-      'execution_update_step',
-      'execution_mark_blocked',
-      'execution_complete',
-      'execution_get',
-      'execution_list',
-      // Plans
-      'create_plan',
-      'list_plans',
-      'update_plan_step',
-      // Notes
-      'note_take',
-      'note_create',
-      // Notifications + user input
-      'notify_user',
-      'draft_goal_from_notes',
-      'share_plan',
-      // Composio surface (search + execute + status)
-      'composio_list_tools',
-      'composio_status',
-      // Sessions + agent runs (read-only inspection)
-      'session_history',
-      'agent_run_get',
-      'agent_runs_recent',
-      'background_task_status',
-      'background_tasks_recent',
-      'dispatch_background_task',
-      'hold_task_for_later',
-      'resume_held_task',
-      // Profile writes
-      'user_profile_update',
-      // ── Instructed-but-omitted repair, 2026-06-11 ──────────────────
-      // THIRD occurrence of the allowlist-omission class (after spaces
-      // and workflows above): the instructions explicitly tell the model
-      // to call these, but they were never in this allowlist, so the
-      // model truthfully reported "isn't exposed in this run" and stalled.
-      // Live incident: every clipped tool result carries a
-      // `recall_tool_result("call_…")` marker and the COMPACTED CONTEXT
-      // instruction mandates calling it — yet ALL 286 historical
-      // recall_tool_result calls came from workflow steps; ZERO from chat
-      // (the Ken Fiedler deep-dive stall, 2026-06-11). The focus_* family
-      // ("Call focus_get at the START of every turn — non-negotiable"),
-      // tool_choice_forget, memory_review_instructions and surface_plan
-      // were instructed and had NEVER been called by anything.
-      // orchestrator.test.ts now cross-checks instructions ↔ surface so a
-      // fourth occurrence fails CI instead of stranding a live session.
-      'recall_tool_result',
-      // FOURTH occurrence (2026-06-18): a CLIPPED tool result appends a digest
-      // footer (tool-output-digest.ts) that literally instructs the model to
-      // `call tool_output_query("call_…", {…})` to pull specific records — but
-      // tool_output_query lived ONLY in the worker/planner/workflow-step
-      // allowlists, never the chat orchestrator's. A live Claude chat turn ran
-      // `sf data query`, the 25-record result was clipped, the model followed
-      // the footer, and the Runner hard-failed "Tool tool_output_query not
-      // found in agent Clem." The CI cross-check missed it because the
-      // instruction is in the runtime footer, not ORCHESTRATOR_INSTRUCTIONS.
-      'tool_output_query',
-      'focus_get',
-      'focus_set',
-      'focus_update',
-      'focus_touch',
-      'focus_park',
-      'focus_activate',
-      'focus_clear',
-      'tool_choice_forget',
-      'memory_review_instructions',
-      'surface_plan',
-      // Browser harness (browser-use) — registered since the integration
-      // landed but never allowlisted, so chat could not drive or even check
-      // the user's browser (2026-06-11: "browser harness isn't visible
-      // anywhere"). status = read-only health/install check; run executes a
-      // Python snippet against the user's Chrome via the browser-harness CLI.
-      'browser_harness_status',
-      'browser_harness_run',
-    ]
-      .map(byName)
-      .filter((t): t is Tool<RuntimeContextValue> => Boolean(t))
-  );
+  // DERIVED from the single tool registry (TOOL-REGISTRY-PLAN-2026-07-07, step 2):
+  // the curated ~130-name array was deleted — membership is now every registry
+  // tool whose lanes include 'orchestrator' (deriveOrchestratorDiscoveryNames).
+  // Per-tool provenance (the incident history that grew this list) now lives in
+  // tool-registry.ts. byName still resolves each name to its live Tool and no-ops
+  // to undefined for flag-gated tools (spaces / code-mode off ⇒ absent from
+  // getCoreTools ⇒ filtered out), so the surface stays byte-identical under a flag
+  // exactly as before. Order is the registry's deterministic (alphabetical)
+  // declaration order; the dedup below and the JIT ranker treat this as a
+  // membership set, and a conformance test pins the SET.
+  const discoveryTools: Tool<RuntimeContextValue>[] = [...deriveOrchestratorDiscoveryNames()]
+    .map(byName)
+    .filter((t): t is Tool<RuntimeContextValue> => Boolean(t));
 
-  // De-duplicate (we listed some names twice above for clarity).
+  // De-duplicate. The registry derivation already yields a unique set, so this is
+  // now a defensive no-op kept to preserve the downstream contract.
   const seenDiscoveryNames = new Set<string>();
   const dedupedDiscoveryTools = discoveryTools.filter((t) => {
     const name = (t as { name?: string }).name;
