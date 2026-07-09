@@ -18,6 +18,7 @@ import { randomUUID } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { appendEvent, getToolOutput, writeToolOutput } from '../runtime/harness/eventlog.js';
+import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { deriveCodeModeSets } from './tool-registry.js';
 import { runCodeModeProgram, type CodeModeResult } from './code-mode-sandbox.js';
@@ -385,8 +386,16 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
   // `certifiedBatch` is threaded into the run context ONLY on the batch runner's
   // approved execute path (dispatchBatchItemTool passes it); the ad-hoc code-mode
   // path leaves it undefined, so ad-hoc writes keep full per-item judging.
-  return withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000), ...(certifiedBatch ? { certifiedBatch } : {}) }, () =>
-    wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
+  // BOTH ALS contexts must be established: withHarnessRunContext carries the
+  // GATE state, but tools that read their session via getToolOutputContext()
+  // (dispatch_background_task among them) need the tool-output context too —
+  // without it every catalog-tier context-reading tool reached through
+  // call_tool/code-mode refused with "no session context here" (live
+  // 2026-07-09: background handoff looked broken on every chat surface).
+  return withToolOutputContext({ sessionId, callId, toolName: method }, () =>
+    withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000), ...(certifiedBatch ? { certifiedBatch } : {}) }, () =>
+      wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
+    ),
   );
 }
 

@@ -234,3 +234,24 @@ test('clem.describe returns schema info for a local tool and never dispatches it
   const mcp = await describeCodeModeTool('dataforseo__serp_organic_live_advanced') as { source: string };
   assert.equal(mcp.source, 'mcp');
 });
+
+test('dispatchBatchItemTool establishes tool-output context for the inner tool (background-handoff regression)', async () => {
+  // Live 2026-07-09: dispatch_background_task reached via call_tool refused
+  // with "no session context here" — the code-mode dispatch set the harness
+  // GATE context but never the tool-output ALS the inner tool reads.
+  const { dispatchBatchItemTool, _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
+  const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  _setCodeModeToolsForTests(new Map([
+    ['ctx_probe', {
+      name: 'ctx_probe',
+      invoke: async () => JSON.stringify({ seenSessionId: getToolOutputContext()?.sessionId ?? null }),
+    }],
+  ]) as never);
+  try {
+    const out = await dispatchBatchItemTool('ctx_probe', {}, 'sess-ctx-regression', new ToolCallsCounter(10)) as { seenSessionId?: string | null };
+    assert.equal(out?.seenSessionId, 'sess-ctx-regression', 'inner tool must see the session via getToolOutputContext');
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
