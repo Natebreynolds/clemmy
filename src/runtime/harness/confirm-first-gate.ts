@@ -36,7 +36,7 @@ import { isMutatingExternalWrite } from './execution-gate.js';
 /** Verbs whose writes can't be taken back — a wrong one is felt
  *  immediately (an email sent, a post published). Tracked for telemetry
  *  and future per-shape threshold tuning. */
-const IRREVERSIBLE_VERBS: ReadonlySet<string> = new Set(['SEND', 'PUBLISH']);
+export const IRREVERSIBLE_VERBS: ReadonlySet<string> = new Set(['SEND', 'PUBLISH']);
 
 export interface ExternalWriteShape {
   /** Whether this call is a mutating external write at all. */

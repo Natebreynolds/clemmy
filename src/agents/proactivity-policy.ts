@@ -67,6 +67,22 @@ export interface ProactivityPolicy {
   updatedAt: string;
 }
 
+/**
+ * Hard floor (2026-07-09, sess-mrds80fu): YOLO standing approval must never
+ * silently authorize a BATCH of irreversible external sends — yolo
+ * auto-approved 10 outbound emails while batchConfirmThreshold sat unread.
+ * A send-class approval covering at least this many items requires one
+ * explicit human approval regardless of autoApproveScope. Single sends (a
+ * daily brief to the owner) keep flowing under YOLO. Floored at 2.
+ */
+export function sendBatchApprovalFloor(): number {
+  try {
+    return Math.max(2, loadProactivityPolicy().batchConfirmThreshold || 5);
+  } catch {
+    return 2;
+  }
+}
+
 export interface ProactivityPolicySnapshot {
   policy: ProactivityPolicy;
   quietHoursActive: boolean;

@@ -68,6 +68,15 @@ function approvalSubject(tool: string, args: Record<string, unknown>): string {
     const cmd = typeof args.command === 'string' ? args.command : '';
     return `Run shell: ${cmd.slice(0, 160)}`;
   }
+  if (tool === 'run_batch') {
+    // Same fix as the codex lane's extractApprovalSubject: never show a bare
+    // "run_batch needs your approval" when the plan says what it really is.
+    const plan = (args.plan ?? null) as { sideEffect?: string; items?: unknown[]; composioSlug?: string; tool?: string; objective?: string } | null;
+    if (plan && typeof plan === 'object' && Array.isArray(plan.items)) {
+      const target = plan.composioSlug || plan.tool || 'batch';
+      return `Batch ${plan.sideEffect ?? 'write'} · ${plan.items.length} × ${target}${plan.objective ? ` — ${String(plan.objective).slice(0, 90)}` : ''}`;
+    }
+  }
   return `${tool} needs your approval`;
 }
 

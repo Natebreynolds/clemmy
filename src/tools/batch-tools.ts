@@ -108,10 +108,17 @@ export function registerBatchTools(server: McpServer): void {
             const ledger = await runBatchPlan(planForExecution, sessionId);
             return textResult(`Certified (${cert.reason || 'ok'}).${repairNote} Executed.\n${formatBatchLedger(ledger)}`);
           }
+          // Kind anchors on the SLUG, not only the model-declared sideEffect —
+          // an OUTLOOK_*_SEND_* plan labeled 'write' must still queue as an
+          // external_send so the YOLO send gate sees it (adversarial-review
+          // blocker, 2026-07-09).
+          const { IRREVERSIBLE_VERBS } = await import('../runtime/harness/confirm-first-gate.js');
+          const slugIsSend = typeof planForExecution.composioSlug === 'string'
+            && planForExecution.composioSlug.split('_').some((p) => IRREVERSIBLE_VERBS.has(p.toUpperCase()));
           const record = queuePendingAction({
             title: `Batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 80)}`,
             summary: `run_batch plan · ${planForExecution.tool}${planForExecution.composioSlug ? `/${planForExecution.composioSlug}` : ''} · ${planForExecution.items.length} item(s), executed deterministically after approval. Certification: ${cert.reason || 'allowed'}${repairNote}`,
-            kind: planForExecution.sideEffect === 'send' ? 'external_send' : 'external_write',
+            kind: planForExecution.sideEffect === 'send' || slugIsSend ? 'external_send' : 'external_write',
             toolName: 'run_batch',
             payload: planForExecution,
             targetSummary: `${planForExecution.items.length} item(s): ${planForExecution.items.map((i) => i.id).slice(0, 12).join(', ')}${planForExecution.items.length > 12 ? ' …' : ''}`,

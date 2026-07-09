@@ -51,7 +51,52 @@ export function pendingActionApprovalView(record: PendingActionRecord): PendingA
 
 export function pendingActionApprovalViewFromArgs(args: unknown): PendingActionApprovalView | undefined {
   const id = pendingActionIdFromArgs(args);
-  if (!id) return undefined;
-  const record = getPendingAction(id);
-  return record ? pendingActionApprovalView(record) : undefined;
+  if (id) {
+    const record = getPendingAction(id);
+    if (record) return pendingActionApprovalView(record);
+  }
+  return synthesizedViewFromBatchPlan(args);
+}
+
+/**
+ * A run_batch `propose` approval fires BEFORE any pending action exists, so
+ * there is no queue record to render — which left the approval card with a
+ * bare "run_batch: propose" and zero context while the payload carried the
+ * full plan (2026-07-09, sess-mrds80fu: an Approve button for 10 outbound
+ * emails with no recipients, no count, no objective). Synthesize the rich
+ * view straight from the plan so the card shows what approval actually means.
+ */
+function synthesizedViewFromBatchPlan(args: unknown): PendingActionApprovalView | undefined {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return undefined;
+  const plan = (args as Record<string, unknown>).plan;
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return undefined;
+  const p = plan as { sideEffect?: unknown; items?: unknown; composioSlug?: unknown; tool?: unknown; objective?: unknown };
+  const items = Array.isArray(p.items) ? (p.items as Array<{ id?: unknown; args?: unknown }>) : [];
+  if (items.length === 0) return undefined;
+  const sideEffect = typeof p.sideEffect === 'string' ? p.sideEffect : 'write';
+  const tool = typeof p.composioSlug === 'string' && p.composioSlug ? p.composioSlug : typeof p.tool === 'string' ? p.tool : 'batch';
+  const objective = typeof p.objective === 'string' ? p.objective : '';
+  const ids = items.map((i) => (typeof i.id === 'string' ? i.id : '')).filter(Boolean);
+  const now = new Date().toISOString();
+  return {
+    id: '',
+    title: `Batch ${sideEffect}: ${objective.slice(0, 80) || tool}`,
+    summary: `${items.length} ${sideEffect} item(s) via ${tool}${objective ? ` — ${objective}` : ''}`,
+    kind: sideEffect === 'send' ? 'external_send' : 'external_write',
+    status: 'proposed',
+    toolName: 'run_batch',
+    targetSummary: `${items.length} item(s): ${ids.slice(0, 12).join(', ')}${items.length > 12 ? ' …' : ''}`,
+    preview: JSON.stringify(items[0]?.args ?? {}).slice(0, 400),
+    risk: sideEffect === 'send'
+      ? `Approving executes ${items.length} irreversible send(s) with no further review.`
+      : `Approving executes ${items.length} ${sideEffect} call(s) with no further review.`,
+    rollback: sideEffect === 'send' ? 'Sends are irreversible once delivered.' : 'Depends on the target tool; the ledger lists every executed item.',
+    payload: plan,
+    payloadHash: '',
+    idempotencyKey: '',
+    approvalId: null,
+    resultSummary: null,
+    createdAt: now,
+    updatedAt: now,
+  };
 }

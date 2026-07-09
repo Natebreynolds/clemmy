@@ -801,11 +801,12 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
   }
 });
 
-test('confirm-first gate: YOLO standing approval lets an irreversible batch run without a plan scope', async () => {
-  // Regression for the 2026-06-02 live incident: in YOLO the user has granted
-  // STANDING approval, but the batch gate (an approval gate) still tripped on
-  // the 5th send and demanded a plan the user had already approved. YOLO must
-  // skip the block while still RECORDING each write for batch-count continuity.
+test('confirm-first gate: YOLO never extends to an irreversible batch — threshold blocks; a certified batch passes', async () => {
+  // Supersedes the 2026-06-02 contract after sess-mrds80fu (2026-07-09): YOLO
+  // waved 10 outbound emails through this gate. New contract: YOLO still skips
+  // the gate for irreversible sends UNDER the threshold, but AT the threshold
+  // an ad-hoc irreversible send requires a reviewed approval — and a certified
+  // batch item (human-approved, byte-pinned run_batch plan) satisfies it.
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
   const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
@@ -823,19 +824,25 @@ test('confirm-first gate: YOLO standing approval lets an irreversible batch run 
       name: 'composio_execute_tool',
       execute: async (_input: unknown) => 'sent',
     });
-    const sendNo = (n: number) =>
-      withHarnessRunContext({ sessionId: sess.id, counter }, () =>
-        wrapped.execute!({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
+    const sendNo = (n: number, certified = false) =>
+      withHarnessRunContext(
+        { sessionId: sess.id, counter, ...(certified ? { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } } : {}) },
+        () => wrapped.execute!({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `person${n}@x.com` }) }),
       );
-    // 8 irreversible sends, well past the threshold of 5 — ALL pass in YOLO,
-    // no plan scope ever opened.
-    for (let n = 1; n <= 8; n += 1) {
-      assert.ok(String(await sendNo(n)).startsWith('sent'), `YOLO send #${n} should pass (standing approval)`);
+    // Under the threshold (5): YOLO standing approval still flows.
+    for (let n = 1; n <= 4; n += 1) {
+      assert.ok(String(await sendNo(n)).startsWith('sent'), `YOLO send #${n} under threshold should pass`);
     }
-    // Continuity preserved: each allowed write was still recorded so the batch
-    // count stays accurate if the user later leaves YOLO mid-session.
+    // AT the threshold: the ad-hoc irreversible send is BLOCKED despite YOLO
+    // (surfaced as the soft refusal string, so the agent can recover).
+    const blocked = String(await sendNo(5));
+    assert.match(blocked, /refused by harness/i, 'send #5 must be refused even in YOLO');
+    assert.doesNotMatch(blocked, /^sent/, 'the blocked send must not execute');
+    // A certified batch item (human-approved, byte-pinned plan) passes the gate.
+    assert.ok(String(await sendNo(5, true)).startsWith('sent'), 'certified batch item passes — the approval IS the reviewed plan');
+    // Continuity: every ALLOWED write is still recorded for batch counting.
     const writes = listEvents(sess.id, { types: ['external_write'] });
-    assert.equal(writes.length, 8, 'every YOLO write should still be recorded for batch-count continuity');
+    assert.equal(writes.length, 5, 'allowed writes (4 under-threshold + 1 certified) recorded');
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
     process.env.HARNESS_TOOL_BRACKETS = prevBrackets;

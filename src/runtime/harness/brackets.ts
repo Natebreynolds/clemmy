@@ -1052,8 +1052,13 @@ function compensateFailedExternalWrite(
   if (!sessionId) return;
   try {
     const resultStr = typeof result === 'string' ? result : '';
-    // Composio hard-failure (the 2026-06-12 to/to_email case).
-    if (resultStr.startsWith('⚠️ composio_execute_tool FAILED')) {
+    // Composio hard-failure (the 2026-06-12 to/to_email case) — and the
+    // cold-start resolve NOT FOUND (sess-mrds80fu item 1: the slug 404s at the
+    // RESOLVE step, before any send, so the pre-recorded external_write must
+    // compensate or the batch runner's side-effect-safe retry trips the
+    // duplicate-target gate and the recipient is silently skipped).
+    if (resultStr.startsWith('⚠️ composio_execute_tool FAILED')
+      || /^⚠️ composio_execute_tool NOT FOUND \(slug=/.test(resultStr)) {
       const shape = classifyExternalWrite(toolName, parsedInput);
       if (!shape.mutating) return;
       appendEvent({
@@ -1217,8 +1222,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       const decision = applyMode(rawDecision);
       // Fan-out nudge: only steer the ORCHESTRATOR's own context toward
       // run_worker — inside a worker scope (guardrailScopeId set) the nudge
-      // is wrong advice (workers can't spawn workers), so suppress it.
-      if (decision.fanoutNudge && !ctx.guardrailScopeId) {
+      // is wrong advice (workers can't spawn workers), so suppress it. Also
+      // suppress for CERTIFIED batch items: run_batch IS the sanctioned
+      // serial primitive — nudging its own approved execution toward
+      // run_worker is contradictory noise (fired mid-batch on sess-mrds80fu).
+      if (decision.fanoutNudge && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         fanoutNudge = decision.fanoutNudge;
         try {
           appendEvent({
@@ -1241,7 +1249,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // worker scope they diverge, so suppress. Also suppress when the prior
       // output was error-shaped: a retry after a transient failure must NOT be
       // discouraged. Nudge points at recall_tool_result; never serves a payload.
-      if (decision.cachedCallId && !ctx.guardrailScopeId) {
+      if (decision.cachedCallId && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
         let priorOutput: string | null = null;
         try {
           priorOutput = getToolOutput(ctx.sessionId, decision.cachedCallId)?.output ?? null;
@@ -1471,7 +1479,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
             throw new DuplicateExternalWriteError({ toolName: tool.name, shapeKey: shape.shapeKey, target: dup.target ?? 'unknown' });
           }
           // Grounding: verify the payload against this target's own
-          // session artifacts via an independent fast judge.
+          // session artifacts via an independent fast judge. A CERTIFIED batch
+          // item skips it — certification already judged these exact byte-pinned
+          // payloads once, and this per-item model call was the dominant slice
+          // of the ~30-45s/email pace on sess-mrds80fu's approved batch (the
+          // judge-skip optimization covered the fidelity judges but forgot
+          // this one).
+          if (!skipItemJudge) {
           const verdictResult = await evaluateGrounding(ctx.sessionId, tool.name, parsedInput);
           if (verdictResult.action === 'block') {
             try {
@@ -1497,6 +1511,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               sourceCallIds: verdictResult.sourceCallIds,
               failureCount: verdictResult.failureCount ?? 1,
             });
+          }
           }
         }
       }
@@ -1906,16 +1921,21 @@ export function wrapToolForHarness<T extends WrappableTool>(
             const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
 
             // YOLO = the user has granted STANDING approval ("auto-approve
-            // everything except the hard danger denylist"). The confirm-first
-            // batch gate is an APPROVAL gate; in YOLO it is pure friction and
-            // breaks the approve-once-then-run contract (live 2026-06-02: in
-            // YOLO, after 4 sends the 5th tripped this gate and demanded a
-            // plan the user had already approved). Skip the block in YOLO but
-            // still RECORD the write below for batch-count continuity. The
-            // escalate loop-guard + the hard danger denylist remain the floor.
-            // The same yolo short-circuit lives in evaluateAutoApprove
-            // (plan-scope.ts) — this gate had simply forgotten to ask.
-            const yoloStandingApproval = policy.autoApproveScope === 'yolo';
+            // everything except the hard danger denylist"). For REVERSIBLE
+            // writes the 2026-06-02 rationale stands: this approval gate is
+            // pure friction under YOLO — skip it, still RECORD the write.
+            // But YOLO never extends to an IRREVERSIBLE batch (2026-07-09,
+            // sess-mrds80fu: yolo waved 10 outbound emails through while
+            // batchConfirmThreshold sat unread). Irreversible batches at/over
+            // the threshold require ONE reviewed approval regardless of scope.
+            const yoloStandingApproval = policy.autoApproveScope === 'yolo' && !shape.irreversible;
+
+            // A certified batch item executes a HUMAN-approved, byte-pinned
+            // plan (run_batch: approval pins the payload hash; the yolo
+            // auto-approve hole at the request_approval surface is closed in
+            // orchestrator.ts) — that approval IS the reviewed plan, so the
+            // gate is satisfied without a separate plan scope.
+            const approvedCertifiedBatch = Boolean(ctx.certifiedBatch);
 
             // An instruction-reviewed plan scope satisfies the gate.
             const { getPlanScope } = await import('../../agents/plan-scope.js');
@@ -1940,7 +1960,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               (getRuntimeEnv('CLEMMY_CONFIRM_FIRST_ALL_WRITES', 'off') ?? 'off').toLowerCase() === 'on';
             const severityRequiresGate = gateAllMutating || shape.irreversible;
 
-            if (!yoloStandingApproval && review.required && severityRequiresGate && !hasReviewedScope) {
+            if (!yoloStandingApproval && !approvedCertifiedBatch && review.required && severityRequiresGate && !hasReviewedScope) {
               try {
                 appendEvent({
                   sessionId: ctx.sessionId,

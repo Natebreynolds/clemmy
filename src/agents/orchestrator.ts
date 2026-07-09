@@ -298,6 +298,53 @@ function isYoloAutoApprovalPolicy(): boolean {
   }
 }
 
+const SEND_CLASS_TEXT_RE = /\b(send|sending|sends|email|emails|e-mail|sms|text message|post|posting|publish|tweet|dm)\b/i;
+
+/**
+ * YOLO must NOT auto-approve a BATCH of irreversible external sends
+ * (2026-07-09, sess-mrds80fu: "Auto-approved by YOLO mode: Send market-leader
+ * reactivation emails 1-10" put 10 unapproved emails on the wire). Detection
+ * anchors on the queued pending action when one exists (kind external_send +
+ * its plan's item count); otherwise falls back to send-vocabulary + an item
+ * count parsed from the subject ("emails 1-10", "10 emails"). Single or
+ * uncounted sends keep the YOLO contract unchanged.
+ */
+export const _yoloBlockedForSendBatchForTests = (args: RequestApprovalArgs): Promise<boolean> => yoloBlockedForSendBatch(args);
+
+async function yoloBlockedForSendBatch(args: RequestApprovalArgs): Promise<boolean> {
+  const { sendBatchApprovalFloor } = await import('./proactivity-policy.js');
+  const floor = sendBatchApprovalFloor();
+  const id = args.pendingActionId?.trim();
+  if (id) {
+    try {
+      const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
+      const { IRREVERSIBLE_VERBS } = await import('../runtime/harness/confirm-first-gate.js');
+      const record = getPendingAction(id);
+      if (record) {
+        // Send-ness anchors on BOTH the queue kind AND the plan's own slug —
+        // the kind derives from the MODEL-declared sideEffect, so a send batch
+        // the model labeled 'write' must not slip the gate (adversarial-review
+        // blocker, 2026-07-09).
+        const payload = record.payload as { items?: unknown[]; composioSlug?: string } | undefined;
+        const slugIrreversible = typeof payload?.composioSlug === 'string'
+          && payload.composioSlug.split('_').some((part) => IRREVERSIBLE_VERBS.has(part.toUpperCase()));
+        if (record.kind !== 'external_send' && !slugIrreversible) return false;
+        // Unknown count on a queued SEND batch → conservative: require a human.
+        return !Array.isArray(payload?.items) || payload.items.length >= floor;
+      }
+    } catch { return true; /* fail-closed on the safety path */ }
+  }
+  const text = `${args.subject} ${args.reason ?? ''}`;
+  if (!SEND_CLASS_TEXT_RE.test(text)) return false;
+  // Count only numbers that plausibly denote batch size: an explicit range
+  // ("emails 1-10") or a number adjacent to a send-noun ("25 outreach emails").
+  // A bare number ("July 10 newsletter") must not block a single daily send.
+  const range = /(\d{1,4})\s*[-–]\s*(\d{1,4})/.exec(text);
+  const counted = /\b(\d{1,4})\s+(?:[a-z-]+\s+){0,2}?(?:emails?|e-mails?|messages?|recipients?|contacts?|prospects?|sends?|posts?|dms?|sms)\b/i.exec(text);
+  const count = range ? Math.abs(Number(range[2]) - Number(range[1])) + 1 : counted ? Number(counted[1]) : undefined;
+  return typeof count === 'number' && Number.isFinite(count) && count >= floor;
+}
+
 // Code-level backstop for the v0.5.59 context fix: in YOLO, ask_user_question is
 // the ONE human-wait path with no autonomy-scope awareness — its siblings
 // (request_approval, confirm-first, per-tool approval) all honor YOLO in code.
@@ -338,11 +385,29 @@ function inferApprovedComposioSlugs(args: RequestApprovalArgs): string[] {
   return [];
 }
 
-function openRequestApprovalScope(args: RequestApprovalArgs, runContext: unknown): string[] {
+async function pendingActionApprovedSlugs(args: RequestApprovalArgs): Promise<string[]> {
+  const id = args.pendingActionId?.trim();
+  if (!id) return [];
+  try {
+    const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
+    const record = getPendingAction(id);
+    const slug = (record?.payload as { composioSlug?: string } | undefined)?.composioSlug;
+    return typeof slug === 'string' && slug.trim() ? [slug.trim()] : [];
+  } catch {
+    return [];
+  }
+}
+
+async function openRequestApprovalScope(args: RequestApprovalArgs, runContext: unknown): Promise<string[]> {
   if (args.destructive) return [];
   const sessionId = extractSessionId(runContext);
   if (!sessionId) return [];
-  const allowedComposioSlugs = inferApprovedComposioSlugs(args);
+  // Approve-once-then-run: a HUMAN approval of a queued action IS the reviewed
+  // plan — open the scope for the plan's own slug so the confirm-first gate
+  // doesn't re-refuse the approved batch at the threshold (adversarial review,
+  // 2026-07-09). The text-inference fallback keeps the old draft-batch shape.
+  const fromPendingAction = await pendingActionApprovedSlugs(args);
+  const allowedComposioSlugs = fromPendingAction.length > 0 ? fromPendingAction : inferApprovedComposioSlugs(args);
   if (allowedComposioSlugs.length === 0) return [];
   openPlanScope({
     sessionId,
@@ -390,21 +455,27 @@ export function buildRequestApprovalTool() {
     // orchestrator can keep moving.
     needsApproval: async (_ctx, input) => {
       const args = input as RequestApprovalArgs;
+      // Send-batch check FIRST: a queued external_send whose subject happens
+      // to read like a local save ("save these emails to memory then send")
+      // must never ride the local-save shortcut past the gate (adversarial-
+      // review blocker, 2026-07-09).
+      if (await yoloBlockedForSendBatch(args)) return true;
       if (isLocalSaveApproval(args)) return false;
       if (isYoloAutoApprovalPolicy()) return false;
       return true;
     },
     execute: async (args, runContext) => {
-      if (isLocalSaveApproval(args)) {
+      const sendBatchBlocked = await yoloBlockedForSendBatch(args);
+      if (!sendBatchBlocked && isLocalSaveApproval(args)) {
         const pendingActionText = await markPendingActionApprovedFromRequest(args);
         return `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.${pendingActionText}`;
       }
-      if (isYoloAutoApprovalPolicy()) {
+      if (!sendBatchBlocked && isYoloAutoApprovalPolicy()) {
         const pendingActionText = await markPendingActionApprovedFromRequest(args);
         return `Auto-approved by YOLO mode: ${args.subject}. Proceed with the action you described.${pendingActionText}`;
       }
       const pendingActionText = await markPendingActionApprovedFromRequest(args);
-      const scopedSlugs = openRequestApprovalScope(args, runContext);
+      const scopedSlugs = await openRequestApprovalScope(args, runContext);
       const scopeText = scopedSlugs.length > 0
         ? ` Approved scope opened for ${scopedSlugs.join(', ')} in this session, so matching concrete tool calls should not ask again.`
         : '';
