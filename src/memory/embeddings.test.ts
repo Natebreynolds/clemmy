@@ -8,6 +8,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   bufferToVector,
   classifyEmbedError,
@@ -15,14 +18,26 @@ import {
   cosine,
   EMBEDDING_DIM,
   embedQuery,
+  getEmbeddingProvider,
   getEmbeddingHealth,
   isEmbeddingsEnabled,
   vectorToBuffer,
   _resetEmbeddingHealthForTest,
+  _resetEmbedDemotionForTest,
+  _resetEmbeddingProviderCooldownsForTest,
   _driveEmbedFailureForTest,
   _driveEmbedSuccessForTest,
+  _setEmbeddingProviderHealthFileForTest,
   _setEmbeddingProviderForTest,
+  _setLocalProviderForTest,
 } from './embeddings.js';
+
+const TEST_PROVIDER_HEALTH_DIR = mkdtempSync(path.join(os.tmpdir(), 'clemmy-embedding-health-test-'));
+_setEmbeddingProviderHealthFileForTest(path.join(TEST_PROVIDER_HEALTH_DIR, 'embedding-provider-health.json'));
+test.after(() => {
+  _resetEmbeddingProviderCooldownsForTest();
+  rmSync(TEST_PROVIDER_HEALTH_DIR, { recursive: true, force: true });
+});
 
 test('embedQuery in-flight cache: two CONCURRENT identical embeds make ONE provider call (the per-turn double-embed)', async () => {
   _resetEmbeddingHealthForTest();
@@ -100,6 +115,46 @@ test('embedQuery cache is cleared when the embedding provider changes', async ()
     assert.equal(callsB, 1, 'provider swap must not reuse the previous provider vector');
     assert.equal(b[0], 2);
   } finally {
+    _setEmbeddingProviderForTest(undefined);
+    _resetEmbeddingHealthForTest();
+  }
+});
+
+test('embedQuery remote single-flight: different query falls back while an OpenAI probe is in flight', async () => {
+  _resetEmbeddingHealthForTest();
+  let calls = 0;
+  let started!: () => void;
+  let release!: () => void;
+  const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+  const holdPromise = new Promise<void>((resolve) => { release = resolve; });
+  _setEmbeddingProviderForTest({
+    name: 'openai',
+    model: 'text-embedding-3-small',
+    dim: EMBEDDING_DIM,
+    embed: async (texts: string[]) => {
+      calls += 1;
+      started();
+      await holdPromise;
+      return texts.map(() => Float32Array.from({ length: EMBEDDING_DIM }, () => 1));
+    },
+  });
+  try {
+    const first = embedQuery('slow semantic probe');
+    await startedPromise;
+
+    const t0 = Date.now();
+    const second = await embedQuery('different query during slow probe');
+
+    assert.equal(second, null, 'second query degrades immediately instead of starting another remote call');
+    assert.ok(Date.now() - t0 < 100, 'busy-provider fallback should be immediate');
+    assert.equal(calls, 1, 'only one OpenAI embed call is in flight');
+
+    release();
+    const firstVector = await first;
+    assert.ok(firstVector);
+    assert.equal(firstVector[0], 1);
+  } finally {
+    release?.();
     _setEmbeddingProviderForTest(undefined);
     _resetEmbeddingHealthForTest();
   }
@@ -251,5 +306,66 @@ test('breaker: success resets state and records lastSuccessAt', () => {
     assert.ok(h.lastSuccessAt, 'lastSuccessAt is recorded');
   } finally {
     delete process.env.CLEMMY_EMBED_LOCAL_FALLBACK;
+  }
+});
+
+test('provider cooldown persists across daemon health reset and routes OpenAI to local', async () => {
+  _resetEmbeddingProviderCooldownsForTest();
+  _resetEmbeddingHealthForTest();
+  _resetEmbedDemotionForTest();
+  _setEmbeddingProviderForTest(undefined);
+  _setLocalProviderForTest({
+    name: 'local',
+    model: 'test-local-embedding',
+    dim: 4,
+    async embed(texts: string[]) {
+      return texts.map(() => new Float32Array([1, 0, 0, 0]));
+    },
+  });
+
+  const prevKey = process.env.OPENAI_API_KEY;
+  const prevProvider = process.env.CLEMMY_EMBED_PROVIDER;
+  const prevLocal = process.env.CLEMMY_LOCAL_EMBEDDINGS;
+  const realFetch = globalThis.fetch;
+  process.env.OPENAI_API_KEY = 'sk-test-openai-fails';
+  delete process.env.CLEMMY_EMBED_PROVIDER;
+  process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls += 1;
+    return {
+      ok: false,
+      status: 401,
+      text: async () => 'invalid_api_key',
+    };
+  }) as unknown as typeof fetch;
+
+  try {
+    const vector = await embedQuery('provider health survives restart');
+    assert.ok(vector, 'current call should succeed on local fallback');
+    assert.equal(vector.length, 4);
+    assert.equal(fetchCalls, 1, 'OpenAI is probed once before local fallback');
+    const health = getEmbeddingHealth();
+    assert.equal(health.providerCooldownReason, 'auth');
+    assert.ok(health.providerCooldownUntilMs > Date.now(), 'provider cooldown is persisted');
+
+    _resetEmbeddingHealthForTest();
+    _resetEmbedDemotionForTest();
+    const afterRestartProvider = await getEmbeddingProvider();
+    assert.equal(afterRestartProvider?.name, 'local', 'restart reads provider cooldown and avoids OpenAI');
+
+    const second = await embedQuery('provider health survives restart second call');
+    assert.ok(second, 'post-restart call still uses local provider');
+    assert.equal(fetchCalls, 1, 'post-restart selection must not re-probe OpenAI during cooldown');
+  } finally {
+    globalThis.fetch = realFetch;
+    _setEmbeddingProviderForTest(undefined);
+    _setLocalProviderForTest(undefined);
+    _resetEmbedDemotionForTest();
+    _resetEmbeddingHealthForTest();
+    _resetEmbeddingProviderCooldownsForTest();
+    if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+    if (prevProvider === undefined) delete process.env.CLEMMY_EMBED_PROVIDER; else process.env.CLEMMY_EMBED_PROVIDER = prevProvider;
+    if (prevLocal === undefined) delete process.env.CLEMMY_LOCAL_EMBEDDINGS; else process.env.CLEMMY_LOCAL_EMBEDDINGS = prevLocal;
   }
 });

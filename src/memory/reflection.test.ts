@@ -46,6 +46,10 @@ const {
   _resetResolverStatsForTest,
   _testOnly_peekSessionImportance,
   _testOnly_resetAllSessionImportance,
+  _testOnly_setReflectionExtractor,
+  _testOnly_sanitizeExtractionOutput,
+  _testOnly_sanitizeRecursivePatternOutput,
+  _testOnly_sanitizeConflictDecision,
 } = await import('./reflection.js');
 const { rememberFact, getFact, setFactPinned, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
 const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
@@ -57,6 +61,7 @@ function factContentHash(id: number): string {
 
 test.afterEach(() => {
   _setEmbeddingProviderForTest(undefined);
+  _testOnly_setReflectionExtractor(null);
 });
 
 test('entities: upsert is idempotent + merges aliases', () => {
@@ -248,12 +253,171 @@ test('session importance counter: accumulate + reset', () => {
   assert.equal(_testOnly_peekSessionImportance('never-seen'), 0);
 });
 
-// Note: full importance-gating integration coverage (extraction below
-// threshold → cancelled:low_importance, accumulation across calls,
-// commit-then-reset) requires mocking the LLM extractor. The threshold
-// helper above + the gate's deterministic arithmetic are unit-tested;
-// the runtime path is exercised end-to-end in manual verification per
-// the Phase 2 plan.
+test('reflectOnToolReturn: low-importance extractions persist and commit together when the threshold crosses', async () => {
+  resetMemoryDb();
+  _testOnly_resetAllSessionImportance();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  const prevThreshold = process.env.CLEMMY_REFLECTION_THRESHOLD;
+  delete process.env.CLEMMY_REFLECTION;
+  process.env.CLEMMY_REFLECTION_THRESHOLD = '10';
+  const sessionId = 'sess-pending-reflection';
+  try {
+    _testOnly_setReflectionExtractor(async (prompt) => {
+      if (prompt.includes('call-low')) {
+        return {
+          facts: [{ kind: 'reference', text: 'Quorvex amber docket anchors the retention proof', importance: 4 }],
+          entities: [{ type: 'project', name: 'Quorvex Docket' }],
+          pointers: [],
+        };
+      }
+      return {
+        facts: [{ kind: 'reference', text: 'Zentara blue ledger closes the threshold proof', importance: 6 }],
+        entities: [],
+        pointers: [{ label: 'zentara blue ledger' }],
+      };
+    });
+
+    const first = await reflectOnToolReturn({
+      sessionId,
+      callId: 'call-low',
+      tool: 'read_file',
+      output: 'first durable output '.repeat(80),
+    });
+    assert.equal(first.skipped, 'low_importance');
+    assert.equal(first.factsWritten, 0);
+    assert.equal(first.pointersStored, 1, 'pointer is stored even while fact commit is delayed');
+    assert.equal(_testOnly_peekSessionImportance(sessionId), 4);
+    assert.equal(
+      (openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get() as { n: number }).n,
+      0,
+      'below-threshold facts are delayed, not committed immediately',
+    );
+    const firstPointer = listRecentEpisodicPointers(sessionId, 10)[0];
+    assert.equal(firstPointer?.call_id, 'call-low');
+    assert.match(firstPointer?.label ?? '', /derived_fact_source/);
+
+    const second = await reflectOnToolReturn({
+      sessionId,
+      callId: 'call-cross',
+      tool: 'read_file',
+      output: 'second durable output '.repeat(80),
+    });
+    assert.equal(second.skipped, undefined);
+    assert.equal(second.factsWritten, 2, 'crossing the threshold commits current and pending facts');
+    assert.equal(second.entitiesUpserted, 1, 'pending entities commit with their delayed batch');
+    assert.equal(second.sumImportance, 10);
+    assert.equal(_testOnly_peekSessionImportance(sessionId), 0, 'pending threshold window resets after commit');
+
+    const rows = openMemoryDb().prepare(`
+      SELECT content, derived_from_call_id
+      FROM consolidated_facts
+      ORDER BY derived_from_call_id
+    `).all() as Array<{ content: string; derived_from_call_id: string | null }>;
+    assert.deepEqual(
+      rows.map((r) => [r.derived_from_call_id, r.content]),
+      [
+        ['call-cross', 'Zentara blue ledger closes the threshold proof'],
+        ['call-low', 'Quorvex amber docket anchors the retention proof'],
+      ],
+    );
+    assert.equal(
+      (openMemoryDb().prepare('SELECT COUNT(*) AS n FROM reflection_pending_extractions').get() as { n: number }).n,
+      0,
+      'pending rows are cleared only after the delayed facts commit',
+    );
+  } finally {
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+    if (prevThreshold === undefined) delete process.env.CLEMMY_REFLECTION_THRESHOLD; else process.env.CLEMMY_REFLECTION_THRESHOLD = prevThreshold;
+  }
+});
+
+test('reflectOnToolReturn: extractor failure still leaves a recallable pointer', async () => {
+  resetMemoryDb();
+  _testOnly_resetAllSessionImportance();
+  const prevReflect = process.env.CLEMMY_REFLECTION;
+  delete process.env.CLEMMY_REFLECTION;
+  try {
+    _testOnly_setReflectionExtractor(async () => null);
+    const result = await reflectOnToolReturn({
+      sessionId: 'sess-extractor-fail',
+      callId: 'call-extractor-fail',
+      tool: 'composio_execute_tool',
+      output: 'large connector output with potentially useful rows '.repeat(80),
+    });
+    assert.equal(result.skipped, 'extractor_failed');
+    assert.equal(result.pointersStored, 1);
+    const pointers = listRecentEpisodicPointers('sess-extractor-fail', 5);
+    assert.equal(pointers.length, 1);
+    assert.equal(pointers[0].call_id, 'call-extractor-fail');
+    assert.match(pointers[0].label, /extractor_failed/);
+  } finally {
+    if (prevReflect === undefined) delete process.env.CLEMMY_REFLECTION; else process.env.CLEMMY_REFLECTION = prevReflect;
+  }
+});
+
+test('reflection extractor sanitizer preserves signal from schema-drifted JSON', () => {
+  const extraction = _testOnly_sanitizeExtractionOutput('```json\n' + JSON.stringify({
+    facts: [
+      { kind: 'memory', text: 'User prefers CRM exports grouped by account owner.', importance: '8' },
+      { kind: 'project', text: 'Acme renewal outreach uses the Q3 pipeline sheet.', importance: 6 },
+    ],
+    entities: [
+      { type: 'organization', name: 'Acme Legal', aliases: [null, 'Acme'] },
+      { type: 'account', name: 'Q3 Pipeline' },
+      { type: 'person', name: '' },
+    ],
+    pointers: null,
+    resources: [
+      { kind: 'sheet', name: 'Q3 pipeline sheet', whats_here: 'renewal outreach rows' },
+      { kind: 'folder', ref: 'drive:missing-name' },
+    ],
+  }) + '\n```', { withResources: true });
+
+  assert.ok(extraction);
+  assert.deepEqual(extraction.facts.map((fact) => [fact.kind, fact.importance]), [['user', 8], ['project', 6]]);
+  assert.deepEqual(extraction.entities.map((entity) => [entity.type, entity.name]), [['company', 'Acme Legal'], ['company', 'Q3 Pipeline']]);
+  assert.deepEqual(extraction.entities[0].aliases, ['Acme']);
+  assert.deepEqual(extraction.pointers, []);
+  assert.deepEqual(extraction.resources, [
+    { kind: 'sheet', name: 'Q3 pipeline sheet', whats_here: 'renewal outreach rows' },
+  ]);
+});
+
+test('recursive reflection sanitizer accepts schema-drifted pattern output', () => {
+  const extraction = _testOnly_sanitizeRecursivePatternOutput('```json\n' + JSON.stringify({
+    patterns: [
+      { summary: 'User repeatedly asks for harness changes that keep model output from being discarded.', importance: '11' },
+      { text: 'ok', importance: 7 },
+      { pattern: 'Clementine work increasingly centers on long-horizon recovery and durable memory.', score: '6' },
+    ],
+  }) + '\n```');
+
+  assert.ok(extraction);
+  assert.deepEqual(extraction.patterns, [
+    { text: 'User repeatedly asks for harness changes that keep model output from being discarded.', importance: 10 },
+    { text: 'Clementine work increasingly centers on long-horizon recovery and durable memory.', importance: 6 },
+  ]);
+  assert.deepEqual(_testOnly_sanitizeRecursivePatternOutput('{"patterns":null}')?.patterns, []);
+  assert.deepEqual(_testOnly_sanitizeRecursivePatternOutput('[{"text":"Top-level array pattern","importance":4}]')?.patterns, [
+    { text: 'Top-level array pattern', importance: 4 },
+  ]);
+});
+
+test('conflict resolver sanitizer accepts schema-drifted JSON', () => {
+  const decision = _testOnly_sanitizeConflictDecision('```json\n' + JSON.stringify({
+    verdict: 'update',
+    targetId: '42',
+    replacement: 'User now prefers concise Friday pipeline summaries.',
+    rationale: 'The candidate is a newer user preference.',
+  }) + '\n```');
+  assert.deepEqual(decision, {
+    decision: 'UPDATE',
+    target_id: 42,
+    rewrite: 'User now prefers concise Friday pipeline summaries.',
+    reason: 'The candidate is a newer user preference.',
+  });
+  assert.equal(_testOnly_sanitizeConflictDecision('{"decision":"MERGE"}'), null);
+});
 
 test('runRecursiveReflection: disabled via CLEMMY_REFLECTION=off returns cancelled', async () => {
   resetMemoryDb();

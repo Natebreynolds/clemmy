@@ -31,7 +31,7 @@ import { BASE_DIR, MODELS } from '../config.js';
 import { embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { deleteFact, rememberFact } from './facts.js';
 import type { ConsolidatedFactKind } from './db.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 
 const logger = pino({ name: 'clementine-next.memory.import' });
 
@@ -208,22 +208,105 @@ const DISTILL_INSTRUCTIONS = [
   `Each fact: self-contained (readable with zero surrounding context), ≤${FACT_MAX_CHARS} chars, classified as user | project | feedback | constraint | reference.`,
   'DO NOT extract: ephemeral state, timestamps/ids, formatting/boilerplate, tool syntax, anything about the OTHER agent\'s own mechanics unless it encodes a user preference.',
   'DO NOT invent. Empty/noise input → empty facts array.',
+  'Return ONLY JSON: {"facts":[{"kind":"user|project|feedback|reference|constraint","content":"...","importance":1-10|null}]}',
 ].join('\n');
 
-async function distillFile(text: string, filePath: string): Promise<Array<z.infer<typeof DistillSchema>['facts'][number]> | null> {
+type DistilledImportFact = z.infer<typeof DistillSchema>['facts'][number];
+
+function parseDistillerJson(value: unknown): unknown | null {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const candidate = extractJsonCandidate(value);
+  if (!candidate) return null;
   try {
-    const agent = new Agent<unknown, typeof DistillSchema>({
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeDistilledKind(value: unknown): ConsolidatedFactKind {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (/^users?$|identity|profile|preference|person/.test(raw)) return 'user';
+  if (/^projects?$|task|goal|work|workspace/.test(raw)) return 'project';
+  if (/feedback|correction|instruction|guideline|rule/.test(raw)) return 'feedback';
+  if (/constraint|policy|limit|requirement|must|never/.test(raw)) return 'constraint';
+  return 'reference';
+}
+
+function stringField(obj: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string') return value.replace(/\s+/g, ' ').trim();
+  }
+  return '';
+}
+
+function sanitizeDistillerOutput(value: unknown): DistilledImportFact[] | null {
+  const parsed = parseDistillerJson(value);
+  if (parsed == null) return null;
+  const container = parsed as { facts?: unknown; memories?: unknown; items?: unknown; data?: unknown };
+  const rawFacts =
+    Array.isArray(parsed) ? parsed
+      : Array.isArray(container.facts) ? container.facts
+        : Array.isArray(container.memories) ? container.memories
+          : Array.isArray(container.items) ? container.items
+            : Array.isArray(container.data) ? container.data
+              : container.facts === null ? []
+                : null;
+  if (!Array.isArray(rawFacts)) return null;
+
+  const facts: DistilledImportFact[] = [];
+  for (const raw of rawFacts) {
+    if (facts.length >= DISTILL_MAX_FACTS_PER_FILE) break;
+    let content = '';
+    let kind: ConsolidatedFactKind = 'reference';
+    let importance: number | null | undefined;
+
+    if (typeof raw === 'string') {
+      content = raw.replace(/\s+/g, ' ').trim();
+    } else if (raw && typeof raw === 'object') {
+      const obj = raw as Record<string, unknown>;
+      content = stringField(obj, ['content', 'fact', 'text', 'summary', 'memory', 'statement', 'value']);
+      kind = normalizeDistilledKind(obj.kind ?? obj.type ?? obj.category);
+      const n = typeof obj.importance === 'number'
+        ? obj.importance
+        : typeof obj.importance === 'string'
+          ? Number.parseFloat(obj.importance)
+          : typeof obj.score === 'number'
+            ? obj.score
+            : typeof obj.score === 'string'
+              ? Number.parseFloat(obj.score)
+              : NaN;
+      importance = Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : null;
+    }
+
+    if (content.length < 8) continue;
+    facts.push({
+      kind,
+      content: content.slice(0, FACT_MAX_CHARS),
+      importance,
+    });
+  }
+  return facts;
+}
+
+export function _testOnly_sanitizeDistillerOutput(value: unknown): DistilledImportFact[] | null {
+  return sanitizeDistillerOutput(value);
+}
+
+async function distillFile(text: string, filePath: string): Promise<DistilledImportFact[] | null> {
+  try {
+    const agent = new Agent({
       name: 'Memory Import Distiller',
       model: MODELS.fast || MODELS.primary || 'gpt-5.4-mini',
       instructions: DISTILL_INSTRUCTIONS,
-      outputType: normalizeZodForCodexStrict(DistillSchema) as typeof DistillSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-memory-import' });
     const input = `FILE: ${path.basename(filePath)}\n\n${text.slice(0, 24_000)}`;
     const result = await runner.run(agent, input);
-    const final = (result as { finalOutput?: { facts?: unknown } }).finalOutput;
-    if (!final || !Array.isArray(final.facts)) return null;
-    return final.facts as Array<z.infer<typeof DistillSchema>['facts'][number]>;
+    const final = (result as { finalOutput?: unknown }).finalOutput;
+    return sanitizeDistillerOutput(final);
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err), file: filePath }, 'memory-import distiller failed — falling back to deterministic harvest');
     return null;

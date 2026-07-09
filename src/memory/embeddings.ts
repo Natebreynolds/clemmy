@@ -1,6 +1,8 @@
 import pino from 'pino';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
-import { openMemoryDb } from './db.js';
+import { openMemoryDb, STATE_DIR } from './db.js';
 
 /**
  * Provider-backed embeddings for semantic recall rerank.
@@ -72,6 +74,103 @@ const COOLDOWN_TERMINAL_MS = 60 * 60_000;   // quota / auth — probe at most ho
 
 export type EmbedErrorClass = 'quota' | 'auth' | 'rate_limit' | 'transient';
 
+interface PersistedProviderCooldown {
+  cls: EmbedErrorClass;
+  untilMs: number;
+  since: string;
+  failures: number;
+}
+
+interface PersistedProviderCooldownState {
+  providers?: Record<string, PersistedProviderCooldown>;
+}
+
+const EMBEDDING_PROVIDER_HEALTH_FILE = path.join(STATE_DIR, 'embedding-provider-health.json');
+let embeddingProviderHealthFile = EMBEDDING_PROVIDER_HEALTH_FILE;
+let embeddingProviderHealthFileIsTestOverride = false;
+let providerCooldownsLoaded = false;
+const providerCooldowns = new Map<string, PersistedProviderCooldown>();
+
+function providerCooldownKey(provider: Pick<EmbeddingProvider, 'name' | 'model' | 'dim'>): string {
+  return `${provider.name ?? 'unknown'}:${provider.model ?? 'unknown'}:${provider.dim}`;
+}
+
+function loadProviderCooldowns(): void {
+  if (providerCooldownsLoaded) return;
+  providerCooldownsLoaded = true;
+  providerCooldowns.clear();
+  if (!existsSync(embeddingProviderHealthFile)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(embeddingProviderHealthFile, 'utf-8')) as PersistedProviderCooldownState;
+    const now = Date.now();
+    for (const [key, rec] of Object.entries(parsed.providers ?? {})) {
+      if (
+        typeof key === 'string' &&
+        typeof rec.cls === 'string' &&
+        typeof rec.untilMs === 'number' &&
+        typeof rec.since === 'string' &&
+        typeof rec.failures === 'number' &&
+        rec.untilMs > now
+      ) {
+        providerCooldowns.set(key, rec);
+      }
+    }
+  } catch {
+    providerCooldowns.clear();
+  }
+  persistProviderCooldowns();
+}
+
+function persistProviderCooldowns(): void {
+  const now = Date.now();
+  for (const [key, rec] of providerCooldowns) {
+    if (rec.untilMs <= now) providerCooldowns.delete(key);
+  }
+  try {
+    if (providerCooldowns.size === 0) {
+      rmSync(embeddingProviderHealthFile, { force: true });
+      return;
+    }
+    mkdirSync(path.dirname(embeddingProviderHealthFile), { recursive: true });
+    const tmp = `${embeddingProviderHealthFile}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify({ providers: Object.fromEntries(providerCooldowns) }, null, 2), 'utf-8');
+    renameSync(tmp, embeddingProviderHealthFile);
+  } catch {
+    // Best-effort health marker only. In-process breaker/demotion still works.
+  }
+}
+
+function providerCooldown(provider: EmbeddingProvider): PersistedProviderCooldown | null {
+  loadProviderCooldowns();
+  const key = providerCooldownKey(provider);
+  const rec = providerCooldowns.get(key);
+  if (!rec) return null;
+  if (rec.untilMs <= Date.now()) {
+    providerCooldowns.delete(key);
+    persistProviderCooldowns();
+    return null;
+  }
+  return rec;
+}
+
+function markProviderCooldown(provider: EmbeddingProvider, cls: EmbedErrorClass, untilMs: number, failures: number): void {
+  if (provider.name !== 'openai' || untilMs <= Date.now()) return;
+  loadProviderCooldowns();
+  providerCooldowns.set(providerCooldownKey(provider), {
+    cls,
+    untilMs,
+    since: new Date().toISOString(),
+    failures,
+  });
+  persistProviderCooldowns();
+}
+
+function clearProviderCooldown(provider: EmbeddingProvider): void {
+  if (provider.name !== 'openai') return;
+  loadProviderCooldowns();
+  if (providerCooldowns.delete(providerCooldownKey(provider))) persistProviderCooldowns();
+}
+
 export function classifyEmbedError(err: unknown): EmbedErrorClass {
   const msg = err instanceof Error ? err.message : String(err);
   if (/insufficient_quota|exceeded your current quota|check your plan and billing/i.test(msg)) return 'quota';
@@ -104,6 +203,8 @@ let cooldownUntilMs = 0;
 let lastSuccessAtMs = 0;
 let lastErrorClass: EmbedErrorClass | null = null;
 let lastErrorAtMs = 0;
+const providerInFlightSince = new Map<string, number>();
+const providerInFlightDone = new Map<string, Promise<void>>();
 
 function inCooldown(): boolean {
   if (cooldownUntilMs === 0) return false;
@@ -121,40 +222,45 @@ function breakerOpenPeek(): boolean {
   return cooldownUntilMs !== 0 && Date.now() < cooldownUntilMs;
 }
 
-function recordSuccess(): void {
+function recordSuccess(provider?: EmbeddingProvider): void {
   consecutiveFailures = 0;
   cooldownUntilMs = 0;
   lastSuccessAtMs = Date.now();
   lastErrorClass = null;
+  if (provider) clearProviderCooldown(provider);
 }
 
-function recordFailure(err: unknown): void {
+function recordFailure(err: unknown): { cls: EmbedErrorClass; opened: boolean; untilMs: number; failures: number } {
   consecutiveFailures++;
   const cls = classifyEmbedError(err);
   lastErrorClass = cls;
   lastErrorAtMs = Date.now();
+  const failures = consecutiveFailures;
   const terminal = cls === 'quota' || cls === 'auth';
   // Terminal errors are definitive — open immediately (don't burn 2 more calls
   // confirming the quota is still empty). Transient/rate-limit wait for the
   // threshold so a single blip doesn't drop recall to FTS.
   const shouldOpen = cooldownUntilMs === 0 && (terminal || consecutiveFailures >= CONSECUTIVE_FAIL_THRESHOLD);
+  let openedUntilMs = 0;
   if (shouldOpen) {
     // ±12% jitter so many daemons/callers don't re-probe in lockstep (thundering
     // herd on the embedding endpoint the moment a cooldown lapses).
     const base = cooldownForClass(cls);
     const ms = Math.round(base * (0.88 + Math.random() * 0.24));
     cooldownUntilMs = Date.now() + ms;
+    openedUntilMs = cooldownUntilMs;
     const line = `embeddings circuit breaker open (${cls}) — recall on FTS-only for ~${Math.round(ms / 60_000)}m`;
     if (terminal) {
       logger.error(
-        { cls, failures: consecutiveFailures, cooldownMs: ms },
+        { cls, failures, cooldownMs: ms },
         `${line}. ${cls === 'quota' ? 'OpenAI quota exhausted — add credit/billing to restore semantic memory.' : 'OpenAI key rejected — check credentials.'}`,
       );
     } else {
-      logger.warn({ cls, failures: consecutiveFailures, cooldownMs: ms }, line);
+      logger.warn({ cls, failures, cooldownMs: ms }, line);
     }
     maybeDemoteToLocal(cls);
   }
+  return { cls, opened: shouldOpen, untilMs: openedUntilMs, failures };
 }
 
 // ── Local-fallback demotion (2026-07-08) ────────────────────────────────────
@@ -163,8 +269,8 @@ function recordFailure(err: unknown): void {
 // the #1 recall pain). The daemon ships a zero-key local model, and the
 // backfill already re-embeds any row whose stored model/dim differs from the
 // active provider — so instead of degrading, DEMOTE to the local provider for
-// the rest of the process lifetime (one flip max — no OpenAI↔local churn; a
-// daemon restart gives OpenAI a fresh chance). The ~1k-chunk corpus re-embeds
+// the rest of the process lifetime (one flip max — no OpenAI↔local churn;
+// terminal/provider cooldowns survive daemon restarts). The ~1k-chunk corpus re-embeds
 // locally within a few backfill ticks; hybrid recall's FTS half covers the
 // transition. Kill-switch CLEMMY_EMBED_LOCAL_FALLBACK=off restores FTS-only
 // degradation. A quota/auth breaker demotes on the FIRST open (it will not
@@ -196,7 +302,7 @@ function maybeDemoteToLocal(cls: EmbedErrorClass): void {
   void loadLocalProvider();
   logger.error(
     { cls, model: LOCAL_EMBEDDING_MODEL },
-    'OpenAI embedder demoted — semantic memory continues on the LOCAL embedding model for this daemon run (restart re-probes OpenAI). Fix billing/network to restore the OpenAI embedder.',
+    'OpenAI embedder demoted — semantic memory continues on the LOCAL embedding model while the OpenAI provider is cooling down. Fix billing/network to restore the OpenAI embedder.',
   );
 }
 
@@ -210,6 +316,8 @@ export interface EmbeddingHealth {
   enabled: boolean;
   breakerOpen: boolean;
   cooldownUntilMs: number;
+  providerCooldownUntilMs: number;
+  providerCooldownReason: EmbedErrorClass | null;
   lastSuccessAt: string | null;
   consecutiveFailures: number;
   lastErrorClass: EmbedErrorClass | null;
@@ -218,10 +326,13 @@ export interface EmbeddingHealth {
 
 /** Snapshot of embedding health for the diagnostics panel — non-mutating. */
 export function getEmbeddingHealth(): EmbeddingHealth {
+  const openaiCooldown = providerCooldown(OPENAI_PROVIDER);
   return {
     enabled: isEmbeddingsEnabled(),
     breakerOpen: breakerOpenPeek(),
     cooldownUntilMs,
+    providerCooldownUntilMs: openaiCooldown?.untilMs ?? 0,
+    providerCooldownReason: openaiCooldown?.cls ?? null,
     lastSuccessAt: lastSuccessAtMs ? new Date(lastSuccessAtMs).toISOString() : null,
     consecutiveFailures,
     lastErrorClass,
@@ -237,10 +348,29 @@ export function _resetEmbeddingHealthForTest(): void {
   lastErrorClass = null;
   lastErrorAtMs = 0;
   embedQueryInflight.clear();
+  providerInFlightSince.clear();
+  providerInFlightDone.clear();
+  providerCooldownsLoaded = false;
+  providerCooldowns.clear();
 }
 /** Test-only: drive the breaker without a real API call. */
 export function _driveEmbedFailureForTest(err: unknown): void { recordFailure(err); }
 export function _driveEmbedSuccessForTest(): void { recordSuccess(); }
+/** Test-only: point persisted provider health at a disposable file. */
+export function _setEmbeddingProviderHealthFileForTest(file: string | null): void {
+  embeddingProviderHealthFile = file ?? EMBEDDING_PROVIDER_HEALTH_FILE;
+  embeddingProviderHealthFileIsTestOverride = file !== null;
+  providerCooldownsLoaded = false;
+  providerCooldowns.clear();
+}
+/** Test-only: clear persisted provider cooldowns from the disposable health file. */
+export function _resetEmbeddingProviderCooldownsForTest(): void {
+  providerCooldownsLoaded = true;
+  providerCooldowns.clear();
+  if (embeddingProviderHealthFileIsTestOverride) {
+    try { rmSync(embeddingProviderHealthFile, { force: true }); } catch { /* best effort */ }
+  }
+}
 
 // ── Embedding provider abstraction (WS3) ────────────────────────────────
 // Ends the OpenAI hard-lock: a non-OpenAI-key user (codex_oauth / claude-brain)
@@ -345,7 +475,13 @@ export async function getEmbeddingProvider(): Promise<EmbeddingProvider | null> 
   // A demoted OpenAI embedder routes to local for this process lifetime
   // (breaker opened on quota/auth, or twice on transient — see recordFailure).
   if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return loadLocalProvider();
-  if (override !== 'local' && getOpenAiApiKey()) return OPENAI_PROVIDER;
+  if (override !== 'local' && getOpenAiApiKey()) {
+    if (override !== 'openai' && providerCooldown(OPENAI_PROVIDER)) {
+      if (!localEmbeddingsAllowed()) return null;
+      return loadLocalProvider();
+    }
+    return OPENAI_PROVIDER;
+  }
   if (override === 'openai') return null; // forced openai but no key
   if (!localEmbeddingsAllowed()) return null;
   return loadLocalProvider();
@@ -363,7 +499,14 @@ function activeProviderSync(): EmbeddingProvider | null {
   // while the local model is still loading: OpenAI is known-bad here, and a
   // brief lexical-only window beats re-poisoning recall with timeouts.
   if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return localProvider ?? null;
-  if (override !== 'local' && getOpenAiApiKey()) return OPENAI_PROVIDER;
+  if (override !== 'local' && getOpenAiApiKey()) {
+    if (override !== 'openai' && providerCooldown(OPENAI_PROVIDER)) {
+      if (!localEmbeddingsAllowed()) return null;
+      void loadLocalProvider();
+      return localProvider ?? null;
+    }
+    return OPENAI_PROVIDER;
+  }
   if (override === 'openai') return null;
   if (!localEmbeddingsAllowed()) return null;
   return localProvider ?? null; // null until warmup completes
@@ -396,11 +539,22 @@ export function _resetLocalProviderForTest(): void {
   localProvider = undefined;
   localProbeInFlight = null;
 }
+/** Test-only: seed the lazily-probed local provider without loading ONNX. */
+export function _setLocalProviderForTest(p: EmbeddingProvider | null | undefined): void {
+  localProvider = p;
+  localProbeInFlight = null;
+}
 
 // Eager local warmup on no-key installs so isEmbeddingsEnabled() flips true
 // before the first recall, instead of reporting "off" for the first turn.
 // Fire-and-forget; failures already degrade to lexical inside loadLocalProvider.
-if (!getOpenAiApiKey() && localEmbeddingsAllowed() && providerOverride() !== 'off' && providerOverride() !== 'openai' && !embeddingsDisabledByEnv()) {
+if (
+  localEmbeddingsAllowed()
+  && providerOverride() !== 'off'
+  && providerOverride() !== 'openai'
+  && !embeddingsDisabledByEnv()
+  && !getOpenAiApiKey()
+) {
   void loadLocalProvider();
 }
 
@@ -529,21 +683,134 @@ function embedQueryCacheEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_EMBED_QUERY_CACHE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
+function urgentFactEmbeddingBusyWaitMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_EMBED_URGENT_BUSY_WAIT_MS', '1000') || '1000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1000;
+}
+
 function embeddingProviderCacheKey(provider: EmbeddingProvider): string {
   return `${provider.name ?? 'unknown'}:${provider.model ?? 'unknown'}:${provider.dim}`;
 }
 
-async function embedQueryWithProvider(provider: EmbeddingProvider, query: string): Promise<Float32Array | null> {
-  if (inCooldown()) return null;
+function remoteProviderSingleFlightEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_EMBED_REMOTE_SINGLE_FLIGHT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+function providerUsesRemoteSingleFlight(provider: EmbeddingProvider): boolean {
+  return remoteProviderSingleFlightEnabled() && provider.name === 'openai';
+}
+
+function providerBusyReason(provider: EmbeddingProvider): string | null {
+  if (!providerUsesRemoteSingleFlight(provider)) return null;
+  const key = embeddingProviderCacheKey(provider);
+  const since = providerInFlightSince.get(key);
+  if (!since) return null;
+  return `embedding provider already has an in-flight probe (${Math.max(0, Date.now() - since)}ms old)`;
+}
+
+async function waitForProviderIdle(provider: EmbeddingProvider, timeoutMs: number): Promise<boolean> {
+  if (!providerUsesRemoteSingleFlight(provider) || timeoutMs <= 0) return !providerBusyReason(provider);
+  const done = providerInFlightDone.get(embeddingProviderCacheKey(provider));
+  if (!done) return true;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   try {
-    const [vector] = await provider.embed([query]);
-    recordSuccess();
-    return vector ?? null;
+    return await Promise.race([
+      done.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function callProviderEmbed(provider: EmbeddingProvider, texts: string[]): Promise<Float32Array[]> {
+  if (!providerUsesRemoteSingleFlight(provider)) return provider.embed(texts);
+  const key = embeddingProviderCacheKey(provider);
+  providerInFlightSince.set(key, Date.now());
+  let call: Promise<Float32Array[]>;
+  try {
+    call = provider.embed(texts);
   } catch (err) {
-    recordFailure(err);
-    logger.warn({ err }, 'embedQuery failed; falling back to FTS-only');
+    providerInFlightSince.delete(key);
+    throw err;
+  }
+  const done = call.then(() => undefined, () => undefined);
+  providerInFlightDone.set(key, done);
+  try {
+    return await call;
+  } finally {
+    if (providerInFlightDone.get(key) === done) {
+      providerInFlightDone.delete(key);
+      providerInFlightSince.delete(key);
+    }
+  }
+}
+
+async function fallbackProviderAfterFailure(failedProvider: EmbeddingProvider): Promise<EmbeddingProvider | null> {
+  if (inCooldown()) return null;
+  const next = await getEmbeddingProvider();
+  if (!next) return null;
+  if (embeddingProviderCacheKey(next) === embeddingProviderCacheKey(failedProvider)) return null;
+  return next;
+}
+
+type EmbedBatchResult =
+  | { provider: EmbeddingProvider; vectors: Float32Array[] }
+  | { skipped: true; reason: string };
+
+async function embedBatchWithProviderFailover(
+  provider: EmbeddingProvider,
+  texts: string[],
+  logContext: Record<string, unknown>,
+  options: { busyWaitMs?: number } = {},
+): Promise<EmbedBatchResult | null> {
+  if (inCooldown()) return null;
+  if (options.busyWaitMs && providerBusyReason(provider)) {
+    await waitForProviderIdle(provider, options.busyWaitMs);
+  }
+  const busy = providerBusyReason(provider);
+  if (busy) return { skipped: true, reason: busy };
+  try {
+    const vectors = await callProviderEmbed(provider, texts);
+    recordSuccess(provider);
+    return { provider, vectors };
+  } catch (err) {
+    const failure = recordFailure(err);
+    if (failure.opened) markProviderCooldown(provider, failure.cls, failure.untilMs, failure.failures);
+    const fallback = await fallbackProviderAfterFailure(provider);
+    if (fallback) {
+      try {
+        const vectors = await callProviderEmbed(fallback, texts);
+        recordSuccess(fallback);
+        logger.warn(
+          { ...logContext, err, provider: embeddingProviderCacheKey(provider), fallback: embeddingProviderCacheKey(fallback) },
+          'embedding provider failed; fallback provider succeeded',
+        );
+        return { provider: fallback, vectors };
+      } catch (fallbackErr) {
+        const fallbackFailure = recordFailure(fallbackErr);
+        if (fallbackFailure.opened) markProviderCooldown(fallback, fallbackFailure.cls, fallbackFailure.untilMs, fallbackFailure.failures);
+        logger.warn(
+          { ...logContext, err: fallbackErr, provider: embeddingProviderCacheKey(fallback) },
+          'embedding fallback provider failed',
+        );
+      }
+    }
+    logger.warn(
+      { ...logContext, err, provider: embeddingProviderCacheKey(provider) },
+      'embedding provider failed; no fallback provider available',
+    );
     return null;
   }
+}
+
+async function embedQueryWithProvider(provider: EmbeddingProvider, query: string): Promise<Float32Array | null> {
+  const result = await embedBatchWithProviderFailover(provider, [query], { operation: 'embedQuery' });
+  if (result && 'skipped' in result) return null;
+  return result?.vectors[0] ?? null;
 }
 
 async function embedQueryUncached(query: string): Promise<Float32Array | null> {
@@ -582,16 +849,9 @@ export async function embedTexts(texts: string[]): Promise<Float32Array[] | null
   if (texts.length === 0) return [];
   const provider = await getEmbeddingProvider();
   if (!provider) return null;
-  if (inCooldown()) return null;
-  try {
-    const vectors = await provider.embed(texts);
-    recordSuccess();
-    return vectors;
-  } catch (err) {
-    recordFailure(err);
-    logger.warn({ err, count: texts.length }, 'embedTexts failed; caller falls back to non-semantic path');
-    return null;
-  }
+  const result = await embedBatchWithProviderFailover(provider, texts, { operation: 'embedTexts', count: texts.length });
+  if (result && 'skipped' in result) return null;
+  return result?.vectors ?? null;
 }
 
 export interface EmbedBackfillStats {
@@ -615,7 +875,7 @@ export interface EmbedBackfillStats {
  */
 export async function embedMissingChunks(options: { maxChunks?: number } = {}): Promise<EmbedBackfillStats> {
   const start = Date.now();
-  const provider = await getEmbeddingProvider();
+  let provider = await getEmbeddingProvider();
   const stats: EmbedBackfillStats = {
     enabled: provider !== null,
     candidateChunks: 0,
@@ -666,14 +926,17 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
     stats.batched++;
-    let vectors: Float32Array[] = [];
-    try {
-      vectors = await provider.embed(batch.map((r) => r.content));
-      recordSuccess();
-    } catch (err) {
-      recordFailure(err);
+    const result = await embedBatchWithProviderFailover(provider, batch.map((r) => r.content), {
+      operation: 'embedMissingChunks',
+      batchStart: i,
+      batchSize: batch.length,
+    });
+    if (result && 'skipped' in result) {
+      stats.reason = result.reason;
+      break;
+    }
+    if (!result) {
       stats.failed += batch.length;
-      logger.warn({ err, batchStart: i, batchSize: batch.length }, 'embed batch failed');
       // If the breaker tripped on this batch, bail the whole tick —
       // hammering N more batches just to time out N more times wastes
       // 6s per batch and floods the log.
@@ -683,12 +946,14 @@ export async function embedMissingChunks(options: { maxChunks?: number } = {}): 
       }
       continue;
     }
+    provider = result.provider;
+    const vectors = result.vectors;
 
     const tx = db.transaction(() => {
       for (let j = 0; j < batch.length; j++) {
         const vector = vectors[j];
         if (!vector) continue;
-        insert.run(batch[j].id, provider.model, vector.length, vectorToBuffer(vector), now);
+        insert.run(batch[j].id, result.provider.model, vector.length, vectorToBuffer(vector), now);
         stats.embedded++;
       }
     });
@@ -738,7 +1003,7 @@ export function loadEmbeddingsForChunks(chunkIds: number[]): Map<number, Float32
  */
 export async function embedMissingFacts(options: { maxChunks?: number; newestFirst?: boolean } = {}): Promise<EmbedBackfillStats> {
   const start = Date.now();
-  const provider = await getEmbeddingProvider();
+  let provider = await getEmbeddingProvider();
   const stats: EmbedBackfillStats = {
     enabled: provider !== null,
     candidateChunks: 0,
@@ -792,26 +1057,33 @@ export async function embedMissingFacts(options: { maxChunks?: number; newestFir
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
     stats.batched++;
-    let vectors: Float32Array[] = [];
-    try {
-      vectors = await provider.embed(batch.map((r) => r.content));
-      recordSuccess();
-    } catch (err) {
-      recordFailure(err);
+    const result = await embedBatchWithProviderFailover(provider, batch.map((r) => r.content), {
+      operation: 'embedMissingFacts',
+      batchStart: i,
+      batchSize: batch.length,
+    }, {
+      busyWaitMs: options.newestFirst ? urgentFactEmbeddingBusyWaitMs() : 0,
+    });
+    if (result && 'skipped' in result) {
+      stats.reason = result.reason;
+      break;
+    }
+    if (!result) {
       stats.failed += batch.length;
-      logger.warn({ err, batchStart: i, batchSize: batch.length }, 'embed fact batch failed');
       if (inCooldown()) {
         stats.reason = 'circuit breaker opened mid-tick';
         break;
       }
       continue;
     }
+    provider = result.provider;
+    const vectors = result.vectors;
 
     const tx = db.transaction(() => {
       for (let j = 0; j < batch.length; j++) {
         const vector = vectors[j];
         if (!vector) continue;
-        insert.run(batch[j].id, provider.model, vector.length, vectorToBuffer(vector), batch[j].hash, now);
+        insert.run(batch[j].id, result.provider.model, vector.length, vectorToBuffer(vector), batch[j].hash, now);
         stats.embedded++;
       }
     });

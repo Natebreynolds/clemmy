@@ -22,7 +22,7 @@ const {
   writeDistilledSkill, loadSkill, listSkills, renderSkillsIndex,
   updateSkillFrontmatter, appendSkillPitfall, SKILLS_DIR,
 } = await import('./skill-store.js');
-const { assessNovelty, reinforceDraftSkills } = await import('./skill-distiller.js');
+const { assessNovelty, reinforceDraftSkills, _testOnly_sanitizeDistilledSkillOutput } = await import('./skill-distiller.js');
 import type { TraceToolCall } from '../execution/trace-to-workflow.js';
 
 beforeEach(() => {
@@ -125,6 +125,31 @@ test('novelty gate: enough breadth but NO discovery ⇒ not novel', () => {
     call('read_file', '{"p":"5"}'),
   ];
   assert.equal(assessNovelty(calls).novel, false, 'no search + no retry-with-change ⇒ skip');
+});
+
+test('distilled skill sanitizer accepts fenced schema-drifted JSON', () => {
+  const skill = _testOnly_sanitizeDistilledSkillOutput('```json\n' + JSON.stringify({
+    title: 'Market Leader / Send Contacts!',
+    summary: 'Send approved contact batches using the proven mail workflow.',
+    prerequisites: 'mcp:composio, secret:GMAIL_API_KEY',
+    steps: [
+      'Load the approved contact batch from the workspace artifact.',
+      'Validate every recipient and draft the message before sending.',
+      'Send only after the existing approval gate has passed.',
+    ],
+    tools: [
+      { slug: 'GMAIL_SEND_EMAIL', args: { to: '<email>', subject: '<subject>', body: '<body>' }, gotcha: 'Use the approved mailbox.' },
+    ],
+    gotchas: 'Do not send to unapproved contacts.',
+  }) + '\n```');
+  assert.ok(skill);
+  assert.equal(skill.name, 'market-leader-send-contacts');
+  assert.match(skill.description, /approved contact batches/);
+  assert.deepEqual(skill.requires, ['mcp:composio', 'secret:GMAIL_API_KEY']);
+  assert.match(skill.procedureMarkdown, /approved contact batch/);
+  assert.equal(skill.provenTools[0].tool, 'GMAIL_SEND_EMAIL');
+  assert.equal(skill.provenTools[0].notes, 'Use the approved mailbox.');
+  assert.deepEqual(skill.pitfalls, ['Do not send to unapproved contacts.']);
 });
 
 // ─── C4: self-improvement ────────────────────────────────────────────────────

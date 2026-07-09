@@ -19,7 +19,13 @@ const { resetMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
 const { listActiveFacts } = await import('./facts.js');
 // eslint-disable-next-line import/first
-const { scanMemorySource, ingestMemorySource, listMemoryImportBatches, undoMemoryImportBatch } = await import('./memory-import.js');
+const {
+  scanMemorySource,
+  ingestMemorySource,
+  listMemoryImportBatches,
+  undoMemoryImportBatch,
+  _testOnly_sanitizeDistillerOutput,
+} = await import('./memory-import.js');
 
 const SRC = path.join(TEST_HOME, 'foreign-memory');
 
@@ -93,6 +99,25 @@ test('ingestMemorySource (distill off): structured description → typed fact; f
   assert.equal(undone.deleted, batch.newFactIds.length);
   const after = listActiveFacts({ limit: 50 }).filter((f) => f.sourceApp === 'import:test-foreign');
   assert.equal(after.length, 0, 'undo must remove all imported facts');
+});
+
+test('distiller sanitizer preserves facts from schema-drifted JSON', () => {
+  const facts = _testOnly_sanitizeDistillerOutput('```json\n' + JSON.stringify({
+    facts: [
+      { type: 'preference', fact: 'Jane prefers weekly executive summaries.', importance: '9' },
+      { category: 'policy', text: 'Never run destructive migrations without an approved backup.', score: '11' },
+      { kind: 'reference', content: 'short' },
+    ],
+  }) + '\n```');
+  assert.equal(facts?.length, 2);
+  assert.deepEqual(facts?.map((f) => f.kind), ['user', 'constraint']);
+  assert.deepEqual(facts?.map((f) => f.importance), [9, 10]);
+  assert.match(facts?.[0].content ?? '', /weekly executive summaries/);
+
+  assert.deepEqual(_testOnly_sanitizeDistillerOutput('{"facts":null}'), []);
+  assert.deepEqual(_testOnly_sanitizeDistillerOutput('[{"summary":"Top-level array fact survives.","importance":4}]'), [
+    { kind: 'reference', content: 'Top-level array fact survives.', importance: 4 },
+  ]);
 });
 
 test('scanMemorySource: nonexistent path degrades to a skip, single file works', () => {

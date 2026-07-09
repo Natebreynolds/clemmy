@@ -18,7 +18,7 @@ import pino from 'pino';
 import { z } from 'zod';
 import { Agent, Runner } from '@openai/agents';
 import { getRuntimeEnv, MODELS } from '../config.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { readSessionTrace, readSessionToolReturns, type TraceToolCall } from '../execution/trace-to-workflow.js';
 import {
   listSkills, loadSkill, writeDistilledSkill, isSafeSkillName,
@@ -197,8 +197,8 @@ const DistilledSchema = z.object({
 });
 export type DistilledSkill = z.infer<typeof DistilledSchema>;
 
-function buildDistillerAgent(): Agent<unknown, typeof DistilledSchema> {
-  return new Agent<unknown, typeof DistilledSchema>({
+function buildDistillerAgent(): Agent<unknown> {
+  return new Agent({
     name: 'SkillDistiller',
     model: MODELS.fast,
     modelSettings: { reasoning: { effort: 'low' } },
@@ -208,10 +208,113 @@ function buildDistillerAgent(): Agent<unknown, typeof DistilledSchema> {
       'Never include secret values (tokens, full emails/PII) — only argument keys/shapes.',
       'requires: list real prerequisites (mcp:/cli:/secret:) the procedure depends on. Empty array if none.',
       'Be concrete and short. This is a procedure to execute, not an essay.',
+      'Return ONLY JSON with keys: name, description, requires, procedureMarkdown, provenTools, pitfalls.',
     ].join('\n'),
-    outputType: normalizeZodForCodexStrict(DistilledSchema) as typeof DistilledSchema,
     tools: [],
   });
+}
+
+function parseDistilledSkillJson(value: unknown): unknown | null {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const candidate = extractJsonCandidate(value);
+  if (!candidate) return null;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function cleanString(value: unknown, max = 1000): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, max) : '';
+}
+
+function stringFromKeys(obj: Record<string, unknown>, keys: string[], max = 1000): string {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.trim()) return cleanString(value, max);
+    if (Array.isArray(value)) {
+      const lines = value.map((v, i) => typeof v === 'string' ? `${i + 1}. ${cleanString(v, max)}` : '').filter(Boolean);
+      if (lines.length > 0) return lines.join('\n').slice(0, max);
+    }
+  }
+  return '';
+}
+
+function normalizeSkillName(value: unknown): string {
+  return cleanString(value, 80)
+    .toLowerCase()
+    .replace(/['"`]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+    .replace(/-+$/g, '');
+}
+
+function stringArray(value: unknown, max: number): string[] {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/\n|,/)
+      : [];
+  const out: string[] = [];
+  for (const item of raw) {
+    const s = cleanString(item, 200);
+    if (s && !out.includes(s)) out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function sanitizeProvenTools(value: unknown): DistilledSkill['provenTools'] {
+  const raw = Array.isArray(value) ? value : [];
+  const out: DistilledSkill['provenTools'] = [];
+  for (const item of raw) {
+    if (out.length >= 20) break;
+    if (typeof item === 'string') {
+      const tool = cleanString(item, 120);
+      if (tool) out.push({ tool, argsShape: '{}', notes: null });
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const tool = stringFromKeys(obj, ['tool', 'slug', 'name', 'toolName'], 120);
+    if (!tool) continue;
+    let argsShape = stringFromKeys(obj, ['argsShape', 'argumentsShape', 'args', 'arguments', 'schema', 'input'], 500);
+    if (!argsShape && obj.args && typeof obj.args === 'object') {
+      argsShape = JSON.stringify(Object.keys(obj.args as Record<string, unknown>).sort());
+    }
+    out.push({
+      tool,
+      argsShape: argsShape || '{}',
+      notes: stringFromKeys(obj, ['notes', 'note', 'gotcha', 'tip'], 240) || null,
+    });
+  }
+  return out;
+}
+
+function sanitizeDistilledSkillOutput(value: unknown): DistilledSkill | null {
+  const parsed = parseDistilledSkillJson(value);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  const name = normalizeSkillName(obj.name ?? obj.title ?? obj.skillName);
+  const description = stringFromKeys(obj, ['description', 'summary', 'whenToUse', 'when_to_use'], 200);
+  const procedureMarkdown = stringFromKeys(obj, ['procedureMarkdown', 'procedure', 'steps', 'markdown', 'body'], 8000);
+  const candidate: DistilledSkill = {
+    name,
+    description,
+    requires: stringArray(obj.requires ?? obj.prerequisites, 8),
+    procedureMarkdown,
+    provenTools: sanitizeProvenTools(obj.provenTools ?? obj.tools ?? obj.toolCalls),
+    pitfalls: stringArray(obj.pitfalls ?? obj.gotchas ?? obj.warnings, 8),
+  };
+  const checked = DistilledSchema.safeParse(candidate);
+  return checked.success ? checked.data : null;
+}
+
+export function _testOnly_sanitizeDistilledSkillOutput(value: unknown): DistilledSkill | null {
+  return sanitizeDistilledSkillOutput(value);
 }
 
 function renderDistillerPrompt(input: {
@@ -295,9 +398,8 @@ async function distillFromCalls(
       renderDistillerPrompt({ objective: context.objective, evidence: context.evidence ?? '', calls }),
       { maxTurns: 1 },
     );
-    const parsed = DistilledSchema.safeParse(result.finalOutput);
-    if (!parsed.success) return { status: 'failed', detail: 'distiller output did not parse' };
-    const draft = parsed.data;
+    const draft = sanitizeDistilledSkillOutput((result as { finalOutput?: unknown }).finalOutput);
+    if (!draft) return { status: 'failed', detail: 'distiller output did not parse' };
     if (!isSafeSkillName(draft.name)) return { status: 'failed', detail: `unsafe skill name: ${draft.name}` };
 
     const dup = findDuplicate(draft.name, draft.description);

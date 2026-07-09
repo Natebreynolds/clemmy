@@ -22,9 +22,13 @@ const { resetMemoryDb, openMemoryDb } = await import('./db.js');
 const { rememberFact } = await import('./facts.js');
 // eslint-disable-next-line import/first
 const {
-  embedMissingFacts, isEmbeddingsEnabled, getEmbeddingProvider, activeEmbeddingDim, activeEmbeddingModel,
+  embedMissingFacts, embedQuery, isEmbeddingsEnabled, getEmbeddingProvider, activeEmbeddingDim, activeEmbeddingModel,
   loadEmbeddingsForChunks, loadFactEmbeddings, vectorToBuffer,
+  getEmbeddingHealth,
+  _resetEmbedDemotionForTest,
+  _resetEmbeddingHealthForTest,
   _setEmbeddingProviderForTest,
+  _setLocalProviderForTest,
 } = await import('./embeddings.js');
 
 function fakeProvider(name: string, model: string, dim: number): EmbeddingProvider {
@@ -42,8 +46,19 @@ function fakeProvider(name: string, model: string, dim: number): EmbeddingProvid
 }
 
 before(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
-beforeEach(() => { resetMemoryDb(); openMemoryDb(); });
-afterEach(() => { _setEmbeddingProviderForTest(undefined); });
+const realFetch = globalThis.fetch;
+beforeEach(() => {
+  resetMemoryDb();
+  openMemoryDb();
+  _resetEmbeddingHealthForTest();
+  _resetEmbedDemotionForTest();
+});
+afterEach(() => {
+  _setEmbeddingProviderForTest(undefined);
+  _setLocalProviderForTest(undefined);
+  globalThis.fetch = realFetch;
+  delete process.env.OPENAI_API_KEY;
+});
 
 test('an injected provider is selected and reports enabled + model/dim', async () => {
   _setEmbeddingProviderForTest(fakeProvider('local', 'bge-small', 384));
@@ -125,6 +140,76 @@ test('loadEmbeddingsForChunks only returns vectors from the active provider spac
 
   _setEmbeddingProviderForTest(fakeProvider('local', 'bge-small', 384));
   assert.equal(loadEmbeddingsForChunks([chunkId]).size, 0, 'stale prior-provider chunk vector is ignored');
+});
+
+test('embedMissingFacts switches to local provider mid-tick after OpenAI demotion', async () => {
+  _setEmbeddingProviderForTest(undefined);
+  _setLocalProviderForTest(fakeProvider('local', 'test-local-embedding', 4));
+  process.env.OPENAI_API_KEY = 'sk-test-openai-fails';
+
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls += 1;
+    return {
+      ok: false,
+      status: 401,
+      text: async () => 'invalid_api_key',
+    };
+  }) as unknown as typeof fetch;
+
+  for (let i = 0; i < 100; i++) {
+    rememberFact({ kind: 'user', content: `Durable fact ${i} survives provider failover.` });
+  }
+
+  const stats = await embedMissingFacts({ maxChunks: 100 });
+  assert.equal(fetchCalls, 1, 'OpenAI is attempted once before demotion');
+  assert.equal(stats.batched, 2, 'fixture crosses the 96-row batch boundary');
+  assert.equal(stats.embedded, 100);
+  assert.equal(stats.failed, 0);
+  assert.equal(getEmbeddingHealth().breakerOpen, false, 'stale OpenAI must not reopen the breaker');
+
+  const db = openMemoryDb();
+  const models = (db.prepare('SELECT DISTINCT model FROM fact_embeddings ORDER BY model').all() as { model: string }[])
+    .map((row) => row.model);
+  assert.deepEqual(models, ['test-local-embedding']);
+});
+
+test('embedMissingFacts skips cleanly while an OpenAI probe is already in flight', async () => {
+  let calls = 0;
+  let started!: () => void;
+  let release!: () => void;
+  const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+  const holdPromise = new Promise<void>((resolve) => { release = resolve; });
+
+  _setEmbeddingProviderForTest({
+    name: 'openai',
+    model: 'text-embedding-3-small',
+    dim: 4,
+    async embed(texts: string[]) {
+      calls += 1;
+      started();
+      await holdPromise;
+      return texts.map(() => new Float32Array([1, 0, 0, 0]));
+    },
+  });
+
+  try {
+    const interactive = embedQuery('interactive semantic probe');
+    await startedPromise;
+    rememberFact({ kind: 'user', content: 'Fact waiting for a quiet embedding provider.' });
+
+    const stats = await embedMissingFacts({ maxChunks: 1 });
+
+    assert.equal(stats.embedded, 0);
+    assert.equal(stats.failed, 0, 'busy remote provider is skipped, not counted as a failed fact');
+    assert.match(stats.reason ?? '', /in-flight probe/);
+    assert.equal(calls, 1, 'backfill did not start a competing OpenAI call');
+
+    release();
+    assert.ok(await interactive);
+  } finally {
+    release?.();
+  }
 });
 
 test('CLEMMY_EMBED_PROVIDER=off forces no provider even with one injectable', async () => {

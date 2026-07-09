@@ -622,6 +622,29 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
       CREATE INDEX IF NOT EXISTS idx_entity_edges_object ON entity_edges(object_id);
     `,
   },
+  {
+    // v14 — durable reflection threshold buffer. The reflection importance gate
+    // used to keep only an in-memory sum; sub-threshold extracted facts were
+    // discarded, and a daemon restart erased the accumulated score. This table
+    // stores the bounded extractor output until the session crosses the commit
+    // threshold, so "low importance" means delayed, not forgotten.
+    version: 14,
+    sql: `
+      CREATE TABLE IF NOT EXISTS reflection_pending_extractions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id      TEXT NOT NULL,
+        call_id         TEXT NOT NULL,
+        tool            TEXT,
+        extraction_json TEXT NOT NULL,
+        importance      REAL NOT NULL,
+        created_at      TEXT NOT NULL,
+        UNIQUE(session_id, call_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_reflection_pending_session
+        ON reflection_pending_extractions(session_id, created_at ASC);
+    `,
+  },
 ];
 
 function runMigrations(db: Database.Database): void {

@@ -2,7 +2,6 @@ import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
 import { MODELS, getRuntimeEnv } from '../config.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
 import {
   rememberFact,
@@ -22,6 +21,7 @@ import { recordEntityEdge } from './relations.js';
 import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 
 /**
  * Reflection-on-tool-return — Phase 1 of the brain architecture.
@@ -127,6 +127,12 @@ export type Extraction = z.infer<typeof ExtractionSchema> & {
   relationships?: z.infer<typeof ExtractedRelationshipSchema>[];
 };
 
+interface PendingReflectionBatch {
+  input: ReflectionInput;
+  extraction: Extraction;
+  importance: number;
+}
+
 export interface ReflectionInput {
   sessionId: string;
   callId: string;
@@ -213,6 +219,172 @@ function getReflectorModel(): string {
   return MODELS.fast || MODELS.primary || 'gpt-5.4-mini';
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function boundedString(value: unknown, max: number): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, max) : null;
+}
+
+function recordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+function numberInRange(value: unknown, min: number, max: number, fallback: number): number {
+  const parsed = typeof value === 'number'
+    ? value
+    : typeof value === 'string'
+      ? Number.parseFloat(value)
+      : Number.NaN;
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function normalizeFactKind(value: unknown, text: string): ConsolidatedFactKind {
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if ((FACT_KIND_VALUES as readonly string[]).includes(raw)) return raw as ConsolidatedFactKind;
+  if (/^\s*(user|nathan|the user)\b/i.test(text)) return 'user';
+  if (/\b(project|repo|workflow|client work|campaign)\b/i.test(text)) return 'project';
+  if (/\b(prefers?|dislikes?|liked|feedback|requested|asked that)\b/i.test(text)) return 'feedback';
+  return 'reference';
+}
+
+function normalizeEntityType(value: unknown): EntityType {
+  const raw = typeof value === 'string'
+    ? value.trim().toLowerCase().replace(/[\s_-]+/g, '_')
+    : '';
+  if ((ENTITY_TYPE_VALUES as readonly string[]).includes(raw)) return raw as EntityType;
+  if (/^(org|organization|business|company|client|customer|vendor|firm|account|employer|agency)$/.test(raw)) return 'company';
+  if (/^(human|contact|employee|lead|candidate|person_user|individual)$/.test(raw)) return 'person';
+  if (/^(repo|repository|workflow|initiative|campaign|deal|matter|case)$/.test(raw)) return 'project';
+  if (/^(location|city|state|country|venue|address)$/.test(raw)) return 'place';
+  return 'thing';
+}
+
+function parseExtractorJson(value: unknown): unknown | null {
+  if (isRecord(value)) return value;
+  if (typeof value !== 'string') return null;
+  const candidate = extractJsonCandidate(value);
+  if (!candidate) return null;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeExtractionOutput(
+  value: unknown,
+  opts: { withResources?: boolean; withRelationships?: boolean } = {},
+): Extraction | null {
+  const parsed = parseExtractorJson(value);
+  if (!isRecord(parsed)) return null;
+
+  const facts = recordArray(parsed.facts)
+    .map((fact) => {
+      const text = boundedString(fact.text ?? fact.fact ?? fact.content, 500);
+      if (!text || text.length < 3) return null;
+      return {
+        kind: normalizeFactKind(fact.kind ?? fact.type ?? fact.category, text),
+        text,
+        importance: numberInRange(fact.importance ?? fact.score ?? fact.poignancy, 1, 10, 3),
+      };
+    })
+    .filter((fact): fact is z.infer<typeof ExtractedFactSchema> => fact !== null)
+    .slice(0, EXTRACTOR_MAX_FACTS);
+
+  const entities = recordArray(parsed.entities)
+    .map((entity) => {
+      const name = boundedString(entity.name ?? entity.canonical ?? entity.canonical_name, 120);
+      if (!name) return null;
+      const aliases = Array.isArray(entity.aliases)
+        ? entity.aliases
+            .map((alias) => boundedString(alias, 120))
+            .filter((alias): alias is string => !!alias && alias.toLowerCase() !== name.toLowerCase())
+            .slice(0, 8)
+        : undefined;
+      return {
+        type: normalizeEntityType(entity.type ?? entity.entity_type ?? entity.kind),
+        name,
+        ...(aliases && aliases.length > 0 ? { aliases } : {}),
+      };
+    })
+    .filter((entity): entity is z.infer<typeof ExtractedEntitySchema> => entity !== null)
+    .slice(0, 12);
+
+  const pointers = recordArray(parsed.pointers)
+    .map((pointer) => {
+      const label = boundedString(pointer.label ?? pointer.name ?? pointer.title, 120);
+      if (!label || label.length < 3) return null;
+      const sourceUri = boundedString(pointer.source_uri ?? pointer.sourceUri ?? pointer.uri, 200);
+      return {
+        label,
+        ...(sourceUri ? { source_uri: sourceUri } : {}),
+      };
+    })
+    .filter((pointer): pointer is z.infer<typeof ExtractedPointerSchema> => pointer !== null)
+    .slice(0, 4);
+
+  const extraction: Extraction = { facts, entities, pointers };
+
+  if (opts.withResources) {
+    extraction.resources = recordArray(parsed.resources)
+      .map((resource) => {
+        const kind = boundedString(resource.kind ?? resource.type, 40);
+        const name = boundedString(resource.name ?? resource.title ?? resource.label, 160);
+        if (!kind || !name) return null;
+        const ref = boundedString(resource.ref ?? resource.id ?? resource.uri, 200);
+        const whatsHere = boundedString(resource.whats_here ?? resource.whatsHere ?? resource.description, 200);
+        const whenToUse = boundedString(resource.when_to_use ?? resource.whenToUse, 160);
+        return {
+          kind,
+          name,
+          ...(ref ? { ref } : {}),
+          ...(whatsHere ? { whats_here: whatsHere } : {}),
+          ...(whenToUse ? { when_to_use: whenToUse } : {}),
+        };
+      })
+      .filter((resource): resource is z.infer<typeof ExtractedResourceSchema> => resource !== null)
+      .slice(0, 6);
+  }
+
+  if (opts.withRelationships) {
+    extraction.relationships = recordArray(parsed.relationships)
+      .map((relationship) => {
+        const subject = boundedString(relationship.subject, 120);
+        const predicate = boundedString(relationship.predicate ?? relationship.relation ?? relationship.relationship, 80);
+        const object = boundedString(relationship.object, 120);
+        if (!subject || !predicate || !object) return null;
+        return { subject, predicate, object };
+      })
+      .filter((relationship): relationship is z.infer<typeof ExtractedRelationshipSchema> => relationship !== null)
+      .slice(0, 8);
+  }
+
+  return extraction;
+}
+
+function sanitizeRecursivePatternOutput(value: unknown): { patterns: { text: string; importance: number }[] } | null {
+  const parsed = parseExtractorJson(value);
+  if (!isRecord(parsed) && !Array.isArray(parsed)) return null;
+  const source = Array.isArray(parsed) ? parsed : parsed.patterns;
+  const patterns = recordArray(source)
+    .map((pattern) => {
+      const text = boundedString(pattern.text ?? pattern.pattern ?? pattern.summary, 500);
+      if (!text || text.length < 3) return null;
+      return {
+        text,
+        importance: numberInRange(pattern.importance ?? pattern.score ?? pattern.poignancy, 1, 10, 5),
+      };
+    })
+    .filter((pattern): pattern is { text: string; importance: number } => pattern !== null)
+    .slice(0, 3);
+  return { patterns };
+}
+
 function readDisableFlag(): boolean {
   const raw = (process.env.CLEMMY_REFLECTION ?? '').trim().toLowerCase();
   return raw === 'off' || raw === 'false' || raw === '0';
@@ -289,30 +461,35 @@ interface SessionImportanceCounter {
 const SESSION_IMPORTANCE = new Map<string, SessionImportanceCounter>();
 const SESSION_IMPORTANCE_IDLE_MS = 24 * 60 * 60 * 1000; // 24h reset
 
-function accumulateImportance(sessionId: string, delta: number): SessionImportanceCounter {
+function updateSessionImportanceSnapshot(sessionId: string, sum: number): SessionImportanceCounter {
   const now = Date.now();
   const existing = SESSION_IMPORTANCE.get(sessionId);
   if (!existing || now - existing.lastUpdatedAt > SESSION_IMPORTANCE_IDLE_MS) {
-    const fresh: SessionImportanceCounter = { sum: delta, lastUpdatedAt: now };
+    const fresh: SessionImportanceCounter = { sum, lastUpdatedAt: now };
     SESSION_IMPORTANCE.set(sessionId, fresh);
     return fresh;
   }
-  existing.sum += delta;
+  existing.sum = sum;
   existing.lastUpdatedAt = now;
   return existing;
-}
-
-function resetSessionImportance(sessionId: string): void {
-  SESSION_IMPORTANCE.delete(sessionId);
 }
 
 // Exported for tests only — lets the test suite peek/reset state
 // without exposing the internal map shape.
 export function _testOnly_peekSessionImportance(sessionId: string): number {
-  return SESSION_IMPORTANCE.get(sessionId)?.sum ?? 0;
+  try {
+    return sumPendingReflectionImportance(sessionId);
+  } catch {
+    return SESSION_IMPORTANCE.get(sessionId)?.sum ?? 0;
+  }
 }
 export function _testOnly_resetAllSessionImportance(): void {
   SESSION_IMPORTANCE.clear();
+  try {
+    openMemoryDb().prepare('DELETE FROM reflection_pending_extractions').run();
+  } catch {
+    // Test helper only; ignore if the DB has not been migrated/opened yet.
+  }
 }
 /**
  * Pure handle on the extractor for smoke testing. Bypasses the public
@@ -320,8 +497,28 @@ export function _testOnly_resetAllSessionImportance(): void {
  * smoke test can hammer real Codex N times without polluting state.
  * Returns `null` when the extractor fails (thrown OR invalid-shape).
  */
+type ReflectionExtractorFn = (serialized: string) => Promise<Extraction | null>;
+let extractorOverrideForTest: ReflectionExtractorFn | null = null;
+
 export async function _testOnly_runExtractor(serialized: string): Promise<Extraction | null> {
   return runExtractor(serialized);
+}
+
+export function _testOnly_setReflectionExtractor(fn: ReflectionExtractorFn | null): void {
+  extractorOverrideForTest = fn;
+}
+
+export function _testOnly_sanitizeExtractionOutput(
+  value: unknown,
+  opts: { withResources?: boolean; withRelationships?: boolean } = {},
+): Extraction | null {
+  return sanitizeExtractionOutput(value, opts);
+}
+
+export function _testOnly_sanitizeRecursivePatternOutput(
+  value: unknown,
+): { patterns: { text: string; importance: number }[] } | null {
+  return sanitizeRecursivePatternOutput(value);
 }
 
 /**
@@ -346,6 +543,7 @@ function markReflected(key: string): void {
 }
 
 async function runExtractor(serialized: string): Promise<Extraction | null> {
+  if (extractorOverrideForTest) return extractorOverrideForTest(serialized);
   const model = getReflectorModel();
   // Source-map: when on, ask the extractor for `resources` too (named
   // locations). Flag-off keeps the schema + prompt byte-identical to today.
@@ -354,36 +552,25 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
   // Common case (no relationships): use the precomputed static schemas/prompts
   // so flag-off is byte-identical to today. Only compose dynamically when the
   // (default-off) entity-edges flag is on.
-  let schema: z.ZodTypeAny = withResources ? ExtractionSchemaWithResources : ExtractionSchema;
   let instructions = withResources ? PROMPT_PREAMBLE_WITH_RESOURCES : PROMPT_PREAMBLE;
   if (withRelationships) {
-    const shape: Record<string, z.ZodTypeAny> = {
-      facts: z.array(ExtractedFactSchema).max(EXTRACTOR_MAX_FACTS),
-      entities: z.array(ExtractedEntitySchema).max(12),
-      pointers: z.array(ExtractedPointerSchema).max(4),
-      relationships: z.array(ExtractedRelationshipSchema).max(8),
-    };
-    if (withResources) shape.resources = z.array(ExtractedResourceSchema).max(6);
-    schema = z.object(shape);
     instructions = buildExtractorPreamble(withResources, true);
   }
   try {
-    // v0.5.22.1 — outputType binds ExtractionSchema to the SDK's structured-
-    // output path, so OpenAI's grammar-constrained sampling guarantees a
-    // schema-conforming response (no more "reflection extractor returned
-    // invalid shape" warnings). normalizeZodForCodexStrict rewrites
-    // .optional() → .nullable() so Codex's strict-mode validator accepts.
-    const agent = new Agent<unknown, typeof ExtractionSchema>({
+    // Keep the model contract in the prompt, but do NOT bind SDK outputType
+    // here. Reflection is best-effort memory capture: a missing optional
+    // resource field or an enum synonym should cost one entry, not the entire
+    // extraction pass. Clementine-owned sanitization below preserves the signal
+    // and drops only fields/entries that cannot be made meaningful.
+    const agent = new Agent({
       name: 'Reflection Extractor',
       model,
       instructions,
-      outputType: normalizeZodForCodexStrict(schema) as typeof ExtractionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-reflection' });
     const result = await runner.run(agent, serialized);
     const final = (result as { finalOutput?: unknown }).finalOutput;
-    if (!final || typeof final !== 'object') return null;
-    return final as Extraction;
+    return sanitizeExtractionOutput(final, { withResources, withRelationships });
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection extractor failed');
     return null;
@@ -398,13 +585,6 @@ async function runExtractor(serialized: string): Promise<Extraction | null> {
 // finalOutput is CAST, not zod-parsed, so the cap is re-enforced at the
 // updateFact call site — an oversized rewrite falls back to candidate.text.
 const CONFLICT_REWRITE_MAX_CHARS = 500;
-
-const ConflictDecisionSchema = z.object({
-  decision: z.enum(['ADD', 'UPDATE', 'DELETE', 'NOOP']),
-  target_id: z.number().int().nullable().optional(),
-  rewrite: z.string().min(3).max(CONFLICT_REWRITE_MAX_CHARS).optional(),
-  reason: z.string().max(300).optional(),
-});
 
 const CONFLICT_PROMPT = [
   'You are a memory-conflict resolver. A new candidate fact has been extracted from a tool return. Existing facts may or may not contradict it.',
@@ -430,6 +610,32 @@ interface ConflictDecision {
   reason?: string;
 }
 
+function sanitizeConflictDecision(value: unknown): ConflictDecision | null {
+  const parsed = parseExtractorJson(value);
+  if (!isRecord(parsed)) return null;
+  const decisionRaw = boundedString(parsed.decision ?? parsed.action ?? parsed.verdict, 20)?.toUpperCase();
+  if (decisionRaw !== 'ADD' && decisionRaw !== 'UPDATE' && decisionRaw !== 'DELETE' && decisionRaw !== 'NOOP') return null;
+  const targetRaw = parsed.target_id ?? parsed.targetId ?? parsed.id;
+  const targetNumber = typeof targetRaw === 'number'
+    ? targetRaw
+    : typeof targetRaw === 'string'
+      ? Number.parseInt(targetRaw, 10)
+      : Number.NaN;
+  const target_id = Number.isInteger(targetNumber) && targetNumber > 0 ? targetNumber : null;
+  const rewrite = boundedString(parsed.rewrite ?? parsed.content ?? parsed.replacement, CONFLICT_REWRITE_MAX_CHARS);
+  const reason = boundedString(parsed.reason ?? parsed.rationale, 300);
+  return {
+    decision: decisionRaw,
+    ...(target_id !== null ? { target_id } : {}),
+    ...(rewrite ? { rewrite } : {}),
+    ...(reason ? { reason } : {}),
+  };
+}
+
+export function _testOnly_sanitizeConflictDecision(value: unknown): ConflictDecision | null {
+  return sanitizeConflictDecision(value);
+}
+
 export async function resolveConflict(
   candidate: { kind: 'user' | 'project' | 'feedback' | 'reference' | 'constraint'; text: string; trustLevel?: number },
   similar: ConsolidatedFact[],
@@ -437,11 +643,10 @@ export async function resolveConflict(
   if (similar.length === 0) return { decision: 'ADD' };
   const model = getReflectorModel();
   try {
-    const agent = new Agent<unknown, typeof ConflictDecisionSchema>({
+    const agent = new Agent({
       name: 'Memory Conflict Resolver',
       model,
       instructions: CONFLICT_PROMPT,
-      outputType: normalizeZodForCodexStrict(ConflictDecisionSchema) as typeof ConflictDecisionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-conflict-resolver' });
     const candTrust = typeof candidate.trustLevel === 'number' ? candidate.trustLevel.toFixed(2) : '?';
@@ -455,8 +660,7 @@ export async function resolveConflict(
     ].join('\n');
     const result = await runner.run(agent, prompt);
     const final = (result as { finalOutput?: unknown }).finalOutput;
-    if (!final || typeof final !== 'object') return { decision: 'ADD' };
-    return final as ConflictDecision;
+    return sanitizeConflictDecision(final) ?? { decision: 'ADD' };
   } catch {
     // Conservative: on any failure, ADD. Better to have a duplicate
     // than to lose a real fact.
@@ -837,6 +1041,236 @@ export function listRecentEpisodicPointers(sessionId: string, limit = 10): Episo
   `).all(sessionId, limit) as EpisodicPointerRow[];
 }
 
+const PENDING_REFLECTION_MAX_PER_SESSION = 64;
+
+function storePendingReflectionBatch(input: ReflectionInput, extraction: Extraction, importance: number): void {
+  const db = openMemoryDb();
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT OR REPLACE INTO reflection_pending_extractions
+      (session_id, call_id, tool, extraction_json, importance, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    input.sessionId,
+    input.callId,
+    input.tool ?? null,
+    JSON.stringify(extraction),
+    importance,
+    now,
+  );
+  db.prepare(`
+    DELETE FROM reflection_pending_extractions
+    WHERE session_id = ?
+      AND id NOT IN (
+        SELECT id FROM reflection_pending_extractions
+        WHERE session_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+      )
+  `).run(input.sessionId, input.sessionId, PENDING_REFLECTION_MAX_PER_SESSION);
+}
+
+function sumPendingReflectionImportance(sessionId: string): number {
+  const db = openMemoryDb();
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(importance), 0) AS sum
+    FROM reflection_pending_extractions
+    WHERE session_id = ?
+  `).get(sessionId) as { sum: number | null } | undefined;
+  const sum = Number(row?.sum ?? 0);
+  updateSessionImportanceSnapshot(sessionId, sum);
+  return sum;
+}
+
+function listPendingReflectionBatches(sessionId: string): PendingReflectionBatch[] {
+  const db = openMemoryDb();
+  const rows = db.prepare(`
+    SELECT session_id, call_id, tool, extraction_json, importance
+    FROM reflection_pending_extractions
+    WHERE session_id = ?
+    ORDER BY created_at ASC, id ASC
+  `).all(sessionId) as Array<{
+    session_id: string;
+    call_id: string;
+    tool: string | null;
+    extraction_json: string;
+    importance: number;
+  }>;
+  const batches: PendingReflectionBatch[] = [];
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.extraction_json) as Extraction;
+      batches.push({
+        input: {
+          sessionId: row.session_id,
+          callId: row.call_id,
+          tool: row.tool,
+          output: '',
+        },
+        extraction: parsed,
+        importance: Number(row.importance) || 0,
+      });
+    } catch {
+      // A corrupt pending row must not wedge the threshold forever.
+    }
+  }
+  return batches;
+}
+
+function clearPendingReflectionBatches(sessionId: string): void {
+  const db = openMemoryDb();
+  db.prepare('DELETE FROM reflection_pending_extractions WHERE session_id = ?').run(sessionId);
+  updateSessionImportanceSnapshot(sessionId, 0);
+}
+
+function compactToolLabel(tool: string | null): string {
+  const raw = (tool ?? 'tool').replace(/[_:.-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return raw ? raw.slice(0, 80) : 'tool';
+}
+
+function formatApproxBytes(chars: number): string {
+  if (chars >= 1024 * 1024) return `${(chars / (1024 * 1024)).toFixed(1)}MB`;
+  if (chars >= 1024) return `${Math.max(1, Math.round(chars / 1024))}KB`;
+  return `${chars} chars`;
+}
+
+function storeFallbackPointer(input: ReflectionInput, reason: 'extractor_failed' | 'derived_fact_source'): number {
+  try {
+    storeEpisodicPointer({
+      sessionId: input.sessionId,
+      callId: input.callId,
+      label: `${compactToolLabel(input.tool)} output (${formatApproxBytes(input.output.length)}; ${reason})`,
+      tool: input.tool ?? null,
+      sourceUri: null,
+    });
+    return 1;
+  } catch {
+    return 0;
+  }
+}
+
+function storeExtractedPointers(input: ReflectionInput, extraction: Extraction): number {
+  let pointersStored = 0;
+  for (const pointer of extraction.pointers ?? []) {
+    try {
+      storeEpisodicPointer({
+        sessionId: input.sessionId,
+        callId: input.callId,
+        label: pointer.label,
+        tool: input.tool ?? null,
+        sourceUri: pointer.source_uri ?? null,
+      });
+      pointersStored += 1;
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err), pointer }, 'reflection: storeEpisodicPointer failed');
+    }
+  }
+  return pointersStored;
+}
+
+interface ReflectionCommitStats {
+  factsWritten: number;
+  factsUpdated: number;
+  factsDeleted: number;
+  factsNoop: number;
+  entitiesUpserted: number;
+  sumImportance: number;
+}
+
+function emptyCommitStats(): ReflectionCommitStats {
+  return {
+    factsWritten: 0,
+    factsUpdated: 0,
+    factsDeleted: 0,
+    factsNoop: 0,
+    entitiesUpserted: 0,
+    sumImportance: 0,
+  };
+}
+
+function mergeCommitStats(into: ReflectionCommitStats, next: ReflectionCommitStats): void {
+  into.factsWritten += next.factsWritten;
+  into.factsUpdated += next.factsUpdated;
+  into.factsDeleted += next.factsDeleted;
+  into.factsNoop += next.factsNoop;
+  into.entitiesUpserted += next.entitiesUpserted;
+  into.sumImportance += next.sumImportance;
+}
+
+async function commitExtractionMemory(input: ReflectionInput, extraction: Extraction): Promise<ReflectionCommitStats> {
+  const stats = emptyCommitStats();
+
+  // Connectors-as-authoritative-writers (Thread 1): classify the producing
+  // tool's source category once for this batch. A system of record lifts the
+  // derived-fact trust from 0.6 -> 0.9 (ground truth) and records the source
+  // app; a web/scrape source lowers it to 0.5. Flag-gated; unrecognized tools
+  // -> null -> unchanged default trust.
+  const source = isSourceTrustEnabled() ? classifySource(input.tool) : null;
+
+  for (const fact of extraction.facts ?? []) {
+    try {
+      // Mem0-style conflict resolution (Chhikara et al §2.1) via the
+      // shared consolidation path: find similar existing facts and let
+      // the LLM decide ADD / UPDATE / DELETE / NOOP. Falls back to ADD
+      // if anything fails — we never lose information silently.
+      const outcome = await consolidateFact(
+        {
+          kind: fact.kind,
+          text: fact.text,
+          importance: fact.importance,
+          trustLevel: source?.trust,
+          sourceApp: source?.app,
+        },
+        {
+          sessionId: input.sessionId,
+          derivedFrom: {
+            sessionId: input.sessionId,
+            callId: input.callId,
+            tool: input.tool ?? undefined,
+          },
+        },
+      );
+      stats.factsWritten += outcome.written;
+      stats.factsUpdated += outcome.updated;
+      stats.factsDeleted += outcome.deleted;
+      stats.factsNoop += outcome.noop;
+      stats.sumImportance += outcome.importanceAdded;
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err), fact }, 'reflection: consolidateFact failed');
+    }
+  }
+
+  // Upsert entities, keeping a name->id map so relationships can resolve.
+  const entityIdByName = new Map<string, number>();
+  for (const entity of extraction.entities ?? []) {
+    try {
+      const id = upsertEntity({ type: entity.type, name: entity.name, aliases: entity.aliases });
+      entityIdByName.set(entity.name.trim().toLowerCase(), id);
+      for (const a of entity.aliases ?? []) entityIdByName.set(String(a).trim().toLowerCase(), id);
+      stats.entitiesUpserted += 1;
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err), entity }, 'reflection: upsertEntity failed');
+    }
+  }
+
+  // WS2 (gated): persist entity<->entity relations the extractor surfaced. Both
+  // endpoints must be entities we just upserted (subject/object are names from
+  // the same `entities` list) so we never invent an edge to an unknown node.
+  if (Array.isArray(extraction.relationships)) {
+    for (const rel of extraction.relationships) {
+      try {
+        const subjectId = entityIdByName.get(rel.subject.trim().toLowerCase());
+        const objectId = entityIdByName.get(rel.object.trim().toLowerCase());
+        if (subjectId && objectId) recordEntityEdge({ subjectId, predicate: rel.predicate, objectId });
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : String(err), rel }, 'reflection: recordEntityEdge failed');
+      }
+    }
+  }
+
+  return stats;
+}
+
 /**
  * Main entry. Async — caller (hooks.ts) does NOT await. Returns the
  * count of rows written for observability via the dashboard, but the
@@ -895,7 +1329,8 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
 
   const extraction = await runExtractor(`Tool: ${input.tool ?? 'unknown'}\nCall: ${input.callId}\n\n${serialized}`);
   if (!extraction) {
-    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored: 0, skipped: 'extractor_failed' });
+    const pointersStored = storeFallbackPointer(input, 'extractor_failed');
+    return emitObservability({ factsWritten: 0, entitiesUpserted: 0, pointersStored, skipped: 'extractor_failed' });
   }
 
   // Source-map / landscape memory — mint resource pointers BEFORE the
@@ -930,126 +1365,56 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
   // Stanford §4.2: importance-threshold gating on the COMMIT step. The
   // extractor already ran (cheap fast-tier call); we just decide
   // whether the extracted facts clear the rolling sum-importance bar.
-  // Skipped extractions accumulate into the next call's budget so a
-  // session of low-signal tool returns eventually crosses the gate
-  // and writes.
-  const extractionImportance = extraction.facts.reduce((acc, f) => acc + (f.importance || 0), 0);
+  // Skipped extractions persist into the durable pending table so a session of
+  // low-signal tool returns eventually crosses the gate and commits ALL delayed
+  // facts. A daemon restart no longer erases the threshold window.
+  const extractionImportance = (extraction.facts ?? []).reduce((acc, f) => acc + (f.importance || 0), 0);
+  // Pointers are recovery handles, not semantic facts. Store them before the
+  // importance gate so a low-importance or delayed commit still leaves the model
+  // a call_id breadcrumb for recall_tool_result/tool_output_query. If the
+  // extractor found facts but emitted no pointer, create a deterministic source
+  // pointer so recovery does not depend on pointer-field extraction.
+  let pointersStored = storeExtractedPointers(input, extraction);
+  if (pointersStored === 0 && extractionImportance > 0) {
+    pointersStored += storeFallbackPointer(input, 'derived_fact_source');
+  }
   const threshold = getReflectionThreshold();
+  let batchesToCommit: PendingReflectionBatch[] = [{ input, extraction, importance: extractionImportance }];
+  let pendingImportance = extractionImportance;
+  let clearPendingAfterCommit = false;
+
   if (threshold > 0 && extractionImportance > 0) {
-    const counter = accumulateImportance(input.sessionId, extractionImportance);
-    if (counter.sum < threshold) {
+    storePendingReflectionBatch(input, extraction, extractionImportance);
+    pendingImportance = sumPendingReflectionImportance(input.sessionId);
+    if (pendingImportance < threshold) {
       return emitObservability({
         factsWritten: 0,
         entitiesUpserted: 0,
-        pointersStored: 0,
-        sumImportance: counter.sum,
+        pointersStored,
+        sumImportance: pendingImportance,
         skipped: 'low_importance',
       });
     }
-    // Crossed the threshold — reset so the next eligible window starts
-    // fresh. We still proceed with the current commit below.
-    resetSessionImportance(input.sessionId);
+    batchesToCommit = listPendingReflectionBatches(input.sessionId);
+    if (batchesToCommit.length === 0) batchesToCommit = [{ input, extraction, importance: extractionImportance }];
+    clearPendingAfterCommit = true;
   }
 
-  let factsWritten = 0;
-  let factsUpdated = 0;
-  let factsDeleted = 0;
-  let factsNoop = 0;
-  let entitiesUpserted = 0;
-  let pointersStored = 0;
-  let sumImportance = 0;
-
-  // Connectors-as-authoritative-writers (Thread 1): classify the producing
-  // tool's source category once for this batch. A system of record lifts the
-  // derived-fact trust from 0.6 → 0.9 (ground truth) and records the source
-  // app; a web/scrape source lowers it to 0.5. Flag-gated; unrecognized
-  // tools → null → unchanged default trust.
-  const source = isSourceTrustEnabled() ? classifySource(input.tool) : null;
-
-  for (const fact of extraction.facts) {
-    try {
-      // Mem0-style conflict resolution (Chhikara et al §2.1) via the
-      // shared consolidation path: find similar existing facts and let
-      // the LLM decide ADD / UPDATE / DELETE / NOOP. Falls back to ADD
-      // if anything fails — we never lose information silently.
-      const outcome = await consolidateFact(
-        {
-          kind: fact.kind,
-          text: fact.text,
-          importance: fact.importance,
-          trustLevel: source?.trust,
-          sourceApp: source?.app,
-        },
-        {
-          sessionId: input.sessionId,
-          derivedFrom: {
-            sessionId: input.sessionId,
-            callId: input.callId,
-            tool: input.tool ?? undefined,
-          },
-        },
-      );
-      factsWritten += outcome.written;
-      factsUpdated += outcome.updated;
-      factsDeleted += outcome.deleted;
-      factsNoop += outcome.noop;
-      sumImportance += outcome.importanceAdded;
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err), fact }, 'reflection: consolidateFact failed');
-    }
+  const totals = emptyCommitStats();
+  for (const batch of batchesToCommit) {
+    const stats = await commitExtractionMemory(batch.input, batch.extraction);
+    mergeCommitStats(totals, stats);
   }
-
-  // Upsert entities, keeping a name→id map so relationships can resolve.
-  const entityIdByName = new Map<string, number>();
-  for (const entity of extraction.entities) {
-    try {
-      const id = upsertEntity({ type: entity.type, name: entity.name, aliases: entity.aliases });
-      entityIdByName.set(entity.name.trim().toLowerCase(), id);
-      for (const a of entity.aliases ?? []) entityIdByName.set(String(a).trim().toLowerCase(), id);
-      entitiesUpserted += 1;
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err), entity }, 'reflection: upsertEntity failed');
-    }
-  }
-
-  // WS2 (gated): persist entity↔entity relations the extractor surfaced. Both
-  // endpoints must be entities we just upserted (subject/object are names from
-  // the same `entities` list) so we never invent an edge to an unknown node.
-  if (Array.isArray(extraction.relationships)) {
-    for (const rel of extraction.relationships) {
-      try {
-        const subjectId = entityIdByName.get(rel.subject.trim().toLowerCase());
-        const objectId = entityIdByName.get(rel.object.trim().toLowerCase());
-        if (subjectId && objectId) recordEntityEdge({ subjectId, predicate: rel.predicate, objectId });
-      } catch (err) {
-        logger.warn({ err: err instanceof Error ? err.message : String(err), rel }, 'reflection: recordEntityEdge failed');
-      }
-    }
-  }
-
-  for (const pointer of extraction.pointers) {
-    try {
-      storeEpisodicPointer({
-        sessionId: input.sessionId,
-        callId: input.callId,
-        label: pointer.label,
-        tool: input.tool ?? null,
-        sourceUri: pointer.source_uri ?? null,
-      });
-      pointersStored += 1;
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err), pointer }, 'reflection: storeEpisodicPointer failed');
-    }
-  }
+  if (clearPendingAfterCommit) clearPendingReflectionBatches(input.sessionId);
 
   return emitObservability({
-    factsWritten,
-    factsUpdated,
-    factsDeleted,
-    factsNoop,
-    entitiesUpserted,
+    factsWritten: totals.factsWritten,
+    factsUpdated: totals.factsUpdated,
+    factsDeleted: totals.factsDeleted,
+    factsNoop: totals.factsNoop,
+    entitiesUpserted: totals.entitiesUpserted,
     pointersStored,
-    sumImportance,
+    sumImportance: clearPendingAfterCommit ? pendingImportance : totals.sumImportance,
   });
 }
 
@@ -1066,10 +1431,10 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
 // at 9.3 min of extractor wall-clock in one session, stalling brain steps to
 // 27-37s. Draining reflections through a single-slot FIFO chain caps in-flight
 // extractions at 1, so background learning yields to the live loop instead of
-// competing with it. Best-effort: a bounded queue drops the overflow (memory
-// capture is lossy by design; high-signal facts recur) rather than growing
-// unbounded on a long autonomous run. CLEMMY_REFLECTION_SERIAL=off reverts to
-// the legacy concurrent path.
+// competing with it. Best-effort: a bounded queue drops overflow rather than
+// growing unbounded on a long autonomous run; once an extractor succeeds, the
+// threshold buffer above is durable. CLEMMY_REFLECTION_SERIAL=off reverts to the
+// legacy concurrent path.
 const REFLECTION_MAX_PENDING = 32;
 let reflectionPending = 0;
 let reflectionTail: Promise<void> = Promise.resolve();
@@ -1177,19 +1542,17 @@ async function runRecursivePatternExtractor(
 ): Promise<{ patterns: { text: string; importance: number }[] } | null> {
   const model = getReflectorModel();
   try {
-    const agent = new Agent<unknown, typeof RecursiveExtractionSchema>({
+    const agent = new Agent({
       name: 'Recursive Reflection Extractor',
       model,
       instructions: RECURSIVE_PROMPT,
-      outputType: normalizeZodForCodexStrict(RecursiveExtractionSchema) as typeof RecursiveExtractionSchema,
     });
     const runner = new Runner({ workflowName: 'clementine-recursive-reflection' });
     const lines = facts.map((f) => `[id=${f.id}, depth=${f.derivation_depth}, importance=${f.importance ?? '?'}] ${f.content}`);
     const prompt = `Kind: ${kind}\nFact count: ${facts.length}\n\nFacts:\n${lines.join('\n')}`;
     const result = await runner.run(agent, prompt);
     const final = (result as { finalOutput?: unknown }).finalOutput;
-    if (!final || typeof final !== 'object') return null;
-    return final as { patterns: { text: string; importance: number }[] };
+    return sanitizeRecursivePatternOutput(final);
   } catch (err) {
     logger.warn({ kind, err: err instanceof Error ? err.message : String(err) }, 'recursive-reflection extractor failed');
     return null;
