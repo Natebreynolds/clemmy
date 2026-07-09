@@ -81,6 +81,21 @@ test('buildClaudeHeadlessArgs uses print-mode stream-json without bare mode', ()
   assert.equal(args[args.indexOf('--model') + 1], 'claude-opus-4-8');
 });
 
+test('buildClaudeHeadlessArgs drops optional flags an installed CLI does not support', () => {
+  // Live v1.4.0 user report: "Claude Code headless exited 1: error: unknown
+  // option '--safe-mode'". Core args must survive with EVERY optional flag off.
+  const minimal = buildClaudeHeadlessArgs('claude-opus-4-8', () => false);
+  assert.deepEqual(minimal, ['-p', '--model', 'claude-opus-4-8', '--output-format', 'stream-json', '--verbose']);
+  // Selective support keeps exactly the advertised flags.
+  const partial = buildClaudeHeadlessArgs('sonnet', (f) => f === '--include-partial-messages');
+  assert.equal(partial.includes('--safe-mode'), false);
+  assert.equal(partial.includes('--include-partial-messages'), true);
+  // --tools travels with its empty-string operand, both present or both absent.
+  const withTools = buildClaudeHeadlessArgs('sonnet', (f) => f === '--tools');
+  assert.equal(withTools[withTools.indexOf('--tools') + 1], '');
+  assert.equal(minimal.includes('--tools'), false);
+});
+
 test('buildClaudeHeadlessEnv uses OAuth token and strips API-key envs', async () => {
   const oldApi = process.env.ANTHROPIC_API_KEY;
   const oldAuth = process.env.ANTHROPIC_AUTH_TOKEN;

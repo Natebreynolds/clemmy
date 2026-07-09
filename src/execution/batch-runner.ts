@@ -148,6 +148,15 @@ export function prepareBatchPlanForExecution(plan: BatchPlan): PreparedBatchPlan
   const slug = prepared.composioSlug.trim();
   const schema = getCachedToolSchema(slug);
   prepared.composioSlug = slug;
+  // Warm the slug's version resolution before the loop starts so the batch's
+  // first item never races the cold-start resolve fetch (its result is memoized
+  // in the composio client). Fire-and-forget; failures re-probe at execute time.
+  void (async () => {
+    try {
+      const { resolveComposioToolVersion } = await import('../integrations/composio/client.js');
+      await resolveComposioToolVersion(slug);
+    } catch { /* best-effort warmup */ }
+  })();
   prepared.items = prepared.items.map((item, index) => {
     if (!item || typeof item.args !== 'object' || item.args === null || Array.isArray(item.args)) return item;
     const normalized = normalizeComposioBatchItemArgs(slug, item.args, schema);
@@ -412,7 +421,12 @@ function previewOf(value: unknown): string {
 }
 
 function errorLooksTransient(message: string): boolean {
-  return /timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed|429|rate.?limit|5\d\d|socket hang up|network/i.test(message);
+  // "NOT FOUND (slug=…)" is composio's COLD-START version-resolve race: the
+  // resolve step 404s once before any side effect, then the warm registry
+  // serves every later item (sess-mrds80fu: item 1 of 10 died un-retried on
+  // exactly this). The resolve failure happens BEFORE the send executes, so
+  // one retry is side-effect-safe.
+  return /timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed|429|rate.?limit|5\d\d|socket hang up|network|NOT FOUND \(slug=/i.test(message);
 }
 
 /** A rate-limit / throttling error is handled DISTINCTLY from other transients: it

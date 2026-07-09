@@ -91,21 +91,71 @@ export function claudeCliModelArg(modelId: string): string {
   return modelId || 'sonnet';
 }
 
-export function buildClaudeHeadlessArgs(modelId: string): string[] {
+/** Flags that not every installed Claude Code version understands. An unknown
+ *  option makes the CLI exit 1 before emitting anything ("unknown option
+ *  '--safe-mode'", live user report on v1.4.0) — so these are OPTIONAL:
+ *  included only when the installed CLI's --help advertises them, and dropped
+ *  wholesale on an unknown-option retry. Core args (print mode, model,
+ *  stream-json output) are universal. */
+export const CLAUDE_HEADLESS_OPTIONAL_FLAGS: Array<{ flag: string; extra?: string[] }> = [
+  { flag: '--safe-mode' },
+  { flag: '--disable-slash-commands' },
+  { flag: '--tools', extra: [''] },
+  { flag: '--no-session-persistence' },
+  { flag: '--include-partial-messages' },
+];
+
+export function buildClaudeHeadlessArgs(modelId: string, flagSupported?: (flag: string) => boolean): string[] {
+  const optional = CLAUDE_HEADLESS_OPTIONAL_FLAGS
+    .filter((o) => (flagSupported ? flagSupported(o.flag) : true))
+    .flatMap((o) => [o.flag, ...(o.extra ?? [])]);
   return [
     '-p',
-    '--safe-mode',
-    '--disable-slash-commands',
-    '--tools',
-    '',
+    ...optional,
     '--model',
     claudeCliModelArg(modelId),
-    '--no-session-persistence',
     '--output-format',
     'stream-json',
     '--verbose',
-    '--include-partial-messages',
   ];
+}
+
+// Per-binary support cache: probe the installed CLI's --help ONCE and remember
+// which optional flags it advertises. A failed probe returns null → optimistic
+// full args (pre-existing behavior), backstopped by the unknown-option retry.
+// Failed probes are negative-cached for a few minutes so a hanging --help
+// can't add its timeout to EVERY headless call.
+const headlessFlagSupportCache = new Map<string, Set<string>>();
+const headlessProbeFailedAt = new Map<string, number>();
+const HEADLESS_PROBE_RETRY_MS = 5 * 60 * 1000;
+
+export function _setHeadlessFlagSupportForTests(command: string, flags: Set<string> | null): void {
+  if (flags === null) headlessFlagSupportCache.delete(command);
+  else headlessFlagSupportCache.set(command, flags);
+}
+
+async function probeSupportedHeadlessFlags(command: string): Promise<Set<string> | null> {
+  const cached = headlessFlagSupportCache.get(command);
+  if (cached) return cached;
+  const failedAt = headlessProbeFailedAt.get(command);
+  if (failedAt && Date.now() - failedAt < HEADLESS_PROBE_RETRY_MS) return null;
+  try {
+    const { execFile } = await import('node:child_process');
+    const help = await new Promise<string>((resolve, reject) => {
+      execFile(command, ['--help'], { timeout: 8000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderrText) => {
+        const combined = `${stdout ?? ''}${stderrText ?? ''}`;
+        if (combined.trim()) resolve(combined);
+        else reject(err ?? new Error('empty --help output'));
+      });
+    });
+    const set = new Set(CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag).filter((f) => help.includes(f)));
+    headlessFlagSupportCache.set(command, set);
+    headlessProbeFailedAt.delete(command);
+    return set;
+  } catch {
+    headlessProbeFailedAt.set(command, Date.now());
+    return null;
+  }
 }
 
 export async function buildClaudeHeadlessEnv(): Promise<NodeJS.ProcessEnv> {
@@ -415,8 +465,40 @@ function collectStderr(child: ChildProcessWithoutNullStreams): () => string {
 }
 
 async function* runClaudeHeadless(request: ModelRequest, modelId: string): AsyncGenerator<{ kind: 'delta'; delta: string } | { kind: 'done'; response: ModelResponse }> {
+  const command = resolveClaudeCliPath() ?? 'claude';
+  const support = await probeSupportedHeadlessFlags(command);
+  // Start from the probed set (or every optional flag when the probe failed).
+  const active = new Set(support ?? CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag));
+  // Unknown-option exits happen BEFORE any stream output, so dropping only the
+  // flag the CLI names and retrying preserves the isolation flags it DOES
+  // support (--tools '' keeps the print-mode subprocess tool-less — dropping
+  // it wholesale would hand the retry a tool-capable Claude Code). Bounded by
+  // the optional-flag count; never retried after output starts.
+  let emittedAnything = false;
+  for (let attempt = 0; attempt <= CLAUDE_HEADLESS_OPTIONAL_FLAGS.length; attempt += 1) {
+    const args = buildClaudeHeadlessArgs(modelId, (f) => active.has(f));
+    try {
+      for await (const evt of runClaudeHeadlessAttempt(request, modelId, command, args)) {
+        if (evt.kind === 'delta') emittedAnything = true;
+        yield evt;
+      }
+      headlessFlagSupportCache.set(command, new Set(active));
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const unknown = /unknown option '?(--[a-z-]+)'?/i.exec(message);
+      if (emittedAnything || !unknown) throw err;
+      const offending = unknown[1];
+      if (!active.has(offending)) throw err; // not one of ours — real failure
+      active.delete(offending);
+      logger.warn({ command, offending }, 'claude headless rejected an optional flag — retrying without it');
+    }
+  }
+  throw new Error('Claude Code headless could not agree on CLI flags after retries.');
+}
+
+async function* runClaudeHeadlessAttempt(request: ModelRequest, modelId: string, command: string, args: string[]): AsyncGenerator<{ kind: 'delta'; delta: string } | { kind: 'done'; response: ModelResponse }> {
   const env = await buildClaudeHeadlessEnv();
-  const args = buildClaudeHeadlessArgs(modelId);
   const prompt = renderClaudeHeadlessPrompt(request);
   const state: HeadlessRunState = {
     responseId: `claude-headless-${randomUUID()}`,
@@ -424,7 +506,6 @@ async function* runClaudeHeadless(request: ModelRequest, modelId: string): Async
     emittedText: '',
     rawEvents: 0,
   };
-  const command = resolveClaudeCliPath() ?? 'claude';
   const child = spawnImpl(command, args, {
     env,
     cwd: process.cwd(),
