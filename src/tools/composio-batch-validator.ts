@@ -44,8 +44,112 @@ export interface ComposioArgsValidation {
   mode: ValidationMode;
 }
 
+export interface NormalizedComposioBatchItemArgs {
+  args: Record<string, unknown>;
+  connectedAccountId?: string | null;
+  repairs: string[];
+  errors: string[];
+}
+
 function isRecordValue(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function parseJsonObject(value: unknown): { value?: Record<string, unknown>; error?: string } {
+  if (isRecordValue(value)) return { value };
+  if (typeof value !== 'string') return { error: 'arguments must be a JSON object or JSON object string' };
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!isRecordValue(parsed)) return { error: 'arguments must parse to a JSON object' };
+    return { value: parsed };
+  } catch {
+    return { error: 'arguments is not valid JSON' };
+  }
+}
+
+function schemaRequiredFields(schema?: Record<string, unknown> | null): Set<string> {
+  const required = isRecordValue(schema) && Array.isArray(schema.required)
+    ? schema.required.filter((key): key is string => typeof key === 'string')
+    : [];
+  return new Set(required);
+}
+
+function schemaPropertyFields(schema?: Record<string, unknown> | null): Set<string> | null {
+  const properties = isRecordValue(schema?.properties) ? schema!.properties : null;
+  return properties ? new Set(Object.keys(properties)) : null;
+}
+
+function isOutlookSendEmailSlug(toolSlug: string): boolean {
+  return /^OUTLOOK(?:_|$).*SEND.*EMAIL$/i.test(toolSlug);
+}
+
+function applyEmailRecipientAliases(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  schema?: Record<string, unknown> | null,
+): { args: Record<string, unknown>; repairs: string[] } {
+  const repairs: string[] = [];
+  const out = { ...args };
+  const required = schemaRequiredFields(schema);
+  const properties = schemaPropertyFields(schema);
+  const needsToEmail = required.has('to_email') || isOutlookSendEmailSlug(toolSlug);
+  if (needsToEmail && !('to_email' in out) && 'to' in out) {
+    out.to_email = out.to;
+    if (!properties || !properties.has('to')) delete out.to;
+    repairs.push('mapped recipient alias "to" to required field "to_email"');
+  }
+  return { args: out, repairs };
+}
+
+/**
+ * Repair the two batch-only Composio shape mistakes that are both common and
+ * semantics-preserving:
+ *   1. A run_batch item contains the full composio_execute_tool wrapper even
+ *      though the batch runner will add that wrapper per item.
+ *   2. A provider-specific email send schema wants `to_email`, while the model
+ *      used the ordinary email field `to`.
+ *
+ * This is NOT a broad heuristic validator. Unknown shapes pass through; only a
+ * wrapper for the SAME slug is unwrapped, and recipient aliases are applied only
+ * when the cached schema requires `to_email` or for the known Outlook send-email
+ * slug family that produced the live failure.
+ */
+export function normalizeComposioBatchItemArgs(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  schema?: Record<string, unknown> | null,
+): NormalizedComposioBatchItemArgs {
+  const repairs: string[] = [];
+  const errors: string[] = [];
+  let nextArgs = { ...args };
+  let connectedAccountId: string | null | undefined;
+
+  const hasComposioWrapper = 'tool_slug' in nextArgs || 'arguments' in nextArgs || 'connected_account_id' in nextArgs;
+  if (hasComposioWrapper && 'arguments' in nextArgs) {
+    const wrapperSlug = typeof nextArgs.tool_slug === 'string' ? nextArgs.tool_slug.trim() : '';
+    if (wrapperSlug && wrapperSlug !== toolSlug) {
+      errors.push(`wrapper tool_slug "${wrapperSlug}" does not match plan composioSlug "${toolSlug}"`);
+    }
+    const parsed = parseJsonObject(nextArgs.arguments);
+    if (parsed.error) {
+      errors.push(`wrapper arguments ${parsed.error}`);
+    } else if (parsed.value) {
+      nextArgs = { ...parsed.value };
+      const rawConnection = args.connected_account_id;
+      connectedAccountId = typeof rawConnection === 'string' && rawConnection.trim()
+        ? rawConnection.trim()
+        : rawConnection === null
+          ? null
+          : undefined;
+      repairs.push('unwrapped nested composio_execute_tool args inside run_batch item');
+    }
+  }
+
+  const recipient = applyEmailRecipientAliases(toolSlug, nextArgs, schema);
+  nextArgs = recipient.args;
+  repairs.push(...recipient.repairs);
+
+  return { args: nextArgs, connectedAccountId, repairs, errors };
 }
 
 /**

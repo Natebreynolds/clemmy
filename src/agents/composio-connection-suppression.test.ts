@@ -4,7 +4,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { suppressConnectionAfterHardAuthFailure } = await import('./composio-connection-suppression.js');
+const {
+  hardAuthSuppressionDurationMs,
+  mergeConnectionSuppressions,
+  suppressConnectionAfterHardAuthFailure,
+} = await import('./composio-connection-suppression.js');
 
 test('suppresses Composio SDK auth errors even when message/cause are non-enumerable', () => {
   const err = Object.create(null);
@@ -45,4 +49,74 @@ test('suppresses expired connection errors from nested SDK payloads', () => {
     Date.parse('2026-07-02T12:00:00Z'),
   );
   assert.equal(suppression?.reason, 'expired');
+});
+
+test('hard auth suppressions use progressive long-lived quarantine windows', () => {
+  const now = Date.parse('2026-07-02T12:00:00Z');
+  const expiredErr = {
+    data: {
+      error: {
+        message: "Connected account ca_expired for toolkit 'outlook' is in EXPIRED state",
+        code: 1820,
+      },
+    },
+  };
+  const state = {};
+
+  const first = suppressConnectionAfterHardAuthFailure(state, 'ca_expired', expiredErr, now);
+  assert.equal(first?.failures, 1);
+  assert.equal(first?.suppressUntil, new Date(now + hardAuthSuppressionDurationMs('expired', 1)).toISOString());
+
+  const secondNow = now + 60_000;
+  const second = suppressConnectionAfterHardAuthFailure(state, 'ca_expired', expiredErr, secondNow);
+  assert.equal(second?.failures, 2);
+  assert.equal(second?.suppressUntil, new Date(secondNow + hardAuthSuppressionDurationMs('expired', 2)).toISOString());
+});
+
+test('entity mismatch starts with a week-long quarantine because it requires account repair', () => {
+  const now = Date.parse('2026-07-02T12:00:00Z');
+  const suppression = suppressConnectionAfterHardAuthFailure(
+    {},
+    'ca_stale',
+    new Error('ConnectedAccountEntityIdMismatch: connected account user id does not match code: 1812'),
+    now,
+  );
+
+  assert.equal(suppression?.reason, 'entity-mismatch');
+  assert.equal(suppression?.suppressUntil, new Date(now + hardAuthSuppressionDurationMs('entity-mismatch', 1)).toISOString());
+});
+
+test('mergeConnectionSuppressions keeps the active record with the furthest suppressUntil', () => {
+  const now = Date.parse('2026-07-02T12:00:00Z');
+  const target = {
+    suppressedConnections: {
+      ca_same: {
+        reason: 'expired',
+        suppressUntil: '2026-07-03T12:00:00.000Z',
+        lastErrorAt: '2026-07-02T11:00:00.000Z',
+        failures: 1,
+      },
+    },
+  };
+
+  mergeConnectionSuppressions(target, {
+    suppressedConnections: {
+      ca_same: {
+        reason: 'entity-mismatch',
+        suppressUntil: '2026-07-09T12:00:00.000Z',
+        lastErrorAt: '2026-07-02T11:30:00.000Z',
+        failures: 2,
+      },
+      ca_expired_old: {
+        reason: 'expired',
+        suppressUntil: '2026-07-01T12:00:00.000Z',
+        lastErrorAt: '2026-07-01T11:00:00.000Z',
+        failures: 1,
+      },
+    },
+  }, now);
+
+  assert.equal(target.suppressedConnections.ca_same.reason, 'entity-mismatch');
+  assert.equal(target.suppressedConnections.ca_same.failures, 2);
+  assert.equal((target.suppressedConnections as Record<string, unknown>).ca_expired_old, undefined);
 });

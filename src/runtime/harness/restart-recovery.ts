@@ -8,12 +8,12 @@
  * survived in the event log). That violates the north-star "long-running without
  * failing" + "reports back without fail".
  *
- * This closes the report-back gap (not full auto-resume): runConversation marks
- * the session in-flight on entry and clears it in a finally on ANY exit, so a
- * marker that survives a restart unambiguously means "this run was killed
- * mid-flight". On boot we surface each such chat run with a non-silent
- * conversation_completed (so the session shows it, and a `continue` resumes with
- * full replayed context) plus a bounded notification, then clear the marker.
+ * This closes the report-back gap: runConversation marks the session in-flight
+ * on entry and clears it in a finally on ANY exit, so a marker that survives a
+ * restart unambiguously means "this run was killed mid-flight". On boot we
+ * surface each such chat run with a non-silent conversation_completed, and when
+ * the safety bar proves no external write happened, auto-resume through the
+ * normal harness spine.
  *
  * Chat-only by construction (the marker is only set for kind='chat'); workflow/
  * agent/execution sessions have their own resume paths and are never touched.
@@ -59,14 +59,15 @@ export const AUTO_RESUME_DIRECTIVE = [
   'If the task was already effectively complete, deliver the final answer now.',
 ].join('\n');
 
-/** External-write check: TRUE when the interrupted window recorded any
- *  external_write event — those runs are never auto-resumed (double-act risk). */
-function hadExternalWriteSince(sessionId: string, sinceIso: string): boolean {
+/** External-write count in the interrupted window. Any count >0 blocks
+ *  auto-resume (double-act risk); null means the check failed, which also
+ *  blocks auto-resume because safety could not be proven. */
+function countExternalWritesSince(sessionId: string, sinceIso: string): number | null {
   try {
     const writes = listEvents(sessionId, { types: ['external_write'] });
-    return writes.some((ev) => String(ev.createdAt ?? '') >= sinceIso);
+    return writes.filter((ev) => String(ev.createdAt ?? '') >= sinceIso).length;
   } catch {
-    return true; // can't prove safety → keep the manual banner
+    return null; // can't prove safety → keep the manual banner
   }
 }
 
@@ -109,6 +110,8 @@ export interface RestartRecoveryRecord {
   noticeRecorded: boolean;
   notified: boolean;
   markerCleared: boolean;
+  /** True when the restart recovery decision was recorded in the event log. */
+  decisionRecorded: boolean;
   /** True when this run met the safety bar and a resume was dispatched. */
   autoResumed: boolean;
   /** Why auto-resume did NOT run (for the boot log / forensics). */
@@ -195,6 +198,7 @@ export function recoverInterruptedChatRuns(
       noticeRecorded: false,
       notified: false,
       markerCleared: false,
+      decisionRecorded: false,
       autoResumed: false,
       errors: [],
     };
@@ -202,11 +206,12 @@ export function recoverInterruptedChatRuns(
     // Auto-resume decision (see the safety bar above). Decided up front so the
     // in-session notice tells the truth about what happens next.
     const ageMs = now() - Date.parse(since);
+    const externalWritesSinceInterrupt = countExternalWritesSince(row.id, since);
     if (!autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
     else if (!dispatchResume) record.autoResumeSkipped = 'no_dispatcher';
     else if (autoResumes >= AUTO_RESUME_MAX_PER_BOOT) record.autoResumeSkipped = 'boot_cap';
     else if (!Number.isFinite(ageMs) || ageMs > AUTO_RESUME_MAX_AGE_MS) record.autoResumeSkipped = 'too_old';
-    else if (hadExternalWriteSince(row.id, since)) record.autoResumeSkipped = 'external_write';
+    else if (externalWritesSinceInterrupt === null || externalWritesSinceInterrupt > 0) record.autoResumeSkipped = 'external_write';
     const willAutoResume = record.autoResumeSkipped === undefined;
 
     try {
@@ -217,6 +222,38 @@ export function recoverInterruptedChatRuns(
       record.replayPrepared = true;
     } catch (err) {
       record.errors.push(`replay_primer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Durable audit of the safety decision. This is intentionally separate from
+    // the visible notice below: consumers can reconstruct why a run auto-resumed
+    // or stayed manual without parsing human-facing copy or daemon boot logs.
+    try {
+      appendEvent({
+        sessionId: row.id,
+        turn: 0,
+        role: 'system',
+        type: 'restart_recovery_decision',
+        data: {
+          interruptedAt: since,
+          ageMs: Number.isFinite(ageMs) ? ageMs : null,
+          eligible: willAutoResume,
+          autoResume: willAutoResume,
+          autoResumeSkipped: record.autoResumeSkipped ?? null,
+          externalWritesSinceInterrupt,
+          writeCheckFailed: externalWritesSinceInterrupt === null,
+          hasDispatcher: !!dispatchResume,
+          bootCap: AUTO_RESUME_MAX_PER_BOOT,
+          bootResumeOrdinal: willAutoResume ? autoResumes + 1 : null,
+          replayPrepared: record.replayPrepared,
+          replayPrimerChanged: record.replayPrimerChanged,
+          snapshotItemsBefore: record.snapshotItemsBefore,
+          snapshotItemsAfter: record.snapshotItemsAfter,
+          lastResponseIdPresent: record.lastResponseIdPresent,
+        },
+      });
+      record.decisionRecorded = true;
+    } catch (err) {
+      record.errors.push(`decision_event: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     // Non-silent in-session notice (the dock replays it). The text tells the

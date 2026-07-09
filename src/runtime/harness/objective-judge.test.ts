@@ -140,7 +140,8 @@ test('buildObjectiveJudgePrompt without skill context is unchanged (no rubric in
   const { buildObjectiveJudgePrompt } = await import('./objective-judge.js');
   const p = buildObjectiveJudgePrompt('do a thing', 'done');
   assert.doesNotMatch(p, /SKILLS LOADED THIS SESSION/);
-  assert.match(p, /respond with the structured verdict/);
+  assert.match(p, /exactly one verdict line/);
+  assert.doesNotMatch(p, /structured verdict/);
 });
 
 // Regression (2026-06-14): a build/deploy run that loads NO skill still did real
@@ -233,8 +234,23 @@ test('parseCompletionVerdict: INCOMPLETE marker → done:false + missing evidenc
 
 test('parseCompletionVerdict: tolerant of NOT-DONE alias, no colon, lowercase, whitespace', () => {
   assert.equal(parseCompletionVerdict('  done  everything shipped')?.done, true);
+  assert.equal(parseCompletionVerdict('DONE')?.done, true);
+  assert.equal(parseCompletionVerdict('DONE - everything shipped')?.done, true);
   assert.equal(parseCompletionVerdict('NOT-DONE: still missing the send confirmation')?.done, false);
   assert.equal(parseCompletionVerdict('not done: nothing produced')?.done, false);
+});
+
+test('parseCompletionVerdict: legacy structured object/JSON verdicts are accepted', () => {
+  const done = parseCompletionVerdict({ done: true, reason: 'file written at /tmp/report.md' });
+  assert.deepEqual(done, { done: true, reason: 'file written at /tmp/report.md' });
+
+  const incomplete = parseCompletionVerdict('```json\n{"done":"false","reason":"missing the spreadsheet URL"}\n```');
+  assert.equal(incomplete?.done, false);
+  assert.equal(incomplete?.reason, 'missing the spreadsheet URL');
+
+  const status = parseCompletionVerdict('{"status":"completed","summary":"artifact path returned"}');
+  assert.equal(status?.done, true);
+  assert.equal(status?.reason, 'artifact path returned');
 });
 
 test('parseCompletionVerdict: no marker → null (caller applies its own fail semantics)', () => {
@@ -247,4 +263,36 @@ test('parseCompletionVerdict: reason clamped in code, never validated', () => {
   const v = parseCompletionVerdict(`DONE: ${'z'.repeat(900)}`);
   assert.equal(v?.done, true);
   assert.equal(v!.reason.length, 400);
+});
+
+// ─── Per-criterion checklist verdict parsing (goal-contract granularity) ───
+
+test('parseCriteriaVerdicts: one line per criterion, mixed MET/UNMET, notes preserved', async () => {
+  const { parseCriteriaVerdicts } = await import('./objective-judge.js');
+  const raw = ['1: MET: sheet URL present', '2: UNMET: no send confirmation', '3: MET: file path quoted'].join('\n');
+  const v = parseCriteriaVerdicts(raw, 3);
+  assert.equal(v?.length, 3);
+  assert.deepEqual(v?.map((x) => x.pass), [true, false, true]);
+  assert.match(v?.[1].note ?? '', /send confirmation/);
+});
+
+test('parseCriteriaVerdicts: tolerant of synonyms (PASS/FAIL), separators, and order', async () => {
+  const { parseCriteriaVerdicts } = await import('./objective-judge.js');
+  const raw = ['2) FAIL — missing artifact', '1. PASS: done well'].join('\n');
+  const v = parseCriteriaVerdicts(raw, 2);
+  assert.deepEqual(v?.map((x) => x.pass), [true, false]);
+});
+
+test('parseCriteriaVerdicts: ALL-OR-NOTHING — a partial listing returns null (never silently partial)', async () => {
+  const { parseCriteriaVerdicts } = await import('./objective-judge.js');
+  assert.equal(parseCriteriaVerdicts('1: MET: ok', 2), null);
+  assert.equal(parseCriteriaVerdicts('here is my analysis of the criteria...', 2), null);
+  assert.equal(parseCriteriaVerdicts('', 1), null);
+});
+
+test('parseCriteriaVerdicts: out-of-range and duplicate indices ignored, prose around lines tolerated', async () => {
+  const { parseCriteriaVerdicts } = await import('./objective-judge.js');
+  const raw = ['Verdicts:', '1: MET: ok', '1: UNMET: dup ignored', '5: MET: out of range', '2: UNMET: real'].join('\n');
+  const v = parseCriteriaVerdicts(raw, 2);
+  assert.deepEqual(v?.map((x) => x.pass), [true, false]);
 });

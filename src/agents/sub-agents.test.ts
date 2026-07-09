@@ -14,6 +14,7 @@ import {
   defaultOrchestratorHandoffs,
   isOrchestratorSlug,
 } from './sub-agents.js';
+import { externalMcpScopeFromResolvedTools } from './external-mcp-scope-lock.js';
 
 test('isOrchestratorSlug: clementine is the default orchestrator', () => {
   assert.equal(isOrchestratorSlug('clementine'), true);
@@ -62,6 +63,35 @@ test('buildWorkerAgent honors an explicit routed model override', async () => {
   assert.equal(worker.model, 'claude-opus-4-8');
 });
 
+test('buildWorkerAgent attaches no external MCP servers without an explicit parent scope or packet need', async () => {
+  const worker = await buildWorkerAgent();
+  assert.equal(worker.mcpServers.length, 0);
+});
+
+test('buildWorkerAgent preserves an explicit parent MCP scope', async () => {
+  const worker = await buildWorkerAgent({
+    mcpToolScope: { reason: 'parent scoped data work', allowedServerSlugs: ['dataforseo'], maxTools: 8 },
+  });
+  assert.equal(worker.mcpServers.length, 1);
+});
+
+test('worker resolvedTools derive external MCP only from exact native MCP slugs/server names', () => {
+  assert.equal(externalMcpScopeFromResolvedTools('none needed', ['dataforseo']), null);
+  assert.equal(externalMcpScopeFromResolvedTools('skill_read and read_file only', ['dataforseo']), null);
+  assert.equal(
+    externalMcpScopeFromResolvedTools('DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE', ['dataforseo']),
+    null,
+    'Composio slugs should stay on composio_execute_tool, not attach native MCP',
+  );
+
+  const dataforseo = externalMcpScopeFromResolvedTools('`dataforseo__serp_organic_live_advanced`', ['dataforseo', 'firecrawl']);
+  assert.deepEqual(dataforseo?.allowedServerSlugs, ['dataforseo']);
+  assert.ok(dataforseo?.toolPatterns?.some((pattern) => pattern.includes('serp') && pattern.includes('organic')));
+
+  const firecrawl = externalMcpScopeFromResolvedTools('mcp__firecrawl__scrape', ['dataforseo', 'firecrawl']);
+  assert.deepEqual(firecrawl?.allowedServerSlugs, ['firecrawl']);
+});
+
 test('Worker is a LEAF (has no handoffs of its own)', async () => {
   const worker = await buildWorkerAgent();
   const handoffs = (worker as unknown as { handoffs?: unknown[] }).handoffs;
@@ -99,7 +129,7 @@ test('Worker gets the full native surface minus only recursion/meta vectors (blo
   );
 
   // Recovery + core work tools the worker must have.
-  for (const must of ['recall_tool_result', 'tool_output_query', 'composio_execute_tool', 'read_file', 'run_shell_command']) {
+  for (const must of ['recall_tool_result', 'tool_output_query', 'workspace_artifact_query', 'composio_execute_tool', 'read_file', 'run_shell_command']) {
     assert.ok(toolNames.has(must), `worker must have ${must}`);
   }
 

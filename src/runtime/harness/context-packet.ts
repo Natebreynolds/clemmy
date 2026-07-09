@@ -8,6 +8,7 @@ import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namesp
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
 import { pinnedCalendarRuleLabels } from './constraint-guard.js';
 import { pitfallsForSkills } from './known-pitfalls.js';
+import { listHarnessCapabilityHealth } from './capability-health.js';
 import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-system-guidance.js';
 import type { FanoutPosture } from '../../dashboard/agent-system-metrics.js';
 import { tokenize } from '../../shared/workflow-scoring.js';
@@ -507,6 +508,16 @@ function summarizeToolScope(input: string): AgentContextPacket['toolScope'] {
   }
 }
 
+function harnessCapabilityHealthWarnings(limit = 3): string[] {
+  try {
+    return listHarnessCapabilityHealth()
+      .slice(0, limit)
+      .map((rec) => `Harness ${rec.id} is ${rec.state}${rec.reason ? `: ${rec.reason}` : ''}`);
+  } catch {
+    return [];
+  }
+}
+
 export function buildAgentContextPacket(
   input: string,
   memory: MemoryPrimerSummary,
@@ -527,9 +538,14 @@ export function buildAgentContextPacket(
   const workflows = rankWorkflows(input);
   const toolScope = summarizeToolScope(input);
   const mcp = lightenQa ? [] : mcpHealth();
-  const healthWarnings = lightenQa ? [] : [
-    ...diskHealthWarnings(),
-    ...mcp.map((server) => `MCP ${server.slug} is ${server.state}${server.lastError ? `: ${server.lastError}` : ''}`),
+  const healthWarnings = [
+    ...harnessCapabilityHealthWarnings(),
+    ...(lightenQa
+      ? []
+      : [
+          ...diskHealthWarnings(),
+          ...mcp.map((server) => `MCP ${server.slug} is ${server.state}${server.lastError ? `: ${server.lastError}` : ''}`),
+        ]),
   ];
   const focus = focusLine();
   const memoryLine = memory.enabled

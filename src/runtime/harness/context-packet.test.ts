@@ -46,6 +46,7 @@ writeFileSync(
 
 const { buildAgentContextPacket, detectMultiItemIntent, detectMultiItemIntentFromConversation } = await import('./context-packet.js');
 const { __resetAgentSystemGuidanceCacheForTests } = await import('../agent-system-guidance.js');
+const capabilityHealth = await import('./capability-health.js');
 
 test.after(() => {
   try {
@@ -53,6 +54,10 @@ test.after(() => {
   } catch {
     // best effort
   }
+});
+
+test.beforeEach(() => {
+  capabilityHealth._resetHarnessCapabilityHealthForTest();
 });
 
 test('context packet ranks relevant skills and workflows for the current request', () => {
@@ -209,6 +214,28 @@ test('detectMultiItemIntent is total — never throws, handles junk input', () =
 // ─── P0: packet wiring (chat-only directive, size-aware, suppression) ───────
 
 const NO_MEMORY = { enabled: false, hitCount: 0, source: null, injected: false } as const;
+
+test('packet keeps harness capability warnings on QA-lightened turns', () => {
+  capabilityHealth.recordHarnessCapabilityHealth({
+    id: 'claude_sdk_local_mcp_surface',
+    state: 'unavailable',
+    summary: 'Claude SDK local MCP surface did not initialize.',
+    reason: 'SDK stream ended before emitting an init message.',
+    sessionId: 'context-packet-health',
+  });
+
+  const packet = buildAgentContextPacket(
+    'what is the current harness status?',
+    NO_MEMORY,
+    { sessionKind: 'chat', sessionId: 'context-packet-health' },
+  );
+
+  assert.equal(packet.turnIntent, 'qa');
+  assert.equal(packet.mcp.length, 0, 'QA lightening still skips MCP probes');
+  assert.ok(packet.healthWarnings.some((warning) => /claude_sdk_local_mcp_surface/.test(warning)));
+  assert.match(packet.text, /Harness claude_sdk_local_mcp_surface is unavailable/);
+  assert.match(packet.text, /SDK stream ended before emitting an init message/);
+});
 
 test('packet injects bounded agent-system guidance for chat turns', () => {
   const packet = buildAgentContextPacket(

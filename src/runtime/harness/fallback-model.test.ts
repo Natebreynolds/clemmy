@@ -1,8 +1,21 @@
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
-import { withModelFallback, isOverloadError, isFalloverError, type FallbackTarget } from './fallback-model.js';
+import { withModelFallback, isOverloadError, isFalloverError, type FallbackTarget, __test__ } from './fallback-model.js';
 import { BoundaryError } from '../boundary-error.js';
+
+const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-fallback-model-test-'));
+__test__.setDeadBrainsFileForTests(path.join(TMP, 'brain-auth-dead.json'));
+__test__.setSilentBrainsFileForTests(path.join(TMP, 'brain-silent-cooldown.json'));
+
+after(() => {
+  __test__.setDeadBrainsFileForTests(null);
+  __test__.setSilentBrainsFileForTests(null);
+  rmSync(TMP, { recursive: true, force: true });
+});
 
 function req(): ModelRequest { return { input: 'hi', modelSettings: {}, tools: [], handoffs: [] } as unknown as ModelRequest; }
 function resp(text: string): ModelResponse { return { output: [{ type: 'message', content: text }], usage: {} } as unknown as ModelResponse; }
@@ -200,8 +213,32 @@ test('sticky auth-dead: after an auth failure, the NEXT request skips the dead b
     assert.equal(deadCalls, 1);
     assert.equal(liveCalls, 1);
     assert.equal(isBrainAuthDead('gpt-5.5-dead'), true, 'the auth failure stuck');
+    assert.equal(__test__.getDeadBrainEntryForTests('gpt-5.5-dead')?.reason, 'model.auth_expired');
     await fb.getResponse(req()); // second request: dead brain is SKIPPED
     assert.equal(deadCalls, 1, 'the dead brain was not probed again');
+    assert.equal(liveCalls, 2);
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('sticky auth-dead: marker survives daemon restart and skips the dead brain during cooldown', async () => {
+  const { reviveDeadBrains, isBrainAuthDead } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let deadCalls = 0, liveCalls = 0;
+    const dead = model({ getResponse: async () => { deadCalls++; throw new Error('HTTP 401 Unauthorized'); } });
+    const live = model({ getResponse: async () => { liveCalls++; return resp('from live'); } });
+    const fb = withModelFallback([target('restart-dead', dead), target('restart-live', live)]);
+    await fb.getResponse(req());
+    assert.equal(deadCalls, 1);
+    assert.equal(liveCalls, 1);
+    assert.equal(isBrainAuthDead('restart-dead'), true);
+
+    __test__.resetDeadBrainsMemoryForTests();
+    const afterRestart = withModelFallback([target('restart-dead', dead), target('restart-live', live)]);
+    await afterRestart.getResponse(req());
+    assert.equal(deadCalls, 1, 'persisted auth-dead marker skipped the dead brain after restart');
     assert.equal(liveCalls, 2);
   } finally {
     reviveDeadBrains();
@@ -220,6 +257,134 @@ test('sticky auth-dead: a transport timeout does NOT stick (transient failures s
     assert.equal(isBrainAuthDead('flaky'), false, 'a timeout never sticks');
     await fb.getResponse(req());
     assert.equal(flakyCalls, 2, 'the flaky brain is probed again next request');
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('silent cooldown: repeated transport timeouts skip the quiet brain briefly', async () => {
+  const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let quietCalls = 0, liveCalls = 0;
+    const quiet = model({ getResponse: async () => {
+      quietCalls++;
+      throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'hung' });
+    } });
+    const live = model({ getResponse: async () => { liveCalls++; return resp('from live'); } });
+    const fb = withModelFallback([target('quiet-primary', quiet), target('quiet-live', live)]);
+
+    await fb.getResponse(req());
+    assert.equal(quietCalls, 1);
+    assert.equal(liveCalls, 1);
+    assert.equal(isBrainSilenced('quiet-primary'), false, 'one timeout is still treated as transient');
+
+    await fb.getResponse(req());
+    assert.equal(quietCalls, 2);
+    assert.equal(liveCalls, 2);
+    assert.equal(isBrainSilenced('quiet-primary'), true, 'the second timeout opens the short cooldown');
+    assert.equal(__test__.getSilentBrainEntryForTests('quiet-primary')?.reason, 'model.transport_timeout');
+
+    await fb.getResponse(req());
+    assert.equal(quietCalls, 2, 'cooldown skipped the repeatedly silent brain');
+    assert.equal(liveCalls, 3);
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('silent cooldown: marker survives daemon restart and skips the quiet brain', async () => {
+  const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let quietCalls = 0, liveCalls = 0;
+    const quiet = model({ getResponse: async () => {
+      quietCalls++;
+      throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'hung' });
+    } });
+    const live = model({ getResponse: async () => { liveCalls++; return resp('from live'); } });
+    const fb = withModelFallback([target('restart-quiet', quiet), target('restart-live', live)]);
+
+    await fb.getResponse(req());
+    await fb.getResponse(req());
+    assert.equal(quietCalls, 2);
+    assert.equal(liveCalls, 2);
+    assert.equal(isBrainSilenced('restart-quiet'), true);
+
+    __test__.resetSilentBrainsMemoryForTests();
+    const afterRestart = withModelFallback([target('restart-quiet', quiet), target('restart-live', live)]);
+    await afterRestart.getResponse(req());
+    assert.equal(quietCalls, 2, 'persisted silent marker skipped the quiet brain after restart');
+    assert.equal(liveCalls, 3);
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('silent cooldown: a successful retry clears prior silent-failure history', async () => {
+  const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let mode: 'timeout' | 'ok' = 'timeout';
+    let primaryCalls = 0, liveCalls = 0;
+    const primary = model({ getResponse: async () => {
+      primaryCalls++;
+      if (mode === 'timeout') {
+        throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'hung' });
+      }
+      return resp('primary recovered');
+    } });
+    const live = model({ getResponse: async () => { liveCalls++; return resp('from live'); } });
+    const fb = withModelFallback([target('recovering-primary', primary), target('recovering-live', live)]);
+
+    await fb.getResponse(req());
+    assert.equal(primaryCalls, 1);
+    assert.equal(liveCalls, 1);
+    assert.equal(isBrainSilenced('recovering-primary'), false);
+
+    mode = 'ok';
+    await fb.getResponse(req());
+    assert.equal(primaryCalls, 2);
+    assert.equal(liveCalls, 1);
+    assert.equal(__test__.getSilentBrainEntryForTests('recovering-primary'), null, 'success cleared the prior failure count');
+
+    mode = 'timeout';
+    await fb.getResponse(req());
+    assert.equal(primaryCalls, 3, 'the recovered brain is probed again');
+    assert.equal(liveCalls, 2);
+    assert.equal(isBrainSilenced('recovering-primary'), false, 'a fresh single timeout does not immediately silence it');
+  } finally {
+    reviveDeadBrains();
+  }
+});
+
+test('silent cooldown: when EVERY brain is silenced, the full chain is still probed', async () => {
+  const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  try {
+    let aMode: 'timeout' | 'ok' = 'timeout';
+    let aCalls = 0, bCalls = 0;
+    const a = model({ getResponse: async () => {
+      aCalls++;
+      if (aMode === 'ok') return resp('a recovered');
+      throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'a hung' });
+    } });
+    const b = model({ getResponse: async () => {
+      bCalls++;
+      throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'b hung' });
+    } });
+    const fb = withModelFallback([target('all-silent-a', a), target('all-silent-b', b)]);
+
+    await assert.rejects(() => fb.getResponse(req()));
+    await assert.rejects(() => fb.getResponse(req()));
+    assert.equal(isBrainSilenced('all-silent-a'), true);
+    assert.equal(isBrainSilenced('all-silent-b'), true);
+
+    aMode = 'ok';
+    const res = await fb.getResponse(req());
+    assert.equal(aCalls, 3, 'the all-silenced chain still probed from the top');
+    assert.equal(bCalls, 2);
+    assert.ok(JSON.stringify(res).includes('a recovered'));
   } finally {
     reviveDeadBrains();
   }

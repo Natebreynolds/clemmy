@@ -12,6 +12,7 @@ import {
   filterToolsByPolicy,
   looksLikeToolError,
   parseToolArguments,
+  _testOnly_sanitizeAgentDecisionOutput,
 } from './autonomy-v2.js';
 import { DEFAULT_PROACTIVITY_POLICY, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 
@@ -46,6 +47,28 @@ test('AgentDecisionSchema strips unknown keys (e.g. legacy actions array)', () =
   if (r.success) {
     assert.equal('actions' in r.data, false, 'unknown actions key should be stripped');
   }
+});
+
+test('sanitizeAgentDecisionOutput accepts fenced schema-drifted JSON', () => {
+  const decision = _testOnly_sanitizeAgentDecisionOutput('```json\n' + JSON.stringify({
+    message: 'Checked the inbox, found no actionable requests, and left the queue unchanged.',
+    follow_ups: ['Check the inbox again on the next cadence.'],
+    next_wake_minutes: '45',
+    actions: [{ type: 'noop' }],
+  }) + '\n```');
+  assert.deepEqual(decision, {
+    summary: 'Checked the inbox, found no actionable requests, and left the queue unchanged.',
+    commitments: ['Check the inbox again on the next cadence.'],
+    followUpMinutes: 45,
+  });
+});
+
+test('sanitizeAgentDecisionOutput treats plain text as a usable summary', () => {
+  const decision = _testOnly_sanitizeAgentDecisionOutput('Reviewed the queued work and found nothing that needs action yet.');
+  assert.deepEqual(decision, {
+    summary: 'Reviewed the queued work and found nothing that needs action yet.',
+    commitments: [],
+  });
 });
 
 test('buildPolicyText reflects watch mode guidance', () => {

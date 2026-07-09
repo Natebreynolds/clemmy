@@ -42,6 +42,7 @@ function makeRunner(cfg: {
   finalOutputThrows?: unknown;
   history?: unknown[];
   interruptions?: unknown[];
+  events?: unknown[];
 }) {
   return {
     run: async () => ({
@@ -55,6 +56,9 @@ function makeRunner(cfg: {
       rawResponses: [],
       state: { toString: () => 'state' },
       completed: cfg.completed,
+      async *[Symbol.asyncIterator]() {
+        for (const event of cfg.events ?? []) yield event;
+      },
     }),
   };
 }
@@ -87,6 +91,19 @@ test('guard: parse error with no recoverable text → safe fallback string', asy
   const runner = makeRunner({ completed: Promise.reject(new SyntaxError('bad')), history: [] });
   const out = await callRunner(runner);
   assert.match(out.finalOutput as string, /couldn't be structured/);
+});
+
+test('guard: parse error with empty history recovers active streamed text', async () => {
+  const runner = makeRunner({
+    completed: Promise.reject(new SyntaxError('bad')),
+    history: [],
+    events: [
+      { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: 'Built the report ' } },
+      { type: 'raw_model_stream_event', data: { type: 'output_text_delta', delta: 'and saved it to disk.' } },
+    ],
+  });
+  const out = await callRunner(runner);
+  assert.equal(out.finalOutput, 'Built the report and saved it to disk.');
 });
 
 test('guard: parse recovery does not reuse stale assistant text from prior turns', async () => {

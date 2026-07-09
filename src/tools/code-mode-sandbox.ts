@@ -109,6 +109,43 @@ function maxConsecutiveRpcFailures(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_CONSECUTIVE_RPC_FAILURES;
 }
 
+function toolResultFailureReason(value: unknown): string | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (record.ok === false) {
+      const err = typeof record.error === 'string'
+        ? record.error
+        : typeof record.stderr === 'string' && record.stderr.trim()
+          ? record.stderr
+          : JSON.stringify(record);
+      return err.slice(0, 300);
+    }
+    if (typeof record.exit_code === 'number' && record.exit_code !== 0) {
+      const stderr = typeof record.stderr === 'string' && record.stderr.trim() ? ` stderr: ${record.stderr.trim()}` : '';
+      return `exit_code ${record.exit_code}${stderr}`.slice(0, 300);
+    }
+    return null;
+  }
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  if (
+    /^exit_code:\s*[1-9]\d*/i.test(text) ||
+    /^(Directory|File) does not exist:/i.test(text) ||
+    /^Not a file:/i.test(text) ||
+    /^No path provided\b/i.test(text) ||
+    /^Tool call (?:refused|blocked) by harness\b/i.test(text) ||
+    /^An error occurred while running the tool\b/i.test(text) ||
+    /^\s*(?:ERROR|Error|InvalidToolInputError)\b/i.test(text) ||
+    /^MCP error\b/i.test(text) ||
+    /^⚠️|^FAILED \(slug=/i.test(text) ||
+    /^NOT CONNECTED\b/i.test(text)
+  ) {
+    return text.slice(0, 300);
+  }
+  return null;
+}
+
 // The blocked module set — shared by both blocker mechanisms below.
 const BLOCKED_RE = `/^(node:)?(fs|fs\\/promises|child_process|net|http|https|http2|dns|dns\\/promises|tls|dgram|cluster|worker_threads|module|vm|inspector|repl|v8|wasi|perf_hooks|trace_events|diagnostics_channel|os|readline|tty)$/`;
 
@@ -332,9 +369,25 @@ export async function runCodeModeProgram(
             .then((res) => {
               releaseSlot();
               touchActivity();
-              consecutiveRpcFailures = 0;
-              rpcCompleted += 1;
-              recordPartial(method, true, res);
+              const softFailure = toolResultFailureReason(res);
+              if (softFailure) {
+                consecutiveRpcFailures += 1;
+                rpcFailed += 1;
+                recordPartial(method, false, softFailure);
+                if (consecutiveRpcFailures >= failBreaker) {
+                  try { child.stdin.write(JSON.stringify({ id, error: softFailure }) + '\n'); } catch { /* ignore */ }
+                  finish({
+                    ok: false,
+                    error: `code-mode program aborted: ${consecutiveRpcFailures} consecutive tool calls returned tool-error results (last: ${method} → ${softFailure.slice(0, 300)}). The program is likely iterating bad input or ignoring a tool error — fix the program and re-run.`,
+                    rpcCalls, logs, partial: partialOnFailure(),
+                  });
+                  return;
+                }
+              } else {
+                consecutiveRpcFailures = 0;
+                rpcCompleted += 1;
+                recordPartial(method, true, res);
+              }
               try { child.stdin.write(JSON.stringify({ id, result: res ?? null }) + '\n'); } catch { /* child gone */ }
             })
             .catch((e: unknown) => {

@@ -6,10 +6,10 @@ import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import type { RuntimeContextValue } from '../types.js';
 import { wrapToolForHarness, type WrappableTool } from '../runtime/harness/brackets.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { harnessInstructions } from './harness-context.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { getRuntimeEnv } from '../config.js';
+import { externalMcpScopeForAllowedToolLock } from './external-mcp-scope-lock.js';
 
 /** DEFAULT ON. Inject the "Remembered Tool Choices" recall into an UNBOUND workflow
  *  step so it uses the proven tool for its intent — the same learned recall chat
@@ -17,8 +17,8 @@ import { getRuntimeEnv } from '../config.js';
 function workflowStepRecallEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKFLOW_STEP_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
 }
+
 import { harnessInputGuardrails, harnessOutputGuardrails } from '../runtime/harness/guardrails.js';
-import { OrchestratorDecisionSchema } from './orchestrator.js';
 
 /**
  * Workflow-step agent — a CONSTRAINED unit of work, not a full
@@ -37,9 +37,10 @@ import { OrchestratorDecisionSchema } from './orchestrator.js';
  *     data (the explicit output channel), which the runner captures as
  *     stepOutputs[stepId].
  *
- * It keeps the OrchestratorDecisionSchema outputType + harness guardrails
- * so the existing runConversation / resume / approval-pause machinery in
- * runStepViaHarness works unchanged.
+ * It deliberately does NOT require an SDK `outputType` by default. The
+ * workflow's real structured channel is workflow_step_result(data); requiring a
+ * second JSON decision envelope made step runs fail on harmless final prose
+ * ("Invalid output type") before the runner could consume the captured result.
  */
 
 // BLOCKLIST, not a whitelist. A step gets the SAME open-ended work-tool
@@ -114,20 +115,25 @@ export function filterToolsForStep<T extends { name?: string }>(tools: T[]): T[]
 // channel so a step can never be starved of its ability to return.
 //
 // Note (scope): this prunes the CORE tool list (which carries the composio
-// gateway — the proven drift vector). MCP servers are attached separately and
-// are NOT scoped here, so an mcp-bound step keeps its MCP tools; tighter MCP
-// scoping is a follow-up. A step with no/`*` allowedTools is unchanged.
+// gateway — the proven drift vector). External MCP attachment is derived from
+// the same lock below: local/structural locks attach no external MCP servers,
+// and MCP-looking locks attach only the named server family. A step with no/`*`
+// allowedTools is unchanged.
 
 /** Structural channels a step always needs, regardless of its bound work family
  *  — NEVER pruned away. Beyond the output channel (without which a step can't
  *  return at all), this keeps the REPORT channel (notify_user — a triage/brief
  *  step's job is to report) and the RECALL channel (recall_tool_result /
  *  tool_output_query — to read back a large tool output the harness clipped to
- *  the side-store). These are structural, not "work" tools, so keeping them
+ *  the side-store) plus read_file/workspace_artifact_query for workflow
+ *  workspace context artifacts.
+ *  These are structural, not "work" tools, so keeping them
  *  doesn't reopen the composio drift vector the lock exists to close. */
 export const STEP_STRUCTURAL_BASELINE_TOOLS = new Set<string>([
   'workflow_step_result',
   'notify_user',
+  'read_file',
+  'workspace_artifact_query',
   'recall_tool_result',
   'tool_output_query',
 ]);
@@ -165,6 +171,27 @@ export function lockToolsForStep<T extends { name?: string }>(tools: T[], allowe
   return tools.filter((t) => allow(typeof t?.name === 'string' ? t.name : ''));
 }
 
+/**
+ * Translate a locked step's explicit allowedTools into its external MCP surface.
+ *
+ * Return values are intentional:
+ *   undefined => preserve the caller's legacy/default MCP scope
+ *   null      => attach no external MCP servers
+ *   scope     => attach only the matched server family
+ */
+export function workflowStepExternalMcpScopeForLock(
+  allowed?: string[] | null,
+  fallback?: McpToolScope,
+  serverNames?: string[],
+): McpToolScope | null | undefined {
+  return externalMcpScopeForAllowedToolLock({
+    allowed,
+    fallback,
+    serverNames,
+    reason: 'workflow step allowedTools lock',
+  });
+}
+
 const STEP_INSTRUCTIONS = [
   'You are executing ONE step of a workflow — a deterministic pipeline, not a chat.',
   'Do exactly the work the step prompt describes, using the smallest set of tool calls. Do not branch into other tasks, do not re-plan, do not ask the user questions.',
@@ -190,7 +217,7 @@ export interface BuildWorkflowStepAgentOptions {
 
 export async function buildWorkflowStepAgent(
   options: BuildWorkflowStepAgentOptions = {},
-): Promise<Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>> {
+): Promise<Agent<RuntimeContextValue, any>> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const tools = lockToolsForStep(
     filterToolsForStep(all),
@@ -208,7 +235,9 @@ export async function buildWorkflowStepAgent(
   const instructions = learnedRecall
     ? () => `${baseInstructions()}\n\n${learnedRecall}`
     : baseInstructions;
-  return new Agent<RuntimeContextValue, typeof OrchestratorDecisionSchema>({
+  const externalMcpScope = workflowStepExternalMcpScopeForLock(options.lockTools, options.mcpToolScope);
+  const externalMcpServers = externalMcpScope === null ? [] : [getOrCreateExternalMcpServers(externalMcpScope)];
+  return new Agent<RuntimeContextValue, any>({
     name: 'WorkflowStep',
     instructions,
     // Step orchestration (OrchestratorDecisionSchema, multi-tool) stays on the
@@ -216,9 +245,11 @@ export async function buildWorkflowStepAgent(
     // (see workflow-runner runStepViaHarness). The RouterModelProvider dispatches
     // the id to its provider.
     model: options.model ?? MODELS.primary,
-    outputType: normalizeZodForCodexStrict(OrchestratorDecisionSchema) as typeof OrchestratorDecisionSchema,
+    // No SDK structured outputType: workflow_step_result(data) is the one
+    // structured channel. A second response_format envelope only gives the
+    // model another way to fail after doing useful work.
     tools: tools.map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
-    mcpServers: [getOrCreateExternalMcpServers(options.mcpToolScope)],
+    ...(externalMcpServers.length > 0 ? { mcpServers: externalMcpServers } : {}),
     inputGuardrails: harnessInputGuardrails,
     outputGuardrails: harnessOutputGuardrails,
   });

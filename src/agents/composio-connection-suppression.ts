@@ -1,12 +1,16 @@
-const DEFAULT_SUPPRESSION_MS = 12 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+const EXPIRED_BACKOFF_MS = [DAY_MS, 3 * DAY_MS, 7 * DAY_MS, 30 * DAY_MS] as const;
+const ENTITY_MISMATCH_BACKOFF_MS = [7 * DAY_MS, 14 * DAY_MS, 30 * DAY_MS] as const;
 
 export type ComposioConnectionSuppressionReason = 'expired' | 'entity-mismatch';
 
 export interface ComposioConnectionSuppression {
-  reason: ComposioConnectionSuppressionReason;
+  reason?: string;
   suppressUntil: string;
-  lastErrorAt: string;
-  failures: number;
+  lastErrorAt?: string;
+  failures?: number;
 }
 
 export interface ComposioConnectionSuppressionState {
@@ -50,20 +54,47 @@ export function suppressConnectionAfterHardAuthFailure(
   connectionId: string,
   err: unknown,
   nowMs: number,
-  suppressionMs = DEFAULT_SUPPRESSION_MS,
+  suppressionMs?: number,
 ): ComposioConnectionSuppression | undefined {
   const reason = classifyHardAuthFailure(err);
   if (!reason) return undefined;
 
   const previous = state.suppressedConnections?.[connectionId];
+  const failures = (previous?.failures ?? 0) + 1;
+  const durationMs = suppressionMs ?? hardAuthSuppressionDurationMs(reason, failures);
   const rec: ComposioConnectionSuppression = {
     reason,
-    suppressUntil: new Date(nowMs + suppressionMs).toISOString(),
+    suppressUntil: new Date(nowMs + durationMs).toISOString(),
     lastErrorAt: new Date(nowMs).toISOString(),
-    failures: (previous?.failures ?? 0) + 1,
+    failures,
   };
   state.suppressedConnections = { ...(state.suppressedConnections ?? {}), [connectionId]: rec };
   return rec;
+}
+
+export function hardAuthSuppressionDurationMs(
+  reason: ComposioConnectionSuppressionReason,
+  failures: number,
+): number {
+  const schedule = reason === 'entity-mismatch' ? ENTITY_MISMATCH_BACKOFF_MS : EXPIRED_BACKOFF_MS;
+  const index = Math.max(0, Math.min(schedule.length - 1, Math.floor(failures) - 1));
+  return schedule[index];
+}
+
+export function mergeConnectionSuppressions(
+  target: ComposioConnectionSuppressionState,
+  source: ComposioConnectionSuppressionState,
+  nowMs: number,
+): void {
+  for (const [connectionId, rec] of Object.entries(source.suppressedConnections ?? {})) {
+    const until = Date.parse(rec.suppressUntil);
+    if (!Number.isFinite(until) || until <= nowMs) continue;
+    const existing = target.suppressedConnections?.[connectionId];
+    const existingUntil = existing ? Date.parse(existing.suppressUntil) : NaN;
+    if (!existing || !Number.isFinite(existingUntil) || until > existingUntil) {
+      target.suppressedConnections = { ...(target.suppressedConnections ?? {}), [connectionId]: rec };
+    }
+  }
 }
 
 function classifyHardAuthFailure(err: unknown): ComposioConnectionSuppressionReason | undefined {

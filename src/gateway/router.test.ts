@@ -14,6 +14,7 @@ import path from 'node:path';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-gateway-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 
 const { ClementineGateway } = await import('./router.js');
 const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
@@ -28,11 +29,13 @@ const {
 afterEach(() => {
   resetEventLog();
   process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 });
 
 test.after(() => {
   resetEventLog();
   delete process.env.CLEMMY_HARNESS_WEBHOOK;
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
@@ -252,6 +255,28 @@ test('gateway auto-promotes broad multi-system data pipelines to background', as
   assert.equal(task!.source, 'mobile');
   assert.match(task!.prompt, /Salesforce/);
   assert.match(task!.prompt, /Airtable CRM/);
+});
+
+test('gateway keeps simple replies with negated background instructions in foreground', async () => {
+  const session = createSession({ kind: 'chat', channel: 'webhook', title: 'Smoke test' });
+  let respondCalled = false;
+  const gateway = new ClementineGateway({
+    respond: async (req: { sessionId: string }) => {
+      respondCalled = true;
+      return { text: 'HOTPATCH_SMOKE_OK', sessionId: req.sessionId };
+    },
+  } as never);
+
+  const response = await gateway.handleMessage({
+    message: 'Reply exactly HOTPATCH_SMOKE_OK. Do not call tools, send messages, modify files, or start background tasks.',
+    sessionId: session.id,
+    channel: 'webhook',
+    source: 'webhook',
+  });
+
+  assert.equal(respondCalled, true, 'foreground chat run should handle the simple reply');
+  assert.equal(response.queuedTaskId, undefined, 'negated background wording must not queue a durable task');
+  assert.equal(response.text, 'HOTPATCH_SMOKE_OK');
 });
 
 test('gateway explicit "move this to the background" with task skips foreground execution', async () => {

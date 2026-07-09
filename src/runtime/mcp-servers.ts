@@ -1,18 +1,26 @@
 import path from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer } from '@openai/agents';
-import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR } from '../config.js';
+import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR, getRuntimeEnv } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
 import { mergedSpawnEnv } from './spawn-env.js';
-import { createMcpNamespaceShim } from './mcp-namespace-shim.js';
+import { createMcpNamespaceShim, slugifyServerName } from './mcp-namespace-shim.js';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
 import { rankToolsBySemantic, semanticToolRankEnabled } from './mcp-tool-rank.js';
 import { isEmbeddingsEnabled } from '../memory/embeddings.js';
+import { listToolChoices, type ToolChoiceRecord, type ToolChoiceRecordChoice } from '../memory/tool-choice-store.js';
 import type { McpToolScope } from './mcp-tool-scope.js';
 import type { ManagedMcpServer } from '../types.js';
 
 function positiveIntEnv(key: string, fallback: number): number {
   const raw = process.env[key];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function positiveIntRuntimeEnv(key: string, fallback: number): number {
+  const raw = getRuntimeEnv(key, '');
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -29,6 +37,63 @@ const MCP_REQUEST_TIMEOUT_MS = positiveIntEnv('MCP_REQUEST_TIMEOUT_MS', 10 * 60 
 // shell-exec and CLI-discovery seams so a packaged .app resolves binaries
 // identically everywhere. See src/runtime/spawn-env.ts.
 const mergedEnv = mergedSpawnEnv;
+
+function runtimeFlagEnabled(key: string, fallback: boolean): boolean {
+  const raw = getRuntimeEnv(key, fallback ? 'on' : 'off');
+  if (!raw) return fallback;
+  return !/^(0|false|off|no)$/i.test(raw.trim());
+}
+
+function isNpxCommand(command: string): boolean {
+  const base = command.trim().replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
+  return base === 'npx' || base === 'npx.cmd' || base === 'npx.ps1';
+}
+
+function explicitServerEnvValue(server: ManagedMcpServer, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = server.env?.[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function mcpNpxCacheDir(serverName: string): string {
+  return path.join(BASE_DIR, 'state', 'mcp-npx-cache', slugifyServerName(serverName));
+}
+
+function applyNpmConfigPair(
+  env: Record<string, string>,
+  server: ManagedMcpServer,
+  lowerKey: string,
+  upperKey: string,
+  fallback: string,
+): void {
+  const explicit = explicitServerEnvValue(server, [lowerKey, upperKey]);
+  const value = explicit ?? fallback;
+  env[lowerKey] = value;
+  env[upperKey] = value;
+}
+
+function stdioLaunchEnv(server: ManagedMcpServer): Record<string, string> {
+  const env = mergedEnv(server.env);
+  if (!server.command || !isNpxCommand(server.command)) return env;
+  if (!runtimeFlagEnabled('CLEMMY_MCP_NPX_ISOLATED_CACHE', true)) return env;
+
+  const cacheDir = explicitServerEnvValue(server, ['npm_config_cache', 'NPM_CONFIG_CACHE'])
+    ?? mcpNpxCacheDir(server.name);
+  try {
+    mkdirSync(cacheDir, { recursive: true });
+  } catch {
+    // npm will report the real launch failure if the cache path is unusable.
+  }
+
+  applyNpmConfigPair(env, server, 'npm_config_cache', 'NPM_CONFIG_CACHE', cacheDir);
+  applyNpmConfigPair(env, server, 'npm_config_update_notifier', 'NPM_CONFIG_UPDATE_NOTIFIER', 'false');
+  applyNpmConfigPair(env, server, 'npm_config_audit', 'NPM_CONFIG_AUDIT', 'false');
+  applyNpmConfigPair(env, server, 'npm_config_fund', 'NPM_CONFIG_FUND', 'false');
+  applyNpmConfigPair(env, server, 'npm_config_yes', 'NPM_CONFIG_YES', 'true');
+  return env;
+}
 
 function localNodeCommand(): string {
   // In packaged Electron, the daemon itself is already running under
@@ -81,7 +146,7 @@ function createExternalServer(server: ManagedMcpServer): MCPServer | null {
       args: server.args ?? [],
       clientSessionTimeoutSeconds: MCP_CLIENT_SESSION_TIMEOUT_SECONDS,
       timeout: MCP_REQUEST_TIMEOUT_MS,
-      env: mergedEnv(server.env),
+      env: stdioLaunchEnv(server),
       cwd: BASE_DIR,
     });
   }
@@ -179,8 +244,10 @@ export function createConfiguredMcpServers(): MCPServer {
  */
 let cachedShim: MCPServer | null = null;
 let cachedExternalShim: MCPServer | null = null;
-// (Scoped shims no longer own a separate base — they wrap the shared all-external
-//  base shim, so there are no per-scope base children to track or close.)
+// Named scopes get a base keyed by the resolved server set, then cheap filtered
+// views keyed by the full scope (tool patterns, caps, ranking hints). This keeps
+// deterministic scopes from cold-starting unrelated external servers.
+let cachedScopedExternalBaseShims: Map<string, MCPServer> = new Map();
 let cachedScopedExternalShims: Map<string, MCPServer> = new Map();
 // Fail-open shim is a cheap cap-only view over cachedExternalShim (the all-
 // external base), so it owns no child processes — clearing the base is enough.
@@ -276,6 +343,146 @@ function ensureAllExternalBaseShim(): MCPServer {
   return cachedExternalShim;
 }
 
+function parseServerSlugCsv(raw: string | undefined | null): string[] {
+  return [...new Set((raw ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean))];
+}
+
+function enabledExternalServers(): ManagedMcpServer[] {
+  return discoverMcpServers().filter((server) => server.enabled);
+}
+
+function resolveConfiguredExternalServerSlugs(allowedServerSlugs: string[]): string[] {
+  if (allowedServerSlugs.length === 0) return [];
+  const out = new Set<string>();
+  for (const server of enabledExternalServers()) {
+    if (serverMatchesAllowedSlugs(server, allowedServerSlugs)) {
+      out.add(slugifyServerName(server.name));
+    }
+  }
+  return [...out].sort();
+}
+
+function externalServerSetCacheKey(allowedServerSlugs?: string[]): string {
+  const matched = resolveConfiguredExternalServerSlugs(allowedServerSlugs ?? []);
+  return matched.join('|') || 'empty';
+}
+
+function ensureScopedExternalBaseShim(scope: Pick<McpToolScope, 'allowedServerSlugs'>): MCPServer {
+  const key = externalServerSetCacheKey(scope.allowedServerSlugs);
+  const cached = cachedScopedExternalBaseShims.get(key);
+  if (cached) return cached;
+
+  const base = createMcpNamespaceShim({
+    servers: buildRawMcpServers({
+      excludeLocal: true,
+      allowedServerSlugs: scope.allowedServerSlugs,
+    }),
+  });
+  cachedScopedExternalBaseShims.set(key, base);
+  return base;
+}
+
+function mcpServerSlugFromChoiceIdentifier(identifier: string): string | null {
+  const trimmed = identifier.trim();
+  if (!trimmed) return null;
+  const withoutMcpPrefix = trimmed.toLowerCase().startsWith('mcp__')
+    ? trimmed.slice('mcp__'.length)
+    : trimmed;
+  const idx = withoutMcpPrefix.indexOf('__');
+  if (idx <= 0 || idx === withoutMcpPrefix.length - 2) return null;
+  const slug = withoutMcpPrefix.slice(0, idx).trim();
+  if (!slug || /^clementine[-_]?local$/i.test(slug)) return null;
+  return slug;
+}
+
+function choiceHasRecoveredAfterFailure(choice: ToolChoiceRecordChoice): boolean {
+  if (!choice.lastFailureAt) return true;
+  const lastGood = choice.lastSuccessAt ?? choice.testedAt;
+  const positives = (choice.successCount ?? 0) + (choice.approvalCount ?? 0);
+  const negatives = (choice.failureCount ?? 0) + (choice.rejectionCount ?? 0);
+  return lastGood > choice.lastFailureAt || positives > negatives;
+}
+
+function choicePrewarmScore(choice: ToolChoiceRecordChoice): number {
+  const positives = (choice.successCount ?? 0) + (choice.approvalCount ?? 0);
+  const negatives = (choice.failureCount ?? 0) + (choice.rejectionCount ?? 0);
+  return positives * 10 - negatives * 6;
+}
+
+export function selectMcpPrewarmServerSlugs(
+  opts: { choices?: ToolChoiceRecord[]; limit?: number } = {},
+): string[] {
+  const limit = Math.max(0, opts.limit ?? positiveIntRuntimeEnv('CLEMMY_MCP_PREWARM_LIMIT', 3));
+  if (limit === 0) return [];
+
+  const choices = opts.choices ?? listToolChoices();
+  const bySlug = new Map<string, { score: number; at: string }>();
+  for (const record of choices) {
+    const choice = record.choice;
+    if (!choice || choice.kind !== 'mcp') continue;
+    const rawSlug = mcpServerSlugFromChoiceIdentifier(choice.identifier);
+    if (!rawSlug) continue;
+    if (!choiceHasRecoveredAfterFailure(choice)) continue;
+    const [resolved] = resolveConfiguredExternalServerSlugs([rawSlug]);
+    if (!resolved) continue;
+    const candidate = {
+      score: choicePrewarmScore(choice),
+      at: choice.lastSuccessAt ?? choice.testedAt,
+    };
+    const prev = bySlug.get(resolved);
+    if (!prev || candidate.score > prev.score || (candidate.score === prev.score && candidate.at > prev.at)) {
+      bySlug.set(resolved, candidate);
+    }
+  }
+
+  const learned = [...bySlug.entries()]
+    .sort((a, b) => (b[1].score - a[1].score) || b[1].at.localeCompare(a[1].at))
+    .map(([slug]) => slug)
+    .slice(0, limit);
+  if (learned.length > 0) return learned;
+
+  // If the user has exactly one external MCP server configured, warming it is
+  // still scoped. The pathological case is only the multi-server all-warm.
+  const configured = enabledExternalServers();
+  if (configured.length === 1) return [slugifyServerName(configured[0].name)].slice(0, limit);
+  return [];
+}
+
+export interface McpPrewarmSelection {
+  mode: 'off' | 'all' | 'scoped' | 'none';
+  allowedServerSlugs?: string[];
+  reason: string;
+}
+
+export function resolveMcpPrewarmSelection(
+  opts: { mode?: string | null; servers?: string | null; choices?: ToolChoiceRecord[]; limit?: number } = {},
+): McpPrewarmSelection {
+  const mode = (opts.mode ?? getRuntimeEnv('CLEMMY_MCP_PREWARM', 'scoped') ?? 'scoped').trim().toLowerCase();
+  if (['off', '0', 'false', 'no'].includes(mode)) {
+    return { mode: 'off', reason: 'CLEMMY_MCP_PREWARM=off' };
+  }
+
+  const explicitRaw = opts.servers ?? getRuntimeEnv('CLEMMY_MCP_PREWARM_SERVERS', '');
+  const explicit = parseServerSlugCsv(explicitRaw);
+  if (['all', 'all-external', 'legacy'].includes(mode) || explicit.some((server) => server === '*')) {
+    return { mode: 'all', reason: explicit.includes('*') ? 'CLEMMY_MCP_PREWARM_SERVERS=*' : `CLEMMY_MCP_PREWARM=${mode}` };
+  }
+  if (explicit.length > 0) {
+    const resolved = resolveConfiguredExternalServerSlugs(explicit);
+    return resolved.length > 0
+      ? { mode: 'scoped', allowedServerSlugs: resolved, reason: 'explicit CLEMMY_MCP_PREWARM_SERVERS' }
+      : { mode: 'none', allowedServerSlugs: [], reason: 'explicit CLEMMY_MCP_PREWARM_SERVERS matched no configured server' };
+  }
+
+  const selected = selectMcpPrewarmServerSlugs({ choices: opts.choices, limit: opts.limit });
+  return selected.length > 0
+    ? { mode: 'scoped', allowedServerSlugs: selected, reason: 'remembered/single-server scoped prewarm' }
+    : { mode: 'none', allowedServerSlugs: [], reason: 'no remembered MCP server and multiple/no configured servers' };
+}
+
 /**
  * Fail-open per class: an unrecognized-intent turn exposes the user's OWN
  * connected external servers (all of them), bounded by scope.maxTools, instead
@@ -320,14 +527,10 @@ export function getOrCreateExternalMcpServers(scope?: McpToolScope): MCPServer {
   const cached = cachedScopedExternalShims.get(key);
   if (cached) return cached;
 
-  // Reuse the ONE daemon-lifetime all-external base (the same child processes the
-  // prewarm and every other scope share) and narrow it with the scope filter —
-  // `toolMatchesScope` drops any tool whose server isn't in allowedServerSlugs, so
-  // the model sees an identical surface. Previously this branch spawned a SEPARATE
-  // base child per distinct scope key (a fresh DataForSEO/etc. process for every
-  // new intent), which is why one server cold-booted several times per turn and
-  // leaked children across a session. This mirrors getOrCreateFailOpenExternalShim.
-  const base = ensureAllExternalBaseShim();
+  // Build/reuse a daemon-lifetime base for ONLY the named server set, then
+  // narrow tools with the scope filter. This keeps a DataForSEO-only scope from
+  // constructing the all-external base and cold-starting unrelated MCP servers.
+  const base = ensureScopedExternalBaseShim(scope);
   const scoped = createScopedExternalShim(base, scope);
   cachedScopedExternalShims.set(key, scoped);
   return scoped;
@@ -363,22 +566,34 @@ export async function prewarmWithRetry(
 }
 
 /**
- * Warm the daemon-lifetime external MCP base shim at startup, OFF the hot path.
- * Connecting while the boot loop is idle avoids the synchronous-better-sqlite3
- * event-loop starvation that times out a COLD connect mid-turn and degrades the
- * server (sess-mqg8wdw1: dataforseo "connecting" stalled a Salesforce-CLI turn
- * that never needed it). Connections persist, so every later turn — and every
- * cheap scoped/fail-open VIEW that delegates to this base — reuses them without
- * a per-turn handshake. Best-effort + retried; a still-dead server just stays a
- * stub and the per-turn skip-path (MCP_ATTACH_CONNECTED_ONLY) keeps it from ever
- * blocking a turn. Kill-switch (CLEMMY_MCP_PREWARM) is checked by the caller.
+ * Warm external MCP servers at startup, OFF the hot path. Callers can pass a
+ * scoped server set so boot does not cold-start every configured integration.
+ * Best-effort + retried; a still-dead server just stays a stub and the per-turn
+ * skip-path (MCP_ATTACH_CONNECTED_ONLY) keeps it from blocking a turn.
  */
 export async function prewarmMcpServers(
-  opts: { attempts?: number; gapMs?: number } = {},
-): Promise<{ attempts: number; allConnected: boolean }> {
-  const base = ensureAllExternalBaseShim() as { prewarm?: () => Promise<boolean> };
-  if (typeof base.prewarm !== 'function') return { attempts: 0, allConnected: true };
-  return prewarmWithRetry(() => base.prewarm!(), opts);
+  opts: { attempts?: number; gapMs?: number; allowedServerSlugs?: string[] } = {},
+): Promise<{ attempts: number; allConnected: boolean; target: 'all' | 'scoped' | 'none'; serverSlugs: string[] }> {
+  const scoped = Array.isArray(opts.allowedServerSlugs);
+  const serverSlugs = scoped
+    ? resolveConfiguredExternalServerSlugs(opts.allowedServerSlugs ?? [])
+    : enabledExternalServers().map((server) => slugifyServerName(server.name)).sort();
+  if (scoped && serverSlugs.length === 0) {
+    return { attempts: 0, allConnected: true, target: 'none', serverSlugs: [] };
+  }
+
+  const base = (scoped
+    ? ensureScopedExternalBaseShim({ allowedServerSlugs: serverSlugs })
+    : ensureAllExternalBaseShim()) as { prewarm?: () => Promise<boolean> };
+  if (typeof base.prewarm !== 'function') {
+    return { attempts: 0, allConnected: true, target: scoped ? 'scoped' : 'all', serverSlugs };
+  }
+  const result = await prewarmWithRetry(() => base.prewarm!(), opts);
+  return {
+    ...result,
+    target: scoped ? 'scoped' : 'all',
+    serverSlugs,
+  };
 }
 
 /**
@@ -395,9 +610,11 @@ export async function invalidateConfiguredMcpServers(): Promise<void> {
   const targets = [
     cachedShim,
     cachedExternalShim,
+    ...cachedScopedExternalBaseShims.values(),
   ].filter((s): s is MCPServer => s !== null);
   cachedShim = null;
   cachedExternalShim = null;
+  cachedScopedExternalBaseShims = new Map();
   cachedFailOpenExternalShim = null;
   cachedFailOpenKey = '';
   cachedScopedExternalShims = new Map();
@@ -414,3 +631,46 @@ export async function invalidateConfiguredMcpServers(): Promise<void> {
 export function listRawMcpServers(): MCPServer[] {
   return buildRawMcpServers();
 }
+
+export const mcpServersTestHooks = {
+  cacheState(): {
+    allExternalBaseCreated: boolean;
+    scopedExternalBaseKeys: string[];
+    scopedExternalViewKeys: string[];
+    failOpenCreated: boolean;
+  } {
+    return {
+      allExternalBaseCreated: cachedExternalShim !== null,
+      scopedExternalBaseKeys: [...cachedScopedExternalBaseShims.keys()].sort(),
+      scopedExternalViewKeys: [...cachedScopedExternalShims.keys()].sort(),
+      failOpenCreated: cachedFailOpenExternalShim !== null,
+    };
+  },
+  rawExternalServerNames(allowedServerSlugs?: string[]): string[] {
+    return buildRawMcpServers({ excludeLocal: true, allowedServerSlugs }).map((server) => server.name);
+  },
+  rawExternalStdioLaunches(allowedServerSlugs?: string[]): Array<{
+    name: string;
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string>;
+  }> {
+    return discoverMcpServers()
+      .filter((server) => server.enabled && server.type === 'stdio' && !!server.command)
+      .filter((server) => serverMatchesAllowedSlugs(server, allowedServerSlugs))
+      .map((server) => ({
+        name: server.name,
+        command: server.command!,
+        args: server.args ?? [],
+        cwd: BASE_DIR,
+        env: stdioLaunchEnv(server),
+      }));
+  },
+  externalServerSetCacheKey(allowedServerSlugs?: string[]): string {
+    return externalServerSetCacheKey(allowedServerSlugs);
+  },
+  mcpServerSlugFromChoiceIdentifier(identifier: string): string | null {
+    return mcpServerSlugFromChoiceIdentifier(identifier);
+  },
+};

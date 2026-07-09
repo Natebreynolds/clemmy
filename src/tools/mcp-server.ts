@@ -21,6 +21,7 @@ import { registerBatchTools } from './batch-tools.js';
 import { registerExecutionTools } from './execution-tools.js';
 import { registerProfileTools } from './profile-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
+import { registerHarnessStatusTools } from './harness-status-tools.js';
 import { registerCliTools } from './cli-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerWorkflowScheduleTools } from './workflow-schedule-tools.js';
@@ -31,6 +32,7 @@ import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
 import { registerRecallTools } from './recall-tools.js';
+import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
 import { registerToolSearchTool } from './tool-search-tool.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
 import { codeModeEnabled, codeModeDescription, runCodeModeForSession } from './code-mode-tool.js';
@@ -146,6 +148,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerExecutionTools(server);
   registerProfileTools(server);
   registerCapabilityTools(server);
+  registerHarnessStatusTools(server);
   registerCliTools(server);
   registerSkillTools(server);
   registerWorkflowScheduleTools(server);
@@ -159,6 +162,8 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   // 25-row `sf data query`) the harness clipped — without them it hits the same
   // "tool not found" the @openai/agents lane was fixed for.
   registerRecallTools(server);
+  // Exact JSON slices from run-workspace artifacts/offloaded step context.
+  registerWorkspaceArtifactTools(server);
   // Schema-on-demand discovery entry — read-only search over the built-in tool
   // catalog (SCHEMA-ON-DEMAND-PLAN-2026-07-07). Additive + dormant in Phase 0.
   registerToolSearchTool(server);

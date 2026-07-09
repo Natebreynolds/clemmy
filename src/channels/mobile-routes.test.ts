@@ -468,7 +468,9 @@ test('chat/send returns 503 when no assistant is wired', async () => {
 
 test('chat/send includes model route diagnostics and preserves them on idempotent replay', async () => {
   const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   const assistant = {
     respond: async (req: { sessionId: string }) => ({
       text: 'Done. Route passthrough recorded.',
@@ -507,6 +509,8 @@ test('chat/send includes model route diagnostics and preserves them on idempoten
   } finally {
     if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
     else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacyFallback === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+    else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
     await h.close();
   }
 });

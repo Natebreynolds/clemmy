@@ -173,7 +173,7 @@ export function buildGroundingPrompt(payload: string, sources: GroundingSource[]
     '=== Source artifacts for this target (newest first, research before confirmations) ===',
     ...sources.map((s) => `--- ${s.callId} (${s.tool ?? 'unknown'}, ${s.createdAt}) ---\n${s.excerpt}`),
     '',
-    'Respond with the structured verdict.',
+    'Respond with exactly one verdict line.',
   ].join('\n');
 }
 
@@ -205,7 +205,7 @@ export function _setGroundingJudgeForTests(fn: GroundingJudgeFn | null): void { 
  *  (caller converts to fail-open). Dynamic imports keep brackets.ts free of
  *  an SDK dependency at module load. */
 async function runGroundingJudge(payload: string, sources: GroundingSource[]): Promise<GroundingVerdict> {
-  const [{ Agent, Runner }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
+  const [{ Agent, Runner }, { resolveBoundaryJudge, resolveBoundaryJudgeHedge }, { withJudgeHedge, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('./debate-model.js'),
     import('./judge-family.js'),
@@ -215,55 +215,68 @@ async function runGroundingJudge(payload: string, sources: GroundingSource[]): P
   // output flaked live on the safety path (schema validation rejecting VALID
   // verdicts → judge "unavailable"). One line, two markers, a regex: nothing
   // left to fail on presentation.
+  //
+  // HEDGED (judge-family.ts): a slow/dead primary is raced by a cheap judge
+  // from the other flagship family after the hedge delay — a real verdict at
+  // ~hedge-delay+seconds instead of a 25s advisory downgrade.
   const routing = resolveBoundaryJudge();
-  const agent = new Agent({
-    name: 'GroundingJudge',
-    instructions: [
-      'Verify an outgoing external-write payload against the session\'s own source artifacts.',
-      'Reply with EXACTLY ONE LINE and nothing else, one of:',
-      '"GROUNDED: <one short sentence why the payload is consistent>" — use this unless there is a CONCRETE contradiction between the payload and the target\'s source artifacts (or between the sources themselves) on a load-bearing fact;',
-      '"UNGROUNDED: <the specific contradiction found>" — a load-bearing fact in the payload contradicts the sources.',
-    ].join(' '),
-    // Cross-family boundary judge (a Codex/GLM brain is not graded by its own
-    // family); falls open to the brain-family-safe cheap id (routing.modelId, never
-    // a repurposed BYO fast slot) when no different family is available.
-    model: routing.model ?? routing.modelId,
-    modelSettings: { reasoning: { effort: 'low' } },
-    tools: [],
-  });
-  const runner = new Runner({ workflowName: 'clementine-grounding-judge' });
+  const hedgeRouting = resolveBoundaryJudgeHedge(routing);
+  type Routing = typeof routing;
+  const mkAgent = (r: Routing) =>
+    new Agent({
+      name: 'GroundingJudge',
+      instructions: [
+        'Verify an outgoing external-write payload against the session\'s own source artifacts.',
+        'Reply with EXACTLY ONE LINE and nothing else, one of:',
+        '"GROUNDED: <one short sentence why the payload is consistent>" — use this unless there is a CONCRETE contradiction between the payload and the target\'s source artifacts (or between the sources themselves) on a load-bearing fact;',
+        '"UNGROUNDED: <the specific contradiction found>" — a load-bearing fact in the payload contradicts the sources.',
+      ].join(' '),
+      // Cross-family boundary judge (a Codex/GLM brain is not graded by its own
+      // family); falls open to the brain-family-safe cheap id (routing.modelId, never
+      // a repurposed BYO fast slot) when no different family is available.
+      model: r.model ?? r.modelId,
+      modelSettings: { reasoning: { effort: 'low' } },
+      tools: [],
+    });
   const startedAt = Date.now();
-  let recorded = false;
-  const record = (outcome: 'passed' | 'blocked' | 'timeout' | 'invalid' | 'error') => {
-    recorded = true;
+  const record = (outcome: 'passed' | 'blocked' | 'timeout' | 'invalid' | 'error', r: Routing = routing) => {
     recordJudgeMetric({
       lane: 'grounding',
       outcome,
       durationMs: Date.now() - startedAt,
-      modelId: routing.modelId,
-      judgeFamily: routing.judgeFamily,
-      brainFamily: routing.brainFamily,
-      selfJudge: routing.selfJudge,
+      modelId: r.modelId,
+      judgeFamily: r.judgeFamily,
+      brainFamily: r.brainFamily,
+      selfJudge: r.selfJudge,
     });
   };
-  try {
-    const result = await withJudgeTimeout(runner.run(agent, buildGroundingPrompt(payload, sources), { maxTurns: 1 }));
-    if (!result) {
-      record('timeout');
-      throw new Error('grounding judge timed out');
-    }
+  class InvalidVerdict extends Error {}
+  const prompt = buildGroundingPrompt(payload, sources);
+  const attempt = (r: Routing) => async (): Promise<GroundingVerdict> => {
+    const runner = new Runner({ workflowName: 'clementine-grounding-judge' });
+    const result = await runner.run(mkAgent(r), prompt, { maxTurns: 1 });
     const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
     const verdict = parseGroundingVerdict(raw);
-    if (!verdict) {
-      record('invalid');
-      throw new Error(`grounding judge returned no GROUNDED/UNGROUNDED verdict (got: ${raw.slice(0, 120)})`);
-    }
-    record(verdict.grounded ? 'passed' : 'blocked');
+    if (!verdict) throw new InvalidVerdict(`grounding judge returned no GROUNDED/UNGROUNDED verdict (got: ${raw.slice(0, 120)})`);
     return verdict;
-  } catch (err) {
-    if (!recorded) record('error');
-    throw err;
+  };
+  const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+  if (raced.value) {
+    const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
+    record(raced.value.grounded ? 'passed' : 'blocked', winner);
+    return raced.value;
   }
+  if (raced.errors.length === 0) {
+    record('timeout');
+    throw new Error('grounding judge timed out');
+  }
+  const invalid = raced.errors.find((e) => e instanceof InvalidVerdict);
+  if (invalid) {
+    record('invalid');
+    throw invalid;
+  }
+  record('error');
+  throw raced.errors[0] instanceof Error ? raced.errors[0] : new Error(String(raced.errors[0]));
 }
 
 // ─────────────────────────────────────────────────────────────────

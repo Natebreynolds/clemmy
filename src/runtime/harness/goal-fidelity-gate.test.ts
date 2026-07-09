@@ -30,6 +30,7 @@ const {
   personalizationRegion,
   detectBatchUniformity,
   buildGoalFidelityPrompt,
+  parseGoalFidelityVerdict,
   summarizeGoalFidelityState,
   evaluateGoalFidelity,
   GoalFidelityCheckFailedError,
@@ -165,6 +166,49 @@ test('buildGoalFidelityPrompt: includes goal, skill, evidence, payload, and the 
   assert.match(p, /BYTE-IDENTICAL/);
   assert.match(p, /FAIL OPEN/);
   assert.match(p, /DEFINING requirement/);
+  assert.match(p, /exactly one verdict line/);
+  assert.doesNotMatch(p, /structured verdict/);
+});
+
+test('parseGoalFidelityVerdict: marker verdicts are schema-free and clamped', () => {
+  const pass = parseGoalFidelityVerdict('FULFILLS: this send is aligned with the approved goal');
+  assert.equal(pass?.fulfills, true);
+  assert.match(pass?.gap ?? '', /aligned/);
+  assert.equal(pass?.blockKind, 'other');
+
+  const gap = parseGoalFidelityVerdict(`GAP - ${'x'.repeat(900)}`);
+  assert.equal(gap?.fulfills, false);
+  assert.equal(gap?.gap.length, 400);
+  assert.equal(gap?.blockKind, 'other');
+
+  const approval = parseGoalFidelityVerdict('GAP-APPROVAL: present the draft and ask good to send');
+  assert.equal(approval?.fulfills, false);
+  assert.equal(approval?.blockKind, 'present_for_approval');
+
+  assert.equal(parseGoalFidelityVerdict('FULFILLS')?.fulfills, true);
+});
+
+test('parseGoalFidelityVerdict: legacy structured object/JSON verdicts are accepted instead of becoming judge outages', () => {
+  const objectVerdict = parseGoalFidelityVerdict({
+    fulfills: false,
+    gap: 'the opening is identical across firms',
+    blockKind: 'present_for_approval',
+  });
+  assert.deepEqual(objectVerdict, {
+    fulfills: false,
+    gap: 'the opening is identical across firms',
+    blockKind: 'present_for_approval',
+  });
+
+  const jsonVerdict = parseGoalFidelityVerdict('```json\n{"fulfills":"true","gap":"scope matches the goal"}\n```');
+  assert.equal(jsonVerdict?.fulfills, true);
+  assert.equal(jsonVerdict?.gap, 'scope matches the goal');
+
+  const verdictField = parseGoalFidelityVerdict('{"verdict":"GAP-APPROVAL","reason":"draft-only skill must present before sending"}');
+  assert.equal(verdictField?.fulfills, false);
+  assert.equal(verdictField?.blockKind, 'present_for_approval');
+
+  assert.equal(parseGoalFidelityVerdict('I think this looks fine.'), null);
 });
 
 test('summarizeGoalFidelityState: no goal is visible and does not call the judge', () => {

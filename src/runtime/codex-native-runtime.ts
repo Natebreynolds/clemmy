@@ -526,6 +526,10 @@ export function sanitizeCodexInputIds(input: CodexInputMessage[]): CodexInputMes
       const { id: _drop, ...rest } = item as Record<string, unknown>;
       return rest as CodexInputMessage;
     }
+    if (it.type === 'function_call_output' && it.id !== undefined) {
+      const { id: _drop, ...rest } = item as Record<string, unknown>;
+      return rest as CodexInputMessage;
+    }
     return item;
   });
 }

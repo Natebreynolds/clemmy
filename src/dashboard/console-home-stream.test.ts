@@ -17,6 +17,7 @@ import express from 'express';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-console-home-stream-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_HARNESS_HOME = 'off';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
@@ -27,6 +28,7 @@ type StreamEvent = { type?: string; text?: string; error?: string; route?: { rou
 
 test.after(() => {
   delete process.env.CLEMMY_HARNESS_HOME;
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   resetEventLog();
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });

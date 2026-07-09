@@ -72,6 +72,20 @@ test('blocked-text in the final reply is blocked (no judge needed)', async () =>
   assert.equal(judge.calls(), 0);
 });
 
+test('self-reported missing tool surface is blocked (no judge needed)', async () => {
+  const judge = judgeStub(true);
+  const text =
+    'This run is executing inside a text-only Claude Code print-mode subprocess. Shell execution is not exposed here, so I cannot create the requested files.';
+  const v = await verifyDelivered('create the requested files', text, {
+    stoppedReason: 'success',
+    judgeFn: judge.fn,
+  });
+  assert.equal(v.delivered, false);
+  assert.equal(v.status, 'blocked');
+  assert.equal(v.blockerType, 'permission');
+  assert.equal(judge.calls(), 0);
+});
+
 test('a self-declared non-delivery is blocked even when the run stopped cleanly', async () => {
   const judge = judgeStub(true);
   const v = await verifyDelivered(
@@ -150,6 +164,7 @@ test('matchesBlockedText: true on blocked shapes, false on a clean result', () =
   assert.equal(matchesBlockedText('waiting on your confirmation'), true);
   assert.equal(matchesBlockedText("I'm stopping this run without a number."), true);
   assert.equal(matchesBlockedText('Nothing that satisfies the success criterion; no verified integer produced.'), true);
+  assert.equal(matchesBlockedText('This environment has no tool access, so I cannot fetch search volumes.'), true);
   assert.equal(matchesBlockedText('Added 5 rows to the sheet.'), false);
   assert.equal(matchesBlockedText(''), false);
   assert.equal(matchesBlockedText(undefined), false);
@@ -168,6 +183,7 @@ test('classifyBlocker: tags the blocker text by KIND (ordered, most-specific-fir
   assert.equal(classifyBlocker('Approval required to send the emails.'), 'needs_approval');
   assert.equal(classifyBlocker('Permission denied on the CRM.'), 'permission');
   assert.equal(classifyBlocker('Missing credentials for Salesforce.'), 'permission');
+  assert.equal(classifyBlocker('This environment has no tool access, so I cannot fetch search volumes.'), 'permission');
   assert.equal(classifyBlocker('The service is unavailable (503).'), 'external_down');
   assert.equal(classifyBlocker('connection reset by peer'), 'external_down');
   assert.equal(classifyBlocker('I hit the run budget before finishing.'), 'budget');

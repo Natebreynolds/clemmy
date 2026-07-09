@@ -1,5 +1,6 @@
 import type { RunStoppedReason } from '../../types.js';
 import { isPromiseShapedReply, judgeObjectiveComplete, type ObjectiveJudgeFn } from './objective-judge.js';
+import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 
 /**
  * Report-back honesty chokepoint shared by the async lanes that otherwise
@@ -62,6 +63,7 @@ export const BLOCKED_TEXT_PATTERNS: RegExp[] = [
 export function matchesBlockedText(text: string | null | undefined): boolean {
   const t = (text ?? '').trim();
   if (!t) return false;
+  if (looksLikeToolUnavailableSelfReport(t)) return true;
   return BLOCKED_TEXT_PATTERNS.some((re) => re.test(t));
 }
 
@@ -117,6 +119,7 @@ export function classifyBlocker(
   if (stoppedReason === 'max-turns-with-grace') return 'budget';
   const t = (text ?? '').trim();
   if (t) {
+    if (looksLikeToolUnavailableSelfReport(t)) return 'permission';
     for (const [type, re] of BLOCKER_TYPE_PATTERNS) {
       if (re.test(t)) return type;
     }

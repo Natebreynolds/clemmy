@@ -2,6 +2,7 @@ import {
   validateComposioBatchOperation,
   validateComposioArgs,
   validateArgsAgainstSchema,
+  normalizeComposioBatchItemArgs,
   formatBatchValidationError,
 } from './composio-batch-validator.js';
 
@@ -129,6 +130,65 @@ import {
 }
 
 // ─── Schema-grounded validation ──────────────────────────────────────
+
+// Batch item repair: unwrap an accidental composio_execute_tool wrapper and
+// normalize Outlook's human-friendly "to" alias to the provider field.
+{
+  const normalized = normalizeComposioBatchItemArgs('OUTLOOK_OUTLOOK_SEND_EMAIL', {
+    tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
+    arguments: JSON.stringify({ to: 'nate@example.com', subject: 'Hi', body: 'Body' }),
+    connected_account_id: 'ca_123',
+  });
+  if (normalized.errors.length > 0) throw new Error(`Should not reject same-slug wrapper: ${normalized.errors.join(', ')}`);
+  if (normalized.args.to_email !== 'nate@example.com' || 'to' in normalized.args) {
+    throw new Error('Should map Outlook "to" alias to "to_email" and remove the alias');
+  }
+  if (normalized.connectedAccountId !== 'ca_123') {
+    throw new Error('Should preserve wrapper connected_account_id for batch dispatch');
+  }
+}
+
+// Schema-grounded recipient alias: any provider whose real schema requires
+// to_email can be repaired without slug-specific code.
+{
+  const normalized = normalizeComposioBatchItemArgs('ACME_SEND', {
+    to: 'nate@example.com',
+    subject: 'Hi',
+    body: 'Body',
+  }, {
+    type: 'object',
+    required: ['to_email', 'subject', 'body'],
+    properties: { to_email: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } },
+  });
+  if (normalized.args.to_email !== 'nate@example.com' || 'to' in normalized.args) {
+    throw new Error('Schema-required to_email should be repaired from to');
+  }
+}
+
+// No over-normalization: Gmail-style tools commonly accept "to"; leave them
+// alone unless a schema explicitly asks for to_email.
+{
+  const normalized = normalizeComposioBatchItemArgs('GMAIL_SEND_EMAIL', {
+    to: 'nate@example.com',
+    subject: 'Hi',
+    body: 'Body',
+  });
+  if (normalized.args.to !== 'nate@example.com' || 'to_email' in normalized.args || normalized.repairs.length > 0) {
+    throw new Error('Should not rewrite Gmail-style to into to_email without schema evidence');
+  }
+}
+
+// Mismatched wrappers are provably unsafe: the model put one slug in the batch
+// plan and a different slug in the item wrapper.
+{
+  const normalized = normalizeComposioBatchItemArgs('OUTLOOK_OUTLOOK_SEND_EMAIL', {
+    tool_slug: 'GMAIL_SEND_EMAIL',
+    arguments: JSON.stringify({ to: 'nate@example.com', subject: 'Hi', body: 'Body' }),
+  });
+  if (!normalized.errors.some((err) => err.includes('does not match'))) {
+    throw new Error('Should reject a mismatched nested wrapper slug');
+  }
+}
 
 // THE FUTURE-PROOF PROOF: a brand-new toolkit whose items are keyed by a
 // non-`*id` identity ('sku') — the one shape class the structural

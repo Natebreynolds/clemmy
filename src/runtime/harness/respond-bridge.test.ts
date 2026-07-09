@@ -27,6 +27,8 @@ const { appendEvent, createSession, getSession, resetEventLog } = await import('
 const { AgentRuntimeCancelledError } = await import('../provider.js');
 // eslint-disable-next-line import/first
 const { ClaudeSdkProviderOverloadError } = await import('./claude-agent-sdk.js');
+// eslint-disable-next-line import/first
+const capabilityHealth = await import('./capability-health.js');
 
 const FAKE_AGENT = {} as never;
 const okConfigure = (async () => ({ ok: true })) as never;
@@ -43,6 +45,7 @@ function fakeRun(result: Record<string, unknown>): never {
 
 beforeEach(() => {
   resetEventLog();
+  capabilityHealth._resetHarnessCapabilityHealthForTest();
   _setBridgeImplsForTests({});
   delete process.env.CLEMMY_HARNESS_WEBHOOK;
   delete process.env.CLEMMY_HARNESS_CRON;
@@ -51,6 +54,7 @@ beforeEach(() => {
   delete process.env.CLEMMY_HARNESS_WORKFLOW;
   delete process.env.CLEMMY_HARNESS_DISCORD;
   delete process.env.CLEMMY_HARNESS_SLACK;
+  delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   process.env.AUTH_MODE = 'api_key';
 });
@@ -69,10 +73,10 @@ test('harnessSurfaceEnabled: default on, kill-switch values off', () => {
   assert.equal(harnessSurfaceEnabled('webhook'), true);
 });
 
-test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); kill-switch reverts', () => {
+test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); kill-switch disables the lane', () => {
   // 2026-06-13 audit #7: dashboard/home/workflow validated live → default ON
   // like every other surface (the gated loop is the ONE path). The per-surface
-  // kill-switch still reverts to legacy for instant rollback.
+  // kill-switch disables the harness lane; legacy requires explicit break-glass.
   assert.equal(harnessSurfaceEnabled('dashboard'), true, 'dashboard default ON');
   assert.equal(harnessSurfaceEnabled('home'), true, 'home default ON');
   assert.equal(harnessSurfaceEnabled('workflow'), true, 'workflow default ON');
@@ -80,7 +84,7 @@ test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); k
   assert.equal(harnessSurfaceEnabled('discord'), true, 'discord default ON');
   assert.equal(harnessSurfaceEnabled('slack'), true, 'slack default ON');
   process.env.CLEMMY_HARNESS_DASHBOARD = 'off';
-  assert.equal(harnessSurfaceEnabled('dashboard'), false, 'kill-switch reverts to legacy');
+  assert.equal(harnessSurfaceEnabled('dashboard'), false, 'kill-switch disables the lane');
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
 });
 
@@ -95,18 +99,21 @@ test('respondPreferHarness: dashboard rides the gated harness loop by DEFAULT (a
   assert.equal(legacyCalled, 0, 'default-ON → gated harness loop, not legacy');
 });
 
-test('home + dashboard ride the gated loop by default; the kill-switch still routes to legacy', async () => {
+test('home + dashboard ride the gated loop by default; the kill-switch blocks unless legacy fallback is explicit', async () => {
   assert.equal(harnessSurfaceEnabled('dashboard'), true, 'architect drafting surface ON');
   assert.equal(harnessSurfaceEnabled('home'), true, 'home chat surface ON');
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: fakeRun({ status: 'completed' }) });
   let legacyCalled = 0;
   await respondPreferHarness('home', { message: 'hi', sessionId: 'home-baked' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
   assert.equal(legacyCalled, 0, 'home default-ON → gated harness loop');
-  // kill-switch still reverts
+  // The old automatic revert is gone: disabled harness lanes block by default
+  // instead of silently bypassing the gates through assistant.respond().
   process.env.CLEMMY_HARNESS_HOME = 'off';
   try {
-    await respondPreferHarness('home', { message: 'hi', sessionId: 'home-killed' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
-    assert.equal(legacyCalled, 1, 'kill-switch → legacy');
+    const res = await respondPreferHarness('home', { message: 'hi', sessionId: 'home-killed' }, async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; });
+    assert.equal(legacyCalled, 0, 'kill-switch blocks by default');
+    assert.equal(res.stoppedReason, 'error');
+    assert.match(res.text, /harness lane is disabled/i);
   } finally {
     delete process.env.CLEMMY_HARNESS_HOME;
   }
@@ -131,15 +138,41 @@ test('non-honorModel surface ignores request.model (cron/gateway byte-identical)
   assert.equal(capturedModel, undefined, 'cron does NOT forward model — harness keeps its configured model');
 });
 
-test('respondPreferHarness: kill-switch routes to legacy', async () => {
+test('respondPreferHarness: kill-switch blocks by default, legacy fallback requires explicit break-glass', async () => {
   process.env.CLEMMY_HARNESS_CRON = 'off';
   let legacyCalled = 0;
   const res = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-t1' }, async (req) => {
     legacyCalled += 1;
     return { text: 'legacy', sessionId: req.sessionId };
   });
+  assert.equal(legacyCalled, 0);
+  assert.equal(res.stoppedReason, 'error');
+  assert.match(res.text, /harness lane is disabled/i);
+
+  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  const legacy = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-t1-legacy' }, async (req) => {
+    legacyCalled += 1;
+    return { text: 'legacy', sessionId: req.sessionId };
+  });
   assert.equal(legacyCalled, 1);
-  assert.equal(res.text, 'legacy');
+  assert.equal(legacy.text, 'legacy');
+});
+
+test('respondPreferHarness: preflight blocks are recorded in harness capability health', async () => {
+  process.env.CLEMMY_HARNESS_CRON = 'off';
+  const res = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-health-block' }, async (req) => ({
+    text: 'legacy',
+    sessionId: req.sessionId,
+  }));
+
+  assert.equal(res.stoppedReason, 'error');
+  const rec = capabilityHealth.readHarnessCapabilityHealth('respond_bridge_surface_disabled');
+  assert.ok(rec, 'preflight block is persisted for harness_status/model context');
+  assert.equal(rec.state, 'unavailable');
+  assert.equal(rec.sessionId, 'bridge-health-block');
+  assert.match(rec.reason ?? '', /cron: The cron harness lane is disabled/);
+  assert.equal(rec.details?.surface, 'cron');
+  assert.equal(rec.details?.reason, 'surface_disabled');
 });
 
 test('respondPreferHarness: harness-FILTERABLE excludeToolNames ride the gated loop (exclusion passed to the builder)', async () => {
@@ -159,7 +192,7 @@ test('respondPreferHarness: harness-FILTERABLE excludeToolNames ride the gated l
   assert.deepEqual(captured, ['composio_execute_tool', 'workflow_run'], 'exclusion forwarded to the agent builder');
 });
 
-test('respondPreferHarness: a NON-filterable exclude (external MCP tool) stays legacy — no silent surface widening', async () => {
+test('respondPreferHarness: a NON-filterable exclude blocks by default — no silent surface widening or legacy bypass', async () => {
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: fakeAgentBuilder, runConversation: fakeRun({ status: 'completed' }) });
   let legacyCalled = 0;
   const res = await respondPreferHarness(
@@ -167,19 +200,22 @@ test('respondPreferHarness: a NON-filterable exclude (external MCP tool) stays l
     { message: 'hi', sessionId: 'bridge-excl-ext', excludeToolNames: ['dataforseo__serp_organic_live_advanced'] },
     async (req) => { legacyCalled += 1; return { text: 'legacy', sessionId: req.sessionId }; },
   );
-  assert.equal(legacyCalled, 1, 'the harness cannot enforce an external-MCP exclude → legacy (invariant preserved)');
-  assert.equal(res.text, 'legacy');
+  assert.equal(legacyCalled, 0, 'the harness cannot enforce an external-MCP exclude → block before run');
+  assert.equal(res.stoppedReason, 'error');
+  assert.match(res.text, /tool exclusions cannot be enforced/i);
 });
 
-test('respondPreferHarness: harness auth unavailable falls back to legacy (pre-run only)', async () => {
+test('respondPreferHarness: harness auth unavailable blocks by default instead of falling back to legacy', async () => {
   _setBridgeImplsForTests({ configure: (async () => ({ ok: false, reason: 'no auth' })) as never });
   let legacyCalled = 0;
   const res = await respondPreferHarness('webhook', { message: 'hi', sessionId: 'bridge-t3' }, async (req) => {
     legacyCalled += 1;
     return { text: 'legacy', sessionId: req.sessionId };
   });
-  assert.equal(legacyCalled, 1);
-  assert.equal(res.text, 'legacy');
+  assert.equal(legacyCalled, 0);
+  assert.equal(res.stoppedReason, 'error');
+  assert.match(res.text, /model runtime is not configured/i);
+  assert.match(res.text, /no auth/i);
 });
 
 test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through Claude Agent SDK brain', async () => {

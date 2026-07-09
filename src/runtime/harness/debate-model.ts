@@ -960,6 +960,37 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
   return { model: null, modelId: codexSafeFast(), judgeFamily: brainFamily, brainFamily, selfJudge: true };
 }
 
+/**
+ * Resolve a HEDGE judge for a boundary call: a cheap model from a flagship
+ * family DIFFERENT from the primary judge's, fired only when the primary is
+ * slow (judge-family.ts withJudgeHedge). Null when no distinct family is
+ * logged in — the call then runs unhedged, byte-identical to before. The hedge
+ * may share the BRAIN's family (a tagged selfJudge verdict beats the advisory
+ * downgrade a timeout causes — the verdict is still real, just lower-confidence).
+ */
+export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting): BoundaryJudgeRouting | null {
+  if (!judgeCrossFamilyEnabled()) return null;
+  const haveClaude = claudeAvailable();
+  const haveCodex = codexAvailable();
+  const candidates: Array<{ provider: 'claude' | 'codex'; modelId: string; available: boolean }> = [
+    { provider: 'claude', modelId: boundaryClaudeJudgeModel(), available: haveClaude },
+    { provider: 'codex', modelId: boundaryCodexJudgeModel(), available: haveCodex },
+  ];
+  for (const c of candidates) {
+    if (!c.available || c.provider === primary.judgeFamily) continue;
+    const model = buildJudgeForRole({ modelId: c.modelId, provider: c.provider, source: 'default' }, haveClaude, haveCodex);
+    if (!model) continue;
+    return {
+      model,
+      modelId: c.modelId,
+      judgeFamily: c.provider,
+      brainFamily: primary.brainFamily,
+      selfJudge: c.provider === primary.brainFamily,
+    };
+  }
+  return null;
+}
+
 export function resolveDebateBrains(passthrough: ModelProvider, modelName?: string): DebateBrains | null {
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();

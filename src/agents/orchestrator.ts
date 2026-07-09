@@ -19,7 +19,6 @@ import { buildPlannerTool } from './planner.js';
 // composio writes); it just does one job and returns.
 import { buildWorkerAgent } from './sub-agents.js';
 import { harnessInstructions } from './harness-context.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { getOrCreateExternalMcpServers } from '../runtime/mcp-servers.js';
 import { codeModeMandateDirective } from '../tools/code-mode-tool.js';
@@ -71,11 +70,9 @@ import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
  * N-independent-items work.
  *
  * The turn output is PLAIN TEXT + an optional one-line marker (ASK: /
- * CONTINUE:), parsed by the loop (parseDecisionText). The structured
- * OrchestratorDecisionSchema/outputType is retained only for the
- * emergency CLEMMY_PLAINTEXT_DECISION=off revert. Worker fan-out
- * happens via parallel tool calls to run_worker, which IS
- * parallelizable because run_worker is a tool, not a handoff.
+ * CONTINUE:), parsed by the loop (parseDecisionText). Worker fan-out happens
+ * via parallel tool calls to run_worker, which IS parallelizable because
+ * run_worker is a tool, not a handoff.
  *
  * Input + output guardrails come from the harness registry so the
  * SDK enforces policy_violation / missing_capability before any
@@ -169,17 +166,6 @@ function workerIntentRoutingEnabled(): boolean {
  *  the item on the next connected brain. */
 function workerBrainFalloverEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
-}
-
-/** Plain-text DECISION contract (default ON): the Orchestrator emits plain text +
- *  an optional one-line marker (ASK:/CONTINUE:) instead of the structured
- *  OrchestratorDecision JSON envelope — so a turn can NEVER fail on output shape
- *  (the 2026-07-08 landing-page D_decision_unparsed class). With the SDK
- *  outputType dropped the model is free to end its turn with just text, which the
- *  loop parses (parseDecisionText). `=off` restores the JSON outputType (the loop
- *  still parses the object shape either way, so this is a pure emergency revert). */
-function plaintextDecisionEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_PLAINTEXT_DECISION', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 interface ChatWorkerModelRoute {
@@ -1394,18 +1380,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     ...(dynamicReasoningEnabled()
       ? { modelSettings: { reasoning: { effort: 'none' as const }, text: { verbosity: 'low' as const } } }
       : {}),
-    // v0.5.22 — normalize via the centralized helper so the schema
-    // serializes Codex-strict compatible (every property in `required`,
-    // optional fields as nullable). Without this, .nullish() reply
-    // produces a JSON schema with reply absent from required, which
-    // Codex rejects under SDK 0.11.5 strict mode.
-    // Plain-text DECISION contract (default): NO structured outputType — the
-    // model ends its turn with plain text + an optional marker, which the loop
-    // parses. Dropping the JSON response_format is what makes an unparseable
-    // decision impossible. `CLEMMY_PLAINTEXT_DECISION=off` restores the envelope.
-    ...(plaintextDecisionEnabled()
-      ? {}
-      : { outputType: normalizeZodForCodexStrict(OrchestratorDecisionSchema) as typeof OrchestratorDecisionSchema }),
+    // Plain-text DECISION contract: no SDK structured outputType. The model
+    // ends its turn with prose plus an optional marker, and the loop parses or
+    // repairs that. Reintroducing response_format here recreates the observed
+    // D_decision_unparsed/schema-validation failures where useful work was
+    // discarded because the final envelope was not perfect JSON.
     // T2.1 — wrapToolForHarness adds the per-tool timeout + mid-turn
     // kill check + pre-increment limit check. No-op when
     // HARNESS_TOOL_BRACKETS is off, so this is safe to leave in even

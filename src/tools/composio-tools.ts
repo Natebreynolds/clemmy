@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
-import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
+import { classifyTool, needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import {
   executeComposioTool,
   getComposioCredentialStatus,
@@ -679,6 +679,40 @@ export function normalizeInlineConnectedAccountId(
   return { args, connectedAccountId: effectiveConnectionId };
 }
 
+export function applySuppressedComposioConnectionPolicy(
+  toolSlug: string,
+  connectedAccountId: string | undefined,
+  state: ComposioConnectionSuppressionState,
+  nowMs: number = Date.now(),
+): { connectedAccountId: string | undefined; note?: string; block?: string } {
+  if (!connectedAccountId) return { connectedAccountId };
+  const suppression = state.suppressedConnections?.[connectedAccountId];
+  if (!suppression) return { connectedAccountId };
+  const untilMs = Date.parse(suppression.suppressUntil);
+  if (!Number.isFinite(untilMs) || untilMs <= nowMs) return { connectedAccountId };
+
+  const reason = suppression.reason ?? 'suppressed';
+  const toolkit = toolkitOfSlug(toolSlug).toUpperCase();
+  const mutating = classifyTool('composio_execute_tool', { args: { tool_slug: toolSlug } }) !== 'read';
+  if (mutating) {
+    return {
+      connectedAccountId,
+      block:
+        `COMPOSIO_CONNECTION_SUPPRESSED: \`${toolSlug}\` was pinned to connection \`${connectedAccountId}\`, ` +
+        `but Clementine has already quarantined that ${toolkit} connection as ${reason} until ${suppression.suppressUntil}. ` +
+        `Do NOT retry this connection id. Call \`composio_status\` to inspect usable connections; if this exact account is required, ask the user to reconnect it. ` +
+        `For external writes/sends, do not silently switch accounts unless a standing account rule or explicit user instruction verifies the replacement.`,
+    };
+  }
+
+  return {
+    connectedAccountId: undefined,
+    note:
+      `[connection-repair] Ignored suppressed ${toolkit} connection ${connectedAccountId} (${reason} until ${suppression.suppressUntil}) ` +
+      `and retried without the stale pin so live connection resolution can choose a usable account.`,
+  };
+}
+
 function latestUserInputForContext(context: unknown): string {
   const sessionId = sessionIdFromRunContext(context);
   if (!sessionId) return '';
@@ -786,6 +820,16 @@ async function runComposioExecute(
       effectiveConnectionId = calendarRoute.routeConnectionId;
       accountRouteNote = `[account-route] Routed Outlook calendar read to connection ${calendarRoute.routeConnectionId} from standing rule #${calendarRoute.constraint.id}.`;
     }
+  }
+  if (!gate.routeConnectedAccountId) {
+    const route = applySuppressedComposioConnectionPolicy(
+      toolSlug,
+      effectiveConnectionId,
+      readComposioConnectionSuppressionState() as unknown as ComposioConnectionSuppressionState,
+    );
+    if (route.block) return route.block;
+    effectiveConnectionId = route.connectedAccountId;
+    if (route.note) accountRouteNote = accountRouteNote ? `${accountRouteNote}\n${route.note}` : route.note;
   }
 
   // Pre-dispatch arg validation — schema-grounded when the action's real

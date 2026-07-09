@@ -8,7 +8,7 @@
  *     once each on first crossing
  *   - withTimeout rejects when work exceeds the deadline and resolves
  *     when work completes in time
- *   - timeoutForTool picks shell/MCP/default budgets correctly
+ *   - timeoutForTool picks shell/MCP/code-mode/default budgets correctly
  */
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
@@ -488,6 +488,14 @@ test('wrapToolForHarness: kill switch is checked mid-turn (per-tool)', async () 
   } finally {
     process.env.HARNESS_TOOL_BRACKETS = prev;
   }
+});
+
+test('timeoutForTool: run_tool_program outer budget exceeds the code-mode sandbox ceiling', () => {
+  assert.equal(timeoutForTool('run_tool_program'), DEFAULT_TIMEOUTS_MS.externalApi);
+  assert.ok(
+    timeoutForTool('run_tool_program') > 180_000,
+    'outer harness must not kill code mode before its default 180s sandbox ceiling can return partial results',
+  );
 });
 
 test('wrapToolForHarness: applies per-tool timeout via withTimeout', async () => {

@@ -42,6 +42,26 @@ test('a clean interrupted run (no external writes) is AUTO-RESUMED with the trut
   assert.equal(dispatched[0].directive, AUTO_RESUME_DIRECTIVE);
   const notices = listEvents(id, { types: ['conversation_completed'] });
   assert.match(String((notices.at(-1)?.data as { reply?: string }).reply ?? ''), /resuming it automatically/);
+  const decisions = listEvents(id, { types: ['restart_recovery_decision'] });
+  assert.equal(decisions.length, 1);
+  assert.deepEqual(
+    {
+      eligible: decisions[0].data.eligible,
+      autoResume: decisions[0].data.autoResume,
+      autoResumeSkipped: decisions[0].data.autoResumeSkipped,
+      externalWritesSinceInterrupt: decisions[0].data.externalWritesSinceInterrupt,
+      writeCheckFailed: decisions[0].data.writeCheckFailed,
+      bootResumeOrdinal: decisions[0].data.bootResumeOrdinal,
+    },
+    {
+      eligible: true,
+      autoResume: true,
+      autoResumeSkipped: null,
+      externalWritesSinceInterrupt: 0,
+      writeCheckFailed: false,
+      bootResumeOrdinal: 1,
+    },
+  );
 });
 
 test('an interrupted run WITH an external write keeps the manual banner (double-act guard)', async () => {
@@ -55,6 +75,26 @@ test('an interrupted run WITH an external write keeps the manual banner (double-
   assert.equal(dispatched.length, 0, 'a write-touched run is never auto-resumed');
   const notices = listEvents(id, { types: ['conversation_completed'] });
   assert.match(String((notices.at(-1)?.data as { reply?: string }).reply ?? ''), /Reply `continue`/);
+  const decisions = listEvents(id, { types: ['restart_recovery_decision'] });
+  assert.equal(decisions.length, 1);
+  assert.deepEqual(
+    {
+      eligible: decisions[0].data.eligible,
+      autoResume: decisions[0].data.autoResume,
+      autoResumeSkipped: decisions[0].data.autoResumeSkipped,
+      externalWritesSinceInterrupt: decisions[0].data.externalWritesSinceInterrupt,
+      writeCheckFailed: decisions[0].data.writeCheckFailed,
+      bootResumeOrdinal: decisions[0].data.bootResumeOrdinal,
+    },
+    {
+      eligible: false,
+      autoResume: false,
+      autoResumeSkipped: 'external_write',
+      externalWritesSinceInterrupt: 1,
+      writeCheckFailed: false,
+      bootResumeOrdinal: null,
+    },
+  );
 });
 
 test('kill-switch CLEMMY_CHAT_AUTO_RESUME=off restores banner-only for everyone', async () => {

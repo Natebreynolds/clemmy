@@ -14,7 +14,8 @@
  * silently API-billed.
  */
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
@@ -31,19 +32,145 @@ const API_KEY_PREFIX = 'sk-ant-api03';
 // Claude Code CLI keychain so we can rotate the refresh token freely. Preferred
 // over the keychain when present.
 const CLAUDE_VAULT_FILE = path.join(BASE_DIR, 'state', 'claude-auth.json');
+const CLAUDE_VAULT_DEAD_FILE = path.join(BASE_DIR, 'state', 'claude-auth-dead.json');
+const CLAUDE_VAULT_DEGRADED_FILE = path.join(BASE_DIR, 'state', 'claude-auth-degraded.json');
+
+interface ClaudeVaultDeadState {
+  refreshTokenHash: string;
+  reason: string;
+  since: string;
+}
+
+interface ClaudeVaultDegradedState {
+  vaultTokenHash: string | null;
+  reason: string;
+  loggedAt: string;
+}
 
 /** A Clementine-owned vault refresh token the server has rejected with a
  *  permanent `invalid_grant` (revoked / rotated away / not found). Retrying it on
  *  every request only burns a doomed network round-trip and spams the log — the
  *  grant is dead until the user re-authenticates. Keyed by the token STRING so a
- *  re-auth (which writes a NEW token via saveClaudeTokens) auto-recovers with no
- *  restart. NULL means "no known-dead grant". */
+ *  re-auth (which writes a NEW token via saveClaudeTokens) auto-recovers. The
+ *  persisted marker stores only the token HASH so the state survives daemon
+ *  restarts without duplicating the secret. NULL means "no known-dead grant". */
 let deadVaultRefreshToken: string | null = null;
+let claudeVaultDeadFile = CLAUDE_VAULT_DEAD_FILE;
+let claudeVaultDegradedFile = CLAUDE_VAULT_DEGRADED_FILE;
 
 /** Dedupe the "falling back to the Claude Code subscription token" WARN: it fired
  *  on EVERY request while the vault grant was down. Log once per distinct reason;
  *  reset on re-auth so a future degradation logs again. */
 let loggedFallbackReason: string | null = null;
+
+function refreshTokenHash(refreshToken: string): string {
+  return createHash('sha256').update(refreshToken).digest('hex');
+}
+
+function readClaudeVaultDeadState(): ClaudeVaultDeadState | null {
+  if (!existsSync(claudeVaultDeadFile)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(claudeVaultDeadFile, 'utf-8')) as Partial<ClaudeVaultDeadState>;
+    if (
+      typeof parsed.refreshTokenHash === 'string' &&
+      typeof parsed.reason === 'string' &&
+      typeof parsed.since === 'string'
+    ) {
+      return {
+        refreshTokenHash: parsed.refreshTokenHash,
+        reason: parsed.reason,
+        since: parsed.since,
+      };
+    }
+  } catch { /* ignore corrupt marker; request path can rediscover */ }
+  return null;
+}
+
+function isVaultRefreshTokenMarkedDead(refreshToken: string): boolean {
+  if (deadVaultRefreshToken === refreshToken) return true;
+  return readClaudeVaultDeadState()?.refreshTokenHash === refreshTokenHash(refreshToken);
+}
+
+function markClaudeVaultRefreshDead(refreshToken: string, reason: string): void {
+  deadVaultRefreshToken = refreshToken;
+  const refreshTokenHashValue = refreshTokenHash(refreshToken);
+  try {
+    const existing = readClaudeVaultDeadState();
+    if (existing?.refreshTokenHash === refreshTokenHashValue) return;
+    mkdirSync(path.dirname(claudeVaultDeadFile), { recursive: true });
+    writeFileSync(
+      claudeVaultDeadFile,
+      JSON.stringify({
+        refreshTokenHash: refreshTokenHashValue,
+        reason: reason.slice(0, 300),
+        since: new Date().toISOString(),
+      }, null, 2),
+      { encoding: 'utf-8', mode: 0o600 },
+    );
+    try { chmodSync(claudeVaultDeadFile, 0o600); } catch { /* best-effort */ }
+  } catch { /* best-effort; the in-memory latch still prevents same-process spam */ }
+}
+
+function clearClaudeVaultRefreshDead(): void {
+  deadVaultRefreshToken = null;
+  try { rmSync(claudeVaultDeadFile, { force: true }); } catch { /* ignore */ }
+}
+
+function readClaudeVaultDegradedState(): ClaudeVaultDegradedState | null {
+  if (!existsSync(claudeVaultDegradedFile)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(claudeVaultDegradedFile, 'utf-8')) as Partial<ClaudeVaultDegradedState>;
+    if (
+      (typeof parsed.vaultTokenHash === 'string' || parsed.vaultTokenHash === null) &&
+      typeof parsed.reason === 'string' &&
+      typeof parsed.loggedAt === 'string'
+    ) {
+      return {
+        vaultTokenHash: parsed.vaultTokenHash,
+        reason: parsed.reason,
+        loggedAt: parsed.loggedAt,
+      };
+    }
+  } catch { /* ignore corrupt marker; request path can rewrite */ }
+  return null;
+}
+
+function vaultFallbackHash(): string | null {
+  const vault = getVaultClaudeTokens();
+  const token = vault?.refreshToken || vault?.accessToken;
+  return token ? refreshTokenHash(token) : null;
+}
+
+function shouldLogClaudeCodeFallback(reason: string): boolean {
+  const vaultTokenHash = vaultFallbackHash();
+  const memoryKey = `${vaultTokenHash ?? 'no-vault'}:${reason}`;
+  if (loggedFallbackReason === memoryKey) return false;
+  loggedFallbackReason = memoryKey;
+  const persisted = readClaudeVaultDegradedState();
+  // Once a vault grant is degraded, don't re-warn on every daemon restart. The
+  // invalid_grant warning already carries the re-auth action; this line is just
+  // the degraded-route notice.
+  if (persisted?.vaultTokenHash === vaultTokenHash) return false;
+  try {
+    mkdirSync(path.dirname(claudeVaultDegradedFile), { recursive: true });
+    writeFileSync(
+      claudeVaultDegradedFile,
+      JSON.stringify({
+        vaultTokenHash,
+        reason,
+        loggedAt: new Date().toISOString(),
+      }, null, 2),
+      { encoding: 'utf-8', mode: 0o600 },
+    );
+    try { chmodSync(claudeVaultDegradedFile, 0o600); } catch { /* best-effort */ }
+  } catch { /* best-effort; in-memory latch still suppresses same-process spam */ }
+  return true;
+}
+
+function clearClaudeVaultDegraded(): void {
+  loggedFallbackReason = null;
+  try { rmSync(claudeVaultDegradedFile, { force: true }); } catch { /* ignore */ }
+}
 
 /** Persist our own Claude tokens (from the in-app login or a refresh). 0600. */
 export function saveClaudeTokens(tokens: ClaudeTokenSet): void {
@@ -51,8 +178,8 @@ export function saveClaudeTokens(tokens: ClaudeTokenSet): void {
   writeFileSync(CLAUDE_VAULT_FILE, JSON.stringify(tokens, null, 2), { encoding: 'utf-8', mode: 0o600 });
   // A freshly-written grant supersedes any prior dead/degraded state — clear the
   // markers so the next request re-attempts refresh and re-arms fallback logging.
-  deadVaultRefreshToken = null;
-  loggedFallbackReason = null;
+  clearClaudeVaultRefreshDead();
+  clearClaudeVaultDegraded();
   try { chmodSync(CLAUDE_VAULT_FILE, 0o600); } catch { /* best-effort */ }
 }
 
@@ -212,9 +339,8 @@ function tryClaudeCodeFallback(reason: string): string | null {
   if (!cli) return null;
   try {
     const token = assertSubscriptionToken(cli);
-    if (loggedFallbackReason !== reason) {
+    if (shouldLogClaudeCodeFallback(reason)) {
       logger.warn({ reason }, 'Using Claude Code subscription token because Clementine Claude vault token is unavailable');
-      loggedFallbackReason = reason;
     }
     return token;
   } catch {
@@ -234,9 +360,8 @@ function isPermanentGrantFailure(err: unknown): boolean {
  *  yet replaced by a re-auth — surfaced for auth-status UI ("re-authenticate
  *  Claude"). Cheap: reads the vault file only, no network. */
 export function claudeVaultRefreshDead(): boolean {
-  if (!deadVaultRefreshToken) return false;
   const t = getVaultClaudeTokens();
-  return !!t?.refreshToken && t.refreshToken === deadVaultRefreshToken;
+  return !!t?.refreshToken && isVaultRefreshTokenMarkedDead(t.refreshToken);
 }
 
 /** Async loader that refreshes OUR vault token before expiry (rotating the
@@ -254,10 +379,10 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
     tokens.expiresAt && tokens.expiresAt <= Date.now() + REFRESH_BEFORE_MS
   ) {
     const refreshToken = tokens.refreshToken; // narrowed non-empty by the guard above
-    if (refreshToken === deadVaultRefreshToken) {
+    if (isVaultRefreshTokenMarkedDead(refreshToken)) {
       // Grant already rejected as invalid_grant — skip the doomed network refresh
       // and go straight to fallback. Recovers automatically once a re-auth writes
-      // a new token (saveClaudeTokens clears deadVaultRefreshToken).
+      // a new token (saveClaudeTokens clears the dead marker).
       const fallback = tryClaudeCodeFallback('vault_refresh_dead');
       if (fallback) return fallback;
     } else {
@@ -276,7 +401,7 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
         if (isPermanentGrantFailure(err)) {
           // Mark the grant dead so we stop re-attempting it every request. Log
           // ONCE, loudly, with the fix — not once per call.
-          deadVaultRefreshToken = refreshToken;
+          markClaudeVaultRefreshDead(refreshToken, msg);
           logger.warn(
             { err: msg },
             'Clementine Claude vault grant is dead (invalid_grant) — re-authenticate Claude from Settings. Using the Claude Code subscription token meanwhile; this grant will not be retried until re-auth.',
@@ -317,7 +442,7 @@ export function isClaudeSubscriptionReady(): boolean {
 export function claudeVaultFallbackReady(): boolean {
   const t = getVaultClaudeTokens();
   if (!t?.accessToken?.startsWith(OAT_PREFIX)) return false;
-  if (t.refreshToken) return true; // refreshable
+  if (t.refreshToken && !isVaultRefreshTokenMarkedDead(t.refreshToken)) return true; // refreshable
   return !t.expiresAt || t.expiresAt > Date.now() + 60_000; // or currently valid
 }
 
@@ -363,6 +488,15 @@ export function getClaudeAuthSnapshot(): ClaudeAuthSnapshot {
           reason: 'Using Claude Code subscription token because the Clementine Claude vault token is unavailable.',
         };
       } catch {
+        if (tokens.refreshToken && isVaultRefreshTokenMarkedDead(tokens.refreshToken)) {
+          const dead = readClaudeVaultDeadState();
+          return {
+            configured: false,
+            source: 'vault',
+            refreshable: false,
+            reason: `Clementine Claude vault grant is dead${dead?.since ? ` since ${dead.since}` : ''}; re-authenticate Claude from Settings.`,
+          };
+        }
         // Fall through to the primary error.
       }
     }
@@ -384,10 +518,32 @@ export const __test__ = {
   setRefreshClaudeTokensForTests(fn: ((refreshToken: string) => Promise<ClaudeTokenSet>) | null): void {
     refreshClaudeTokensImpl = fn ?? refreshClaudeTokens;
   },
+  setClaudeVaultDeadFileForTests(file: string | null): void {
+    claudeVaultDeadFile = file ?? CLAUDE_VAULT_DEAD_FILE;
+  },
+  setClaudeVaultDegradedFileForTests(file: string | null): void {
+    claudeVaultDegradedFile = file ?? CLAUDE_VAULT_DEGRADED_FILE;
+  },
+  getClaudeVaultDeadStateForTests(): ClaudeVaultDeadState | null {
+    return readClaudeVaultDeadState();
+  },
+  getClaudeVaultDegradedStateForTests(): ClaudeVaultDegradedState | null {
+    return readClaudeVaultDegradedState();
+  },
+  resetDegradedMemoryForTests(): void {
+    deadVaultRefreshToken = null;
+    loggedFallbackReason = null;
+  },
   /** Reset module-level degraded-auth markers between tests. */
   resetDegradedStateForTests(): void {
     deadVaultRefreshToken = null;
     loggedFallbackReason = null;
+    if (claudeVaultDeadFile !== CLAUDE_VAULT_DEAD_FILE) {
+      try { rmSync(claudeVaultDeadFile, { force: true }); } catch { /* ignore */ }
+    }
+    if (claudeVaultDegradedFile !== CLAUDE_VAULT_DEGRADED_FILE) {
+      try { rmSync(claudeVaultDegradedFile, { force: true }); } catch { /* ignore */ }
+    }
   },
 };
 

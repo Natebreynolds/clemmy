@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { recordStepResult, takeStepResult, clearStepResult, registerStepResultTool } from './step-result-tool.js';
+import { recordStepResult, takeStepResult, peekStepResult, clearStepResult, recordStepResultFromTranscript, registerStepResultTool } from './step-result-tool.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 
 test('recordStepResult / takeStepResult: take returns once then clears', () => {
@@ -26,6 +26,52 @@ test('takeStepResult distinguishes "no result" from a falsy result', () => {
   const r = takeStepResult('sess-empty');
   assert.equal(r.found, true);
   assert.equal(r.value, '');
+});
+
+test('peekStepResult reads without consuming the workflow result', () => {
+  clearStepResult('sess-peek');
+  recordStepResult('sess-peek', { ok: true });
+  assert.deepEqual(peekStepResult('sess-peek'), { found: true, value: { ok: true } });
+  assert.deepEqual(takeStepResult('sess-peek'), { found: true, value: { ok: true } });
+  assert.equal(takeStepResult('sess-peek').found, false);
+});
+
+test('recordStepResultFromTranscript materializes function-style workflow_step_result text', () => {
+  clearStepResult('sess-transcript-fn');
+  const ok = recordStepResultFromTranscript(
+    'sess-transcript-fn',
+    'workflow_step_result({"report":"ok","count":2})',
+  );
+  assert.equal(ok, true);
+  assert.deepEqual(takeStepResult('sess-transcript-fn'), { found: true, value: { report: 'ok', count: 2 } });
+});
+
+test('recordStepResultFromTranscript materializes Claude XML workflow_step_result text', () => {
+  clearStepResult('sess-transcript-xml');
+  const ok = recordStepResultFromTranscript('sess-transcript-xml', [
+    'Calling `workflow_step_result` with the required payload now.',
+    '<function_calls>',
+    '<invoke name="workflow_step_result">',
+    '<parameter name="report">ok</parameter>',
+    '<parameter name="ok">true</parameter>',
+    '</invoke>',
+    '</function_calls>',
+  ].join('\n'));
+  assert.equal(ok, true);
+  assert.deepEqual(takeStepResult('sess-transcript-xml'), { found: true, value: { report: 'ok', ok: true } });
+});
+
+test('recordStepResultFromTranscript ignores non-structural fake tool calls', () => {
+  clearStepResult('sess-transcript-shell');
+  const ok = recordStepResultFromTranscript('sess-transcript-shell', [
+    '<function_calls>',
+    '<invoke name="run_shell_command">',
+    '<parameter name="command">rm -rf /tmp/nope</parameter>',
+    '</invoke>',
+    '</function_calls>',
+  ].join('\n'));
+  assert.equal(ok, false);
+  assert.equal(takeStepResult('sess-transcript-shell').found, false);
 });
 
 test('results are isolated per session (concurrency safety)', () => {

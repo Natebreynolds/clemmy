@@ -14,18 +14,22 @@
  * out). Routing rules, in order:
  *
  *   1. Per-surface kill-switch (`CLEMMY_HARNESS_<SURFACE>`, default ON) —
- *      flips a surface back to legacy instantly.
+ *      blocks that surface unless the explicit legacy escape hatch is enabled.
  *   2. `excludeToolNames` the harness CANNOT enforce (a non-local/external MCP
- *      tool) → legacy. buildOrchestratorAgent now filters HARNESS-surface tools,
- *      so callers excluding only local tools (architect: workflow_*; autonomy:
- *      composio_execute_tool + workflow_*) ride the gated loop. A non-filterable
- *      exclude still routes legacy — never silently WIDEN a caller's surface.
- *   3. Harness runtime auth unavailable → legacy. This check happens BEFORE
- *      any model call or tool dispatch, so falling back can never
- *      double-execute side effects.
+ *      tool) → blocks pre-run. buildOrchestratorAgent filters HARNESS-surface
+ *      tools, so callers excluding only local tools (architect: workflow_*;
+ *      autonomy composio_execute_tool + workflow_*) ride the gated loop. A
+ *      non-filterable exclude must not silently widen the surface or route
+ *      through legacy.
+ *   3. Harness runtime auth unavailable → blocks pre-run with an actionable
+ *      model setup message.
  *   4. Once the harness run STARTS, errors propagate — there is deliberately
  *      no run-failed→legacy retry (a retry after a partial run is the
  *      double-send class the gates exist to prevent).
+ *
+ * Legacy fallback still exists as an explicit operator break-glass:
+ * `CLEMMY_LEGACY_RESPOND_FALLBACK=on`. It is intentionally global and loud so
+ * the old ApprovalStore / assistant.respond path cannot come back accidentally.
  *
  * Known, accepted contract differences from the legacy loop (same trade the
  * workflow runner accepted when it converged):
@@ -48,6 +52,7 @@ import { falloverBrainModelIds, type BrainProviderClass } from './model-role-opt
 import { resolveRoleModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
 import { nonFilterableToolExcludes } from './tool-policy.js';
+import { recordHarnessCapabilityHealth } from './capability-health.js';
 import pino from 'pino';
 import { LOCAL_MCP_TOOL_NAMES } from '../../tools/catalog.js';
 import { actionBus } from '../action-bus.js';
@@ -167,6 +172,54 @@ function routeForLegacyFallback(surface: HarnessSurface, request: AssistantReque
     provider: providerFor(request.model),
     transport: 'legacy_assistant',
   };
+}
+
+function legacyRespondFallbackEnabled(): boolean {
+  const raw = (getRuntimeEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', 'off') ?? 'off').trim().toLowerCase();
+  return raw === 'on' || raw === '1' || raw === 'true' || raw === 'yes';
+}
+
+function blockedPreRunResponse(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  reason: string,
+  details?: Record<string, unknown>,
+): AssistantResponse {
+  const route = routeForHarness(surface, request);
+  try {
+    const code = typeof details?.reason === 'string' && details.reason.trim()
+      ? details.reason.trim().replace(/[^a-z0-9_-]+/gi, '_').toLowerCase()
+      : 'preflight_block';
+    recordHarnessCapabilityHealth({
+      id: `respond_bridge_${code}`,
+      state: 'unavailable',
+      summary: 'Respond bridge preflight blocked a harness run before model or tool work started.',
+      reason: `${surface}: ${reason}`,
+      sessionId: request.sessionId,
+      details: {
+        surface,
+        route,
+        requestedModel: request.model ?? null,
+        runId: request.runId ?? null,
+        ...details,
+      },
+    });
+  } catch {
+    // Health telemetry is advisory; never change the preflight response.
+  }
+  return withRouteDiagnostics({
+    text: reason,
+    sessionId: request.sessionId,
+    stoppedReason: 'error',
+    raw: {
+      blockedBy: 'harness_preflight',
+      surface,
+      ...details,
+    },
+  }, {
+    ...route,
+    transport: 'harness_preflight_block',
+  });
 }
 
 function routeForHarness(surface: HarnessSurface, request: AssistantRequest, modelOverride?: string): AssistantRouteDiagnostics {
@@ -545,23 +598,52 @@ export async function respondPreferHarness(
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
 ): Promise<AssistantResponse> {
   if (!harnessSurfaceEnabled(surface)) {
-    return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+    if (legacyRespondFallbackEnabled()) {
+      bridgeLogger.warn({ surface, reason: 'surface_disabled' }, 'explicit legacy respond fallback engaged');
+      return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+    }
+    return blockedPreRunResponse(
+      surface,
+      request,
+      `The ${surface} harness lane is disabled by configuration, so I did not start the run. Re-enable CLEMMY_HARNESS_${surface.toUpperCase()} or set CLEMMY_LEGACY_RESPOND_FALLBACK=on only as a deliberate emergency rollback.`,
+      { reason: 'surface_disabled' },
+    );
   }
   // Per-call tool-exclusion: route through the harness ONLY when it can ENFORCE
   // every excluded name (harness-surface tool). A non-filterable exclude (an
-  // external MCP tool) falls back to legacy so we never silently widen the
-  // caller's tool surface. buildOrchestratorAgent does the actual filtering.
+  // external MCP tool) blocks pre-run by default so we never silently widen the
+  // caller's tool surface or bypass the harness. buildOrchestratorAgent does the
+  // actual filtering for enforceable names.
   if (!harnessCanEnforceExcludes(request.excludeToolNames)) {
-    return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+    if (legacyRespondFallbackEnabled()) {
+      bridgeLogger.warn({ surface, excludeToolNames: request.excludeToolNames, reason: 'non_filterable_excludes' }, 'explicit legacy respond fallback engaged');
+      return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+    }
+    const unsafe = nonFilterableToolExcludes(request.excludeToolNames, HARNESS_FILTERABLE_TOOLS);
+    return blockedPreRunResponse(
+      surface,
+      request,
+      `I did not start this run because the requested tool exclusions cannot be enforced by the harness: ${unsafe.join(', ')}. Remove those exclusions or route the task through a scoped harness tool surface.`,
+      { reason: 'non_filterable_excludes', excludeToolNames: request.excludeToolNames, nonFilterableExcludes: unsafe },
+    );
   }
-  let auth: { ok: boolean };
+  let auth: { ok: boolean; reason?: string };
   try {
     auth = await configureImpl();
-  } catch {
-    auth = { ok: false };
+  } catch (err) {
+    auth = { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
   if (!auth.ok) {
-    return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+    if (legacyRespondFallbackEnabled()) {
+      bridgeLogger.warn({ surface, reason: 'harness_auth_unavailable', authReason: auth.reason }, 'explicit legacy respond fallback engaged');
+      return withRouteDiagnostics(await legacyRespond(request), routeForLegacyFallback(surface, request));
+    }
+    return blockedPreRunResponse(
+      surface,
+      request,
+      `I could not start the harness because the model runtime is not configured: ${auth.reason ?? 'unknown auth/configuration error'}. Open Settings > Models and connect Codex, Claude, or a BYO model.`,
+      { reason: 'harness_auth_unavailable', authReason: auth.reason },
+    );
   }
   if (claudeAgentSdkBrainEnabled(surface)) {
     const detachProgressRelay = attachLegacyProgressRelay(request);

@@ -22,14 +22,21 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
-import { executeComposioTool, listConnectedToolkits } from '../integrations/composio/client.js';
+import {
+  executeComposioTool,
+  listConnectedToolkits,
+  readComposioConnectionSuppressionState,
+  saveComposioConnectionSuppressionState,
+} from '../integrations/composio/client.js';
 import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
 import {
   clearConnectionSuppression,
   isConnectionSuppressed,
+  mergeConnectionSuppressions,
   pruneConnectionSuppressions,
   suppressConnectionAfterHardAuthFailure,
   type ComposioConnectionSuppression,
+  type ComposioConnectionSuppressionState,
 } from './composio-connection-suppression.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
 import { decideSurface, shouldSurface, type SurfaceDecision } from './surface-decision.js';
@@ -81,6 +88,8 @@ export interface CalendarMonitorDeps {
   now: () => number;
   loadState: () => CalendarMonitorState;
   saveState: (s: CalendarMonitorState) => void;
+  readConnectionSuppressions?: (nowMs: number) => ComposioConnectionSuppressionState;
+  saveConnectionSuppressions?: (s: ComposioConnectionSuppressionState, nowMs?: number) => void;
 }
 
 // ── config (user-editable via the proactivity policy) ────────────────────────
@@ -260,6 +269,8 @@ const REAL_DEPS: CalendarMonitorDeps = {
   now: () => Date.now(),
   loadState: loadStateReal,
   saveState: saveStateReal,
+  readConnectionSuppressions: readComposioConnectionSuppressionState,
+  saveConnectionSuppressions: saveComposioConnectionSuppressionState,
 };
 
 export const calendarMonitorInternalsForTest = { loadStateReal, saveStateReal };
@@ -282,6 +293,16 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
 
   const nowMs = deps.now();
   const state = deps.loadState();
+  let sharedSuppressionsLoaded = false;
+  try {
+    const shared = deps.readConnectionSuppressions?.(nowMs);
+    if (shared) {
+      mergeConnectionSuppressions(state, shared, nowMs);
+      sharedSuppressionsLoaded = true;
+    }
+  } catch {
+    // The ambient monitor remains best-effort if the shared suppression store is unreadable.
+  }
   if (state.lastScanAt && nowMs - Date.parse(state.lastScanAt) < cfg.intervalMs) return 0;
 
   let connections: Awaited<ReturnType<typeof listConnectedToolkits>>;
@@ -301,6 +322,7 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
   const surfaced = new Set(state.surfacedIds);
   const seenKeys = new Set<string>();
   const candidates: Array<{ ev: CalEvent; score: EventScore; label: string; connectionId: string; slug: string }> = [];
+  let suppressionChanged = false;
 
   for (const cal of calendars) {
     if (isConnectionSuppressed(state, cal.connectionId, nowMs)) {
@@ -314,6 +336,7 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
     } catch (err) {
       const suppression = suppressConnectionAfterHardAuthFailure(state, cal.connectionId, err, nowMs);
       if (suppression) {
+        suppressionChanged = true;
         logger.warn({
           err,
           slug: cal.slug,
@@ -347,11 +370,19 @@ export async function processCalendarMonitor(deps: CalendarMonitorDeps = REAL_DE
   }
 
   const persisted = [...surfaced].filter((k) => seenKeys.has(k)).slice(-SURFACED_IDS_CAP);
+  const suppressedConnections = pruneConnectionSuppressions(state, nowMs);
   deps.saveState({
     lastScanAt: new Date(nowMs).toISOString(),
     surfacedIds: persisted,
-    suppressedConnections: pruneConnectionSuppressions(state, nowMs),
+    suppressedConnections,
   });
+  if ((sharedSuppressionsLoaded || suppressionChanged) && deps.saveConnectionSuppressions) {
+    try {
+      deps.saveConnectionSuppressions({ suppressedConnections }, nowMs);
+    } catch {
+      // Local monitor state was already persisted; shared store propagation is best-effort.
+    }
+  }
 
   if (toSurface.length > 0) logger.info({ surfaced: toSurface.length, scanned: calendars.length }, 'calendar-monitor surfaced needs-you events');
   return toSurface.length;

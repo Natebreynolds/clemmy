@@ -19,6 +19,7 @@ const {
   composioThrownErrorOutput,
   asyncResultItemCount,
   normalizeInlineConnectedAccountId,
+  applySuppressedComposioConnectionPolicy,
   buildComposioStatusPayload,
 } = await import('./composio-tools.js');
 const {
@@ -109,6 +110,93 @@ test('normalizeInlineConnectedAccountId lets the explicit outer connection win a
   const junk = normalizeInlineConnectedAccountId({ connected_account_id: 'null', q: 'x' }, undefined);
   assert.equal(junk.connectedAccountId, undefined);
   assert.deepEqual(junk.args, { q: 'x' });
+});
+
+test('applySuppressedComposioConnectionPolicy repairs stale pins for read-only Composio calls', () => {
+  const routed = applySuppressedComposioConnectionPolicy(
+    'OUTLOOK_LIST_MAIL_FOLDER_MESSAGES',
+    'ca_expired',
+    {
+      suppressedConnections: {
+        ca_expired: {
+          reason: 'expired',
+          suppressUntil: '2026-07-10T00:00:00.000Z',
+          lastErrorAt: '2026-07-09T00:00:00.000Z',
+          failures: 2,
+        },
+      },
+    },
+    Date.parse('2026-07-09T12:00:00.000Z'),
+  );
+
+  assert.equal(routed.connectedAccountId, undefined);
+  assert.match(routed.note ?? '', /Ignored suppressed OUTLOOK connection ca_expired/);
+  assert.equal(routed.block, undefined);
+});
+
+test('applySuppressedComposioConnectionPolicy treats read-side batch getters as repairable reads', () => {
+  const routed = applySuppressedComposioConnectionPolicy(
+    'GOOGLESHEETS_BATCH_GET',
+    'ca_expired_sheet',
+    {
+      suppressedConnections: {
+        ca_expired_sheet: {
+          reason: 'expired',
+          suppressUntil: '2026-07-10T00:00:00.000Z',
+          failures: 1,
+        },
+      },
+    },
+    Date.parse('2026-07-09T12:00:00.000Z'),
+  );
+
+  assert.equal(routed.connectedAccountId, undefined);
+  assert.match(routed.note ?? '', /GOOGLESHEETS/);
+  assert.equal(routed.block, undefined);
+});
+
+test('applySuppressedComposioConnectionPolicy blocks mutating calls on quarantined accounts', () => {
+  const routed = applySuppressedComposioConnectionPolicy(
+    'GMAIL_SEND_EMAIL',
+    'ca_bad_sender',
+    {
+      suppressedConnections: {
+        ca_bad_sender: {
+          reason: 'entity-mismatch',
+          suppressUntil: '2026-07-16T00:00:00.000Z',
+          lastErrorAt: '2026-07-09T00:00:00.000Z',
+          failures: 1,
+        },
+      },
+    },
+    Date.parse('2026-07-09T12:00:00.000Z'),
+  );
+
+  assert.equal(routed.connectedAccountId, 'ca_bad_sender');
+  assert.match(routed.block ?? '', /COMPOSIO_CONNECTION_SUPPRESSED/);
+  assert.match(routed.block ?? '', /Do NOT retry this connection id/);
+  assert.match(routed.block ?? '', /do not silently switch accounts/i);
+});
+
+test('applySuppressedComposioConnectionPolicy ignores expired quarantine windows', () => {
+  const routed = applySuppressedComposioConnectionPolicy(
+    'OUTLOOK_LIST_MAIL_FOLDER_MESSAGES',
+    'ca_old',
+    {
+      suppressedConnections: {
+        ca_old: {
+          reason: 'expired',
+          suppressUntil: '2026-07-08T00:00:00.000Z',
+          failures: 1,
+        },
+      },
+    },
+    Date.parse('2026-07-09T12:00:00.000Z'),
+  );
+
+  assert.equal(routed.connectedAccountId, 'ca_old');
+  assert.equal(routed.note, undefined);
+  assert.equal(routed.block, undefined);
 });
 
 test('buildComposioStatusPayload puts usable connections first and does not expose suppressed ids by default', () => {

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import type { RuntimeContextValue } from '../types.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 
 /**
  * Planner sub-agent — the deliberate planning step the orchestrator
@@ -139,9 +139,155 @@ export const PlanSchema = z.object({
 
 export type Plan = z.infer<typeof PlanSchema>;
 
-export function buildPlannerAgent(): Agent<RuntimeContextValue, typeof PlanSchema> {
+function parsePlannerJson(value: unknown): unknown | null {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const candidate = extractJsonCandidate(value);
+  if (!candidate) return null;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function compactString(value: unknown, max = 1000): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, max) : '';
+}
+
+function stringArray(value: unknown, max: number): string[] {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/\n|;/)
+      : [];
+  const out: string[] = [];
+  for (const item of raw) {
+    const s = compactString(item, 500);
+    if (s && !out.includes(s)) out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function normalizeComplexity(value: unknown): Plan['estimatedComplexity'] {
+  const raw = compactString(value, 40).toLowerCase();
+  if (raw === 'trivial' || raw === 'moderate' || raw === 'significant' || raw === 'large') return raw;
+  if (/simple|small|easy|quick/.test(raw)) return 'moderate';
+  if (/multi|complex|hard/.test(raw)) return 'significant';
+  return 'moderate';
+}
+
+function boolFrom(value: unknown, fallback = false): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (/^(true|yes|1)$/i.test(value.trim())) return true;
+    if (/^(false|no|0)$/i.test(value.trim())) return false;
+  }
+  return fallback;
+}
+
+function sanitizePlanSteps(value: unknown): Plan['steps'] {
+  const raw = Array.isArray(value) ? value : [];
+  const steps: Plan['steps'] = [];
+  for (const item of raw) {
+    if (steps.length >= 20) break;
+    if (typeof item === 'string') {
+      const action = compactString(item, 1000);
+      if (action.length >= 4) {
+        steps.push({
+          n: steps.length + 1,
+          action,
+          rationale: 'Necessary to complete the requested work.',
+          verification: null,
+        });
+      }
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const obj = item as Record<string, unknown>;
+    const action = compactString(obj.action ?? obj.task ?? obj.step ?? obj.title ?? obj.description, 1000);
+    if (action.length < 4) continue;
+    const nRaw = obj.n ?? obj.number ?? obj.index;
+    const n = typeof nRaw === 'number'
+      ? Math.trunc(nRaw)
+      : typeof nRaw === 'string'
+        ? Number.parseInt(nRaw, 10)
+        : steps.length + 1;
+    const rationale = compactString(obj.rationale ?? obj.why ?? obj.reason, 1000) || 'Necessary to complete the requested work.';
+    const verification = compactString(obj.verification ?? obj.verify ?? obj.check, 1000) || null;
+    steps.push({ n: Number.isFinite(n) && n > 0 ? n : steps.length + 1, action, rationale, verification });
+  }
+  return steps.map((step, index) => ({ ...step, n: index + 1 }));
+}
+
+function sanitizeStages(value: unknown, successCriteria: string[]): Plan['stages'] {
+  if (value === null || value === undefined) return null;
+  const raw = Array.isArray(value) ? value : [];
+  const stages: NonNullable<Plan['stages']> = [];
+  for (const item of raw) {
+    if (stages.length >= 6) break;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const obj = item as Record<string, unknown>;
+    const title = compactString(obj.title ?? obj.name, 200);
+    const criteria = stringArray(obj.criteria ?? obj.successCriteria, 20);
+    if (title.length >= 3 && criteria.length > 0) stages.push({ title, criteria });
+  }
+  return stages.length > 0 ? stages : successCriteria.length > 3 ? null : null;
+}
+
+function sanitizeExternalSends(value: unknown): Plan['externalSends'] {
+  if (value === null || value === undefined) return null;
+  const raw = Array.isArray(value) ? value : [];
+  const sends: NonNullable<Plan['externalSends']> = [];
+  for (const item of raw) {
+    if (sends.length >= 10) break;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const obj = item as Record<string, unknown>;
+    const slug = compactString(obj.slug ?? obj.tool ?? obj.toolSlug, 120);
+    const summary = compactString(obj.summary ?? obj.description ?? obj.target, 500);
+    if (slug.length < 2 || summary.length < 3) continue;
+    const rawCount = obj.count;
+    const parsedCount = typeof rawCount === 'number'
+      ? Math.trunc(rawCount)
+      : typeof rawCount === 'string'
+        ? Number.parseInt(rawCount, 10)
+        : Number.NaN;
+    sends.push({ slug, summary, count: Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : null });
+  }
+  return sends.length > 0 ? sends : null;
+}
+
+export function sanitizePlanOutput(value: unknown): Plan | null {
+  const parsed = parsePlannerJson(value);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  const steps = sanitizePlanSteps(obj.steps ?? obj.plan ?? obj.actions);
+  const successCriteria = stringArray(obj.successCriteria ?? obj.success_criteria ?? obj.criteria, 6);
+  const objective = compactString(obj.objective ?? obj.goal ?? obj.summary, 1000);
+  const candidate: Plan = {
+    objective,
+    steps,
+    successCriteria,
+    stages: sanitizeStages(obj.stages ?? obj.milestones, successCriteria),
+    risks: stringArray(obj.risks, 6),
+    estimatedComplexity: normalizeComplexity(obj.estimatedComplexity ?? obj.estimated_complexity ?? obj.complexity),
+    recommendsTrackedExecution: boolFrom(obj.recommendsTrackedExecution ?? obj.recommends_tracked_execution ?? obj.trackedExecution, false),
+    needsUserInput: stringArray(obj.needsUserInput ?? obj.needs_user_input ?? obj.questions, 5),
+    appliedInstructions: stringArray(obj.appliedInstructions ?? obj.applied_instructions, 8),
+    externalSends: sanitizeExternalSends(obj.externalSends ?? obj.external_sends),
+  };
+  const checked = PlanSchema.safeParse(candidate);
+  return checked.success ? checked.data : null;
+}
+
+export function _testOnly_sanitizePlanOutput(value: unknown): Plan | null {
+  return sanitizePlanOutput(value);
+}
+
+export function buildPlannerAgent(): Agent<RuntimeContextValue> {
   const tools = filterToolsByNames(getCoreTools(), PLANNER_TOOL_NAMES) as Tool<RuntimeContextValue>[];
-  return new Agent<RuntimeContextValue, typeof PlanSchema>({
+  return new Agent<RuntimeContextValue>({
     name: 'Planner',
     instructions: [
       'You are the Planner. Your job is to turn a user request into a clear, inspectable plan — nothing more.',
@@ -158,11 +304,9 @@ export function buildPlannerAgent(): Agent<RuntimeContextValue, typeof PlanSchem
       'Set `recommendsTrackedExecution: true` when the work is multi-system, spans multiple sessions, or has irreversible steps. The orchestrator decides whether to honor this.',
       'ENUMERATE EXTERNAL SENDS: if the plan sends or publishes anything irreversible (emails, posts, DMs, messages), populate `externalSends` — one entry per distinct send SHAPE, with the exact tool/slug you will call (e.g. "OUTLOOK_SEND_EMAIL"), a plain-language summary of who/what it targets, and the count. This is the list the user blesses on approval: matching sends then run hands-off within the goal scope while anything off the list still pauses. List ONLY sends you will actually make; leave null for read-only or local-only plans.',
       'Be honest about risk. "Irreversible delete" is a real risk to call out. "Could break stuff" is not — get specific.',
-      'Return one plan. The orchestrator decides what happens next.',
+      'Return one plan as JSON with keys: objective, steps, successCriteria, stages, risks, estimatedComplexity, recommendsTrackedExecution, needsUserInput, appliedInstructions, externalSends. The orchestrator decides what happens next.',
     ].join('\n\n'),
     model: MODELS.fast,
-    // v0.5.22 — Codex-strict-compatible via centralized normalizer.
-    outputType: normalizeZodForCodexStrict(PlanSchema) as typeof PlanSchema,
     tools,
   });
 }
@@ -185,13 +329,12 @@ export function buildPlannerTool(): Tool<RuntimeContextValue> {
       'After receiving the plan, decide: (a) execute it yourself, using share_plan first when the user should see a safe working plan, (b) ask the user the needsUserInput questions first, (c) refine by calling draft_plan again with more context, or (d) surface_plan when it needs review/approval.',
     ].join(' '),
     customOutputExtractor: async (output) => {
-      // The planner agent's finalOutput is the parsed PlanSchema value.
-      // Serialize so the orchestrator sees structured fields it can
-      // reason over rather than free-form text.
+      // The planner agent may return either a parsed object or text/fenced
+      // JSON. Clementine owns the shape tolerance here so a useful plan is not
+      // discarded by provider-specific structured-output validation.
       const final = output.finalOutput;
-      if (final && typeof final === 'object') {
-        return JSON.stringify(final, null, 2);
-      }
+      const plan = sanitizePlanOutput(final);
+      if (plan) return JSON.stringify(plan, null, 2);
       return typeof final === 'string' ? final : JSON.stringify(final ?? {});
     },
   }) as Tool<RuntimeContextValue>;

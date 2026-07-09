@@ -64,6 +64,8 @@ function makeDeps(over: Partial<InboxMonitorDeps> & {
     now: over.now ?? (() => Date.parse('2026-06-16T12:00:00Z')),
     loadState: over.loadState ?? (() => state),
     saveState: over.saveState ?? ((s: any) => { state = s; saved.push(s); }),
+    readConnectionSuppressions: over.readConnectionSuppressions,
+    saveConnectionSuppressions: over.saveConnectionSuppressions,
   };
   return { deps, notified, saved, toolCalls };
 }
@@ -185,6 +187,7 @@ test('processInboxMonitor: watches ALL mailboxes status-agnostically, labels eac
 test('processInboxMonitor: suppresses hard Composio auth failures by connection id', async () => {
   let now = Date.parse('2026-06-16T12:00:00Z');
   const calls: string[] = [];
+  const sharedSaves: any[] = [];
   const { deps, saved } = makeDeps({
     now: () => now,
     intervalMs: 15 * 60_000,
@@ -199,16 +202,43 @@ test('processInboxMonitor: suppresses hard Composio auth failures by connection 
       }
       return outlookResp([]);
     },
+    saveConnectionSuppressions: (s: any) => sharedSaves.push(s),
   });
 
   assert.equal(await processInboxMonitor(deps), 0);
   assert.deepEqual(calls, ['ca_good', 'ca_bad']);
   assert.equal(saved.at(-1)?.suppressedConnections?.ca_bad?.reason, 'expired');
+  assert.equal(sharedSaves.at(-1)?.suppressedConnections?.ca_bad?.reason, 'expired');
 
   calls.length = 0;
   now += 16 * 60_000;
   assert.equal(await processInboxMonitor(deps), 0);
   assert.deepEqual(calls, ['ca_good'], 'the hard-failed stale connection is skipped on the next scan');
+});
+
+test('processInboxMonitor: skips connections suppressed by the shared Composio store', async () => {
+  const sharedSaves: any[] = [];
+  const { deps, toolCalls } = makeDeps({
+    connections: [
+      { slug: 'outlook', connectionId: 'ca_good', status: 'ACTIVE', accountEmail: 'good@example.com' },
+      { slug: 'outlook', connectionId: 'ca_bad', status: 'ACTIVE', accountEmail: 'bad@example.com' },
+    ],
+    readConnectionSuppressions: () => ({
+      suppressedConnections: {
+        ca_bad: {
+          reason: 'entity-mismatch',
+          suppressUntil: '2026-06-17T12:00:00.000Z',
+          lastErrorAt: '2026-06-16T12:00:00.000Z',
+          failures: 1,
+        },
+      },
+    }),
+    saveConnectionSuppressions: (s: any) => sharedSaves.push(s),
+  });
+
+  assert.equal(await processInboxMonitor(deps), 0);
+  assert.deepEqual(toolCalls.map((call) => call.conn), ['ca_good']);
+  assert.equal(sharedSaves.at(-1)?.suppressedConnections?.ca_bad?.reason, 'entity-mismatch');
 });
 
 test('inbox monitor real state loader preserves persisted connection suppressions', () => {

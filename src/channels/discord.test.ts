@@ -12,14 +12,18 @@ import type { PendingApprovalRow } from '../runtime/harness/approval-registry.js
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-discord-test-'));
 const PREV_HOME = process.env.CLEMENTINE_HOME;
 const PREV_HARNESS_WEBHOOK = process.env.CLEMMY_HARNESS_WEBHOOK;
+const PREV_LEGACY_RESPOND_FALLBACK = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_HARNESS_WEBHOOK = 'off';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 
 const { __test__ } = await import('./discord.js');
 
 after(() => {
   if (PREV_HARNESS_WEBHOOK === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
   else process.env.CLEMMY_HARNESS_WEBHOOK = PREV_HARNESS_WEBHOOK;
+  if (PREV_LEGACY_RESPOND_FALLBACK === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = PREV_LEGACY_RESPOND_FALLBACK;
   if (PREV_HOME === undefined) delete process.env.CLEMENTINE_HOME;
   else process.env.CLEMENTINE_HOME = PREV_HOME;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }

@@ -116,7 +116,7 @@ test('orchestrator discovery surface: critical members present, non-orchestrator
   for (const n of [
     'composio_execute_tool', 'memory_forget', 'memory_pin', 'space_save', 'workflow_create',
     'workflow_from_session', 'goal_create', 'run_batch', 'run_tool_program', 'recall_tool_result',
-    'tool_output_query', 'focus_get', 'browser_harness_run', 'pending_action_queue', 'tool_search',
+    'tool_output_query', 'workspace_artifact_query', 'focus_get', 'browser_harness_run', 'pending_action_queue', 'tool_search',
   ]) {
     assert.ok(surface.has(n), `orchestrator discovery surface must include ${n}`);
   }
@@ -129,7 +129,7 @@ test('orchestrator discovery surface: critical members present, non-orchestrator
 
 test('SDK read-only profile: critical reads present, write/execution primitives absent', () => {
   const ro = asSet(CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS);
-  for (const n of ['memory_recall', 'read_file', 'ask_user_question', 'tool_search', 'recall_tool_result', 'skill_read']) {
+  for (const n of ['memory_recall', 'read_file', 'workspace_artifact_query', 'ask_user_question', 'tool_search', 'recall_tool_result', 'skill_read', 'harness_status']) {
     assert.ok(ro.has(n), `read-only must include ${n}`);
   }
   for (const n of ['write_file', 'run_shell_command', 'run_worker', 'composio_execute_tool']) {
@@ -200,7 +200,7 @@ test('code-mode sets: INVARIANT members after the derive flip (equality is now t
   const { readOnly, write } = deriveCodeModeSets();
   assertSetEqual(readOnly, asSet(READ_ONLY_TOOLS), 'exported set mirrors the derivation');
   assertSetEqual(write, asSet(WRITE_TOOLS), 'exported set mirrors the derivation');
-  for (const n of ['memory_recall', 'read_file', 'list_files', 'recall_tool_result', 'tool_output_query', 'skill_read', 'composio_search_tools']) {
+  for (const n of ['memory_recall', 'read_file', 'workspace_artifact_query', 'list_files', 'recall_tool_result', 'tool_output_query', 'skill_read', 'composio_search_tools']) {
     assert.ok(readOnly.has(n), `code-mode read surface must keep ${n}`);
   }
   for (const n of ['composio_execute_tool', 'write_file', 'run_shell_command']) {
@@ -260,7 +260,7 @@ test('B1 guardrail sets: INVARIANT members after the derive flip (the runaway-wr
   for (const n of ['composio_execute_tool', 'write_file', 'run_shell_command', 'notify_user', 'ask_user_question', 'workflow_run']) {
     assert.ok(MUTATING_TOOLS.has(n), `${n} must classify as mutating (tight loop thresholds)`);
   }
-  for (const n of ['read_file', 'list_files', 'memory_recall', 'focus_get', 'recall_tool_result']) {
+  for (const n of ['read_file', 'workspace_artifact_query', 'list_files', 'memory_recall', 'focus_get', 'recall_tool_result']) {
     assert.ok(IDEMPOTENT_TOOLS.has(n), `${n} must classify as idempotent (loose loop thresholds)`);
   }
   assert.ok(CACHE_SAFE_READS.has('read_file') && !CACHE_SAFE_READS.has('git_status'), 'cache-safe stays narrower than idempotent (git_status is volatile)');

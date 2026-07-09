@@ -79,7 +79,104 @@ export async function withJudgeTimeout<T>(work: Promise<T>, timeoutMs = boundary
   }
 }
 
-export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding';
+// ─────────────────────────────────────────────────────────────────
+// Hedged judge call — tail-latency insurance for the boundary lanes.
+//
+// Live 2026-07-08: a degraded-network evening put 7 of 9 boundary judge calls
+// past the (then) 12s deadline with VALID verdicts arriving at 14–19s — the
+// gates silently downgraded to advisory 78% of the time. Raising the deadline
+// to 25s recovers the verdicts but buys them with wall-clock. The structural
+// fix is a HEDGE: start the primary judge; if it hasn't answered by the hedge
+// delay, ALSO start a second cheap judge (the other family when logged in) and
+// take the FIRST parsed verdict. A healthy primary answers in 2–6s and the
+// hedge never fires (zero extra cost); a degraded one gets a second chance at
+// ~hedgeDelay+few-seconds instead of a 25s advisory downgrade.
+// Kill-switch: CLEMMY_JUDGE_HEDGE=off (default on).
+// ─────────────────────────────────────────────────────────────────
+
+export function judgeHedgeEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_JUDGE_HEDGE', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
+/** How long the primary judge gets to itself before the hedge fires. Below the
+ *  healthy p95 (~6s) so a normal call never pays for two, well below the 25s
+ *  deadline so the hedge has room to answer. */
+export function judgeHedgeDelayMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_JUDGE_HEDGE_DELAY_MS', '7000') ?? '7000', 10);
+  return Number.isFinite(raw) && raw >= 500 ? raw : 7000;
+}
+
+export interface HedgedJudgeResult<T> {
+  /** The winning attempt's value, or null when no attempt produced one in time. */
+  value: T | null;
+  winner: 'primary' | 'hedge' | null;
+  /** True when the hedge attempt was actually started (telemetry). */
+  hedgeFired: boolean;
+  /** Errors thrown by attempts (empty on a pure deadline miss) — the call site
+   *  classifies its own failure taxonomy (invalid vs transport). */
+  errors: unknown[];
+}
+
+/**
+ * Race a primary judge attempt against a delayed hedge attempt under one
+ * deadline. Attempts are thunks that RESOLVE with a parsed verdict and THROW
+ * on transport/parse failure — a primary failure before the hedge delay
+ * starts the hedge immediately (no dead air). The loser is abandoned, never
+ * awaited (both are single fail-open/advisory calls, safe to drop).
+ */
+export async function withJudgeHedge<T>(
+  primary: () => Promise<T>,
+  hedge: (() => Promise<T>) | null,
+  opts: { hedgeDelayMs?: number; timeoutMs?: number } = {},
+): Promise<HedgedJudgeResult<T>> {
+  const timeoutMs = opts.timeoutMs ?? boundaryJudgeTimeoutMs();
+  const hedgeThunk = judgeHedgeEnabled() ? hedge : null;
+  const hedgeDelayMs = Math.min(opts.hedgeDelayMs ?? judgeHedgeDelayMs(), timeoutMs);
+  return await new Promise((resolve) => {
+    let settled = false;
+    let hedgeFired = false;
+    let primaryFailed = false;
+    let hedgeFailed = false;
+    const errors: unknown[] = [];
+    let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (value: T | null, winner: 'primary' | 'hedge' | null) => {
+      if (settled) return;
+      settled = true;
+      if (hedgeTimer) clearTimeout(hedgeTimer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      resolve({ value, winner, hedgeFired, errors });
+    };
+
+    const startHedge = () => {
+      if (settled || hedgeFired || !hedgeThunk) return;
+      hedgeFired = true;
+      hedgeThunk().then(
+        (v) => finish(v, 'hedge'),
+        (err) => {
+          errors.push(err);
+          hedgeFailed = true;
+          if (primaryFailed) finish(null, null);
+        },
+      );
+    };
+
+    deadlineTimer = setTimeout(() => finish(null, null), timeoutMs);
+    if (hedgeThunk) hedgeTimer = setTimeout(startHedge, hedgeDelayMs);
+    primary().then(
+      (v) => finish(v, 'primary'),
+      (err) => {
+        errors.push(err);
+        primaryFailed = true;
+        if (!hedgeThunk || hedgeFailed) { finish(null, null); return; }
+        startHedge(); // don't wait out the delay behind a dead primary
+      },
+    );
+  });
+}
+
+export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding' | 'certify' | 'watcher';
 export type JudgeMetricOutcome = 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error';
 
 export interface JudgeMetricRecord {
@@ -123,7 +220,7 @@ interface JudgeMetricAggregate extends JudgeMetricLaneSnapshot {
   totalMs: number;
 }
 
-const JUDGE_METRIC_LANES: JudgeMetricLane[] = ['completion', 'grounding', 'goal_fidelity', 'output_grounding'];
+const JUDGE_METRIC_LANES: JudgeMetricLane[] = ['completion', 'grounding', 'goal_fidelity', 'output_grounding', 'certify', 'watcher'];
 const judgeMetrics = new Map<JudgeMetricLane, JudgeMetricAggregate>();
 
 function emptyJudgeMetricAggregate(lane: JudgeMetricLane): JudgeMetricAggregate {

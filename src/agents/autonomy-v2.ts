@@ -7,7 +7,7 @@ import { getOpenAiApiKey, getRuntimeEnv, MODELS } from '../config.js';
 import { getCoreTools } from '../tools/registry.js';
 import { getOrCreateConfiguredMcpServers } from '../runtime/mcp-servers.js';
 import { autonomyV2OutputGuardrails } from './autonomy-guardrails.js';
-import { normalizeZodForCodexStrict } from '../runtime/schema-normalizer.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { getProactivityPolicySnapshot, type ProactivityPolicy, type ProactivityPolicySnapshot } from './proactivity-policy.js';
 import { renderOpenCheckInsForAgent } from './check-ins.js';
 import { getProposalFeedback, renderProposalFeedback } from './proposal-feedback.js';
@@ -135,6 +135,66 @@ export const AgentDecisionSchema = z.object({
 });
 
 export type AgentDecisionV2 = z.infer<typeof AgentDecisionSchema>;
+
+function parseDecisionJson(value: unknown): unknown | null {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const candidate = extractJsonCandidate(value);
+  if (!candidate) return null;
+  try {
+    return JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function cleanDecisionString(value: unknown, max = 1200): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, max) : '';
+}
+
+function cleanStringArray(value: unknown, max: number): string[] {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/\n|;/)
+      : [];
+  const out: string[] = [];
+  for (const item of raw) {
+    const s = cleanDecisionString(item, 500);
+    if (s && !out.includes(s)) out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+export function sanitizeAgentDecisionOutput(value: unknown): AgentDecisionV2 | null {
+  const parsed = parseDecisionJson(value);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    if (typeof value === 'string') {
+      const summary = cleanDecisionString(value, 1200);
+      if (summary) return { summary, commitments: [] };
+    }
+    return null;
+  }
+  const obj = parsed as Record<string, unknown>;
+  const rawFollowUp = obj.followUpMinutes ?? obj.follow_up_minutes ?? obj.nextWakeMinutes ?? obj.next_wake_minutes;
+  const followUp = typeof rawFollowUp === 'number'
+    ? Math.trunc(rawFollowUp)
+    : typeof rawFollowUp === 'string'
+      ? Number.parseInt(rawFollowUp, 10)
+      : undefined;
+  const candidate: AgentDecisionV2 = {
+    summary: cleanDecisionString(obj.summary ?? obj.message ?? obj.result ?? obj.report, 1200),
+    commitments: cleanStringArray(obj.commitments ?? obj.followUps ?? obj.follow_ups, 8),
+    ...(Number.isFinite(followUp) ? { followUpMinutes: followUp } : {}),
+  };
+  const checked = AgentDecisionSchema.safeParse(candidate);
+  return checked.success ? checked.data : null;
+}
+
+export function _testOnly_sanitizeAgentDecisionOutput(value: unknown): AgentDecisionV2 | null {
+  return sanitizeAgentDecisionOutput(value);
+}
 
 // -------- Inbox + state --------
 // We re-read v1's on-disk inbox / state directly so v2 stays compatible
@@ -476,7 +536,7 @@ function buildAgentInstructions(agent: TeamAgentRecord, policy: ProactivityPolic
 // Building an Agent is cheap, but caching avoids per-tick churn and
 // gives us a stable EventEmitter to attach hooks to per slug.
 
-type AutonomyAgent = Agent<RuntimeContextValue, typeof AgentDecisionSchema>;
+type AutonomyAgent = Agent<RuntimeContextValue>;
 
 interface AgentCacheEntry {
   record: TeamAgentRecord;
@@ -618,13 +678,10 @@ async function getAgent(record: TeamAgentRecord, policy: ProactivityPolicy): Pro
     })
     : undefined;
 
-  const agent: AutonomyAgent = new Agent<RuntimeContextValue, typeof AgentDecisionSchema>({
+  const agent: AutonomyAgent = new Agent<RuntimeContextValue>({
     name: record.name,
     instructions: buildAgentInstructions(record, policy),
     model: record.model ?? MODELS.fast,
-    // v0.5.22 — Codex-strict-compatible via centralized normalizer.
-    outputType: normalizeZodForCodexStrict(AgentDecisionSchema) as typeof AgentDecisionSchema,
-    outputGuardrails: autonomyV2OutputGuardrails,
     tools,
     handoffs,
     // Single namespace-shimmed MCP server — flattens every configured
@@ -740,6 +797,15 @@ function attachToolHooks(agent: AutonomyAgent): void {
   });
 }
 
+async function assertAutonomyDecisionGuardrails(decision: AgentDecisionV2): Promise<void> {
+  for (const guardrail of autonomyV2OutputGuardrails) {
+    const result = await guardrail.execute({ agentOutput: decision } as never);
+    if (result.tripwireTriggered) {
+      throw new Error(`Autonomy decision rejected by ${guardrail.name}: ${String(result.outputInfo ?? 'guardrail triggered')}`);
+    }
+  }
+}
+
 // -------- Main cycle --------
 //
 // Phase 2 removed executeDecisionActions — the SDK Runner now executes
@@ -787,10 +853,11 @@ async function runAgentCycleV2(record: TeamAgentRecord): Promise<{ runId: string
       maxTurns: 8,
     });
 
-    const decision = result.finalOutput as AgentDecisionV2 | undefined;
+    const decision = sanitizeAgentDecisionOutput(result.finalOutput);
     if (!decision) {
-      throw new Error('Agent run completed but produced no structured output.');
+      throw new Error('Agent run completed but produced no usable decision output.');
     }
+    await assertAutonomyDecisionGuardrails(decision);
 
     recordAutonomyResponse(runId, JSON.stringify(decision));
     recordAutonomyDecision(runId, {

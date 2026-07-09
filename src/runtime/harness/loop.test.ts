@@ -71,6 +71,7 @@ const { listEvents: listEventsForConv } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const { getPlanScope, isAutoApprovedByScope } = await import('../../agents/plan-scope.js');
 const { rememberFact } = await import('../../memory/facts.js');
+const { recordStepResult, takeStepResult, clearStepResult } = await import('../../tools/step-result-tool.js');
 
 test.after(() => {
   try {
@@ -2509,6 +2510,82 @@ test('runConversation: a non-envelope plain-text final output is a VALID complet
   );
 });
 
+test('runConversation: captured workflow_step_result terminates despite punt-shaped final prose and leaves payload for runner', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'workflow' });
+  clearStepResult(sess.id);
+  let calls = 0;
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    calls += 1;
+    recordStepResult(sess.id, { rows: [{ id: 1 }], total: 1 });
+    return { history: items, lastResponseId: undefined, finalOutput: 'Done.' };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run one workflow step',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.steps, 1);
+  assert.equal(calls, 1, 'captured step result must not trigger a repair/retry turn');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completed.at(-1)?.data.reason, 'workflow_step_result_captured');
+  const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted', 'guardrail_tripped'] });
+  assert.equal(retries.length, 0, 'step result capture bypasses missing-reply/stall repair');
+  assert.deepEqual(
+    takeStepResult(sess.id),
+    { found: true, value: { rows: [{ id: 1 }], total: 1 } },
+    'runConversation must peek only; workflow runner still owns the payload',
+  );
+});
+
+test('runConversation: fake workflow_step_result transcript is materialized into the structural result channel', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'workflow' });
+  clearStepResult(sess.id);
+  let calls = 0;
+  const fakeCall = [
+    'Calling `workflow_step_result` with the required payload now.',
+    '',
+    '<function_calls>',
+    '<invoke name="workflow_step_result">',
+    '<parameter name="report">ok</parameter>',
+    '</invoke>',
+    '</function_calls>',
+    '',
+    'Done.',
+  ].join('\n');
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    calls += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: fakeCall };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'run one workflow step',
+    maxSteps: 3,
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(calls, 1, 'structural fake transcript is safe to materialize without another model turn');
+  const captured = listEventsForConv(sess.id, { types: ['heartbeat'] })
+    .filter((event) => event.data.kind === 'workflow_step_result_transcript_captured');
+  assert.equal(captured.length, 1);
+  const retries = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retries.length, 0);
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(completed.at(-1)?.data.reason, 'workflow_step_result_captured');
+  assert.deepEqual(
+    takeStepResult(sess.id),
+    { found: true, value: { report: 'ok' } },
+  );
+});
+
 // ─── Plain-text marker contract: parse table ──────────────────────────────
 test('toOrchestratorDecision: plain-text marker parse table (ASK / CONTINUE / no-marker / case / whitespace)', () => {
   // No marker → the whole text is the completed, user-facing reply (fail-open).
@@ -3605,6 +3682,46 @@ test('runConversation: structured zero-tool completion claim is retried', async 
   assert.equal(retryEvents.length, 1);
 });
 
+test('runConversation: plain self-reported no-tool-access completion is retried', async () => {
+  // Live background repro bg-mrbqprgv (2026-07-08): the model returned a
+  // plain-text "this environment has no tool access" answer. The markerless
+  // text parser treated it as a completed reply, so the background task banked
+  // a hollow done. This must route through the same zero-tool retry path.
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let scriptIndex = 0;
+  const scripted: unknown[] = [
+    'Nothing new - this environment has no tool access (Composio, Google Sheets, DataForSEO, or file I/O are not exposed to me here), so I cannot fetch search volumes, create a Google Sheet, or verify anything.',
+    {
+      summary: 'All set after retry.',
+      reply: 'Done after retry.',
+      done: true,
+      nextAction: 'completed',
+      reason: null,
+    },
+  ];
+  const runRunner: RunRunnerFn = async (_r, _a, items) => {
+    const output = scripted[scriptIndex] ?? scripted[scripted.length - 1];
+    scriptIndex += 1;
+    return { history: items, lastResponseId: undefined, finalOutput: output };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'create the SEO volume tracker sheet',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  const stuckEvents = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.equal(stuckEvents.length, 1);
+  assert.equal((stuckEvents[0].data as { kind: string }).kind, 'tool_unavailable_self_report');
+  const retryEvents = listEventsForConv(sess.id, { types: ['stall_retry_attempted'] });
+  assert.equal(retryEvents.length, 1);
+});
+
 // BUG 1 (2026-06-15 Brooke email-find): a done:true completion that REPORTS the
 // result of work done in PRIOR turns must NOT be flagged a zero-tool prose claim.
 test('runConversation: done:true completion reporting PRIOR tool work is NOT a zero-tool stall (Brooke fix)', async () => {
@@ -3790,10 +3907,42 @@ test('toOrchestratorDecision: a hallucinated tool transcript AFTER a lead-in sen
     'Let me find the correct file path.\n\n**Tool Call: run_shell_command**\nStatus: Completed\n\nTerminal:\n' +
     '```\nfind /Users/n/.clementine-next -iname "*market-leader*"\n```';
   assert.equal(toOrchestratorDecision(fake), null, 'a lead-in sentence must not launder a fake transcript into a reply');
+  assert.equal(
+    toOrchestratorDecision('Calling `workflow_step_result` now with the required payload.'),
+    null,
+    'a short tool-call announcement with no payload is still a punt',
+  );
   // A real reply with an "Options:"-style heading before a fence still completes.
   const real = 'Options:\n\n```\nnpm run build\n```\nRun the first one and the site rebuilds.';
   const d = toOrchestratorDecision(real);
   assert.ok(d && d.done === true, 'a plain heading before a fence is a real reply, not a transcript');
+});
+
+test('runConversation: a "**Tool: read**" missing-argument transcript is retried as a fake tool call, not completed', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const fake = "**Tool: read**\n\n*(No `path` provided in the assistant's tool call — the harness will supply required params.)*";
+  const runRunner: RunRunnerFn = async (_agent, items) => ({
+    history: items as never,
+    lastResponseId: undefined,
+    finalOutput: fake,
+    toolCalls: 0,
+  } as never);
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Read the transcript file and save the analysis JSON.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.completedReason, 'sub_agent_stalled');
+  const stuck = listEventsForConv(sess.id, { types: ['stuck_detected'] });
+  assert.ok(stuck.length >= 1, 'fake tool transcript must be detected before completion');
+  assert.equal((stuck[0].data as { fakeToolTranscript?: boolean }).fakeToolTranscript, true);
+  assert.equal((stuck[0].data as { toolName?: string }).toolName, 'read');
 });
 
 test('runConversation: a SHORT announcement repeated across retries is still a stall — never salvaged', async () => {
@@ -4026,6 +4175,15 @@ test('speed: a hanging embeddings provider cannot gate model dispatch (fire-and-
 test('plain-text decision: a hallucinated tool call as markdown is a PUNT, not a completed reply (2026-07-08 Joshua Tree deploy)', () => {
   const fake = '**run_shell_command**\n```\ncd /Users/n/Projects/site && netlify deploy --dir "." --prod\n```';
   assert.equal(toOrchestratorDecision(fake), null, 'tool-shaped heading + fence must route to the stall nudge');
+  const xmlFake = [
+    'Calling `workflow_step_result` with the required payload now.',
+    '<function_calls>',
+    '<invoke name="workflow_step_result">',
+    '<parameter name="report">GENERIC_HARNESS_STEP</parameter>',
+    '</invoke>',
+    '</function_calls>',
+  ].join('\n');
+  assert.equal(toOrchestratorDecision(xmlFake), null, 'Claude-style XML function_calls must route to the stall nudge');
   // A real reply that mentions a command inline (longer, prose-led) still completes.
   const real = `The site is live at https://example.netlify.app — I deployed it with netlify deploy after building all sections. ${'Detail. '.repeat(300)}`;
   const d = toOrchestratorDecision(real);

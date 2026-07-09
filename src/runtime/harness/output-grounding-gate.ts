@@ -333,12 +333,12 @@ export function buildOutputGroundingPrompt(claims: NumericClaim[], sources: Grou
     '=== SOURCE TOOL RESULTS (this session; research before confirmations) ===',
     ...sources.map((s) => `--- ${s.callId} (${s.tool ?? 'unknown'}, ${s.createdAt}) ---\n${s.excerpt}`),
     '',
-    'Respond with the structured verdict.',
+    'Respond with exactly one verdict line.',
   ].join('\n');
 }
 
 async function runOutputGroundingJudge(claims: NumericClaim[], sources: GroundingSource[]): Promise<OutputGroundingVerdict> {
-  const [{ Agent, Runner }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
+  const [{ Agent, Runner }, { resolveBoundaryJudge, resolveBoundaryJudgeHedge }, { withJudgeHedge, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('./debate-model.js'),
     import('./judge-family.js'),
@@ -348,54 +348,67 @@ async function runOutputGroundingJudge(claims: NumericClaim[], sources: Groundin
   // markers, an optional "| FIGURES:" list carrying the offending figures (the
   // only offending field consumed downstream). A regex parses it; no schema left
   // to reject a valid verdict on presentation.
+  //
+  // HEDGED (judge-family.ts): a slow/dead primary is raced by a cheap judge
+  // from the other flagship family after the hedge delay — a real verdict at
+  // ~hedge-delay+seconds instead of a 25s advisory downgrade.
   const routing = resolveBoundaryJudge();
-  const agent = new Agent({
-    name: 'OutputGroundingJudge',
-    instructions: [
-      "Verify a deliverable's numeric claims against the session's own captured tool results. Accept derived/rounded/aggregated figures (fail open when the sources are silent or ambiguous).",
-      'Reply with EXACTLY ONE LINE and nothing else, one of:',
-      '"GROUNDED: <one short sentence why the figures are consistent>";',
-      '"CONTRADICTED: <the contradiction found> | FIGURES: <the failing figures, semicolon-separated, e.g. $24.5K; 18%>" — a figure conflicts with a source value that no rounding/aggregation reconciles;',
-      '"UNVERIFIABLE: <why> | FIGURES: <the unsourced figures, semicolon-separated>" — a load-bearing figure has NO plausible source.',
-      'Omit the "| FIGURES:" part for GROUNDED.',
-    ].join(' '),
-    model: routing.model ?? routing.modelId,
-    modelSettings: { reasoning: { effort: 'low' } },
-    tools: [],
-  });
-  const runner = new Runner({ workflowName: 'clementine-output-grounding-judge' });
+  const hedgeRouting = resolveBoundaryJudgeHedge(routing);
+  type Routing = typeof routing;
+  const mkAgent = (r: Routing) =>
+    new Agent({
+      name: 'OutputGroundingJudge',
+      instructions: [
+        "Verify a deliverable's numeric claims against the session's own captured tool results. Accept derived/rounded/aggregated figures (fail open when the sources are silent or ambiguous).",
+        'Reply with EXACTLY ONE LINE and nothing else, one of:',
+        '"GROUNDED: <one short sentence why the figures are consistent>";',
+        '"CONTRADICTED: <the contradiction found> | FIGURES: <the failing figures, semicolon-separated, e.g. $24.5K; 18%>" — a figure conflicts with a source value that no rounding/aggregation reconciles;',
+        '"UNVERIFIABLE: <why> | FIGURES: <the unsourced figures, semicolon-separated>" — a load-bearing figure has NO plausible source.',
+        'Omit the "| FIGURES:" part for GROUNDED.',
+      ].join(' '),
+      model: r.model ?? r.modelId,
+      modelSettings: { reasoning: { effort: 'low' } },
+      tools: [],
+    });
   const startedAt = Date.now();
-  let recorded = false;
-  const record = (outcome: 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error') => {
-    recorded = true;
+  const record = (outcome: 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error', r: Routing = routing) => {
     recordJudgeMetric({
       lane: 'output_grounding',
       outcome,
       durationMs: Date.now() - startedAt,
-      modelId: routing.modelId,
-      judgeFamily: routing.judgeFamily,
-      brainFamily: routing.brainFamily,
-      selfJudge: routing.selfJudge,
+      modelId: r.modelId,
+      judgeFamily: r.judgeFamily,
+      brainFamily: r.brainFamily,
+      selfJudge: r.selfJudge,
     });
   };
-  try {
-    const result = await withJudgeTimeout(runner.run(agent, buildOutputGroundingPrompt(claims, sources), { maxTurns: 1 }));
-    if (!result) {
-      record('timeout');
-      throw new Error('output-grounding judge timed out');
-    }
+  class InvalidVerdict extends Error {}
+  const prompt = buildOutputGroundingPrompt(claims, sources);
+  const attempt = (r: Routing) => async (): Promise<OutputGroundingVerdict> => {
+    const runner = new Runner({ workflowName: 'clementine-output-grounding-judge' });
+    const result = await runner.run(mkAgent(r), prompt, { maxTurns: 1 });
     const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
     const verdict = parseOutputGroundingVerdict(raw);
-    if (!verdict) {
-      record('invalid');
-      throw new Error(`output-grounding judge returned no GROUNDED/CONTRADICTED/UNVERIFIABLE verdict (got: ${raw.slice(0, 120)})`);
-    }
-    record(verdict.verdict === 'grounded' ? 'passed' : (verdict.verdict === 'unverifiable' ? 'advisory' : 'blocked'));
+    if (!verdict) throw new InvalidVerdict(`output-grounding judge returned no GROUNDED/CONTRADICTED/UNVERIFIABLE verdict (got: ${raw.slice(0, 120)})`);
     return verdict;
-  } catch (err) {
-    if (!recorded) record('error');
-    throw err;
+  };
+  const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+  if (raced.value) {
+    const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
+    record(raced.value.verdict === 'grounded' ? 'passed' : (raced.value.verdict === 'unverifiable' ? 'advisory' : 'blocked'), winner);
+    return raced.value;
   }
+  if (raced.errors.length === 0) {
+    record('timeout');
+    throw new Error('output-grounding judge timed out');
+  }
+  const invalid = raced.errors.find((e) => e instanceof InvalidVerdict);
+  if (invalid) {
+    record('invalid');
+    throw invalid;
+  }
+  record('error');
+  throw raced.errors[0] instanceof Error ? raced.errors[0] : new Error(String(raced.errors[0]));
 }
 
 // ─────────────────────────────────────────────────────────────────

@@ -276,6 +276,17 @@ export const EVENT_TYPES = [
   // supersededAt?}. Absent when a genuine dead-end apology has no recovery,
   // so the sole reply still renders. (2026-07-03.)
   'conversation_superseded',
+  // Restart recovery decision: emitted once per interrupted chat session found
+  // on boot, before the visible recovery notice/resume dispatch. Carries the
+  // safety evidence behind auto-resume vs manual-continue so restart recovery is
+  // auditable from the event log, not only from daemon boot logs.
+  'restart_recovery_decision',
+  // Judge verdict audit row (T3-B4 verdict door): ONE canonical event for every
+  // completion/goal/target/delivery judge verdict, emitted by the call sites
+  // that own the session context. Carries {door, pass, reason, failedOpen,
+  // selfJudge, durationMs?, detail?} so run views and forensics read verdicts
+  // from the event log instead of scraping heartbeats and prose.
+  'verdict_recorded',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

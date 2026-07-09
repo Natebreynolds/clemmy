@@ -1213,6 +1213,19 @@ function serializeInputItem(item: AgentInputItem): unknown {
       status: anyItem.status,
     };
   }
+  if (anyItem.type === 'function_call_output') {
+    const callId = typeof anyItem.callId === 'string'
+      ? anyItem.callId
+      : typeof anyItem.call_id === 'string'
+        ? anyItem.call_id
+        : undefined;
+    return {
+      type: 'function_call_output',
+      call_id: callId,
+      output: typeof anyItem.output === 'string' ? anyItem.output : JSON.stringify(anyItem.output ?? null),
+      status: anyItem.status,
+    };
+  }
   // Reasoning items — pass the encrypted_content blob through so codex
   // can resume reasoning state without re-deriving it.
   if (anyItem.type === 'reasoning') {

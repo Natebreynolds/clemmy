@@ -90,6 +90,8 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
   assert.ok(captured.allowedLocalMcpTools.includes('memory_search'));
   assert.equal(captured.allowedLocalMcpTools.includes('run_shell_command'), false);
   assert.equal(captured.allowedLocalMcpTools.includes('write_file'), false);
+  assert.equal(captured.nativeMcpScopeInput, 'skill_read');
+  assert.equal(captured.nativeMcpScopeMode, 'resolved_tools');
 });
 
 // ── 2026-06-22 fan-out fix: SDK-lane cap visibility + intent-aware cap ─────────

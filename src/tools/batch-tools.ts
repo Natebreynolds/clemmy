@@ -12,6 +12,7 @@ import { z } from 'zod';
 import {
   certifyBatchPlan,
   formatBatchLedger,
+  prepareBatchPlanForExecution,
   readBatchLedger,
   runBatchPlan,
   validateBatchPlan,
@@ -85,9 +86,17 @@ export function registerBatchTools(server: McpServer): void {
             concurrency: rawPlan.concurrency ?? undefined,
             haltAfterConsecutiveFailures: rawPlan.haltAfterConsecutiveFailures ?? undefined,
           };
-          const errors = validateBatchPlan(plan);
+          const prepared = prepareBatchPlanForExecution(plan);
+          if (prepared.errors.length > 0) {
+            return textResult(`Plan invalid after harness normalization — fix and re-propose:\n${prepared.errors.map((e) => `- ${e}`).join('\n')}`);
+          }
+          const planForExecution = prepared.plan;
+          const errors = validateBatchPlan(planForExecution);
           if (errors.length > 0) return textResult(`Plan invalid — DO NOT re-propose the identical plan; change what the errors name first:\n${errors.map((e) => `- ${e}`).join('\n')}`);
-          const cert = await certifyBatchPlan(plan);
+          const repairNote = prepared.repairs.length > 0
+            ? ` Harness normalized ${prepared.repairs.length} batch item shape(s) before certification.`
+            : '';
+          const cert = await certifyBatchPlan(planForExecution);
           if (!cert.allow) {
             return textResult(
               `Plan REFUSED by certification: ${cert.reason}`
@@ -95,25 +104,25 @@ export function registerBatchTools(server: McpServer): void {
               + '\nFix the payloads and re-propose; do NOT retry the identical plan.',
             );
           }
-          if (plan.sideEffect === 'read') {
-            const ledger = await runBatchPlan(plan, sessionId);
-            return textResult(`Certified (${cert.reason || 'ok'}) and executed.\n${formatBatchLedger(ledger)}`);
+          if (planForExecution.sideEffect === 'read') {
+            const ledger = await runBatchPlan(planForExecution, sessionId);
+            return textResult(`Certified (${cert.reason || 'ok'}).${repairNote} Executed.\n${formatBatchLedger(ledger)}`);
           }
           const record = queuePendingAction({
-            title: `Batch ${plan.sideEffect}: ${plan.objective.slice(0, 80)}`,
-            summary: `run_batch plan · ${plan.tool}${plan.composioSlug ? `/${plan.composioSlug}` : ''} · ${plan.items.length} item(s), executed deterministically after approval. Certification: ${cert.reason || 'allowed'}`,
-            kind: plan.sideEffect === 'send' ? 'external_send' : 'external_write',
+            title: `Batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 80)}`,
+            summary: `run_batch plan · ${planForExecution.tool}${planForExecution.composioSlug ? `/${planForExecution.composioSlug}` : ''} · ${planForExecution.items.length} item(s), executed deterministically after approval. Certification: ${cert.reason || 'allowed'}${repairNote}`,
+            kind: planForExecution.sideEffect === 'send' ? 'external_send' : 'external_write',
             toolName: 'run_batch',
-            payload: plan,
-            targetSummary: `${plan.items.length} item(s): ${plan.items.map((i) => i.id).slice(0, 12).join(', ')}${plan.items.length > 12 ? ' …' : ''}`,
-            preview: JSON.stringify(plan.items[0]?.args ?? {}).slice(0, 400),
-            risk: `Executes ${plan.items.length} ${plan.sideEffect} call(s) with no further review; per-call gates and consecutive-failure halt remain active.`,
-            rollback: plan.sideEffect === 'send' ? 'Sends are irreversible once delivered.' : 'Depends on the target tool; the ledger lists every executed item.',
+            payload: planForExecution,
+            targetSummary: `${planForExecution.items.length} item(s): ${planForExecution.items.map((i) => i.id).slice(0, 12).join(', ')}${planForExecution.items.length > 12 ? ' …' : ''}`,
+            preview: JSON.stringify(planForExecution.items[0]?.args ?? {}).slice(0, 400),
+            risk: `Executes ${planForExecution.items.length} ${planForExecution.sideEffect} call(s) with no further review; per-call gates and consecutive-failure halt remain active.`,
+            rollback: planForExecution.sideEffect === 'send' ? 'Sends are irreversible once delivered.' : 'Depends on the target tool; the ledger lists every executed item.',
             sessionId,
             createdBy: 'run_batch',
           });
           return textResult(
-            `Certified (${cert.reason || 'allowed'}) and queued for approval as pending action ${record.id} (${plan.items.length} ${plan.sideEffect} item(s)). `
+            `Certified (${cert.reason || 'allowed'}).${repairNote} Queued for approval as pending action ${record.id} (${planForExecution.items.length} ${planForExecution.sideEffect} item(s)). `
             + `Once it is APPROVED, call run_batch action=execute pending_action_id=${record.id}. Do not execute items yourself.`,
           );
         }
@@ -125,13 +134,18 @@ export function registerBatchTools(server: McpServer): void {
           if (record.status !== 'approved') {
             return textResult(`Pending action ${pending_action_id} is ${record.status} — it must be APPROVED before execution.`);
           }
-          const plan = record.payload as BatchPlan;
+          const prepared = prepareBatchPlanForExecution(record.payload as BatchPlan);
+          if (prepared.errors.length > 0) return textResult(`Stored plan failed normalization (${prepared.errors.join('; ')}) — do not execute; re-propose.`);
+          const plan = prepared.plan;
           const errors = validateBatchPlan(plan);
           if (errors.length > 0) return textResult(`Stored plan failed re-validation (${errors.join('; ')}) — do not execute; re-propose.`);
-          // Certified + approved: the plan passed ONE certification judge over
-          // these exact payloads and approval byte-pins them by payloadHash, so
-          // the per-item LLM boundary judges are skipped at the write boundary.
-          const ledger = await runBatchPlan(plan, sessionId, { certified: { payloadHash: record.payloadHash } });
+          // Certified + approved: clean stored plans passed ONE certification
+          // judge over these exact payloads and approval byte-pins them by
+          // payloadHash, so the per-item LLM boundary judges are skipped. If an
+          // older stored plan needed rescue normalization at execute time, do
+          // NOT claim exact-payload certification; let the per-item judges run.
+          const certified = prepared.repairs.length === 0 ? { payloadHash: record.payloadHash } : undefined;
+          const ledger = await runBatchPlan(plan, sessionId, certified ? { certified } : undefined);
           try {
             recordPendingActionResult(record.id, ledger.failed === 0 && !ledger.halted ? 'executed' : 'failed',
               `${ledger.succeeded}/${ledger.total} succeeded, ${ledger.failed} failed${ledger.halted ? ', HALTED' : ''} (ledger ${ledger.batchId})`);

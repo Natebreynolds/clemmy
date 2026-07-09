@@ -17,7 +17,8 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRunContextStorage } from '../runtime/harness/brackets.js';
-import { appendEvent, writeToolOutput } from '../runtime/harness/eventlog.js';
+import { appendEvent, getToolOutput, writeToolOutput } from '../runtime/harness/eventlog.js';
+import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { deriveCodeModeSets } from './tool-registry.js';
 import { runCodeModeProgram, type CodeModeResult } from './code-mode-sandbox.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
@@ -124,6 +125,111 @@ export const WRITE_TOOLS: ReadonlySet<string> = codeModeSets.write;
 export const READ_ONLY_TOOLS: ReadonlySet<string> = codeModeSets.readOnly;
 
 type InvokableTool = { name: string; invoke?: (ctx: unknown, input: string, details: unknown) => Promise<unknown> };
+
+export interface CodeModeShellResult {
+  ok: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+  raw: string;
+  stdout_json?: unknown;
+  result_handle?: string;
+  truncated_at_write?: boolean;
+}
+
+function strictJsonParse(value: string): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: JSON.parse(value) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function parseStdoutJson(stdout: string): unknown | undefined {
+  const direct = strictJsonParse(stdout.trim());
+  if (direct.ok) return direct.value;
+  const candidate = extractJsonCandidate(stdout);
+  if (!candidate) return undefined;
+  const repaired = strictJsonParse(candidate);
+  return repaired.ok ? repaired.value : undefined;
+}
+
+function sectionAfter(label: 'stdout' | 'stderr', body: string): string {
+  const marker = `${label}:\n`;
+  if (body === marker.slice(0, -1)) return '';
+  if (!body.startsWith(marker)) return '';
+  return body.slice(marker.length);
+}
+
+export function parseShellToolOutput(raw: string, opts: { callId?: string; truncatedAtWrite?: boolean } = {}): CodeModeShellResult | null {
+  const firstLine = raw.match(/^\s*exit_code:\s*([^\n\r]*)/i);
+  if (!firstLine) return null;
+  const parsedCode = Number.parseInt(firstLine[1].trim(), 10);
+  const exitCode = Number.isFinite(parsedCode) ? parsedCode : null;
+  let rest = raw.slice(firstLine[0].length).replace(/^\r?\n\r?\n?/, '');
+  let stdout = '';
+  let stderr = '';
+
+  if (rest.startsWith('stdout:\n')) {
+    const stderrBoundary = rest.indexOf('\n\nstderr:\n');
+    if (stderrBoundary >= 0) {
+      stdout = sectionAfter('stdout', rest.slice(0, stderrBoundary));
+      stderr = sectionAfter('stderr', rest.slice(stderrBoundary + 2));
+    } else {
+      stdout = sectionAfter('stdout', rest);
+    }
+  } else if (rest.startsWith('stderr:\n')) {
+    stderr = sectionAfter('stderr', rest);
+  }
+
+  const result: CodeModeShellResult = {
+    ok: exitCode === 0,
+    exit_code: exitCode,
+    stdout,
+    stderr,
+    raw,
+    ...(opts.callId ? { result_handle: opts.callId } : {}),
+    ...(opts.truncatedAtWrite ? { truncated_at_write: true } : {}),
+  };
+  const stdoutJson = parseStdoutJson(stdout);
+  if (stdoutJson !== undefined) result.stdout_json = stdoutJson;
+  return result;
+}
+
+function parseToolErrorText(raw: string): { ok: false; error: string; raw: string; error_kind: 'tool_error' } | null {
+  const text = raw.trim();
+  if (!text) return null;
+  if (
+    /^Tool call (?:refused|blocked) by harness\b/i.test(text) ||
+    /^An error occurred while running the tool\b/i.test(text) ||
+    /^\s*(?:ERROR|Error|InvalidToolInputError)\b/i.test(text) ||
+    /^MCP error\b/i.test(text) ||
+    /^FAILED \(slug=/i.test(text) ||
+    /^NOT CONNECTED\b/i.test(text)
+  ) {
+    return { ok: false, error: text.slice(0, 2000), raw, error_kind: 'tool_error' };
+  }
+  return null;
+}
+
+export function normalizeCodeModeToolResult(
+  method: string,
+  out: unknown,
+  opts: { sessionId?: string; callId?: string } = {},
+): unknown {
+  if (out == null || typeof out !== 'string') return out ?? null;
+  const parked = opts.sessionId && opts.callId ? getToolOutput(opts.sessionId, opts.callId) : null;
+  const raw = parked?.output ?? out;
+  const shell = method === 'run_shell_command' || /^\s*exit_code:\s*/i.test(raw)
+    ? parseShellToolOutput(raw, { callId: parked ? opts.callId : undefined, truncatedAtWrite: parked?.truncatedAtWrite })
+    : null;
+  if (shell) return shell;
+  const direct = strictJsonParse(raw.trim());
+  if (direct.ok) return direct.value;
+  const toolError = parseToolErrorText(raw);
+  if (toolError) return toolError;
+  return raw;
+}
 
 let toolsByName: Map<string, InvokableTool> | null = null;
 async function realToolsByName(): Promise<Map<string, InvokableTool>> {
@@ -257,9 +363,9 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
     const out = isMcpNamespacedTool(method)
       ? await dispatchCodeModeMcpTool(method, args)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, codeMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
-    if (typeof out !== 'string') return out ?? null;
-    try { return JSON.parse(out); } catch { return out; }
+    const normalized = normalizeCodeModeToolResult(method, out, { sessionId, callId });
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, codeMode: true, preview: (typeof normalized === 'string' ? normalized : JSON.stringify(normalized ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    return normalized;
   } catch (err) {
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: false, codeMode: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 400) } }); } catch { /* best-effort */ }
     throw err;
@@ -388,6 +494,8 @@ export function codeModeDescription(): string {
     'Run ONE short JavaScript program (the body of an async function — use `return` for the result) against the `clem` API instead of emitting many separate tool calls.',
     'Use this for DATA-HEAVY or MULTI-STEP work — loop/filter/paginate/aggregate over many items and `return` only the distilled result, so the large intermediate tool outputs never enter the conversation.',
     'The API is `clem.<tool>(args)` returning a Promise; built-in tools: ' + surface + '.',
+    '`run_shell_command` is normalized inside code mode: it returns `{ ok, exit_code, stdout, stderr, raw, stdout_json? }`, not the model-facing `exit_code:\\nstdout:` text wrapper. For JSON-emitting CLIs, use `result.stdout_json ?? JSON.parse(result.stdout)`; never parse the whole tool result.',
+    'Obvious upstream tool-error banners return structured `{ ok:false, error, raw }`; branch on `ok === false` instead of trying to parse them as data.',
     'You can ALSO call any connected external MCP tool here by its `<server>__<tool>` name — e.g. `await clem["dataforseo__serp_organic_live_advanced"]({...})` — and they run through the SAME gates as a normal MCP call.',
     'BEST USE — do the FETCHES inside the program: for several DataForSEO / SEO / analytics / Salesforce lookups, call ' + fetchTools + ' here (Promise.all the independent ones), distill, and `return` only the small result — NOT many discrete tool calls each dumping raw JSON into the conversation.',
     writes

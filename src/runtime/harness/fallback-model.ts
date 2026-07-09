@@ -25,9 +25,11 @@
  */
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
-import { getRuntimeEnv } from '../../config.js';
+import { BASE_DIR, getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
 import pino from 'pino';
@@ -136,16 +138,136 @@ function authFalloverEnabled(): boolean {
 // event + ONE error log per dead-marking, not a warning per turn.
 interface DeadBrainEntry { reason: string; since: number; until: number }
 const deadBrains = new Map<string, DeadBrainEntry>();
+const DEAD_BRAINS_FILE = path.join(BASE_DIR, 'state', 'brain-auth-dead.json');
+let deadBrainsFile = DEAD_BRAINS_FILE;
+let deadBrainsLoaded = false;
+
+interface SilentBrainEntry { reason: string; firstAt: number; lastAt: number; count: number; until: number }
+const silentBrains = new Map<string, SilentBrainEntry>();
+const SILENT_BRAINS_FILE = path.join(BASE_DIR, 'state', 'brain-silent-cooldown.json');
+let silentBrainsFile = SILENT_BRAINS_FILE;
+let silentBrainsLoaded = false;
 
 function authDeadCooldownMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_AUTH_DEAD_BRAIN_COOLDOWN_MS', '900000') ?? '900000', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 900_000; // default 15 min
 }
 
+function silentBrainThreshold(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_SILENT_BRAIN_THRESHOLD', '2') ?? '2', 10);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2;
+}
+
+function silentBrainWindowMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_SILENT_BRAIN_WINDOW_MS', '600000') ?? '600000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 600_000; // 10 min
+}
+
+function silentBrainCooldownMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_SILENT_BRAIN_COOLDOWN_MS', '300000') ?? '300000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 300_000; // 5 min
+}
+
+function loadDeadBrains(): void {
+  if (deadBrainsLoaded) return;
+  deadBrainsLoaded = true;
+  if (!existsSync(deadBrainsFile)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(deadBrainsFile, 'utf-8')) as Record<string, Partial<DeadBrainEntry>>;
+    const now = Date.now();
+    for (const [label, entry] of Object.entries(parsed)) {
+      if (
+        typeof label === 'string' &&
+        typeof entry.reason === 'string' &&
+        typeof entry.since === 'number' &&
+        typeof entry.until === 'number' &&
+        entry.until > now
+      ) {
+        deadBrains.set(label, { reason: entry.reason, since: entry.since, until: entry.until });
+      }
+    }
+    if (deadBrains.size === 0) {
+      try { rmSync(deadBrainsFile, { force: true }); } catch { /* ignore */ }
+    }
+  } catch {
+    try { rmSync(deadBrainsFile, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+function persistDeadBrains(): void {
+  const now = Date.now();
+  for (const [label, entry] of deadBrains) {
+    if (entry.until <= now) deadBrains.delete(label);
+  }
+  if (deadBrains.size === 0) {
+    try { rmSync(deadBrainsFile, { force: true }); } catch { /* ignore */ }
+    return;
+  }
+  const obj = Object.fromEntries(deadBrains);
+  try {
+    mkdirSync(path.dirname(deadBrainsFile), { recursive: true });
+    writeFileSync(deadBrainsFile, JSON.stringify(obj, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    try { chmodSync(deadBrainsFile, 0o600); } catch { /* best-effort */ }
+  } catch { /* best-effort; in-memory registry still protects this process */ }
+}
+
+function loadSilentBrains(): void {
+  if (silentBrainsLoaded) return;
+  silentBrainsLoaded = true;
+  if (!existsSync(silentBrainsFile)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(silentBrainsFile, 'utf-8')) as Record<string, Partial<SilentBrainEntry>>;
+    const now = Date.now();
+    for (const [label, entry] of Object.entries(parsed)) {
+      if (
+        typeof label === 'string' &&
+        typeof entry.reason === 'string' &&
+        typeof entry.firstAt === 'number' &&
+        typeof entry.lastAt === 'number' &&
+        typeof entry.count === 'number' &&
+        typeof entry.until === 'number' &&
+        (entry.until > now || now - entry.lastAt <= silentBrainWindowMs())
+      ) {
+        silentBrains.set(label, {
+          reason: entry.reason,
+          firstAt: entry.firstAt,
+          lastAt: entry.lastAt,
+          count: Math.max(1, Math.floor(entry.count)),
+          until: entry.until,
+        });
+      }
+    }
+    if (silentBrains.size === 0) {
+      try { rmSync(silentBrainsFile, { force: true }); } catch { /* ignore */ }
+    }
+  } catch {
+    try { rmSync(silentBrainsFile, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+function persistSilentBrains(): void {
+  const now = Date.now();
+  for (const [label, entry] of silentBrains) {
+    if (entry.until <= now && now - entry.lastAt > silentBrainWindowMs()) silentBrains.delete(label);
+  }
+  if (silentBrains.size === 0) {
+    try { rmSync(silentBrainsFile, { force: true }); } catch { /* ignore */ }
+    return;
+  }
+  const obj = Object.fromEntries(silentBrains);
+  try {
+    mkdirSync(path.dirname(silentBrainsFile), { recursive: true });
+    writeFileSync(silentBrainsFile, JSON.stringify(obj, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    try { chmodSync(silentBrainsFile, 0o600); } catch { /* best-effort */ }
+  } catch { /* best-effort; in-memory registry still protects this process */ }
+}
+
 export function markBrainAuthDead(label: string, reason: string, correlation?: { sessionId?: string; workflowRunId?: string }): void {
+  loadDeadBrains();
   const now = Date.now();
   const existing = deadBrains.get(label);
   deadBrains.set(label, { reason, since: existing?.since ?? now, until: now + authDeadCooldownMs() });
+  persistDeadBrains();
   if (existing) return; // already surfaced — just extend the cooldown
   logger.error(
     { brain: label, reason, cooldownMs: authDeadCooldownMs() },
@@ -178,23 +300,95 @@ export function markBrainAuthDead(label: string, reason: string, correlation?: {
 }
 
 export function isBrainAuthDead(label: string): boolean {
+  loadDeadBrains();
   const entry = deadBrains.get(label);
   if (!entry) return false;
-  if (Date.now() >= entry.until) { deadBrains.delete(label); return false; }
+  if (Date.now() >= entry.until) { deadBrains.delete(label); persistDeadBrains(); return false; }
   return true;
+}
+
+function silentFailureReason(err: unknown): string | null {
+  if (err instanceof FirstByteTimeoutError) return 'first-byte-timeout';
+  const kind = normalizedModelFailureReason(err);
+  return kind === 'model.transport_timeout' ? kind : null;
+}
+
+export function isBrainSilenced(label: string): boolean {
+  loadSilentBrains();
+  const entry = silentBrains.get(label);
+  if (!entry) return false;
+  if (Date.now() >= entry.until) {
+    if (Date.now() - entry.lastAt > silentBrainWindowMs()) silentBrains.delete(label);
+    else entry.until = 0;
+    persistSilentBrains();
+    return false;
+  }
+  return entry.until > 0;
+}
+
+function clearBrainSilentFailure(label: string): void {
+  loadSilentBrains();
+  if (!silentBrains.delete(label)) return;
+  persistSilentBrains();
+}
+
+function recordBrainSilentFailure(label: string, err: unknown, correlation?: { sessionId?: string; workflowRunId?: string }): void {
+  const reason = silentFailureReason(err);
+  if (!reason) return;
+  loadSilentBrains();
+  const now = Date.now();
+  const existing = silentBrains.get(label);
+  const inWindow = existing ? now - existing.firstAt <= silentBrainWindowMs() : false;
+  const count = inWindow && existing ? existing.count + 1 : 1;
+  const firstAt = inWindow && existing ? existing.firstAt : now;
+  const alreadySilenced = Boolean(existing && existing.until > now);
+  const shouldSilence = count >= silentBrainThreshold();
+  silentBrains.set(label, {
+    reason,
+    firstAt,
+    lastAt: now,
+    count,
+    until: shouldSilence ? now + silentBrainCooldownMs() : 0,
+  });
+  persistSilentBrains();
+  if (!shouldSilence || alreadySilenced) return;
+  logger.warn(
+    { brain: label, reason, failures: count, windowMs: silentBrainWindowMs(), cooldownMs: silentBrainCooldownMs() },
+    'brain repeatedly silent before content — skipping this brain briefly',
+  );
+  recordOperationalEvent({
+    source: 'model',
+    type: 'brain_silent_cooldown',
+    severity: 'warn',
+    actor: 'fallback-model',
+    sessionId: correlation?.sessionId,
+    workflowRunId: correlation?.workflowRunId,
+    payload: { brain: label, reason, failures: count, cooldownMs: silentBrainCooldownMs() },
+  });
 }
 
 /** Called by the re-auth / brain-switch flows: a fresh grant (or an explicit
  *  user choice) must get an immediate probe, not wait out the cooldown. */
 export function reviveDeadBrains(label?: string): void {
+  loadDeadBrains();
+  loadSilentBrains();
   if (label === undefined) deadBrains.clear();
   else deadBrains.delete(label);
+  if (label === undefined) silentBrains.clear();
+  else silentBrains.delete(label);
+  persistDeadBrains();
+  persistSilentBrains();
 }
 
 /** True when this error is the auth class that should stick. */
 function isAuthDeadReason(err: unknown): boolean {
   const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
   return kind === 'model.auth_expired' || isAuthRecoverableError(err);
+}
+
+function normalizedModelFailureReason(err: unknown): string {
+  const kind = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
+  return kind === 'runtime.unknown' && isAuthRecoverableError(err) ? 'model.auth_expired' : kind;
 }
 
 export function isFalloverError(err: unknown): boolean {
@@ -220,11 +414,11 @@ export class FallbackModel implements Model {
     return false;
   }
 
-  /** The chain minus brains whose auth is marked dead. Never empty: if EVERY
-   *  brain is marked dead, probe the full chain anyway — a token may have been
-   *  refreshed out-of-band, and a failed probe is better than no brain at all. */
+  /** The chain minus brains whose auth is dead or which repeatedly went silent
+   *  before content. Never empty: if EVERY brain is unavailable, probe the full
+   *  chain anyway — tokens may have refreshed or a silent provider may recover. */
   private liveChain(): FallbackTarget[] {
-    const alive = this.chain.filter((t) => !isBrainAuthDead(t.label));
+    const alive = this.chain.filter((t) => !isBrainAuthDead(t.label) && !isBrainSilenced(t.label));
     return alive.length > 0 ? alive : this.chain;
   }
 
@@ -233,7 +427,7 @@ export class FallbackModel implements Model {
    *  — so the very next request routes around it. */
   private markIfAuthDead(chain: FallbackTarget[], i: number, err: unknown): void {
     if (!isAuthDeadReason(err)) return;
-    const reason = err instanceof BoundaryError ? err.kind : classifyModelError(err).kind;
+    const reason = normalizedModelFailureReason(err);
     markBrainAuthDead(chain[i].label, reason, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
   }
 
@@ -251,10 +445,12 @@ export class FallbackModel implements Model {
         const call = chain[i].getModel().getResponse(req);
         const result = await this.withFirstByteTimeout(call, isLast, () => cleanup(true));
         cleanup(false);
+        clearBrainSilentFailure(chain[i].label);
         return result;
       } catch (err) {
         cleanup(true); // release a hung request
         this.markIfAuthDead(chain, i, err);
+        recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         if (this.isFalloverReason(err) && !isLast) {
           this.logFallover(chain, i, err);
           continue;
@@ -288,10 +484,12 @@ export class FallbackModel implements Model {
           cur = await it.next();
         }
         cleanup(false);
+        clearBrainSilentFailure(chain[i].label);
         return; // streamed to completion
       } catch (err) {
         cleanup(true); // release a hung brain
         this.markIfAuthDead(chain, i, err);
+        recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         // Switch only if NOTHING reached the Runner yet (else we'd duplicate a
         // partially-streamed reply) and a next brain exists.
         if (!yieldedAny && this.isFalloverReason(err) && !isLast) {
@@ -308,7 +506,7 @@ export class FallbackModel implements Model {
   }
 
   private logFallover(chain: FallbackTarget[], i: number, err: unknown): void {
-    const reason = err instanceof FirstByteTimeoutError ? 'first-byte-timeout' : (err instanceof BoundaryError ? err.kind : classifyModelError(err).kind);
+    const reason = err instanceof FirstByteTimeoutError ? 'first-byte-timeout' : normalizedModelFailureReason(err);
     logger.warn(
       {
         from: chain[i].label,
@@ -380,3 +578,32 @@ export function withModelFallback(chain: FallbackTarget[], opts: FallbackOptions
   if (chain.length === 1 && !opts.firstByteTimeoutMs) return chain[0].getModel();
   return new FallbackModel(chain, opts);
 }
+
+export const __test__ = {
+  setDeadBrainsFileForTests(file: string | null): void {
+    deadBrainsFile = file ?? DEAD_BRAINS_FILE;
+    deadBrains.clear();
+    deadBrainsLoaded = false;
+  },
+  resetDeadBrainsMemoryForTests(): void {
+    deadBrains.clear();
+    deadBrainsLoaded = false;
+  },
+  getDeadBrainEntryForTests(label: string): DeadBrainEntry | null {
+    loadDeadBrains();
+    return deadBrains.get(label) ?? null;
+  },
+  setSilentBrainsFileForTests(file: string | null): void {
+    silentBrainsFile = file ?? SILENT_BRAINS_FILE;
+    silentBrains.clear();
+    silentBrainsLoaded = false;
+  },
+  resetSilentBrainsMemoryForTests(): void {
+    silentBrains.clear();
+    silentBrainsLoaded = false;
+  },
+  getSilentBrainEntryForTests(label: string): SilentBrainEntry | null {
+    loadSilentBrains();
+    return silentBrains.get(label) ?? null;
+  },
+};

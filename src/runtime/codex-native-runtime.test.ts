@@ -40,13 +40,15 @@ test('sanitizeCodexInputIds strips non-fc ids off function_call items (the 2026-
     { type: 'function_call', call_id: 'call_x', name: 'read_file', arguments: '{}', id: '20260624072838009e610297f64eac' },
     // a genuine Codex fc id — must be kept
     { type: 'function_call', call_id: 'call_y', name: 'write_file', arguments: '{}', id: 'fc_abc123' },
-    { type: 'function_call_output', call_id: 'call_x', output: 'ok' },
+    { type: 'function_call_output', call_id: 'call_x', output: 'ok', id: '20260624072838009e610297f64eac' },
   ] as unknown as Parameters<typeof sanitizeCodexInputIds>[0];
   const out = sanitizeCodexInputIds(input) as Array<Record<string, unknown>>;
   assert.equal(out[1].id, undefined, 'non-fc id dropped');
   assert.equal(out[1].call_id, 'call_x', 'call_id preserved for correlation');
   assert.equal(out[2].id, 'fc_abc123', 'a real fc id is kept');
-  assert.equal(out[3].type, 'function_call_output', 'non-function_call items untouched');
+  assert.equal(out[3].type, 'function_call_output');
+  assert.equal(out[3].id, undefined, 'function_call_output ids are never needed on Codex input');
+  assert.equal(out[3].call_id, 'call_x', 'output call_id preserved for correlation');
 });
 
 test('functionCallInput preserves Responses phase metadata on Codex function call history', () => {

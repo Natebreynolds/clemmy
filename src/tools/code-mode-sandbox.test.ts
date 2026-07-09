@@ -93,6 +93,74 @@ test('failure breaker: 10 consecutive tool-call failures abort the program with 
   assert.ok(calls <= 12, `dispatch stopped near the breaker threshold, got ${calls}`);
 });
 
+test('failure breaker: tool-error text results also abort the program', async () => {
+  let calls = 0;
+  const dispatch: CodeModeDispatch = async (_method, args) => {
+    calls++;
+    const dir = (args as { directory?: string }).directory ?? '';
+    return `Directory does not exist: /Applications/Clementine.app/Contents/Resources/daemon/${dir}`;
+  };
+  const r = await runCodeModeProgram(
+    // The live bug did not throw: list_files returned a normal text result that
+    // started with "Directory does not exist:", so the old failure breaker reset.
+    `for (const dir of "/Users/nathan/some/path") { await clem.list_files({ directory: dir }); } return 'done';`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, false, 'tool-error result banners count as failures');
+  assert.match(r.error ?? '', /tool-error results/i);
+  assert.ok(calls <= 12, `dispatch stopped near the breaker threshold, got ${calls}`);
+  assert.equal(r.partial?.completed ?? 0, 0);
+  assert.ok((r.partial?.failed ?? 0) >= 10, 'soft tool failures are reported in partials');
+});
+
+test('failure breaker: structured ok:false tool results also abort the program', async () => {
+  let calls = 0;
+  const dispatch: CodeModeDispatch = async () => {
+    calls++;
+    return { ok: false, error: 'InvalidToolInputError: Invalid JSON input for tool', raw: 'An error occurred while running the tool.' };
+  };
+  const r = await runCodeModeProgram(
+    `for (let i = 0; i < 30; i++) { await clem.composio_execute_tool({ i }); } return 'done';`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, false, 'structured tool failures count toward the breaker');
+  assert.match(r.error ?? '', /tool-error results/i);
+  assert.ok(calls <= 12, `dispatch stopped near the breaker threshold, got ${calls}`);
+  assert.equal(r.partial?.completed ?? 0, 0);
+  assert.ok((r.partial?.failed ?? 0) >= 10);
+});
+
+test('failure breaker: non-zero structured shell results also abort the program', async () => {
+  let calls = 0;
+  const dispatch: CodeModeDispatch = async () => {
+    calls++;
+    return { ok: false, exit_code: 2, stdout: '', stderr: 'sf: bad query' };
+  };
+  const r = await runCodeModeProgram(
+    `for (let i = 0; i < 30; i++) { await clem.run_shell_command({ command: 'sf query' }); } return 'done';`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, false, 'non-zero shell results count toward the breaker');
+  assert.match(r.error ?? '', /tool-error results/i);
+  assert.ok(calls <= 12, `dispatch stopped near the breaker threshold, got ${calls}`);
+});
+
+test('failure breaker: ordinary empty-result text is data, not a tool failure', async () => {
+  let calls = 0;
+  const dispatch: CodeModeDispatch = async () => { calls++; return 'No matching files found'; };
+  const r = await runCodeModeProgram(
+    `const out = []; for (let i = 0; i < 12; i++) out.push(await clem.search({ i })); return out.length;`,
+    dispatch,
+    { timeoutMs: 20_000 },
+  );
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.value, 12);
+  assert.equal(calls, 12);
+});
+
 test('failure breaker: intervening successes reset the count — a probe-and-miss program is NOT aborted', async () => {
   let calls = 0;
   const dispatch: CodeModeDispatch = async () => {

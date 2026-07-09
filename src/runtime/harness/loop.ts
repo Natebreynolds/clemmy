@@ -26,6 +26,7 @@ import {
   defaultToolCallsPerTurn,
   withHarnessRunContext,
   harnessToolBracketsEnabled,
+  startGate,
 } from './brackets.js';
 import { compactSessionIfNeeded, checkpointGoalStage } from './compaction.js';
 import {
@@ -44,7 +45,8 @@ import {
   predictTurnCost,
 } from './budget.js';
 import { MODELS } from '../../config.js';
-import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, composeJudgedObjective, type ObjectiveJudgeFn } from './objective-judge.js';
+import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
+import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import {
   getActiveGoalForSession,
@@ -58,6 +60,7 @@ import {
   type PlanProposal,
 } from '../../agents/plan-proposals.js';
 import { validateGoal, toGoalEvidence, type GoalValidationResult, type ValidateGoalInput } from '../../execution/goal-validate.js';
+import { recordVerdictEvent } from '../../execution/verdict.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge, skillExecutionShortfall } from './skill-execution.js';
 import { isOutputGroundingGateEnabled, evaluateOutputGrounding, buildOutputGroundingChatRetry } from './output-grounding-gate.js';
 import { classifyMessageIntent } from '../../assistant/message-intent.js';
@@ -92,6 +95,7 @@ export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText 
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import { getPlanScope, openPlanScope } from '../../agents/plan-scope.js';
 import { classifyTool } from '../../agents/tool-taxonomy.js';
+import { peekStepResult, recordStepResultFromTranscript } from '../../tools/step-result-tool.js';
 
 /**
  * Wrap appendEvent so a transient SQLite write failure (lock, disk
@@ -828,6 +832,8 @@ export interface RunConversationOptions {
   judgeCompletion?: boolean;
   /** Test injection for the objective judge (defaults to judgeObjectiveComplete). */
   judgeFn?: ObjectiveJudgeFn;
+  /** Test injection for the trajectory watcher (defaults to runWatcherJudge). */
+  watcherJudge?: WatcherJudgeFn;
   /** Test injection for goal-contract validation (defaults to validateGoal). */
   goalValidator?: (input: ValidateGoalInput) => Promise<GoalValidationResult>;
   /** Test injection. */
@@ -1079,7 +1085,7 @@ function episodicBlockForPrimer(sessionId: string): string {
   try {
     const pointers = listRecentEpisodicPointers(sessionId, TURN_MEMORY_PRIMER_EPISODIC_TOP_K);
     if (pointers.length === 0) return '';
-    const lines = pointers.map((p) => `- ${p.label}${p.tool ? ` (via ${p.tool})` : ''}`);
+    const lines = pointers.map((p) => `- ${p.label} [${p.call_id}]${p.tool ? ` (via ${p.tool})` : ''}`);
     return [
       '[RECENTLY OBSERVED THIS SESSION — you already pulled these; recall_tool_result to re-read instead of re-fetching]',
       ...lines,
@@ -1127,6 +1133,76 @@ function hasUserFacingReply(decision: OrchestratorDecisionShape | null | undefin
 
 function isCompletedWithoutUserFacingReply(decision: OrchestratorDecisionShape | null | undefined): boolean {
   return Boolean(decision && decision.nextAction === 'completed' && !hasUserFacingReply(decision));
+}
+
+function hasCapturedWorkflowStepResult(sessionId: string): boolean {
+  try {
+    return peekStepResult(sessionId).found;
+  } catch {
+    return false;
+  }
+}
+
+function captureWorkflowStepResultTranscript(opts: {
+  sessionId: string;
+  turn: number;
+  output: unknown;
+}): boolean {
+  if (typeof opts.output !== 'string') return false;
+  try {
+    const captured = recordStepResultFromTranscript(opts.sessionId, opts.output);
+    if (captured) {
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: opts.turn,
+        role: 'system',
+        type: 'heartbeat',
+        data: { kind: 'workflow_step_result_transcript_captured' },
+      });
+    }
+    return captured;
+  } catch {
+    return false;
+  }
+}
+
+function completeCapturedWorkflowStepResult(opts: {
+  sessionId: string;
+  turn: number;
+  steps: number;
+  decision?: OrchestratorDecisionShape | null;
+}): RunConversationResult {
+  safeAppend({
+    sessionId: opts.sessionId,
+    turn: opts.turn,
+    role: 'Clem',
+    type: 'conversation_step',
+    data: {
+      step: opts.steps,
+      decision: userVisibleStepDecision(opts.decision ?? null),
+    },
+  });
+  safeAppend({
+    sessionId: opts.sessionId,
+    turn: opts.turn,
+    role: 'system',
+    type: 'conversation_completed',
+    data: {
+      steps: opts.steps,
+      reason: 'workflow_step_result_captured',
+      summary: opts.decision?.summary ?? 'Workflow step emitted a structured result.',
+      internalSummary: opts.decision?.summary ?? null,
+      reply: opts.decision?.reply ?? null,
+      delivered: true,
+    },
+  });
+  return {
+    sessionId: opts.sessionId,
+    status: 'completed',
+    steps: opts.steps,
+    lastDecision: opts.decision ?? undefined,
+    lastTurn: opts.turn,
+  };
 }
 
 function userVisibleStepDecision(
@@ -1330,6 +1406,15 @@ export function buildStallRetryMessage(sessionId: string, stall: StallInfo): str
       }
     }
   } catch { /* fall through to the generic nudge */ }
+
+  const stallDetail = stall.detail as { fakeToolTranscript?: unknown; toolName?: unknown };
+  if (stallDetail.fakeToolTranscript === true && stallDetail.toolName === 'workflow_step_result') {
+    return [
+      'Your previous response wrote a fake `workflow_step_result` call as text; no tool call occurred.',
+      'Call the ACTUAL `workflow_step_result` tool exactly once now with the JSON payload requested by the workflow step.',
+      'Do not write XML, markdown, `<function_calls>`, or prose before the tool call.',
+    ].join(' ');
+  }
 
   let toolCallHint = '';
   try {
@@ -1563,6 +1648,24 @@ async function runConversationCore(
   // most ONCE per run (a foreground chat grinding through a long action task).
   let backgroundOfferNudged = false;
 
+  // WATCHER judge (trajectory co-pilot, watcher-judge.ts). Spans the run for
+  // opted-in action turns: every ~N tool calls a NON-BLOCKING background check
+  // judges the trajectory against the GOAL; a confident drift verdict is
+  // injected as a one-sentence steer at the NEXT continuation boundary — the
+  // agent gets corrected mid-course instead of bounced by the completion judge
+  // after the whole turn is burned. Never awaited on the critical path; ≤
+  // MAX_WATCHER_INJECTIONS steers per run; silent on any judge failure.
+  const watcherJudge = options.watcherJudge ?? runWatcherJudge;
+  const watcherEnabled = watcherJudgeEnabled() && objectiveJudgeOptIn;
+  const WATCHER_INTERVAL_TOOLS = watcherCheckIntervalTools();
+  let watcherLastCheckedAt = 0;
+  let watcherInjectionsUsed = 0;
+  let watcherChecksUsed = 0;
+  let watcherCheckInFlight = false;
+  // Boxed: the background check assigns from inside a closure the loop body
+  // reads on later iterations (a bare local narrows to `never` under TS CFA).
+  const watcherSteerBox: { pending: WatcherVerdict | null } = { pending: null };
+
   // W1a chat step-boundary brain fallover state. `currentAgent` swaps to a
   // rebuilt agent on the next brain when a turn fails transiently; tried ids
   // prevent re-trying the same brain. Capability = caller passed both hooks.
@@ -1760,6 +1863,20 @@ async function runConversationCore(
     // (the Orchestrator chose to end without our structured shape).
     const decision = toOrchestratorDecision(turnResult.finalOutput);
     lastDecision = decision ?? lastDecision;
+
+    captureWorkflowStepResultTranscript({
+      sessionId: options.sessionId,
+      turn: turnResult.turn,
+      output: turnResult.finalOutput,
+    });
+    if (hasCapturedWorkflowStepResult(options.sessionId)) {
+      return completeCapturedWorkflowStepResult({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        steps: stepIndex,
+        decision,
+      });
+    }
 
     const missingReplyDecision = isCompletedWithoutUserFacingReply(decision) ? decision : null;
     if (
@@ -2214,6 +2331,30 @@ async function runConversationCore(
       // was flipped to awaiting_user_input (broke 4 goal-contract-loop tests; the
       // gate is default-on).
       let goalSatisfiedThisTurn = false;
+      // Verdict from the independent objective judge IF it ran this iteration.
+      // verifyDelivered below reuses it instead of placing a SECOND identical
+      // judge call: both trigger on the same promise-shaped completed reply, so
+      // on the non-goal path the same (objective, reply) pair was judged twice
+      // back-to-back — one redundant serial model call blocking the reply. The
+      // objective judge's verdict is the richer one (composed objective +
+      // skill/tool-call evidence), so it is authoritative when present.
+      let objectiveJudgeVerdictThisTurn: ObjectiveJudgeVerdict | null = null;
+      // EAGER output-grounding: start the figure-verification judge NOW so it
+      // races the goal-contract / objective judge below instead of running
+      // serially after them (one full judge latency saved on completed action
+      // turns with figures). deferCommit — if the completion judge bounces,
+      // this verdict is DISCARDED and must not leak a failure-count bump
+      // (brackets.ts pre-write gates pioneered this exact shape). Fail-open:
+      // errors resolve to allow at the consume site.
+      const eagerDeliverable = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
+      const eagerOutputGroundingPromise = (
+        isOutputGroundingGateEnabled()
+        && decision.nextAction === 'completed'
+        && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
+        && eagerDeliverable && eagerDeliverable.trim()
+      )
+        ? startGate(evaluateOutputGrounding(options.sessionId, eagerDeliverable, { kind: 'chat', deferCommit: true }))
+        : null;
       const activeGoal = safeActiveGoal(options.sessionId);
       const goalGate = Boolean(activeGoal)
         && (totalToolCalls >= 1 || isPromiseShapedReply(decision.reply || decision.summary));
@@ -2237,6 +2378,16 @@ async function runConversationCore(
           objective: goalPlan.objective,
           successCriteria: validateCriteria,
           evidenceText,
+        });
+        // Verdict door (T3-B4): one canonical audit row per judge decision.
+        recordVerdictEvent(options.sessionId, turnResult.turn, {
+          door: 'goal_validation',
+          pass: validation.pass,
+          reason: validation.advice ?? (validation.pass ? 'all criteria met' : undefined),
+          failedOpen: validation.judgeFailedOpen,
+          criteriaMet: validation.criteriaMet,
+          criteriaTotal: validation.criteriaTotal,
+          ...(currentStage ? { detail: { stageId: currentStage.id } } : {}),
         });
         const updated = recordGoalValidation(
           activeGoal.id,
@@ -2379,6 +2530,15 @@ async function runConversationCore(
           judgedObjective = composeJudgedObjective(objective, priorInputs);
         } catch { /* fail-open: judge the raw input */ }
         const verdict = await objectiveJudge(judgedObjective, responseText ?? '', skillContext);
+        objectiveJudgeVerdictThisTurn = verdict;
+        // Verdict door (T3-B4): one canonical audit row per judge decision.
+        recordVerdictEvent(options.sessionId, turnResult.turn, {
+          door: 'completion',
+          pass: verdict.done,
+          reason: verdict.reason,
+          failedOpen: verdict.failedOpen,
+          selfJudge: verdict.selfJudge,
+        });
         if (verdict.done && (verdict.failedOpen || verdict.selfJudge)) {
           completionVerification = { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge };
         }
@@ -2447,17 +2607,19 @@ async function runConversationCore(
       // budget so it can't loop; mutually exclusive with the judge bounce above
       // (that path `continue`d). Contradiction → recompute + re-state; no-source
       // figure → ship with an advisory note. Fail-open: never wedge a completion.
+      // The verdict was started EAGERLY (deferCommit) before the goal-contract /
+      // objective judge, so it has been running CONCURRENTLY with them — the
+      // await here is usually instant instead of a full serial judge call. The
+      // failure bump is committed only when the bounce is actually surfaced
+      // (a bounce verdict discarded by an earlier judge `continue` never leaks
+      // a count — same integrity contract as the brackets pre-write gates).
       let outputGroundingNote = '';
-      if (
-        isOutputGroundingGateEnabled()
-        && decision.nextAction === 'completed'
-        && objectiveJudgeContinuations < MAX_OBJECTIVE_JUDGE_CONTINUATIONS
-      ) {
+      if (eagerOutputGroundingPromise) {
         try {
-          const deliverable = decision.reply && decision.reply.trim() ? decision.reply : decision.summary;
-          if (deliverable && deliverable.trim()) {
-            const og = await evaluateOutputGrounding(options.sessionId, deliverable, { kind: 'chat' });
+          {
+            const og = await eagerOutputGroundingPromise;
             if (og.action === 'bounce') {
+              og.commitFailure?.();
               try {
                 safeAppend({
                   sessionId: options.sessionId, turn: turnResult.turn, role: 'system', type: 'guardrail_tripped',
@@ -2507,9 +2669,30 @@ async function runConversationCore(
       // A goal contract validated 'satisfied' this turn is the AUTHORITATIVE artifact
       // verification — skip the gate so its weaker promise-shaped heuristic can't
       // override a contract-verified completion into awaiting_user_input.
-      const delivery: DeliveryVerdict = verifyDeliveredEnabled() && !goalSatisfiedThisTurn && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn)
-        ? await verifyDelivered(objective, userVisibleSummary, { judgeFn: objectiveJudge })
+      const cachedObjectiveVerdict = objectiveJudgeVerdictThisTurn;
+      const deliveryGateRan = verifyDeliveredEnabled() && !goalSatisfiedThisTurn && !dispatchedBackgroundWorkflowRun(options.sessionId, turnResult.turn);
+      const delivery: DeliveryVerdict = deliveryGateRan
+        ? await verifyDelivered(objective, userVisibleSummary, {
+            // Reuse the objective judge's verdict when it ran this iteration —
+            // its audit covered this same reply with MORE context, so a second
+            // identical model call adds latency, not information. The
+            // deterministic blocked-text/stoppedReason checks inside
+            // verifyDelivered still run first either way.
+            judgeFn: cachedObjectiveVerdict ? async () => cachedObjectiveVerdict : objectiveJudge,
+          })
         : { delivered: true as const, status: 'completed' as const };
+      // Verdict door (T3-B4) — recorded only when the gate actually evaluated
+      // (a skipped gate is not a verdict).
+      if (deliveryGateRan) {
+        recordVerdictEvent(options.sessionId, turnResult.turn, {
+          door: 'delivery',
+          pass: delivery.delivered,
+          reason: delivery.reason,
+          failedOpen: delivery.verification?.failedOpen,
+          selfJudge: delivery.verification?.selfJudge,
+          ...(delivery.blockerType ? { detail: { blockerType: delivery.blockerType } } : {}),
+        });
+      }
       if (delivery.verification) completionVerification = delivery.verification;
       if (!delivery.delivered) {
         safeAppend({
@@ -2824,7 +3007,64 @@ async function runConversationCore(
           ' NOTE: you have already done substantial work on this in the foreground and it is taking a while. If finishing it will take more than a step or two, call `offer_background` NOW with the objective — tell the user plainly that this is a longer task and you can keep working on it in the background and post updates as it goes (it shows up in Tasks), instead of making them watch here — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
       }
     }
-    nextInput = CONTINUATION_INPUT + bgOfferNudge;
+    // WATCHER: (a) inject a resolved drift steer from the check that ran in the
+    // background during the last turn; (b) start the next check without
+    // awaiting it (it races the coming turn — zero critical-path latency).
+    let watcherSteerNote = '';
+    if (watcherSteerBox.pending) {
+      const steer = watcherSteerBox.pending;
+      watcherSteerBox.pending = null;
+      watcherInjectionsUsed += 1;
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: lastTurn,
+        role: 'system',
+        type: 'heartbeat',
+        data: { kind: 'watcher_steer', miss: steer.miss, steer: steer.steer, injection: watcherInjectionsUsed },
+      });
+      watcherSteerNote = ` TRAJECTORY CHECK (an independent watcher compared your work so far against the goal): ${steer.miss}. ${steer.steer} Address this before finishing — or, if it is already handled or the watcher misread the goal, proceed and make the evidence explicit in your final reply.`;
+    }
+    if (
+      shouldStartWatcherCheck({
+        enabled: watcherEnabled,
+        totalToolCalls,
+        lastCheckedAtToolCalls: watcherLastCheckedAt,
+        checkIntervalTools: WATCHER_INTERVAL_TOOLS,
+        injectionsUsed: watcherInjectionsUsed,
+        maxInjections: MAX_WATCHER_INJECTIONS,
+        checksUsed: watcherChecksUsed,
+        maxChecks: MAX_WATCHER_CHECKS,
+        checkInFlight: watcherCheckInFlight,
+      })
+    ) {
+      watcherCheckInFlight = true;
+      watcherChecksUsed += 1;
+      watcherLastCheckedAt = totalToolCalls;
+      const latestAssistantNote = (lastDecision?.reply?.trim() ? lastDecision.reply : lastDecision?.summary) ?? '';
+      const watcherToolCallCount = totalToolCalls;
+      void (async () => {
+        try {
+          // Gather the digest inside the background task — the goal contract
+          // read and tool-call summary cost nothing on the critical path here.
+          let successCriteria: string[] | undefined;
+          try {
+            const goal = safeActiveGoal(options.sessionId);
+            const criteria = (goal?.approvedPlan ?? goal?.plan)?.successCriteria;
+            if (criteria?.length) successCriteria = criteria;
+          } catch { /* goal-less runs watch the objective alone */ }
+          const verdict = await watcherJudge({
+            objective,
+            ...(successCriteria ? { successCriteria } : {}),
+            toolCallSummary: summarizeToolCallsForJudge(options.sessionId),
+            latestAssistantNote,
+            toolCallCount: watcherToolCallCount,
+          });
+          if (verdict && !verdict.onTrack) watcherSteerBox.pending = verdict;
+        } catch { /* the watcher is silent on any failure */ }
+        finally { watcherCheckInFlight = false; }
+      })();
+    }
+    nextInput = CONTINUATION_INPUT + bgOfferNudge + watcherSteerNote;
   }
 
   // Max steps without resolution.
@@ -4477,6 +4717,20 @@ async function runConversationFromResumeCore(opts: {
     };
   }
 
+  captureWorkflowStepResultTranscript({
+    sessionId: opts.sessionId,
+    turn: lastTurn,
+    output: firstResult.finalOutput,
+  });
+  if (hasCapturedWorkflowStepResult(opts.sessionId)) {
+    return completeCapturedWorkflowStepResult({
+      sessionId: opts.sessionId,
+      turn: lastTurn,
+      steps: 1,
+      decision,
+    });
+  }
+
   // Steps 2..N: same loop semantics as runConversation, but starting
   // from step 2 since the resume covered step 1.
   let stepIndex = 1;
@@ -4755,6 +5009,20 @@ async function runConversationFromResumeCore(opts: {
     }
     decision = toOrchestratorDecision(turnResult.finalOutput);
     lastDecision = decision ?? lastDecision;
+
+    captureWorkflowStepResultTranscript({
+      sessionId: opts.sessionId,
+      turn: turnResult.turn,
+      output: turnResult.finalOutput,
+    });
+    if (hasCapturedWorkflowStepResult(opts.sessionId)) {
+      return completeCapturedWorkflowStepResult({
+        sessionId: opts.sessionId,
+        turn: turnResult.turn,
+        steps: stepIndex,
+        decision,
+      });
+    }
 
     const missingReplyDecision = isCompletedWithoutUserFacingReply(decision) ? decision : null;
     if (
@@ -5685,6 +5953,21 @@ export function assistantItemText(item: AgentInputItem | null): string | null {
   return null;
 }
 
+function streamedTextFallback(text: string): string | undefined {
+  const trimmed = text.trim();
+  return trimmed || undefined;
+}
+
+function structuredOutputRecoveryText(
+  history: AgentInputItem[],
+  inputItemCount: number,
+  streamedText: string,
+): string {
+  return assistantItemText(findLatestNewAssistantMessage(history, inputItemCount))
+    ?? streamedTextFallback(streamedText)
+    ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+}
+
 const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   type StreamedResultLike = {
     history: AgentInputItem[];
@@ -5733,6 +6016,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // result is reassigned per attempt; the post-drain code reads the winner.
   let result!: Awaited<ReturnType<typeof run>>;
   let structuredOutputFailed = false;
+  let recoveryStreamText = '';
   // The id of the ACTIVE attempt. After a pre-content stall + retry, the
   // abandoned stream keeps draining for a beat (its cancel isn't instant); if
   // its late tokens reach the shared onChunk they INTERLEAVE with the live
@@ -5748,6 +6032,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     const iterable = Symbol.asyncIterator in (myResult as unknown as Record<symbol, unknown>);
     let lastEventAt = Date.now();
     let yieldedContent = false;
+    let attemptStreamText = '';
     const drain = (async () => {
       if (iterable) {
         for await (const event of myResult as unknown as AsyncIterable<unknown>) {
@@ -5758,11 +6043,14 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
             yieldedContent = true;
           }
           if (onChunk && myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
+            attemptStreamText += ev.data.delta;
             try {
               await onChunk(ev.data.delta);
             } catch {
               // never let consumer errors abort the stream
             }
+          } else if (myAttempt === activeAttempt && ev.type === 'raw_model_stream_event' && ev.data?.type === 'output_text_delta' && typeof ev.data.delta === 'string') {
+            attemptStreamText += ev.data.delta;
           }
         }
       }
@@ -5789,6 +6077,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     void drain.finally(() => { if (stallTimer) clearInterval(stallTimer); }).catch(() => { /* surfaced via race */ });
     try {
       await Promise.race([drain, watchdog]);
+      recoveryStreamText = attemptStreamText;
       break; // turn drained successfully
     } catch (err) {
       // A pre-content stall is retryable: nothing streamed, so no tool ran and
@@ -5799,6 +6088,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       }
       if (!isStructuredOutputError(err)) throw err;
       structuredOutputFailed = true;
+      recoveryStreamText = attemptStreamText;
       console.warn('[harness] structured output failed to parse/validate — ending turn with raw text',
         err instanceof Error ? err.message : err);
       break;
@@ -5810,7 +6100,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
 
   let finalOutput: unknown;
   if (structuredOutputFailed) {
-    finalOutput = assistantItemText(findLatestNewAssistantMessage(history, items.length)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+    finalOutput = structuredOutputRecoveryText(history, items.length, recoveryStreamText);
   } else {
     try {
       finalOutput = result.finalOutput;
@@ -5819,7 +6109,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
       structuredOutputFailed = true;
       console.warn('[harness] finalOutput failed to parse/validate — ending turn with raw text',
         err instanceof Error ? err.message : err);
-      finalOutput = assistantItemText(findLatestNewAssistantMessage(history, items.length)) ?? STRUCTURED_OUTPUT_RECOVERY_FALLBACK;
+      finalOutput = structuredOutputRecoveryText(history, items.length, recoveryStreamText);
     }
   }
 
@@ -6009,5 +6299,3 @@ function recallBudgetMaxBytes(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_MAX_BYTES', '150000') ?? '150000', 10);
   return Number.isFinite(raw) && raw >= 10_000 ? raw : 150_000;
 }
-
-

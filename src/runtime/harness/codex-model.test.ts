@@ -144,6 +144,13 @@ test('buildCodexRequestBody drops non-Codex function_call ids from mixed-provide
       output: { type: 'text', text: 'ok' },
       status: 'completed',
     },
+    {
+      type: 'function_call_output',
+      id: '20260624072838009e610297f64eac',
+      call_id: 'call_direct_output',
+      output: 'direct output replay',
+      status: 'completed',
+    },
   ] as unknown as ModelRequest['input']));
 
   const input = body.input as Array<Record<string, unknown>>;
@@ -156,6 +163,10 @@ test('buildCodexRequestBody drops non-Codex function_call ids from mixed-provide
   assert.equal(input[4].type, 'function_call_output');
   assert.equal(input[4].id, undefined, 'function_call_output does not need a provider-specific item id');
   assert.equal(input[4].call_id, 'call_cross_provider');
+  assert.equal(input[5].type, 'function_call_output');
+  assert.equal(input[5].id, undefined, 'direct function_call_output replay ids must be stripped too');
+  assert.equal(input[5].call_id, 'call_direct_output');
+  assert.equal(input[5].output, 'direct output replay');
 });
 
 class ScriptedCodexModel extends CodexResponsesModel {

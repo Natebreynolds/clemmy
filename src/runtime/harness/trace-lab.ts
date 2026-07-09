@@ -195,6 +195,8 @@ function eventSeverity(type: EventType, data: Record<string, unknown>): TraceSev
     || type === 'external_write_orphaned'
     || type === 'approval_requested'
     || type === 'brain_fallover'
+    || (type === 'restart_recovery_decision' && data.writeCheckFailed === true)
+    || (type === 'verdict_recorded' && (data.pass === false || data.failedOpen === true))
     || data.outcome === 'advisory'
     || data.reason === 'interrupted_by_restart'
   ) return 'warn';
@@ -217,12 +219,21 @@ function eventLabel(type: EventType, data: Record<string, unknown>): string {
     case 'approval_resolved': return `Approval ${str(data, 'resolution', 'status') ?? 'resolved'}`;
     case 'handoff': return `Handoff to ${str(data, 'to', 'agent', 'target') ?? 'agent'}`;
     case 'conversation_completed': return 'Conversation completed';
+    case 'restart_recovery_decision':
+      return data.eligible === true
+        ? 'Restart recovery: auto-resume'
+        : `Restart recovery: ${str(data, 'autoResumeSkipped') ?? 'manual'}`;
     case 'run_completed': return 'Run completed';
     case 'run_failed': return 'Run failed';
     case 'worker_model_routed': return 'Worker model routed';
     case 'reasoning_effort': return 'Reasoning effort selected';
     case 'goal_alignment_judged': return 'Goal alignment judged';
     case 'output_grounding_judged': return 'Output grounding judged';
+    case 'verdict_recorded': {
+      const door = str(data, 'door') ?? 'judge';
+      const outcome = data.failedOpen === true ? 'accepted (judge unavailable)' : data.pass === true ? 'passed' : 'not passed';
+      return `Verdict · ${door.replace(/_/g, ' ')}: ${outcome}`;
+    }
     default: return type.replace(/_/g, ' ');
   }
 }
@@ -232,6 +243,20 @@ function eventDetail(ev: EventRow): string {
   const category = eventCategory(ev.type);
   if (ev.type === 'user_input_received') return clip(str(data, 'text') ?? '');
   if (ev.type === 'conversation_completed') return clip(str(data, 'reply', 'summary', 'reason') ?? '');
+  if (ev.type === 'restart_recovery_decision') {
+    return clip([
+      `interrupted=${str(data, 'interruptedAt') ?? 'unknown'}`,
+      `ageMs=${data.ageMs ?? 'unknown'}`,
+      `externalWrites=${data.externalWritesSinceInterrupt ?? 'unknown'}`,
+      `skipped=${data.autoResumeSkipped ?? 'none'}`,
+    ].join(' · '));
+  }
+  if (ev.type === 'verdict_recorded') {
+    const scorecard = typeof data.criteriaMet === 'number' && typeof data.criteriaTotal === 'number'
+      ? ` · criteria ${data.criteriaMet}/${data.criteriaTotal}`
+      : '';
+    return clip(`${str(data, 'reason') ?? ''}${scorecard}${data.selfJudge === true ? ' · self-judged' : ''}`);
+  }
   if (ev.type === 'tool_called') return clip(str(data, 'arguments', 'args', 'tool_slug') ?? '');
   if (ev.type === 'tool_returned') return clip(str(data, 'output', 'summary', 'result') ?? '');
   if (ev.type === 'approval_requested') return clip(str(data, 'subject', 'tool') ?? '');

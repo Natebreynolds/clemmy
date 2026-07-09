@@ -29,6 +29,8 @@ import { appendEvent, writeToolOutput } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 import { createClementineMcpServer } from '../../tools/mcp-server.js';
+import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
+import { recordHarnessCapabilityHealth } from './capability-health.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -398,7 +400,10 @@ function toClaudeSdkMcpConfig(s: ManagedMcpServer): McpServerConfig | null {
  * native call — dataforseo__* etc. classify as READ (auto-allow) and any native
  * write/unknown classifies as write (approval), so no gate is bypassed. Fail-open → {}.
  */
-export function buildScopedNativeMcpServers(scopeInput?: string): Record<string, McpServerConfig> {
+export function buildScopedNativeMcpServers(
+  scopeInput?: string,
+  opts: { mode?: 'prompt' | 'resolved_tools' } = {},
+): Record<string, McpServerConfig> {
   if (!claudeSdkNativeMcpEnabled()) return {};
   // Empty/absent scope ⇒ we don't know what THIS query needs. For the SDK native
   // lane attach ZERO external servers rather than inheriting resolveMcpToolScope's
@@ -412,7 +417,10 @@ export function buildScopedNativeMcpServers(scopeInput?: string): Record<string,
   try {
     const all = discoverMcpServers().filter((s) => s.enabled);
     if (all.length === 0) return {};
-    const scope = resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
+    const scope = opts.mode === 'resolved_tools'
+      ? externalMcpScopeFromResolvedTools(scopeInput, all.map((server) => server.name))
+      : resolveMcpToolScope({ userInput: scopeInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
+    if (!scope) return {};
     if (scope.allowAll === false && (scope.allowedServerSlugs ?? []).length === 0) return {};
     const deferExternal = claudeToolSearchEnabled();
     const out: Record<string, McpServerConfig> = {};
@@ -551,16 +559,15 @@ function mcpToolTail(toolName: string): string {
   return toolName.split('__').at(-1) ?? toolName;
 }
 
-function sdkToolNamesForLocalMcp(tools: string[]): string[] {
-  const out = new Set<string>();
-  for (const tool of tools) {
-    const t = tool.trim();
-    if (!t) continue;
-    out.add(t);
-    out.add(`mcp__clementine-local__${t}`);
-    out.add(`mcp__clementine_local__${t}`);
-  }
-  return [...out];
+function sdkPreapprovedToolsForMode(tools: string[], agentic: boolean): string[] {
+  void tools;
+  void agentic;
+  // Do not put local MCP tools in `allowedTools` while `canUseTool` is installed:
+  // the Claude SDK treats bare allowedTools entries as pre-approved and skips
+  // canUseTool for those calls. Clementine's callback is the single permission
+  // authority; non-agentic runs shrink the advertised schema surface with the
+  // local MCP server allowlist instead of SDK preapproval.
+  return [];
 }
 
 function missingRequiredLocalMcpTools(requiredTools: string[] | undefined, advertisedTools: string[]): string[] {
@@ -574,15 +581,60 @@ function missingRequiredLocalMcpTools(requiredTools: string[] | undefined, adver
   return required.filter((tool) => !advertised.has(normalizeToolName(tool)));
 }
 
-function assertRequiredLocalMcpTools(requiredTools: string[] | undefined, advertisedTools: string[]): void {
-  const missing = missingRequiredLocalMcpTools(requiredTools, advertisedTools);
-  if (missing.length > 0) throw new ClaudeAgentSdkToolSurfaceError(missing, advertisedTools);
-}
-
-const BASELINE_LOCAL_MCP_TOOLS = new Set(['ping', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file']);
+const BASELINE_LOCAL_MCP_TOOLS = new Set(['ping', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file', 'workspace_artifact_query']);
 
 function localMcpSurfaceInitialized(advertisedTools: string[]): boolean {
   return advertisedTools.some((toolName) => BASELINE_LOCAL_MCP_TOOLS.has(mcpToolTail(toolName)));
+}
+
+const CLAUDE_SDK_LOCAL_MCP_SURFACE_CAPABILITY = 'claude_sdk_local_mcp_surface';
+
+function recordClaudeSdkLocalMcpSurfaceHealth(
+  options: ClaudeAgentSdkRunOptions,
+  state: 'healthy' | 'degraded' | 'unavailable',
+  input: {
+    advertisedTools: string[];
+    missingTools?: string[];
+    reason?: string | null;
+    startupTimeoutMs?: number;
+  },
+): void {
+  const requiredTools = requiredLocalMcpTools(options);
+  if (requiredTools.length === 0) return;
+  try {
+    const missingTools = input.missingTools ?? [];
+    recordHarnessCapabilityHealth({
+      id: CLAUDE_SDK_LOCAL_MCP_SURFACE_CAPABILITY,
+      state,
+      summary: state === 'healthy'
+        ? 'Claude SDK local MCP surface advertised the required local tools.'
+        : 'Claude SDK local MCP surface did not advertise tools the harness depends on.',
+      reason: input.reason
+        ?? (missingTools.length ? `missing required local MCP tool${missingTools.length === 1 ? '' : 's'}: ${missingTools.join(', ')}` : null),
+      sessionId: options.sessionId,
+      details: {
+        modelId: options.modelId ?? null,
+        agentic: Boolean(options.agentic),
+        requiredTools,
+        missingTools,
+        availableToolCount: input.advertisedTools.length,
+        availableTools: input.advertisedTools.slice(0, 120),
+        ...(input.startupTimeoutMs !== undefined ? { startupTimeoutMs: input.startupTimeoutMs } : {}),
+      },
+    });
+  } catch {
+    // Health recording must never affect model execution or fallover.
+  }
+}
+
+function recordClaudeSdkToolSurfaceError(options: ClaudeAgentSdkRunOptions, err: ClaudeAgentSdkToolSurfaceError): void {
+  const state = localMcpSurfaceInitialized(err.availableTools) ? 'degraded' : 'unavailable';
+  recordClaudeSdkLocalMcpSurfaceHealth(options, state, {
+    advertisedTools: err.availableTools,
+    missingTools: err.missingTools,
+    reason: err.reason,
+    startupTimeoutMs: err.startupTimeoutMs,
+  });
 }
 
 function toolSurfaceRetryEnabled(): boolean {
@@ -640,6 +692,9 @@ export interface ClaudeAgentSdkRunOptions {
    * agentic mode (the canUseTool gate covers native calls). Absent ⇒ no native attach.
    */
   nativeMcpScopeInput?: string;
+  /** Interpret nativeMcpScopeInput as exact worker-packet resolvedTools instead
+   *  of a free-form prompt. This disables fail-open for "none needed" workers. */
+  nativeMcpScopeMode?: 'prompt' | 'resolved_tools';
   /**
    * JIT tool-RAG (Claude-brain port). When set, the in-process MCP server is
    * spawned advertising ONLY these tools, so the model receives only their schemas
@@ -1051,6 +1106,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // pausedMs for the wall-clock; the ceiling COUNTING is what the flag gates.
   const canUseTool = withToolCeiling(baseCanUseTool, allowed, ceilingState, { countCeiling: sdkToolCeilingEnabled() });
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
+  const localMcpToolAllowlist = options.mcpToolAllowlist ?? (agentic ? undefined : allowed);
   const sdkOptions: ClaudeAgentOptions = {
     env,
     ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
@@ -1061,7 +1117,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     skills: [],
     tools: [],
     mcpServers: {
-      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, options.mcpToolAllowlist, {
+      ...buildClaudeAgentSdkLocalMcpServers(options.sessionId, agentic, localMcpToolAllowlist, {
         workflowRunId: options.workflowRunId,
         workflowName: options.workflowName,
         stepId: options.stepId,
@@ -1069,14 +1125,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
       // canUseTool gate then covers every native call. Gives the Claude brain parity
       // with the Codex lane instead of being blind to native MCPs.
-      ...(agentic ? buildScopedNativeMcpServers(options.nativeMcpScopeInput) : {}),
+      ...(agentic ? buildScopedNativeMcpServers(options.nativeMcpScopeInput, { mode: options.nativeMcpScopeMode }) : {}),
     },
-    // Native tools are intentionally NOT in allowedTools — with permissionMode
-    // 'default' (agentic) they are visible via mcpServers and every call routes through
-    // canUseTool (reads auto-allow, writes → approval). Non-agentic denies them (safe).
-    allowedTools: sdkToolNamesForLocalMcp(allowed),
+    // Keep SDK preapproval empty for both modes. Non-agentic runs use the local
+    // MCP allowlist above to advertise only read/local schemas, then the same
+    // canUseTool path enforces the deny-only allowlist and loop ceilings.
+    allowedTools: sdkPreapprovedToolsForMode(allowed, agentic),
     canUseTool,
-    permissionMode: agentic ? 'default' : 'dontAsk',
+    permissionMode: 'default',
     maxTurns: options.maxTurns ?? 3,
     // Flip ON only when a delta sink is provided (chat surfaces). Worker/workflow
     // callers omit onDelta → no partial-message traffic → result assembly +
@@ -1228,7 +1284,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         const nextInit = extractInit(message);
         if (nextInit && !init) {
           init = nextInit;
-          assertRequiredLocalMcpTools(options.requiredLocalMcpTools, init.tools ?? []);
+          const advertisedTools = init.tools ?? [];
+          const missingTools = missingRequiredLocalMcpTools(options.requiredLocalMcpTools, advertisedTools);
+          if (missingTools.length > 0) throw new ClaudeAgentSdkToolSurfaceError(missingTools, advertisedTools);
+          recordClaudeSdkLocalMcpSurfaceHealth(options, 'healthy', { advertisedTools });
         }
         const delta = extractTextDelta(message);
         if (delta) {
@@ -1331,6 +1390,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       } else if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && result?.subtype !== 'success') {
         threwTurnLimit = true;
       } else if (err instanceof ClaudeAgentSdkToolSurfaceError) {
+        recordClaudeSdkToolSurfaceError(options, err);
         const committed = toolUses.length > 0 || streamedAny;
         const maxRetries = err.startupTimeoutMs !== undefined
           ? maxToolSurfaceStartupRetries()

@@ -12,6 +12,7 @@ import type { Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 const mod = await import('./claude-agent-sdk.js');
 const usageLog = await import('../usage-log.js');
 const eventlog = await import('./eventlog.js');
+const capabilityHealth = await import('./capability-health.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
   CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
@@ -46,6 +47,7 @@ test.beforeEach(() => {
   writeClaudeToken();
   setClaudeAgentSdkQueryForTest(null);
   setClaudeAgentSdkReflectionForTest(null);
+  capabilityHealth._resetHarnessCapabilityHealthForTest();
 });
 
 test.after(() => {
@@ -233,7 +235,10 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.equal(capture.call.options.env.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-sdk-test-token');
   assert.equal(capture.call.options.env.ANTHROPIC_API_KEY, undefined);
   assert.equal(capture.call.options.model, 'claude-sonnet-4-6');
-  assert.equal(capture.call.options.permissionMode, 'dontAsk');
+  assert.deepEqual(capture.call.options.allowedTools, []);
+  assert.equal(capture.call.options.permissionMode, 'default');
+  const canUse = capture.call.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+  assert.equal((await canUse('mcp__clementine-local__ping', {}, {})).behavior, 'allow');
   assert.equal(capture.call.options.mcpServers['clementine-local'].type, 'sdk');
   assert.equal(capture.call.options.mcpServers['clementine-local'].name, 'clementine-local');
   assert.ok(capture.call.options.mcpServers['clementine-local'].instance);
@@ -285,6 +290,12 @@ test('runClaudeAgentSdk fails before model work when required local MCP tools ar
       return true;
     },
   );
+  const health = capabilityHealth.readHarnessCapabilityHealth('claude_sdk_local_mcp_surface');
+  assert.ok(health, 'missing required tool should be persisted as harness capability health');
+  assert.equal(health!.state, 'degraded');
+  assert.match(health!.reason ?? '', /run_shell_command/);
+  assert.deepEqual((health!.details as { missingTools?: unknown }).missingTools, ['run_shell_command']);
+  assert.deepEqual((health!.details as { availableTools?: unknown }).availableTools, ['mcp__clementine-local__ping']);
 });
 
 test('runClaudeAgentSdk retries once when the local MCP surface is temporarily empty', async () => {
@@ -364,6 +375,10 @@ test('runClaudeAgentSdk retries once when the local MCP surface is temporarily e
 
     assert.equal(calls, 2);
     assert.equal(result.text, 'ready');
+    const health = capabilityHealth.readHarnessCapabilityHealth('claude_sdk_local_mcp_surface');
+    assert.ok(health);
+    assert.equal(health!.state, 'healthy');
+    assert.equal((health!.details as { availableToolCount?: unknown }).availableToolCount, 1);
   } finally {
     if (originalRetries === undefined) delete process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES;
     else process.env.CLEMMY_CLAUDE_SDK_TOOL_SURFACE_RETRIES = originalRetries;
@@ -622,9 +637,39 @@ test('runClaudeAgentSdk uses the conservative read-only tool set by default', as
   }) as any);
 
   await runClaudeAgentSdk({ prompt: 'Search memory.' });
-  assert.ok(capture.call.options.allowedTools.includes('mcp__clementine-local__memory_search'));
-  assert.equal(capture.call.options.allowedTools.includes('mcp__clementine-local__run_shell_command'), false);
-  assert.equal(capture.call.options.allowedTools.includes('mcp__clementine-local__composio_execute_tool'), false);
+  assert.deepEqual(capture.call.options.allowedTools, []);
+  assert.equal(capture.call.options.permissionMode, 'default');
+  const canUse = capture.call.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+  assert.equal((await canUse('mcp__clementine-local__memory_search', {}, {})).behavior, 'allow');
+  assert.equal((await canUse('mcp__clementine-local__run_shell_command', { command: 'echo hi' }, {})).behavior, 'deny');
+  assert.equal((await canUse('mcp__clementine-local__composio_execute_tool', {}, {})).behavior, 'deny');
+});
+
+test('agentic SDK runs leave allowedTools empty so canUseTool is the permission authority', async () => {
+  const capture: { call?: any } = {};
+  setClaudeAgentSdkQueryForTest(((params: any) => {
+    capture.call = params;
+    return successQuery('ok');
+  }) as any);
+
+  await runClaudeAgentSdk({
+    prompt: 'Read a file safely.',
+    sessionId: 'sdk-agentic-permission-authority',
+    modelId: 'claude-sonnet-4-6',
+    agentic: true,
+    allowedLocalMcpTools: ['read_file', 'memory_search', 'run_shell_command'],
+  });
+
+  assert.deepEqual(capture.call.options.allowedTools, []);
+  assert.equal(capture.call.options.permissionMode, 'default');
+  const canUse = capture.call.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+  const verdict = await canUse('mcp__clementine-local__read_file', { path: '/tmp/example.txt' }, {
+    signal: new AbortController().signal,
+    toolUseID: 'toolu_read',
+    requestId: 'req_read',
+  });
+  assert.equal(verdict.behavior, 'allow');
+  assert.deepEqual(verdict.updatedInput, { path: '/tmp/example.txt' });
 });
 
 // Brain continuity: a Claude Agent SDK turn must feed its tool returns into the
@@ -1239,6 +1284,40 @@ test('buildScopedNativeMcpServers: an EMPTY scope attaches NO external servers (
     assert.deepEqual(buildScopedNativeMcpServers(''), {}, 'empty string ⇒ no external servers');
     assert.deepEqual(buildScopedNativeMcpServers('   '), {}, 'whitespace ⇒ no external servers');
     assert.deepEqual(buildScopedNativeMcpServers(undefined), {}, 'undefined ⇒ no external servers');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
+    if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;
+    invalidateMcpServerDiscoveryCache();
+  }
+});
+
+test('buildScopedNativeMcpServers: resolved_tools mode never fail-opens worker packets', async () => {
+  const { invalidateMcpServerDiscoveryCache } = await import('../mcp-config.js');
+  const mcpDir = path.join(TMP_HOME, 'mcp');
+  mkdirSync(mcpDir, { recursive: true });
+  writeFileSync(path.join(mcpDir, 'servers.json'), JSON.stringify({
+    dataforseo: { type: 'stdio', command: 'npx', args: ['dataforseo-mcp-server'], env: { DATAFORSEO_USERNAME: 'x', DATAFORSEO_PASSWORD: 'y' }, description: 'SEO', enabled: true },
+    supabase: { type: 'stdio', command: 'npx', args: ['supabase-mcp'], description: 'db', enabled: true },
+  }), 'utf-8');
+  invalidateMcpServerDiscoveryCache();
+
+  const prev = process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+  const prevScope = process.env.CLEMMY_SCOPED_MCP_TOOLS;
+  try {
+    delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP;
+    process.env.CLEMMY_SCOPED_MCP_TOOLS = 'on';
+
+    assert.deepEqual(buildScopedNativeMcpServers('none needed', { mode: 'resolved_tools' }), {});
+    assert.deepEqual(buildScopedNativeMcpServers('skill_read read_file', { mode: 'resolved_tools' }), {});
+    assert.deepEqual(
+      buildScopedNativeMcpServers('DATAFORSEO_GET_GOOGLE_HIST_BULK_TRAFFIC_EST_LIVE', { mode: 'resolved_tools' }),
+      {},
+      'Composio tool slugs stay on composio_execute_tool, not native MCP',
+    );
+
+    const exact = buildScopedNativeMcpServers('dataforseo__serp_organic_live_advanced', { mode: 'resolved_tools' });
+    assert.ok(exact.dataforseo, 'exact native MCP tool slug attaches its server');
+    assert.equal(exact.supabase, undefined, 'resolved_tools mode does not attach unrelated servers');
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP; else process.env.CLEMMY_CLAUDE_SDK_NATIVE_MCP = prev;
     if (prevScope === undefined) delete process.env.CLEMMY_SCOPED_MCP_TOOLS; else process.env.CLEMMY_SCOPED_MCP_TOOLS = prevScope;

@@ -327,10 +327,11 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
       //       there (no thrash on an unfixable miss).
       // Tell them apart by whether the surface came back initialized at all: the
       // MCP server ALWAYS registers the baseline read tools (ping/memory_search/
-      // workspace_roots/list_files/read_file) regardless of gated-mutations, so
+      // workspace_roots/list_files/read_file/workspace_artifact_query) regardless
+      // of gated-mutations, so
       // their ABSENCE means the child never finished initializing.
       const tail = (t: string): string => t.split('__').at(-1) ?? t;
-      const BASELINE = new Set(['ping', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file']);
+      const BASELINE = new Set(['ping', 'memory_search', 'memory_read', 'workspace_roots', 'list_files', 'read_file', 'workspace_artifact_query']);
       const surfaceInitialized = err.availableTools.some((t) => BASELINE.has(tail(t)));
       if (!surfaceInitialized) {
         // Transient phrasing so isTransientStepError() classifies it retryable

@@ -89,6 +89,9 @@ class ServerWarmingError extends Error {
 
 type MCPTool = Awaited<ReturnType<MCPServer['listTools']>>[number];
 type CallToolResultContent = Awaited<ReturnType<MCPServer['callTool']>>;
+type McpContentBlock = { type: string; [key: string]: unknown };
+
+const MCP_INVALID_RESULT_PREFIX = 'ERROR: MCP_RESULT_INVALID';
 
 // Audit #6: an MCP EXECUTE/write tool can perform a network mutation through its
 // args — kernel `exec_command({command:'curl', args:['-X','POST',…]})` or
@@ -112,6 +115,167 @@ function detectMcpArgsNetworkMutation(
     return { isNetworkMutation: true, shapeKey: 'mcp:http_mutation' };
   }
   return { isNetworkMutation: false };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function stringifyMcpSnippet(value: unknown, maxChars = 900): string {
+  try {
+    const json = JSON.stringify(value);
+    const text = json === undefined ? String(value) : json;
+    return text.length > maxChars ? `${text.slice(0, maxChars)}...` : text;
+  } catch {
+    const text = String(value);
+    return text.length > maxChars ? `${text.slice(0, maxChars)}...` : text;
+  }
+}
+
+function mcpContentArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (isRecord(value) && Array.isArray(value.content)) return value.content;
+  return null;
+}
+
+function mcpMetadataSources(value: unknown): Record<string, unknown>[] {
+  const sources: Record<string, unknown>[] = [];
+  if (Array.isArray(value)) sources.push(value as unknown as Record<string, unknown>);
+  if (isRecord(value)) {
+    sources.push(value);
+    if (Array.isArray(value.content)) sources.push(value.content as unknown as Record<string, unknown>);
+  }
+  return sources;
+}
+
+function copyMcpResultMetadata(from: unknown, to: CallToolResultContent, opts: { forceIsError?: boolean } = {}): void {
+  const target = to as unknown as Record<string, unknown>;
+  for (const source of mcpMetadataSources(from)) {
+    for (const key of ['_meta', 'structuredContent', 'isError'] as const) {
+      if (source[key] !== undefined) target[key] = source[key];
+    }
+  }
+  if (opts.forceIsError) target.isError = true;
+}
+
+function invalidMcpResultText(toolName: string, reason: string, raw?: unknown): string {
+  const rawSuffix = raw === undefined ? '' : ` Raw: ${stringifyMcpSnippet(raw)}`;
+  return [
+    `${MCP_INVALID_RESULT_PREFIX}: ${toolName} returned malformed MCP content. ${reason}.${rawSuffix}`,
+    'Treat this tool call as failed; do not trust missing fields from this result. Change the arguments/tool, use a different source, or tell the user the data source returned an invalid result shape.',
+  ].join('\n\n');
+}
+
+function makeInvalidMcpResult(toolName: string, reason: string, raw?: unknown): CallToolResultContent {
+  const result = [{ type: 'text', text: invalidMcpResultText(toolName, reason, raw) }] as CallToolResultContent;
+  copyMcpResultMetadata(undefined, result, { forceIsError: true });
+  return result;
+}
+
+function validMcpImageBlock(block: Record<string, unknown>): boolean {
+  return typeof block.data === 'string' && typeof block.mimeType === 'string';
+}
+
+function normalizeMcpCallResult(
+  toolName: string,
+  rawResult: unknown,
+): { result: CallToolResultContent; invalid: boolean; summary?: string } {
+  const content = mcpContentArray(rawResult);
+  if (!content) {
+    const reason = `Expected the MCP tool to return a content array, but received ${typeof rawResult}`;
+    return {
+      result: makeInvalidMcpResult(toolName, reason, rawResult),
+      invalid: true,
+      summary: reason,
+    };
+  }
+
+  let changed = content !== rawResult;
+  let invalid = false;
+  const normalized: McpContentBlock[] = [];
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i];
+    if (!isRecord(block)) {
+      invalid = true;
+      changed = true;
+      normalized.push({
+        type: 'text',
+        text: invalidMcpResultText(toolName, `content[${i}] was not an object`, block),
+      });
+      continue;
+    }
+
+    const type = block.type;
+    if (type === 'text') {
+      if (typeof block.text === 'string') {
+        normalized.push(block as McpContentBlock);
+      } else {
+        invalid = true;
+        changed = true;
+        normalized.push({
+          type: 'text',
+          text: invalidMcpResultText(toolName, `content[${i}] was a text block without a string text field`, block),
+        });
+      }
+      continue;
+    }
+
+    if (type === 'image') {
+      if (validMcpImageBlock(block)) {
+        normalized.push(block as McpContentBlock);
+      } else {
+        invalid = true;
+        changed = true;
+        normalized.push({
+          type: 'text',
+          text: invalidMcpResultText(toolName, `content[${i}] was an image block without string data and mimeType fields`, block),
+        });
+      }
+      continue;
+    }
+
+    invalid = true;
+    changed = true;
+    normalized.push({
+      type: 'text',
+      text: invalidMcpResultText(toolName, `content[${i}] had unsupported or missing type ${JSON.stringify(type)}`, block),
+    });
+  }
+
+  if (!changed && !invalid && Array.isArray(rawResult)) {
+    return { result: rawResult as CallToolResultContent, invalid: false };
+  }
+  const result = normalized as CallToolResultContent;
+  copyMcpResultMetadata(rawResult, result, { forceIsError: invalid });
+  return {
+    result,
+    invalid,
+    summary: invalid ? `${MCP_INVALID_RESULT_PREFIX}: malformed MCP content` : undefined,
+  };
+}
+
+function mcpResultHasErrorMetadata(result: unknown): boolean {
+  return mcpMetadataSources(result).some((source) => source.isError === true);
+}
+
+function mcpResultFailure(result: unknown): { failed: boolean; summary: string; notFound: boolean } {
+  const text = mcpResultText(result);
+  if (mcpResultHasErrorMetadata(result)) {
+    const summary = text.replace(/\s+/g, ' ').trim().slice(0, 240) || 'MCP result marked isError';
+    return { failed: true, summary, notFound: classifyToolError(summary) === 'not_found' };
+  }
+  return detectStructuredToolFailure(text);
+}
+
+function isInvalidMcpCallResultValidationError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const text = message.toLowerCase();
+  const resultContext = /invalid tools\/call result|tools\/call|call result|content|path.*text|["']text["']/.test(text);
+  if (!resultContext) return false;
+  return /invalid tools\/call result/.test(text)
+    || /invalid_union/.test(text)
+    || /expected string, received (undefined|null)/.test(text)
+    || /invalid input: expected string/.test(text);
 }
 
 // Append the global fan-out advisory to a native MCP result when the model is
@@ -169,7 +333,8 @@ function annotateMcpResultFailure(toolName: string, result: CallToolResultConten
       })
       .join('\n');
     if (!combined) return result;
-    const { failed, summary } = detectStructuredToolFailure(combined);
+    if (combined.includes(MCP_INVALID_RESULT_PREFIX)) return result;
+    const { failed, summary } = mcpResultFailure(result);
     if (!failed) return result;
     const corrective = toolFailureCorrective(summary, { toolName });
     return [{ type: 'text', text: corrective }, ...result] as CallToolResultContent;
@@ -218,8 +383,9 @@ function creditMcpOutcome(toolName: string, failed: boolean, text: string): void
 
 /** Flatten an MCP result's text blocks for failure detection / crediting. */
 function mcpResultText(result: unknown): string {
-  return Array.isArray(result)
-    ? result.map((b) => (typeof (b as { text?: unknown } | null)?.text === 'string' ? (b as { text: string }).text : '')).join('\n')
+  const content = mcpContentArray(result);
+  return content
+    ? content.map((b) => (typeof (b as { text?: unknown } | null)?.text === 'string' ? (b as { text: string }).text : '')).join('\n')
     : '';
 }
 
@@ -1013,14 +1179,18 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       try {
         // Forward to the underlying server with the ORIGINAL tool name.
         const rawResult = await server.callTool(parsed.toolName, args);
-        finish('success');
+        const normalized = normalizeMcpCallResult(toolName, rawResult);
+        const rawText = mcpResultText(normalized.result);
+        const failure = normalized.invalid
+          ? { failed: true, summary: normalized.summary ?? rawText.slice(0, 240), notFound: false }
+          : mcpResultFailure(normalized.result);
+        finish(failure.failed ? 'error' : 'success', failure.failed ? (failure.summary || rawText).slice(0, 240) : undefined);
         // Credit the MCP proven path's outcome (success, or a structured failure
         // envelope) — the ONLY place native MCP results reach procedural memory.
-        const rawText = mcpResultText(rawResult);
-        creditMcpOutcome(toolName, detectStructuredToolFailure(rawText).failed, rawText);
+        creditMcpOutcome(toolName, failure.failed, rawText || failure.summary);
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
-        const result = clipMcpResultForRecall(toolName, rawResult);
+        const result = clipMcpResultForRecall(toolName, normalized.result);
         // Record the irreversible send in the SHARED external_write ledger so a
         // later same-shape send (composio OR MCP) to the same target gets the
         // duplicate bump. Best-effort; telemetry must never affect the result.
@@ -1050,6 +1220,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
+        if (!(err instanceof BoundaryError) && isInvalidMcpCallResultValidationError(err)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const result = makeInvalidMcpResult(toolName, msg);
+          creditMcpOutcome(toolName, true, mcpResultText(result));
+          return appendMcpFanoutAdvisory(toolName, args, result);
+        }
         // Credit a thrown MCP failure to the proven path (transient blips and
         // BoundaryError approval/unavailable states are NOT the path's fault →
         // skipped by creditMcpOutcome / the guard here).

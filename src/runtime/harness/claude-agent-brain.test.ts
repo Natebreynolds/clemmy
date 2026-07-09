@@ -26,9 +26,11 @@ const {
 } = brain;
 const { appendEvent, createSession, getSession, listEvents, resetEventLog, writeToolOutput } = await import('./eventlog.js');
 const { ClaudeSdkProviderOverloadError, ClaudeSdkContextOverflowError } = await import('./claude-agent-sdk.js');
+const capabilityHealth = await import('./capability-health.js');
 
 beforeEach(() => {
   resetEventLog();
+  capabilityHealth._resetHarnessCapabilityHealthForTest();
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
@@ -282,6 +284,31 @@ test('renderClaudeAgentBrainTurnContext bounds slow hybrid recall and falls back
   const elapsedMs = Date.now() - start;
   assert.ok(elapsedMs < 1500, `slow recall must not stall turn-context assembly; elapsed ${elapsedMs}ms`);
   assert.doesNotMatch(ctx, /Relevant To Your Request\n- /, 'timed-out recall block is omitted');
+});
+
+test('Claude brain volatile turn context includes degraded harness capability health', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  capabilityHealth.recordHarnessCapabilityHealth({
+    id: 'claude_sdk_local_mcp_surface',
+    state: 'degraded',
+    summary: 'Claude SDK local MCP surface did not advertise tools the harness depends on.',
+    reason: 'missing required local MCP tool: memory_recall',
+    sessionId: 'brain-health-context',
+    details: { missingTools: ['memory_recall'], availableToolCount: 0 },
+  });
+  capabilityHealth.recordHarnessCapabilityHealth({
+    id: 'healthy_thing',
+    state: 'healthy',
+    summary: 'Healthy should stay silent.',
+  });
+
+  const ctx = await renderClaudeAgentBrainTurnContext({ message: 'continue', sessionId: 'brain-health-context' });
+
+  assert.match(ctx, /## Harness Capability Health/);
+  assert.match(ctx, /claude_sdk_local_mcp_surface: degraded/);
+  assert.match(ctx, /memory_recall/);
+  assert.match(ctx, /harness_status/);
+  assert.doesNotMatch(ctx, /healthy_thing/);
 });
 
 test('Claude brain carries same-session external-write ledger in the volatile turn context', async () => {

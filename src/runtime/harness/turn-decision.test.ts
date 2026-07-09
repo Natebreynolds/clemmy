@@ -12,6 +12,9 @@
  *   - Joshua Tree deploy (2026-07-08): a hallucinated tool call rendered as
  *     markdown ("**run_shell_command**" + fence) must stay a punt — the site
  *     was never deployed; that prose must never complete a run.
+ *   - bg-mrcg45p1 (2026-07-08): a fake `**Tool: read**` transcript with
+ *     missing path text must stay a punt — the meeting analysis was never
+ *     written even though the background task was marked done.
  *   - "I'll run the Outlook search now." — a TRUE short punt stays a punt.
  *
  * These pin the classification vocabulary so later refactors can't silently
@@ -116,6 +119,15 @@ test('golden sess-mrcg3mtx shape 2: lead-in sentence + "**Tool Call: run_shell_c
   assert.equal(kind, 'fake_tool_transcript');
 });
 
+test('golden bg-mrcg45p1: "**Tool: read**" missing-argument transcript is a fake tool transcript', () => {
+  const fake =
+    "**Tool: read**\n\n*(No `path` provided in the assistant's tool call — the harness will supply required params.)*";
+  assert.equal(toOrchestratorDecision(fake), null, 'missing-argument tool label must not complete the task');
+  const { kind, decision } = classifyTurnText(fake, { toolCalls: 0 });
+  assert.equal(kind, 'fake_tool_transcript');
+  assert.equal(decision, null);
+});
+
 test('an "Options:" heading before a fence is a REAL reply, not a transcript', () => {
   const real = 'Options:\n\n```\nnpm run build\n```\nRun the first one and the site rebuilds.';
   const d = toOrchestratorDecision(real);
@@ -130,6 +142,24 @@ test('an "Options:" heading before a fence is a REAL reply, not a transcript', (
 test('golden true punt: "I\'ll run the Outlook search now." is a punt, decision null', () => {
   assert.equal(toOrchestratorDecision("I'll run the Outlook search now."), null);
   const { kind, decision } = classifyTurnText("I'll run the Outlook search now.", { toolCalls: 0 });
+  assert.equal(kind, 'punt');
+  assert.equal(decision, null);
+});
+
+test('golden bg-mrbqprgv: self-reported no tool access is a punt, not a completed answer', () => {
+  const text =
+    'Nothing new - this environment has no tool access (Composio, Google Sheets, DataForSEO, or file I/O are not exposed to me here), so I cannot fetch search volumes, create a Google Sheet, or verify anything.';
+  assert.equal(toOrchestratorDecision(text), null);
+  const { kind, decision } = classifyTurnText(text, { toolCalls: 0 });
+  assert.equal(kind, 'punt');
+  assert.equal(decision, null);
+});
+
+test('golden workflow-step no-live-tool-access wording is a punt', () => {
+  const text =
+    'I cannot complete this step - this execution context has no live tool access, so I cannot call workflow_step_result.';
+  assert.equal(toOrchestratorDecision(text), null);
+  const { kind, decision } = classifyTurnText(text, { toolCalls: 0 });
   assert.equal(kind, 'punt');
   assert.equal(decision, null);
 });

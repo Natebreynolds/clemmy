@@ -39,6 +39,13 @@ export function takeStepResult(sessionId: string): { found: boolean; value: unkn
   return { found: true, value };
 }
 
+/** Loop-side: check whether a step result exists without consuming it.
+ *  The workflow runner remains the only owner that takes/clears the payload. */
+export function peekStepResult(sessionId: string): { found: boolean; value: unknown } {
+  if (!sessionId || !stepResults.has(sessionId)) return { found: false, value: undefined };
+  return { found: true, value: stepResults.get(sessionId) };
+}
+
 /** Test/maintenance: drop a session's pending result without reading. */
 export function clearStepResult(sessionId: string): void {
   stepResults.delete(sessionId);
@@ -60,6 +67,106 @@ function coerceStepData(data: string): unknown {
     }
   }
   return data;
+}
+
+function unescapeXmlText(text: string): string {
+  return text
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function coerceTranscriptValue(value: string): unknown {
+  const trimmed = unescapeXmlText(value).trim();
+  if (!trimmed) return '';
+  if (/^(?:true|false|null|-?\d+(?:\.\d+)?)$/i.test(trimmed) || /^[[{"]/.test(trimmed)) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return typeof parsed === 'string' ? coerceStepData(parsed) : parsed;
+    } catch {
+      /* keep as text */
+    }
+  }
+  return unescapeXmlText(value);
+}
+
+function extractBalancedJsonCall(text: string): unknown | undefined {
+  const call = /\bworkflow_step_result\s*\(/i.exec(text);
+  if (!call) return undefined;
+  let i = call.index + call[0].length;
+  while (i < text.length && /\s/.test(text[i])) i += 1;
+  const open = text[i];
+  const close = open === '{' ? '}' : open === '[' ? ']' : open === '"' ? '"' : '';
+  if (!close) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let j = i; j < text.length; j += 1) {
+    const ch = text[j];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      if (open === '"' && !inString) {
+        try {
+          const parsed = JSON.parse(text.slice(i, j + 1));
+          return typeof parsed === 'string' ? coerceStepData(parsed) : parsed;
+        } catch {
+          return undefined;
+        }
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (open !== '"' && ch === open) depth += 1;
+    if (open !== '"' && ch === close) {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          const parsed = JSON.parse(text.slice(i, j + 1));
+          return typeof parsed === 'string' ? coerceStepData(parsed) : parsed;
+        } catch {
+          return undefined;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractXmlCall(text: string): unknown | undefined {
+  const invoke = /<invoke\s+name=["']workflow_step_result["'][^>]*>([\s\S]{0,4000}?)<\/invoke>/i.exec(text);
+  if (!invoke?.[1]) return undefined;
+  const params = [...invoke[1].matchAll(/<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi)];
+  if (params.length === 0) return undefined;
+  const dataParam = params.find((m) => m[1] === 'data');
+  if (dataParam?.[2]) return coerceStepData(unescapeXmlText(dataParam[2]));
+  const out: Record<string, unknown> = {};
+  for (const match of params) {
+    const key = match[1];
+    if (!key) continue;
+    out[key] = coerceTranscriptValue(match[2] ?? '');
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Best-effort repair for models that write the inert structural result call
+ *  as text instead of invoking the tool. Never executes arbitrary tools. */
+export function recordStepResultFromTranscript(sessionId: string, text: string): boolean {
+  if (!sessionId || !text || stepResults.has(sessionId)) return false;
+  const value = extractBalancedJsonCall(text) ?? extractXmlCall(text);
+  if (value === undefined) return false;
+  recordStepResult(sessionId, value);
+  return true;
 }
 
 export function registerStepResultTool(server: McpServer): void {

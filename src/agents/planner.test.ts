@@ -15,7 +15,7 @@ import { mkdirSync, rmSync } from 'node:fs';
 const TEST_HOME = '/tmp/clemmy-test-planner';
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
-const { PlanSchema, buildPlannerAgent, buildPlannerTool } = await import('./planner.js');
+const { PlanSchema, buildPlannerAgent, buildPlannerTool, _testOnly_sanitizePlanOutput } = await import('./planner.js');
 
 before(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -132,14 +132,41 @@ test('PlanSchema: caps steps and successCriteria', () => {
   }));
 });
 
+test('sanitizePlanOutput accepts fenced schema-drifted JSON', () => {
+  const plan = _testOnly_sanitizePlanOutput('```json\n' + JSON.stringify({
+    goal: 'Draft approved outreach emails for the top accounts.',
+    actions: [
+      { step: 'Review standing outbound instructions.', why: 'Respect user preferences.', check: 'Instructions are reflected in the drafts.' },
+      'Create the draft emails for review.',
+    ],
+    criteria: ['Drafts exist for the selected accounts.'],
+    milestones: [{ name: 'Draft', successCriteria: ['Drafts exist for the selected accounts.'] }],
+    risks: 'Irreversible if emails are sent instead of drafted.',
+    complexity: 'small',
+    trackedExecution: 'false',
+    questions: 'Which accounts should be included?',
+    applied_instructions: 'Do not send without approval.',
+    external_sends: [{ tool: 'OUTLOOK_SEND_EMAIL', target: 'approved account outreach', count: '3' }],
+  }) + '\n```');
+
+  assert.ok(plan);
+  assert.equal(plan.objective, 'Draft approved outreach emails for the top accounts.');
+  assert.equal(plan.steps.length, 2);
+  assert.equal(plan.steps[1].n, 2);
+  assert.equal(plan.estimatedComplexity, 'moderate');
+  assert.equal(plan.recommendsTrackedExecution, false);
+  assert.deepEqual(plan.needsUserInput, ['Which accounts should be included?']);
+  assert.deepEqual(plan.appliedInstructions, ['Do not send without approval.']);
+  assert.deepEqual(plan.externalSends, [
+    { slug: 'OUTLOOK_SEND_EMAIL', summary: 'approved account outreach', count: 3 },
+  ]);
+});
+
 // ─── Planner Agent ─────────────────────────────────────────────
 
-test('Planner Agent: is named Planner with structured output', () => {
+test('Planner Agent: is named Planner', () => {
   const agent = buildPlannerAgent();
   assert.equal(agent.name, 'Planner');
-  // The output type is the PlanSchema; SDK stores it on the agent.
-  // We don't unwrap the SDK internals here — name check + tool-surface
-  // check below proves the wiring without coupling to SDK internals.
 });
 
 test('Planner Agent: tool surface is read-only', () => {

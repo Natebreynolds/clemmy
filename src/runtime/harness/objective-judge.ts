@@ -3,7 +3,8 @@ import { MODELS } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
-import { recordJudgeMetric, withJudgeTimeout, type JudgeMetricOutcome } from './judge-family.js';
+import { recordJudgeMetric, withJudgeHedge, type JudgeMetricLane, type JudgeMetricOutcome } from './judge-family.js';
+import { extractJsonCandidate } from './json-repair.js';
 
 /**
  * Judge system prompt — modeled on OpenAI Codex's continuation.md auditor
@@ -21,7 +22,8 @@ export const JUDGE_SYSTEM_PROMPT = [
   'Use an AUDIT CHECKLIST: enumerate the concrete, verifiable deliverables the objective implies, then check each one against the assistant\'s response.',
   '',
   'Rules:',
-  '- A deliverable counts as complete only when the response contains VERIFIABLE EVIDENCE (a URL, a file path, a quoted result, an emitted artifact) — not a promise or summary of what was done.',
+  '- A deliverable counts as complete only when the response contains VERIFIABLE EVIDENCE — the concrete result itself, its quoted output, or a pointer to the produced artifact — not a promise or summary of what was done.',
+  '- Evidence takes WHATEVER FORM the objective implies. Demand a link, file, or record only when the objective itself calls for one; for a question, analysis, or plan the answer in the response IS the deliverable. NEVER mark the objective incomplete for lacking a URL or file it never asked for.',
   '- Do NOT accept proxy signals (e.g. "I have updated the records", "task complete", "✓") as completion by themselves. Require the artifact or its output.',
   '- A plan, intention, or "I will work on this next" is NOT complete.',
   '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
@@ -35,7 +37,8 @@ export const JUDGE_SYSTEM_PROMPT = [
   '',
   'Examples:',
   '  DONE: Spreadsheet created at /Users/me/Q3.xlsx with URL returned',
-  '  INCOMPLETE: Assistant proposed steps but no artifact or URL was produced',
+  '  DONE: The requested analysis is fully present in the response with its supporting figures',
+  '  INCOMPLETE: Assistant proposed steps but did not produce the deliverable the objective named',
   '  INCOMPLETE: Two of three deliverables remain — emails drafted but no send confirmation evidence',
 ].join('\n');
 
@@ -158,6 +161,16 @@ export const HARNESS_INJECTED_INPUT_PREFIXES = [
   'Your previous response could not be parsed into the required structured decision',
   'You already auto-resolved that approval question under YOLO',
   'Before you deliver this:',
+  // Restart-recovery auto-resume directive (restart-recovery.ts
+  // AUTO_RESUME_DIRECTIVE) — dispatched as the resumed session's input, never
+  // typed by the user. Without this entry, later bare follow-ups in a resumed
+  // session compose the directive into the judged objective, and auto-memory
+  // can learn it as a "user" fact.
+  'The previous run in this session was interrupted by a daemon restart and has been automatically resumed.',
+  // Background-task resume wrapper (background-tasks.ts) — "Resume background
+  // task bg-… Original request: …" is a harness-dispatched continuation, never
+  // a user message (the ORIGINAL request inside it is the real objective).
+  'Resume background task ',
 ] as const;
 
 export function isHarnessInjectedInput(text: string): boolean {
@@ -222,16 +235,52 @@ export type ObjectiveJudgeFn = (
 // so each caller applies its OWN fail semantics (strict throws → not-passed; the
 // interactive judge fails open → done:true), preserving both directions unchanged.
 export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string } | null {
+  if (isRecord(finalOutput)) return parseCompletionObject(finalOutput);
   const raw = String(finalOutput ?? '').trim();
-  const match = /^\s*(DONE|INCOMPLETE|NOT[- ]?DONE)\s*:?\s*(.*)$/im.exec(raw);
-  if (!match) return null;
-  return { done: match[1].toUpperCase() === 'DONE', reason: (match[2] || '').slice(0, 400) };
+  const match = /^\s*(DONE|INCOMPLETE|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
+  if (match) {
+    return { done: match[1].toUpperCase() === 'DONE', reason: (match[2] || '').trim().slice(0, 400) };
+  }
+  const json = extractJsonCandidate(raw);
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    return isRecord(parsed) ? parseCompletionObject(parsed) : null;
+  } catch {
+    return null;
+  }
 }
 
-function buildJudgeAgent(routing?: BoundaryJudgeRouting): Agent<RuntimeContextValue> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseCompletionBool(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, '-');
+  if (/^(true|yes|done|complete|completed|pass|passed|met)$/.test(normalized)) return true;
+  if (/^(false|no|incomplete|not-done|not-complete|not-completed|fail|failed|unmet)$/.test(normalized)) return false;
+  return null;
+}
+
+function parseCompletionObject(obj: Record<string, unknown>): { done: boolean; reason: string } | null {
+  let done = parseCompletionBool(obj.done ?? obj.complete ?? obj.completed ?? obj.pass ?? obj.passed);
+  if (done === null) {
+    done = parseCompletionBool(obj.verdict ?? obj.status ?? obj.result ?? obj.kind);
+  }
+  if (done === null) return null;
+  const rawReason = obj.reason ?? obj.rationale ?? obj.explanation ?? obj.missing ?? obj.evidence ?? obj.summary;
+  const reason = typeof rawReason === 'string' && rawReason.trim()
+    ? rawReason.trim().slice(0, 400)
+    : done ? 'objective satisfied' : 'objective missing required evidence';
+  return { done, reason };
+}
+
+function buildJudgeAgent(routing?: BoundaryJudgeRouting, instructions: string = JUDGE_SYSTEM_PROMPT): Agent<RuntimeContextValue> {
   return new Agent<RuntimeContextValue>({
     name: 'ObjectiveCompletionJudge',
-    instructions: JUDGE_SYSTEM_PROMPT,
+    instructions,
     // Cross-family boundary judge (avoids the brain self-grading); falls open to
     // the brain-family-safe cheap id when no different family is available (never a
     // repurposed BYO fast slot that would storm an unintended provider).
@@ -248,9 +297,10 @@ function recordCompletionJudgeMetric(
   outcome: JudgeMetricOutcome,
   startedAt: number,
   routing?: BoundaryJudgeRouting,
+  lane: JudgeMetricLane = 'completion',
 ): void {
   recordJudgeMetric({
-    lane: 'completion',
+    lane,
     outcome,
     durationMs: Date.now() - startedAt,
     modelId: routing?.modelId,
@@ -317,8 +367,199 @@ export function buildObjectiveJudgePrompt(
       ...skillContext.skills.map((s) => `\n--- skill: ${s.name} (first 5000 chars) ---\n${s.body.slice(0, 5000)}`),
     );
   }
-  parts.push('', 'Audit it against the objective and respond with the structured verdict.');
+  parts.push('', 'Audit it against the objective and respond with exactly one verdict line.');
   return parts.join('\n');
+}
+
+/** Thrown by an attempt whose model answered but off-contract — classified
+ *  'invalid' (vs transport 'error') in the metric lane. */
+class JudgeVerdictParseError extends Error {}
+
+interface CompletionJudgeRun {
+  /** Parsed verdict from the first attempt to answer, or null. */
+  verdict: { done: boolean; reason: string } | null;
+  /** null-verdict cause for metrics/fail semantics: pure deadline miss vs
+   *  parse failure vs transport error. */
+  failure: 'timeout' | 'invalid' | 'error' | null;
+  /** The winning attempt's routing (primary routing when nothing won). */
+  routing?: BoundaryJudgeRouting;
+}
+
+/**
+ * One HEDGED judge run — the shared engine for every completion-lane verdict
+ * shape. The primary cross-family judge starts immediately; if it hasn't
+ * answered by the hedge delay (or dies first), a cheap judge from the other
+ * flagship family races it, and the first PARSED value wins (judge-family.ts).
+ * Metrics record the winner's model/family, so a hedge win is visible in
+ * telemetry. Parametrized on (instructions, prompt, parse, lane) so the
+ * one-line DONE/INCOMPLETE judge, the per-criterion checklist judge, and the
+ * trajectory watcher share routing, hedging, metrics, and failure taxonomy
+ * instead of forking them. Exported for the watcher (watcher-judge.ts).
+ */
+export async function runHedgedJudge<T>(
+  instructions: string,
+  prompt: string,
+  parse: (finalOutput: unknown) => T | null,
+  isPass: (value: T) => boolean,
+  lane: JudgeMetricLane = 'completion',
+): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting }> {
+  const startedAt = Date.now();
+  let routing: BoundaryJudgeRouting | undefined;
+  try {
+    const { resolveBoundaryJudge, resolveBoundaryJudgeHedge } = await import('./debate-model.js');
+    routing = resolveBoundaryJudge();
+    const hedgeRouting = resolveBoundaryJudgeHedge(routing);
+    const attempt = (r: BoundaryJudgeRouting) => async () => {
+      const runner = new Runner({ workflowName: 'clementine-objective-judge' });
+      const result = await runner.run(buildJudgeAgent(r, instructions), prompt, { maxTurns: 1 });
+      const value = parse(result.finalOutput);
+      if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
+      return value;
+    };
+    const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+    const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
+    if (raced.value !== null) {
+      recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
+      return { value: raced.value, failure: null, routing: winner };
+    }
+    const failure =
+      raced.errors.length === 0
+        ? 'timeout'
+        : raced.errors.some((e) => e instanceof JudgeVerdictParseError)
+          ? 'invalid'
+          : 'error';
+    recordCompletionJudgeMetric(failure, startedAt, routing, lane);
+    return { value: null, failure, routing };
+  } catch (err) {
+    recordCompletionJudgeMetric('error', startedAt, routing, lane);
+    logDebugSafe(err);
+    return { value: null, failure: 'error', routing };
+  }
+}
+
+async function runCompletionJudge(
+  objective: string,
+  assistantResponse: string,
+  skillContext?: SkillExecutionContext,
+): Promise<CompletionJudgeRun> {
+  const run = await runHedgedJudge(
+    JUDGE_SYSTEM_PROMPT,
+    buildObjectiveJudgePrompt(objective, assistantResponse, skillContext),
+    parseCompletionVerdict,
+    (v) => v.done,
+  );
+  return { verdict: run.value, failure: run.failure, routing: run.routing };
+}
+
+/** Swallow-with-trace: the judge lanes are fail-open/fail-strict by CONTRACT,
+ *  but a resolver bug should still be visible in debug logs. */
+function logDebugSafe(err: unknown): void {
+  try {
+    // eslint-disable-next-line no-console
+    if (process.env.CLEMMY_DEBUG) console.error('[objective-judge]', err instanceof Error ? err.message : err);
+  } catch {
+    /* never throws */
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Per-criterion checklist judge — real granularity for goal contracts.
+//
+// validateGoal used to send all fuzzy criteria in one call and stamp the
+// single DONE/INCOMPLETE on EVERY criterion — successRatePercent had fake
+// granularity (all fuzzy criteria passed or failed together), and a run that
+// met 4 of 5 criteria scored 0% on the fuzzy set. Same ONE call, but the
+// judge now audits each criterion individually and answers one line per
+// criterion; the parser is all-or-nothing (a partial listing throws →
+// retry/hedge → caller's fail-strict semantics), so granularity is never
+// silently degraded.
+// ─────────────────────────────────────────────────────────────────
+
+export const CRITERIA_JUDGE_SYSTEM_PROMPT = [
+  'You are a goal-completion judge. You receive (1) a user objective, (2) a NUMBERED list of success criteria, and (3) the assistant\'s evidence.',
+  '',
+  'Audit EACH criterion INDIVIDUALLY against the evidence.',
+  '',
+  'Rules (apply to every criterion):',
+  '- A criterion counts as MET only when the evidence contains VERIFIABLE proof — the concrete result itself, its quoted output, or a pointer to the produced artifact — not a promise or summary of what was done.',
+  '- Proof takes WHATEVER FORM the criterion implies. Demand a link, file, or record only when the criterion itself calls for one; NEVER mark a criterion UNMET for lacking a URL or file it never asked for.',
+  '- Do NOT accept proxy signals ("I have updated the records", "task complete", "✓") as completion by themselves.',
+  '- A plan, intention, or "I will work on this next" is NOT met.',
+  '- HONEST BLOCKER: if the evidence explicitly names why this specific criterion is genuinely blocked (a named tool/endpoint unavailable, a record that does not exist, access denied), treat it as MET rather than demanding a retry of an unavailable capability.',
+  '- Judge ONLY the listed criteria. Do not invent extra requirements.',
+  '',
+  'Reply with EXACTLY ONE LINE PER CRITERION, in order, numbered to match, and nothing else:',
+  '  "<n>: MET: <short evidence>" or "<n>: UNMET: <short missing piece>".',
+  '',
+  'Example for 3 criteria:',
+  '  1: MET: spreadsheet URL present in the reply',
+  '  2: UNMET: no send confirmation for the second email',
+  '  3: MET: file path /tmp/report.pdf quoted with contents summary',
+].join('\n');
+
+export interface CriterionJudgeVerdict {
+  pass: boolean;
+  note: string;
+}
+
+/** Parse the per-criterion judge reply. ALL-OR-NOTHING: unless every one of the
+ *  `count` criteria has a parsed line, returns null (→ the attempt is 'invalid'
+ *  and the hedge/retry path takes over) — granularity is never silently partial. */
+export function parseCriteriaVerdicts(finalOutput: unknown, count: number): CriterionJudgeVerdict[] | null {
+  const raw = String(finalOutput ?? '').trim();
+  if (!raw || count <= 0) return null;
+  const verdicts = new Map<number, CriterionJudgeVerdict>();
+  const re = /^\s*(\d{1,3})\s*[:.)\-]\s*(MET|UNMET|PASS|FAIL|DONE|INCOMPLETE)\b\s*[:—–-]?\s*(.*)$/gim;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const idx = Number.parseInt(m[1], 10);
+    if (idx < 1 || idx > count || verdicts.has(idx)) continue;
+    verdicts.set(idx, { pass: /^(MET|PASS|DONE)$/i.test(m[2]), note: (m[3] || '').slice(0, 300) });
+  }
+  if (verdicts.size !== count) return null;
+  return Array.from({ length: count }, (_, i) => verdicts.get(i + 1) as CriterionJudgeVerdict);
+}
+
+/**
+ * STRICT per-criterion checklist judge: ONE hedged model call, one verdict per
+ * criterion. Throws on infra failure exactly like judgeObjectiveCompleteStrict
+ * (goal validation must fail toward not-passed, never auto-satisfy).
+ */
+export async function judgeGoalCriteriaStrict(
+  objective: string,
+  criteria: string[],
+  evidenceText: string,
+): Promise<CriterionJudgeVerdict[]> {
+  const list = criteria.map((c) => c.trim()).filter((c) => c.length > 0);
+  if (list.length === 0 || !evidenceText.trim()) {
+    throw new Error('insufficient text to judge');
+  }
+  const shown = clipForJudge(evidenceText, JUDGE_RESPONSE_MAX_CHARS);
+  const prompt = [
+    `Objective: ${objective}`,
+    '',
+    'Success criteria to audit individually:',
+    ...list.map((c, i) => `${i + 1}. ${c}`),
+    '',
+    shown.truncated
+      ? "Assistant's evidence (LONG — windowed to its head and tail with the middle elided for length; judge ONLY what is visible and do NOT mark a criterion UNMET merely because its proof might fall in the omitted middle):"
+      : "Assistant's evidence:",
+    shown.text,
+    '',
+    `Audit each criterion and reply with exactly ${list.length} numbered lines as instructed.`,
+  ].join('\n');
+  const run = await runHedgedJudge(
+    CRITERIA_JUDGE_SYSTEM_PROMPT,
+    prompt,
+    (o) => parseCriteriaVerdicts(o, list.length),
+    (v) => v.every((x) => x.pass),
+  );
+  if (!run.value) {
+    throw new Error(
+      run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
+    );
+  }
+  return run.value;
 }
 
 /**
@@ -336,37 +577,13 @@ export async function judgeObjectiveCompleteStrict(
   if (!objective.trim() || !assistantResponse.trim()) {
     throw new Error('insufficient text to judge');
   }
-  const startedAt = Date.now();
-  let routing: BoundaryJudgeRouting | undefined;
-  let recorded = false;
-  const record = (outcome: JudgeMetricOutcome) => {
-    recorded = true;
-    recordCompletionJudgeMetric(outcome, startedAt, routing);
-  };
-  try {
-    const { resolveBoundaryJudge } = await import('./debate-model.js');
-    routing = resolveBoundaryJudge();
-    const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-    const result = await withJudgeTimeout(
-      runner.run(buildJudgeAgent(routing), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
-        maxTurns: 1,
-      }),
+  const run = await runCompletionJudge(objective, assistantResponse, skillContext);
+  if (!run.verdict) {
+    throw new Error(
+      run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',
     );
-    if (!result) {
-      record('timeout');
-      throw new Error('judge timed out');
-    }
-    const verdict = parseCompletionVerdict(result.finalOutput);
-    if (!verdict) {
-      record('invalid');
-      throw new Error('judge output did not parse');
-    }
-    record(verdict.done ? 'passed' : 'blocked');
-    return { done: verdict.done, reason: verdict.reason };
-  } catch (err) {
-    if (!recorded) record('error');
-    throw err;
   }
+  return { done: run.verdict.done, reason: run.verdict.reason };
 }
 
 /**
@@ -382,35 +599,15 @@ export async function judgeObjectiveComplete(
   if (!objective.trim() || !assistantResponse.trim()) {
     return { done: true, reason: 'insufficient text to judge — accepting completion' };
   }
-  const startedAt = Date.now();
-  let routing: BoundaryJudgeRouting | undefined;
-  let recorded = false;
-  const record = (outcome: JudgeMetricOutcome) => {
-    recorded = true;
-    recordCompletionJudgeMetric(outcome, startedAt, routing);
-  };
-  try {
-    const { resolveBoundaryJudge } = await import('./debate-model.js');
-    routing = resolveBoundaryJudge();
-    const runner = new Runner({ workflowName: 'clementine-objective-judge' });
-    const result = await withJudgeTimeout(
-      runner.run(buildJudgeAgent(routing), buildObjectiveJudgePrompt(objective, assistantResponse, skillContext), {
-        maxTurns: 1,
-      }),
-    );
-    if (!result) {
-      record('timeout');
-      return { done: true, reason: 'judge timed out — accepting completion', failedOpen: true };
-    }
-    const verdict = parseCompletionVerdict(result.finalOutput);
-    if (!verdict) {
-      record('invalid');
-      return { done: true, reason: 'judge output did not parse — accepting completion', failedOpen: true };
-    }
-    record(verdict.done ? 'passed' : 'blocked');
-    return { done: verdict.done, reason: verdict.reason, selfJudge: routing?.selfJudge === true };
-  } catch {
-    if (!recorded) record('error');
-    return { done: true, reason: 'judge unavailable — accepting completion', failedOpen: true };
+  const run = await runCompletionJudge(objective, assistantResponse, skillContext);
+  if (!run.verdict) {
+    const why =
+      run.failure === 'timeout'
+        ? 'judge timed out — accepting completion'
+        : run.failure === 'invalid'
+          ? 'judge output did not parse — accepting completion'
+          : 'judge unavailable — accepting completion';
+    return { done: true, reason: why, failedOpen: true };
   }
+  return { done: run.verdict.done, reason: run.verdict.reason, selfJudge: run.routing?.selfJudge === true };
 }

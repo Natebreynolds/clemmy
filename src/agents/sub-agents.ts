@@ -19,6 +19,7 @@ import { getGoalPinForDelegation } from './plan-proposals.js';
 import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
 import { normalizeWorkerOutput } from './worker-output.js';
+import { externalMcpScopeFromResolvedTools } from './external-mcp-scope-lock.js';
 
 /**
  * Sub-agents.
@@ -117,9 +118,13 @@ function filterToolsForWorker<T extends { name?: string }>(tools: T[]): T[] {
   );
 }
 
-export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; model?: string } = {}): Promise<SubAgent> {
+export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; model?: string; workerInput?: WorkerToolInput } = {}): Promise<SubAgent> {
   const all = await getCoreToolsAsync({ includeDynamicComposioTools: false });
   const tools = filterToolsForWorker(all) as Tool<RuntimeContextValue>[];
+  const externalMcpScope = options.mcpToolScope ?? (options.workerInput
+    ? externalMcpScopeFromResolvedTools(options.workerInput.resolvedTools)
+    : null);
+  const externalMcpServers = externalMcpScope === null ? [] : [getOrCreateExternalMcpServers(externalMcpScope)];
   const baseInstructions = [
       'You are a Worker — a stateless, single-task sub-agent inside Clementine.',
       'Your scope is ONE item. The parent agent fans out across N items by calling you N times in parallel; each call is a fresh, isolated context.',
@@ -161,12 +166,10 @@ export async function buildWorkerAgent(options: { mcpToolScope?: McpToolScope; m
     // the old behavior). The registered provider still routes the resulting id.
     model: options.model ?? resolveRoleModel('worker').modelId,
     tools: wrapTools(tools),
-    // External MCP servers (DataForSEO, Supabase, browsermcp, etc.)
-    // the user has configured. Tools surface as `<server>__<tool>`.
-    // Local clementine MCP is excluded — those tools are already in
-    // `tools` via getCoreToolsAsync(), and duplicating would force the
-    // model to disambiguate (memory_remember vs clementine-local__memory_remember).
-    mcpServers: [getOrCreateExternalMcpServers(options.mcpToolScope)],
+    // External MCP servers are attached only from an explicit parent scope or
+    // exact worker-packet `resolvedTools`. A worker with "none needed"/local
+    // tools should not cold-start every external MCP child.
+    ...(externalMcpServers.length > 0 ? { mcpServers: externalMcpServers } : {}),
   });
 }
 
@@ -211,7 +214,7 @@ export async function runCrossProviderWorker(
   modelId: string,
   sessionId: string,
 ): Promise<CrossProviderWorkerResult> {
-  const worker = await buildWorkerAgent({ model: modelId });
+  const worker = await buildWorkerAgent({ model: modelId, workerInput: input });
   const guard = workerThrashGuardEnabled();
   // Base per-item turn budget — mirrors the orchestrator nested lane
   // (CLEMMY_WORKER_MAX_TURNS default 8, intent-aware ceiling on top).

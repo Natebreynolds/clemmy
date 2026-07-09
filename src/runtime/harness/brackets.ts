@@ -415,6 +415,14 @@ export function timeoutForTool(toolName: string): number {
   if (toolName === 'run_batch') {
     return DEFAULT_TIMEOUTS_MS.shell;
   }
+  // run_tool_program has its OWN activity-aware sandbox ceiling
+  // (CLEMMY_CODEMODE_MAX_MS, default 180s) and partial-result salvage. The
+  // outer harness must be wider than that inner deadline; otherwise the generic
+  // 60s wrapper kills code mode first and the model gets an ask/retry timeout
+  // instead of the sandbox's "partial results salvaged" corrective.
+  if (toolName === 'run_tool_program') {
+    return DEFAULT_TIMEOUTS_MS.externalApi;
+  }
   // MCP namespace shim separator is "__" (src/runtime/mcp-namespace-shim.ts).
   if (toolName.includes('__')) {
     return DEFAULT_TIMEOUTS_MS.mcp;

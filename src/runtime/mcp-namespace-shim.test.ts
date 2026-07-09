@@ -48,6 +48,10 @@ function makeFakeServer(opts: {
   failConnect?: boolean;
   /** Throw from close to verify the shim swallows close errors. */
   failClose?: boolean;
+  /** Return a custom callTool payload to exercise result-shape boundaries. */
+  callToolResult?: unknown | ((toolName: string, args: Record<string, unknown> | null) => unknown | Promise<unknown>);
+  /** Throw from callTool to simulate SDK/server invocation failures. */
+  failCallTool?: Error;
 }): MCPServer & {
   _calls: { tool: string; args: Record<string, unknown> | null }[];
   _connected: number;
@@ -72,7 +76,13 @@ function makeFakeServer(opts: {
     },
     async callTool(toolName, args) {
       state.calls.push({ tool: toolName, args });
-      return { content: [{ type: 'text', text: `${opts.name}:${toolName}` }] } as any;
+      if (opts.failCallTool) throw opts.failCallTool;
+      if ('callToolResult' in opts) {
+        return typeof opts.callToolResult === 'function'
+          ? await opts.callToolResult(toolName, args)
+          : opts.callToolResult as any;
+      }
+      return [{ type: 'text', text: `${opts.name}:${toolName}` }] as any;
     },
     async invalidateToolsCache() {},
   };
@@ -157,6 +167,72 @@ test('shim: callTool routes to the right server with the original tool name', as
   await shim.callTool('beta__get_thing', { q: 'pinecone' });
   assert.deepEqual(a._calls, []);
   assert.deepEqual(b._calls, [{ tool: 'get_thing', args: { q: 'pinecone' } }]);
+});
+
+test('shim: normalizes malformed MCP text blocks into model-readable failure results', async () => {
+  const dfs = makeFakeServer({
+    name: 'dataforseo',
+    tools: [{ name: 'get_page_content' }],
+    callToolResult: [{ type: 'text' }],
+  });
+  const shim = createMcpNamespaceShim({ servers: [dfs], cacheToolsList: false });
+  await shim.listTools();
+
+  const result = await shim.callTool('dataforseo__get_page_content', { url: 'https://example.com' });
+
+  assert.equal(Array.isArray(result), true);
+  assert.equal((result as any).isError, true);
+  const text = ((result as any[])[0] as { text?: string }).text ?? '';
+  assert.match(text, /MCP_RESULT_INVALID/);
+  assert.match(text, /text block without a string text field/);
+});
+
+test('shim: SDK invalid tools/call result validation errors become tool results instead of thrown run failures', async () => {
+  const validationError = new Error(
+    'MCP error -32602: Invalid tools/call result: [{"code":"invalid_union","errors":[[{"expected":"string","code":"invalid_type","path":["text"],"message":"Invalid input: expected string, received undefined"}]]}]',
+  );
+  const dfs = makeFakeServer({
+    name: 'dataforseo',
+    tools: [{ name: 'get_page_content' }],
+    failCallTool: validationError,
+  });
+  const shim = createMcpNamespaceShim({ servers: [dfs], cacheToolsList: false });
+  await shim.listTools();
+
+  const result = await shim.callTool('dataforseo__get_page_content', { url: 'https://example.com' });
+
+  assert.equal(Array.isArray(result), true);
+  assert.equal((result as any).isError, true);
+  const text = ((result as any[])[0] as { text?: string }).text ?? '';
+  assert.match(text, /MCP_RESULT_INVALID/);
+  assert.match(text, /Invalid tools\/call result/);
+});
+
+test('shim: MCP isError metadata gets self-correcting failure guidance', async () => {
+  const prev = process.env.CLEMMY_MCP_ERROR_CORRECTIVE;
+  process.env.CLEMMY_MCP_ERROR_CORRECTIVE = 'on';
+  try {
+    const content = [{ type: 'text', text: 'plain MCP failure body' }] as any;
+    content.isError = true;
+    const server = makeFakeServer({
+      name: 'plainerr',
+      tools: [{ name: 'get_failure_probe' }],
+      callToolResult: content,
+    });
+    const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
+    await shim.listTools();
+
+    const result = await shim.callTool('plainerr__get_failure_probe', {});
+    const text = (result as any[])
+      .map((block) => (typeof block?.text === 'string' ? block.text : ''))
+      .join('\n');
+
+    assert.match(text, /plainerr__get_failure_probe FAILED: plain MCP failure body/);
+    assert.match(text, /Do ONE of these instead/);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_MCP_ERROR_CORRECTIVE;
+    else process.env.CLEMMY_MCP_ERROR_CORRECTIVE = prev;
+  }
 });
 
 test('shim: native MCP lifecycle telemetry is scoped to the harness session', async () => {

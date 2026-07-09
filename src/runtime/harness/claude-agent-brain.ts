@@ -41,6 +41,7 @@ import {
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
 import { resolveEffectiveToolNames, type ToolNamePolicyResult } from './tool-policy.js';
+import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -618,7 +619,9 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   // isn't repeated. Bounded to a couple of lines; empty for most turns.
   let pitfalls = '';
   try { pitfalls = knownPitfallLineForInput(request.message ?? '') ?? ''; } catch { pitfalls = ''; }
-  return [volatile, continuationContext, recall, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n');
+  let harnessHealth = '';
+  try { harnessHealth = renderHarnessCapabilityHealthForContext({ limit: 3 }); } catch { harnessHealth = ''; }
+  return [volatile, continuationContext, harnessHealth, recall, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n');
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(

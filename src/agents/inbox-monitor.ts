@@ -31,14 +31,21 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
-import { executeComposioTool, listConnectedToolkits } from '../integrations/composio/client.js';
+import {
+  executeComposioTool,
+  listConnectedToolkits,
+  readComposioConnectionSuppressionState,
+  saveComposioConnectionSuppressionState,
+} from '../integrations/composio/client.js';
 import { addNotification, type NotificationRecord } from '../runtime/notifications.js';
 import {
   clearConnectionSuppression,
   isConnectionSuppressed,
+  mergeConnectionSuppressions,
   pruneConnectionSuppressions,
   suppressConnectionAfterHardAuthFailure,
   type ComposioConnectionSuppression,
+  type ComposioConnectionSuppressionState,
 } from './composio-connection-suppression.js';
 import { getProactivityPolicySnapshot, loadProactivityPolicy } from './proactivity-policy.js';
 import { decideSurface, shouldSurface, type SurfaceDecision } from './surface-decision.js';
@@ -82,6 +89,8 @@ export interface InboxMonitorDeps {
   now: () => number;
   loadState: () => InboxMonitorState;
   saveState: (s: InboxMonitorState) => void;
+  readConnectionSuppressions?: (nowMs: number) => ComposioConnectionSuppressionState;
+  saveConnectionSuppressions?: (s: ComposioConnectionSuppressionState, nowMs?: number) => void;
 }
 
 // ── config (user-editable via the proactivity policy) ────────────────────────
@@ -258,6 +267,8 @@ const REAL_DEPS: InboxMonitorDeps = {
   now: () => Date.now(),
   loadState: loadStateReal,
   saveState: saveStateReal,
+  readConnectionSuppressions: readComposioConnectionSuppressionState,
+  saveConnectionSuppressions: saveComposioConnectionSuppressionState,
 };
 
 export const inboxMonitorInternalsForTest = { loadStateReal, saveStateReal };
@@ -280,6 +291,16 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
 
   const nowMs = deps.now();
   const state = deps.loadState();
+  let sharedSuppressionsLoaded = false;
+  try {
+    const shared = deps.readConnectionSuppressions?.(nowMs);
+    if (shared) {
+      mergeConnectionSuppressions(state, shared, nowMs);
+      sharedSuppressionsLoaded = true;
+    }
+  } catch {
+    // The ambient monitor remains best-effort if the shared suppression store is unreadable.
+  }
   if (state.lastScanAt && nowMs - Date.parse(state.lastScanAt) < cfg.intervalMs) return 0;
 
   let connections: Awaited<ReturnType<typeof listConnectedToolkits>>;
@@ -302,6 +323,7 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
   const surfaced = new Set(state.surfacedIds);
   const seenKeys = new Set<string>(); // every unread key seen this scan (window refresh)
   const candidates: Array<{ msg: UnreadMessage; score: MessageScore; label: string; connectionId: string; slug: string }> = [];
+  let suppressionChanged = false;
 
   for (const box of mailboxes) {
     if (isConnectionSuppressed(state, box.connectionId, nowMs)) {
@@ -315,6 +337,7 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
     } catch (err) {
       const suppression = suppressConnectionAfterHardAuthFailure(state, box.connectionId, err, nowMs);
       if (suppression) {
+        suppressionChanged = true;
         logger.warn({
           err,
           slug: box.slug,
@@ -352,11 +375,19 @@ export async function processInboxMonitor(deps: InboxMonitorDeps = REAL_DEPS): P
   // of a fixed-size window and re-surfacing as a duplicate. Read/deleted ones
   // drop out naturally (they won't reappear in the unread list). Cap is a backstop.
   const persisted = [...surfaced].filter((k) => seenKeys.has(k)).slice(-SURFACED_IDS_CAP);
+  const suppressedConnections = pruneConnectionSuppressions(state, nowMs);
   deps.saveState({
     lastScanAt: new Date(nowMs).toISOString(),
     surfacedIds: persisted,
-    suppressedConnections: pruneConnectionSuppressions(state, nowMs),
+    suppressedConnections,
   });
+  if ((sharedSuppressionsLoaded || suppressionChanged) && deps.saveConnectionSuppressions) {
+    try {
+      deps.saveConnectionSuppressions({ suppressedConnections }, nowMs);
+    } catch {
+      // Local monitor state was already persisted; shared store propagation is best-effort.
+    }
+  }
 
   if (toSurface.length > 0) {
     logger.info({ surfaced: toSurface.length, scanned: mailboxes.length }, 'inbox-monitor surfaced needs-you items');

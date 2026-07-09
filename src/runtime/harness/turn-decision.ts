@@ -12,6 +12,7 @@
 import { listEvents, type EventRow } from './eventlog.js';
 import { getRuntimeEnv } from '../../config.js';
 import { scrubInternalNarration } from './scrub-internal-narration.js';
+import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 // Type-only import — erased at compile time, so there is no runtime cycle
 // with loop.ts (which imports this module's values).
 import type { OrchestratorDecisionShape } from './loop.js';
@@ -119,6 +120,7 @@ function looksLikeZeroWorkStallText(trimmed: string): boolean {
     STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
     !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)
   ) return true;
+  if (looksLikeToolUnavailableSelfReport(trimmed)) return true;
   // A HALLUCINATED TOOL CALL rendered as text — a tool-shaped heading
   // ("**run_shell_command**" or "**Tool Call: run_shell_command**") near the
   // start, followed shortly by a fenced block. Live 2026-07-08: gpt-5.5 ended
@@ -143,11 +145,29 @@ function looksLikeZeroWorkStallText(trimmed: string): boolean {
 // replies use those.
 const HALLUCINATED_TOOL_TRANSCRIPT_PATTERN =
   /(?:^|\n)\s*(?:(?:\*\*|`)(?:tool call:\s*)?[a-z][a-z0-9_]*(?:\*\*|`)|tool call:\s*[a-z][a-z0-9_]*|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)\s*\n[\s\S]{0,120}?```/i;
+const HALLUCINATED_XML_TOOL_CALL_PATTERN =
+  /<function_calls>[\s\S]{0,600}?<invoke\s+name=["']([a-z][a-z0-9_]*)["'][\s\S]{0,1400}?<\/function_calls>/i;
+const HALLUCINATED_TOOL_LABEL_PATTERN =
+  /(?:^|\n)\s*(?:\*\*)?\s*(?:tool|tool call)\s*:\s*([a-z][a-z0-9_-]*)\s*(?:\*\*)?/i;
+const HALLUCINATED_BRACKET_TOOL_LABEL_PATTERN =
+  /\[(?:tool|tool call)\s*:\s*([a-z][a-z0-9_-]*)\]/i;
+const HALLUCINATED_TOOL_NO_PARAMS_PATTERN =
+  /\b(?:no\s+`?[a-z][a-z0-9_-]*`?\s+provided|assistant's tool call|harness will supply required params|tool call.+missing required)/i;
+
+function hallucinatedToolTranscriptName(trimmed: string): string | null {
+  const xml = HALLUCINATED_XML_TOOL_CALL_PATTERN.exec(trimmed);
+  if (xml && xml.index <= 200) return xml[1] ?? null;
+  const label = HALLUCINATED_TOOL_LABEL_PATTERN.exec(trimmed);
+  if (label && label.index <= 200 && HALLUCINATED_TOOL_NO_PARAMS_PATTERN.test(trimmed)) return label[1] ?? null;
+  const bracket = HALLUCINATED_BRACKET_TOOL_LABEL_PATTERN.exec(trimmed);
+  if (bracket && bracket.index <= 200 && HALLUCINATED_TOOL_NO_PARAMS_PATTERN.test(trimmed)) return bracket[1] ?? null;
+  return null;
+}
 
 function looksLikeHallucinatedToolTranscript(trimmed: string): boolean {
   if (trimmed.length >= 2_000) return false;
   const transcript = HALLUCINATED_TOOL_TRANSCRIPT_PATTERN.exec(trimmed);
-  return Boolean(transcript && transcript.index <= 200);
+  return Boolean(transcript && transcript.index <= 200) || Boolean(hallucinatedToolTranscriptName(trimmed));
 }
 
 /** Parse the model's plain-text turn output into a decision. Never returns a
@@ -251,7 +271,7 @@ export const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|worki
 //
 // Boundary anchors (\b) prevent substring matches; the Unicode-
 // apostrophe class catches curly quotes models love to emit.
-const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|pulling\s|querying\s|checking\s|retrieving\s|processing\s|attempting\s|trying\s|configuring\s|preparing\s|setting up\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
+const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|calling\s|pulling\s|querying\s|checking\s|retrieving\s|processing\s|attempting\s|trying\s|configuring\s|preparing\s|setting up\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
 const STRUCTURED_TOOL_UNAVAILABLE_PATTERN = /\b(tool[- ]?enabled run|tool runtime|tool access|tool surface.{0,80}not available|tools? (?:were|was|are|is) (?:not )?available|no (?:commentary\/)?tool calls? (?:were|was|are|is) available|no executable tool results|no completed tool results|handoff summary|without tool access|resend ["“]?continue["”]?.*tool|please resend.*tool[- ]?enabled|cannot (?:create|read|write|search|execute|run).{0,80}(?:this turn|without tools?))\b/i;
 // A zero-tool turn that AGREES with a correction, reflects on future behavior,
 // or admits it isn't done is a legitimate CONVERSATIONAL reply — not a false
@@ -340,15 +360,18 @@ export function evaluateStructuredDecisionStall(opts: {
     };
   }
   if (!combined) return undefined;
-  if (
-    noMeaningfulTools &&
+  const selfReportedToolUnavailable = looksLikeToolUnavailableSelfReport(combined);
+  const toolUnavailableClaim =
+    selfReportedToolUnavailable ||
     (
-      decision.nextAction === 'awaiting_user_input' ||
-      decision.nextAction === 'awaiting_handoff_result' ||
-      decision.nextAction === 'abandoned'
-    ) &&
-    STRUCTURED_TOOL_UNAVAILABLE_PATTERN.test(combined)
-  ) {
+      STRUCTURED_TOOL_UNAVAILABLE_PATTERN.test(combined) &&
+      (
+        decision.nextAction === 'awaiting_user_input' ||
+        decision.nextAction === 'awaiting_handoff_result' ||
+        decision.nextAction === 'abandoned'
+      )
+    );
+  if (noMeaningfulTools && decision.nextAction !== 'awaiting_approval' && toolUnavailableClaim) {
     return {
       signal: 'A_zero_tools',
       rawOutput: combined.slice(0, 220),
@@ -535,6 +558,40 @@ export function evaluateProgress(opts: {
   // Signal A — zero tools + short generic reply (current behavior).
   if (effectiveToolCalls === 0 && typeof opts.finalOutput === 'string') {
     const trimmed = opts.finalOutput.trim();
+    const fakeToolName = hallucinatedToolTranscriptName(trimmed);
+    if (trimmed && looksLikeHallucinatedToolTranscript(trimmed)) {
+      return {
+        signal: 'A_zero_tools',
+        rawOutput: trimmed.slice(0, 220),
+        userVisibleMessage:
+          `_(The model wrote a fake tool call transcript instead of calling the tool. ` +
+          `Output: "${trimmed.slice(0, 160)}…". The harness will retry and require a real tool call.)_`,
+        detail: {
+          rawOutput: trimmed.slice(0, 220),
+          fakeToolTranscript: true,
+          toolName: fakeToolName,
+          toolCalls: effectiveToolCalls,
+          totalToolCalls: opts.toolCalls,
+          afterHandoff: handoffProgress ?? null,
+        },
+      };
+    }
+    if (trimmed && looksLikeToolUnavailableSelfReport(trimmed)) {
+      return {
+        signal: 'A_zero_tools',
+        rawOutput: trimmed.slice(0, 220),
+        userVisibleMessage:
+          `_(The model claimed tool access was unavailable but made zero tool calls. ` +
+          `The harness will retry and require a real tool call.)_`,
+        detail: {
+          kind: 'tool_unavailable_self_report',
+          rawOutput: trimmed.slice(0, 220),
+          toolCalls: effectiveToolCalls,
+          totalToolCalls: opts.toolCalls,
+          afterHandoff: handoffProgress ?? null,
+        },
+      };
+    }
     if (trimmed && trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) {
       return {
         signal: 'A_zero_tools',

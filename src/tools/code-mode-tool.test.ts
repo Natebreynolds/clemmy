@@ -8,7 +8,18 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { READ_ONLY_TOOLS, dispatchCodeModeTool, buildCodeModeTool, isCodeModeToolAllowed, isMcpNamespacedTool, codeModeMandateDirective } from './code-mode-tool.js';
+import {
+  READ_ONLY_TOOLS,
+  dispatchCodeModeTool,
+  buildCodeModeTool,
+  isCodeModeToolAllowed,
+  isMcpNamespacedTool,
+  codeModeMandateDirective,
+  normalizeCodeModeToolResult,
+  parseShellToolOutput,
+  runCodeModeForSession,
+  _setCodeModeToolsForTests,
+} from './code-mode-tool.js';
 
 test('READ_ONLY_TOOLS excludes every mutating tool (the Phase-1 boundary)', () => {
   for (const writeTool of ['composio_execute_tool', 'write_file', 'run_shell_command', 'request_approval', 'execution_create', 'memory_remember']) {
@@ -150,6 +161,51 @@ test('codeModeMandateDirective: kill-switches respect CODE_MODE_MANDATE and CODE
 test('buildCodeModeTool exposes run_tool_program with a program parameter', () => {
   const t = buildCodeModeTool() as { name?: string };
   assert.equal(t.name, 'run_tool_program');
+});
+
+test('parseShellToolOutput: exit_code/stdout/stderr wrapper becomes a structured shell result', () => {
+  const out = parseShellToolOutput('exit_code: 0\n\nstdout:\n{"status":0,"records":[{"Name":"Acme"}]}\n\nstderr:\nwarning only');
+  assert.ok(out);
+  assert.equal(out.ok, true);
+  assert.equal(out.exit_code, 0);
+  assert.equal(out.stdout.trim(), '{"status":0,"records":[{"Name":"Acme"}]}');
+  assert.equal(out.stderr.trim(), 'warning only');
+  assert.deepEqual(out.stdout_json, { status: 0, records: [{ Name: 'Acme' }] });
+});
+
+test('normalizeCodeModeToolResult: obvious tool-error banners become structured failures', () => {
+  const out = normalizeCodeModeToolResult(
+    'composio_execute_tool',
+    'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool',
+  ) as { ok?: boolean; error?: string };
+  assert.equal(out.ok, false);
+  assert.match(out.error ?? '', /InvalidToolInputError/);
+});
+
+test('runCodeModeForSession: run_shell_command exposes stdout/stdout_json instead of the text wrapper', async () => {
+  const prevWrites = process.env.CLEMMY_CODE_MODE_WRITES;
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.CLEMMY_CODE_MODE_WRITES = 'on';
+  process.env.HARNESS_TOOL_BRACKETS = 'off';
+  _setCodeModeToolsForTests(new Map<string, { name: string; invoke: () => Promise<unknown> }>([
+    ['run_shell_command', {
+      name: 'run_shell_command',
+      invoke: async () => 'exit_code: 0\n\nstdout:\n{"status":0,"result":{"records":[{"Name":"Acme"}]}}\n\nstderr:\nCLI warning',
+    }],
+  ]));
+  try {
+    const result = await runCodeModeForSession(
+      `const res = await clem.run_shell_command({ command: 'sf data query --json', cwd: null, timeout_ms: 1000 });
+       return { exit: res.exit_code, parsed: JSON.parse(res.stdout).result.records[0].Name, auto: res.stdout_json.result.records[0].Name, stderr: res.stderr };`,
+      'sess-codemode-shell',
+    );
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(result.value, { exit: 0, parsed: 'Acme', auto: 'Acme', stderr: 'CLI warning' });
+  } finally {
+    _setCodeModeToolsForTests(null);
+    if (prevWrites === undefined) delete process.env.CLEMMY_CODE_MODE_WRITES; else process.env.CLEMMY_CODE_MODE_WRITES = prevWrites;
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+  }
 });
 
 test('run_tool_program surface follows CLEMMY_CODE_MODE: absent when off, present when on (default on)', async () => {

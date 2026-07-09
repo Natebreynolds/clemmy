@@ -52,6 +52,7 @@ import { extractTargetKeys, renderPayloadForJudge } from './grounding-gate.js';
 import { gatherSessionSkills, skillBodyExecutionShortfall, type SessionSkill } from './skill-execution.js';
 import { composeJudgedObjective } from './objective-judge.js';
 import { getActiveGoalForSession } from '../../agents/plan-proposals.js';
+import { extractJsonCandidate } from './json-repair.js';
 
 // ─────────────────────────────────────────────────────────────────
 // Config
@@ -479,15 +480,87 @@ export function buildGoalFidelityPrompt(input: GoalFidelityJudgeInput): string {
     '=== OUTGOING ACTION (about to fire) ===',
     input.payload,
     '',
-    'Respond with the structured verdict.',
+    'Respond with exactly one verdict line.',
   ].join('\n');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function stringField(value: unknown, max = 400): string | null {
+  return typeof value === 'string' && value.trim()
+    ? value.trim().slice(0, max)
+    : null;
+}
+
+function boolField(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (/^(true|yes|pass|passes|passed|fulfills|fulfilled|aligned|allow|allowed)$/i.test(normalized)) return true;
+  if (/^(false|no|fail|fails|failed|gap|blocked|misaligned|not[_ -]?fulfilled|not[_ -]?fulfills)$/i.test(normalized)) return false;
+  return null;
+}
+
+function blockKindField(value: unknown, marker?: string): GoalFidelityVerdict['blockKind'] {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase().replace(/[-\s]+/g, '_') : '';
+  if (normalized === 'present_for_approval' || normalized === 'approval' || marker === 'GAP-APPROVAL') {
+    return 'present_for_approval';
+  }
+  return 'other';
+}
+
+function parseGoalFidelityObject(obj: Record<string, unknown>): GoalFidelityVerdict | null {
+  const markerText = stringField(obj.verdict ?? obj.status ?? obj.result ?? obj.kind, 80)?.toUpperCase().replace(/[\s_]+/g, '-');
+  let fulfills = boolField(obj.fulfills ?? obj.fulfilled ?? obj.pass ?? obj.passes ?? obj.ok ?? obj.aligned);
+  if (fulfills === null && markerText) {
+    if (/^(FULFILLS|FULFILLED|PASS|PASSED|ALLOW|ALLOWED|ALIGNED)$/.test(markerText)) fulfills = true;
+    else if (/^(GAP|FAIL|FAILED|BLOCK|BLOCKED|MISALIGNED|NOT-FULFILLED|NOT-FULFILLS)$/.test(markerText)) fulfills = false;
+    else if (markerText === 'GAP-APPROVAL' || markerText === 'PRESENT-FOR-APPROVAL') fulfills = false;
+  }
+  if (fulfills === null) return null;
+  const gap = stringField(obj.gap ?? obj.reason ?? obj.rationale ?? obj.explanation ?? obj.recovery)
+    ?? (fulfills ? 'fulfills the goal and skill requirement' : 'judge reported a goal-fidelity gap');
+  return {
+    fulfills,
+    gap,
+    blockKind: fulfills ? 'other' : blockKindField(obj.blockKind ?? obj.block_kind, markerText),
+  };
+}
+
+/** Parse either the current schema-free marker verdict or the legacy
+ * structured-object verdict. The latter is intentionally tolerated because old
+ * prompt tails and some model families still emit `{fulfills,gap}` even when the
+ * judge instructions ask for marker text; that should not turn a usable safety
+ * verdict into a judge outage. */
+export function parseGoalFidelityVerdict(finalOutput: unknown): GoalFidelityVerdict | null {
+  if (isRecord(finalOutput)) return parseGoalFidelityObject(finalOutput);
+  const raw = String(finalOutput ?? '').trim();
+  const match = /^\s*(FULFILLS|GAP-APPROVAL|GAP)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
+  if (match) {
+    const marker = match[1].toUpperCase();
+    return {
+      fulfills: marker === 'FULFILLS',
+      gap: (match[2] || '').trim().slice(0, 400),
+      blockKind: marker === 'GAP-APPROVAL' ? 'present_for_approval' : 'other',
+    };
+  }
+  const json = extractJsonCandidate(raw);
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    return isRecord(parsed) ? parseGoalFidelityObject(parsed) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Real judge: one fast-model call, structured output, throws on infra error
  *  (caller converts to fail-open). Dynamic imports keep brackets.ts free of an
  *  SDK dependency at module load — same pattern as the grounding judge. */
 async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<GoalFidelityVerdict> {
-  const [{ Agent, Runner }, { resolveBoundaryJudge }, { withJudgeTimeout, recordJudgeMetric }] = await Promise.all([
+  const [{ Agent, Runner }, { resolveBoundaryJudge, resolveBoundaryJudgeHedge }, { withJudgeHedge, recordJudgeMetric }] = await Promise.all([
     import('@openai/agents'),
     import('./debate-model.js'),
     import('./judge-family.js'),
@@ -497,65 +570,74 @@ async function runGoalFidelityJudge(input: GoalFidelityJudgeInput): Promise<Goal
   // the safety path (schema validation rejecting VALID verdicts → judge
   // "unavailable" → fail-closed parked sends). One line, three markers, a
   // regex: nothing left to fail on presentation.
+  //
+  // HEDGED (judge-family.ts): a slow/dead primary judge is raced by a cheap
+  // judge from the other flagship family after the hedge delay. This lane is
+  // where a timeout is most expensive — a judge outage during a send-burst
+  // fail-CLOSES and parks approved sends (the 2026-07-08 degraded-network
+  // evening) — so a second chance at a real verdict directly prevents parks.
   const routing = resolveBoundaryJudge();
-  const agent = new Agent({
-    name: 'GoalFidelityJudge',
-    instructions: [
-      'Verify an about-to-fire irreversible external action against the run\'s goal and the loaded skill\'s defining requirement.',
-      'Reply with EXACTLY ONE LINE and nothing else, one of:',
-      '"FULFILLS: <one short sentence why the action is faithful>" — use this unless there is a CONCRETE, NAMEABLE gap (vague/style/uncertain → FULFILLS, fail open);',
-      '"GAP-APPROVAL: <the gap>" — ONLY when the single gap is that the loaded skill is draft-only (it says "does not send"/"present for approval"; that is the skill\'s scope, not a ban on the user sending the approved draft);',
-      '"GAP: <the single specific gap and the concrete recovery>" — a genuine violation (wrong/byte-identical target, off-goal, un-rendered artifact, per-item research skipped).',
-    ].join(' '),
-    // Cross-family boundary judge (avoids same-family self-grading); falls open to
-    // the brain-family-safe cheap id (routing.modelId, never a repurposed BYO fast
-    // slot) when no different family is logged in.
-    model: routing.model ?? routing.modelId,
-    // Binary verdict against an explicit rubric — low reasoning effort trims the
-    // largest chunk of per-call latency on this hot path (same as the
-    // completion judge).
-    modelSettings: { reasoning: { effort: 'low' } },
-    tools: [],
-  });
-  const runner = new Runner({ workflowName: 'clementine-goal-fidelity-judge' });
+  const hedgeRouting = resolveBoundaryJudgeHedge(routing);
+  type Routing = typeof routing;
+  const mkAgent = (r: Routing) =>
+    new Agent({
+      name: 'GoalFidelityJudge',
+      instructions: [
+        'Verify an about-to-fire irreversible external action against the run\'s goal and the loaded skill\'s defining requirement.',
+        'Reply with EXACTLY ONE LINE and nothing else, one of:',
+        '"FULFILLS: <one short sentence why the action is faithful>" — use this unless there is a CONCRETE, NAMEABLE gap (vague/style/uncertain → FULFILLS, fail open);',
+        '"GAP-APPROVAL: <the gap>" — ONLY when the single gap is that the loaded skill is draft-only (it says "does not send"/"present for approval"; that is the skill\'s scope, not a ban on the user sending the approved draft);',
+        '"GAP: <the single specific gap and the concrete recovery>" — a genuine violation (wrong/byte-identical target, off-goal, un-rendered artifact, per-item research skipped).',
+      ].join(' '),
+      // Cross-family boundary judge (avoids same-family self-grading); falls open to
+      // the brain-family-safe cheap id (routing.modelId, never a repurposed BYO fast
+      // slot) when no different family is logged in.
+      model: r.model ?? r.modelId,
+      // Binary verdict against an explicit rubric — low reasoning effort trims the
+      // largest chunk of per-call latency on this hot path (same as the
+      // completion judge).
+      modelSettings: { reasoning: { effort: 'low' } },
+      tools: [],
+    });
   const startedAt = Date.now();
-  let recorded = false;
-  const record = (outcome: 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error') => {
-    recorded = true;
+  const record = (outcome: 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error', r: Routing = routing) => {
     recordJudgeMetric({
       lane: 'goal_fidelity',
       outcome,
       durationMs: Date.now() - startedAt,
-      modelId: routing.modelId,
-      judgeFamily: routing.judgeFamily,
-      brainFamily: routing.brainFamily,
-      selfJudge: routing.selfJudge,
+      modelId: r.modelId,
+      judgeFamily: r.judgeFamily,
+      brainFamily: r.brainFamily,
+      selfJudge: r.selfJudge,
     });
   };
-  try {
-    const result = await withJudgeTimeout(runner.run(agent, buildGoalFidelityPrompt(input), { maxTurns: 1 }));
-    if (!result) {
-      record('timeout');
-      throw new Error('goal-fidelity judge timed out');
-    }
-    const raw = String((result as { finalOutput?: unknown }).finalOutput ?? '').trim();
-    const match = /^\s*(FULFILLS|GAP-APPROVAL|GAP)\s*:?\s*(.*)$/im.exec(raw);
-    if (!match) {
-      record('invalid');
-      throw new Error(`goal-fidelity judge returned no FULFILLS/GAP verdict (got: ${raw.slice(0, 120)})`);
-    }
-    const marker = match[1].toUpperCase();
-    const verdict: GoalFidelityVerdict = {
-      fulfills: marker === 'FULFILLS',
-      gap: (match[2] || '').slice(0, 400),
-      blockKind: marker === 'GAP-APPROVAL' ? 'present_for_approval' : 'other',
-    };
-    record(verdict.fulfills ? 'passed' : (input.skills.length === 0 ? 'advisory' : 'blocked'));
+  class InvalidVerdict extends Error {}
+  const prompt = buildGoalFidelityPrompt(input);
+  const attempt = (r: Routing) => async (): Promise<GoalFidelityVerdict> => {
+    const runner = new Runner({ workflowName: 'clementine-goal-fidelity-judge' });
+    const result = await runner.run(mkAgent(r), prompt, { maxTurns: 1 });
+    const raw = (result as { finalOutput?: unknown }).finalOutput;
+    const verdict = parseGoalFidelityVerdict(raw);
+    if (!verdict) throw new InvalidVerdict(`goal-fidelity judge returned no FULFILLS/GAP verdict (got: ${String(raw ?? '').slice(0, 120)})`);
     return verdict;
-  } catch (err) {
-    if (!recorded) record('error');
-    throw err;
+  };
+  const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+  if (raced.value) {
+    const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
+    record(raced.value.fulfills ? 'passed' : (input.skills.length === 0 ? 'advisory' : 'blocked'), winner);
+    return raced.value;
   }
+  if (raced.errors.length === 0) {
+    record('timeout');
+    throw new Error('goal-fidelity judge timed out');
+  }
+  const invalid = raced.errors.find((e) => e instanceof InvalidVerdict);
+  if (invalid) {
+    record('invalid');
+    throw invalid;
+  }
+  record('error');
+  throw raced.errors[0] instanceof Error ? raced.errors[0] : new Error(String(raced.errors[0]));
 }
 
 // ─────────────────────────────────────────────────────────────────

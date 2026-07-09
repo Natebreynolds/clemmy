@@ -63,6 +63,8 @@ function makeDeps(over: Partial<CalendarMonitorDeps> & {
     now: over.now ?? (() => NOW),
     loadState: over.loadState ?? (() => state),
     saveState: over.saveState ?? ((s: any) => { state = s; saved.push(s); }),
+    readConnectionSuppressions: over.readConnectionSuppressions,
+    saveConnectionSuppressions: over.saveConnectionSuppressions,
   };
   return { deps, notified, toolCalls, saved };
 }
@@ -168,6 +170,7 @@ test('processCalendarMonitor: watches ALL calendars status-agnostically, labels 
 test('processCalendarMonitor: suppresses hard Composio auth failures by connection id', async () => {
   let now = NOW;
   const calls: string[] = [];
+  const sharedSaves: any[] = [];
   const { deps, saved } = makeDeps({
     now: () => now,
     intervalMs: 30 * 60_000,
@@ -182,16 +185,43 @@ test('processCalendarMonitor: suppresses hard Composio auth failures by connecti
       }
       return calResp([]);
     },
+    saveConnectionSuppressions: (s: any) => sharedSaves.push(s),
   });
 
   assert.equal(await processCalendarMonitor(deps), 0);
   assert.deepEqual(calls, ['ca_good', 'ca_bad']);
   assert.equal(saved.at(-1)?.suppressedConnections?.ca_bad?.reason, 'entity-mismatch');
+  assert.equal(sharedSaves.at(-1)?.suppressedConnections?.ca_bad?.reason, 'entity-mismatch');
 
   calls.length = 0;
   now += 31 * 60_000;
   assert.equal(await processCalendarMonitor(deps), 0);
   assert.deepEqual(calls, ['ca_good'], 'the hard-failed stale connection is skipped on the next scan');
+});
+
+test('processCalendarMonitor: skips connections suppressed by the shared Composio store', async () => {
+  const sharedSaves: any[] = [];
+  const { deps, toolCalls } = makeDeps({
+    connections: [
+      { slug: 'outlook', connectionId: 'ca_good', status: 'ACTIVE', accountEmail: 'good@example.com' },
+      { slug: 'outlook', connectionId: 'ca_bad', status: 'ACTIVE', accountEmail: 'bad@example.com' },
+    ],
+    readConnectionSuppressions: () => ({
+      suppressedConnections: {
+        ca_bad: {
+          reason: 'expired',
+          suppressUntil: '2026-06-17T12:00:00.000Z',
+          lastErrorAt: '2026-06-16T12:00:00.000Z',
+          failures: 1,
+        },
+      },
+    }),
+    saveConnectionSuppressions: (s: any) => sharedSaves.push(s),
+  });
+
+  assert.equal(await processCalendarMonitor(deps), 0);
+  assert.deepEqual(toolCalls.map((call) => call.conn), ['ca_good']);
+  assert.equal(sharedSaves.at(-1)?.suppressedConnections?.ca_bad?.reason, 'expired');
 });
 
 test('calendar monitor real state loader preserves persisted connection suppressions', () => {

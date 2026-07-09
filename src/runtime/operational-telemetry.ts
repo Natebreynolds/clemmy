@@ -47,6 +47,7 @@ export const MODEL_OPERATIONAL_EVENT_TYPES = [
   'model_call_failed',
   'model_fallover',
   'brain_auth_dead',
+  'brain_silent_cooldown',
   'route_policy_updated',
 ] as const;
 

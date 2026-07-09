@@ -1,6 +1,6 @@
 import { Runner } from '@openai/agents';
 import { surfacePlan, surfaceAskingPlan } from '../../agents/plan-proposals.js';
-import { buildPlannerAgent, PlanSchema, type Plan } from '../../agents/planner.js';
+import { buildPlannerAgent, sanitizePlanOutput, type Plan } from '../../agents/planner.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { recallHybrid } from '../../memory/recall.js';
 import { extractNamedResource } from '../../memory/focus.js';
@@ -416,9 +416,9 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
 
     // Wait for the stream to fully settle so finalOutput is populated.
     await result.completed;
-    const parsed = PlanSchema.safeParse(result.finalOutput);
-    if (!parsed.success) {
-      const message = parsed.error.message;
+    const plan = sanitizePlanOutput(result.finalOutput);
+    if (!plan) {
+      const message = 'planner output did not parse into a usable plan';
       appendEvent({
         sessionId: input.sessionId,
         turn: 0,
@@ -429,7 +429,6 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       return surfacePlanFirstFailure(input, message);
     }
 
-    const plan = parsed.data;
     appendEvent({
       sessionId: input.sessionId,
       turn: 0,
@@ -475,7 +474,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       return { surfaced: true, ...(askingProposalId ? { proposalId: askingProposalId } : {}) };
     }
 
-    if (!planRequiresUserApproval(parsed.data, input.input)) {
+    if (!planRequiresUserApproval(plan, input.input)) {
       appendEvent({
         sessionId: input.sessionId,
         turn: 0,
@@ -483,7 +482,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
         type: 'conversation_step',
         data: {
           decision: {
-            summary: `Prepared a safe local plan and continued without an approval gate: ${parsed.data.objective}`,
+            summary: `Prepared a safe local plan and continued without an approval gate: ${plan.objective}`,
             reply: null,
             done: false,
             nextAction: 'continue_to_execution',
@@ -495,7 +494,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
     }
 
     const proposal = surfacePlan({
-      plan: parsed.data,
+      plan,
       originatingRequest: input.input,
       sessionId: input.sessionId,
       channel: input.channel,
@@ -509,8 +508,8 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
       type: 'conversation_completed',
       data: {
         reason: 'plan_first',
-        summary: `Plan ready for approval: ${parsed.data.objective}`,
-        reply: renderPlanReply(parsed.data, proposal.id),
+        summary: `Plan ready for approval: ${plan.objective}`,
+        reply: renderPlanReply(plan, proposal.id),
         planProposalId: proposal.id,
       },
     });

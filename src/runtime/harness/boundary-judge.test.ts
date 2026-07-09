@@ -145,3 +145,91 @@ test('boundary downshift: a heavyweight judge PIN governs family only on the hot
   // BYO judges are never downshifted (their tiers are unknowable here).
   assert.equal(downshiftForBoundary(mk('byo', 'glm-5.2')).modelId, 'glm-5.2');
 });
+
+// ─── Hedged judge (tail-latency insurance, 2026-07-08 degraded-network fix) ───
+
+test('withJudgeHedge: fast primary wins, hedge never fires (zero extra cost on the healthy path)', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  let hedgeStarted = false;
+  const r = await withJudgeHedge(
+    async () => 'primary-verdict',
+    async () => { hedgeStarted = true; return 'hedge-verdict'; },
+    { hedgeDelayMs: 50, timeoutMs: 1000 },
+  );
+  assert.equal(r.value, 'primary-verdict');
+  assert.equal(r.winner, 'primary');
+  assert.equal(r.hedgeFired, false);
+  assert.equal(hedgeStarted, false);
+});
+
+test('withJudgeHedge: slow primary → hedge fires at the delay and its verdict wins', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  const slow = () => new Promise<string>((resolve) => { setTimeout(() => resolve('late'), 500); });
+  const t0 = Date.now();
+  const r = await withJudgeHedge(slow, async () => 'hedge-verdict', { hedgeDelayMs: 20, timeoutMs: 1000 });
+  assert.equal(r.value, 'hedge-verdict');
+  assert.equal(r.winner, 'hedge');
+  assert.equal(r.hedgeFired, true);
+  assert.ok(Date.now() - t0 < 400, 'did not wait out the slow primary');
+});
+
+test('withJudgeHedge: primary dies before the delay → hedge starts immediately (no dead air)', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  const t0 = Date.now();
+  const r = await withJudgeHedge(
+    async () => { throw new Error('transport'); },
+    async () => 'hedge-verdict',
+    { hedgeDelayMs: 5000, timeoutMs: 8000 },
+  );
+  assert.equal(r.value, 'hedge-verdict');
+  assert.equal(r.winner, 'hedge');
+  assert.ok(Date.now() - t0 < 1000, 'hedge fired without waiting for the hedge delay');
+  assert.equal(r.errors.length, 1);
+});
+
+test('withJudgeHedge: both attempts fail → null value with the errors surfaced for classification', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  const r = await withJudgeHedge(
+    async () => { throw new Error('a'); },
+    async () => { throw new Error('b'); },
+    { hedgeDelayMs: 10, timeoutMs: 500 },
+  );
+  assert.equal(r.value, null);
+  assert.equal(r.winner, null);
+  assert.equal(r.errors.length, 2);
+});
+
+test('withJudgeHedge: pure deadline miss (both hung) → null with NO errors (classified timeout)', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  const hang = () => new Promise<string>(() => {});
+  const t0 = Date.now();
+  const r = await withJudgeHedge(hang, hang, { hedgeDelayMs: 5, timeoutMs: 60 });
+  assert.equal(r.value, null);
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.hedgeFired, true);
+  assert.ok(Date.now() - t0 < 1000);
+});
+
+test('withJudgeHedge: no hedge available → primary-only, still bounded by the deadline', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  const hang = () => new Promise<string>(() => {});
+  const r = await withJudgeHedge(hang, null, { hedgeDelayMs: 5, timeoutMs: 40 });
+  assert.equal(r.value, null);
+  assert.equal(r.hedgeFired, false);
+});
+
+test('withJudgeHedge: kill-switch CLEMMY_JUDGE_HEDGE=off runs unhedged', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  const prev = process.env.CLEMMY_JUDGE_HEDGE;
+  try {
+    process.env.CLEMMY_JUDGE_HEDGE = 'off';
+    let hedgeStarted = false;
+    const slow = () => new Promise<string>((resolve) => { setTimeout(() => resolve('late-primary'), 100); });
+    const r = await withJudgeHedge(slow, async () => { hedgeStarted = true; return 'hedge'; }, { hedgeDelayMs: 5, timeoutMs: 2000 });
+    assert.equal(r.value, 'late-primary');
+    assert.equal(hedgeStarted, false);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_JUDGE_HEDGE;
+    else process.env.CLEMMY_JUDGE_HEDGE = prev;
+  }
+});
