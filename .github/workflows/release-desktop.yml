@@ -127,6 +127,9 @@ jobs:
         # "damaged" even though the .app inside is notarized.
         run: npm run release
 
+      - name: Verify mac release assets and updater feed
+        run: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "${GITHUB_REF_NAME#v}"
+
       - name: Upload stapled artifacts to GitHub Release
         working-directory: apps/desktop
         env:

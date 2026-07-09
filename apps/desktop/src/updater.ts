@@ -30,6 +30,7 @@ import path from 'node:path';
 const { autoUpdater } = electronUpdater;
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { compareVersions } from './version-compare.js';
+import { isMissingReleaseMetadataError, updaterErrorMessage } from './updater-errors.js';
 
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const MOVE_TO_APPLICATIONS_MESSAGE =
@@ -83,6 +84,33 @@ function updateStatus(next: Partial<UpdaterStatus>): void {
   }
 }
 
+function markMissingReleaseMetadataAsNoUpdate(err: unknown, log = updaterLog): void {
+  const message = updaterErrorMessage(err);
+  log?.('warn', 'updater release metadata missing — treating as no update', { err: message });
+  updateStatus({
+    state: 'no-update',
+    version: undefined,
+    releaseNotes: undefined,
+    progressPct: undefined,
+    lastCheckedAt: new Date().toISOString(),
+    error: undefined,
+  });
+}
+
+function handleUpdaterError(err: unknown, log = updaterLog): void {
+  downloadInFlight = false;
+  if (isMissingReleaseMetadataError(err)) {
+    markMissingReleaseMetadataAsNoUpdate(err, log);
+    return;
+  }
+  const message = updaterErrorMessage(err);
+  log?.('error', 'updater error', { err: message });
+  updateStatus({
+    state: 'error',
+    error: message,
+  });
+}
+
 export function getUpdaterStatus(): UpdaterStatus {
   return { ...status, ...getInstallBlockerStatus() };
 }
@@ -116,10 +144,7 @@ export async function checkForUpdatesNow(): Promise<UpdaterStatus> {
     updateStatus({ state: 'checking', error: undefined });
     await autoUpdater.checkForUpdates();
   } catch (err) {
-    updateStatus({
-      state: 'error',
-      error: err instanceof Error ? err.message : String(err),
-    });
+    handleUpdaterError(err);
   }
   return getUpdaterStatus();
 }
@@ -435,12 +460,7 @@ export function initAutoUpdater(opts: { logFile: string }): void {
   });
 
   autoUpdater.on('error', (err: Error) => {
-    downloadInFlight = false;
-    log('error', 'updater error', { err: err.message });
-    updateStatus({
-      state: 'error',
-      error: err.message,
-    });
+    handleUpdaterError(err, log);
   });
 
   // Initial check + periodic refresh. Only in packaged builds —
@@ -484,10 +504,10 @@ function ensureLogDir(logFile: string): void {
 }
 
 function armAutomaticChecks(): void {
-  autoUpdater.checkForUpdates().catch(() => { /* logged by updater event */ });
+  autoUpdater.checkForUpdates().catch((err: unknown) => { handleUpdaterError(err); });
   if (periodicHandle) return;
   periodicHandle = setInterval(() => {
-    autoUpdater.checkForUpdates().catch(() => { /* logged by updater event */ });
+    autoUpdater.checkForUpdates().catch((err: unknown) => { handleUpdaterError(err); });
   }, CHECK_INTERVAL_MS);
   // Don't keep the event loop alive just for the timer.
   periodicHandle.unref?.();
@@ -506,7 +526,11 @@ function beginUpdateDownload(log?: UpdaterLog): {
     updateStatus({ state: 'downloading', progressPct: status.progressPct ?? 0, error: undefined });
     void autoUpdater.downloadUpdate()
       .catch((err: unknown) => {
-        const reason = err instanceof Error ? err.message : String(err);
+        if (isMissingReleaseMetadataError(err)) {
+          markMissingReleaseMetadataAsNoUpdate(err, log);
+          return;
+        }
+        const reason = updaterErrorMessage(err);
         log?.('error', 'updater download error', { err: reason });
         updateStatus({ state: 'error', error: reason });
       })
@@ -516,7 +540,11 @@ function beginUpdateDownload(log?: UpdaterLog): {
     return { ok: true, action: 'download-started' };
   } catch (err) {
     downloadInFlight = false;
-    const reason = err instanceof Error ? err.message : String(err);
+    if (isMissingReleaseMetadataError(err)) {
+      markMissingReleaseMetadataAsNoUpdate(err, log);
+      return { ok: false, reason: 'Update metadata is missing from the release.' };
+    }
+    const reason = updaterErrorMessage(err);
     log?.('error', 'updater download error', { err: reason });
     updateStatus({ state: 'error', error: reason });
     return { ok: false, reason };

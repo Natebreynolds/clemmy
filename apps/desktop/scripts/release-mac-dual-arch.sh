@@ -125,6 +125,13 @@ echo "-> Building mobile web app"
 echo "-> Building console web app (new desktop UI)"
 (cd "$ROOT_DIR" && npm run build:console-web)
 
+# The release directory is an output cache, not source. Clean it before building
+# so local releases cannot accidentally upload old Clementine-*.dmg/zip assets
+# from a previous version alongside the new latest-mac.yml.
+echo "-> Cleaning previous desktop release artifacts"
+rm -rf "$DESKTOP_DIR/release"
+mkdir -p "$DESKTOP_DIR/release"
+
 # Vendor the uv runtime binaries BEFORE packaging — file/image conversion
 # (markitdown) needs them inside the .app, and they're gitignored so they are
 # NOT present in a fresh CI checkout. Without this, extraResources copies an
@@ -134,3 +141,7 @@ echo "-> Vendoring uv runtime binaries (required for file/image conversion)"
 
 build_arch arm64 arm64
 build_arch x64 x86_64
+
+echo "-> Verifying desktop release artifacts + updater feed"
+RELEASE_VERSION="$(cd "$DESKTOP_DIR" && node -p "require('./package.json').version")"
+(cd "$ROOT_DIR" && node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "$RELEASE_VERSION")

@@ -1,0 +1,114 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { parseLatestMacYml, verifyDesktopReleaseAssets } from './verify-desktop-release-assets.mjs';
+
+function withFixture(fn) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-release-assets-'));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function writeAsset(dir, name, content = 'asset') {
+  writeFileSync(path.join(dir, name), content);
+  writeFileSync(path.join(dir, `${name}.blockmap`), 'blockmap');
+  return Buffer.byteLength(content);
+}
+
+function writeFeed(dir, version, files, pathEntry = files[0]?.url ?? '') {
+  const body = [
+    `version: ${version}`,
+    'files:',
+    ...files.flatMap((file) => [
+      `  - url: ${file.url}`,
+      `    sha512: ${file.sha512 ?? 'abc='}`,
+      `    size: ${file.size}`,
+    ]),
+    `path: ${pathEntry}`,
+    'sha512: abc=',
+    "releaseDate: '2026-07-09T00:00:00.000Z'",
+    '',
+  ].join('\n');
+  writeFileSync(path.join(dir, 'latest-mac.yml'), body);
+}
+
+test('parseLatestMacYml extracts version, path, and file entries', () => {
+  const parsed = parseLatestMacYml([
+    'version: 1.2.3',
+    'files:',
+    '  - url: Clementine-1.2.3-mac.zip',
+    '    sha512: one=',
+    '    size: 10',
+    '  - url: Clementine-1.2.3.dmg',
+    '    sha512: two=',
+    '    size: 20',
+    'path: Clementine-1.2.3-mac.zip',
+  ].join('\n'));
+  assert.equal(parsed.version, '1.2.3');
+  assert.equal(parsed.path, 'Clementine-1.2.3-mac.zip');
+  assert.deepEqual(parsed.files, [
+    { url: 'Clementine-1.2.3-mac.zip', sha512: 'one=', size: 10 },
+    { url: 'Clementine-1.2.3.dmg', sha512: 'two=', size: 20 },
+  ]);
+});
+
+test('verifyDesktopReleaseAssets accepts a complete feed + artifacts fixture', () => {
+  withFixture((dir) => {
+    const zipSize = writeAsset(dir, 'Clementine-1.2.3-mac.zip', 'zip payload');
+    const dmgSize = writeAsset(dir, 'Clementine-1.2.3.dmg', 'dmg payload');
+    writeFeed(dir, '1.2.3', [
+      { url: 'Clementine-1.2.3-mac.zip', size: zipSize },
+      { url: 'Clementine-1.2.3.dmg', size: dmgSize },
+    ]);
+
+    const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3' });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.ok, true);
+  });
+});
+
+test('verifyDesktopReleaseAssets fails missing latest-mac.yml', () => {
+  withFixture((dir) => {
+    const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3' });
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join('\n'), /missing updater feed/);
+  });
+});
+
+test('verifyDesktopReleaseAssets catches missing referenced artifact and stale versions', () => {
+  withFixture((dir) => {
+    const dmgSize = writeAsset(dir, 'Clementine-1.2.3.dmg', 'dmg payload');
+    writeAsset(dir, 'Clementine-1.0.0.dmg', 'old payload');
+    writeFeed(dir, '1.2.3', [
+      { url: 'Clementine-1.2.3-mac.zip', size: 10 },
+      { url: 'Clementine-1.2.3.dmg', size: dmgSize },
+    ]);
+
+    const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3' });
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join('\n'), /missing artifact: Clementine-1\.2\.3-mac\.zip/);
+    assert.match(result.errors.join('\n'), /stale Clementine artifacts/);
+  });
+});
+
+test('verifyDesktopReleaseAssets catches size mismatches and missing blockmaps', () => {
+  withFixture((dir) => {
+    writeFileSync(path.join(dir, 'Clementine-1.2.3-mac.zip'), 'zip payload');
+    const dmgSize = writeAsset(dir, 'Clementine-1.2.3.dmg', 'dmg payload');
+    writeFeed(dir, '1.2.3', [
+      { url: 'Clementine-1.2.3-mac.zip', size: 999 },
+      { url: 'Clementine-1.2.3.dmg', size: dmgSize },
+    ]);
+
+    const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3' });
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join('\n'), /size mismatch/);
+    assert.match(result.errors.join('\n'), /missing blockmap/);
+  });
+});

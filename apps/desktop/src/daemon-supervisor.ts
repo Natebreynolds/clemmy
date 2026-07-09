@@ -1,10 +1,9 @@
-import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, renameSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, renameSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
-import type { Readable } from 'node:stream';
 import { extractShellPath } from './shell-path-extractor.js';
 import { readCache as readShellPathCache, writeCache as writeShellPathCache, mergePaths } from './shell-path-cache.js';
 
@@ -52,7 +51,8 @@ export type SupervisorEvent =
   | { type: 'restart-scheduled'; delayMs: number; attempt: number }
   | { type: 'restart-counter-reset'; reason: string; priorAttempts: number }
   | { type: 'restart-skipped'; reason: string }
-  | { type: 'hung-restart'; misses: number; unresponsiveMs: number };
+  | { type: 'liveness-deferred'; misses: number; unresponsiveMs: number; ipcHeartbeatAgeMs: number; deferral: number; maxDeferrals: number }
+  | { type: 'hung-restart'; misses: number; unresponsiveMs: number; ipcHeartbeatAgeMs: number | null; heartbeat: DaemonIpcHeartbeatSnapshot | null; recentLogs: SupervisorLogTailEntry[] };
 
 const READINESS_TIMEOUT_MS = 90_000;
 const READINESS_POLL_MS = 250;
@@ -82,6 +82,142 @@ const LIVENESS_PROBE_INTERVAL_MS = 20_000;
 const LIVENESS_PROBE_TIMEOUT_MS = 15_000;
 const LIVENESS_MAX_MISSES = 4;
 const LIVENESS_GRACE_AFTER_READY_MS = 180_000;
+const SUPERVISOR_IPC_HEARTBEAT_TYPE = 'clementine.daemon.heartbeat';
+const SUPERVISOR_IPC_HEARTBEAT_FRESH_MS = 30_000;
+const LIVENESS_MAX_IPC_DEFERRALS = 2;
+
+interface DaemonIpcHeartbeatMessage {
+  type: typeof SUPERVISOR_IPC_HEARTBEAT_TYPE;
+  at?: unknown;
+  uptimeMs?: unknown;
+  pid?: unknown;
+  phase?: unknown;
+  reason?: unknown;
+}
+
+export interface DaemonIpcHeartbeatSnapshot {
+  at?: string;
+  uptimeMs?: number;
+  pid?: number;
+  reason?: string;
+  phase?: {
+    name?: string;
+    detail?: string;
+    startedAt?: string;
+    activeMs?: number;
+    sequence?: number;
+  };
+}
+
+export interface SupervisorLogTailEntry {
+  at: string;
+  stream: 'stdout' | 'stderr';
+  line: string;
+}
+
+export function isDaemonIpcHeartbeatMessage(message: unknown): message is DaemonIpcHeartbeatMessage {
+  return Boolean(
+    message
+    && typeof message === 'object'
+    && (message as { type?: unknown }).type === SUPERVISOR_IPC_HEARTBEAT_TYPE,
+  );
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function stringValue(value: unknown, maxChars = 240): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxChars) : undefined;
+}
+
+export function normalizeDaemonIpcHeartbeatMessage(message: unknown): DaemonIpcHeartbeatSnapshot | null {
+  if (!isDaemonIpcHeartbeatMessage(message)) return null;
+  const raw = message as DaemonIpcHeartbeatMessage;
+  const phaseRaw = raw.phase && typeof raw.phase === 'object'
+    ? raw.phase as Record<string, unknown>
+    : null;
+  const phase = phaseRaw
+    ? {
+        name: stringValue(phaseRaw.name),
+        detail: stringValue(phaseRaw.detail),
+        startedAt: stringValue(phaseRaw.startedAt),
+        activeMs: finiteNumber(phaseRaw.activeMs),
+        sequence: finiteNumber(phaseRaw.sequence),
+      }
+    : undefined;
+  return {
+    at: stringValue(raw.at),
+    uptimeMs: finiteNumber(raw.uptimeMs),
+    pid: finiteNumber(raw.pid),
+    reason: stringValue(raw.reason),
+    phase: phase && Object.values(phase).some((v) => v !== undefined) ? phase : undefined,
+  };
+}
+
+export function appendSupervisorLogTail(
+  tail: SupervisorLogTailEntry[],
+  stream: 'stdout' | 'stderr',
+  chunk: string,
+  nowIso: string = new Date().toISOString(),
+  opts: { maxEntries?: number; maxLineChars?: number } = {},
+): SupervisorLogTailEntry[] {
+  const maxEntries = opts.maxEntries ?? 80;
+  const maxLineChars = opts.maxLineChars ?? 500;
+  const next = [...tail];
+  for (const rawLine of chunk.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    next.push({ at: nowIso, stream, line: line.slice(0, maxLineChars) });
+  }
+  return next.slice(-maxEntries);
+}
+
+export function formatHungRestartDiagnostic(input: {
+  misses: number;
+  unresponsiveMs: number;
+  ipcHeartbeatAgeMs: number | null;
+  heartbeat: DaemonIpcHeartbeatSnapshot | null;
+  recentLogs: SupervisorLogTailEntry[];
+}): string {
+  const phase = input.heartbeat?.phase;
+  const phaseText = phase?.name
+    ? `${phase.name}${phase.detail ? ` ${phase.detail}` : ''}${typeof phase.activeMs === 'number' ? ` active=${Math.round(phase.activeMs / 1000)}s` : ''}`
+    : 'unknown';
+  const lines = [
+    `=== Daemon HUNG diagnostic: misses=${input.misses} http_unresponsive=${Math.round(input.unresponsiveMs / 1000)}s ipc_heartbeat=${formatIpcHeartbeatAge(input.ipcHeartbeatAgeMs)} phase=${phaseText} ===`,
+  ];
+  if (input.heartbeat) {
+    lines.push(`[heartbeat] ${JSON.stringify(input.heartbeat)}`);
+  }
+  if (input.recentLogs.length > 0) {
+    lines.push('[recent daemon logs]');
+    for (const entry of input.recentLogs.slice(-12)) {
+      lines.push(`${entry.at} ${entry.stream}: ${entry.line}`);
+    }
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+export function shouldDeferHungRestartForIpcHeartbeat(
+  heartbeatAgeMs: number | null,
+  freshMs = SUPERVISOR_IPC_HEARTBEAT_FRESH_MS,
+  priorDeferrals = 0,
+  maxDeferrals = LIVENESS_MAX_IPC_DEFERRALS,
+): heartbeatAgeMs is number {
+  return heartbeatAgeMs !== null
+    && Number.isFinite(heartbeatAgeMs)
+    && heartbeatAgeMs >= 0
+    && heartbeatAgeMs <= freshMs
+    && priorDeferrals < maxDeferrals;
+}
+
+function formatIpcHeartbeatAge(ageMs: number | null): string {
+  if (ageMs === null || !Number.isFinite(ageMs)) return 'none';
+  return `${Math.round(ageMs / 1000)}s`;
+}
 
 // supervisor.log is append-only and was never rotated — it grew unbounded
 // (30MB+ observed). Roll it at log-open when it exceeds this size, keeping one
@@ -178,7 +314,7 @@ function loadDotenvBaseline(daemonProjectRoot: string): Record<string, string> {
 }
 
 export class DaemonSupervisor {
-  private child: ChildProcessByStdio<null, Readable, Readable> | null = null;
+  private child: ChildProcess | null = null;
   private logStream: ReturnType<typeof createWriteStream> | null = null;
   private shuttingDown = false;
   private restartAttempts = 0;
@@ -193,6 +329,10 @@ export class DaemonSupervisor {
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
   private livenessMisses = 0;
   private livenessProbeInFlight = false;
+  private livenessIpcDeferrals = 0;
+  private lastIpcHeartbeatAt = 0;
+  private lastIpcHeartbeat: DaemonIpcHeartbeatSnapshot | null = null;
+  private recentDaemonLogs: SupervisorLogTailEntry[] = [];
 
   constructor(private opts: SupervisorOptions) {
     if (!existsSync(opts.daemonProjectRoot)) {
@@ -349,11 +489,17 @@ export class DaemonSupervisor {
     }
     env[pathEnvKey] = augmentedPath;
 
+    this.lastIpcHeartbeatAt = 0;
+    this.lastIpcHeartbeat = null;
+    this.recentDaemonLogs = [];
     this.child = spawn(command, args, {
       cwd: this.opts.daemonProjectRoot,
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
+    if (!this.child.stdout || !this.child.stderr) {
+      throw new Error('Daemon supervisor failed to open stdout/stderr pipes');
+    }
 
     // Roll the log if it's grown past the cap BEFORE re-opening it for append.
     rotateSupervisorLogIfNeeded(this.opts.logFile, supervisorLogMaxBytes());
@@ -365,10 +511,20 @@ export class DaemonSupervisor {
     // once emit() started mirroring log events into the file, silently
     // doubling supervisor.log's growth (~11MB/day observed).
     this.child.stdout.on('data', (buf: Buffer) => {
-      this.emit({ type: 'log', stream: 'stdout', line: buf.toString() });
+      const line = buf.toString();
+      this.recentDaemonLogs = appendSupervisorLogTail(this.recentDaemonLogs, 'stdout', line);
+      this.emit({ type: 'log', stream: 'stdout', line });
     });
     this.child.stderr.on('data', (buf: Buffer) => {
-      this.emit({ type: 'log', stream: 'stderr', line: buf.toString() });
+      const line = buf.toString();
+      this.recentDaemonLogs = appendSupervisorLogTail(this.recentDaemonLogs, 'stderr', line);
+      this.emit({ type: 'log', stream: 'stderr', line });
+    });
+    this.child.on('message', (message: unknown) => {
+      const heartbeat = normalizeDaemonIpcHeartbeatMessage(message);
+      if (!heartbeat) return;
+      this.lastIpcHeartbeatAt = Date.now();
+      this.lastIpcHeartbeat = heartbeat;
     });
 
     this.child.on('exit', (code, signal) => {
@@ -418,7 +574,12 @@ export class DaemonSupervisor {
       this.livenessProbeInFlight = true;
       void fetch(url, { signal: AbortSignal.timeout(LIVENESS_PROBE_TIMEOUT_MS) })
         .then((r) => {
-          this.livenessMisses = r.status === 200 ? 0 : this.livenessMisses + 1;
+          if (r.status === 200) {
+            this.livenessMisses = 0;
+            this.livenessIpcDeferrals = 0;
+          } else {
+            this.livenessMisses += 1;
+          }
         })
         .catch(() => {
           this.livenessMisses += 1;
@@ -426,9 +587,23 @@ export class DaemonSupervisor {
         .finally(() => {
           this.livenessProbeInFlight = false;
           if (this.livenessMisses < LIVENESS_MAX_MISSES || this.shuttingDown || !this.child) return;
-          const unresponsiveMs = this.livenessMisses * LIVENESS_PROBE_INTERVAL_MS;
-          this.emit({ type: 'hung-restart', misses: this.livenessMisses, unresponsiveMs });
-          this.logStream?.write(`=== Daemon HUNG (event loop unresponsive ~${Math.round(unresponsiveMs / 1000)}s) — force-restarting at ${new Date().toISOString()} ===\n`);
+          const misses = this.livenessMisses;
+          const unresponsiveMs = misses * LIVENESS_PROBE_INTERVAL_MS;
+          const ipcHeartbeatAgeMs = this.lastIpcHeartbeatAt > 0 ? Date.now() - this.lastIpcHeartbeatAt : null;
+          if (shouldDeferHungRestartForIpcHeartbeat(ipcHeartbeatAgeMs, SUPERVISOR_IPC_HEARTBEAT_FRESH_MS, this.livenessIpcDeferrals, LIVENESS_MAX_IPC_DEFERRALS)) {
+            this.livenessIpcDeferrals += 1;
+            const deferral = this.livenessIpcDeferrals;
+            this.livenessMisses = 0;
+            this.emit({ type: 'liveness-deferred', misses, unresponsiveMs, ipcHeartbeatAgeMs, deferral, maxDeferrals: LIVENESS_MAX_IPC_DEFERRALS });
+            this.logStream?.write(`=== Daemon HTTP liveness missed ${misses} probes (~${Math.round(unresponsiveMs / 1000)}s), but IPC heartbeat is fresh (${formatIpcHeartbeatAge(ipcHeartbeatAgeMs)} old) — deferring restart ${deferral}/${LIVENESS_MAX_IPC_DEFERRALS} at ${new Date().toISOString()} ===\n`);
+            return;
+          }
+          const heartbeat = this.lastIpcHeartbeat;
+          const recentLogs = [...this.recentDaemonLogs];
+          this.emit({ type: 'hung-restart', misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs });
+          this.logStream?.write(`=== Daemon HUNG (HTTP unresponsive ~${Math.round(unresponsiveMs / 1000)}s, IPC heartbeat ${formatIpcHeartbeatAge(ipcHeartbeatAgeMs)} old) — force-restarting at ${new Date().toISOString()} ===\n`);
+          this.logStream?.write(formatHungRestartDiagnostic({ misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs }));
+          this.writeHungRestartSnapshot({ misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs });
           this.stopLivenessWatchdog();
           // A frozen event loop cannot run its SIGTERM handler — go straight
           // to SIGKILL; the child 'exit' handler schedules the restart with
@@ -444,6 +619,22 @@ export class DaemonSupervisor {
     if (this.livenessTimer) clearInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.livenessMisses = 0;
+    this.livenessIpcDeferrals = 0;
+  }
+
+  private writeHungRestartSnapshot(snapshot: {
+    misses: number;
+    unresponsiveMs: number;
+    ipcHeartbeatAgeMs: number | null;
+    heartbeat: DaemonIpcHeartbeatSnapshot | null;
+    recentLogs: SupervisorLogTailEntry[];
+  }): void {
+    try {
+      const file = path.join(path.dirname(this.opts.logFile), 'supervisor-hang-snapshots.jsonl');
+      appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...snapshot })}\n`);
+    } catch {
+      // Best-effort only; supervisor.log still carries the human-readable version.
+    }
   }
 
   /** Stop the daemon. Sends SIGTERM, escalates to SIGKILL after 5s. */
