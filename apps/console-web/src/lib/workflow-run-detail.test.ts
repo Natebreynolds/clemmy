@@ -153,3 +153,38 @@ test('tolerates an empty / malformed log without throwing', () => {
   const detail = buildWorkflowRunDetail([{ kind: 'step_started' }, { foo: 'bar' } as Ev]);
   assert.deepEqual(detail.steps, []); // events without a stepId are ignored
 });
+
+// ─── Trust cockpit: run-level verdicts + watcher steers (T3-B4) ──────────────
+
+test('verdict_recorded folds into run-level verdicts with the criteria scorecard — never a step', () => {
+  const detail = buildWorkflowRunDetail([
+    { kind: 'run_started', t: '2026-07-08T01:00:00Z' },
+    { kind: 'step_started', stepId: 'pull', t: '2026-07-08T01:00:01Z' },
+    { kind: 'step_completed', stepId: 'pull', t: '2026-07-08T01:00:05Z', output: 'rows' },
+    { kind: 'verdict_recorded', t: '2026-07-08T01:00:09Z', meta: { door: 'goal_validation', pass: false, reason: 'criterion 2 unmet', failedOpen: false, criteriaMet: 1, criteriaTotal: 2 } },
+    { kind: 'verdict_recorded', t: '2026-07-08T01:00:10Z', meta: { door: 'workflow_target', pass: true, reason: 'target satisfied' } },
+    { kind: 'run_completed', t: '2026-07-08T01:00:11Z' },
+  ]);
+  assert.equal(detail.verdicts.length, 2);
+  assert.deepEqual(detail.verdicts[0], { door: 'goal_validation', pass: false, reason: 'criterion 2 unmet', failedOpen: false, criteriaMet: 1, criteriaTotal: 2 });
+  assert.equal(detail.verdicts[1].pass, true);
+  assert.deepEqual(detail.steps.map((s) => s.stepId), ['pull'], 'verdicts never create steps');
+});
+
+test('watcher steers fold run-level — the synthetic (watcher) stepId never becomes a phantom pending step', () => {
+  const detail = buildWorkflowRunDetail([
+    { kind: 'step_completed', stepId: 'a', t: '2026-07-08T01:00:01Z', output: 'x' },
+    { kind: 'step_advisory', stepId: '(watcher)', t: '2026-07-08T01:00:02Z', meta: { reason: 'watcher_steer', miss: 'criterion untouched', steer: 'address it before drafting', injection: 1, afterSteps: 2 } },
+    { kind: 'step_completed', stepId: 'b', t: '2026-07-08T01:00:05Z', output: 'y' },
+  ]);
+  assert.equal(detail.watcherSteers.length, 1);
+  assert.deepEqual(detail.watcherSteers[0], { miss: 'criterion untouched', steer: 'address it before drafting', afterSteps: 2 });
+  assert.deepEqual(detail.steps.map((s) => s.stepId), ['a', 'b'], 'no (watcher) phantom step');
+});
+
+test('advisoryLabel knows the watcher steer slug; runs without cockpit events fold to empty lists', () => {
+  assert.equal(advisoryLabel('watcher_steer'), 'Watcher steered mid-run');
+  const detail = buildWorkflowRunDetail([{ kind: 'step_completed', stepId: 'a', t: '', output: 'x' }]);
+  assert.deepEqual(detail.verdicts, []);
+  assert.deepEqual(detail.watcherSteers, []);
+});

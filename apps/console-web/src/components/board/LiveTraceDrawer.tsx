@@ -101,6 +101,26 @@ function toolName(data?: Record<string, unknown>): string {
   return typeof n === 'string' ? n : '';
 }
 
+/** One canonical verdict row for both event stores (harness eventlog `data`,
+ *  workflow event `meta` — same field vocabulary via the T3-B4 verdict door). */
+function verdictTraceRow(key: string, d: Record<string, unknown>, time?: string | number): TraceRow {
+  const pass = d.pass === true;
+  const failedOpen = d.failedOpen === true;
+  const door = String(d.door ?? 'judge').replace(/_/g, ' ');
+  const scorecard = typeof d.criteriaMet === 'number' && typeof d.criteriaTotal === 'number'
+    ? ` · ${d.criteriaMet}/${d.criteriaTotal} criteria`
+    : '';
+  const reason = typeof d.reason === 'string' ? d.reason : '';
+  return {
+    key,
+    icon: pass && !failedOpen ? CheckCircle2 : AlertCircle,
+    label: failedOpen ? `Verdict (${door}): accepted — judge unavailable` : pass ? `Verdict (${door}): passed` : `Verdict (${door}): not passed`,
+    detail: `${reason}${scorecard}`.slice(0, 140),
+    ...(time !== undefined ? { time } : {}),
+    tone: pass && !failedOpen ? 'success' : 'warning',
+  };
+}
+
 function workflowDetail(ev: Record<string, unknown>): string {
   const kind = String(ev.kind ?? '');
   const stepId = typeof ev.stepId === 'string' ? ev.stepId : '';
@@ -136,7 +156,7 @@ function workflowArtifactsText(value: unknown): string {
 // synthesis) that WorkflowRunDetail folds the timeline from — never window
 // these out. Only the noisy high-frequency kinds (item_*, tool_*, heartbeat)
 // get trimmed once the buffer exceeds the cap.
-const WORKFLOW_IMPORTANT_KIND = /^(step_|run_|attempt|advisory|synthesis)/;
+const WORKFLOW_IMPORTANT_KIND = /^(step_|run_|attempt|advisory|synthesis|verdict_)/;
 const WORKFLOW_EVENT_CAP = 400;
 
 /** Cap the workflow event buffer at WORKFLOW_EVENT_CAP, but evict only the
@@ -462,12 +482,30 @@ export function LiveTraceDrawer({
   const rows: TraceRow[] = isWorkflow
     ? rawWorkflow.flatMap((ev, i) => {
         const kind = String(ev.kind ?? '');
+        // Verdict door + watcher steers: data-dependent tone/label, so they get
+        // bespoke rows instead of a static milestone entry.
+        const meta = (ev.meta && typeof ev.meta === 'object' && !Array.isArray(ev.meta) ? ev.meta : {}) as Record<string, unknown>;
+        if (kind === 'verdict_recorded') {
+          return [verdictTraceRow(`wf-${i}`, meta, ev.t as string)];
+        }
+        if (kind === 'step_advisory' && meta.reason === 'watcher_steer') {
+          const detail = [meta.miss, meta.steer].filter((x) => typeof x === 'string' && x).join(' → ').slice(0, 140);
+          return [{ key: `wf-${i}`, icon: Radio, label: 'Watcher steered', detail, time: ev.t as string, tone: 'live' as const }];
+        }
         const m = WORKFLOW_MILESTONES[kind];
         if (!m) return [];
         const detail = workflowDetail(ev);
         return [{ key: `wf-${i}`, icon: m.icon, label: m.label, detail, time: ev.t as string, tone: m.tone }];
       })
     : rawHarness.flatMap((ev) => {
+        const data = (ev.data ?? {}) as Record<string, unknown>;
+        if (ev.type === 'verdict_recorded') {
+          return [verdictTraceRow(`h-${ev.seq}`, data, ev.createdAt)];
+        }
+        if (ev.type === 'heartbeat' && data.kind === 'watcher_steer') {
+          const detail = [data.miss, data.steer].filter((x) => typeof x === 'string' && x).join(' → ').slice(0, 140);
+          return [{ key: `h-${ev.seq}`, icon: Radio, label: 'Watcher steered', detail, time: ev.createdAt, tone: 'live' as const }];
+        }
         const m = HARNESS_MILESTONES[ev.type];
         if (!m) return [];
         const tName = toolName(ev.data);

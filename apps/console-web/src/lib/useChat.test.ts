@@ -84,3 +84,31 @@ test('reduceActivity: tool rows carry the salient target and a composio call rea
   assert.equal(a[1].label, 'dataforseo · serp organic live advanced', 'server__tool renders as server · tool');
   assert.equal(a[1].detail, 'executive coaching');
 });
+
+// ─── Trust cockpit: verdict + watcher rows in the activity strip ─────────────
+
+test('reduceActivity: verdict_recorded appends a check row with door, scorecard, and pass tone', () => {
+  let a = reduceActivity([], ev('verdict_recorded', { door: 'goal_validation', pass: false, reason: 'criterion 2 unmet', criteriaMet: 1, criteriaTotal: 2 }));
+  assert.equal(a.length, 1);
+  assert.equal(a[0].kind, 'check');
+  assert.match(a[0].label, /goal validation 1\/2: not passed/);
+  assert.equal(a[0].detail, 'criterion 2 unmet');
+  assert.equal(a[0].status, 'failed');
+
+  a = reduceActivity(a, ev('verdict_recorded', { door: 'completion', pass: true, failedOpen: true }));
+  assert.match(a[1].label, /accepted \(judge unavailable\)/);
+  assert.equal(a[1].status, 'failed', 'failed-open acceptance renders as attention, not a clean tick');
+
+  a = reduceActivity(a, ev('verdict_recorded', { door: 'delivery', pass: true, reason: 'artifact delivered' }));
+  assert.equal(a[2].status, 'done');
+});
+
+test('reduceActivity: watcher_steer heartbeat appends a check row; other heartbeats stay invisible', () => {
+  let a = reduceActivity([], ev('heartbeat', { kind: 'progress_check_in', message: 'still going' }));
+  assert.equal(a.length, 0, 'generic heartbeats never clutter the strip');
+  a = reduceActivity(a, ev('heartbeat', { kind: 'watcher_steer', miss: 'criterion untouched', steer: 'address it before drafting' }));
+  assert.equal(a.length, 1);
+  assert.equal(a[0].kind, 'check');
+  assert.equal(a[0].label, 'Watcher steered');
+  assert.equal(a[0].detail, 'criterion untouched → address it before drafting');
+});

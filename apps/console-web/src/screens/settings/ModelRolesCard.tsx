@@ -62,6 +62,8 @@ const JUDGE_LANE_LABEL: Record<string, string> = {
   grounding: 'Write grounding',
   goal_fidelity: 'Goal fidelity',
   output_grounding: 'Numeric grounding',
+  certify: 'Batch certify',
+  watcher: 'Watcher',
 };
 
 function formatJudgeDuration(ms: number | undefined): string {

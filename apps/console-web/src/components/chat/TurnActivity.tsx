@@ -131,11 +131,13 @@ export function TurnActivity({ items, live }: { items: ActivityItem[]; live: boo
             <li key={a.id} className="flex items-center gap-2 text-caption">
               {a.kind === 'agent' ? (
                 <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
+              ) : a.kind === 'check' ? (
+                <Check className={cn('h-3 w-3 shrink-0', a.status === 'failed' ? 'text-warning' : 'text-success')} aria-hidden />
               ) : (
                 <Wrench className="h-3 w-3 shrink-0 text-faint" aria-hidden />
               )}
               <span className={cn('min-w-0 truncate', running ? 'text-fg' : 'text-muted')}>{a.label}</span>
-              {a.detail && a.kind === 'tool' && (
+              {a.detail && (a.kind === 'tool' || a.kind === 'check') && (
                 <span className="min-w-0 flex-1 truncate text-faint">→ {a.detail}</span>
               )}
               {!a.detail && <span className="flex-1" />}

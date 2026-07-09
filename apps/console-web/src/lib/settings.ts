@@ -223,7 +223,7 @@ export type ActiveBrain = 'codex_oauth' | 'claude_oauth' | 'api_key';
 export const setActiveBrain = (brain: ActiveBrain, modelId?: string) =>
   patch<{ activeBrain: ActiveBrain; claudeAuth: ClaudeAuth }>('/api/console/settings/active-brain', modelId ? { brain, modelId } : { brain });
 
-export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding';
+export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding' | 'certify' | 'watcher';
 export type JudgeMetricOutcome = 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error';
 export interface JudgeMetricLaneSnapshot {
   lane: JudgeMetricLane;

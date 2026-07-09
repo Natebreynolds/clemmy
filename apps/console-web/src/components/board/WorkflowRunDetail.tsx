@@ -101,6 +101,49 @@ export function WorkflowRunDetail({ events }: { events: ReadonlyArray<Record<str
         </div>
       )}
 
+      {detail.verdicts.length > 0 && (
+        <div className="rounded-md border border-border px-3 py-2.5">
+          <div className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-faint">Run verdicts</div>
+          <ul className="space-y-1.5">
+            {detail.verdicts.map((v, i) => (
+              <li key={`verdict-${i}`} className="flex items-start gap-2 text-small">
+                {v.pass && !v.failedOpen
+                  ? <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" aria-hidden />
+                  : <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden />}
+                <span className="min-w-0">
+                  <span className="font-semibold text-fg">{v.door.replace(/_/g, ' ')}</span>
+                  {': '}
+                  <span className={v.pass && !v.failedOpen ? 'text-success' : 'text-warning'}>
+                    {v.failedOpen ? 'accepted — judge unavailable' : v.pass ? 'passed' : 'not passed'}
+                  </span>
+                  {typeof v.criteriaMet === 'number' && typeof v.criteriaTotal === 'number' && (
+                    <span className="text-muted"> · {v.criteriaMet}/{v.criteriaTotal} criteria</span>
+                  )}
+                  {v.reason && <span className="text-muted"> — {v.reason}</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {detail.watcherSteers.length > 0 && (
+        <div className="rounded-md border border-border border-l-2 border-l-primary px-3 py-2.5">
+          <div className="mb-1.5 flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-faint">
+            <Radio className="h-3.5 w-3.5" aria-hidden /> Watcher steered mid-run
+          </div>
+          <ul className="space-y-1.5">
+            {detail.watcherSteers.map((w, i) => (
+              <li key={`steer-${i}`} className="text-small text-fg">
+                {w.afterSteps !== undefined && <span className="text-faint">after step {w.afterSteps} · </span>}
+                {w.miss}
+                {w.steer && w.steer !== w.miss && <span className="text-muted"> → {w.steer}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <ol className="space-y-2">
         {detail.steps.map((s) => (
           <StepRow key={s.stepId} step={s} />

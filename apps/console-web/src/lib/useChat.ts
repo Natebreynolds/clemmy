@@ -11,10 +11,11 @@ export type MessageStatus =
   | 'thinking' | 'complete' | 'failed' | 'stopped'
   | 'awaiting-approval' | 'awaiting-reply' | 'awaiting-plan';
 
-/** One live step in a turn's activity strip — a tool call or a spawned agent. */
+/** One live step in a turn's activity strip — a tool call, a spawned agent, a
+ *  batch meter, or a trust check (judge verdict / watcher steer). */
 export interface ActivityItem {
   id: string;
-  kind: 'tool' | 'agent' | 'batch';
+  kind: 'tool' | 'agent' | 'batch' | 'check';
   label: string;
   detail?: string;
   provider?: 'claude' | 'codex' | 'glm' | 'unknown';
@@ -170,6 +171,29 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     }
     case 'worker_capped':
       return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed' } : a));
+    // Trust cockpit: judge verdicts + watcher steers appear as 'check' rows so
+    // the strip shows not only what the agent DID but what verified it.
+    case 'verdict_recorded': {
+      const door = typeof d.door === 'string' ? d.door.replace(/_/g, ' ') : 'judge';
+      const pass = d.pass === true;
+      const failedOpen = d.failedOpen === true;
+      const scorecard = typeof d.criteriaMet === 'number' && typeof d.criteriaTotal === 'number' ? ` ${d.criteriaMet}/${d.criteriaTotal}` : '';
+      const reason = typeof d.reason === 'string' ? d.reason : '';
+      return [...prev, {
+        id: `v${prev.length}-${door}`,
+        kind: 'check',
+        label: failedOpen ? `Verdict · ${door}: accepted (judge unavailable)` : `Verdict · ${door}${scorecard}: ${pass ? 'passed' : 'not passed'}`,
+        ...(reason ? { detail: reason } : {}),
+        status: pass && !failedOpen ? 'done' : 'failed',
+      }];
+    }
+    case 'heartbeat': {
+      if (d.kind !== 'watcher_steer') return prev;
+      const miss = typeof d.miss === 'string' ? d.miss : '';
+      const steer = typeof d.steer === 'string' ? d.steer : '';
+      const detail = [miss, steer && steer !== miss ? steer : ''].filter(Boolean).join(' → ');
+      return [...prev, { id: `w${prev.length}`, kind: 'check', label: 'Watcher steered', ...(detail ? { detail } : {}), status: 'done' }];
+    }
     default:
       return prev;
   }
@@ -197,7 +221,14 @@ function progressLabel(ev: HarnessEvent): string | null {
     // last "Got results from X" through a long silent reasoning phase and reads
     // as stuck (observed: a ~4-min codex reasoning call showed no movement). The
     // animated ThinkingDots + this label make an active-but-quiet turn legible.
-    case 'heartbeat': return 'Still working…';
+    case 'heartbeat': {
+      // Watcher steer: show the actual course-correction, not a generic pulse —
+      // this is the "co-pilot caught something" moment the user should see.
+      if (d.kind === 'watcher_steer' && typeof d.steer === 'string' && d.steer) {
+        return `Watcher: ${d.steer}`;
+      }
+      return 'Still working…';
+    }
     default: return null;
   }
 }

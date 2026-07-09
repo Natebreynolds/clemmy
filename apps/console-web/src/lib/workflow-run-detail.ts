@@ -52,6 +52,27 @@ export interface WorkflowRunSummary {
 
 export type WorkflowRunStatus = 'unknown' | 'running' | 'completed' | 'failed' | 'cancelled';
 
+/** Run-level judge verdict (T3-B4 verdict door): the end-of-run target/goal
+ *  judges record ONE canonical `verdict_recorded` event with no stepId. */
+export interface WorkflowRunVerdict {
+  door: string;
+  pass: boolean;
+  reason: string;
+  failedOpen: boolean;
+  criteriaMet?: number;
+  criteriaTotal?: number;
+}
+
+/** Mid-run watcher steer (trajectory co-pilot): step_advisory rows with
+ *  reason 'watcher_steer' and the synthetic '(watcher)' stepId — run-level
+ *  observations, not steps, so they render in their own list instead of as a
+ *  phantom pending step. */
+export interface WorkflowWatcherSteer {
+  miss: string;
+  steer: string;
+  afterSteps?: number;
+}
+
 export interface WorkflowRunDetail {
   steps: WorkflowRunStep[];
   summary: WorkflowRunSummary | null;
@@ -61,6 +82,10 @@ export interface WorkflowRunDetail {
   durationMs?: number;
   /** Sum of per-step tokens (undefined when no step carried a token count). */
   tokensTotal?: number;
+  /** Run-level judge verdicts, in event order. */
+  verdicts: WorkflowRunVerdict[];
+  /** Mid-run watcher steers, in event order. */
+  watcherSteers: WorkflowWatcherSteer[];
 }
 
 type Ev = Record<string, unknown>;
@@ -131,6 +156,8 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
   let runStatus: WorkflowRunStatus = 'unknown';
   let runStartedAt: string | undefined;
   let runFinishedAt: string | undefined;
+  const verdicts: WorkflowRunVerdict[] = [];
+  const watcherSteers: WorkflowWatcherSteer[] = [];
 
   const ensure = (stepId: string): WorkflowRunStep => {
     let s = byStep.get(stepId);
@@ -163,8 +190,31 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
       };
       continue;
     }
+    if (kind === 'verdict_recorded') {
+      const meta = asMeta(ev.meta);
+      verdicts.push({
+        door: str(meta.door) || 'judge',
+        pass: meta.pass === true,
+        reason: str(meta.reason),
+        failedOpen: meta.failedOpen === true,
+        ...(num(meta.criteriaMet) !== undefined ? { criteriaMet: num(meta.criteriaMet) } : {}),
+        ...(num(meta.criteriaTotal) !== undefined ? { criteriaTotal: num(meta.criteriaTotal) } : {}),
+      });
+      continue;
+    }
     const stepId = str(ev.stepId);
     if (!stepId) continue;
+    // Watcher steers ride step_advisory with the synthetic '(watcher)' stepId —
+    // run-level observations, never a phantom step in the step list.
+    if (kind === 'step_advisory' && str(asMeta(ev.meta).reason) === 'watcher_steer') {
+      const meta = asMeta(ev.meta);
+      watcherSteers.push({
+        miss: str(meta.miss),
+        steer: str(meta.steer),
+        ...(num(meta.afterSteps) !== undefined ? { afterSteps: num(meta.afterSteps) } : {}),
+      });
+      continue;
+    }
     const s = ensure(stepId);
     const meta = asMeta(ev.meta);
     switch (kind) {
@@ -253,7 +303,7 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
       })()
     : undefined;
 
-  return { steps, summary, runStatus, runStartedAt, runFinishedAt, durationMs, tokensTotal };
+  return { steps, summary, runStatus, runStartedAt, runFinishedAt, durationMs, tokensTotal, verdicts, watcherSteers };
 }
 
 /** Friendly, human labels for the advisory reasons the runner emits (incl. the
@@ -261,6 +311,7 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
  *  raw slug with underscores spaced out. */
 const ADVISORY_LABELS: Record<string, string> = {
   brain_fallover: 'Switched brain',
+  watcher_steer: 'Watcher steered mid-run',
   skill_not_executed: 'Skill deliverable not confirmed',
   ungrounded_output: 'Output not grounded in tool results',
   inferred_output_contract: 'Output contract inferred',
