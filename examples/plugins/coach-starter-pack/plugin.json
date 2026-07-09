@@ -1,0 +1,11 @@
+{
+  "id": "clementine.coach-starter-pack",
+  "name": "Coach Starter Pack",
+  "version": "1.0.0",
+  "description": "Everything a coaching practice needs on day one: session prep and notes, a weekly client check-in rhythm, and the coaching operating principles pre-loaded into memory.",
+  "publisher": { "name": "Clementine Examples" },
+  "permissions": {
+    "externalWrites": "approval",
+    "schedules": true
+  }
+}

@@ -14,8 +14,9 @@
  * Layout of a plugin source (a directory, or a .clemplug tarball of one):
  *   plugin.json          ← this manifest (required)
  *   skills/<name>/SKILL.md
- *   workflows/<name>.json
+ *   workflows/<name>/SKILL.md   (scripts/ + references/ ride along)
  *   mcp/servers.json     ← fragment merged into the user's servers.json
+ *   memory/*.md          ← structured-frontmatter facts, imported on install
  */
 
 export interface PluginPermissions {
@@ -46,8 +47,9 @@ export interface PluginManifest {
 
 export interface PluginContents {
   skills: string[];      // skill dir names under skills/
-  workflows: string[];   // workflow file basenames (sans .json) under workflows/
+  workflows: string[];   // workflow dir names under workflows/
   mcpServers: string[];  // server names in mcp/servers.json
+  memoryFiles: string[]; // importable files under memory/, relative to the plugin root
 }
 
 const ID_RE = /^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$/;
@@ -107,7 +109,8 @@ export function renderConsentSummary(manifest: PluginManifest, contents: PluginC
   if (contents.skills.length) lines.push(`  • ${contents.skills.length} skill${contents.skills.length === 1 ? '' : 's'}: ${contents.skills.join(', ')}`);
   if (contents.workflows.length) lines.push(`  • ${contents.workflows.length} workflow${contents.workflows.length === 1 ? '' : 's'}: ${contents.workflows.join(', ')}`);
   if (contents.mcpServers.length) lines.push(`  • ${contents.mcpServers.length} MCP server${contents.mcpServers.length === 1 ? '' : 's'}: ${contents.mcpServers.join(', ')}`);
-  if (!contents.skills.length && !contents.workflows.length && !contents.mcpServers.length) lines.push('  • (nothing — empty plugin)');
+  if (contents.memoryFiles.length) lines.push(`  • ${contents.memoryFiles.length} memory file${contents.memoryFiles.length === 1 ? '' : 's'}: imported as facts (removed on uninstall; disable leaves them)`);
+  if (!contents.skills.length && !contents.workflows.length && !contents.mcpServers.length && !contents.memoryFiles.length) lines.push('  • (nothing — empty plugin)');
   const p = manifest.permissions ?? {};
   lines.push('Asks for:');
   lines.push(`  • external writes: ${p.externalWrites === 'never' ? 'NEVER (send-class steps disabled)' : 'normal approval gates'}`);

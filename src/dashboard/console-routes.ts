@@ -5385,8 +5385,12 @@ export function registerConsoleRoutes(
   // JS plugins register MCP tools (executable code). They show up here
   // and under the Tools panel — they are NOT skills. Skills are pure
   // prompt knowledge; plugins are tool code.
+  //
+  // NOTE: this used to be GET /api/console/plugins, which shadowed the
+  // content-cartridge route of the same path (Express: first registered
+  // wins). /api/console/plugins now belongs to cartridges exclusively.
 
-  app.get('/api/console/plugins', async (req, res) => {
+  app.get('/api/console/custom-tools', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const plugins = await loadPlugins();
@@ -6304,7 +6308,7 @@ export function registerConsoleRoutes(
     return out;
   };
 
-  // ---- Plugins (content cartridges: skills/workflows/MCP bundles) ----------
+  // ---- Plugins (content cartridges: skills/workflows/MCP/memory bundles) ----
   app.get('/api/console/plugins', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
@@ -6315,17 +6319,140 @@ export function registerConsoleRoutes(
     }
   });
 
+  app.get('/api/console/plugins/catalog', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listPluginCatalog } = await import('../plugins/plugin-catalog.js');
+      const { listPlugins } = await import('../plugins/plugin-store.js');
+      const installed = new Map(listPlugins().map((p) => [p.manifest.id, p]));
+      const catalog = await listPluginCatalog();
+      res.json({
+        ...catalog,
+        items: catalog.items.map((item) => {
+          const plugin = installed.get(item.id);
+          return {
+            ...item,
+            installed: Boolean(plugin),
+            enabled: plugin?.enabled,
+            installedVersion: plugin?.manifest.version,
+          };
+        }),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Consent-before-install over HTTP: preview stashes the uploaded/downloaded
+  // archive under a short-lived token and returns the consent contract; install
+  // only ever runs against a token the client previewed.
+  const pluginUploads = new Map<string, { archivePath: string; tmpDir: string; expiresAt: number }>();
+  const PLUGIN_UPLOAD_TTL_MS = 10 * 60 * 1000;
+  const sweepPluginUploads = (): void => {
+    const now = Date.now();
+    for (const [token, u] of pluginUploads) {
+      if (u.expiresAt <= now) {
+        try { fs.rmSync(u.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+        pluginUploads.delete(token);
+      }
+    }
+  };
+  const dropPluginUpload = (token: string): void => {
+    const u = pluginUploads.get(token);
+    if (u) { try { fs.rmSync(u.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ } pluginUploads.delete(token); }
+  };
+  const pluginMcpCachesInvalidate = async (): Promise<void> => {
+    const { invalidateMcpServerDiscoveryCache } = await import('../runtime/mcp-config.js');
+    const { invalidateConfiguredMcpServers } = await import('../runtime/mcp-servers.js');
+    invalidateMcpServerDiscoveryCache();
+    await invalidateConfiguredMcpServers();
+  };
+
+  app.post('/api/console/plugins/preview', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    sweepPluginUploads();
+    try {
+      const { resolvePluginSource, previewPlugin } = await import('../plugins/plugin-store.js');
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clemplug-upload-'));
+      let archivePath: string;
+      const contentType = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+      if (contentType === 'application/json') {
+        // The app-level express.json() may parse the body before our
+        // route-scoped raw parser sees it — accept either shape.
+        const body = (Buffer.isBuffer(req.body)
+          ? JSON.parse(req.body.toString('utf-8') || '{}')
+          : (req.body ?? {})) as { url?: string; catalogId?: string };
+        if (body.catalogId) {
+          const { createCatalogPluginArchive } = await import('../plugins/plugin-catalog.js');
+          archivePath = await createCatalogPluginArchive(body.catalogId, tmpDir);
+        } else {
+          if (!body.url) { fs.rmSync(tmpDir, { recursive: true, force: true }); res.status(400).json({ error: 'url or catalogId required' }); return; }
+          const { downloadPluginArchive } = await import('../plugins/plugin-fetch.js');
+          const dl = await downloadPluginArchive(body.url);
+          archivePath = path.join(tmpDir, path.basename(dl.file));
+          fs.cpSync(dl.file, archivePath);
+          dl.cleanup();
+        }
+      } else {
+        const rawName = typeof req.query.name === 'string' ? path.basename(req.query.name) : 'plugin.clemplug';
+        const name = /\.(clemplug|tgz|tar\.gz)$/i.test(rawName) ? rawName.replace(/[^a-zA-Z0-9._-]/g, '_') : 'plugin.clemplug';
+        const bytes = Buffer.isBuffer(req.body) && req.body.length > 0 ? (req.body as Buffer) : null;
+        if (!bytes) { fs.rmSync(tmpDir, { recursive: true, force: true }); res.status(400).json({ error: 'archive bytes or {url} required' }); return; }
+        archivePath = path.join(tmpDir, name);
+        writeFileSync(archivePath, bytes);
+      }
+      const resolved = resolvePluginSource(archivePath);
+      try {
+        const preview = previewPlugin(resolved.dir);
+        const uploadToken = randomBytes(16).toString('hex');
+        pluginUploads.set(uploadToken, { archivePath, tmpDir, expiresAt: Date.now() + PLUGIN_UPLOAD_TTL_MS });
+        res.json({ uploadToken, ...preview });
+      } finally {
+        resolved.cleanup();
+      }
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/plugins/install', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    sweepPluginUploads();
+    const uploadToken = typeof req.body?.uploadToken === 'string' ? req.body.uploadToken : '';
+    const upload = pluginUploads.get(uploadToken);
+    if (!upload) { res.status(404).json({ ok: false, error: 'upload expired — insert the cartridge again' }); return; }
+    try {
+      const { resolvePluginSource, installPlugin } = await import('../plugins/plugin-store.js');
+      const resolved = resolvePluginSource(upload.archivePath);
+      try {
+        const plugin = await installPlugin(resolved.dir);
+        if (plugin.artifacts.some((a) => a.kind === 'mcp-server')) await pluginMcpCachesInvalidate();
+        res.json({ ok: true, plugin });
+      } finally {
+        resolved.cleanup();
+      }
+      dropPluginUpload(uploadToken);
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/plugins/:id/:action', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const { id, action } = req.params;
     try {
-      const { setPluginEnabled, uninstallPlugin } = await import('../plugins/plugin-store.js');
+      const { setPluginEnabled, uninstallPlugin, getPlugin } = await import('../plugins/plugin-store.js');
+      const ownsMcp = getPlugin(id)?.artifacts.some((a) => a.kind === 'mcp-server') ?? false;
       if (action === 'enable' || action === 'disable') {
-        res.json({ ok: true, plugin: setPluginEnabled(id, action === 'enable') });
+        const plugin = setPluginEnabled(id, action === 'enable');
+        if (ownsMcp) await pluginMcpCachesInvalidate();
+        res.json({ ok: true, plugin });
         return;
       }
       if (action === 'uninstall') {
-        res.json({ ok: true, ...uninstallPlugin(id) });
+        const result = uninstallPlugin(id);
+        if (ownsMcp) await pluginMcpCachesInvalidate();
+        res.json({ ok: true, ...result });
         return;
       }
       res.status(400).json({ error: `unknown action ${action}` });

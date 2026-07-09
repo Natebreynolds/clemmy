@@ -1,0 +1,9 @@
+{
+  "coach-thinking": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+    "description": "Structured step-by-step reasoning for working through complex client situations. Ships disabled — enable it from the MCP panel when you want it.",
+    "enabled": false
+  }
+}

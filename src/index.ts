@@ -10,6 +10,7 @@ import { startSlackBot } from './channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from './channels/slack-manifest.js';
 import { startWebhookServer } from './channels/webhook.js';
 import { startChatCli } from './cli/chat.js';
+import { startSupervisorIpcHeartbeat } from './daemon/phase.js';
 import { startDaemon } from './daemon/runner.js';
 import {
   clearDaemonPid,
@@ -67,8 +68,10 @@ Auth
   auth logout         Clear stored auth
 
 Plugins
-  plugin install <dir|pkg>  Install a plugin (copies dir or npm-installs pkg)
+  plugin install <dir|.clemplug|url|pkg>  Install a plugin cartridge (or legacy npm pkg)
   plugin list               List installed plugins
+  plugin enable|disable <id>  Eject/re-seat a cartridge without deleting it
+  plugin uninstall <id>     Remove a cartridge and everything it brought
 
 Memory
   memory status       Show SQLite vault index and fact counts
@@ -351,6 +354,8 @@ function cmdHarnessAudit(): number {
 }
 
 async function main(): Promise<void> {
+  startSupervisorIpcHeartbeat();
+
   // NOTE: an earlier attempt called process.chdir(os.homedir()) here to
   // dodge a `shell-init: getcwd` warning. That broke previously-working
   // shell commands — calling chdir on the daemon process apparently
@@ -527,9 +532,24 @@ async function main(): Promise<void> {
       return;
     }
     if (sub === 'install' && arg) {
+      // A URL downloads to a temp archive, then flows through the same
+      // consent path as a local source.
+      let downloaded: { file: string; cleanup: () => void } | null = null;
+      let source = arg;
+      if (/^https?:\/\//i.test(arg)) {
+        const { downloadPluginArchive } = await import('./plugins/plugin-fetch.js');
+        try {
+          downloaded = await downloadPluginArchive(arg);
+          source = downloaded.file;
+        } catch (err) {
+          console.error(`Download failed: ${err instanceof Error ? err.message : String(err)}`);
+          process.exitCode = 1;
+          return;
+        }
+      }
       // A source with plugin.json is a cartridge; anything else = legacy path.
       let resolved: { dir: string; cleanup: () => void } | null = null;
-      try { resolved = resolvePluginSource(arg); } catch { /* not a dir/tarball → legacy npm path below */ }
+      try { resolved = resolvePluginSource(source); } catch { /* not a dir/tarball → legacy npm path below */ }
       if (resolved && existsSync(path.join(resolved.dir, 'plugin.json'))) {
         try {
           const preview = previewPlugin(resolved.dir);
@@ -539,17 +559,20 @@ async function main(): Promise<void> {
             console.log('\nRe-run with --yes to consent and install.');
             return;
           }
-          const installed = installPlugin(resolved.dir);
-          console.log(`\nInstalled ${installed.manifest.id} v${installed.manifest.version} (${installed.artifacts.length} artifact${installed.artifacts.length === 1 ? '' : 's'}).`);
+          const installed = await installPlugin(resolved.dir);
+          const memoryNote = installed.memory ? ` — ${installed.memory.newFacts} memory fact${installed.memory.newFacts === 1 ? '' : 's'} imported${installed.memory.deduped ? ` (${installed.memory.deduped} already known)` : ''}` : '';
+          console.log(`\nInstalled ${installed.manifest.id} v${installed.manifest.version} (${installed.artifacts.length} artifact${installed.artifacts.length === 1 ? '' : 's'})${memoryNote}.`);
         } catch (err) {
           console.error(`Install failed: ${err instanceof Error ? err.message : String(err)}`);
           process.exitCode = 1;
         } finally {
           resolved.cleanup();
+          downloaded?.cleanup();
         }
         return;
       }
       resolved?.cleanup();
+      downloaded?.cleanup();
       process.exitCode = cmdPluginInstall(arg);
       return;
     }
@@ -567,7 +590,7 @@ async function main(): Promise<void> {
       } catch (err) { console.error(err instanceof Error ? err.message : String(err)); process.exitCode = 1; }
       return;
     }
-    console.log('Usage: clementine plugin <list | install <dir|.clemplug|npm-package> [--yes] | enable <id> | disable <id> | uninstall <id>>');
+    console.log('Usage: clementine plugin <list | install <dir|.clemplug|url|npm-package> [--yes] | enable <id> | disable <id> | uninstall <id>>');
     return;
   }
 

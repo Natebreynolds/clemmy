@@ -71,3 +71,7 @@ vendor/
 # Local Netlify folder
 .netlify
 proof-report.json
+
+# Local demo/scratch outputs — never release content
+output/
+*.clemplug

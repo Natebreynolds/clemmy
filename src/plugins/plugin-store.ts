@@ -17,7 +17,7 @@
  * run through the same certification + gates as hand-built ones.
  */
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
@@ -25,14 +25,18 @@ import { installSkillFromDir, uninstallSkill, isSafeSkillName, SKILLS_DIR } from
 import { readWorkflowDefinitionFile, readWorkflow, writeWorkflow, deleteWorkflow } from '../memory/workflow-store.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
+import { ingestMemorySource, scanMemorySource, undoMemoryImportBatch } from '../memory/memory-import.js';
 import { validateManifest, renderConsentSummary, type PluginContents, type PluginManifest } from './plugin-manifest.js';
 
-export interface PluginArtifact { kind: 'skill' | 'workflow' | 'mcp-server'; name: string }
+/** For 'memory', name is the import batch id (undoMemoryImportBatch removes it). */
+export interface PluginArtifact { kind: 'skill' | 'workflow' | 'mcp-server' | 'memory'; name: string }
 export interface InstalledPlugin {
   manifest: PluginManifest;
   installedAt: string;
   enabled: boolean;
   artifacts: PluginArtifact[];
+  /** Present when the cartridge bundled memory/ — counts for display. */
+  memory?: { batchId: string; newFacts: number; deduped: number };
 }
 interface Ledger { plugins: Record<string, InstalledPlugin> }
 
@@ -56,11 +60,22 @@ function writeLedger(ledger: Ledger): void {
 
 /** Resolve a plugin source (directory, or .clemplug/.tgz/.tar.gz via system tar)
  *  to a readable directory. Tarballs extract to a temp dir the caller owns. */
+const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
+
 export function resolvePluginSource(source: string): { dir: string; cleanup: () => void } {
   const src = path.resolve(source);
   if (!existsSync(src)) throw new Error(`Plugin source not found: ${src}`);
   if (readdirSafe(src) !== null) return { dir: src, cleanup: () => { /* caller's dir — leave it */ } };
   if (!/\.(clemplug|tgz|tar\.gz)$/i.test(src)) throw new Error('Plugin source must be a directory or a .clemplug/.tgz archive');
+  if (statSync(src).size > MAX_ARCHIVE_BYTES) throw new Error(`Archive exceeds ${MAX_ARCHIVE_BYTES / (1024 * 1024)}MB limit`);
+  // Defense-in-depth beyond modern tar's own path stripping: refuse any member
+  // that could escape the extraction dir.
+  const listing = execFileSync('tar', ['-tzf', src], { stdio: 'pipe' }).toString('utf-8');
+  for (const member of listing.split('\n')) {
+    const m = member.trim();
+    if (!m) continue;
+    if (path.isAbsolute(m) || m.split('/').includes('..')) throw new Error(`Archive contains an unsafe path: ${m}`);
+  }
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'clemplug-'));
   execFileSync('tar', ['-xzf', src, '-C', tmp], { stdio: 'pipe' });
   // Accept both layouts: manifest at the archive root, or under a single top dir.
@@ -91,7 +106,12 @@ export function discoverContents(dir: string): PluginContents {
   if (existsSync(mcpFile)) {
     try { mcpServers = Object.keys(JSON.parse(readFileSync(mcpFile, 'utf-8')) as Record<string, unknown>); } catch { /* invalid fragment surfaces at install */ }
   }
-  return { skills, workflows, mcpServers };
+  let memoryFiles: string[] = [];
+  const memoryDir = path.join(dir, 'memory');
+  if (existsSync(memoryDir)) {
+    memoryFiles = scanMemorySource(memoryDir).files.map((f) => path.relative(dir, f.path));
+  }
+  return { skills, workflows, mcpServers, memoryFiles };
 }
 
 export interface PluginPreview {
@@ -130,12 +150,13 @@ export function previewPlugin(dir: string): PluginPreview {
 
 /** Materialize the cartridge. Call AFTER the user consented to previewPlugin().
  *  Partial failures roll back everything this install materialized. */
-export function installPlugin(dir: string): InstalledPlugin {
+export async function installPlugin(dir: string): Promise<InstalledPlugin> {
   const { manifest, contents } = previewPlugin(dir);
   const ledger = readLedger();
   if (ledger.plugins[manifest.id]) throw new Error(`Plugin ${manifest.id} is already installed (uninstall it first, or bump the version and reinstall)`);
 
   const done: PluginArtifact[] = [];
+  let memorySummary: InstalledPlugin['memory'];
   const rollback = (): void => {
     for (const a of done.reverse()) {
       try {
@@ -145,7 +166,7 @@ export function installPlugin(dir: string): InstalledPlugin {
           const servers = loadUserMcpServers();
           delete servers[a.name];
           saveUserMcpServers(servers);
-        }
+        } else if (a.kind === 'memory') undoMemoryImportBatch(a.name);
       } catch { /* best-effort rollback */ }
     }
   };
@@ -177,6 +198,18 @@ export function installPlugin(dir: string): InstalledPlugin {
       }
       saveUserMcpServers(servers);
     }
+    // Memory ingests LAST so a failure here rolls back the whole cartridge.
+    // distill:false keeps install deterministic (no model call) — authors ship
+    // structured-frontmatter files; freeform falls back to bullet harvesting.
+    // Per-file errors ride in batch.errors and do not fail the install.
+    if (contents.memoryFiles.length) {
+      const batch = await ingestMemorySource(path.join(dir, 'memory'), {
+        sourceLabel: `plugin:${manifest.id}`,
+        distill: false,
+      });
+      done.push({ kind: 'memory', name: batch.id });
+      memorySummary = { batchId: batch.id, newFacts: batch.newFactIds.length, deduped: batch.dedupedCount };
+    }
   } catch (err) {
     rollback();
     throw err;
@@ -187,6 +220,7 @@ export function installPlugin(dir: string): InstalledPlugin {
     installedAt: new Date().toISOString(),
     enabled: true,
     artifacts: done,
+    ...(memorySummary ? { memory: memorySummary } : {}),
   };
   ledger.plugins[manifest.id] = installed;
   writeLedger(ledger);
@@ -222,6 +256,9 @@ export function setPluginEnabled(id: string, enabled: boolean): InstalledPlugin 
         if (!enabled && existsSync(live)) { mkdirSync(stash, { recursive: true }); renameSync(live, parked); }
         if (enabled && existsSync(parked)) { mkdirSync(SKILLS_DIR, { recursive: true }); renameSync(parked, live); }
       }
+      // 'memory' is deliberately untouched by disable: the source memory/ dir is
+      // gone after install, so knowledge stays live (eject keeps the save) and
+      // is removed only by uninstall's batch undo.
     } catch { /* one stuck artifact must not wedge the rest; state converges on retry */ }
   }
   plugin.enabled = enabled;
@@ -244,6 +281,7 @@ export function uninstallPlugin(id: string): { removed: PluginArtifact[] } {
         const servers = loadUserMcpServers();
         if (servers[a.name]) { delete servers[a.name]; saveUserMcpServers(servers); removed.push(a); }
       }
+      else if (a.kind === 'memory' && undoMemoryImportBatch(a.name).batch) removed.push(a);
     } catch { /* keep going — report what actually came out */ }
   }
   const fresh = readLedger();
