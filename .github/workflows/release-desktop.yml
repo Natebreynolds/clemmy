@@ -104,6 +104,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install console-web test dependencies
+        working-directory: apps/console-web
+        run: npm ci
+
       - name: Unit tests
         run: npm test
 
