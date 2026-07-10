@@ -299,6 +299,31 @@ test('Win 2: the stable memory block is frozen per session — a mid-session vau
   invalidateStableMemorySnapshot();
 });
 
+test('CONVERGE guard: after the user answers a clarifying question, the turn context steers toward EXECUTION (one beat, no turn-by-turn re-ask)', async () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on';
+  delete process.env.CLEMMY_BRAIN_CONVERGE;
+  const sid = createSession({ kind: 'chat' }).id;
+  // No prior clarifying question → no convergence steer.
+  const before = await renderClaudeAgentBrainTurnContext({ message: 'design a win-back workspace', sessionId: sid });
+  assert.doesNotMatch(before, /CONVERGE/);
+  // Clem's PREVIOUS turn ended by asking a clarifying question (awaiting-user completion).
+  appendEvent({ sessionId: sid, turn: 1, role: 'system', type: 'conversation_completed', data: { awaitingUser: true, summary: 'win-back action or closed-lost diagnosis?' } });
+  const after = await renderClaudeAgentBrainTurnContext({ message: 'winback action please', sessionId: sid });
+  assert.match(after, /CONVERGE/, 'answering a clarifying question injects the execute-now steer');
+  assert.match(after, /EXECUTE the work this turn/);
+  assert.match(after, /do NOT ask another separate clarifying question/);
+  // An approval card (approval_requested) is NOT a clarifying question — it must not trip the steer.
+  const sid2 = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sid2, turn: 1, role: 'system', type: 'conversation_completed', data: { summary: 'done, sent 3 emails' } });
+  const normal = await renderClaudeAgentBrainTurnContext({ message: 'thanks', sessionId: sid2 });
+  assert.doesNotMatch(normal, /CONVERGE/, 'a normal completion does not trip the steer');
+  // Kill-switch off → no steer even after a clarify.
+  process.env.CLEMMY_BRAIN_CONVERGE = 'off';
+  const killed = await renderClaudeAgentBrainTurnContext({ message: 'winback action please', sessionId: sid });
+  assert.doesNotMatch(killed, /CONVERGE/, 'kill-switch disables the steer');
+  delete process.env.CLEMMY_BRAIN_CONVERGE;
+});
+
 test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/model-role capability', () => {
   const prompt = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: 'brain-prompt' }, 'local_authoring');
   assert.match(prompt, /local-authoring tools/);

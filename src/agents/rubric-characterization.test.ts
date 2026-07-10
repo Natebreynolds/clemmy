@@ -35,9 +35,12 @@ const GOLDEN = {
   // envelope to the plain-text MARKER contract (ASK:/CONTINUE:/no-marker).
   instructions: { len: 36209, sha16: '1cd224b72ac8212d' },
   native: { len: 35312, sha16: 'd5f7444d3490299e' },
-  claudeBrain: { len: 4813, sha16: 'fa006f0bbc934c99' },
+  // 2026-07-09: CONVERSE-FIRST line rewritten — one bundled clarifying beat then
+  // EXECUTE (no turn-by-turn interrogation), and offer_background no longer stacks
+  // as a question after clarifying. Fixes the "back-to-back questions" friction.
+  claudeBrain: { len: 5395, sha16: '52d8998bcb06b083' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8313, sha16: 'aadb106041567382' },
+  lean: { len: 8895, sha16: '7126928e5c053338' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
