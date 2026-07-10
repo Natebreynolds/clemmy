@@ -11,6 +11,7 @@ import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
+import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import {
   pullRecentTurnsForSession,
   renderRecentActionsForHarnessHistory,
@@ -680,27 +681,10 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   // the brain drips a second/third separate question turn-by-turn instead of
   // planning once and acting (2026-07-09). Kill-switch CLEMMY_BRAIN_CONVERGE=off.
   let convergenceSteer = '';
-  if (convergenceSteerEnabled() && priorTurnAskedClarifying(request.sessionId)) {
-    convergenceSteer =
-      'CONVERGE — your previous turn asked the user a clarifying question and they just answered it. You now have enough: EXECUTE the work this turn. Choose sensible defaults for anything still open and state them in one line; do NOT ask another separate clarifying question, and do NOT stack an offer_background question. Pause again ONLY if a decision is genuinely blocking and unguessable, or — for an irreversible/batch external write — to queue the payload and request approval once.';
+  if (convergenceSteerEnabled() && priorTurnEndedAwaitingClarification(request.sessionId)) {
+    convergenceSteer = CONVERGENCE_STEER;
   }
   return [convergenceSteer, volatile, continuationContext, harnessHealth, recall, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n');
-}
-
-/** True when Clem's PREVIOUS turn ended by asking the user a clarifying question
- *  (an awaiting-user completion) — so the current user message is the answer.
- *  Drives the one-beat-then-execute convergence steer. NOT an approval card
- *  (that's approval_requested, a different, legit pause). */
-function priorTurnAskedClarifying(sessionId?: string): boolean {
-  if (!sessionId) return false;
-  try {
-    const last = listEvents(sessionId, { types: ['conversation_completed'], desc: true, limit: 1 });
-    return Boolean((last[0]?.data as { awaitingUser?: boolean } | undefined)?.awaitingUser);
-  } catch { return false; }
-}
-
-function convergenceSteerEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BRAIN_CONVERGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(

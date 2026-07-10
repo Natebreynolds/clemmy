@@ -33,8 +33,12 @@ const GOLDEN = {
   // HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
   // 2026-07-08: DECISION_CONTRACT swapped from the OrchestratorDecision JSON
   // envelope to the plain-text MARKER contract (ASK:/CONTINUE:/no-marker).
-  instructions: { len: 36209, sha16: '1cd224b72ac8212d' },
-  native: { len: 35312, sha16: 'd5f7444d3490299e' },
+  // 2026-07-09: CONVERSE-FIRST + OFFER-BACKGROUND rewritten on the full/Codex
+  // rubric too (one bundled beat then execute; offer_background reserved for
+  // long/unattended work, never stacked after clarifying) — parity with the lean
+  // brain line, so the GPT/Codex lane stops the back-to-back questions.
+  instructions: { len: 36525, sha16: '58a4eccedd88d17e' },
+  native: { len: 35628, sha16: '9d7bef2cf5bf1c4b' },
   // 2026-07-09: CONVERSE-FIRST line rewritten — one bundled clarifying beat then
   // EXECUTE (no turn-by-turn interrogation), and offer_background no longer stacks
   // as a question after clarifying. Fixes the "back-to-back questions" friction.

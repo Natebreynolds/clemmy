@@ -50,6 +50,7 @@ import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, wa
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { isUngrantableMultiplexer } from '../../agents/plan-scope.js';
+import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -1635,6 +1636,16 @@ async function runConversationCore(
 
   let stepIndex = 0;
   let nextInput = options.input;
+  // CONVERGENCE (one beat, then execute): if Clem's previous turn ended by asking
+  // a clarifying question and the user is now answering it, prepend an EXECUTE-now
+  // directive so the model plans ONCE and acts — not another back-to-back question.
+  // This lane (Codex/GPT) is what a non-Claude brain model runs on; the steer must
+  // fire here too (2026-07-09 "it kept asking me redundant questions"). Kill-switch
+  // CLEMMY_BRAIN_CONVERGE=off. options.input is always the user's real message
+  // (harness continuations re-assign nextInput inside the loop, never options.input).
+  if (convergenceSteerEnabled() && priorTurnEndedAwaitingClarification(options.sessionId)) {
+    nextInput = `${CONVERGENCE_STEER}\n\n${options.input}`;
+  }
   let lastDecision: OrchestratorDecisionShape | undefined;
   let lastTurn = 0;
   // Stall-retry counter (scoped to this conversation). Incremented each
