@@ -333,6 +333,10 @@ function isYoloAutoApprovalPolicy(): boolean {
 }
 
 const IRREVERSIBLE_ACTION_TEXT_RE = /\b(send|sending|sent|post|posting|publish|publishing|tweet|tweeting|dm|sms|text message|call|calling|dial)\b/i;
+// `email` is both an action and a noun. Match it only in an action position so
+// "Email the customer" cannot auto-approve in YOLO, while local saves such as
+// "Save the email template to memory" remain reversible.
+const DIRECT_EMAIL_ACTION_TEXT_RE = /(?:^|[.!?]\s+|\b(?:please|to|will|should|must|can|could|would)\s+)(?:email|e-mail)(?:s|ed|ing)?\b/i;
 
 /**
  * YOLO covers reversible work, never irreversible sends or destructive actions.
@@ -362,7 +366,7 @@ async function requestApprovalRequiresHuman(args: RequestApprovalArgs): Promise<
     } catch { return true; /* fail-closed on the safety path */ }
   }
   const text = `${args.subject} ${args.reason ?? ''}`;
-  return IRREVERSIBLE_ACTION_TEXT_RE.test(text);
+  return IRREVERSIBLE_ACTION_TEXT_RE.test(text) || DIRECT_EMAIL_ACTION_TEXT_RE.test(text);
 }
 
 // Code-level backstop for the v0.5.59 context fix: in YOLO, ask_user_question is

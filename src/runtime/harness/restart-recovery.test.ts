@@ -137,6 +137,50 @@ test('idempotent: a second boot scan finds nothing (marker already cleared)', ()
   assert.equal(reportInterruptedChatRuns(() => 2001), 0, 'no double-recovery');
 });
 
+test('boot cutoff recovers only markers owned by the previous daemon process', async () => {
+  const bootCutoffMs = Date.parse('2026-07-10T19:11:47.000Z');
+  const scanNowMs = Date.parse('2026-07-10T19:14:46.000Z');
+  const previousProcess = HarnessSession.create({ kind: 'chat', title: 'pre-boot work' });
+  previousProcess.setRunInFlight('2026-07-10T19:11:46.999Z');
+  const liveProcess = HarnessSession.create({ kind: 'chat', title: 'live work' });
+  liveProcess.setRunInFlight('2026-07-10T19:14:38.000Z');
+  const equalCutoff = HarnessSession.create({ kind: 'chat', title: 'ambiguous boundary' });
+  equalCutoff.setRunInFlight('2026-07-10T19:11:47.000Z');
+  const malformed = HarnessSession.create({ kind: 'chat', title: 'malformed marker' });
+  malformed.setRunInFlight('not-a-timestamp');
+  const dispatched: string[] = [];
+
+  const summary = recoverInterruptedChatRuns(
+    () => scanNowMs,
+    async (sessionId) => { dispatched.push(sessionId); },
+    { bootCutoffMs },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(summary.recovered, 1);
+  assert.deepEqual(dispatched, [previousProcess.id]);
+  assert.equal(HarnessSession.load(previousProcess.id)?.runInFlightSince(), null);
+  assert.ok(hasInterruptedEvent(previousProcess.id));
+
+  for (const session of [liveProcess, equalCutoff, malformed]) {
+    assert.notEqual(HarnessSession.load(session.id)?.runInFlightSince(), null, `${session.title} marker remains armed`);
+    assert.equal(hasInterruptedEvent(session.id), false, `${session.title} receives no false restart notice`);
+    assert.equal(
+      listEvents(session.id, { types: ['restart_recovery_decision'] }).length,
+      0,
+      `${session.title} receives no restart decision`,
+    );
+    assert.equal(
+      HarnessSession.load(session.id)?.toInputItems().some((item) => {
+        const content = (item as { content?: unknown }).content;
+        return typeof content === 'string' && content.startsWith(restartRecoveryPrimerPrefixForTests());
+      }),
+      false,
+      `${session.title} receives no replay primer`,
+    );
+  }
+});
+
 test('kill-switch off → no-op (marker preserved, nothing surfaced)', () => {
   const prev = process.env.CLEMMY_CHAT_RESTART_RECOVERY;
   const s = HarnessSession.create({ kind: 'chat', title: 'y' });

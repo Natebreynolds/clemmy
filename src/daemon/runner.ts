@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import matter from 'gray-matter';
 import pino from 'pino';
 import { ClementineAssistant } from '../assistant/core.js';
@@ -1090,7 +1091,7 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
       message: directive,
       model: MODELS.primary,
     }, (req) => assistant.respond(req));
-  });
+  }, { bootCutoffMs: performance.timeOrigin });
   if (recoveredChats > 0) {
     logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart (safe ones auto-resumed)');
   }

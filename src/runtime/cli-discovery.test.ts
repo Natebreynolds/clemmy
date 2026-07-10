@@ -11,10 +11,38 @@
  * This test asserts the structural rule fires regardless of whether a
  * binary is in the curated list.
  */
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-const { resolveSafeCliProbe, _resetCltDetectionCache, isDeveloperToolchainInstalled } = await import('./cli-discovery.js');
+const originalClementineHome = process.env.CLEMENTINE_HOME;
+const testHome = mkdtempSync(path.join(os.tmpdir(), 'clementine-cli-discovery-test-'));
+process.env.CLEMENTINE_HOME = testHome;
+
+const {
+  resolveSafeCliProbe,
+  _resetCltDetectionCache,
+  fullScan,
+  isDeveloperToolchainInstalled,
+  probe,
+} = await import('./cli-discovery.js');
+
+after(() => {
+  if (originalClementineHome === undefined) delete process.env.CLEMENTINE_HOME;
+  else process.env.CLEMENTINE_HOME = originalClementineHome;
+  rmSync(testHome, { recursive: true, force: true });
+});
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+function writeExecutable(file: string, body: string): void {
+  writeFileSync(file, `#!/bin/sh\nset -eu\n${body}\n`, 'utf-8');
+  chmodSync(file, 0o755);
+}
 
 test('isDeveloperToolchainInstalled returns a boolean (file-stat only — never spawns)', () => {
   _resetCltDetectionCache();
@@ -99,4 +127,65 @@ test('SYSTEM_BINARIES set still catches wish at /usr/bin even when CLT installed
   }
   const result = resolveSafeCliProbe('wish', '/usr/bin/wish');
   assert.equal(result.skipped, true);
+});
+
+test('fullScan inventories PATH executables without running them', async () => {
+  const binDir = path.join(testHome, 'stat-only-bin');
+  const executionMarker = path.join(testHome, 'full-scan-executed');
+  mkdirSync(binDir, { recursive: true });
+  writeExecutable(
+    path.join(binDir, 'side-effect-cli'),
+    `printf 'executed' > ${shellQuote(executionMarker)}\nprintf 'side-effect-cli 1.0\\n'`,
+  );
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = binDir;
+  try {
+    const result = await fullScan({ concurrency: 1 });
+    const entry = result.clis.find((cli) => cli.command === 'side-effect-cli');
+
+    assert.equal(existsSync(executionMarker), false, 'a full scan must not execute PATH binaries');
+    assert.ok(entry, 'stat-only executable should remain visible in the CLI inventory');
+    assert.equal(entry.isLikelyCli, true);
+    assert.equal(entry.probedAt, undefined);
+    assert.equal(entry.version, undefined);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+});
+
+test('explicit probe runs in private scratch cwd, never process.cwd()', async () => {
+  const fixtureDir = path.join(testHome, 'probe-fixture');
+  const observationFile = path.join(testHome, 'probe-observation');
+  const sentinelName = `relative-probe-sentinel-${process.pid}`;
+  const processCwdSentinel = path.join(process.cwd(), sentinelName);
+  const executable = path.join(fixtureDir, 'relative-writer-cli');
+  mkdirSync(fixtureDir, { recursive: true });
+  rmSync(processCwdSentinel, { force: true });
+
+  writeExecutable(executable, [
+    `printf 'sentinel' > ${shellQuote(sentinelName)}`,
+    `{ printf '%s\\n' \"$PWD\"; test -f ${shellQuote(sentinelName)} && printf 'sentinel-present\\n'; } > ${shellQuote(observationFile)}`,
+    `printf 'relative-writer-cli 1.0\\n'`,
+  ].join('\n'));
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ''}`;
+  const entry = await (async () => {
+    try {
+      return await probe('relative-writer-cli');
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  })();
+  const [probeCwd, sentinelState] = readFileSync(observationFile, 'utf-8').trim().split(/\r?\n/);
+
+  assert.equal(entry?.version, 'relative-writer-cli 1.0');
+  assert.equal(sentinelState, 'sentinel-present', 'fixture must observe its relative sentinel during execution');
+  assert.notEqual(probeCwd, process.cwd());
+  assert.match(path.basename(probeCwd), /^clementine-cli-probe-/);
+  assert.equal(existsSync(processCwdSentinel), false, 'probe must not write relative files in daemon cwd');
+  assert.equal(existsSync(probeCwd), false, 'probe scratch directory should be removed after execution');
 });

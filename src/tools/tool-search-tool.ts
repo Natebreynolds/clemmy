@@ -53,7 +53,10 @@ async function toolSchemaMap(): Promise<Map<string, unknown>> {
   return schemaMapPromise;
 }
 
-export function registerToolSearchTool(server: McpServer): void {
+export function registerToolSearchTool(
+  server: McpServer,
+  opts: { allowedNames?: ReadonlySet<string> } = {},
+): void {
   server.tool(
     'tool_search',
     DESCRIPTION,
@@ -72,7 +75,7 @@ export function registerToolSearchTool(server: McpServer): void {
         .describe(`How many ranked results to return (default ${TOP_RESULTS}).`),
     },
     async ({ query, limit }: { query: string; limit?: number }) => {
-      const ranked = await rankCatalog(query);
+      const ranked = await rankCatalog(query, { allowedNames: opts.allowedNames });
       const topN = ranked.slice(0, Math.min(limit ?? TOP_RESULTS, 20));
       const schemaMap = await toolSchemaMap();
 
@@ -93,7 +96,9 @@ export function registerToolSearchTool(server: McpServer): void {
             query,
             results: topN.map((r) => ({ name: r.name, summary: r.oneLiner })),
             schemas,
-            hint: 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
+            hint: opts.allowedNames
+              ? 'Call one of the returned tools by name; every result is available on this turn\'s active surface.'
+              : 'Call the tool you need by name. If its schema is not shown above, search again with a tighter query.',
           },
           null,
           2,

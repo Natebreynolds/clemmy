@@ -60,6 +60,25 @@ test('parseLatestMacYml extracts version, path, and file entries', () => {
 
 test('verifyDesktopReleaseAssets accepts a complete feed + artifacts fixture', () => {
   withFixture((dir) => {
+    const armZipSize = writeAsset(dir, 'Clementine-1.2.3-arm64-mac.zip', 'arm zip payload');
+    const armDmgSize = writeAsset(dir, 'Clementine-1.2.3-arm64.dmg', 'arm dmg payload');
+    const zipSize = writeAsset(dir, 'Clementine-1.2.3-mac.zip', 'zip payload');
+    const dmgSize = writeAsset(dir, 'Clementine-1.2.3.dmg', 'dmg payload');
+    writeFeed(dir, '1.2.3', [
+      { url: 'Clementine-1.2.3-arm64-mac.zip', size: armZipSize },
+      { url: 'Clementine-1.2.3-arm64.dmg', size: armDmgSize },
+      { url: 'Clementine-1.2.3-mac.zip', size: zipSize },
+      { url: 'Clementine-1.2.3.dmg', size: dmgSize },
+    ], 'Clementine-1.2.3-mac.zip');
+
+    const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3' });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.ok, true);
+  });
+});
+
+test('verifyDesktopReleaseAssets rejects an internally valid x64-only feed', () => {
+  withFixture((dir) => {
     const zipSize = writeAsset(dir, 'Clementine-1.2.3-mac.zip', 'zip payload');
     const dmgSize = writeAsset(dir, 'Clementine-1.2.3.dmg', 'dmg payload');
     writeFeed(dir, '1.2.3', [
@@ -68,8 +87,9 @@ test('verifyDesktopReleaseAssets accepts a complete feed + artifacts fixture', (
     ]);
 
     const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3' });
-    assert.deepEqual(result.errors, []);
-    assert.equal(result.ok, true);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join('\n'), /missing architecture artifact: Clementine-1\.2\.3-arm64-mac\.zip/);
+    assert.match(result.errors.join('\n'), /missing architecture artifact: Clementine-1\.2\.3-arm64\.dmg/);
   });
 });
 

@@ -31,7 +31,7 @@ import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, writeToolOutput } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
-import { createClementineMcpServer } from '../../tools/mcp-server.js';
+import { createClementineMcpServer, listClementineMcpToolNames } from '../../tools/mcp-server.js';
 import {
   isTerminalToolName,
   terminalToolShouldHalt,
@@ -281,6 +281,26 @@ export function defaultClaudeAgentSdkAllowedLocalTools(profile: ClaudeAgentSdkTo
     .split(',')
     .map((toolName) => toolName.trim())
     .filter(Boolean);
+}
+
+/** The authoritative in-process MCP capability surface for a full agentic turn.
+ * Kept separate from defaultClaudeAgentSdkAllowedLocalTools(), which is only the
+ * permission fast-allow profile. */
+const ADVERTISABLE_LOCAL_TOOLS_TTL_MS = 5_000;
+let advertisableLocalToolsCache: { at: number; names: string[] } | null = null;
+export function claudeAgentSdkAdvertisableLocalTools(): string[] {
+  const now = Date.now();
+  if (!advertisableLocalToolsCache || now - advertisableLocalToolsCache.at >= ADVERTISABLE_LOCAL_TOOLS_TTL_MS) {
+    advertisableLocalToolsCache = {
+      at: now,
+      names: listClementineMcpToolNames({ gatedMutations: true }),
+    };
+  }
+  return [...advertisableLocalToolsCache.names];
+}
+
+export function _resetClaudeAgentSdkAdvertisableLocalToolsForTest(): void {
+  advertisableLocalToolsCache = null;
 }
 
 function localNodeCommand(): string {

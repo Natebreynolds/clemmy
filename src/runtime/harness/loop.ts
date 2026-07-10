@@ -95,6 +95,7 @@ import {
 import {
   completionEvidenceToolName,
   hasMeaningfulSuccessfulToolNames,
+  objectiveMayRequireMultipleResults,
   toolOutputLooksSuccessful,
 } from './tool-evidence.js';
 // Turn-decision classification lives in turn-decision.ts (extracted 2026-07-08);
@@ -2606,6 +2607,7 @@ async function runConversationCore(
           optIn: objectiveJudgeOptIn,
           actionIntent: objectiveJudgeActionIntent,
           meaningfulToolEvidence,
+          multiResultObjective: objectiveMayRequireMultipleResults(objective),
           continuationsUsed: objectiveJudgeContinuations,
           maxContinuations: MAX_OBJECTIVE_JUDGE_CONTINUATIONS,
           nextAction: decision.nextAction,

@@ -25,10 +25,16 @@ const {
   frameTrustedMemory,
   sdkStreamingEnabled,
   invalidateStableMemorySnapshot,
+  claudeAgentSdkAdvertisedToolUniverse,
+  partitionClaudeAgentSdkJitSurface,
 } = brain;
 const { appendEvent, createSession, getSession, listEvents, resetEventLog, writeToolOutput } = await import('./eventlog.js');
 const { saveUserProfile } = await import('../user-profile.js');
-const { ClaudeSdkProviderOverloadError, ClaudeSdkContextOverflowError } = await import('./claude-agent-sdk.js');
+const {
+  ClaudeSdkProviderOverloadError,
+  ClaudeSdkContextOverflowError,
+  _resetClaudeAgentSdkAdvertisableLocalToolsForTest,
+} = await import('./claude-agent-sdk.js');
 const capabilityHealth = await import('./capability-health.js');
 
 beforeEach(() => {
@@ -37,6 +43,7 @@ beforeEach(() => {
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
   setClaudeAgentSdkBrainSearchFactsHybridForTest(null);
+  _resetClaudeAgentSdkAdvertisableLocalToolsForTest();
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_ALLOWED_TOOLS;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN_MAX_TURNS;
@@ -105,8 +112,13 @@ test('completion judge targets suspicious text and skips concrete tool-backed re
   );
   assert.equal(
     shouldJudgeClaudeCompletion('send the emails', 'Sent the emails.', ['GMAIL_SEND_EMAIL']),
+    true,
+    'one successful send cannot certify a plural objective',
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('send the email', 'Sent the email.', ['GMAIL_SEND_EMAIL']),
     false,
-    'a successful concrete send slug is completion evidence',
+    'a successful concrete send still certifies a singular objective',
   );
 });
 
@@ -133,6 +145,23 @@ test('JIT monotonic floor: the EMITTED allowlist string is byte-identical once c
   assert.equal(t5, t2);
   // And the serialization follows fullAllowed order, not selection/insertion order.
   assert.equal(t2, 'alpha,bravo,charlie');
+});
+
+test('full-mode JIT keeps MCP advertisement separate from the permission fast-allow set', () => {
+  const fastAllow = ['memory_recall', 'tool_search'];
+  const universe = claudeAgentSdkAdvertisedToolUniverse('full', fastAllow);
+  assert.ok(universe.includes('task_hygiene'), 'catalog-only gated tools remain advertisable');
+  assert.ok(universe.includes('focus_get'), 'real MCP tools outside the CLI catalog remain advertisable');
+  assert.ok(!universe.includes('browser_harness_run'), 'CLI-only names absent from this MCP server are not promised');
+
+  const selected = new Set(['memory_recall', 'tool_search', 'task_hygiene']);
+  const partitioned = partitionClaudeAgentSdkJitSurface(fastAllow, universe, selected);
+  assert.ok(partitioned.advertisedNames.includes('task_hygiene'));
+  assert.ok(!partitioned.fastAllowNames.includes('task_hygiene'), 'catalog-only tools must still reach canUseTool');
+
+  const readOnly = claudeAgentSdkAdvertisedToolUniverse('read_only', fastAllow);
+  assert.ok(!readOnly.includes('task_hygiene'), 'non-agentic profiles remain capability-limited');
+  assert.ok(!claudeAgentSdkAdvertisedToolUniverse('full', fastAllow, ['task_hygiene']).includes('task_hygiene'));
 });
 
 test('Move 1: the SDK brain ARMS the in-flight marker during the run and CLEARS it on completion', async () => {

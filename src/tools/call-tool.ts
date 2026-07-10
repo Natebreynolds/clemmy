@@ -27,8 +27,8 @@
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
-import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
-import { ToolCallsCounter } from '../runtime/harness/brackets.js';
+import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { harnessRunContextStorage, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
 import { dispatchBatchItemTool, isMcpNamespacedTool } from './code-mode-tool.js';
 import { deriveOrchestratorDiscoveryNames } from './tool-registry.js';
@@ -71,7 +71,10 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
     }),
     // needsApproval intentionally omitted → false. Gate decisions come from the
     // INNER tool via dispatchBatchItemTool (see file header). Do NOT set this true.
-    execute: async ({ name, args_json }: { name: string; args_json: string }): Promise<string> => {
+    execute: async (
+      { name, args_json }: { name: string; args_json: string },
+      runContext: unknown,
+    ): Promise<string> => {
       const target = (name ?? '').trim();
       if (!target) return JSON.stringify({ error: 'bad_request', detail: 'name is required' });
 
@@ -127,7 +130,16 @@ export function buildCallTool(): Tool<RuntimeContextValue> {
       }
 
       // 4. Dispatch through the gated inner path (gates key on the INNER name).
-      const sessionId = getToolOutputContext()?.sessionId ?? '';
+      const sessionId = sessionIdFromRunContext(runContext)
+        ?? getToolOutputContext()?.sessionId
+        ?? harnessRunContextStorage.getStore()?.sessionId
+        ?? '';
+      if (!sessionId) {
+        return JSON.stringify({
+          error: 'missing_session_context',
+          detail: 'call_tool requires an active harness session before it can dispatch an inner tool.',
+        });
+      }
       const counter = new ToolCallsCounter(1000);
       const out = await dispatchBatchItemTool(target, args, sessionId, counter);
 

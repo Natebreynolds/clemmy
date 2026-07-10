@@ -21,14 +21,14 @@ interface Captured {
   handler: Handler;
 }
 
-function captureToolSearch(): Captured {
+function captureToolSearch(allowedNames?: ReadonlySet<string>): Captured {
   let captured: Captured | undefined;
   const fakeServer = {
     tool(name: string, description: string, schema: Record<string, unknown>, handler: Handler): void {
       captured = { name, description, schema, handler };
     },
   };
-  registerToolSearchTool(fakeServer as unknown as McpServer);
+  registerToolSearchTool(fakeServer as unknown as McpServer, { allowedNames });
   assert.ok(captured, 'tool_search should register');
   return captured!;
 }
@@ -79,4 +79,13 @@ test('no session context still returns results (recording is a no-op)', async ()
   const t = captureToolSearch();
   const out = await runSearch(t.handler, 'send an email');
   assert.ok(out.results.length > 0);
+});
+
+test('a scoped MCP search never promises tools outside the active advertised surface', async () => {
+  const allowed = new Set(['task_hygiene', 'tool_search']);
+  const t = captureToolSearch(allowed);
+  const out = await runSearch(t.handler, 'repair and compact the task ledger');
+  assert.ok(out.results.length > 0);
+  assert.ok(out.results.every((result) => allowed.has(result.name)));
+  assert.ok(out.results.some((result) => result.name === 'task_hygiene'));
 });

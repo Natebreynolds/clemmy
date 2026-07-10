@@ -1,35 +1,135 @@
 name: Release Desktop App
 
-# Builds, signs, notarizes, and publishes the Clementine .dmg + zip
-# to GitHub Releases whenever a tag matching `v*` is pushed.
+# Tag pushes publish production releases. Manual runs build a signed, notarized
+# macOS candidate and keep it private as a GitHub Actions artifact.
 #
 # Required repository secrets:
-#   APPLE_ID                  natebreynolds@icloud.com
-#   APPLE_APP_PASSWORD        16-char app-specific password from appleid.apple.com
-#   APPLE_TEAM_ID             4AR3Y8XD72
-#   CSC_LINK                  base64-encoded Developer ID Application .p12
-#   CSC_KEY_PASSWORD          password used when exporting the .p12
-#   GITHUB_TOKEN              auto-provided by Actions; lets electron-builder
-#                             upload the .dmg to the release.
-#
-# To export your cert as .p12 for CSC_LINK:
-#   1. Open Keychain Access on the machine where the cert lives
-#   2. Find "Developer ID Application: Nathan Reynolds (4AR3Y8XD72)"
-#   3. Right-click → Export → format = "Personal Information Exchange (.p12)"
-#   4. Set a strong export password — that's the CSC_KEY_PASSWORD value
-#   5. base64 -i cert.p12 -o cert.p12.b64 → paste the contents as CSC_LINK
+#   APPLE_ID
+#   APPLE_APP_PASSWORD
+#   APPLE_TEAM_ID
+#   CSC_LINK
+#   CSC_KEY_PASSWORD
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      candidate_version:
+        description: 'Prerelease SemVer without v (for example, 1.4.4-rc.1)'
+        required: true
+        type: string
+
+# Production runs are serialized and an in-progress release is never cancelled.
+# Candidate runs have independent groups so they cannot block a tag release.
+concurrency:
+  group: desktop-release-${{ github.event_name == 'push' && 'production' || format('candidate-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
+  preflight:
+    name: Validate source and release gates
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release-metadata.outputs.version }}
+      tag: ${{ steps.release-metadata.outputs.tag }}
+      candidate: ${{ steps.release-metadata.outputs.candidate }}
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate candidate or production tag
+        id: release-metadata
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            VERSION="$CANDIDATE_VERSION" node <<'NODE'
+          const version = process.env.VERSION ?? '';
+          const core = '(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)';
+          const identifier = '(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)';
+          const prerelease = `${identifier}(?:\\.${identifier})*`;
+          const build = '[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*';
+          const candidate = new RegExp(`^${core}-${prerelease}(?:\\+${build})?$`);
+          if (!candidate.test(version)) {
+            console.error(`::error::candidate_version must be a prerelease SemVer without v (for example, 1.4.4-rc.1), not '${version}'.`);
+            process.exit(1);
+          }
+          NODE
+            echo "version=$CANDIDATE_VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "candidate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RELEASE_TAG="$RELEASE_TAG" node <<'NODE'
+          const tag = process.env.RELEASE_TAG ?? '';
+          const stableTag = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+          if (!stableTag.test(tag)) {
+            console.error(`::error::Production desktop releases require a stable SemVer tag like v1.4.4, not '${tag}'.`);
+            process.exit(1);
+          }
+          NODE
+
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          tag_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          main_sha="$(git rev-parse 'refs/remotes/origin/main^{commit}')"
+          if [[ "$tag_sha" != "$main_sha" ]]; then
+            echo "::error::Tag $RELEASE_TAG resolves to $tag_sha, but origin/main is $main_sha. Production tags must point at the exact origin/main commit."
+            exit 1
+          fi
+
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "candidate=false" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Release asset tests
+        run: npm run test:release-assets
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Harness gate benchmark
+        run: npm run bench:gates
+
+      - name: pass^k consistency (strict)
+        run: npm run eval:passk
+        env:
+          EVAL_PASSK_STRICT: 'on'
+
+      - name: Job evals (strict)
+        run: npm run eval:jobs
+        env:
+          EVAL_JOBS_STRICT: 'on'
+
   release-mac:
-    runs-on: macos-14   # arm64 runner so we can build native arm64 + cross-compile x64
-    permissions:
-      contents: write   # required to upload release assets
+    name: Build signed and notarized macOS artifacts
+    needs: preflight
+    runs-on: macos-14
 
     steps:
       - name: Checkout
@@ -41,31 +141,25 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install daemon deps + build
+      - name: Install daemon dependencies and build
         run: |
           npm ci
           npm run build
 
-      - name: Install desktop deps
+      - name: Install desktop dependencies
         working-directory: apps/desktop
         run: npm ci
 
-      - name: Install mobile-web deps
-        # package:dist runs build:mobile-web (tsc + vite), which needs
-        # apps/mobile-web's own deps (e.g. vite/client types). The other
-        # install steps don't cover this nested workspace.
+      - name: Install mobile-web dependencies
         working-directory: apps/mobile-web
         run: npm ci
 
-      - name: Install console-web deps
-        # The release build (release-mac-dual-arch.sh) runs build:console-web
-        # (tsc + vite) for the new desktop UI, which needs this nested
-        # workspace's own deps. Without this the bundle is never built and
-        # the packaged app silently falls back to the legacy console.
+      - name: Install console-web dependencies
         working-directory: apps/console-web
         run: npm ci
 
       - name: Verify release secrets
+        shell: bash
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
@@ -86,87 +180,53 @@ jobs:
             exit 1
           fi
 
-      - name: Sync daemon version from the pushed tag
-        # build-info.ts (the Help page's Version card) reports the nearest
-        # package.json to the bundled daemon — the ROOT package.json. Without
-        # this bump the UI shows the last hand-bumped version (stuck at 0.7.0
-        # while the app itself was 0.9.x). Tag is authoritative for BOTH.
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+      - name: Sync daemon version
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
-      - name: Sync app version from the pushed tag
+      - name: Sync app version
         working-directory: apps/desktop
-        # electron-builder versions the app (and its latest-mac.yml update feed)
-        # from apps/desktop/package.json. The release-bump commit only updates the
-        # ROOT package.json, so the desktop app stayed frozen at whatever version
-        # apps/desktop/package.json last held — every release since republished
-        # that stale version and the auto-updater never advanced (users stuck on
-        # an old build seeing "up to date"). Make the pushed tag authoritative so
-        # the two can never desync again.
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
-      - name: Build + sign + notarize (no publish)
+      - name: Build, sign, and notarize
         working-directory: apps/desktop
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          # electron-builder >=25's built-in notarize step reads this
-          # specific env var name (not APPLE_APP_PASSWORD). Same value;
-          # both are exported so the custom afterSign hook AND the
-          # built-in step both find what they need.
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # `release` uses --publish never so the afterAllArtifactBuild
-        # hook can notarize + staple each .dmg *before* upload. With
-        # --publish always (the previous setup), electron-builder
-        # uploaded each artifact as it was built — i.e. before the
-        # DMG-level staple landed — and the published DMGs went out
-        # unstapled. On fresh Macs Gatekeeper rejects those as
-        # "damaged" even though the .app inside is notarized.
         run: npm run release
 
-      - name: Verify mac release assets and updater feed
-        run: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "${GITHUB_REF_NAME#v}"
-
-      - name: Upload stapled artifacts to GitHub Release
-        working-directory: apps/desktop
+      - name: Verify macOS release assets and updater feed
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # The build step above leaves notarized + stapled DMGs, signed
-        # ZIPs, blockmaps, and latest-mac.yml in apps/desktop/release/.
-        # --clobber lets a re-run of the same tag replace existing
-        # assets without manual cleanup.
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Desktop releases must run from a semver tag like v0.4.23, not '$tag'."
-            exit 1
-          fi
-          echo "Uploading artifacts for tag $tag"
-          ls -la release/
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "$tag" --generate-notes
-          fi
-          gh release upload "$tag" \
-            release/Clementine-*.dmg \
-            release/Clementine-*.dmg.blockmap \
-            release/Clementine-*-mac.zip \
-            release/Clementine-*-mac.zip.blockmap \
-            release/latest-mac.yml \
-            --clobber
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: node scripts/verify-desktop-release-assets.mjs --dir apps/desktop/release --version "$VERSION"
+
+      - name: Upload private macOS build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clementine-macos-${{ needs.preflight.outputs.version }}
+          path: |
+            apps/desktop/release/Clementine-*.dmg
+            apps/desktop/release/Clementine-*.dmg.blockmap
+            apps/desktop/release/Clementine-*-mac.zip
+            apps/desktop/release/Clementine-*-mac.zip.blockmap
+            apps/desktop/release/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 14
 
   release-windows:
+    name: Build Windows artifacts
+    needs: preflight
     runs-on: windows-latest
-    # Mac-only releases: put `[mac-only]` in the tagged commit's message to skip
-    # the Windows build for that release (the tag name is the version, so it
-    # can't carry the marker without breaking semver). Fails open — an absent
-    # head_commit just builds Windows as normal.
-    if: ${{ !contains(github.event.head_commit.message, '[mac-only]') }}
-    permissions:
-      contents: write
+    # Manual runs are macOS candidates. For a tag, [mac-only] on the tagged
+    # commit intentionally skips Windows.
+    if: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, '[mac-only]') }}
 
     steps:
       - name: Checkout
@@ -178,61 +238,139 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install daemon deps
+      - name: Install daemon dependencies
         run: npm ci
 
-      - name: Install desktop deps
+      - name: Install desktop dependencies
         working-directory: apps/desktop
         run: npm ci
 
-      - name: Install mobile-web deps
+      - name: Install mobile-web dependencies
         working-directory: apps/mobile-web
         run: npm ci
 
-      - name: Install console-web deps
+      - name: Install console-web dependencies
         working-directory: apps/console-web
         run: npm ci
 
-      - name: Sync daemon version from the pushed tag
+      - name: Sync daemon version
         shell: bash
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
-      - name: Sync app version from the pushed tag
+      - name: Sync app version
         working-directory: apps/desktop
         shell: bash
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Build Windows installer
         working-directory: apps/desktop
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Optional: set these repository secrets to ship a signed Windows
-          # installer. When absent, electron-builder produces an unsigned
-          # internal/testable NSIS build.
           CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
         run: npm run package:win
 
-      - name: Upload Windows artifacts to GitHub Release
-        working-directory: apps/desktop
+      - name: Upload private Windows build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clementine-windows-${{ needs.preflight.outputs.version }}
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.exe.blockmap
+            apps/desktop/release/latest.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish production GitHub Release
+    needs:
+      - preflight
+      - release-mac
+      - release-windows
+    runs-on: ubuntu-latest
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'push' &&
+        needs.preflight.result == 'success' &&
+        needs.release-mac.result == 'success' &&
+        (needs.release-windows.result == 'success' || needs.release-windows.result == 'skipped')
+      }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout tags
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: clementine-macos-${{ needs.preflight.outputs.version }}
+          path: release-assets
+
+      - name: Download Windows artifacts
+        if: ${{ needs.release-windows.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: clementine-windows-${{ needs.preflight.outputs.version }}
+          path: release-assets
+
+      - name: Create draft, upload assets, and publish atomically
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Desktop releases must run from a semver tag like v0.4.23, not '$tag'."
-            exit 1
-          fi
           shopt -s nullglob
-          assets=(release/*.exe release/*.exe.blockmap release/latest.yml)
+
+          assets=(release-assets/*)
           if (( ${#assets[@]} == 0 )); then
-            echo "::error::No Windows release assets found in apps/desktop/release"
-            ls -la release || true
+            echo "::error::No production release assets were downloaded."
             exit 1
           fi
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "$tag" --generate-notes
+
+          # A release is "latest" only when its tag is the highest stable SemVer
+          # in the repository. An older workflow finishing later therefore cannot
+          # replace a newer stable release as latest.
+          newest_stable_tag="$(node <<'NODE'
+          const { execFileSync } = require('node:child_process');
+          const stable = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+          const tags = execFileSync('git', ['tag', '--list', 'v*'], { encoding: 'utf8' })
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((tag) => ({ tag, match: tag.match(stable) }))
+            .filter(({ match }) => match)
+            .sort((a, b) => {
+              for (let index = 1; index <= 3; index += 1) {
+                const difference = BigInt(a.match[index]) - BigInt(b.match[index]);
+                if (difference < 0n) return -1;
+                if (difference > 0n) return 1;
+              }
+              return 0;
+            });
+          process.stdout.write(tags.at(-1)?.tag ?? '');
+          NODE
+          )"
+
+          mark_latest=false
+          if [[ "$RELEASE_TAG" == "$newest_stable_tag" ]]; then
+            mark_latest=true
           fi
-          gh release upload "$tag" "${assets[@]}" --clobber
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --draft \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
+
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest="$mark_latest"

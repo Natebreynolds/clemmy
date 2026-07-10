@@ -1,116 +1,289 @@
 #!/usr/bin/env bash
-# Hot-patch the installed /Applications/Clementine.app daemon dist with
-# your locally built changes, so you can test in-tree work without
-# tagging or shipping a release.
+# Build the daemon, patch a staged copy of Clementine.app, sign + notarize it,
+# then promote that exact validated bundle into /Applications.
 #
-# Per memory/feedback_clemmy_desktop_patch.md — this is the documented
-# fast loop for fixing the installed app without re-cutting a DMG.
+# The canonical app is never edited in place. A failure before promotion leaves
+# it untouched; a failure after promotion restores the complete previous app.
+# This is intentionally slower than a raw rsync because a modified macOS bundle
+# is not launchable until its new resource seal has been notarized and stapled.
 #
-# STRATEGY (since 2026-06-11): full `rsync --delete` of dist/ — NOT a
-# curated file list. The curated list failed in production: it copied a
-# new brackets.js whose import (runtime/harness/grounding-gate.js) was
-# not on the list → ERR_MODULE_NOT_FOUND → daemon crash-loop. A file
-# list can never track the import graph; syncing the whole tree can.
-# dist/ is pure tsc-emitted JS, byte-portable across architectures, so
-# a full sync is always safe. --delete removes orphaned modules from
-# superseded releases (leaving them creates mixed-state bundles).
-#
-# Scope: syncs the daemon dist/ ONLY. Does NOT touch:
-#   - the Electron main process (apps/desktop, app.asar)
-#   - native modules (better-sqlite3, keytar) — NEVER sync node_modules
-#     wholesale: the app's Electron is x86_64; local builds are arm64.
-#     Clobbering a native .node = ERR_DLOPEN_FAILED crash-loop (see
-#     memory/project_hotpatch_arch_footgun.md).
-#   - signing / notarization metadata
-#
-# A full timestamped backup of the previous installed dist is written
-# to /tmp first; the revert command is printed at the end.
+# Scope: daemon dist, the daemon package version, and the approved pure-JS
+# @openai/agents* + zod packages. Desktop app.asar and native modules are not
+# rebuilt or replaced.
 
 set -euo pipefail
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALLED_DIST="/Applications/Clementine.app/Contents/Resources/daemon/dist"
+INSTALLED_APP="${CLEMENTINE_APP_PATH:-/Applications/Clementine.app}"
+APP_DIR="$(dirname "$INSTALLED_APP")"
+APP_NAME="$(basename "$INSTALLED_APP")"
+INSTALLED_DIST="$INSTALLED_APP/Contents/Resources/daemon/dist"
+ENTITLEMENTS="$REPO_ROOT/apps/desktop/build/entitlements.mac.plist"
+NOTARY_PROFILE="${CLEMENTINE_NOTARY_PROFILE:-ClementineNotary}"
+LOCK_DIR="${TMPDIR:-/tmp}/clementine-hotpatch.lock"
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "Hotpatch already running (lock: $LOCK_DIR)"
+  exit 1
+fi
+
+BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/clemmy-hotpatch.XXXXXX")"
+STAGED_APP="$APP_DIR/.${APP_NAME%.app}-hotpatch-$$.app"
+PREVIOUS_APP="$BACKUP/$APP_NAME"
+FAILED_APP="$BACKUP/${APP_NAME%.app}-failed.app"
+ARCHIVE="$BACKUP/notary-upload.zip"
+NOTARY_RESULT="$BACKUP/notary-result.json"
+OLD_MOVED=0
+PROMOTED=0
+
+stop_installed_app() {
+  killall Clementine 2>/dev/null || true
+  for _ in {1..20}; do
+    if ! pgrep -f "^${INSTALLED_APP}/Contents/" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  pkill -KILL -f "^${INSTALLED_APP}/Contents/" 2>/dev/null || true
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT INT TERM
+
+  if (( rc != 0 )); then
+    if (( PROMOTED == 1 )); then
+      echo
+      echo "Hotpatch failed after promotion; restoring the previous complete app..."
+      stop_installed_app
+      if [[ -d "$INSTALLED_APP" ]]; then mv "$INSTALLED_APP" "$FAILED_APP" || true; fi
+      if [[ -d "$PREVIOUS_APP" ]]; then mv "$PREVIOUS_APP" "$INSTALLED_APP" || true; fi
+      open -n "$INSTALLED_APP" 2>/dev/null || true
+    elif (( OLD_MOVED == 1 )) && [[ ! -d "$INSTALLED_APP" ]] && [[ -d "$PREVIOUS_APP" ]]; then
+      mv "$PREVIOUS_APP" "$INSTALLED_APP" || true
+    fi
+  fi
+
+  rm -rf "$STAGED_APP"
+  rm -f "$ARCHIVE"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+
+for command in node npm rsync security codesign ditto xcrun spctl curl; do
+  command -v "$command" >/dev/null 2>&1 || { echo "Missing required command: $command"; exit 1; }
+done
 
 if [[ ! -d "$INSTALLED_DIST" ]]; then
-  echo "✗ $INSTALLED_DIST not found"
-  echo "  Is Clementine installed at /Applications/Clementine.app?"
+  echo "$INSTALLED_DIST not found"
+  echo "Install Clementine at $INSTALLED_APP first."
+  exit 1
+fi
+if [[ ! -f "$ENTITLEMENTS" ]]; then
+  echo "Missing desktop entitlements: $ENTITLEMENTS"
+  exit 1
+fi
+if [[ ! -w "$APP_DIR" ]]; then
+  echo "$APP_DIR is not writable by the current user."
+  echo "Repair Clementine ownership from the app's updater menu, then retry."
   exit 1
 fi
 
-# Bundle must be user-writable. If it isn't, the dashboard's "Repair
-# ownership & enable updates" flow handles that — direct user there.
-if [[ ! -w "$INSTALLED_DIST" ]]; then
-  echo "✗ $INSTALLED_DIST is not writable by you"
-  echo "  Open Clementine → tray menu → Repair ownership & enable updates"
-  echo "  then re-run this script."
+IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+  | sed -nE 's/^[[:space:]]*[0-9]+\) [0-9A-F]+ "([^"]*Developer ID Application[^"]*)".*/\1/p' \
+  | head -n 1 || true)"
+if [[ -z "$IDENTITY" ]]; then
+  echo "No Developer ID Application signing identity was found in Keychain."
+  exit 1
+fi
+TEAM_ID="$(printf '%s\n' "$IDENTITY" | sed -nE 's/.*\(([A-Z0-9]{10})\)$/\1/p')"
+if [[ -z "$TEAM_ID" ]]; then
+  echo "Could not derive the Apple team id from signing identity: $IDENTITY"
+  exit 1
+fi
+if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" --output-format json >/dev/null 2>&1; then
+  echo "Missing or invalid notarytool Keychain profile: $NOTARY_PROFILE"
+  echo "Create it once with: xcrun notarytool store-credentials \"$NOTARY_PROFILE\""
   exit 1
 fi
 
-# Make sure the local dist is freshly built so we don't ship stale JS.
-if [[ ! -f "$REPO_ROOT/dist/index.js" ]] || \
-   [[ -n "$(find "$REPO_ROOT/src" -name '*.ts' -newer "$REPO_ROOT/dist/index.js" -print -quit 2>/dev/null)" ]]; then
-  echo "→ Local dist is missing or stale — rebuilding..."
-  (cd "$REPO_ROOT" && npm run build) | tail -3
+echo "-> Building fresh daemon dist"
+(cd "$REPO_ROOT" && npm run build) | tail -n 4
+
+LOCAL_VERSION="$(node -p "require('$REPO_ROOT/package.json').version")"
+echo "-> Stopping the installed app before cloning its signed bundle"
+stop_installed_app
+
+echo "-> Verifying the source app"
+codesign --verify --deep --strict --verbose=1 "$INSTALLED_APP"
+spctl --assess --type execute --verbose=4 "$INSTALLED_APP"
+
+echo "-> Cloning the complete app into a private staging path"
+rm -rf "$STAGED_APP"
+if ! cp -cR "$INSTALLED_APP" "$STAGED_APP" 2>/dev/null; then
+  rm -rf "$STAGED_APP"
+  ditto "$INSTALLED_APP" "$STAGED_APP"
 fi
 
-# Full backup of the installed dist so any problem is a one-command revert.
-BACKUP="/tmp/clemmy-hotpatch-$(date +%Y%m%d-%H%M%S)"
-echo "→ Backing up installed dist to $BACKUP/dist"
-mkdir -p "$BACKUP"
-cp -R "$INSTALLED_DIST" "$BACKUP/dist"
+STAGED_DAEMON="$STAGED_APP/Contents/Resources/daemon"
+STAGED_DIST="$STAGED_DAEMON/dist"
+STAGED_NM="$STAGED_DAEMON/node_modules"
 
-# Full sync: copy changed/new files, delete orphans, skip junk.
-echo "→ Syncing full dist (rsync --delete):"
-CHANGES=$(rsync -a --delete --exclude='.DS_Store' --itemize-changes \
-  "$REPO_ROOT/dist/" "$INSTALLED_DIST/" | tee /tmp/clemmy-hotpatch-last-sync.log | wc -l | tr -d ' ')
-echo "  ✓ $CHANGES file(s) changed/removed (details: /tmp/clemmy-hotpatch-last-sync.log)"
+echo "-> Syncing daemon dist into the staged app"
+CHANGES="$(rsync -a --delete --exclude='.DS_Store' --itemize-changes \
+  "$REPO_ROOT/dist/" "$STAGED_DIST/" \
+  | tee "$BACKUP/rsync.log" | wc -l | tr -d ' ')"
+echo "   $CHANGES dist file(s) changed or removed"
 
-# Sync @openai/agents* + zod packages to the installed app's
-# node_modules ONLY when the version differs (these are pure-JS
-# packages — never native modules). SDK 0.11.5 needs zod 4 in lockstep
-# with the built dist; a zod-4-built daemon on zod 3 crashes during
-# agents-core schema handling.
-INSTALLED_NM="$(dirname "$INSTALLED_DIST")/node_modules"
-echo
-echo "→ Checking @openai/agents* + zod package sync"
+# Keep the daemon's runtime banner honest without pretending the unchanged
+# Electron shell was rebuilt. Only the daemon package metadata is updated.
+node - "$STAGED_DAEMON/package.json" "$LOCAL_VERSION" <<'NODE'
+const fs = require('node:fs');
+const [file, version] = process.argv.slice(2);
+const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+pkg.version = version;
+fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);
+NODE
+
+echo "-> Syncing approved pure-JS runtime packages when versions differ"
+SYNCED_PACKAGE_DIRS=()
 for pkg in @openai/agents @openai/agents-core @openai/agents-openai @openai/agents-realtime zod; do
   local_pkg="$REPO_ROOT/node_modules/$pkg"
-  installed_pkg="$INSTALLED_NM/$pkg"
-  if [[ ! -d "$local_pkg" ]]; then continue; fi
-  local_v=$(node -e "try{console.log(require('$local_pkg/package.json').version)}catch{}" 2>/dev/null)
-  installed_v=$(node -e "try{console.log(require('$installed_pkg/package.json').version)}catch{}" 2>/dev/null)
-  if [[ "$local_v" != "$installed_v" && -n "$local_v" ]]; then
-    [[ -d "$installed_pkg" ]] && rm -rf "$installed_pkg"
-    cp -R "$local_pkg" "$installed_pkg"
-    echo "  ✓ $pkg → $local_v (was $installed_v)"
+  staged_pkg="$STAGED_NM/$pkg"
+  [[ -d "$local_pkg" ]] || continue
+  local_v="$(node -e "try{console.log(require('$local_pkg/package.json').version)}catch{}" 2>/dev/null)"
+  staged_v="$(node -e "try{console.log(require('$staged_pkg/package.json').version)}catch{}" 2>/dev/null)"
+  if [[ -n "$local_v" && "$local_v" != "$staged_v" ]]; then
+    mkdir -p "$(dirname "$staged_pkg")"
+    rsync -a --delete "$local_pkg/" "$staged_pkg/"
+    echo "   $pkg -> $local_v (was ${staged_v:-missing})"
   else
-    echo "  · $pkg already at $local_v (no copy)"
+    echo "   $pkg already at $local_v"
+  fi
+  SYNCED_PACKAGE_DIRS+=("$staged_pkg")
+done
+
+# These package syncs are allowed only because they are portable JS. A newly
+# introduced native executable would require the full desktop packaging path.
+for package_dir in "${SYNCED_PACKAGE_DIRS[@]}"; do
+  if [[ -d "$package_dir" ]] && find "$package_dir" -type f -print0 \
+    | xargs -0 file 2>/dev/null | grep 'Mach-O' > "$BACKUP/macho-scan"; then
+    echo "Refusing hotpatch: a synced package contains a Mach-O binary: $package_dir"
+    exit 1
   fi
 done
 
-echo
-echo "──────────────────────────────────────────────────────────────"
-echo "Patch applied. Next steps:"
-echo
-echo "  1. killall Clementine && open -a Clementine"
-echo "  2. Wait ~20-90s, then verify: curl -s -o /dev/null -w '%{http_code}' http://localhost:8520/"
-echo "     (404 = healthy; the daemon auth-gates everything else)"
-echo "  3. Tail ~/.clementine-next/logs/desktop/supervisor.log if it doesn't come up."
-echo
-echo "Revert if anything goes sideways:"
-echo "  rsync -a --delete \"$BACKUP/dist/\" \"$INSTALLED_DIST/\""
-echo "  killall Clementine && open -a Clementine"
-echo "──────────────────────────────────────────────────────────────"
+echo "-> Signing the staged app with hardened runtime"
+codesign --force \
+  --sign "$IDENTITY" \
+  --options runtime \
+  --timestamp \
+  --entitlements "$ENTITLEMENTS" \
+  "$STAGED_APP"
 
-# Re-sign with the local Developer ID so the app keeps a STABLE identity across
-# hotpatches — rsync into the bundle breaks the shipped signature, and macOS
-# TCC re-prompts "access data from other apps" on EVERY relaunch of an
-# identity-less app (recurring popup, 2026-07-07/08). With a stable Developer
-# ID signature the user's Allow sticks. No-op if the cert is absent.
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application: Nathan Reynolds"; then
-  codesign --force --deep --preserve-metadata=entitlements \
-    --sign "Developer ID Application: Nathan Reynolds (4AR3Y8XD72)" \
-    /Applications/Clementine.app >/dev/null 2>&1 \
-    && echo "  ✓ re-signed (stable identity — TCC grant persists)" \
-    || echo "  ⚠ re-sign failed (popup may recur until a signed release installs)"
+RUNTIME_BINARIES=(
+  "$STAGED_APP/Contents/MacOS/Clementine"
+  "$STAGED_APP/Contents/Frameworks/Clementine Helper.app/Contents/MacOS/Clementine Helper"
+  "$STAGED_APP/Contents/Frameworks/Clementine Helper (GPU).app/Contents/MacOS/Clementine Helper (GPU)"
+  "$STAGED_APP/Contents/Frameworks/Clementine Helper (Plugin).app/Contents/MacOS/Clementine Helper (Plugin)"
+  "$STAGED_APP/Contents/Frameworks/Clementine Helper (Renderer).app/Contents/MacOS/Clementine Helper (Renderer)"
+  "$STAGED_APP/Contents/Frameworks/Electron Framework.framework/Versions/Current/Helpers/chrome_crashpad_handler"
+)
+for binary in "${RUNTIME_BINARIES[@]}"; do
+  [[ -e "$binary" ]] || { echo "Missing signed runtime binary: $binary"; exit 1; }
+  signature_details="$(codesign -dvv "$binary" 2>&1)"
+  [[ "$signature_details" == *"flags="*"runtime"* ]] \
+    || { echo "Hardened runtime missing: $binary"; exit 1; }
+done
+signature_details="$(codesign -dvvv "$STAGED_APP" 2>&1)"
+[[ "$signature_details" == *"TeamIdentifier=$TEAM_ID"* ]] \
+  || { echo "Unexpected signing team on staged app"; exit 1; }
+codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+
+echo "-> Archiving and submitting to Apple notarization (this can take several minutes)"
+ditto -c -k --keepParent "$STAGED_APP" "$ARCHIVE"
+xcrun notarytool submit "$ARCHIVE" \
+  --keychain-profile "$NOTARY_PROFILE" \
+  --wait \
+  --timeout 30m \
+  --output-format json > "$NOTARY_RESULT"
+
+NOTARY_STATUS="$(node -e "const d=require('$NOTARY_RESULT'); console.log(d.status || '')")"
+SUBMISSION_ID="$(node -e "const d=require('$NOTARY_RESULT'); console.log(d.id || '')")"
+if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
+  [[ -n "$SUBMISSION_ID" ]] \
+    && xcrun notarytool log "$SUBMISSION_ID" "$BACKUP/notary-log.json" \
+      --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 || true
+  echo "Apple notarization did not accept the staged app (status: ${NOTARY_STATUS:-unknown})."
+  echo "Submission diagnostics: $BACKUP/notary-log.json"
+  exit 1
 fi
+
+echo "-> Stapling and validating the accepted app"
+xcrun stapler staple "$STAGED_APP"
+xcrun stapler validate "$STAGED_APP"
+codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+spctl --assess --type execute --verbose=4 "$STAGED_APP"
+if command -v syspolicy_check >/dev/null 2>&1; then
+  syspolicy_check distribution "$STAGED_APP"
+fi
+
+# Exercise the exact packaged CLI discovery module from the packaged daemon cwd.
+# It must remain stat-only and leave the signed bundle byte-identical.
+echo "-> Exercising packaged CLI discovery without executing PATH binaries"
+(
+  cd "$STAGED_DAEMON"
+  ELECTRON_RUN_AS_NODE=1 "$STAGED_APP/Contents/MacOS/Clementine" \
+    --input-type=module \
+    -e "const m=await import('./dist/runtime/cli-discovery.js'); await m.fullScan({concurrency:1});"
+)
+codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+
+echo "-> Promoting the exact validated staged inode"
+mv "$INSTALLED_APP" "$PREVIOUS_APP"
+OLD_MOVED=1
+if ! mv "$STAGED_APP" "$INSTALLED_APP"; then
+  mv "$PREVIOUS_APP" "$INSTALLED_APP"
+  OLD_MOVED=0
+  exit 1
+fi
+PROMOTED=1
+
+xcrun stapler validate "$INSTALLED_APP"
+codesign --verify --deep --strict --verbose=2 "$INSTALLED_APP"
+spctl --assess --type execute --verbose=4 "$INSTALLED_APP"
+
+echo "-> Launching the promoted app and waiting for daemon health"
+open -n "$INSTALLED_APP"
+HEALTHY=0
+for i in {1..36}; do
+  code="$(curl -sS -o "$BACKUP/health-body" -w '%{http_code}' --max-time 2 \
+    http://127.0.0.1:8520/api/status 2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "   daemon healthy after $((i * 5))s"
+    HEALTHY=1
+    break
+  fi
+  sleep 5
+done
+if (( HEALTHY == 0 )); then
+  echo "Promoted daemon did not become healthy within 180 seconds."
+  exit 1
+fi
+
+# Final launch-time assessment. The previous fullScan implementation mutated
+# the app after signing; this must remain green after the packaged probe + boot.
+codesign --verify --deep --strict --verbose=2 "$INSTALLED_APP"
+spctl --assess --type execute --verbose=4 "$INSTALLED_APP"
+
+echo
+echo "Hotpatch complete: daemon code v$LOCAL_VERSION is running."
+echo "Previous complete app retained at: $PREVIOUS_APP"
+echo "Diagnostics retained at: $BACKUP"
+echo
+echo "Revert:"
+echo "  killall Clementine"
+echo "  mv \"$INSTALLED_APP\" \"$FAILED_APP\""
+echo "  mv \"$PREVIOUS_APP\" \"$INSTALLED_APP\""
+echo "  open -n \"$INSTALLED_APP\""

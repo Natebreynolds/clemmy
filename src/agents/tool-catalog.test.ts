@@ -77,6 +77,13 @@ test('resolveHotSet respects an allowedNames policy', () => {
   assert.deepEqual([...hot], ['read_file']); // mandated tools excluded by policy
 });
 
+test('resolveHotSet makes an explicitly named tool first-class without prior LRU state', () => {
+  _resetHotSetForTest();
+  const hot = resolveHotSet('sess-hotset-literal', 'Call task_hygiene now and report its exact result.');
+  assert.ok(hot.has('task_hygiene'));
+  assert.ok(!getHotSet('sess-hotset-literal').includes('task_hygiene'), 'literal promotion is turn-scoped, not persisted');
+});
+
 // ── ranking (lexical fallback path, embeddings off in tests) ───────────────────
 
 test('rankCatalog ranks an on-topic tool above an unrelated one', async () => {

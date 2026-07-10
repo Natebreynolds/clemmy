@@ -58,6 +58,9 @@ export interface ClementineMcpServerOptions {
   workflowRunId?: string;
   workflowName?: string;
   stepId?: string;
+  /** Internal surface introspection. Called for every tool this server build
+   * attempts to register, after feature gates have been evaluated. */
+  onToolRegistered?: (name: string) => void;
 }
 
 function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
@@ -103,14 +106,18 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
 // NOT shrink the schema payload — verified against the SDK). Unset (default) → no
 // filtering, every tool registers exactly as before (byte-identical). Installed
 // AFTER the ambient-context wrap so it's the OUTERMOST check (skips before wrapping).
-function installToolAllowlistFilter(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
+function resolvedToolAllowlist(opts: ClementineMcpServerOptions = {}): string[] {
   const fromOptions = opts.allowedTools?.map((s) => s.trim()).filter(Boolean);
   const raw = process.env.CLEMENTINE_MCP_ALLOWED_TOOLS?.trim();
-  const allowlist = fromOptions && fromOptions.length > 0
+  return fromOptions && fromOptions.length > 0
     ? fromOptions
     : raw
       ? raw.split(',').map((s) => s.trim()).filter(Boolean)
       : [];
+}
+
+function installToolAllowlistFilter(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
+  const allowlist = resolvedToolAllowlist(opts);
   if (allowlist.length === 0) return;
   const allowed = new Set(allowlist);
   // Floor: a health tool that must always exist so the surface is never empty.
@@ -125,12 +132,22 @@ function installToolAllowlistFilter(server: McpServer, opts: ClementineMcpServer
   };
 }
 
+function installToolRegistrationObserver(server: McpServer, observer?: (name: string) => void): void {
+  if (!observer) return;
+  const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
+  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+    if (typeof args[0] === 'string') observer(args[0]);
+    return wrapped(...args);
+  };
+}
+
 export function createClementineMcpServer(opts: ClementineMcpServerOptions = {}): McpServer {
   ensureToolDirectories();
   const server = new McpServer({ name: 'clementine-next-tools', version: '0.3.0' });
 
   installAmbientToolContext(server, opts);
   installToolAllowlistFilter(server, opts);
+  installToolRegistrationObserver(server, opts.onToolRegistered);
 
   registerMemoryTools(server);
   registerFocusTools(server);
@@ -168,7 +185,10 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerWorkspaceArtifactTools(server);
   // Schema-on-demand discovery entry — read-only search over the built-in tool
   // catalog (SCHEMA-ON-DEMAND-PLAN-2026-07-07). Additive + dormant in Phase 0.
-  registerToolSearchTool(server);
+  const scopedToolNames = resolvedToolAllowlist(opts);
+  registerToolSearchTool(server, {
+    allowedNames: scopedToolNames.length > 0 ? new Set(scopedToolNames) : undefined,
+  });
   registerDynamicTools(server);
   // Agent SDK lane only: expose the mutating tools (shell/composio/write) through
   // the full harness gate chain so the Claude Agent SDK can execute them safely.
@@ -200,6 +220,19 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
 
   server.tool('ping', 'Basic health-check tool for the local MCP server.', {}, async () => textResult('pong'));
   return server;
+}
+
+/** Build the same feature-gated server used by the in-process Claude lane and
+ * return its registered names. This prevents JIT from maintaining a parallel
+ * approximation of the MCP capability surface. */
+export function listClementineMcpToolNames(opts: { gatedMutations?: boolean } = {}): string[] {
+  const names = new Set<string>();
+  createClementineMcpServer({
+    sessionId: '__mcp_surface_introspection__',
+    gatedMutations: opts.gatedMutations,
+    onToolRegistered: (name) => names.add(name),
+  });
+  return [...names];
 }
 
 function registerPluginTool(server: McpServer, tool: PluginTool): void {

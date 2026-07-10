@@ -36,9 +36,7 @@ exports.default = async function notarizing(context) {
   const teamId = process.env.APPLE_TEAM_ID;
 
   if (!appleId || !applePassword || !teamId) {
-    console.warn('  [notarize] missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID — skipping notarization.');
-    console.warn('  [notarize] Build will produce a signed-but-NOT-notarized .app — Gatekeeper will warn on first launch.');
-    return;
+    throw new Error('[notarize] missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID; set APPLE_NOTARIZE_SKIP=true only for an explicit unsigned developer build');
   }
 
   // Lazy-require so dev installs without @electron/notarize don't break

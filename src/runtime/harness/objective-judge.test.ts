@@ -27,6 +27,15 @@ test('gate: skips concrete successful tool-backed completions instead of re-runn
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, meaningfulToolEvidence: true }), false);
 });
 
+test('gate: one successful mutation does not certify a multi-result objective', () => {
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    actionIntent: true,
+    meaningfulToolEvidence: true,
+    multiResultObjective: true,
+  }), true);
+});
+
 test('gate: does NOT fire for a trivial non-action lookup', () => {
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false }), false);
 });

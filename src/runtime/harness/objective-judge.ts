@@ -90,6 +90,8 @@ export interface ObjectiveJudgeGateInput {
   actionIntent: boolean;
   /** Tool calls made across the whole conversation so far. */
   meaningfulToolEvidence: boolean;
+  /** A batch/compound objective cannot be certified by one successful tool. */
+  multiResultObjective?: boolean;
   /** Independent judge continuations already spent this turn. */
   continuationsUsed: number;
   /** Hard cap on judge continuations. */
@@ -135,7 +137,8 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
     input.nextAction === 'completed' &&
     !input.openApprovalCard &&
     input.continuationsUsed < input.maxContinuations &&
-    (Boolean(input.promiseShaped) || (input.actionIntent && !input.meaningfulToolEvidence))
+    (Boolean(input.promiseShaped)
+      || (input.actionIntent && (!input.meaningfulToolEvidence || Boolean(input.multiResultObjective))))
   );
 }
 

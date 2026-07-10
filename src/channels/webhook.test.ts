@@ -87,3 +87,15 @@ test('/api/message session resolver accepts snake_case and camelCase ids', () =>
     { sessionId: 'webhook:user-camel', userId: 'user-camel' },
   );
 });
+
+test('dashboard session cookie survives daemon restart without exposing the webhook secret', () => {
+  const secret = 'desktop-webhook-secret-for-restart-proof';
+  const firstBoot = __test__.deriveDashboardSessionToken(secret);
+  const secondBoot = __test__.deriveDashboardSessionToken(secret);
+  const rotatedSecretBoot = __test__.deriveDashboardSessionToken(`${secret}-rotated`);
+
+  assert.equal(secondBoot, firstBoot, 'same installation secret preserves the cookie across process restarts');
+  assert.notEqual(rotatedSecretBoot, firstBoot, 'rotating the webhook secret invalidates the prior cookie');
+  assert.notEqual(firstBoot, secret, 'the bearer secret itself is never stored in the cookie');
+  assert.match(firstBoot, /^[A-Za-z0-9_-]{43}$/);
+});

@@ -17,7 +17,7 @@
 import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
-import { TOOL_JIT_MANDATED, recallPinnedBuiltinTools } from './tool-jit.js';
+import { TOOL_JIT_MANDATED, queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
 
@@ -60,6 +60,7 @@ export function buildToolCatalog(opts: { allowedNames?: ReadonlySet<string> } = 
  * The hot set for this turn: tools that get a FIRST-CLASS schema instead of living
  * behind tool_search. Union of
  *   - TOOL_JIT_MANDATED (the structural CORE seed — always first-class),
+ *   - exact tool names present in the user's request,
  *   - tool_choice_recall pins for this input (memory says these worked before), and
  *   - the session LRU (tools this session already reached for),
  * intersected with policy-allowed (defaults to the whole registry). Only names that
@@ -76,6 +77,9 @@ export function resolveHotSet(
 
   const out = new Set<string>();
   for (const name of TOOL_JIT_MANDATED) if (keep(name)) out.add(name);
+  for (const name of universe) {
+    if (keep(name) && queryExplicitlyNamesTool(userInput ?? '', name)) out.add(name);
+  }
   for (const name of recallPinnedBuiltinTools(userInput)) if (keep(name)) out.add(name);
   for (const name of getHotSet(sessionId)) if (keep(name)) out.add(name);
   return out;

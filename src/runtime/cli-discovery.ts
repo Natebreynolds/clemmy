@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { BASE_DIR } from '../config.js';
@@ -8,8 +9,7 @@ import { augmentPath } from './spawn-env.js';
  * Local CLI discovery. Two operations, both global:
  *
  *   - scanPath()  → walks every directory on $PATH and lists executable
- *                   files. No curated allowlist. Whatever's on the user's
- *                   machine is what we surface.
+ *                   files using file metadata only. No executable is run.
  *
  *   - probe(cmd)  → runs `<cmd> --version` and `<cmd> --help` and returns
  *                   the head of each. Lets the caller confirm "yes this
@@ -34,7 +34,7 @@ export interface CliEntry {
   command: string;
   /** Absolute path to the binary. */
   path: string;
-  /** Whether `<cmd> --version` or `<cmd> --help` returned cleanly. */
+  /** Whether the executable has enough evidence to surface as a CLI. */
   isLikelyCli: boolean;
   /** Trimmed first lines of `<cmd> --version` output, if any. */
   version?: string;
@@ -47,7 +47,7 @@ export interface CliEntry {
 export interface CliScanResult {
   /** All executables found on $PATH, by basename. Pre-probe. */
   detected: { command: string; path: string }[];
-  /** Subset that responded to --version or --help. Post-probe. */
+  /** Executable CLI inventory. Probe metadata is present only after an explicit probe. */
   clis: CliEntry[];
   /** ISO8601 timestamp when the scan finished. */
   scannedAt: string;
@@ -157,10 +157,11 @@ export function scanPath(): { command: string; path: string }[] {
  * timed out, or errored. We don't distinguish — for probing, we just
  * want to know "did it respond like a CLI."
  */
-function runQuick(command: string, args: string[], timeoutMs = 2000): Promise<string | undefined> {
+function runQuick(command: string, args: string[], cwd: string, timeoutMs = 2000): Promise<string | undefined> {
   return new Promise((resolve) => {
     let settled = false;
     const child = spawn(command, args, {
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       // No shell — direct exec is faster and avoids shell-injection surface.
     });
@@ -486,8 +487,20 @@ export async function probe(command: string, candidatePath?: string): Promise<Cl
     };
   }
 
-  const versionOut = await runQuick(safe.command, ['--version']);
-  const helpOut = versionOut ? undefined : await runQuick(safe.command, ['--help']);
+  // Some otherwise harmless-looking CLIs write relative files during
+  // --version/--help. Never let an explicit probe inherit the daemon cwd:
+  // packaged desktop builds run from inside the signed application bundle.
+  const scratchCwd = mkdtempSync(path.join(os.tmpdir(), 'clementine-cli-probe-'));
+
+  let versionOut: string | undefined;
+  let helpOut: string | undefined;
+  try {
+    chmodSync(scratchCwd, 0o700);
+    versionOut = await runQuick(safe.command, ['--version'], scratchCwd);
+    helpOut = versionOut ? undefined : await runQuick(safe.command, ['--help'], scratchCwd);
+  } finally {
+    rmSync(scratchCwd, { recursive: true, force: true });
+  }
 
   const version = headLines(versionOut ?? '', 2);
   const helpHead = headLines(helpOut ?? '', 4);
@@ -519,29 +532,20 @@ function whichOnPath(command: string): string | undefined {
 }
 
 /**
- * Full scan: walk $PATH, then probe each binary in bounded-concurrency
- * batches so we don't fork 200 children at once. Returns the result
- * AND writes it to the cache so the dashboard has fresh data.
+ * Full scan: walk $PATH using file metadata only. Boot discovery must never
+ * execute arbitrary binaries: besides being slow, even --version/--help can
+ * have side effects. Explicit probe(command) is the only execution path.
+ *
+ * The legacy concurrency option remains accepted for API compatibility.
  */
 export async function fullScan(opts: { concurrency?: number } = {}): Promise<CliScanResult> {
-  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 6, 16));
+  void opts;
   const detected = scanPath();
-  const clis: CliEntry[] = [];
-
-  let i = 0;
-  async function worker(): Promise<void> {
-    while (true) {
-      const idx = i;
-      i += 1;
-      if (idx >= detected.length) return;
-      const { command, path: p } = detected[idx];
-      const entry = await probe(command, p).catch(() => null);
-      if (entry && entry.isLikelyCli) clis.push(entry);
-    }
-  }
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
-
-  clis.sort((a, b) => a.command.localeCompare(b.command));
+  const clis: CliEntry[] = detected.flatMap(({ command, path: executablePath }) => {
+    const safe = resolveSafeCliProbe(command, executablePath);
+    if (safe.skipped) return [];
+    return [{ command, path: safe.path, isLikelyCli: true }];
+  });
 
   const result: CliScanResult = {
     detected,

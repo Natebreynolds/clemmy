@@ -2120,6 +2120,36 @@ test('objective judge: a successful concrete send slug is completion evidence', 
   assert.equal(judgeInvoked, false);
 });
 
+test('objective judge: one successful send does not certify a plural objective', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeInvoked = false;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'composio_execute_tool' };
+    const details = { toolCall: { callId: 'send-1', arguments: '{"tool_slug":"GMAIL_SEND_EMAIL"}' } };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'sent', details);
+    const decision = { summary: 'sent', reply: 'Sent the emails.', done: true, nextAction: 'completed', reason: null };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'send the 3 emails',
+    judgeCompletion: true,
+    judgeFn: async () => {
+      judgeInvoked = true;
+      return { done: true, reason: 'verified by test' };
+    },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(judgeInvoked, true);
+});
+
 test('objective judge: fail-open accepted completions are tagged in conversation_completed', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([

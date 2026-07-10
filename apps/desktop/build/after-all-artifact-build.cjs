@@ -79,16 +79,12 @@ exports.default = async function afterAllArtifactBuild({ artifactPaths }) {
   const applePassword = process.env.APPLE_APP_PASSWORD;
   const teamId = process.env.APPLE_TEAM_ID;
   if (!appleId || !applePassword || !teamId) {
-    console.warn('  [notarize-dmg] missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID — skipping DMG sign+notarize.');
-    console.warn('  [notarize-dmg] DMGs will go out UNSIGNED — Gatekeeper will mark them "damaged" on fresh Macs.');
-    return [];
+    throw new Error('[notarize-dmg] missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID; set APPLE_NOTARIZE_SKIP=true only for an explicit unsigned developer build');
   }
 
   const identity = findSigningIdentity(teamId);
   if (!identity) {
-    console.warn(`  [notarize-dmg] no Developer ID Application cert for team ${teamId} found in keychain — skipping DMG signing.`);
-    console.warn('  [notarize-dmg] Re-run with APPLE_SIGNING_IDENTITY set, or import the cert and try again.');
-    return [];
+    throw new Error(`[notarize-dmg] no Developer ID Application certificate for team ${teamId} was found in the keychain`);
   }
 
   let notarizeFn;
@@ -109,7 +105,6 @@ exports.default = async function afterAllArtifactBuild({ artifactPaths }) {
     console.log(`  [notarize-dmg] uploading ${filename} to Apple notary service (this can take a few minutes)…`);
     const start = Date.now();
     await notarizeFn({
-      tool: 'notarytool',
       appPath: dmgPath,
       appleId,
       appleIdPassword: applePassword,

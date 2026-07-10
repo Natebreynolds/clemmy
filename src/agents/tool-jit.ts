@@ -181,7 +181,7 @@ function looksLikeTeamAgentIntent(query: string): boolean {
     || /\b(proof-researcher|proof-builder)\b/.test(q);
 }
 
-function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
+export function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
   const escaped = toolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(?:^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(query);
 }

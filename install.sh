@@ -73,7 +73,8 @@ case "$OS" in
     if [[ "$ARCH" == "arm64" ]]; then
       ASSET_PATTERN="${APP_NAME}-.*-arm64\\.dmg"
     else
-      ASSET_PATTERN="${APP_NAME}-.*(-x64|-amd64)\\.dmg"
+      # electron-builder's x64 artifact has no architecture suffix.
+      ASSET_PATTERN="${APP_NAME}-[0-9]+\\.[0-9]+\\.[0-9]+\\.dmg"
     fi
     ;;
   Linux)

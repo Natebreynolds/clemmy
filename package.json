@@ -40,6 +40,7 @@
     "build:console-web": "npm --prefix apps/console-web run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test 'src/**/*.test.ts' 'apps/**/*.test.ts'",
+    "test:release-assets": "node --test scripts/merge-mac-update-feeds.test.mjs scripts/verify-desktop-release-assets.test.mjs",
     "bench:gates": "tsx scripts/harness-gate-benchmark.ts",
     "eval:passk": "tsx scripts/eval-passk.ts",
     "eval:spans": "tsx scripts/eval-spans.ts",
@@ -123,6 +124,7 @@
     "@types/node": "^22.12.0",
     "@types/qrcode": "^1.5.5",
     "@types/web-push": "^3.6.4",
+    "js-yaml": "^5.2.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },

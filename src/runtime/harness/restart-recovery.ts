@@ -128,6 +128,16 @@ export interface RestartRecoverySummary {
   records: RestartRecoveryRecord[];
 }
 
+export interface RestartRecoveryOptions {
+  /**
+   * Only markers written before this process started can prove a restart
+   * interruption. The HTTP surface becomes reachable before the boot scan runs,
+   * so markers at/after this cutoff belong to live work in this process and must
+   * remain untouched.
+   */
+  bootCutoffMs?: number;
+}
+
 function listChatSessionsForRecovery(): SessionRow[] {
   const rows: SessionRow[] = [];
   for (let offset = 0; ; offset += CHAT_SCAN_PAGE_SIZE) {
@@ -156,6 +166,7 @@ function buildReplayPrimer(sessionId: string, inFlightSince: string): string {
 export function recoverInterruptedChatRuns(
   now: () => number = Date.now,
   dispatchResume?: ResumeDispatcher,
+  options: RestartRecoveryOptions = {},
 ): RestartRecoverySummary {
   if (!enabled()) return { enabled: false, scanned: 0, recovered: 0, notified: 0, records: [] };
 
@@ -186,6 +197,16 @@ export function recoverInterruptedChatRuns(
       since = null;
     }
     if (!since) continue; // not interrupted — completed runs clear their marker
+
+    // A marker is restart evidence only when it predates this daemon process.
+    // Boot can spend minutes connecting channels before reaching this scan while
+    // the HTTP console is already accepting chats. Never claim, clear, or replay
+    // a marker created during that window. Malformed/equal timestamps also stay
+    // preserved because prior-process ownership cannot be proven.
+    if (options.bootCutoffMs !== undefined) {
+      const sinceMs = Date.parse(since);
+      if (!Number.isFinite(sinceMs) || sinceMs >= options.bootCutoffMs) continue;
+    }
 
     const record: RestartRecoveryRecord = {
       sessionId: row.id,
@@ -366,8 +387,9 @@ export function recoverInterruptedChatRuns(
 export function reportInterruptedChatRuns(
   now: () => number = Date.now,
   dispatchResume?: ResumeDispatcher,
+  options: RestartRecoveryOptions = {},
 ): number {
-  const summary = recoverInterruptedChatRuns(now, dispatchResume);
+  const summary = recoverInterruptedChatRuns(now, dispatchResume, options);
   return summary.recovered;
 }
 

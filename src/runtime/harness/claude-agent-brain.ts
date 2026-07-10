@@ -36,6 +36,7 @@ import { resolveRoleModel } from './model-roles.js';
 import {
   type ClaudeAgentSdkToolProfile,
   defaultClaudeAgentSdkAllowedLocalTools,
+  claudeAgentSdkAdvertisableLocalTools,
   runClaudeAgentSdk,
   ClaudeSdkProviderOverloadError,
   ClaudeSdkContextOverflowError,
@@ -43,7 +44,7 @@ import {
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
 import { resolveEffectiveToolNames, type ToolNamePolicyResult } from './tool-policy.js';
-import { hasMeaningfulSuccessfulToolNames } from './tool-evidence.js';
+import { hasMeaningfulSuccessfulToolNames, objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
@@ -382,6 +383,35 @@ function toolPolicyForRequest(request: AssistantRequest, mode: ClaudeAgentBrainM
   });
 }
 
+/**
+ * In full/agentic mode the SDK permission profile is only the fast-allow set.
+ * The local MCP server intentionally advertises the broader catalog so tools
+ * outside that profile can still reach canUseTool and the shared taxonomy gate.
+ * JIT must preserve that distinction instead of turning permission into reachability.
+ */
+export function claudeAgentSdkAdvertisedToolUniverse(
+  mode: ClaudeAgentBrainMode,
+  fastAllowNames: readonly string[],
+  excludeNames: readonly string[] = [],
+): string[] {
+  const excluded = new Set(excludeNames);
+  const names = mode === 'full'
+    ? claudeAgentSdkAdvertisableLocalTools()
+    : [...fastAllowNames];
+  return [...new Set(names)].filter((name) => !excluded.has(name));
+}
+
+export function partitionClaudeAgentSdkJitSurface(
+  fastAllowNames: readonly string[],
+  advertisedUniverse: readonly string[],
+  exposed: ReadonlySet<string>,
+): { fastAllowNames: string[]; advertisedNames: string[] } {
+  return {
+    fastAllowNames: fastAllowNames.filter((name) => exposed.has(name)),
+    advertisedNames: advertisedUniverse.filter((name) => exposed.has(name)),
+  };
+}
+
 function modeCanAuthorOrExecute(mode: ClaudeAgentBrainMode): boolean {
   return mode === 'local_authoring' || mode === 'full';
 }
@@ -406,7 +436,8 @@ export function shouldJudgeClaudeCompletion(
   successfulToolUses: string[],
 ): boolean {
   return isPromiseShapedReply(replyText)
-    || (!hasMeaningfulSuccessfulToolNames(successfulToolUses, requestText)
+    || ((!hasMeaningfulSuccessfulToolNames(successfulToolUses, requestText)
+      || objectiveMayRequireMultipleResults(requestText))
       && looksLikeActionCompletionClaim(requestText, replyText));
 }
 
@@ -887,6 +918,11 @@ export async function respondViaClaudeAgentSdkBrain(
   // embeddings → the full profile (byte-identical). Never throws into the turn.
   const fullToolPolicy = toolPolicyForRequest(request, mode);
   const fullAllowed = fullToolPolicy.names;
+  const advertisedUniverse = claudeAgentSdkAdvertisedToolUniverse(
+    mode,
+    fullAllowed,
+    request.excludeToolNames,
+  );
   try {
     appendEvent({
       sessionId,
@@ -898,6 +934,7 @@ export async function respondViaClaudeAgentSdkBrain(
   } catch { /* tool policy telemetry must never block the turn */ }
   const jitDecision = resolveToolJitDecision({ allowLane: true, sessionId });
   let jitAllowed = fullAllowed;
+  let jitAdvertised = advertisedUniverse;
   let mcpToolAllowlist: string[] | undefined;
   let jitDropped = 0;
   let jitReason = jitDecision.active ? 'jit-active-no-reduction' : 'jit-inactive';
@@ -911,7 +948,7 @@ export async function respondViaClaudeAgentSdkBrain(
         .join('\n');
       const selection = await selectToolsForTurn({
         userInput: jitQuery,
-        tools: fullAllowed.map((name) => ({ name, description: descByName.get(name) ?? '' })),
+        tools: advertisedUniverse.map((name) => ({ name, description: descByName.get(name) ?? '' })),
         recallPinned: recallPinnedBuiltinTools(jitQuery),
       });
       // H1c: a dock chat IS editing a Workspace — pin the space tools so the JIT
@@ -927,9 +964,11 @@ export async function respondViaClaudeAgentSdkBrain(
         const exposed = (jitMonotonicEnabled() && sessionId)
           ? bumpSessionToolFloor(sessionId, selection.exposed)
           : selection.exposed;
-        jitAllowed = fullAllowed.filter((n) => exposed.has(n));
-        mcpToolAllowlist = jitAllowed;
-        jitDropped = fullAllowed.length - jitAllowed.length;
+        const partitioned = partitionClaudeAgentSdkJitSurface(fullAllowed, advertisedUniverse, exposed);
+        jitAllowed = partitioned.fastAllowNames;
+        jitAdvertised = partitioned.advertisedNames;
+        mcpToolAllowlist = jitAdvertised;
+        jitDropped = advertisedUniverse.length - jitAdvertised.length;
         if (jitDropped <= 0) {
           // Floor converged to the whole surface — advertise all (still cache-stable).
           mcpToolAllowlist = undefined;
@@ -937,7 +976,7 @@ export async function respondViaClaudeAgentSdkBrain(
         }
       }
     } catch {
-      jitAllowed = fullAllowed; mcpToolAllowlist = undefined; jitReason = 'jit-error-fellback';
+      jitAllowed = fullAllowed; jitAdvertised = advertisedUniverse; mcpToolAllowlist = undefined; jitReason = 'jit-error-fellback';
     }
   }
   // Telemetry — emit on a real reduction OR whenever the A/B is running (so the
@@ -949,7 +988,11 @@ export async function respondViaClaudeAgentSdkBrain(
         sessionId, turn: 0, role: 'system', type: 'tool_jit_scope',
         data: {
           lane: 'claude_sdk', arm: jitDecision.arm, experiment: jitDecision.experiment,
-          jitActive: jitDecision.active, droppedCount: jitDropped, exposedCount: jitAllowed.length, reason: jitReason,
+          jitActive: jitDecision.active,
+          droppedCount: jitDropped,
+          exposedCount: jitAdvertised.length,
+          fastAllowCount: jitAllowed.length,
+          reason: jitReason,
         },
       });
     } catch { /* JIT telemetry must never block the turn */ }

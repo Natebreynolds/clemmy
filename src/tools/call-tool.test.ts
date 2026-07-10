@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 const { buildCallTool, _resetCallToolSchemaCacheForTest } = await import('./call-tool.js');
 const { _setCodeModeToolsForTests } = await import('./code-mode-tool.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
 const { getHotSet, _resetHotSetForTest } = await import('../agents/tool-hotset.js');
 const { resetEventLog, createSession, listEvents } = await import('../runtime/harness/eventlog.js');
 const { getLocalToolSchemas } = await import('./local-runtime-tools.js');
@@ -133,6 +134,37 @@ test('a successful dispatch records the reached tool to the session hot-set', as
     );
     assert.equal(String(out), 'ok');
     assert.ok(getHotSet('sess-lru').includes('composio_execute_tool'), 'reached tool is promoted to the hot-set');
+  } finally {
+    _setCodeModeToolsForTests(null);
+  }
+});
+
+test('production run context attributes the inner dispatch without a tool-output ALS shim', async () => {
+  _resetHotSetForTest();
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  _setCodeModeToolsForTests(
+    new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
+  );
+  try {
+    const callTool = buildCallTool() as unknown as ToolLike;
+    const out = await withHarnessRunContext(
+      { sessionId: sess.id, counter: new ToolCallsCounter(10) },
+      () => callTool.invoke!(
+        { context: { sessionId: sess.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({ tool_slug: 'APIFY_GET_DATASET_ITEMS', arguments: '{}' }),
+        }),
+        { toolCall: { callId: 'outer-call-tool' } },
+      ) as Promise<unknown>,
+    );
+
+    assert.equal(String(out), 'rows');
+    const innerCalls = listEvents(sess.id, { types: ['tool_called'] })
+      .filter((event) => (event.data as { tool?: string }).tool === 'composio_execute_tool');
+    assert.equal(innerCalls.length, 1, 'inner dispatch telemetry stays on the active session');
+    assert.ok(getHotSet(sess.id).includes('composio_execute_tool'), 'promotion stays on the active session');
   } finally {
     _setCodeModeToolsForTests(null);
   }

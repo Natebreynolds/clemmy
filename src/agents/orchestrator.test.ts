@@ -684,6 +684,51 @@ test('request_approval triggers the SDK interrupt for external/destructive actio
   );
 });
 
+test('YOLO never auto-approves an unlinked email action phrased as a verb', async () => {
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const t = buildRequestApprovalTool();
+    const needsFn = t.needsApproval as unknown as (
+      ctx: unknown,
+      input: {
+        subject: string;
+        reason: string | null;
+        destructive: boolean;
+        preview: null;
+        pendingActionId: null;
+      },
+    ) => Promise<boolean>;
+
+    for (const subject of ['Email the customer', 'E-mail the customer']) {
+      assert.equal(
+        await needsFn({}, {
+          subject,
+          reason: null,
+          destructive: false,
+          preview: null,
+          pendingActionId: null,
+        }),
+        true,
+        `${subject} must retain the human approval floor without pending-action metadata`,
+      );
+    }
+
+    assert.equal(
+      await needsFn({}, {
+        subject: 'Save the email template to memory',
+        reason: null,
+        destructive: false,
+        preview: null,
+        pendingActionId: null,
+      }),
+      false,
+      'email used as a noun in a local save remains reversible',
+    );
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
 test('request_approval auto-resolves local saves so user-initiated memory writes do not stall', async () => {
   // Repro: orchestrator was gating "save salesforce CLI rule to memory" behind
   // an approval prompt even though the action was local and the user had just

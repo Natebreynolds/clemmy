@@ -1,6 +1,6 @@
 import express from 'express';
 import pino from 'pino';
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -385,8 +385,19 @@ function resolveApiMessageSession(body: {
   };
 }
 
+function deriveDashboardSessionToken(webhookSecret: string): string {
+  if (!webhookSecret) return randomBytes(32).toString('base64url');
+  // The cookie must survive a daemon restart, but must not expose or equal the
+  // bearer secret. A domain-separated HMAC is stable for one installation and
+  // naturally invalidates when the webhook secret rotates.
+  return createHmac('sha256', webhookSecret)
+    .update('clementine-dashboard-session:v1')
+    .digest('base64url');
+}
+
 export const __test__ = {
   completionOutputPreview,
+  deriveDashboardSessionToken,
   enrichActivityRun,
   enrichActivityRunDetail,
   resolveApiMessageSession,
@@ -538,7 +549,7 @@ async function resolveApprovalOrQueueBackgroundContinuation(
 export async function startWebhookServer(assistant: ClementineAssistant): Promise<void> {
   const app = express();
   const dashboardSessionCookieName = 'clementine_dashboard_session';
-  const dashboardSessionToken = randomBytes(32).toString('base64url');
+  const dashboardSessionToken = deriveDashboardSessionToken(WEBHOOK_SECRET);
 
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');

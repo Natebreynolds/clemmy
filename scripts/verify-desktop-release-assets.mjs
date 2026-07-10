@@ -75,6 +75,22 @@ export function verifyDesktopReleaseAssets(options = {}) {
   if (!feed.files.some((file) => file.url.endsWith('.zip'))) errors.push('latest-mac.yml does not reference a .zip artifact');
   if (!feed.files.some((file) => file.url.endsWith('.dmg'))) errors.push('latest-mac.yml does not reference a .dmg artifact');
 
+  if (expectedVersion) {
+    const requiredMacArtifacts = [
+      `Clementine-${expectedVersion}-arm64-mac.zip`,
+      `Clementine-${expectedVersion}-arm64.dmg`,
+      `Clementine-${expectedVersion}-mac.zip`,
+      `Clementine-${expectedVersion}.dmg`,
+    ];
+    const feedUrls = new Set(feed.files.map((file) => file.url));
+    for (const artifact of requiredMacArtifacts) {
+      if (!feedUrls.has(artifact)) errors.push(`latest-mac.yml is missing architecture artifact: ${artifact}`);
+    }
+    if (feed.path !== `Clementine-${expectedVersion}-mac.zip`) {
+      errors.push(`top-level path must remain the x64 legacy fallback, got: ${feed.path || '(missing)'}`);
+    }
+  }
+
   const feedUrls = new Set(feed.files.map((file) => file.url));
   if (feed.path && !feedUrls.has(feed.path)) {
     errors.push(`top-level path ${feed.path} is not present in files[]`);
