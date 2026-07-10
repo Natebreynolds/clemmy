@@ -998,6 +998,23 @@ function recordClaudeAgentSdkUsage(
           }
         : {}),
     });
+    // Eventlog copy of the prompt-prefix cache-hit ratio so it's scoreable PER
+    // SESSION on the default brain lane (mirrors the sdk_first_byte TTFT copy).
+    // The usage-log carries the raw cache tokens, but the freeze-stable-prefix
+    // lever is invisible without a per-turn hit-rate to watch move (2026-07-09).
+    if (options.sessionId?.trim() && totals.inputTokens > 0) {
+      appendEvent({
+        sessionId: options.sessionId.trim(),
+        turn: 0,
+        role: 'system',
+        type: 'sdk_cache',
+        data: {
+          cacheHitRatio: Math.round((totals.cachedInputTokens / totals.inputTokens) * 1000) / 1000,
+          cachedInputTokens: totals.cachedInputTokens,
+          inputTokens: totals.inputTokens,
+        },
+      });
+    }
   } catch { /* observability must never break the SDK lane */ }
 }
 

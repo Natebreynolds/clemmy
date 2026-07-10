@@ -23,8 +23,10 @@ const {
   looksLikeReasoningLeak,
   frameTrustedMemory,
   sdkStreamingEnabled,
+  invalidateStableMemorySnapshot,
 } = brain;
 const { appendEvent, createSession, getSession, listEvents, resetEventLog, writeToolOutput } = await import('./eventlog.js');
+const { saveUserProfile } = await import('../user-profile.js');
 const { ClaudeSdkProviderOverloadError, ClaudeSdkContextOverflowError } = await import('./claude-agent-sdk.js');
 const capabilityHealth = await import('./capability-health.js');
 
@@ -265,6 +267,36 @@ test('renderClaudeAgentBrainSystemAppend carries Clementine context and the read
   // The lean rubric must NOT leak the harness's internal event protocol — that
   // leakage is what the model reproduced as text ("Tool:… / System: tool result").
   assert.doesNotMatch(prompt, /tool_called event|tool_returned event|\[clipped:/);
+});
+
+test('Win 2: the stable memory block is frozen per session — a mid-session vault edit does not bust the cached prefix, but a fresh session / invalidation picks it up', () => {
+  process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on'; // the freeze applies only on the split (cacheable-prefix) path
+  delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT;
+  const sid = 'brain-freeze-A';
+  invalidateStableMemorySnapshot(); // clean slate
+  // First render seeds this session's snapshot (before the vault edit).
+  const first = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
+  // A mid-session vault edit changes what the STABLE block WOULD render.
+  saveUserProfile({ role: 'MARKER_ROLE_XYZZY' });
+  // Same session → byte-identical (frozen); the new role never enters the cached prefix.
+  const second = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
+  assert.equal(second, first, 'frozen snapshot: same session ignores the mid-session edit');
+  assert.doesNotMatch(second, /MARKER_ROLE_XYZZY/);
+  // A DIFFERENT session renders live — proves the edit really does surface (so its
+  // absence above is the freeze, not a non-rendering field).
+  const fresh = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: 'brain-freeze-B' }, 'read_only');
+  assert.match(fresh, /MARKER_ROLE_XYZZY/, 'a fresh session renders the current vault state');
+  // Explicit invalidation re-renders the frozen session.
+  invalidateStableMemorySnapshot(sid);
+  const third = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
+  assert.match(third, /MARKER_ROLE_XYZZY/, 'invalidation re-renders the stable block');
+  // Kill-switch off → live render every turn (no freeze).
+  process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT = 'off';
+  saveUserProfile({ role: 'MARKER_ROLE_SECOND' });
+  const killed = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
+  assert.match(killed, /MARKER_ROLE_SECOND/, 'kill-switch off renders the vault live');
+  delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT;
+  invalidateStableMemorySnapshot();
 });
 
 test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/model-role capability', () => {

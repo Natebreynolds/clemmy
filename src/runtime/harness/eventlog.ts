@@ -105,6 +105,9 @@ export const EVENT_TYPES = [
   // has it too; this copy makes TTFT scoreable from the eventlog (proof
   // harness, speculative-routing acceptance telemetry).
   'sdk_first_byte',
+  // Per-turn prompt-prefix cache-hit ratio on the default brain lane — makes the
+  // freeze-stable-prefix cache lever scoreable from the eventlog (2026-07-09).
+  'sdk_cache',
   // WHICH model/lane served a chat turn (respond bridge, once per turn):
   // {model, routeKind, surface}. The durable answer to "who actually served
   // this?" — brain-matrix assertions, fallover forensics, route-policy audit.
@@ -426,9 +429,10 @@ const MIGRATIONS: { version: number; sql: string }[] = [
   },
   {
     // Reliability pass v0.4.20:
-    //   - session_locks: cross-process serialization for state mutations on
-    //     a single sessionId. Used by withSessionLock (session-lock.ts) to
-    //     close the TOCTOU + duplicate-write holes the audit found.
+    //   - session_locks: legacy cross-process lock table. Its withSessionLock
+    //     helper was removed in the 2026-07-09 subtraction pass (no live caller);
+    //     the table CREATE is retained as an inert vestige — dropping it is a
+    //     separate schema change, out of scope for that pass.
     //   - pending_approvals: addressable approval requests with per-row TTL.
     //     One row per `approval_requested` event. The reaper expires stale
     //     rows; the approval-registry resolves them by approval_id so a

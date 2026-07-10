@@ -489,6 +489,53 @@ export function frameTrustedMemory(persistentContext: string): string {
   ].join('\n');
 }
 
+// Win 2 (freeze-stable-prefix): the STABLE memory block (profile, saved specs,
+// learned facts, data locations) is embedded in the CACHEABLE system append.
+// Re-rendering it every turn meant a single reflection-written fact changed the
+// block and busted the whole prompt-prefix cache (measured ~28% hit rate). We
+// snapshot it PER SESSION so the system append stays byte-stable across turns;
+// facts learned mid-session still reach the model via the volatile tail's hybrid
+// recall (renderClaudeAgentBrainTurnContext), so nothing is lost — only the cache
+// benefits. Kill-switch CLEMMY_BRAIN_STABLE_SNAPSHOT=off reverts to per-turn
+// rendering. (2026-07-09)
+const stableMemorySnapshots = new Map<string, string>();
+const STABLE_SNAPSHOT_MAX = 256;
+
+function stableSnapshotEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_BRAIN_STABLE_SNAPSHOT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+}
+
+/** Invalidate a session's frozen stable-memory snapshot so the next turn
+ *  re-renders it. Call after an EXPLICIT profile/spec/memory edit (not after
+ *  automatic reflection — that churn is exactly what the snapshot defers). Pass
+ *  no id to clear all (e.g. a global profile change). Also used by tests. */
+export function invalidateStableMemorySnapshot(sessionId?: string): void {
+  if (!sessionId?.trim()) { stableMemorySnapshots.clear(); return; }
+  stableMemorySnapshots.delete(sessionId.trim());
+}
+
+/** The STABLE memory block, frozen to a per-session snapshot (see above). Falls
+ *  back to a live render when the kill-switch is off or the session is unknown. */
+function renderStableMemoryFrozen(request: AssistantRequest): string {
+  const render = (): string => renderCanonicalMemoryContext({
+    sessionId: request.sessionId,
+    partition: 'stable',
+    includeSessionActions: false,
+  });
+  const key = request.sessionId?.trim();
+  if (!key || !stableSnapshotEnabled()) return render();
+  const cached = stableMemorySnapshots.get(key);
+  if (cached !== undefined) return cached;
+  const fresh = render();
+  // Bounded FIFO eviction so long-lived daemons don't leak snapshots.
+  if (stableMemorySnapshots.size >= STABLE_SNAPSHOT_MAX) {
+    const oldest = stableMemorySnapshots.keys().next().value;
+    if (oldest !== undefined) stableMemorySnapshots.delete(oldest);
+  }
+  stableMemorySnapshots.set(key, fresh);
+  return fresh;
+}
+
 export function renderClaudeAgentBrainSystemAppend(
   surface: ClaudeAgentBrainSurface,
   request: AssistantRequest,
@@ -499,12 +546,17 @@ export function renderClaudeAgentBrainSystemAppend(
   // turns); the volatile tail + this-session actions move to the user turn (see
   // renderClaudeAgentBrainTurnContext). Split OFF: the old single-append behavior
   // (full context + query recall + sessionActions here) — byte-identical.
-  const persistentContext = renderCanonicalMemoryContext({
-    sessionId: request.sessionId,
-    query: split ? undefined : request.message,
-    partition: split ? 'stable' : 'all',
-    includeSessionActions: false,
-  });
+  // Split ON: the STABLE block is frozen to a per-session snapshot so the system
+  // append stays byte-stable and the prompt-prefix cache hits (Win 2). Split OFF:
+  // the old single-append render (full context + query recall) — byte-identical.
+  const persistentContext = split
+    ? renderStableMemoryFrozen(request)
+    : renderCanonicalMemoryContext({
+        sessionId: request.sessionId,
+        query: request.message,
+        partition: 'all',
+        includeSessionActions: false,
+      });
   const spaceSlug = workspaceSlugFromSessionId(request.sessionId);
   const workspacePrimer = spaceSlug ? buildWorkspaceContextPrimer(spaceSlug) : null;
   // Visibility into THIS session's completed irreversible actions. The text
