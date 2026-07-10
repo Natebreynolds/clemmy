@@ -121,6 +121,16 @@ export function estimateMessagesTokens(items: ReadonlyArray<{ content?: unknown;
  * smaller of (known limit, default).
  */
 const MODEL_CONTEXT_LIMITS: ReadonlyMap<string, number> = new Map([
+  // gpt-5.6 family — discovered model ids can arrive before this static
+  // budget registry is updated. Until per-SKU windows are verified, use the
+  // same conservative Codex-oauth ceiling as gpt-5.5 so new ids do not fall
+  // back to the much smaller unknown-model default.
+  ['gpt-5.6', 400_000],
+  ['gpt-5.6-sol', 400_000],
+  ['gpt-5.6-terra', 400_000],
+  ['gpt-5.6-codex', 400_000],
+  ['gpt-5.6-pro', 400_000],
+  ['gpt-5.6-mini', 200_000],
   // gpt-5.5 family — current frontier (Apr 2026 release).
   // The 1M-token API context is API-KEY ONLY. Through Codex oauth
   // (any tier — Plus, Pro, Business, Enterprise) the effective

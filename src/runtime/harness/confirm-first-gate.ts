@@ -31,12 +31,13 @@
  * tested in confirm-first-gate.test.ts with no SDK / DB / eventlog.
  */
 import { getRuntimeEnv } from '../../config.js';
-import { isMutatingExternalWrite } from './execution-gate.js';
+import { isMutatingExternalWrite, looksLikeNativeMcpSend, isIrreversibleSendSlug, IRREVERSIBLE_SEND_VERBS } from './execution-gate.js';
+// Re-export so existing importers keep working; the canonical predicate is
+// isIrreversibleSendSlug.
+export { isIrreversibleSendSlug };
 
-/** Verbs whose writes can't be taken back — a wrong one is felt
- *  immediately (an email sent, a post published). Tracked for telemetry
- *  and future per-shape threshold tuning. */
-export const IRREVERSIBLE_VERBS: ReadonlySet<string> = new Set(['SEND', 'PUBLISH']);
+/** Back-compat re-export; the canonical predicate is isIrreversibleSendSlug. */
+export const IRREVERSIBLE_VERBS = IRREVERSIBLE_SEND_VERBS;
 
 export interface ExternalWriteShape {
   /** Whether this call is a mutating external write at all. */
@@ -71,11 +72,11 @@ export function classifyExternalWrite(toolName: string, rawArgs: unknown): Exter
   const mutating = isMutatingExternalWrite(toolName, rawArgs);
   if (!mutating) return { mutating: false, irreversible: false, shapeKey: undefined };
   const slug = extractToolSlug(rawArgs);
-  const irreversible = slug
-    ? slug.split('_').some((part) => IRREVERSIBLE_VERBS.has(part))
-    : false;
+  // One classifier, everywhere: a send-verb/comm-object slug OR a native-MCP
+  // send-shaped tool name is irreversible.
+  const irreversible = slug ? isIrreversibleSendSlug(slug) : looksLikeNativeMcpSend(toolName);
   // shapeKey is the slug for composio writes; fall back to the tool name
-  // so non-composio writes (future extension) still batch coherently.
+  // so non-composio writes (native MCP sends) still batch coherently.
   return { mutating: true, irreversible, shapeKey: slug ?? toolName };
 }
 

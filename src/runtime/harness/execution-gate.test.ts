@@ -9,7 +9,56 @@ import {
   isMutatingExternalWrite,
   isGateEnabled,
   MissingExecutionWrapError,
+  isIrreversibleSendSlug,
 } from './execution-gate.js';
+
+// ─── isIrreversibleSendSlug — the ONE canonical predicate ─────────
+// Permanent regression fixtures for the 2026-07-09 re-hunt Lane 5:
+// the classifier both UNDER-gated real sends and OVER-gated reversible writes.
+
+test('isIrreversibleSendSlug: SEND_DRAFT dispatches an existing draft — is a send (DRAFT no longer short-circuits before the SEND verb)', () => {
+  for (const s of ['outlook_send_draft', 'GMAIL_SEND_DRAFT', 'OUTLOOK_SEND_DRAFT']) {
+    assert.equal(isIrreversibleSendSlug(s), true, `${s} must be an irreversible send`);
+  }
+});
+
+test('isIrreversibleSendSlug: CREATE_DRAFT / CREATE_REPLY_DRAFT compose without sending — reversible', () => {
+  for (const s of ['outlook_create_draft', 'outlook_create_reply_draft', 'outlook_create_reply_all_draft', 'GMAIL_CREATE_DRAFT']) {
+    assert.equal(isIrreversibleSendSlug(s), false, `${s} is a reversible draft`);
+  }
+});
+
+test('isIrreversibleSendSlug: FORWARD and REPLY dispatch a real email — are sends', () => {
+  assert.equal(isIrreversibleSendSlug('outlook_forward_mail'), true);
+  assert.equal(isIrreversibleSendSlug('GMAIL_REPLY_TO_THREAD'), true);
+});
+
+test('isIrreversibleSendSlug: dispatch-verb + comm-object native sends are caught', () => {
+  for (const s of ['claude_ai_Google_Calendar__create_event', 'respond_to_event', 'DISCORD_CREATE_MESSAGE', 'TWILIO_CREATE_MESSAGE', 'VAPI_CREATE_CALL', 'TWILIO_MAKE_OUTBOUND_CALL', 'make_outbound_call']) {
+    assert.equal(isIrreversibleSendSlug(s), true, `${s} must be an irreversible send`);
+  }
+});
+
+test('isIrreversibleSendSlug: CALL as a noun (reads) is NOT a send — the bare verb was removed', () => {
+  for (const s of ['VAPI_GET_CALL', 'mcp__vapi__get_call', 'TWILIO_LIST_CALLS', 'mcp__vapi__list_calls']) {
+    assert.equal(isIrreversibleSendSlug(s), false, `${s} is a call READ, not a send`);
+  }
+});
+
+test('isIrreversibleSendSlug: reversible writes stay free (no over-gate on CHAT/COMMENT/spreadsheet/contact)', () => {
+  for (const s of ['OPENAI_CREATE_CHAT_COMPLETION', 'NOTION_CREATE_COMMENT', 'create_record_comment', 'GOOGLESHEETS_CREATE_SPREADSHEET', 'GOOGLESHEETS_VALUES_UPDATE', 'CREATE_CONTACT', 'CREATE_LABEL', 'AIRTABLE_CREATE_RECORD', 'NOTION_CREATE_PAGE']) {
+    assert.equal(isIrreversibleSendSlug(s), false, `${s} is a reversible write — must not force a card`);
+  }
+});
+
+test('isIrreversibleSendSlug: ADD-a-label / ADD-a-reaction are reversible metadata ops, not sends (re-hunt round 2)', () => {
+  // 'ADD' is not a dispatch verb — there is no add-a-communication send. These
+  // reversible metadata ops must NOT be gated as irreversible sends (it would
+  // silently break auto-triage/labeling workflows).
+  for (const s of ['GMAIL_ADD_LABEL_TO_EMAIL', 'SLACK_ADD_REACTION_TO_A_MESSAGE', 'GMAIL_REMOVE_LABEL', 'GOOGLECALENDAR_QUICK_ADD']) {
+    assert.equal(isIrreversibleSendSlug(s), false, `${s} is a reversible metadata op`);
+  }
+});
 
 // ─── isMutatingExternalWrite — composio_execute_tool ──────────────
 

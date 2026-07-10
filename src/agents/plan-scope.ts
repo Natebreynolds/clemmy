@@ -4,6 +4,27 @@ import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
+import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
+
+/** Only IRREVERSIBLE sends (email/call/post) get the strict enumeration floor.
+ *  The taxonomy's 'send' kind is broader — it tags reversible network writes
+ *  (a sheet/record create) too, and those keep the lenient scope/YOLO behavior.
+ *  Authoritative irreversibility comes from classifyExternalWrite. */
+function isIrreversibleSendAction(toolName: string, args: unknown, kindHint?: 'send' | 'other'): boolean {
+  try {
+    // The authoritative classifier is the source of truth. A kindHint of 'other'
+    // must NOT short-circuit it to false: native comm-object sends (create_event,
+    // respond_to_event) derive kindHint='other' from the taxonomy's verb list yet
+    // ARE irreversible sends, and the old short-circuit disarmed the send-lock +
+    // YOLO/wildcard-scope carve-out for them (2026-07-09 re-hunt: Lanes 2/3).
+    if (classifyExternalWrite(toolName, args).irreversible) return true;
+  } catch {
+    // Fail-safe: if we can't classify but the caller called it a send, treat as
+    // irreversible (ask) rather than auto-approve.
+    return kindHint === 'send';
+  }
+  return false;
+}
 
 /**
  * Plan-scoped approval — the consent boundary that turns the
@@ -240,11 +261,28 @@ export function isAutoApprovedByScope(
   // cover it: the side-effect law is stricter than the tool allowlist. (The 5
   // safety gates already ran before this module; this is the extra send lock a
   // no-TTL scope needs that the 15-min time-boxed scope didn't.)
-  if (scope.goalScoped && kindHint === 'send') {
-    const sends = scope.allowedSends ?? [];
-    if (sends.length === 0) return false;
+  // THE SEND LOCK (2026-07-09 bypass hunt, edit 3): a WILDCARD `['*']` scope
+  // never auto-approves an irreversible send. The workflow/background lanes open
+  // `allowedTools:['*']` at launch, and the old goalScoped-only lock let the
+  // `includes('*')` fast-path below wave an un-enumerated send through with no
+  // human (Hole 2). A send is auto-approved only when EXPLICITLY enumerated —
+  // in `allowedSends`, or named (not via wildcard) in `allowedTools`. Otherwise
+  // it returns false → needsApproval → the run PARKS for a card.
+  // THE SEND LOCK — only IRREVERSIBLE sends (email/call/post), not reversible
+  // network writes (a sheet/record create still auto-approves under a scope).
+  if (isIrreversibleSendAction(toolName, args, kindHint)) {
     const slug = extractComposioSlug(args);
-    return sends.includes(toolName) || (!!slug && sends.includes(slug));
+    const sends = scope.allowedSends ?? [];
+    // The SLUG is the real action for a composio send — auto-approve only when
+    // the exact slug is enumerated (allowedSends or allowedComposioSlugs).
+    if (slug && (sends.includes(slug) || (scope.allowedComposioSlugs ?? []).includes(slug))) return true;
+    // A NON-multiplexer send tool named explicitly in allowedTools/allowedSends
+    // is consent. A multiplexer name (composio_execute_tool, call_tool, shell)
+    // is NOT — naming the gateway would blanket-approve every slug through it
+    // (2026-07-09 Hole A: approve Gmail, model then sends Slack). Nor does a
+    // wildcard '*'.
+    if (!isUngrantableMultiplexer(toolName) && (sends.includes(toolName) || scope.allowedTools.includes(toolName))) return true;
+    return false; // wildcard / multiplexer / un-enumerated → human approval required
   }
   if (scope.allowedTools.includes('*')) return true;
   if (scope.allowedTools.includes(toolName)) {
@@ -309,11 +347,20 @@ export function evaluateAutoApprove(input: {
   if (isAutoApprovedByScope(input.sessionId, input.toolName, input.args, input.kindHint)) {
     return { autoApproved: true, reason: 'plan-scope' };
   }
-  if (input.scope === 'yolo') {
-    return { autoApproved: true, reason: 'yolo-policy' };
-  }
-  if (input.scope === 'workspace' && input.insideWorkspace) {
-    return { autoApproved: true, reason: 'workspace-policy' };
+  // YOLO / workspace blanket policies NEVER auto-approve an IRREVERSIBLE send
+  // (Hole C, 2026-07-09): the batch path already carved this out (brackets
+  // confirm-first), but this per-tool path — used by canUseTool for single
+  // sends — did not, so a native-MCP send under YOLO fired with no card. Only
+  // irreversible sends (email/call/post) are held; reversible writes (a sheet
+  // create) keep full YOLO/workspace convenience. YOLO means "don't nag me
+  // about reversible work", not "email anyone silently".
+  if (!isIrreversibleSendAction(input.toolName, input.args, input.kindHint)) {
+    if (input.scope === 'yolo') {
+      return { autoApproved: true, reason: 'yolo-policy' };
+    }
+    if (input.scope === 'workspace' && input.insideWorkspace) {
+      return { autoApproved: true, reason: 'workspace-policy' };
+    }
   }
   // 'balanced' and 'strict' are identical on the EXECUTION gate: a
   // mutating shell/file write still needs an active plan scope. Balanced's
@@ -386,7 +433,7 @@ const UNGRANTABLE_MULTIPLEXERS = new Set<string>([
   'local_cli_run',
   'local_cli_exec',
 ]);
-function isUngrantableMultiplexer(name: string): boolean {
+export function isUngrantableMultiplexer(name: string): boolean {
   if (UNGRANTABLE_MULTIPLEXERS.has(name)) return true;
   // Arbitrary code/command execution hosted via MCP (kernel exec_command,
   // playwright run_code_unsafe / execute_playwright_code, ide executeCode).

@@ -782,14 +782,17 @@ test('confirm-first gate: same-shape writes accrue across calls and the batch tr
     // Write #5 trips the batch gate — no instruction-reviewed plan scope.
     await assert.rejects(async () => { await sendNo(5); }, (err: Error) => /CONFIRM_FIRST_REQUIRED/.test(err.message));
 
-    // Approving a plan opens a scope that covers the rest of the batch.
+    // Approving a plan opens a scope that ENUMERATES the send slug — the
+    // gateway name alone no longer launders consent (2026-07-09 Hole A), so the
+    // reviewed scope must name the actual slug it covers.
     openPlanScope({
       sessionId: sess.id,
       planProposalId: 'plan-test',
       approvedPlanObjective: 'Send the reviewed batch of emails',
       allowedTools: ['composio_execute_tool'],
+      allowedComposioSlugs: ['GMAIL_SEND_EMAIL'],
     });
-    assert.ok(String(await sendNo(5)).startsWith('sent'), 'write passes once a plan scope exists');
+    assert.ok(String(await sendNo(5)).startsWith('sent'), 'write passes once the slug is enumerated in a reviewed scope');
 
     // Closing the scope re-arms the gate.
     closePlanScope(sess.id, 'test');

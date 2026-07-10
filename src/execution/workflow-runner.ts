@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, openSync, writeSy
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
+import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { describeWorkflowStepAction } from '../runtime/approval-summary.js';
 import {
   interpreterFor, scrubbedChildEnv, electronNodeEnv, spawnSandboxedScript, DEFAULT_MAX_OUTPUT_BYTES,
@@ -3801,8 +3802,12 @@ export function stepSideEffectClass(step: WorkflowStepInput): 'read' | 'write' |
  *  send/publish/post/email → send; create/update/delete/write/upsert → write;
  *  else read). Exported for tests. */
 export function callToolSideEffectClass(tool: string): 'read' | 'write' | 'send' {
+  // Delegate the send determination to the ONE canonical predicate so the
+  // runtime agrees with the validator + the unattended auto-approve carve-out
+  // (2026-07-09 re-hunt: workflow call-node lane). The old regex missed
+  // CALL/DIAL/OUTBOUND/MAKE+CALL/RESPOND+EVENT.
+  if (isIrreversibleSendSlug(tool)) return 'send';
   const t = tool.toLowerCase();
-  if (/(?:_|^)(?:send|publish|post|email|dispatch|deliver|tweet|dm|message)(?:_|$)/.test(t)) return 'send';
   if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/.test(t)) return 'write';
   return 'read';
 }

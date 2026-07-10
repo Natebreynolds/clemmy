@@ -91,23 +91,26 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'sent' }]]),
   );
   try {
-    const send = (n: number) =>
-      invokeCallTool(
-        sess.id,
-        'composio_execute_tool',
-        JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: `p${n}@x.com` }) }),
-      );
-    let sawInnerKeyedNudge = false;
-    for (let n = 1; n <= 3; n += 1) {
-      const out = String(await send(n));
-      assert.ok(out.startsWith('sent'), `send #${n} passes through the gated inner tool`);
-      // The write-boundary guardrail fires keyed on the INNER slug — not "call_tool".
-      if (out.includes('GMAIL_SEND_EMAIL') && out.includes('fan-out')) sawInnerKeyedNudge = true;
-    }
-    assert.ok(sawInnerKeyedNudge, 'the write-boundary guardrail keyed on the INNER tool (GMAIL_SEND_EMAIL), proving gate parity');
-    // Direct signal: the harness recorded external_write events for the inner tool.
-    const writes = listEvents(sess.id, { types: ['external_write'] });
-    assert.ok(writes.length >= 3, `write-boundary ledger recorded the inner sends (got ${writes.length})`);
+    // NEW CONTRACT (2026-07-09 Lane 2): an IRREVERSIBLE SEND via call_tool is
+    // REFUSED — call_tool bypasses the approval card, so sends must go through
+    // run_batch or a first-class call. The refusal names the fix.
+    const sendOut = String(await invokeCallTool(
+      sess.id, 'composio_execute_tool',
+      JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: JSON.stringify({ to: 'p@x.com' }) }),
+    ));
+    assert.match(sendOut, /SEND_REQUIRES_APPROVAL|run_batch/i, 'a send via call_tool is refused, directed to run_batch/first-class');
+    assert.equal(listEvents(sess.id, { types: ['external_write'] }).length, 0, 'no send dispatched');
+
+    // A REVERSIBLE WRITE still routes through the gated boundary keyed on the
+    // inner tool name (gate parity preserved for non-sends).
+    _setCodeModeToolsForTests(
+      new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'updated' }]]),
+    );
+    const writeOut = String(await invokeCallTool(
+      sess.id, 'composio_execute_tool',
+      JSON.stringify({ tool_slug: 'GOOGLESHEETS_VALUES_UPDATE', arguments: JSON.stringify({ range: 'A1' }) }),
+    ));
+    assert.ok(writeOut.startsWith('updated'), 'a reversible write routes through the gated inner tool');
   } finally {
     _setCodeModeToolsForTests(null);
     process.env.HARNESS_TOOL_BRACKETS = prev.brackets;

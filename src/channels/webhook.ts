@@ -1866,6 +1866,54 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
 
   app.get('/api/runs/:id', requireAuth, (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const sendHarnessRun = (): boolean => {
+      const session = harnessGetSession(id);
+      if (!session) return false;
+      const events = harnessListEvents(id, { limit: 500, desc: true }) ?? [];
+      const status = effectiveHarnessStatus(session, events);
+      // Most-recent reply/summary for the reading pane "Result" block
+      // (events are newest-first, so find() returns the latest).
+      const completion = events.find((event) =>
+        event.type === 'conversation_completed' || event.type === 'run_completed',
+      );
+      const outputPreview = completionOutputPreview(completion);
+      res.json({ run: enrichActivityRunDetail({
+        id,
+        sessionId: id,
+        kind: ((session as { kind?: unknown }).kind ?? 'harness') as string,
+        channel: ((session as { channel?: unknown }).channel ?? undefined) as string | undefined,
+        source: harnessSource(session),
+        title: ((session as { title?: unknown }).title ?? '(Clementine session)') as string,
+        objective: ((session as { objective?: unknown }).objective ?? undefined) as string | undefined,
+        metadata: (session as { metadata?: Record<string, unknown> }).metadata,
+        status,
+        outputPreview,
+        createdAt: (session as { createdAt?: unknown }).createdAt as string | undefined,
+        updatedAt: (session as { updatedAt?: unknown }).updatedAt as string | undefined,
+        completedAt: status === 'completed' ? (session as { updatedAt?: unknown }).updatedAt as string | undefined : undefined,
+        // Keep `data` so the clean timeline can name tools/steps; `message`
+        // is the pre-rendered friendly line for the raw view. Reverse to
+        // oldest-first (events are fetched newest-first via desc).
+        events: events.slice().reverse().map((ev) => ({
+          id: (ev as { id?: unknown }).id as string | undefined,
+          type: (ev as { type?: unknown }).type as string | undefined,
+          createdAt: (ev as { createdAt?: unknown }).createdAt as string | undefined,
+          data: (ev as { data?: Record<string, unknown> }).data,
+          message: harnessEventMessage(ev),
+        })),
+      }) });
+      return true;
+    };
+
+    // A chat can have both a harness session and a legacy run record with the
+    // same sess-* id. The list endpoint already prefers harness; detail must do
+    // the same or an active approval can open as a stale completed legacy row.
+    try {
+      if (id.startsWith('sess-') && sendHarnessRun()) return;
+    } catch (err) {
+      // Fall through to legacy/fallback lookups below.
+    }
+
     // Legacy run-store lookup first (run-xxx IDs).
     const run = getRun(id);
     if (run) {
@@ -1874,45 +1922,7 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
     }
     // Fallback A — harness session (sess-xxx IDs).
     try {
-      if (id.startsWith('sess-')) {
-        const session = harnessGetSession(id);
-        if (session) {
-          const events = harnessListEvents(id, { limit: 500, desc: true }) ?? [];
-          const status = effectiveHarnessStatus(session, events);
-          // Most-recent reply/summary for the reading pane "Result" block
-          // (events are newest-first, so find() returns the latest).
-          const completion = events.find((event) =>
-            event.type === 'conversation_completed' || event.type === 'run_completed',
-          );
-          const outputPreview = completionOutputPreview(completion);
-          res.json({ run: enrichActivityRunDetail({
-            id,
-            sessionId: id,
-            kind: ((session as { kind?: unknown }).kind ?? 'harness') as string,
-            channel: ((session as { channel?: unknown }).channel ?? undefined) as string | undefined,
-            source: harnessSource(session),
-            title: ((session as { title?: unknown }).title ?? '(Clementine session)') as string,
-            objective: ((session as { objective?: unknown }).objective ?? undefined) as string | undefined,
-            metadata: (session as { metadata?: Record<string, unknown> }).metadata,
-            status,
-            outputPreview,
-            createdAt: (session as { createdAt?: unknown }).createdAt as string | undefined,
-            updatedAt: (session as { updatedAt?: unknown }).updatedAt as string | undefined,
-            completedAt: status === 'completed' ? (session as { updatedAt?: unknown }).updatedAt as string | undefined : undefined,
-            // Keep `data` so the clean timeline can name tools/steps; `message`
-            // is the pre-rendered friendly line for the raw view. Reverse to
-            // oldest-first (events are fetched newest-first via desc).
-            events: events.slice().reverse().map((ev) => ({
-              id: (ev as { id?: unknown }).id as string | undefined,
-              type: (ev as { type?: unknown }).type as string | undefined,
-              createdAt: (ev as { createdAt?: unknown }).createdAt as string | undefined,
-              data: (ev as { data?: Record<string, unknown> }).data,
-              message: harnessEventMessage(ev),
-            })),
-          }) });
-          return;
-        }
-      }
+      if (id.startsWith('sess-') && sendHarnessRun()) return;
       // Fallback B — workflow run record at workflows/runs/<runId>.json.
       const runPath = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
       if (existsSync(runPath)) {

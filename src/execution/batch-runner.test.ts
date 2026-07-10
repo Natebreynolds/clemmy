@@ -425,11 +425,15 @@ test('a harness gate REFUSAL banner is a FAILED item — never a fake success (2
     ['composio_execute_tool', fakeTool('composio_execute_tool', () =>
       'Tool call refused by harness: GOAL_FIDELITY_CHECK_FAILED: this irreversible composio_execute_tool was blocked')],
   ]) as never);
+  // Certified = the human-approved execute path (how a send batch actually
+  // runs). This reaches the inner tool so we can assert its refusal banner is
+  // an honest failure; an UNCERTIFIED send would be refused earlier by the
+  // send floor (which is also correct, just a different message).
   const ledger = await runBatchPlan({
     tool: 'composio_execute_tool', composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', sideEffect: 'send',
     objective: 'verify gate refusals are honest failures',
     items: [{ id: 'a@b.com', args: { to: 'a@b.com' } }],
-  }, 'sess-batch-test');
+  }, 'sess-batch-test', { certified: { payloadHash: 'h-test' } });
   assert.equal(ledger.succeeded, 0);
   assert.equal(ledger.failed, 1);
   assert.match(ledger.outcomes[0].error ?? '', /GOAL_FIDELITY|refused/);

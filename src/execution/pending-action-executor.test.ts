@@ -34,7 +34,9 @@ function queueSingleCall() {
 
 test('approved single-call executes the EXACT stored payload via the dispatcher', async () => {
   const record = queueSingleCall();
-  markPendingActionApprovalResolved(record.id, 'approved');
+  // Human card consent (I1): an external_send executes only on a real card
+  // decision — grant-invariants.test.ts pins the policy-consent refusal.
+  markPendingActionApprovalResolved(record.id, 'approved', 'apr-single-1');
 
   const dispatched: Array<{ toolName: string; payload: unknown; certifiedBatch: unknown }> = [];
   const res = await executeApprovedPendingActionCall(record.id, {
@@ -69,7 +71,9 @@ test('a run_batch pending action defers to the run_batch executor', async () => 
     title: 'Batch send', summary: 'run_batch plan', kind: 'external_send',
     toolName: 'run_batch', payload: { tool: 'composio_execute_tool', items: [] }, sessionId: 'sess-pae',
   });
-  markPendingActionApprovalResolved(record.id, 'approved');
+  // Human card consent — this test is about the run_batch deferral, and an
+  // irreversible send without human consent is now refused before it (I1).
+  markPendingActionApprovalResolved(record.id, 'approved', 'apr-batch-defer');
   let fired = false;
   const res = await executeApprovedPendingActionCall(record.id, { dispatch: async () => { fired = true; return 'x'; } });
   assert.equal(res.status, 'skipped');

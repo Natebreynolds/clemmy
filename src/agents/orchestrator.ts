@@ -318,7 +318,7 @@ async function yoloBlockedForSendBatch(args: RequestApprovalArgs): Promise<boole
   if (id) {
     try {
       const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
-      const { IRREVERSIBLE_VERBS } = await import('../runtime/harness/confirm-first-gate.js');
+      const { isIrreversibleSendSlug } = await import('../runtime/harness/confirm-first-gate.js');
       const record = getPendingAction(id);
       if (record) {
         // Send-ness anchors on BOTH the queue kind AND the plan's own slug —
@@ -327,7 +327,7 @@ async function yoloBlockedForSendBatch(args: RequestApprovalArgs): Promise<boole
         // blocker, 2026-07-09).
         const payload = record.payload as { items?: unknown[]; composioSlug?: string } | undefined;
         const slugIrreversible = typeof payload?.composioSlug === 'string'
-          && payload.composioSlug.split('_').some((part) => IRREVERSIBLE_VERBS.has(part.toUpperCase()));
+          && isIrreversibleSendSlug(payload.composioSlug);
         if (record.kind !== 'external_send' && !slugIrreversible) return false;
         // Unknown count on a queued SEND batch → conservative: require a human.
         return !Array.isArray(payload?.items) || payload.items.length >= floor;
@@ -424,7 +424,13 @@ async function markPendingActionApprovedFromRequest(args: RequestApprovalArgs): 
   if (!pendingActionId) return '';
   try {
     const { getPendingAction, markPendingActionApprovalResolved } = await import('../runtime/harness/pending-actions.js');
-    markPendingActionApprovalResolved(pendingActionId, 'approved');
+    // POLICY consent, typed as such (THE-GRANT R1): this auto-approve path can
+    // never mint 'human' — irreversible kinds require a real card decision and
+    // are refused at execute without one.
+    markPendingActionApprovalResolved(pendingActionId, 'approved', null, {
+      by: 'policy',
+      evidence: { kind: 'policy', scope: loadProactivityPolicy().autoApproveScope },
+    });
     const record = getPendingAction(pendingActionId);
     if (!record) {
       return ` Queued action ${pendingActionId} is approved, but the queue record could not be read; do not reconstruct it from memory.`;

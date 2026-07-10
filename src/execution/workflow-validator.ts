@@ -29,6 +29,7 @@ import {
   promptLooksDeliverable,
   textMentionsDeliverable,
 } from './workflow-deliverable-hints.js';
+import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -542,10 +543,15 @@ export function stepLooksMultiItemWithoutForEach(step: WorkflowStepShape): boole
  *  wins, else derived from the tool slug (mirrors callToolSideEffectClass in the
  *  runner; kept local to avoid a validator→runner import cycle). */
 function callSideEffectClass(step: WorkflowStepShape): 'read' | 'write' | 'send' {
+  const t = (step.call?.tool ?? '');
+  // A real SEND slug can NEVER be downgraded by an explicit sideEffect — the
+  // canonical predicate is checked FIRST so an author labeling a VAPI_CREATE_CALL
+  // node `sideEffect: read`/`write` cannot skip the SEND-CALL GATE (2026-07-09
+  // re-hunt author-side vector). For non-sends the declared class still wins —
+  // authors know their read-only calls best.
+  if (isIrreversibleSendSlug(t)) return 'send';
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
-  const t = (step.call?.tool ?? '').toLowerCase();
-  if (/(?:_|^)(?:send|publish|post|email|dispatch|deliver|tweet|dm|message)(?:_|$)/.test(t)) return 'send';
-  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/.test(t)) return 'write';
+  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/i.test(t)) return 'write';
   return 'read';
 }
 
@@ -685,6 +691,14 @@ export function validateWorkflowDefinition(
       // lands and is live-tested.
       if (step.forEach && callSideEffectClass(step) !== 'read') {
         errors.push(`Step "${step.id ?? '?'}" declares a ${callSideEffectClass(step)}-class call with forEach — a per-item send/write call is not supported yet (double-act risk without per-call idempotency). Use a plain forEach step for the mutating action, or declare sideEffect: read only if the call truly is read-only.`);
+      }
+      // SEND-CALL GATE (2026-07-09 Lane 4): a structured call-node that SENDS
+      // (email/call/post) dispatches directly — no LLM, never through the
+      // bracket battery, so an unattended run fires it with no card. Require
+      // an explicit approval declaration so an ungated send call-node is
+      // un-saveable and un-runnable.
+      if (!step.requiresApproval && callSideEffectClass(step) === 'send') {
+        errors.push(`Step "${step.id ?? '?'}" is a SEND-class call node (${step.call?.tool ?? '?'}) with no approval. A structured send call dispatches directly with no approval card — set requiresApproval: true (+ a short approvalPreview), or route the send through run_batch so it queues for the user's approval.`);
       }
     }
     if (step.id) {

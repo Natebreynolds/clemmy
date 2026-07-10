@@ -38,6 +38,7 @@ writeFileSync(
 const {
   applySkillToPrompt,
   planWorkflowExecutionBatches,
+  callToolSideEffectClass,
   runDeterministicWorkflowStepForTest,
   workflowRunnerInternalsForTest,
   explainDeterministicSpawnError,
@@ -81,6 +82,22 @@ const {
 // machines). Silent-on-track stub = the byte-identical no-steer path.
 const { _setWorkflowWatcherForTests } = await import('./workflow-runner.js');
 _setWorkflowWatcherForTests(async () => ({ onTrack: true, miss: '', steer: '' }));
+
+// ─── Re-hunt Lane 4 regression (2026-07-09) ───────────────────────
+// The RUNTIME call-node classifier must agree with the validator (both route
+// through isIrreversibleSendSlug). The old regex called VAPI_CREATE_CALL /
+// TWILIO_MAKE_OUTBOUND_CALL / RESPOND_TO_EVENT 'write'/'read', so the
+// unattended-scheduled auto-approve carve-out fired them with no consent.
+test('callToolSideEffectClass: telephony + comm-object dispatches are SEND (validator/runtime agree)', () => {
+  for (const t of ['VAPI_CREATE_CALL', 'TWILIO_MAKE_OUTBOUND_CALL', 'ELEVENLABS_MAKE_OUTBOUND_CALL', 'make_outbound_call', 'GOOGLECALENDAR_RESPOND_TO_EVENT', 'GMAIL_SEND_EMAIL', 'DISCORD_CREATE_MESSAGE', 'outlook_send_draft', 'outlook_forward_mail']) {
+    assert.equal(callToolSideEffectClass(t), 'send', `${t} must classify as send at runtime`);
+  }
+  // Reversible writes stay 'write'; call-reads stay 'read'; no over-gating.
+  assert.equal(callToolSideEffectClass('GOOGLESHEETS_CREATE_SPREADSHEET'), 'write');
+  assert.equal(callToolSideEffectClass('OUTLOOK_CREATE_DRAFT'), 'write');
+  assert.equal(callToolSideEffectClass('VAPI_GET_CALL'), 'read');
+  assert.equal(callToolSideEffectClass('TWILIO_LIST_CALLS'), 'read');
+});
 const { SessionStore: RunnerSessionStore } = await import('../memory/session-store.js');
 const { readWorkflowEvents, appendWorkflowEvent, computeResumeState } = await import('./workflow-events.js');
 const { clearStepWatermark, readSeenItemKeys } = await import('./workflow-watermark-store.js');

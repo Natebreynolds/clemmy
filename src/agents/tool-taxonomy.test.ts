@@ -212,6 +212,22 @@ test('classifyTool: send (network mutation) prefixes', () => {
   assert.equal(classifyTool('publish_announcement'), 'send');
 });
 
+test('classifyTool: native comm-object sends the verb list misses are SEND (re-hunt Lanes 2/3)', () => {
+  // create_event emails invitees; respond_to_event RSVPs; these matched the
+  // 'write' verb (create/respond) → 'write' → kindHint 'other' → disarmed the
+  // send lock under a wildcard scope. They must classify as 'send'.
+  assert.equal(classifyTool('claude_ai_Google_Calendar__create_event'), 'send');
+  assert.equal(classifyTool('claude_ai_Microsoft_365__outlook_respond_to_event'), 'send');
+  assert.equal(classifyTool('outlook_send_draft'), 'send');
+  assert.equal(classifyTool('outlook_forward_mail'), 'send');
+  // But a reversible create/read is NOT upgraded: a draft, a comment, a
+  // spreadsheet, and a call READ all stay their true kind (no over-gate).
+  assert.equal(classifyTool('outlook_create_draft'), 'write');
+  assert.equal(classifyTool('create_record_comment'), 'write');
+  assert.equal(classifyTool('googlesheets_create_spreadsheet'), 'write');
+  assert.equal(classifyTool('mcp__vapi__get_call'), 'read');
+});
+
 test('classifyTool: composio_execute_tool routes through tool_slug', () => {
   assert.equal(
     classifyTool('composio_execute_tool', { args: { tool_slug: 'GOOGLESHEETS_BATCH_GET' } }),
@@ -304,13 +320,18 @@ test('decideToolApproval: strict scope makes writes/executes/sends ask', () => {
   }
 });
 
-test('decideToolApproval: yolo scope auto-approves writes/executes/sends', () => {
+test('decideToolApproval: yolo scope auto-approves reversible writes/executes; an IRREVERSIBLE send still cards', () => {
   setScope('yolo');
-  for (const name of ['write_file', 'run_shell_command', 'send_message']) {
+  // Reversible work flows under YOLO.
+  for (const name of ['write_file', 'run_shell_command']) {
     const { needsApproval, reason } = decideToolApproval({ toolName: name });
     assert.equal(needsApproval, false, name);
     assert.equal(reason, 'yolo-policy');
   }
+  // An irreversible send is NOT auto-approved by YOLO (2026-07-09 Hole C) — it
+  // gets one human card. YOLO ≠ "email anyone silently".
+  const send = decideToolApproval({ toolName: 'send_message' });
+  assert.equal(send.needsApproval, true, 'irreversible send cards even under YOLO');
 });
 
 test('decideToolApproval: workspace scope auto-approves writes inside workspace only', () => {

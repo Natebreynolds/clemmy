@@ -96,6 +96,14 @@ test('modelContextLimit: gpt-5.5 family caps at Codex-oauth 400K ceiling', () =>
   assert.equal(modelContextLimit('gpt-5.5-mini'), 200_000);
 });
 
+test('modelContextLimit: gpt-5.6 family resolves before discovery docs catch up', () => {
+  assert.equal(modelContextLimit('gpt-5.6'), 400_000);
+  assert.equal(modelContextLimit('gpt-5.6-sol'), 400_000);
+  assert.equal(modelContextLimit('gpt-5.6-terra'), 400_000);
+  assert.equal(modelContextLimit('gpt-5.6-mini'), 200_000);
+  assert.equal(modelContextLimit('gpt-5.6-sol-2026-07-09'), 400_000);
+});
+
 test('modelContextLimit: gpt-5.5 dated snapshot variant matches via prefix', () => {
   assert.equal(modelContextLimit('gpt-5.5-2026-04-23'), 400_000);
   assert.equal(modelContextLimit('gpt-5.5-codex-2026-05'), 400_000);

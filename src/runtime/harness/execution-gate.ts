@@ -52,6 +52,15 @@ const MUTATING_VERBS: ReadonlySet<string> = new Set([
   'REMOVE',
   'PUBLISH',
   'BATCH', // BATCH_UPDATE, BATCH_DELETE, etc — slug starts with BATCH
+  // Telephony / social publishes — irreversible external actions whose slugs
+  // (TWILIO_MAKE_OUTBOUND_CALL, *_DIAL, *_BROADCAST) carry no CREATE/SEND verb
+  // (2026-07-09 Hole B). Kept in sync with confirm-first IRREVERSIBLE_VERBS.
+  'CALL',
+  'DIAL',
+  'OUTBOUND',
+  'TWEET',
+  'BROADCAST',
+  'DM',
 ]);
 
 /**
@@ -116,6 +125,60 @@ const EXEMPT_TOOL_NAMES: ReadonlySet<string> = new Set([
  *     because static classification is unreliable; the user can opt
  *     in via env flag later.
  */
+/** Verbs whose external effect can't be taken back. Kept here (the lowest pure
+ *  module) so both isMutatingExternalWrite and the confirm-first classifier
+ *  share ONE definition (2026-07-09 unification). */
+export const IRREVERSIBLE_SEND_VERBS: ReadonlySet<string> = new Set([
+  'SEND', 'PUBLISH', 'POST', 'DIAL', 'OUTBOUND', 'TWEET', 'BROADCAST', 'DM',
+  // FORWARD (outlook_forward_mail) and REPLY (gmail_reply_to_thread) dispatch a
+  // real email. A *_REPLY_DRAFT stays reversible — the DRAFT rule below wins.
+  'FORWARD', 'REPLY',
+  // NOTE: 'CALL' is a COMM_OBJECT, not a send verb. Every real call-SEND slug
+  // carries a dispatch verb (CREATE_CALL, MAKE_OUTBOUND_CALL) or OUTBOUND/DIAL,
+  // so it's still caught — while call-READS (VAPI_GET_CALL, list_calls) no longer
+  // false-match the bare noun (2026-07-09 re-hunt).
+]);
+// A CREATE/MAKE/RESPOND/POST of a COMMUNICATION object is a send (an email/
+// call/message/invite goes out) even without a SEND verb —
+// TWILIO_CREATE_MESSAGE, VAPI_CREATE_CALL, GOOGLECALENDAR_CREATE_EVENT,
+// RESPOND_TO_EVENT (RSVP) — while CREATE_SPREADSHEET / CREATE_RECORD stay
+// reversible writes. This object-aware layer is what the {SEND,PUBLISH}
+// verb-match was missing.
+const COMM_OBJECTS: ReadonlySet<string> = new Set([
+  'MESSAGE', 'MESSAGES', 'EMAIL', 'EMAILS', 'MAIL', 'SMS', 'CALL', 'POST', 'POSTS',
+  'TWEET', 'INVITE', 'INVITES', 'INVITATION', 'REPLY',
+  'DM', 'NOTIFICATION', 'ANNOUNCEMENT', 'EVENT',
+  // NOTE: 'CHAT' and 'COMMENT' were removed — they over-gated reversible calls
+  // (OPENAI_CREATE_CHAT_COMPLETION is an LLM read; *_CREATE_COMMENT on a doc/
+  // record is internal + deletable). SLACK_CHAT_POST_MESSAGE stays caught via
+  // the POST verb + MESSAGE object (2026-07-09 re-hunt).
+]);
+// NOTE: 'ADD' is deliberately NOT here. It catches ZERO real sends (no
+// *_ADD_<comm-object> send slug exists) but DID over-gate reversible metadata
+// ops — GMAIL_ADD_LABEL_TO_EMAIL, SLACK_ADD_REACTION_TO_A_MESSAGE — as
+// irreversible sends, silently breaking auto-triage/labeling workflows
+// (2026-07-09 re-hunt round 2). Adding a label/reaction is reversible; there is
+// no add-a-communication send verb.
+const DISPATCH_VERBS: ReadonlySet<string> = new Set(['CREATE', 'MAKE', 'RESPOND', 'POST']);
+
+/** THE canonical "is this an irreversible external send" predicate — the one
+ *  chokepoint classifier every dispatch lane routes through. A DRAFT is
+ *  reversible; a SEND/PUBLISH/CALL verb is a send; a CREATE/MAKE/RESPOND/POST
+ *  of a communication object is a send. Pure + exported. */
+export function isIrreversibleSendSlug(slug: string): boolean {
+  const parts = slug.toUpperCase().split(/[_.]/);
+  // DRAFT handling must run BEFORE the send-verb match, but must NOT blanket-
+  // exempt an explicit send-of-draft: SEND_DRAFT / PUBLISH_DRAFT actually
+  // dispatch the composed draft, while CREATE_DRAFT / CREATE_REPLY_DRAFT do not.
+  // (The prior `includes('DRAFT') → return false` short-circuited before the
+  // SEND check and let every *_SEND_DRAFT through unapproved — 2026-07-09 re-hunt.)
+  if (parts.includes('DRAFT') || parts.includes('DRAFTS')) {
+    return parts.includes('SEND') || parts.includes('PUBLISH');
+  }
+  if (parts.some((p) => IRREVERSIBLE_SEND_VERBS.has(p))) return true;
+  return parts.some((p) => DISPATCH_VERBS.has(p)) && parts.some((p) => COMM_OBJECTS.has(p));
+}
+
 export function isMutatingExternalWrite(
   toolName: string,
   rawArgs: unknown,
@@ -136,11 +199,36 @@ export function isMutatingExternalWrite(
     for (const part of parts) {
       if (MUTATING_VERBS.has(part)) return true;
     }
+    // An irreversible send whose verb isn't in MUTATING_VERBS (RESPOND_TO_EVENT
+    // RSVP, a CREATE/RESPOND + comm-object) must still be seen as mutating so
+    // the send floor gets a chance (2026-07-09 unification).
+    if (isIrreversibleSendSlug(slug)) return true;
     return false;
   }
 
+  // Native MCP tools (e.g. outlook_send_mail, make_outbound_call, create_call,
+  // slack post_message) bypass composio_execute_tool but are still irreversible
+  // external actions. The 2026-07-09 bypass hunt found these ungated on the MCP
+  // shim lane. Name-shape match on the bare tool name (server prefix stripped
+  // upstream): a send/publish/post/dispatch verb.
+  if (looksLikeNativeMcpSend(toolName)) return true;
+
   // Everything else is NOT gated for now. Extension points above.
   return false;
+}
+
+/**
+ * Name-shape detector for a native (non-composio) MCP tool that performs an
+ * irreversible external send/publish. Delegates to the ONE canonical classifier
+ * (isIrreversibleSendSlug) on the bare tool name, so native names go through the
+ * same send-verb + CREATE/RESPOND/POST-of-a-comm-object logic as composio slugs
+ * — catching outlook_send_mail, make_outbound_call, create_event (invite),
+ * respond_to_event (RSVP), create_record_comment, post_message; excluding
+ * drafts and reads (2026-07-09 unification). Pure + exported.
+ */
+export function looksLikeNativeMcpSend(toolName: string): boolean {
+  const bare = toolName.includes('__') ? toolName.split('__').at(-1) ?? toolName : toolName;
+  return isIrreversibleSendSlug(bare);
 }
 
 /**

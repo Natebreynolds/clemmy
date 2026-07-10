@@ -88,7 +88,15 @@ export function registerBatchTools(server: McpServer): void {
           };
           const prepared = prepareBatchPlanForExecution(plan);
           if (prepared.errors.length > 0) {
-            return textResult(`Plan invalid after harness normalization — fix and re-propose:\n${prepared.errors.map((e) => `- ${e}`).join('\n')}`);
+            // Actionable rejection (autopsy A8): a lazy plan that references a
+            // prepared batch instead of materializing every payload (live
+            // 2026-07-09 → a 5-minute chunked-recall spiral) gets the fastest
+            // remediation named, not just "invalid".
+            const missingFields = prepared.errors.some((e) => /missing required field/i.test(e));
+            const remedy = missingFields
+              ? '\n\nFASTEST FIX: each item\'s `args` must be the FULLY MATERIALIZED JSON for the tool — every required field present (the harness already normalizes to_email/subject/body and to→to_email, so do NOT hand-map). If the payloads already exist in a saved artifact, read that file ONCE and inline each item\'s complete args; do not reference the batch by name.'
+              : '';
+            return textResult(`Plan invalid after harness normalization — fix and re-propose:\n${prepared.errors.map((e) => `- ${e}`).join('\n')}${remedy}`);
           }
           const planForExecution = prepared.plan;
           const errors = validateBatchPlan(planForExecution);
@@ -112,9 +120,9 @@ export function registerBatchTools(server: McpServer): void {
           // an OUTLOOK_*_SEND_* plan labeled 'write' must still queue as an
           // external_send so the YOLO send gate sees it (adversarial-review
           // blocker, 2026-07-09).
-          const { IRREVERSIBLE_VERBS } = await import('../runtime/harness/confirm-first-gate.js');
+          const { isIrreversibleSendSlug } = await import('../runtime/harness/confirm-first-gate.js');
           const slugIsSend = typeof planForExecution.composioSlug === 'string'
-            && planForExecution.composioSlug.split('_').some((p) => IRREVERSIBLE_VERBS.has(p.toUpperCase()));
+            && isIrreversibleSendSlug(planForExecution.composioSlug);
           const record = queuePendingAction({
             title: `Batch ${planForExecution.sideEffect}: ${planForExecution.objective.slice(0, 80)}`,
             summary: `run_batch plan · ${planForExecution.tool}${planForExecution.composioSlug ? `/${planForExecution.composioSlug}` : ''} · ${planForExecution.items.length} item(s), executed deterministically after approval. Certification: ${cert.reason || 'allowed'}${repairNote}`,
@@ -140,6 +148,17 @@ export function registerBatchTools(server: McpServer): void {
           if (record.toolName !== 'run_batch') return textResult(`Pending action ${pending_action_id} is not a run_batch plan.`);
           if (record.status !== 'approved') {
             return textResult(`Pending action ${pending_action_id} is ${record.status} — it must be APPROVED before execution.`);
+          }
+          // GRANT INVARIANT I1 (Phase 1): an irreversible send batch executes
+          // only on HUMAN consent. A policy-minted approval (YOLO auto-approve,
+          // Exhibit A's forgery point) is inert here — the honest path is the
+          // approval card, which this refusal names.
+          if (record.kind === 'external_send' && record.approvedBy !== 'human') {
+            return textResult(
+              `Pending action ${pending_action_id} is an irreversible send batch approved by POLICY, not by the user. `
+              + 'It requires the user\'s explicit approval card before execution — file it with request_approval '
+              + `(pendingActionId=${pending_action_id}) and wait for their decision.`,
+            );
           }
           const prepared = prepareBatchPlanForExecution(record.payload as BatchPlan);
           if (prepared.errors.length > 0) return textResult(`Stored plan failed normalization (${prepared.errors.join('; ')}) — do not execute; re-propose.`);

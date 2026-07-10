@@ -12,6 +12,7 @@ import {
   filterToolsByPolicy,
   looksLikeToolError,
   parseToolArguments,
+  _testOnly_buildRunnerConfig,
   _testOnly_sanitizeAgentDecisionOutput,
 } from './autonomy-v2.js';
 import { DEFAULT_PROACTIVITY_POLICY, type ProactivityPolicySnapshot } from './proactivity-policy.js';
@@ -68,6 +69,19 @@ test('sanitizeAgentDecisionOutput treats plain text as a usable summary', () => 
   assert.deepEqual(decision, {
     summary: 'Reviewed the queued work and found nothing that needs action yet.',
     commitments: [],
+  });
+});
+
+test('autonomy-v2 runner disables SDK tracing when no OpenAI capability key is available', () => {
+  assert.deepEqual(_testOnly_buildRunnerConfig(false), {
+    workflowName: 'clementine-autonomy-v2',
+    groupId: 'clementine',
+    tracingDisabled: true,
+  });
+  assert.deepEqual(_testOnly_buildRunnerConfig(true), {
+    workflowName: 'clementine-autonomy-v2',
+    groupId: 'clementine',
+    tracingDisabled: false,
   });
 });
 

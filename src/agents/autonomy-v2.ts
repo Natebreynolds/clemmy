@@ -1,4 +1,4 @@
-import { Agent, Runner, setDefaultOpenAIKey } from '@openai/agents';
+import { Agent, Runner, setDefaultOpenAIKey, setTracingExportApiKey } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -565,13 +565,27 @@ export function clearAutonomyAgentCache(): void {
  */
 const currentRunIdByAgent: WeakMap<AutonomyAgent, string> = new WeakMap();
 
+function buildRunnerConfig(hasOpenAiKey: boolean): ConstructorParameters<typeof Runner>[0] {
+  return {
+    workflowName: 'clementine-autonomy-v2',
+    groupId: 'clementine',
+    tracingDisabled: !hasOpenAiKey,
+  };
+}
+
 function getRunner(): Runner {
   if (runner) return runner;
   const key = getOpenAiApiKey();
-  if (key) setDefaultOpenAIKey(key);
-  runner = new Runner({ workflowName: 'clementine-autonomy-v2', groupId: 'clementine' });
+  const hasKey = key.trim().length > 0;
+  if (hasKey) {
+    setDefaultOpenAIKey(key);
+    setTracingExportApiKey(key);
+  }
+  runner = new Runner(buildRunnerConfig(hasKey));
   return runner;
 }
+
+export const _testOnly_buildRunnerConfig = buildRunnerConfig;
 
 function recordHash(record: TeamAgentRecord): string {
   return JSON.stringify({

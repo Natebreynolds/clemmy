@@ -331,14 +331,22 @@ test('goal-scoped scope with NO allowedSends gates every send', () => {
   assert.equal(isAutoApprovedByScope('sess-gs3', 'write_file', undefined, 'other'), true, 'non-sends still flow');
 });
 
-test('a TIME-boxed scope keeps its prior send behavior (send lock is goal-scoped only)', () => {
-  // Without goalScoped, a send listed in allowedTools auto-approves as before —
-  // the 15-min TTL is what bounds it. The send lock must not regress this.
+test('a send EXPLICITLY named in allowedTools auto-approves; a wildcard scope does NOT (send lock, 2026-07-09)', () => {
+  // A send named in allowedTools is explicit human review → auto-approves.
   openPlanScope({
     sessionId: 'sess-tb', planProposalId: 'plan-tb', approvedPlanObjective: 'time-boxed',
     allowedTools: ['GMAIL_SEND_EMAIL'],
   });
-  assert.equal(isAutoApprovedByScope('sess-tb', 'GMAIL_SEND_EMAIL', undefined, 'send'), true);
+  assert.equal(isAutoApprovedByScope('sess-tb', 'GMAIL_SEND_EMAIL', undefined, 'send'), true, 'explicit send tool auto-approves');
+  // A WILDCARD scope must NOT auto-approve an un-enumerated send (the
+  // workflow/background bypass, Hole 2).
+  openPlanScope({
+    sessionId: 'sess-wild', planProposalId: 'plan-wild', approvedPlanObjective: 'wildcard',
+    allowedTools: ['*'],
+  });
+  assert.equal(isAutoApprovedByScope('sess-wild', 'GMAIL_SEND_EMAIL', undefined, 'send'), false, 'wildcard scope never waves an un-enumerated send');
+  // A wildcard scope still auto-approves a reversible WRITE (unchanged).
+  assert.equal(isAutoApprovedByScope('sess-wild', 'GOOGLESHEETS_VALUES_UPDATE', undefined, 'other'), true, 'wildcard still covers reversible writes');
 });
 
 // ─── B2: standing grants ─────────────────────────────────────────────────────

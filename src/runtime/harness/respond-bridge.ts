@@ -60,22 +60,11 @@ import type { AssistantRequest, AssistantResponse, AssistantRouteDiagnostics, To
 
 export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashboard' | 'home' | 'workflow' | 'discord' | 'slack';
 
-/** Surfaces that are STAGED, not yet validated live: default OFF (legacy stays
- *  byte-identical) so a new conversion lands reversibly and Nathan flips the
- *  switch to live-verify, after which it bakes in and leaves this set. The
- *  already-validated surfaces (webhook/cron/background/cli) default ON. These
- *  flags are TEMPORARY — they collapse to zero (legacy core deleted, conversions
- *  baked in) once validated, so the net is a flag REDUCTION, not sprawl.
- *
- *  2026-06-13 (audit #7 / FORK-collapse): dashboard, home, and workflow have
- *  been validated live (the dev daemon ran all three on the gated loop all
- *  session — architect draft, home chat, and workflow step-chaining smokes
- *  green every run). They now default ON like the other surfaces — the gated
- *  harness loop is the ONE path for every surface. Per-surface kill-switches
- *  (CLEMMY_HARNESS_DASHBOARD/HOME/WORKFLOW=off) remain for instant reversibility
- *  until the legacy core is deleted (Phase 2). Set is now empty (flag REDUCTION
- *  realized). */
-const STAGING_SURFACES: ReadonlySet<HarnessSurface> = new Set<HarnessSurface>();
+/** Every surface runs on the gated harness loop by default (the FORK is dead as
+ *  of v1.4.0). Each keeps a per-surface kill-switch (CLEMMY_HARNESS_<SURFACE>=off)
+ *  for instant reversibility until the legacy core is deleted (Phase 2). The old
+ *  staged-surface default-OFF set collapsed to empty once every surface was
+ *  validated live, and was removed in the 2026-07-09 subtraction pass. */
 
 /** The harness can only ENFORCE an exclusion for tools on its own local surface
  *  (buildOrchestratorAgent filters those by name). External MCP-server tools are
@@ -147,7 +136,8 @@ const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judge
 };
 
 export function harnessSurfaceEnabled(surface: HarnessSurface): boolean {
-  const dflt = STAGING_SURFACES.has(surface) ? 'off' : 'on';
+  // Default ON for every surface; the per-surface kill-switch can force it off.
+  const dflt = 'on';
   const raw = (getRuntimeEnv(`CLEMMY_HARNESS_${surface.toUpperCase()}`, dflt) ?? dflt).trim().toLowerCase();
   return !(raw === 'off' || raw === '0' || raw === 'false' || raw === 'no');
 }

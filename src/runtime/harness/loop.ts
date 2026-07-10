@@ -48,6 +48,8 @@ import { MODELS } from '../../config.js';
 import { judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, isDirectionSeekingQuestion, composeJudgedObjective, type ObjectiveJudgeFn, type ObjectiveJudgeVerdict } from './objective-judge.js';
 import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, watcherJudgeEnabled, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn, type WatcherVerdict } from './watcher-judge.js';
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
+import { classifyExternalWrite } from './confirm-first-gate.js';
+import { isUngrantableMultiplexer } from '../../agents/plan-scope.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -1018,6 +1020,17 @@ function priorTurnAskedQuestion(sessionId: string, currentTurn: number): boolean
   }
 }
 
+/** An approval card is OPEN for this session (THE-GRANT question-immunity:
+ *  the completion judge never fires while the human's decision is pending).
+ *  Fail-open to false — a registry read error must not suppress the judge. */
+function hasOpenApprovalCard(sessionId: string): boolean {
+  try {
+    return approvalRegistry.listPending({ sessionId }).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * v0.5.19 F1 — build the preflight-block system message that gets
  * injected when the gate at `runTurn` projects the next turn would
@@ -1043,29 +1056,20 @@ export function buildPreflightBlockMessage(input: {
   // its actual job (live 2026-05-30: "I need plan mode to do batch
   // rates"). It now surfaces the cost as context and trusts the model to
   // drive — be economical, or split big work via create_plan, but keep
-  // the task moving. The opt-out env stays for parity with old behavior.
-  const useLegacyBlock =
-    (getRuntimeEnv('CLEMMY_PREFLIGHT_LEGACY_BLOCK', 'off') ?? 'off').toLowerCase() === 'on';
+  // the task moving. (The CLEMMY_PREFLIGHT_LEGACY_BLOCK opt-in to the old
+  // hard-stop was retired in the 2026-07-09 subtraction pass — the advisory
+  // default has been the validated behavior since 2026-05-30.)
   const header =
     `[CONTEXT BUDGET NOTICE] This turn is projected at ~${predictedTokens.toLocaleString()} tokens, ` +
     `nearing ${(blockFraction * 100).toFixed(0)}% of the effective context limit ` +
     `(${effectiveLimit.toLocaleString()} tokens). `;
-  if (!useLegacyBlock) {
-    return (
-      header +
-      `This is guidance, not a stop — proceed if the work is worth it. To stay within budget, prefer ` +
-      `narrow tool calls (request only the fields you need) and avoid re-reading large outputs. ` +
-      `If this is a big multi-step effort, you MAY outline it with \`create_plan\` so it survives ` +
-      `context limits, but only if that genuinely helps — do not pause a task that you can finish now. ` +
-      `Use your judgment and keep moving.`
-    );
-  }
   return (
     header +
-    `You MUST call \`propose_plan\` to outline the work for user approval BEFORE executing any tool calls. ` +
-    `Do NOT fire external tool calls in this turn — the plan-mode interlude exists to keep this conversation alive. ` +
-    `If propose_plan is unavailable, reply asking the user to type \`/new continue\` to start a fresh session ` +
-    `(facts + focus carry over via the brain).`
+    `This is guidance, not a stop — proceed if the work is worth it. To stay within budget, prefer ` +
+    `narrow tool calls (request only the fields you need) and avoid re-reading large outputs. ` +
+    `If this is a big multi-step effort, you MAY outline it with \`create_plan\` so it survives ` +
+    `context limits, but only if that genuinely helps — do not pause a task that you can finish now. ` +
+    `Use your judgment and keep moving.`
   );
 }
 
@@ -2557,6 +2561,10 @@ async function runConversationCore(
           // work and never produced it — the chatbot shape. The judge then forces
           // a real artifact or an honest blocker.
           promiseShaped: isPromiseShapedReply(decision.reply || decision.summary),
+          // THE-GRANT Phase 1: never judge completion while the human's approval
+          // card is open — the run is waiting on THEM, and a bounce here is what
+          // escalated a parked ask into unapproved sends (Exhibit A).
+          openApprovalCard: hasOpenApprovalCard(options.sessionId),
         })
         // "I'll report back when it finishes" after a real workflow_run
         // dispatch is NOT promise-shaped over-declaration — the report-back is
@@ -2736,6 +2744,19 @@ async function runConversationCore(
             'Only set nextAction=completed once the real artifact or verifiable evidence genuinely exists.',
           ].join(' ');
           continue;
+        }
+        // Capability compounding (C2, no-goal): a judge-VERIFIED completion with
+        // no pinned goal is still a validated success — distill it into a reusable
+        // draft skill, exactly as the pinned-goal path does at satisfyGoal. Without
+        // this, a successful ad-hoc multi-step run never graduated into a skill
+        // (2026-07-09: extends the shipped distiller to the independent-completion
+        // path). The novelty gate inside distillSkillFromSession no-ops routine
+        // runs, so only genuinely multi-step, discovery-heavy work mints a skill.
+        // Fire-and-forget; never blocks the turn.
+        if (verdict.done) {
+          const distillEvidence = [responseText ?? '', skillContext.toolCallSummary]
+            .filter((s) => s && s.trim()).join('\n');
+          void maybeDistillSkill(options.sessionId, judgedObjective, distillEvidence, options.sessionId);
         }
       }
       // Output-grounding (chat deliverable). The objective judge above verifies
@@ -4539,12 +4560,28 @@ export async function resumePendingApproval(
         }
         stateApi.approve(item);
       } else {
-        // STICKY APPROVAL: pass alwaysApprove so the SDK caches this
-        // decision for the remainder of the run. If the same tool gets
-        // invoked again later in the conversation (model retried, agent
-        // recovered from a fabricated reply, etc.), the SDK auto-resolves
-        // without re-prompting the user.
-        stateApi.approve(item, { alwaysApprove: true });
+        // STICKY APPROVAL caches the decision keyed on the TOOL NAME only —
+        // so for the composio multiplexer, approving one send would auto-
+        // approve every later composio_execute_tool call (different slug,
+        // different recipient) with no card (2026-07-09 Lane 1: one consent →
+        // N irreversible sends). NEVER make an irreversible send sticky —
+        // approve just this call so send #2 re-parks. Reversible/other tools
+        // keep the sticky convenience.
+        const rawItem = (item as { rawItem?: { name?: string; arguments?: unknown } } | null)?.rawItem;
+        const rawName = rawItem?.name ?? '';
+        const isSend = (() => {
+          try { return classifyExternalWrite(rawName, rawItem?.arguments).irreversible; }
+          catch { return false; }
+        })();
+        // alwaysApprove keys on the bare TOOL NAME. For the composio gateway that
+        // name is the slug-blind multiplexer `composio_execute_tool` — making it
+        // sticky on a reversible DRAFT would auto-approve a LATER send of a
+        // different slug with no card. The multiplexer name NEVER counts as
+        // consent (mirrors the Hole-A guard in brackets.ts / plan-scope.ts) —
+        // so only non-send, non-multiplexer tools keep the sticky convenience
+        // (2026-07-09 re-hunt Lane 1).
+        const sticky = !isSend && !isUngrantableMultiplexer(rawName);
+        stateApi.approve(item, sticky ? { alwaysApprove: true } : undefined);
       }
     } else {
       // Symmetric for rejections: future identical invocations stay

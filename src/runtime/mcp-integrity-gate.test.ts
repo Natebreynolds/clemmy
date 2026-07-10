@@ -30,6 +30,7 @@ import type { MCPServer } from '@openai/agents';
 const { createMcpNamespaceShim } = await import('./mcp-namespace-shim.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
 const { createSession, writeToolOutput, listEvents, resetEventLog } = await import('./harness/eventlog.js');
+const { openPlanScope } = await import('../agents/plan-scope.js');
 const grounding = await import('./harness/grounding-gate.js');
 const outputGrounding = await import('./harness/output-grounding-gate.js');
 
@@ -62,6 +63,13 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
   grounding._resetDuplicateStateForTests();
   const sess = createSession({ kind: 'chat' });
 
+  // Authorize the send with an enumerated plan scope so the INTEGRITY gates —
+  // grounding + duplicate — are the ONLY thing between a corrupted/duplicate
+  // send and the wire. (The consent floor now intercepts an unauthorized YOLO
+  // send first, so we grant consent here to isolate the gates under test —
+  // 2026-07-09.)
+  openPlanScope({ sessionId: sess.id, planProposalId: 'p-integ', approvedPlanObjective: 'send the reviewed emails', allowedTools: ['gmail__send_email'] });
+
   // The agent's own extraction artifact for this target (Denver).
   writeToolOutput({
     sessionId: sess.id,
@@ -73,9 +81,9 @@ test('MCP send gets grounding + duplicate gates under a `*` scope (the only guar
     ? { grounded: false, reason: 'Payload claims Houston; the extraction artifact says Denver.' }
     : { grounded: true, reason: 'Matches the Denver extraction.' });
 
-  // YOLO (set at file top) auto-approves the send with no human — so the
-  // integrity gate is the ONLY thing between a corrupted/duplicate send and the
-  // wire. Exactly the case the gate must cover.
+  // With consent granted (scope above), the integrity gate is the ONLY thing
+  // between a corrupted/duplicate send and the wire. Exactly the case the gate
+  // must cover.
   const server = makeSendServer('gmail');
   const shim = createMcpNamespaceShim({ servers: [server], cacheToolsList: false });
   await shim.listTools();
@@ -163,6 +171,7 @@ test('MCP send gets the OUTPUT-GROUNDING gate too — a fabricated figure bounce
   grounding._resetDuplicateStateForTests();
   outputGrounding._resetOutputGroundingStateForTests();
   const sess = createSession({ kind: 'chat' });
+  openPlanScope({ sessionId: sess.id, planProposalId: 'p-integ2', approvedPlanObjective: 'send the reviewed emails', allowedTools: ['gmail__send_email'] });
   // Source: campaign spend sums to $11,000 (labels include "spend"/"campaign").
   writeToolOutput({
     sessionId: sess.id, callId: 'call_spend', tool: 'composio_execute_tool',

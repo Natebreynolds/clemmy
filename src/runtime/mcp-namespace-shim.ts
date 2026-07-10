@@ -25,6 +25,8 @@ import {
   evaluateOutputGrounding,
   OutputGroundingCheckFailedError,
 } from './harness/output-grounding-gate.js';
+import { looksLikeNativeMcpSend } from './harness/execution-gate.js';
+import { isConfirmFirstEnabled } from './harness/confirm-first-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
@@ -1019,7 +1021,11 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // tools still must not run silently. We throw a structured
       // error so the model's next turn sees an explicit "needs
       // approval" rather than silent execution.
-      const decision = decideToolApproval({ toolName, args });
+      // Pass the sessionId so decideToolApproval can consult the session's
+      // plan scope — an enumerated send scope authorizes the send; without the
+      // id it always fell through to policy and blocked a scoped send
+      // (2026-07-09).
+      const decision = decideToolApproval({ toolName, args, sessionId: harnessRunContextStorage.getStore()?.sessionId });
       if (decision.needsApproval) {
         // T2.5 — Throw a structured BoundaryError instead of a bare
         // Error. The Codex runtime's MCP catch path used to receive a
@@ -1064,8 +1070,61 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // Gate as a send when the tool is send-kind (audit #1) OR its args describe
       // a network mutation (audit #6 — kernel exec_command/browser_curl etc.).
       const argMutation = detectMcpArgsNetworkMutation(args);
-      const gateAsSend = decision.kind === 'send' || argMutation.isNetworkMutation;
-      const integrityShapeKey = decision.kind === 'send' ? toolName : (argMutation.shapeKey ?? toolName);
+      // Native MCP send-shaped names (outlook_send_mail, make_outbound_call,
+      // *_post_message) are irreversible even though decision.kind may not tag
+      // them (2026-07-09 bypass hunt lane 3). Fold the name-shape check in.
+      const nameIsSend = looksLikeNativeMcpSend(toolName);
+      const gateAsSend = decision.kind === 'send' || argMutation.isNetworkMutation || nameIsSend;
+      const integrityShapeKey = (decision.kind === 'send' || nameIsSend) ? toolName : (argMutation.shapeKey ?? toolName);
+
+      // BATCH-CONSENT FLOOR for native MCP sends (bypass-hunt lane 3): the shim
+      // dispatches OUTSIDE wrapToolForHarness, so the brackets confirm-first gate
+      // never sees these. Mirror it here — an irreversible-send batch at/over the
+      // threshold requires ONE human approval regardless of YOLO, unless it
+      // rides a human-approved certified batch or a reviewed plan scope.
+      if (gateAsSend && integritySessionId && isConfirmFirstEnabled()) {
+        try {
+          const { loadProactivityPolicy } = await import('../agents/proactivity-policy.js');
+          const { decideInstructionReview } = await import('./harness/confirm-first-gate.js');
+          const { getPlanScope } = await import('../agents/plan-scope.js');
+          let prior = 0;
+          for (const ev of listEvents(integritySessionId, { types: ['external_write'] })) {
+            if ((ev.data as { shapeKey?: string } | undefined)?.shapeKey === integrityShapeKey) prior += 1;
+          }
+          const threshold = loadProactivityPolicy().batchConfirmThreshold;
+          const review = decideInstructionReview({ priorSameShapeCount: prior, threshold });
+          const scope = getPlanScope(integritySessionId);
+          // A send is "reviewed" ONLY by a human-approved certified batch or a
+          // plan scope that ENUMERATED this send (goalScoped + allowedSends) —
+          // a bare wildcard `['*']` scope (opened by workflow/background lanes)
+          // must NOT exempt a native-MCP send batch (2026-07-09 Hole 3).
+          // Native MCP send tools are non-multiplexers, so their own name in
+          // allowedTools/allowedSends is explicit consent; a bare wildcard or
+          // the composio gateway name is not.
+          const { isUngrantableMultiplexer } = await import('../agents/plan-scope.js');
+          const scopeEnumeratesSend = Boolean(
+            scope && !scope.closedAt
+            && !isUngrantableMultiplexer(toolName)
+            && (
+              (scope.allowedSends ?? []).some((s) => s === toolName || s === integrityShapeKey)
+              || scope.allowedTools.includes(toolName)
+            ),
+          );
+          const reviewed = scopeEnumeratesSend || Boolean(activeRunContext?.certifiedBatch);
+          if (review.required && !reviewed) {
+            throw new BoundaryError({
+              kind: 'mcp.approval_blocked',
+              retryable: false,
+              userMessage: `Approval required: this is send #${review.count} of a same-shape batch (threshold ${threshold}). Irreversible send batches need your explicit approval — file it with request_approval and wait for the card.`,
+              operatorMessage: `mcp.send_batch_floor tool=${toolName} count=${review.count} threshold=${threshold}`,
+              context: { toolName, shapeKey: integrityShapeKey, count: review.count, threshold },
+            });
+          }
+        } catch (err) {
+          if (err instanceof BoundaryError) throw err;
+          // count failure → fail toward not-a-batch (never wedge a legit send).
+        }
+      }
       if (gateAsSend && isGroundingGateEnabled() && integritySessionId) {
         try {
           // Duplicate-target speed bump: a same-shape send to a target already

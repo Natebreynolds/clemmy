@@ -380,6 +380,23 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
   if (!real || typeof real.invoke !== 'function') {
     throw new Error(`code-mode: unknown tool "${method}"`);
   }
+  // SEND FLOOR (2026-07-09 bypass hunt, Hole 1): call_tool / code-mode dispatch
+  // by calling wrapped.invoke() DIRECTLY — bypassing the SDK's per-tool
+  // needsApproval hook. So an irreversible SEND reached this way never parks
+  // for a card. Refuse it here unless it rides an approved certified batch:
+  // irreversible sends must go through run_batch (the deterministic, approved
+  // primitive) or a first-class call (which hits the SDK approval hook). Reads
+  // and reversible writes are unaffected.
+  if (!certifiedBatch) {
+    const { classifyExternalWrite } = await import('../runtime/harness/confirm-first-gate.js');
+    const shape = classifyExternalWrite(method, args);
+    if (shape.mutating && shape.irreversible) {
+      throw new Error(
+        `SEND_REQUIRES_APPROVAL: "${method}" is an irreversible external send and cannot be dispatched through call_tool/code-mode (which bypass the approval card). `
+        + 'Use run_batch to send (propose → the user approves the card → it executes), or call the tool first-class so it gets its approval prompt.',
+      );
+    }
+  }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
   const runContext = { context: { sessionId } };
   const details = { toolCall: { callId } };

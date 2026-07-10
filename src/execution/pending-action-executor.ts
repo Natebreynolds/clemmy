@@ -45,6 +45,16 @@ export async function executeApprovedPendingActionCall(
   if (record.status !== 'approved') {
     return { ok: false, status: 'skipped', resultSummary: `Pending action ${id} is ${record.status} — it must be APPROVED before execution.`, record };
   }
+  // GRANT INVARIANT I1 (Phase 1): irreversible sends execute only on HUMAN
+  // consent — a policy-minted approval is inert at every executor.
+  if (record.kind === 'external_send' && record.approvedBy !== 'human') {
+    return {
+      ok: false,
+      status: 'skipped',
+      resultSummary: `Pending action ${id} is an irreversible send approved by POLICY, not the user — it requires their explicit approval card before execution.`,
+      record,
+    };
+  }
   if (record.toolName === 'run_batch') {
     return { ok: false, status: 'skipped', resultSummary: `Pending action ${id} is a run_batch plan — execute it via run_batch action=execute.`, record };
   }

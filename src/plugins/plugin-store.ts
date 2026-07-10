@@ -23,6 +23,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { installSkillFromDir, uninstallSkill, isSafeSkillName, SKILLS_DIR } from '../memory/skill-store.js';
 import { readWorkflowDefinitionFile, readWorkflow, writeWorkflow, deleteWorkflow } from '../memory/workflow-store.js';
+import { validateWorkflowDefinition, type WorkflowFrontmatter } from '../execution/workflow-validator.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { ingestMemorySource, scanMemorySource, undoMemoryImportBatch } from '../memory/memory-import.js';
@@ -140,6 +141,15 @@ export function previewPlugin(dir: string): PluginPreview {
     const def = readWorkflowDefinitionFile(path.join(dir, 'workflows', w, 'SKILL.md'));
     if (!def || !Array.isArray(def.steps) || def.steps.length === 0) {
       throw new Error(`workflow "${w}" failed to parse (SKILL.md frontmatter + step body required)`);
+    }
+    // Run the SAME validator a hand-authored workflow passes through — NOT just a
+    // parse-check. Otherwise a plugin could ship an enabled workflow with an
+    // ungated SEND call node (the SEND-CALL GATE never fired), and the runtime
+    // would honor the absent requiresApproval flag → ungated send on any run
+    // (2026-07-09 re-hunt author-side vector). Reject such a cartridge at the slot.
+    const { errors: wfErrors } = validateWorkflowDefinition(def as unknown as WorkflowFrontmatter);
+    if (wfErrors.length) {
+      throw new Error(`workflow "${w}" failed validation: ${wfErrors.join('; ')}`);
     }
   }
   for (const s of contents.skills) {

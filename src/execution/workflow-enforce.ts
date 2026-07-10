@@ -1,5 +1,6 @@
 import type { WorkflowDefinition, WorkflowInputDef } from '../memory/workflow-store.js';
 import { stepLooksMultiItemWithoutForEach, validateWorkflowDefinition, type WorkflowFrontmatter } from './workflow-validator.js';
+import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
 import {
@@ -100,10 +101,17 @@ export function stepLooksLikeIrreversibleSend(prompt: string): boolean {
 }
 
 function structuredCallSideEffectClass(call: { tool?: string } | undefined): 'read' | 'write' | 'send' {
-  const t = (call?.tool ?? '').toLowerCase();
+  const t = call?.tool ?? '';
   if (!t) return 'read';
-  if (/(?:_|^)(?:send|publish|post|email|dispatch|deliver|tweet|dm|message)(?:_|$)/.test(t)) return 'send';
-  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/.test(t)) return 'write';
+  // Delegate the send determination to the ONE canonical predicate so this
+  // RUNTIME classifier agrees with the validator (workflow-validator.ts already
+  // uses isIrreversibleSendSlug). The old regex missed CALL/DIAL/OUTBOUND/
+  // MAKE+CALL/RESPOND+EVENT (VAPI_CREATE_CALL, TWILIO_MAKE_OUTBOUND_CALL,
+  // GOOGLECALENDAR_RESPOND_TO_EVENT), so the unattended-scheduled auto-approve
+  // carve-out reclassified those as 'write' and fired them with no consent
+  // (2026-07-09 re-hunt: workflow call-node lane).
+  if (isIrreversibleSendSlug(t)) return 'send';
+  if (/(?:_|^)(?:create|update|delete|remove|write|upsert|insert|add|append|move|archive|patch|put)(?:_|$)/i.test(t)) return 'write';
   return 'read';
 }
 
@@ -153,6 +161,11 @@ export function classifyStepSideEffect(step: {
   forEach?: string;
   call?: { tool?: string };
 }): StepSideEffectClass {
+  // A structured call node whose SLUG is a real send can NEVER be downgraded by
+  // an explicit sideEffect — check it FIRST so the runtime auto-approve carve-out
+  // agrees with the validator (an author labeling a VAPI_CREATE_CALL node
+  // `sideEffect: read` must not skip the gate — 2026-07-09 re-hunt author-side).
+  if (step.call?.tool && structuredCallSideEffectClass(step.call) === 'send') return 'send';
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
   if (step.call?.tool) return structuredCallSideEffectClass(step.call);
   if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';

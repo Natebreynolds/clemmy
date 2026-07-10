@@ -38,6 +38,17 @@ export interface PendingActionHistoryItem {
   actor?: string;
 }
 
+/** WHO consented to this action (THE-GRANT plan, Phase 1). 'human' may ONLY be
+ *  written by a real approval-card/workflow resolution; the policy path is
+ *  typed to 'policy' and can never produce it. Absent on legacy records —
+ *  defaulted at read time (see safeReadRecord). */
+export type PendingActionApprovedBy = 'human' | 'policy';
+
+export type PendingActionApprovalEvidence =
+  | { kind: 'card'; approvalId: string }
+  | { kind: 'workflow'; workflowRunId: string }
+  | { kind: 'policy'; scope: string };
+
 export interface PendingActionRecord {
   id: string;
   title: string;
@@ -57,6 +68,8 @@ export interface PendingActionRecord {
   updatedAt: string;
   status: PendingActionStatus;
   approvalId: string | null;
+  approvedBy: PendingActionApprovedBy | null;
+  approvalEvidence: PendingActionApprovalEvidence | null;
   resultSummary: string | null;
   history: PendingActionHistoryItem[];
 }
@@ -114,6 +127,19 @@ function safeReadRecord(file: string): PendingActionRecord | null {
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf-8')) as PendingActionRecord;
     if (!parsed || typeof parsed.id !== 'string') return null;
+    // Back-compat defaulting (THE-GRANT R-compat): records written before the
+    // consent fields existed. A real card resolution always linked approvalId,
+    // so approved+approvalId reads as human consent; approved without one was
+    // a policy/auto path.
+    if (parsed.approvedBy === undefined || parsed.approvedBy === null) {
+      if (parsed.status === 'approved' || parsed.status === 'executed') {
+        parsed.approvedBy = parsed.approvalId ? 'human' : 'policy';
+        parsed.approvalEvidence = parsed.approvalId ? { kind: 'card', approvalId: parsed.approvalId } : null;
+      } else {
+        parsed.approvedBy = null;
+        parsed.approvalEvidence = parsed.approvalEvidence ?? null;
+      }
+    }
     return parsed;
   } catch {
     return null;
@@ -148,6 +174,8 @@ export function queuePendingAction(input: QueuePendingActionInput): PendingActio
     updatedAt: now,
     status: 'queued',
     approvalId: null,
+    approvedBy: null,
+    approvalEvidence: null,
     resultSummary: null,
     history: [{ at: now, status: 'queued', note: 'Action payload queued before execution.', actor: input.createdBy ?? 'clementine' }],
   };
@@ -207,7 +235,14 @@ export function findOpenPendingActionByPayload(toolName: string, payload: unknow
 function updatePendingAction(
   id: string,
   status: PendingActionStatus,
-  opts: { note?: string; actor?: string; approvalId?: string | null; resultSummary?: string | null } = {},
+  opts: {
+    note?: string;
+    actor?: string;
+    approvalId?: string | null;
+    resultSummary?: string | null;
+    approvedBy?: PendingActionApprovedBy;
+    approvalEvidence?: PendingActionApprovalEvidence;
+  } = {},
 ): PendingActionRecord | null {
   const record = getPendingAction(id);
   if (!record) return null;
@@ -218,6 +253,8 @@ function updatePendingAction(
   record.updatedAt = now;
   if (opts.approvalId !== undefined) record.approvalId = opts.approvalId;
   if (opts.resultSummary !== undefined) record.resultSummary = opts.resultSummary;
+  if (opts.approvedBy !== undefined) record.approvedBy = opts.approvedBy;
+  if (opts.approvalEvidence !== undefined) record.approvalEvidence = opts.approvalEvidence;
   record.history = [
     ...(Array.isArray(record.history) ? record.history : []),
     { at: now, status, note: opts.note, actor: opts.actor },
@@ -237,16 +274,27 @@ export function markPendingActionApprovalResolved(
   id: string,
   resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user',
   approvalId?: string | null,
+  consent?: { by: PendingActionApprovedBy; evidence: PendingActionApprovalEvidence },
 ): PendingActionRecord | null {
   const status: PendingActionStatus =
     resolution === 'approved' ? 'approved'
       : resolution === 'rejected' ? 'rejected'
         : resolution === 'expired' ? 'expired'
           : 'cancelled';
+  // Consent provenance (THE-GRANT R1, Phase-1 form): a resolution that carries
+  // a real approvalId is a human card decision; anything else must declare
+  // itself. The policy path (orchestrator auto-approve) passes an explicit
+  // 'policy' consent — it can never claim 'human'.
+  const resolvedConsent = resolution === 'approved'
+    ? consent ?? (approvalId
+      ? { by: 'human' as const, evidence: { kind: 'card' as const, approvalId } }
+      : { by: 'policy' as const, evidence: { kind: 'policy' as const, scope: 'unspecified' } })
+    : undefined;
   return updatePendingAction(id, status, {
     approvalId: approvalId ?? undefined,
     note: `Approval ${resolution}${approvalId ? ` (${approvalId})` : ''}.`,
     actor: 'approval-registry',
+    ...(resolvedConsent ? { approvedBy: resolvedConsent.by, approvalEvidence: resolvedConsent.evidence } : {}),
   });
 }
 

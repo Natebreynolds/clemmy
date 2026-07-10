@@ -1168,6 +1168,23 @@ function creditRecallFromToolResult(sessionId: string | undefined, toolName: str
   } catch { /* learning is best-effort — never break the tool result */ }
 }
 
+// Per-session serialization for the irreversible-send confirm-first gate
+// (2026-07-09 Hole 4). The gate READS the prior same-shape count, AWAITs
+// dynamic imports (yielding the loop), then APPENDs its own external_write.
+// run_worker fans out up to 6 concurrent sends; without serialization all 6
+// read prior<threshold in the await gap and none trip the batch floor — the
+// exact 10-email incident on the worker lane. This chains the gate's critical
+// section per session so each send sees the prior's append.
+const sessionSendGateLocks = new Map<string, Promise<unknown>>();
+function withSendGateLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = sessionSendGateLocks.get(sessionId) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  // Store a non-rejecting tail so a thrown gate (ConfirmFirstRequiredError)
+  // doesn't poison the chain for the next send.
+  sessionSendGateLocks.set(sessionId, run.then(() => undefined, () => undefined));
+  return run;
+}
+
 export function wrapToolForHarness<T extends WrappableTool>(
   tool: T,
   options: WrapToolOptions = {},
@@ -1314,7 +1331,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
     }
     // 2c. Execution-wrap gate
     try {
-      if (isExecutionGateEnabled() && isMutatingExternalWrite(tool.name, parsedInput)) {
+      // GRANT INVARIANT I2 (Phase 1, THE-GRANT plan): after a human approved a
+      // byte-pinned plan, no session-bookkeeping key may refuse the dispatch.
+      // A certified batch item (ctx.certifiedBatch = approved pending action,
+      // payload hash pinned) carries its authority with it — Exhibit C
+      // (2026-07-09): a certified + human-approved 25-email batch was refused
+      // 0/25 by this gate because the session's execution row wasn't active.
+      const grantCarried = Boolean(ctx.certifiedBatch);
+      if (!grantCarried && isExecutionGateEnabled() && isMutatingExternalWrite(tool.name, parsedInput)) {
         const sessionRow = getSession(ctx.sessionId);
         if (sessionRow?.kind === 'chat') {
           const { ExecutionStore } = await import('../../execution/store.js');
@@ -1903,9 +1927,22 @@ export function wrapToolForHarness<T extends WrappableTool>(
     try {
       if (isConfirmFirstEnabled()) {
         const sessionRow = getSession(ctx.sessionId);
-        if (sessionRow?.kind === 'chat') {
-          const shape = classifyExternalWrite(tool.name, parsedInput);
-          if (shape.mutating && shape.shapeKey) {
+        const shape = classifyExternalWrite(tool.name, parsedInput);
+        // GLOBAL SEND FLOOR (2026-07-09 bypass hunt): an IRREVERSIBLE send/
+        // publish batch gates on EVERY session kind — chat, workflow,
+        // execution (background/cron), agent (worker fan-out). The batch-
+        // consent floor is a property of the ACTION, not the chat surface; the
+        // chat-only guard let workflow default-scope sends and run_worker
+        // fan-out reconstitute the unapproved-batch incident on other lanes.
+        // Reversible writes stay chat-scoped (the 2026-05-30 anti-deadlock
+        // rationale below) so capable non-chat runs aren't wedged on undoable
+        // edits.
+        const gateThisSession = sessionRow?.kind === 'chat' || shape.irreversible;
+        if (gateThisSession && shape.mutating && shape.shapeKey) {
+          // Irreversible sends run the count→decide→append critical section
+          // under a per-session lock so a concurrent fan-out can't all read a
+          // stale count (Hole 4); reversible writes don't need it.
+          const runCriticalSection = async (): Promise<void> => {
             // Count prior same-shape writes already allowed this session.
             let prior = 0;
             try {
@@ -1937,10 +1974,31 @@ export function wrapToolForHarness<T extends WrappableTool>(
             // gate is satisfied without a separate plan scope.
             const approvedCertifiedBatch = Boolean(ctx.certifiedBatch);
 
-            // An instruction-reviewed plan scope satisfies the gate.
+            // An instruction-reviewed plan scope satisfies the gate — but for
+            // an IRREVERSIBLE send, only a scope that ENUMERATED the send
+            // (goalScoped + allowedSends) counts. A bare wildcard `['*']` scope
+            // (opened by the workflow/background lanes) must NOT satisfy the
+            // send floor (2026-07-09 Hole 2); it still satisfies reversible
+            // writes as before.
             const { getPlanScope } = await import('../../agents/plan-scope.js');
             const scope = getPlanScope(ctx.sessionId);
-            const hasReviewedScope = !!scope && !scope.closedAt;
+            const scopeOpen = !!scope && !scope.closedAt;
+            // For an irreversible send, a scope only counts as reviewed if it
+            // EXPLICITLY covers the send — enumerated in allowedSends, or the
+            // tool/slug named (NOT via wildcard '*') in allowedTools. A bare
+            // `['*']` scope (workflow/background launch) does not (Hole 2).
+            // Reversible writes keep the any-open-scope behavior.
+            const { isUngrantableMultiplexer } = await import('../../agents/plan-scope.js');
+            const hasReviewedScope = shape.irreversible
+              ? Boolean(scopeOpen && scope && (
+                  // The slug (shapeKey) enumerated in the scope's send/slug lists.
+                  (scope.allowedSends ?? []).some((s) => s === shape.shapeKey)
+                  || (scope.allowedComposioSlugs ?? []).some((s) => s === shape.shapeKey)
+                  // OR a NON-multiplexer send tool named directly (native MCP).
+                  // The composio gateway name never counts (Hole A).
+                  || (!isUngrantableMultiplexer(tool.name) && scope.allowedTools.includes(tool.name))
+                ))
+              : scopeOpen;
 
             // SEVERITY GATE (2026-05-30): only genuinely IRREVERSIBLE
             // batches (SEND/PUBLISH — emails sent, posts published) must
@@ -2007,7 +2065,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
                 },
               });
             } catch { /* telemetry write must never block */ }
-          }
+          };
+          // Serialize irreversible sends per session (Hole 4); reversible
+          // writes run directly (no batch-consent race to protect).
+          if (shape.irreversible) await withSendGateLock(ctx.sessionId, runCriticalSection);
+          else await runCriticalSection();
         }
       }
     } catch (err) {

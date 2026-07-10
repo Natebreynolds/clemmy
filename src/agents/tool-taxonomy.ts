@@ -30,6 +30,7 @@
  */
 
 import { evaluateAutoApprove, recordAutoApproval, summarizeToolArgs } from './plan-scope.js';
+import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
 import type { AutoApproveScope } from './proactivity-policy.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -484,11 +485,26 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
   }
 
   const norm = normalizeForMatch(name);
+  let patternKind: ToolKind | undefined;
   for (const { kind, verbs } of NAME_PATTERNS) {
     for (const verb of verbs) {
-      if (matchesVerb(norm, verb)) return kind;
+      if (matchesVerb(norm, verb)) { patternKind = kind; break; }
     }
+    if (patternKind) break;
   }
+
+  // A native (non-composio) comm-object send that the send-verb list MISSES —
+  // create_event (emails invitees), respond_to_event (RSVP email),
+  // create_message, create_invite — matches the 'write' verb (create/respond)
+  // and would classify as 'write', slipping past the send lock under a wildcard
+  // scope (2026-07-09 re-hunt: native MCP shim lane). Route through the ONE
+  // canonical predicate to UPGRADE write→send. Guarded to only touch a WRITE (or
+  // unmatched default) — never a read/execute/admin — so `get_call`/`list_calls`
+  // (CALL as a noun, not the verb) stay reads.
+  if ((patternKind === undefined || patternKind === 'write') && isIrreversibleSendSlug(name)) {
+    return 'send';
+  }
+  if (patternKind) return patternKind;
 
   // No pattern matched — conservative default. Untyped tools should
   // ask, not silently run. Once a name lands in this branch in the

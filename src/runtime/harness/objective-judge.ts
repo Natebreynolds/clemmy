@@ -106,6 +106,14 @@ export interface ObjectiveJudgeGateInput {
    * and marks itself done. Computed at the callsite from the reply text.
    */
   promiseShaped?: boolean;
+  /**
+   * An approval card is OPEN for this session (THE-GRANT Phase 1, structural
+   * question-immunity): the run is legitimately waiting on the human's card
+   * decision — judging "did the work finish" while their decision is pending
+   * is what scolded a parked ask into unapproved sends (Exhibit A). The judge
+   * NEVER fires while a card is open.
+   */
+  openApprovalCard?: boolean;
 }
 
 /**
@@ -129,6 +137,7 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
   return (
     input.optIn &&
     input.nextAction === 'completed' &&
+    !input.openApprovalCard &&
     input.continuationsUsed < input.maxContinuations &&
     (input.actionIntent || input.totalToolCalls >= input.workThreshold || Boolean(input.promiseShaped))
   );

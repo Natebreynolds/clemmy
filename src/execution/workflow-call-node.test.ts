@@ -67,11 +67,15 @@ test('callToolSideEffectClass: classifies send / write / read from the tool slug
   assert.equal(callToolSideEffectClass('composio_hubspot_list_contacts'), 'read');
 });
 
-test('stepSideEffectClass: a call step derives its class from the tool (declared sideEffect still wins)', () => {
+test('stepSideEffectClass: declared sideEffect can STRENGTHEN but never downgrade a real send (re-hunt round 2 author-side)', () => {
   assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'composio_gmail_send' } }), 'send');
   assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'composio_gmail_search' } }), 'read');
-  // an explicit declaration overrides the slug heuristic
-  assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'composio_gmail_send' }, sideEffect: 'read' }), 'read');
+  // A real SEND slug can NOT be downgraded by an explicit sideEffect — labeling a
+  // send node `read` must not skip the gate. The slug is authoritative for sends.
+  assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'composio_gmail_send' }, sideEffect: 'read' }), 'send');
+  // For a NON-send slug the declared class still wins (an author can strengthen a
+  // read-classified call to write, or knows their read-only call best).
+  assert.equal(stepSideEffectClass({ id: 's', prompt: '', call: { tool: 'composio_gmail_search' }, sideEffect: 'write' }), 'write');
 });
 
 function frontmatter(steps: unknown[]) {
