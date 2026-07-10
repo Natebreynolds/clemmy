@@ -571,6 +571,42 @@ export function clearConnectedToolkitsCache(): void {
   toolkitToolsCache.clear();
 }
 
+let preferredUserIdInflight: Promise<string> | null = null;
+
+/** The live user-id detection (probes connected_accounts, picks the user with the
+ *  most ACTIVE connections) + cache write, deduped so a parallel wave shares one
+ *  probe. */
+async function refreshPreferredUserId(): Promise<string> {
+  if (preferredUserIdInflight) return preferredUserIdInflight;
+  preferredUserIdInflight = (async (): Promise<string> => {
+    try {
+      const composio = getComposio();
+      if (!composio) return DEFAULT_USER_ID;
+      const rawClient = rawComposioClient(composio);
+      const resp = await rawClient.connectedAccounts.list({ limit: 100 });
+      const items = Array.isArray(resp) ? resp : (resp?.items ?? []);
+      const counts = new Map<string, number>();
+      for (const item of items as Array<Record<string, unknown>>) {
+        const userId = str(item.user_id) ?? str(item.userId);
+        if (!userId) continue;
+        const weight = item.status === 'ACTIVE' ? 2 : 1;
+        counts.set(userId, (counts.get(userId) ?? 0) + weight);
+      }
+      const [top] = [...counts.entries()].sort((left, right) => right[1] - left[1])[0] ?? [];
+      const value = top ?? DEFAULT_USER_ID;
+      detectedPreferredUserId = { at: Date.now(), value };
+      return value;
+    } catch {
+      // Composio auth still works for first-run users; default is safe.
+      detectedPreferredUserId = { at: Date.now(), value: DEFAULT_USER_ID };
+      return DEFAULT_USER_ID;
+    } finally {
+      preferredUserIdInflight = null;
+    }
+  })();
+  return preferredUserIdInflight;
+}
+
 export async function getPreferredUserId(): Promise<string> {
   const explicit = readComposioEnv('COMPOSIO_USER_ID');
   // Treat the literal "default" sentinel as "not set" so already-installed
@@ -581,35 +617,21 @@ export async function getPreferredUserId(): Promise<string> {
   if (explicit && explicit !== DEFAULT_USER_ID) return explicit;
 
   const now = Date.now();
+  // Fresh → cached.
   if (detectedPreferredUserId && now - detectedPreferredUserId.at < USER_ID_TTL_MS) {
     return detectedPreferredUserId.value;
   }
-
-  const composio = getComposio();
-  if (!composio) return DEFAULT_USER_ID;
-
-  try {
-    const rawClient = rawComposioClient(composio);
-    const resp = await rawClient.connectedAccounts.list({ limit: 100 });
-    const items = Array.isArray(resp) ? resp : (resp?.items ?? []);
-    const counts = new Map<string, number>();
-    for (const item of items as Array<Record<string, unknown>>) {
-      const userId = str(item.user_id) ?? str(item.userId);
-      if (!userId) continue;
-      const weight = item.status === 'ACTIVE' ? 2 : 1;
-      counts.set(userId, (counts.get(userId) ?? 0) + weight);
-    }
-    const [top] = [...counts.entries()].sort((left, right) => right[1] - left[1])[0] ?? [];
-    if (top) {
-      detectedPreferredUserId = { at: now, value: top };
-      return top;
-    }
-  } catch {
-    // Fall through to default. Composio auth still works for first-run users.
+  // STALE → serve instantly + refresh in background. executeComposioTool calls
+  // this on EVERY dispatch and it hit the same connectedAccounts.list endpoint,
+  // blocking ~2-3s cold after >60s idle — the same tax the connections SWR fix
+  // removed (2026-07-10). A connect/disconnect nulls detectedPreferredUserId, so
+  // a genuine change is never masked.
+  if (detectedPreferredUserId) {
+    void refreshPreferredUserId().catch(() => { /* stale stays served */ });
+    return detectedPreferredUserId.value;
   }
-
-  detectedPreferredUserId = { at: now, value: DEFAULT_USER_ID };
-  return DEFAULT_USER_ID;
+  // Cold (first ever) → await one deduped detection.
+  return refreshPreferredUserId();
 }
 
 function rawComposioClient(composio: Composio): any {
