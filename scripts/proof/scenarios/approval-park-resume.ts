@@ -123,6 +123,26 @@ function approvalAudit(daemon: DaemonHandle, runId: string): ApprovalAuditRow[] 
   }
 }
 
+function actualToolDispatchCount(daemon: DaemonHandle, sessionId: string, tool: string): number {
+  const db = openHarnessDb(daemon.home);
+  try {
+    const row = db.prepare(
+      `SELECT COUNT(*) AS count
+         FROM events
+        WHERE session_id = ?
+          AND type = 'tool_called'
+          AND json_extract(data_json, '$.tool') = ?
+          AND (
+            json_type(data_json, '$.args') IS NOT NULL
+            OR json_type(data_json, '$.arguments') IS NOT NULL
+          )`,
+    ).get(sessionId, tool) as { count?: number } | undefined;
+    return Number(row?.count ?? 0);
+  } finally {
+    db.close();
+  }
+}
+
 function workflowEvents(daemon: DaemonHandle, runId: string): WorkflowEventRow[] {
   const file = path.join(
     daemon.home,
@@ -171,11 +191,13 @@ export const approvalParkResume: ScenarioDef = {
           requiresApproval: true,
           approvalPreview: `Create one proof artifact at ${target}`,
           allowedTools: ['write_file'],
+          output: { type: 'object', required_keys: ['marker', 'path'], non_empty: ['marker', 'path'] },
           prompt: [
             `Call write_file exactly once to create ${JSON.stringify(target)}.`,
             `The complete file content must be exactly this one line: ${marker}`,
             'Do not use shell, do not create another file, and do not call write_file a second time.',
-            `After the write succeeds, call workflow_step_result exactly once with {"marker":${JSON.stringify(marker)},"path":${JSON.stringify(target)}}.`,
+            `After the write succeeds, emit the final structured step result {"marker":${JSON.stringify(marker)},"path":${JSON.stringify(target)}}.`,
+            'Use workflow_step_result exactly once when that result tool is exposed; otherwise return the same object through the provider structured-output channel.',
           ].join(' '),
         }],
       });
@@ -228,13 +250,14 @@ export const approvalParkResume: ScenarioDef = {
         const db = openHarnessDb(daemon.home);
         try { stepMetrics = sessionMetrics(db, stepSessionId); } finally { db.close(); }
       }
-      const writeCalls = stepMetrics?.toolCalls.write_file ?? 0;
+      const rawWriteEvents = stepMetrics?.toolCalls.write_file ?? 0;
+      const writeDispatches = stepSessionId ? actualToolDispatchCount(daemon, stepSessionId, 'write_file') : 0;
       const completedSteps = events.filter((event) => event.kind === 'step_completed' && event.stepId === STEP_ID);
       const completedRuns = events.filter((event) => event.kind === 'run_completed');
       const serializedRun = JSON.stringify(finalRun ?? {});
 
       checks.push({ name: 'workflow run completed', pass: finalRun?.status === 'completed', detail: `status ${finalRun?.status ?? 'missing'}${finalRun?.error ? `, error ${String(finalRun.error).slice(0, 180)}` : ''}` });
-      checks.push({ name: 'exactly one write_file call', pass: writeCalls === 1, detail: `write_file × ${writeCalls}; all tools ${JSON.stringify(stepMetrics?.toolCalls ?? {})}` });
+      checks.push({ name: 'exactly one write_file dispatch', pass: writeDispatches === 1, detail: `dispatches ${writeDispatches}; lifecycle events ${rawWriteEvents}; all tools ${JSON.stringify(stepMetrics?.toolCalls ?? {})}` });
       checks.push({ name: 'exact artifact content landed', pass: artifactText === marker, detail: artifactText ? artifactText.slice(0, 180) : `${target} missing or empty` });
       checks.push({ name: 'exactly one approval was minted and resolved', pass: approvalRows.length === 1 && approvalRows[0]?.status === 'resolved' && approvalRows[0]?.resolution === 'approved', detail: JSON.stringify(approvalRows) });
       checks.push({ name: 'workflow step completed exactly once', pass: completedSteps.length === 1, detail: `step_completed × ${completedSteps.length}` });
@@ -249,7 +272,8 @@ export const approvalParkResume: ScenarioDef = {
           runId: runId || null,
           approvalId: approvedId || null,
           approvalsMinted: approvalRows.length,
-          writeCalls,
+          writeDispatches,
+          rawWriteEvents,
           stepCompletedEvents: completedSteps.length,
           runCompletedEvents: completedRuns.length,
         },

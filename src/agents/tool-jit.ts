@@ -181,6 +181,11 @@ function looksLikeTeamAgentIntent(query: string): boolean {
     || /\b(proof-researcher|proof-builder)\b/.test(q);
 }
 
+function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
+  const escaped = toolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(query);
+}
+
 const DEFAULT_TOP_K = 16;
 // MEASURED (measure-tool-jit-accuracy.ts, text-embedding-3-small): real domain-named
 // intents score their needed tool ≥0.33 (median 0.44); noise/weak matches sit ≤0.19.
@@ -342,6 +347,13 @@ export async function selectToolsForTurn(opts: {
   const recallPinned = recallSet.size > 0
     ? opts.tools.filter((t) => recallSet.has(t.name) && !TOOL_JIT_CORE.has(t.name)).map((t) => t.name)
     : [];
+  // A literal tool name is stronger evidence than a semantic score. Without
+  // this pin, a request such as "call task_hygiene" could retrieve that tool in
+  // tool_search while its schema remained pruned from the provider surface,
+  // leaving the model with a tool it could name but not invoke.
+  const explicitPinned = opts.tools
+    .filter((t) => !TOOL_JIT_CORE.has(t.name) && queryExplicitlyNamesTool(query, t.name))
+    .map((t) => t.name);
   const candidates = opts.tools.filter((t) => !TOOL_JIT_CORE.has(t.name));
   if (candidates.length === 0) return exposeAll('no-jit-candidates');
 
@@ -366,12 +378,12 @@ export async function selectToolsForTurn(opts: {
     .slice(0, k)
     .map((r) => r.name);
 
-  const exposed = new Set<string>([...present, ...intentPinned, ...recallPinned, ...selected]);
+  const exposed = new Set<string>([...present, ...intentPinned, ...recallPinned, ...explicitPinned, ...selected]);
   const droppedCount = all.size - exposed.size;
   return {
     exposed,
     reduced: droppedCount > 0,
-    reason: `jit top${k}@${floor} (${present.length} core + ${intentPinned.length} intent + ${recallPinned.length} recall + ${selected.length} retrieved)`,
+    reason: `jit top${k}@${floor} (${present.length} core + ${intentPinned.length} intent + ${recallPinned.length} recall + ${explicitPinned.length} literal + ${selected.length} retrieved)`,
     droppedCount,
   };
 }

@@ -170,6 +170,25 @@ test('recall-pinned built-in tools survive JIT pruning even below the semantic f
   });
 });
 
+test('a literally named built-in tool survives JIT pruning even at zero semantic score', async () => {
+  await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
+    const tools: JitTool[] = [...CORE_SAMPLE, 'task_hygiene', 'workflow_get']
+      .map((name) => ({ name, description: name }));
+    const zero: JitRankFn = async (_q, ts) => new Map(ts.map((tool) => [tool.name, 0]));
+
+    const selected = await selectToolsForTurn({
+      userInput: 'Call the task_hygiene tool right now, then report what it returned.',
+      tools,
+      rankFn: zero,
+    });
+
+    assert.equal(selected.reduced, true);
+    assert.ok(selected.exposed.has('task_hygiene'));
+    assert.ok(!selected.exposed.has('workflow_get'));
+    assert.match(selected.reason, /1 literal/);
+  });
+});
+
 test('workspace intent pinning also catches natural dashboard requests that omit the word workspace', async () => {
   await withEnv({ CLEMMY_TOOL_JIT: 'on', CLEMMY_TOOL_JIT_MIN_SCORE: '0.5', CLEMMY_TOOL_JIT_BUDGET_TOKENS: '1' }, async () => {
     const tools: JitTool[] = [...CORE_SAMPLE, 'space_save', 'space_refresh', 'workflow_create']
