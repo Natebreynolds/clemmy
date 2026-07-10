@@ -135,12 +135,18 @@ test('workflow park mode interrupts promptly, reuses one exact approval after re
   assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 1, 'resume minted no second card');
   assert.ok(approvalRegistry.get(pending[0].approvalId)?.consumedAt);
 
-  // The grant is one-shot. A later identical call requires a fresh decision.
+  // The one-shot grant is spent AND the action already executed under it. A
+  // later identical call must NOT re-surface a card — that would ask the human to
+  // re-approve an already-sent action (a duplicate irreversible send), or livelock
+  // if they decline. It is terminal-done: deny without parking and mint no
+  // replacement card, so a from-scratch replay skips the done send and proceeds to
+  // its next still-ungranted action.
   const replay = await build()('mcp__clementine-local__run_shell_command', command, opts());
   assert.equal(replay.behavior, 'deny');
-  assert.equal(replay.interrupt, true);
-  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 2);
-  assert.equal(boundaries.filter((boundary) => boundary.state === 'pending').length, 3);
+  assert.equal(replay.interrupt, false, 'a consumed grant is done, not parked — the run continues past it');
+  assert.match(String((replay as { message?: string }).message ?? ''), /already .*(approved|executed)/i, 'message marks it already-done, not a fresh request');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 1, 'no duplicate card minted for the already-executed send');
+  assert.equal(boundaries.filter((boundary) => boundary.state === 'pending').length, 2, 'the consumed replay fires no new pending boundary');
 });
 
 test('workflow park mode treats rejected and expired exact decisions as terminal, without a replacement card', async () => {

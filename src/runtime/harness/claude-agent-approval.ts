@@ -272,9 +272,24 @@ export function buildGatedToolPermission(
           } as PermissionResult;
         }
 
-        // No prior decision, or the prior one-shot grant was already consumed:
-        // create a fresh exact-payload card. registerResumable is race-safe and
-        // tells us whether this process owns surfacing the card.
+        if (prior.state === 'consumed') {
+          // The exact payload was already approved AND executed earlier in this
+          // run (the one-shot grant is spent). A workflow step replays from
+          // scratch on resume, so re-surfacing a fresh card here would ask the
+          // human to re-approve an already-sent action — a duplicate irreversible
+          // send (or a livelock if they decline). It is terminal-done: refuse the
+          // re-run so the from-scratch replay skips it, and do NOT park — the run
+          // continues to its next still-ungranted action.
+          return {
+            behavior: 'deny',
+            message: `This exact action was already approved and executed earlier in this run (approval ${prior.row.approvalId}); skipped to avoid a duplicate send.`,
+            interrupt: false,
+          } as PermissionResult;
+        }
+
+        // No prior decision (state 'none'): create a fresh exact-payload card.
+        // registerResumable is race-safe and tells us whether this process owns
+        // surfacing the card.
         const registered = approvalRegistry.registerResumable({
           sessionId,
           subject,
