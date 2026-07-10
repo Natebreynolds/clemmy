@@ -18,6 +18,7 @@ const {
   detectComposioFailure,
   composioThrownErrorOutput,
   asyncResultItemCount,
+  formatComposioBudgetExceededOutput,
   normalizeInlineConnectedAccountId,
   applySuppressedComposioConnectionPolicy,
   buildComposioStatusPayload,
@@ -26,6 +27,7 @@ const {
   closeEventLog,
   resetEventLog,
   createSession,
+  appendEvent,
   getToolOutput,
 } = await import('../runtime/harness/eventlog.js');
 
@@ -789,6 +791,39 @@ test('asyncResultItemCount: counts items in an Apify dataset (partial-scrape che
   assert.equal(asyncResultItemCount({ data: new Array(7).fill(1) }), 7, 'data array → length');
   assert.equal(asyncResultItemCount({ results: new Array(3).fill(1) }), 3);
   assert.equal(asyncResultItemCount({ status: 'SUCCEEDED' }), null, 'no item list → null (no false count)');
+});
+
+test('post-clarification long Composio receipt cannot inject a second background gate or rerun', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Background, hold, or now?', source: 'offer_background' },
+  });
+  const receipt = {
+    family: 'apify',
+    jobId: 'run-clarified-1',
+    status: 'RUNNING',
+    pollGuidance: 'Poll run-clarified-1 for its existing result.',
+  } as const;
+  const output = formatComposioBudgetExceededOutput(
+    receipt,
+    '{"status":"RUNNING"}',
+    { context: { sessionId: sess.id } },
+  );
+
+  assert.doesNotMatch(output, /offer_background|dispatch_background_task/);
+  assert.doesNotMatch(output, /Prefer handing it to the background/);
+  assert.match(output, /existing LONG-running job/);
+  assert.match(output, /do not add another background-choice gate/);
+  assert.match(output, /do not restart or re-invoke the job/);
+  assert.match(output, /run-clarified-1/);
+
+  const normal = formatComposioBudgetExceededOutput(receipt, '{}');
+  assert.match(normal, /offer_background \/ dispatch_background_task/);
 });
 
 // ─── Discovery-tax: composio_search_tools consults tool-choice memory FIRST ────

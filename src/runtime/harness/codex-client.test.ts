@@ -51,6 +51,7 @@ function writeAuth(payload: Record<string, unknown>): void {
 test.beforeEach(() => {
   resetHarnessRuntimeConfig();
   clearAuth();
+  delete process.env.CLEMMY_BRAIN_FALLOVER;
 });
 
 test.after(() => {
@@ -69,7 +70,7 @@ test('configureHarnessRuntime returns ok:false when NO provider is connected', a
     resetHarnessRuntimeConfig();
     const result = await configureHarnessRuntime();
     assert.equal(result.ok, false);
-    assert.match(result.reason ?? '', /No AI model is signed in/);
+    assert.match(result.reason ?? '', /selected Codex login is unavailable/i);
     assert.match(result.reason ?? '', /Settings → Models/);
   } finally {
     clearClaudeVault();
@@ -188,9 +189,10 @@ test('configureHarnessRuntime: all_in + configured BYO wins over a stale claude_
 });
 
 test('configureHarnessRuntime: dead Claude brain FALLS BACK to an available Codex (session-only)', async () => {
-  const prev = { mode: process.env.AUTH_MODE, routing: process.env.MODEL_ROUTING_MODE };
+  const prev = { mode: process.env.AUTH_MODE, routing: process.env.MODEL_ROUTING_MODE, fallover: process.env.CLEMMY_BRAIN_FALLOVER };
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.MODEL_ROUTING_MODE = 'off';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' }); // Claude unusable (api03)
   writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
   try {
@@ -204,6 +206,27 @@ test('configureHarnessRuntime: dead Claude brain FALLS BACK to an available Code
     clearClaudeVault(); clearAuth();
     if (prev.mode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prev.mode;
     if (prev.routing === undefined) delete process.env.MODEL_ROUTING_MODE; else process.env.MODEL_ROUTING_MODE = prev.routing;
+    if (prev.fallover === undefined) delete process.env.CLEMMY_BRAIN_FALLOVER; else process.env.CLEMMY_BRAIN_FALLOVER = prev.fallover;
+    resetHarnessRuntimeConfig();
+  }
+});
+
+test('configureHarnessRuntime: unavailable Claude fails closed by default even when Codex is connected', async () => {
+  const prevMode = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = 'claude_oauth';
+  writeClaudeVault({ accessToken: 'sk-ant-api03-dead-claude' });
+  writeAuth({ source: 'native', codexOauth: { accessToken: 'codex-acc', refreshToken: 'r', lastRefresh: new Date().toISOString() } });
+  try {
+    resetHarnessRuntimeConfig();
+    const result = await configureHarnessRuntime();
+    assert.equal(result.ok, false);
+    assert.equal(result.fallback, undefined);
+    assert.equal(process.env.AUTH_MODE, 'claude_oauth');
+    assert.match(result.reason ?? '', /Automatic provider switching is off/i);
+  } finally {
+    clearClaudeVault();
+    clearAuth();
+    if (prevMode === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = prevMode;
     resetHarnessRuntimeConfig();
   }
 });

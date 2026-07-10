@@ -23,6 +23,7 @@ const {
   pickRoutePolicyModel,
   clearRoutePolicyCache,
   routePolicyMinSamples,
+  routePolicyEnabled,
 } = await import('./route-policy.js');
 const {
   recordModelRouteDecision,
@@ -66,12 +67,20 @@ function seed(opts: {
 beforeEach(() => {
   resetModelRouteMetricsForTest();
   clearRoutePolicyCache();
-  delete process.env.CLEMMY_ROUTE_POLICY;
+  process.env.CLEMMY_ROUTE_POLICY = 'on';
 });
 
 after(() => {
   resetModelRouteMetricsForTest();
+  delete process.env.CLEMMY_ROUTE_POLICY;
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('adaptive routing is opt-in: default off, explicit on', () => {
+  delete process.env.CLEMMY_ROUTE_POLICY;
+  assert.equal(routePolicyEnabled(), false);
+  process.env.CLEMMY_ROUTE_POLICY = 'on';
+  assert.equal(routePolicyEnabled(), true);
 });
 
 test('job: groups outcomes, scores them, marks thin/weak candidates disabled', () => {

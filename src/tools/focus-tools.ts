@@ -17,14 +17,14 @@ import { textResult } from './shared.js';
  * Current Focus tool surface — the assistant's working-memory attention
  * pointer. See src/memory/focus.ts for storage semantics.
  *
- * The orchestrator's system prompt instructs the model to call
- * `focus_get` at the start of every turn and reason about whether the
- * user's message continues the active focus or shifts to a new topic.
+ * The current snapshot is injected into each turn. This tool is for explicit
+ * inspection or for resolving an ambiguous back-reference when that snapshot
+ * is absent or stale.
  */
 export function registerFocusTools(server: McpServer): void {
   server.tool(
     'focus_get',
-    'Read the assistant\'s current attention pointer. Returns the ACTIVE focus (what we\'re working on RIGHT NOW), a list of PARKED focuses (paused threads we can resume), and a needsConfirm flag (true when the active focus is past its idle window and the user should be asked "still on this?"). Call this at the start of every turn — the active focus tells you what the user is referring to when they say "the spreadsheet" or "that doc."',
+    'Inspect the assistant\'s current attention pointer. Returns the ACTIVE focus, PARKED focuses, and needsConfirm. The current snapshot is already present in turn context, so call this only when the user explicitly asks about focus state or an unresolved back-reference needs a fresh read.',
     {},
     async () => {
       const snap = getFocusSnapshot();

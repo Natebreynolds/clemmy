@@ -16,7 +16,7 @@ import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { planBrain, provisionDaemon } from './provision.js';
-import { openHarnessDb, summarizeAllSessions } from './score.js';
+import { exactBrainRouteChecks, openHarnessDb, summarizeAllSessions } from './score.js';
 import { fanoutMultiItem } from './scenarios/fanout-multi-item.js';
 import { continuityRecall } from './scenarios/continuity-recall.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
@@ -24,12 +24,13 @@ import { approvalParkResume } from './scenarios/approval-park-resume.js';
 import { cronReportBack } from './scenarios/cron-report-back.js';
 import { gatedMutation } from './scenarios/gated-mutation.js';
 import { converseFirst } from './scenarios/converse-first.js';
+import { clarifyThenExecute } from './scenarios/clarify-then-execute.js';
 import { workspaceBuild } from './scenarios/workspace-build.js';
 import { teamAgentHandoff } from './scenarios/team-agent-handoff.js';
 import { pendingActionGate } from './scenarios/pending-action-gate.js';
 import type { BrainKind, ProofReport, ScenarioDef, ScenarioOutcome } from './types.js';
 
-const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst, workspaceBuild, teamAgentHandoff, pendingActionGate];
+const ALL_SCENARIOS: ScenarioDef[] = [fanoutMultiItem, continuityRecall, longToolSelfCorrect, approvalParkResume, cronReportBack, gatedMutation, converseFirst, clarifyThenExecute, workspaceBuild, teamAgentHandoff, pendingActionGate];
 const ALL_BRAINS: BrainKind[] = ['claude', 'codex', 'glm'];
 
 function parseArgs(argv: string[]): { brains: BrainKind[]; scenarios: ScenarioDef[]; scoreOnly?: string; keep: boolean } {
@@ -83,9 +84,10 @@ function servedModelFamilies(home: string): Set<string> {
     for (const row of rows) {
       try {
         const data = JSON.parse(row.data_json) as { model?: string; modelId?: string; provider?: string; transport?: string };
-        if (typeof data.model === 'string') classify(data.model);
+        if (data.provider === 'claude' || data.provider === 'codex' || data.provider === 'byo') families.add(data.provider);
+        else if ((data.transport ?? '').includes('claude_agent_sdk')) families.add('claude');
+        else if (typeof data.model === 'string') classify(data.model);
         else if (typeof data.modelId === 'string') classify(data.modelId);
-        else if (data.provider === 'claude' || (data.transport ?? '').includes('claude_agent_sdk')) families.add('claude');
       } catch { /* skip */ }
     }
     db.close();
@@ -159,10 +161,15 @@ async function main(): Promise<void> {
       daemon.markLog(); // scope daemon.log() (storm check) to THIS scenario
       try {
         const result = await scenario.run(daemon);
-        const failed = result.checks.some((c) => !c.pass);
+        const checks = [...result.checks];
+        if (scenario.routeExpectation === 'exact-brain') {
+          if (result.sessionId) checks.push(...exactBrainRouteChecks(daemon.home, result.sessionId, brainKind, result.latency.length));
+          else checks.push({ name: 'exact route has a scenario session id', pass: false, detail: 'scenario returned no sessionId' });
+        }
+        const failed = checks.some((c) => !c.pass);
         anyFailed ||= failed;
-        outcomes.push({ ...result, scenario: scenario.name, brain: brainKind, status: failed ? 'FAIL' : 'PASS' });
-        console.log(`    ${failed ? '❌ FAIL' : '✅ PASS'} (${result.checks.filter((c) => c.pass).length}/${result.checks.length} checks)`);
+        outcomes.push({ ...result, checks, scenario: scenario.name, brain: brainKind, status: failed ? 'FAIL' : 'PASS' });
+        console.log(`    ${failed ? '❌ FAIL' : '✅ PASS'} (${checks.filter((c) => c.pass).length}/${checks.length} checks)`);
       } catch (err) {
         anyFailed = true;
         outcomes.push({ scenario: scenario.name, brain: brainKind, status: 'FAIL', checks: [], latency: [], error: err instanceof Error ? err.message : String(err) });

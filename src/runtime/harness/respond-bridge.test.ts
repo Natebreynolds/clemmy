@@ -22,7 +22,7 @@ const {
   _setBridgeImplsForTests,
 } = await import('./respond-bridge.js');
 // eslint-disable-next-line import/first
-const { appendEvent, createSession, getSession, resetEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, getSession, listEvents, resetEventLog } = await import('./eventlog.js');
 // eslint-disable-next-line import/first
 const { AgentRuntimeCancelledError } = await import('../provider.js');
 // eslint-disable-next-line import/first
@@ -56,6 +56,14 @@ beforeEach(() => {
   delete process.env.CLEMMY_HARNESS_SLACK;
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
+  delete process.env.CLEMMY_BRAIN_FALLOVER;
+  delete process.env.MODEL_ROUTING_MODE;
+  delete process.env.BYO_MODEL_BASE_URL;
+  delete process.env.BYO_MODEL_API_KEY;
+  delete process.env.BYO_MODEL_ID;
+  delete process.env.BYO_MODEL_JUDGE_ID;
+  delete process.env.BYO_MODEL_PROVIDER;
+  delete process.env.BYO_PROVIDERS;
   process.env.AUTH_MODE = 'api_key';
 });
 
@@ -346,6 +354,7 @@ test('respondPreferHarness: Claude SDK brain opt-in routes background, while wor
 test('Claude SDK brain overload (uncommitted) falls the turn over to the harness brain (Codex→GLM)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   let runConversationCalled = 0;
   _setBridgeImplsForTests({
     configure: okConfigure,
@@ -369,6 +378,7 @@ test('Claude SDK brain overload (uncommitted) falls the turn over to the harness
 test('Claude SDK brain fallover forces a non-Claude harness model when one is configured', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   const oldByoUrl = process.env.BYO_MODEL_BASE_URL;
   const oldByoKey = process.env.BYO_MODEL_API_KEY;
   const oldByoId = process.env.BYO_MODEL_ID;
@@ -415,6 +425,7 @@ test('Claude SDK brain fallover forces a non-Claude harness model when one is co
 test('Claude SDK brain UNPARSEABLE-TOOL-CALL (parse failure) also falls the turn over to the harness brain', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   let runConversationCalled = 0;
   _setBridgeImplsForTests({
     configure: okConfigure,
@@ -435,6 +446,7 @@ test('Claude SDK brain UNPARSEABLE-TOOL-CALL (parse failure) also falls the turn
 test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   let reuseRecordedUserInput: boolean | undefined;
   _setBridgeImplsForTests({
     configure: okConfigure,
@@ -480,6 +492,7 @@ test('Claude SDK uncommitted fallover reuses the pre-recorded user input row', a
 test('Claude SDK brain overload AFTER committing surfaces the error (no double-act)', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   let runConversationCalled = 0;
   _setBridgeImplsForTests({
     configure: okConfigure,
@@ -547,6 +560,37 @@ test('respondViaHarness: completed maps to AssistantResponse with reply preferre
   const session = getSession('bridge-t5');
   assert.ok(session, 'harness session created');
   assert.equal(session?.kind, 'chat', 'webhook surface creates a chat-kind session');
+});
+
+test('all_in gpt-shaped BYO route diagnostics and event telemetry report the actual BYO wire', async () => {
+  process.env.AUTH_MODE = 'api_key';
+  process.env.MODEL_ROUTING_MODE = 'all_in';
+  process.env.BYO_MODEL_BASE_URL = 'https://api.together.test/v1';
+  process.env.BYO_MODEL_API_KEY = 'together-key';
+  process.env.BYO_MODEL_ID = 'gpt-4o';
+  process.env.BYO_MODEL_PROVIDER = 'Together';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: fakeRun({ status: 'completed', lastDecision: { reply: 'served by BYO', done: true, nextAction: 'completed' } }),
+  });
+
+  const res = await respondViaHarness('home', { message: 'hi', sessionId: 'route-gpt-shaped-byo' });
+  assert.equal(res.route?.effectiveModel, 'gpt-4o');
+  assert.equal(res.route?.provider, 'byo');
+  assert.equal(res.route?.transport, 'openai_agents_harness');
+  assert.equal(res.route?.mode, 'all_in');
+
+  const routed = listEvents('route-gpt-shaped-byo', { types: ['turn_model_routed'] });
+  assert.equal(routed.length, 1);
+  assert.deepEqual(routed[0].data, {
+    model: 'gpt-4o',
+    provider: 'byo',
+    transport: 'openai_agents_harness',
+    mode: 'all_in',
+    routeKind: 'harness',
+    surface: 'home',
+  });
 });
 
 test('respondViaHarness: relays harness tool/progress events to legacy callbacks', async () => {
@@ -704,6 +748,7 @@ test('isChatBrainFalloverEligible: ANY genuine Claude-brain failure switches bra
 });
 
 test('parse-exhaustion completion re-runs ONCE on the next brain instead of shipping the apology', async () => {
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   // Seed a connected Claude so falloverBrainModelIds('codex') has a target
   // (the harness brain under AUTH_MODE=api_key resolves to the codex class).
   const { mkdirSync, writeFileSync } = await import('node:fs');
@@ -750,6 +795,7 @@ test('narration give-up is fallover-eligible; without fallover it ships the grac
   const { ClaudeSdkNarrationGiveUpError } = await import('./claude-agent-brain.js');
   const err = new ClaudeSdkNarrationGiveUpError('I started to turn that into an action but it did not go through as a real tool call. Say the word and I will run it properly.');
   // Eligible for the cross-brain re-run (zero tools ran ⇒ side-effect-safe).
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   assert.equal(isChatBrainFalloverEligible(err), true);
   // And the bridge's catch converts it to a graceful reply when fallover is unavailable
   // (kill-switch off ⇒ recoverChatBrainFailure returns null ⇒ text floor).
@@ -793,6 +839,7 @@ test('awaiting_user_input surfaces THE QUESTION (+ numbered options), never the 
 });
 
 test('parse-exhaustion recovery is GATED on external writes — a run that committed a write ships the honest completion, never a blind re-run', async () => {
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
   // The invariant (mirror of loop.ts step-boundary canSwitch): only rerun
   // across brains when the external_write count did not increase during the
   // run. If anything was sent/updated/created, re-driving the turn on another

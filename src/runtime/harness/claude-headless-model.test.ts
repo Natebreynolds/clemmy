@@ -132,6 +132,18 @@ test('renderClaudeHeadlessPrompt preserves system/input and marks text-specialis
   assert.match(prompt, /user:\nDraft a layout critique\./);
 });
 
+test('headless transport fails clearly instead of pretending to serve a tool-bearing request', async () => {
+  const { ClaudeHeadlessModel } = await import('./claude-headless-model.js');
+  const model = new ClaudeHeadlessModel('claude-opus-4-8');
+  const request = {
+    input: 'Read the file.',
+    modelSettings: {},
+    tools: [{ type: 'function', name: 'read_file', description: 'Read', parameters: {}, strict: false }],
+    handoffs: [],
+  } as any;
+  await assert.rejects(() => model.getResponse(request), /text-only transport/);
+});
+
 test('normalizeClaudeHeadlessOutputText strips markdown fences for structured output', () => {
   assert.equal(
     normalizeClaudeHeadlessOutputText('```json\n{"reply":"ok"}\n```', { type: 'object' } as any),

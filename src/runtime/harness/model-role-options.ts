@@ -13,7 +13,12 @@ import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { defaultForRole, type ModelRole } from './model-roles.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
-import { getByoProviders, providerToBackendConfig } from './byo-providers.js';
+import {
+  getByoProviders,
+  providerToBackendConfig,
+  configuredByoProvidersForModel,
+  resolveEffectiveProviderForModel,
+} from './byo-providers.js';
 import { discoveredModels } from './model-discovery.js';
 
 export interface AvailableModelGroup {
@@ -177,7 +182,10 @@ export function connectedModelGroupsForRole(role: ModelRole): AvailableModelGrou
   if (role === 'brain') return [];
   return connectedModelGroups()
     .map((group) => {
-      const models = group.models.filter((model) => roleModelCapability(role, model.id).ok);
+      const models = group.models.filter((model) => {
+        const capability = roleModelCapability(role, model.id);
+        return capability.ok && capability.provider === group.provider;
+      });
       return { ...group, models };
     })
     .filter((group) => group.models.length > 0);
@@ -197,7 +205,19 @@ export function roleModelCapability(role: ModelRole, modelId: string): RoleModel
   }
   const clean = modelId.trim();
   if (!clean) return { ok: false, reason: 'modelId is required.' };
-  const provider = resolveProvider(clean);
+  let provider: ModelProviderClass;
+  try {
+    provider = resolveEffectiveProviderForModel(clean);
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+
+  if (getModelRoutingMode() === 'all_in' && getByoBackendConfig().configured && provider !== 'byo') {
+    return {
+      ok: false,
+      reason: `All-in mode is isolated to the BYO provider; ${clean} cannot be bound to ${role} until all-in is disabled.`,
+    };
+  }
 
   if (provider === 'byo') {
     // Any model offered by any connected provider can serve any non-brain role
@@ -297,6 +317,7 @@ export function brainOptions(): BrainOption[] {
     if (!providerToBackendConfig(provider).configured) continue;
     for (const raw of provider.modelIds) {
       const modelId = raw.trim();
+      if (configuredByoProvidersForModel(modelId).length > 1) continue;
       if (!modelId || seen.has(modelId)) continue;
       seen.add(modelId);
       opts.push({
@@ -326,6 +347,9 @@ export function effectiveBrainValue(): string {
   // the highlighted option is ALWAYS the real brain — never a bare, unmatchable
   // 'api_key' nor a BYO model that isn't actually orchestrating.
   const brainModelId = defaultForRole('brain');
+  if (getModelRoutingMode() === 'all_in' && getByoBackendConfig().configured) {
+    return `api_key:${brainModelId}`;
+  }
   const provider = resolveProvider(brainModelId);
   // claude → the SPECIFIC model value so the picker highlights the right Claude
   // row (brainOptions lists every connected Claude model; the resolved id is

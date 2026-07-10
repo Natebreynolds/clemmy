@@ -1651,6 +1651,91 @@ test('runConversation: stops on first completed decision', async () => {
   assert.equal(events.filter((e) => e.type === 'conversation_completed').length, 1);
 });
 
+test('runConversation: an answer to a genuine prior clarification reaches the standard provider lane with convergence state', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Win-back queue or loss diagnosis?', source: 'decision_awaiting' },
+  });
+  let modelInput = '';
+  const runRunner: RunRunnerFn = async (_runner, _agent, items) => {
+    const last = items.at(-1) as { content?: unknown } | undefined;
+    modelInput = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? '');
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: 'Built the win-back queue and verified the saved workspace.',
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Use the win-back queue.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.match(modelInput, /CONVERGE/);
+  assert.match(modelInput, /EXECUTE the work this turn/);
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 1, 'no second question emitted');
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+});
+
+test('runConversation: answering offer_background suppresses repeat offers without injecting clarification convergence', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Run it in the background, hold it, or do it now here?', source: 'offer_background' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 0,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { awaitingUser: true },
+  });
+  let modelInput = '';
+  let contextSuppressed: unknown;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    const last = items.at(-1) as { content?: unknown } | undefined;
+    modelInput = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? '');
+    contextSuppressed = (opts.context as { suppressBackgroundOffer?: unknown } | undefined)?.suppressBackgroundOffer;
+    return {
+      history: items,
+      lastResponseId: undefined,
+      finalOutput: 'Finished the existing job and verified its result.',
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Do it now here.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(contextSuppressed, true, 'production run context carries repeat-offer suppression into tools');
+  assert.doesNotMatch(modelInput, /CONVERGE/, 'background routing is not a clarification and gets no execute-now steer');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['awaiting_user_input'] })
+      .filter((event) => event.data.source === 'offer_background').length,
+    1,
+    'the existing routing choice remains the only background offer',
+  );
+});
+
 test('runConversation: completed decision with empty reply is retried, not shown as an internal bug bubble', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -3837,6 +3922,30 @@ const PRESENTED_DRAFT =
   "AI-driven results. I'll include the full report link so you can see where " +
   'you show up across Google.\n\nGood to send?';
 
+const STALL_DRAFT = PRESENTED_DRAFT.replace(
+  'Good to send?',
+  'This draft is ready for your review.',
+);
+
+test('runConversation: a substantive reply ending in a concrete question is delivered directly', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({
+    history: items,
+    lastResponseId: undefined,
+    finalOutput: PRESENTED_DRAFT,
+  });
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'send the outreach batch',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.ok(completed.some((e) => String(e.data.reply ?? e.data.summary ?? '').includes('Good to send?')));
+  assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0);
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
 test('runConversation: a zero-tool text reply to the draft-present directive is DELIVERED (plain-text contract)', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
@@ -3848,7 +3957,7 @@ test('runConversation: a zero-tool text reply to the draft-present directive is 
   });
   // The model presents the draft (announcement-verb-laden text, zero tools)
   // every turn — exactly the live failure shape.
-  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: PRESENTED_DRAFT });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: STALL_DRAFT });
   const result = await runConversation({
     agent: makeAgentStub(), sessionId: sess.id, input: 'send the outreach batch',
     makeRunner: makeRunnerStub, runRunner,
@@ -3857,7 +3966,7 @@ test('runConversation: a zero-tool text reply to the draft-present directive is 
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   const delivered = completed.find((e) => (e.data as { reason?: string }).reason === 'plain_text_contract_fulfilled');
   assert.ok(delivered, 'the compliant draft reply is delivered as fulfillment of the plain-text contract');
-  assert.match(String((delivered!.data as { reply?: string }).reply ?? ''), /Good to send\?/);
+  assert.match(String((delivered!.data as { reply?: string }).reply ?? ''), /ready for your review/);
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
 });
 
@@ -3868,7 +3977,7 @@ test('runConversation: a substantive answer repeated identically across stall re
   // call) is used, so the plain-text-contract exemption never applies and the
   // retries genuinely exhaust. The model confidently repeats the same
   // substantive text — the prose IS the deliverable.
-  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: PRESENTED_DRAFT });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: STALL_DRAFT });
   const result = await runConversation({
     agent: makeAgentStub(), sessionId: sess.id, input: 'can I see the full draft please',
     makeRunner: makeRunnerStub, runRunner,
@@ -3877,7 +3986,7 @@ test('runConversation: a substantive answer repeated identically across stall re
   const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
   const salvaged = completed.find((e) => (e.data as { reason?: string }).reason === 'stall_consistent_reply_salvaged');
   assert.ok(salvaged, 'the consistent substantive reply is salvaged and delivered');
-  assert.match(String((salvaged!.data as { reply?: string }).reply ?? ''), /Good to send\?/);
+  assert.match(String((salvaged!.data as { reply?: string }).reply ?? ''), /ready for your review/);
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
 });
 

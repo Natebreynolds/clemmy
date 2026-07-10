@@ -612,14 +612,22 @@ export function getClaudeModel(modelId: string): Model {
   return model;
 }
 
+/** Whether the Claude model used by the standard Agents harness can execute
+ * native Clementine tools. Claude Code print mode is deliberately text-only;
+ * the raw Messages adapter remains tool-capable. */
+export function claudeHarnessModelSupportsTools(): boolean {
+  return claudeSubscriptionTransport() !== 'headless' || !claudeHeadlessCliAvailable();
+}
+
 function isClaudeModelId(id: string | undefined): boolean {
   return Boolean(id && /claude|opus|sonnet|haiku/i.test(id));
 }
 
-/** Overload-fallback (Opus -> Sonnet -> Codex-if-installed) on a 529. Default on;
- *  CLEMMY_CLAUDE_OVERLOAD_FALLBACK=off keeps a single brain (retry + surface). */
+/** Optional overload-fallback (Opus -> Sonnet -> Codex-if-installed) on a 529.
+ *  Default off: the universal router owns provider changes when explicitly
+ *  enabled, avoiding nested retry/fallback chains. */
 export function overloadFallbackEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_CLAUDE_OVERLOAD_FALLBACK', 'on') || 'on').trim().toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_CLAUDE_OVERLOAD_FALLBACK', 'off') || 'off').trim());
 }
 
 const SONNET_FALLBACK_ID = 'claude-sonnet-4-6';

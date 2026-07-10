@@ -55,8 +55,9 @@ export type ResumeDispatcher = (sessionId: string, directive: string) => Promise
 
 export const AUTO_RESUME_DIRECTIVE = [
   'The previous run in this session was interrupted by a daemon restart and has been automatically resumed.',
-  'Pick up exactly where you left off using the replayed conversation, tool outputs, and audit log — do not restart from scratch.',
-  'If the task was already effectively complete, deliver the final answer now.',
+  'First inspect the replayed tool outputs and audit events from the interrupted run. Successful tool results are durable: never repeat a completed mutation, including space_save, and never restart the task from scratch.',
+  'Treat an earlier question as resolved when a later user_input_received event answers it; do not reopen that question.',
+  'A successful space_save can be the final action or an intermediate checkpoint. If the durable results already satisfy the request, use at most read-only verification and report the result now. Otherwise continue only work that the objective and event trail show is clearly unfinished, starting from the last durable boundary.',
 ].join('\n');
 
 /** External-write count in the interrupted window. Any count >0 blocks
@@ -213,7 +214,6 @@ export function recoverInterruptedChatRuns(
     else if (!Number.isFinite(ageMs) || ageMs > AUTO_RESUME_MAX_AGE_MS) record.autoResumeSkipped = 'too_old';
     else if (externalWritesSinceInterrupt === null || externalWritesSinceInterrupt > 0) record.autoResumeSkipped = 'external_write';
     const willAutoResume = record.autoResumeSkipped === undefined;
-
     try {
       record.snapshotItemsBefore = sess.toInputItems().length;
       record.lastResponseIdPresent = !!sess.previousResponseId();

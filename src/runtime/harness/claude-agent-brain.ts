@@ -288,11 +288,14 @@ export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' |
 export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring' | 'full';
 
 function configuredMode(): ClaudeAgentBrainMode | null {
-  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN', 'off') ?? 'off').trim().toLowerCase();
+  // Claude chat/background must use the tool-capable Agent SDK lane by default.
+  // The standard `claude -p` transport is intentionally text-only. Full-mode
+  // writes still pass through Clementine's approval and tool-boundary gates.
+  const raw = (getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN', 'full') ?? 'full').trim().toLowerCase();
   if (raw === 'off' || raw === '0' || raw === 'false' || raw === 'no') return null;
   if (raw === 'read_only' || raw === 'readonly') return 'read_only';
   // Full agentic: Claude executes gated tools (shell/composio/sends) under the
-  // approval gate. (Step 5 will make this the default for claude_oauth.)
+  // approval gate.
   if (raw === 'full' || raw === 'agentic' || raw === 'all') return 'full';
   if (
     raw === 'on'
@@ -1314,6 +1317,7 @@ export async function respondViaClaudeAgentSdkBrain(
   // "say continue", not a failure (claude-agent-sdk.ts returns limitHit).
   const stoppedReason: AssistantResponse['stoppedReason'] =
     result.stoppedReason ?? (result.limitHit ? 'max-turns-with-grace' : 'success');
+  const awaitingInput = stoppedReason === 'awaiting-input';
   // Report-back / observability parity (gap analysis): the harness loop emits
   // conversation_completed + runtime.completed on a clean terminal so the Tasks
   // board, report-back, and watchdog see the run. The Agent SDK lane runs its
@@ -1331,6 +1335,31 @@ export async function respondViaClaudeAgentSdkBrain(
       });
     } catch { /* limit telemetry is best-effort */ }
   }
+  // `ask_user_question` normally records this inside the local tool itself,
+  // but the SDK can also classify a direction-seeking plain-text reply as
+  // awaiting input. Persist the canonical pause in either case so restart,
+  // transcript replay, and the next-turn convergence steer all observe the
+  // same state. Do not duplicate a tool-recorded ask from this user turn.
+  if (awaitingInput) {
+    try {
+      const recent = listEvents(sessionId, {
+        types: ['user_input_received', 'awaiting_user_input'],
+        desc: true,
+        limit: 40,
+      });
+      const latestUser = recent.filter((event) => event.type === 'user_input_received').at(-1);
+      const latestAsk = recent.filter((event) => event.type === 'awaiting_user_input').at(-1);
+      if (!latestAsk || (latestUser && latestAsk.seq < latestUser.seq)) {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: { question: text, source: 'decision_awaiting' },
+        });
+      }
+    } catch { /* pause telemetry is best-effort; completion below remains authoritative */ }
+  }
   let terminalEventRecorded = false;
   try {
     appendEvent({
@@ -1341,11 +1370,12 @@ export async function respondViaClaudeAgentSdkBrain(
       data: {
         reason: result.limitHit
           ? 'awaiting_continue'
-          : stoppedReason === 'awaiting-input'
+          : awaitingInput
             ? 'awaiting_user_input'
             : 'claude_agent_sdk_brain',
         summary: text.slice(0, 400),
         reply: text,
+        ...(awaitingInput ? { awaitingUser: true } : {}),
         // Move 4: surface degraded verification so a self-judged / judge-failed-open
         // completion is distinguishable from an independently-verified one.
         ...(completionVerification ? { verification: completionVerification } : {}),

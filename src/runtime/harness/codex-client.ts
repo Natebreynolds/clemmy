@@ -34,7 +34,12 @@ import { reviveDeadBrains } from './fallback-model.js';
 import { maybeWrapDebate } from './debate-model.js';
 import { loadFreshClaudeAccessToken, claudeVaultFallbackReady } from '../claude-oauth.js';
 import { addNotification } from '../notifications.js';
-import { getModelRoutingMode, getByoBackendConfig, getActiveAuthMode } from '../../config.js';
+import {
+  getModelRoutingMode,
+  getByoBackendConfig,
+  getActiveAuthMode,
+  getRuntimeEnv,
+} from '../../config.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.codex-client' });
@@ -132,6 +137,10 @@ export interface ConfigureResult {
   fallback?: { from: string; to: BrainMode; note: string };
 }
 
+function automaticBrainFallbackEnabled(): boolean {
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
+}
+
 /**
  * Find the first AVAILABLE alternative brain when the desired one can't
  * authenticate. Order: Codex (subscription OAuth) → Claude (subscription OAuth,
@@ -221,12 +230,14 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
       configured = true;
       return { ok: true };
     } catch (err) {
-      const fb = pickAvailableBrainFallback('claude_oauth');
+      const fb = automaticBrainFallbackEnabled() ? pickAvailableBrainFallback('claude_oauth') : null;
       if (fb) return applyBrainFallback('Claude', fb);
       return {
         ok: false,
         reason: (err instanceof Error ? err.message : 'Claude subscription auth is not ready.')
-          + ' No other model is connected — set one up in Settings → Models.',
+          + (automaticBrainFallbackEnabled()
+            ? ' No other model is connected — set one up in Settings → Models.'
+            : ' Automatic provider switching is off; reconnect Claude in Settings → Models or explicitly enable brain fallover.'),
       };
     }
   }
@@ -245,13 +256,14 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
   if (!tokens?.accessToken) {
     // Codex is the default brain but isn't logged in — fall back to any other
     // connected model (Claude / BYO) before surfacing a hard error.
-    const fb = pickAvailableBrainFallback('codex_oauth');
+    const fb = automaticBrainFallbackEnabled() ? pickAvailableBrainFallback('codex_oauth') : null;
     if (fb) return applyBrainFallback('Codex', fb);
     return {
       ok: false,
       reason:
-        'No AI model is signed in yet. Open Settings → Models & routing and ' +
-        'sign in with ChatGPT or Claude (or add an API-key model).',
+        (automaticBrainFallbackEnabled()
+          ? 'No AI model is signed in yet. Open Settings → Models & routing and sign in with ChatGPT or Claude (or add an API-key model).'
+          : 'The selected Codex login is unavailable and automatic provider switching is off. Reconnect Codex in Settings → Models or explicitly enable brain fallover.'),
     };
   }
 

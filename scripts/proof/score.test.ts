@@ -11,7 +11,15 @@ import path from 'node:path';
 import os from 'node:os';
 import Database from 'better-sqlite3';
 
-import { openHarnessDb, sessionMetrics, narrationCheck, stormCheck, summarizeAllSessions } from './score.js';
+import {
+  exactBrainRouteChecks,
+  narrationCheck,
+  openHarnessDb,
+  sessionMetrics,
+  sessionRouteEvidence,
+  stormCheck,
+  summarizeAllSessions,
+} from './score.js';
 
 function buildFixtureHome(): string {
   const home = mkdtempSync(path.join(os.tmpdir(), 'proof-score-fixture-'));
@@ -54,6 +62,30 @@ function buildFixtureHome(): string {
   ev('conversation_completed', { reply: 'done' }, 30_100);
   db.close();
   return home;
+}
+
+function addRouteMarker(home: string, sessionId: string, data: unknown, suffix: string): void {
+  const db = new Database(path.join(home, 'state', 'harness.db'));
+  db.prepare(
+    `INSERT INTO events (id, session_id, turn, role, type, data_json, created_at) VALUES (?,?,?,?,?,?,?)`,
+  ).run(`route-${suffix}`, sessionId, 0, 'system', 'turn_model_routed', JSON.stringify(data), new Date().toISOString());
+  db.close();
+}
+
+function addOperationalFallover(home: string, sessionId: string): void {
+  const db = new Database(path.join(home, 'state', 'operational-telemetry.db'));
+  db.exec(`
+    CREATE TABLE operational_events (
+      event_id TEXT PRIMARY KEY, ts TEXT, source TEXT, type TEXT, severity TEXT,
+      workspace_id TEXT, workflow_run_id TEXT, workflow_node_run_id TEXT,
+      session_id TEXT, model_call_id TEXT, tool_call_id TEXT, actor TEXT,
+      payload_json TEXT
+    );
+  `);
+  db.prepare(
+    `INSERT INTO operational_events (event_id, ts, source, type, severity, session_id, payload_json) VALUES (?,?,?,?,?,?,?)`,
+  ).run('fallover-1', new Date().toISOString(), 'model', 'model_fallover', 'warn', sessionId, '{}');
+  db.close();
 }
 
 test('sessionMetrics computes counts, TTFT, and latency from the fixture', () => {
@@ -118,4 +150,44 @@ test('stormCheck trips on repeated provider-error markers', () => {
   assert.equal(stormCheck('all quiet').pass, true);
   const noisy = Array.from({ length: 5 }, (_, i) => `request failed with 529 overloaded (attempt ${i})`).join('\n');
   assert.equal(stormCheck(noisy).pass, false);
+});
+
+test('exact route evidence is session-scoped, not satisfied by an unrelated provider marker', () => {
+  const home = buildFixtureHome();
+  try {
+    addRouteMarker(home, 'other-session', { provider: 'claude', model: 'claude-opus-4-8' }, 'other');
+    addRouteMarker(home, 'sess-1', { provider: 'codex', model: 'gpt-5.4' }, 'one');
+    addRouteMarker(home, 'sess-1', { provider: 'codex', model: 'gpt-5.4' }, 'two');
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'codex', 2).every((check) => check.pass), true);
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'claude', 2)[1].pass, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('explicit BYO provider identity wins over a gpt-shaped model id', () => {
+  const home = buildFixtureHome();
+  try {
+    addRouteMarker(home, 'sess-1', { provider: 'byo', model: 'gpt-4o', transport: 'openai_agents_harness' }, 'byo-one');
+    addRouteMarker(home, 'sess-1', { provider: 'byo', model: 'gpt-4o', transport: 'openai_agents_harness' }, 'byo-two');
+    const evidence = sessionRouteEvidence(home, 'sess-1');
+    assert.deepEqual([...new Set(evidence.families)], ['byo']);
+    assert.equal(exactBrainRouteChecks(home, 'sess-1', 'glm', 2).every((check) => check.pass), true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mixed same-session providers and a same-session fallover fail the exact route gate', () => {
+  const home = buildFixtureHome();
+  try {
+    addRouteMarker(home, 'sess-1', { provider: 'codex', model: 'gpt-5.4' }, 'mixed-one');
+    addRouteMarker(home, 'sess-1', { provider: 'claude', model: 'claude-opus-4-8' }, 'mixed-two');
+    addOperationalFallover(home, 'sess-1');
+    const checks = exactBrainRouteChecks(home, 'sess-1', 'codex', 2);
+    assert.equal(checks[1].pass, false, 'mixed providers are not an exact Codex route');
+    assert.equal(checks[2].pass, false, 'a recorded fallover fails the route gate');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

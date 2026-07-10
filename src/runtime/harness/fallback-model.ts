@@ -55,6 +55,9 @@ export interface FallbackTarget {
   label: string;
   /** Lazily build the Model — a fallback is only constructed if it's reached. */
   getModel: () => Model;
+  /** Optional request-capability guard. A target that cannot honor the request
+   *  (for example a text-only transport on a tool-bearing turn) is skipped. */
+  supportsRequest?: (request: ModelRequest) => boolean;
 }
 
 export interface FallbackOptions {
@@ -414,12 +417,17 @@ export class FallbackModel implements Model {
     return false;
   }
 
-  /** The chain minus brains whose auth is dead or which repeatedly went silent
-   *  before content. Never empty: if EVERY brain is unavailable, probe the full
-   *  chain anyway — tokens may have refreshed or a silent provider may recover. */
-  private liveChain(): FallbackTarget[] {
-    const alive = this.chain.filter((t) => !isBrainAuthDead(t.label) && !isBrainSilenced(t.label));
-    return alive.length > 0 ? alive : this.chain;
+  /** First filter by request capability, then remove brains whose auth is dead
+   *  or which repeatedly went silent. If every compatible brain is cooling
+   *  down, probe the compatible set again; never fall through to an
+   *  incompatible transport merely because it is available. */
+  private liveChain(request: ModelRequest): FallbackTarget[] {
+    const compatible = this.chain.filter((target) => target.supportsRequest?.(request) !== false);
+    if (compatible.length === 0) {
+      throw new Error('fallback chain has no provider compatible with this request');
+    }
+    const alive = compatible.filter((t) => !isBrainAuthDead(t.label) && !isBrainSilenced(t.label));
+    return alive.length > 0 ? alive : compatible;
   }
 
   /** Sticky-mark a brain whose failure was an auth failure (dead until re-auth
@@ -433,7 +441,7 @@ export class FallbackModel implements Model {
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     const forced = forcedOverloadDepth();
-    const chain = this.liveChain();
+    const chain = this.liveChain(request);
     for (let i = 0; i < chain.length; i++) {
       const isLast = i >= chain.length - 1;
       if (i < forced && !isLast) {
@@ -463,7 +471,7 @@ export class FallbackModel implements Model {
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     const forced = forcedOverloadDepth();
-    const chain = this.liveChain();
+    const chain = this.liveChain(request);
     for (let i = 0; i < chain.length; i++) {
       const isLast = i >= chain.length - 1;
       if (i < forced && !isLast) {
@@ -575,7 +583,7 @@ export class FallbackModel implements Model {
  *  (a lone brain still benefits from converting a hang into a clean error). */
 export function withModelFallback(chain: FallbackTarget[], opts: FallbackOptions = {}): Model {
   if (chain.length === 0) throw new Error('withModelFallback: empty chain');
-  if (chain.length === 1 && !opts.firstByteTimeoutMs) return chain[0].getModel();
+  if (chain.length === 1 && !opts.firstByteTimeoutMs && !chain[0].supportsRequest) return chain[0].getModel();
   return new FallbackModel(chain, opts);
 }
 

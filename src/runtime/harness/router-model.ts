@@ -7,7 +7,7 @@
  *   - `gpt-5*` / `o*` ids → Codex.
  *   - `claude-*` ids      → Claude subscription adapter.
  *   - any other id        → BYO OpenAI-compatible backend.
- *   - all_in mode         → every role on BYO; a stray `gpt-5*` id falls
+ *   - all_in mode         → every role on BYO; a stray built-in model id falls
  *                           back to the BYO primary so a misconfig can't
  *                           silently hit a dead Codex seat.
  *
@@ -15,11 +15,15 @@
  * any connected provider, and the provider dispatch follows the model id rather
  * than whichever brain happened to be active.
  */
-import type { Model, ModelProvider } from '@openai/agents-core';
+import type { Model, ModelProvider, ModelRequest } from '@openai/agents-core';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
-import { resolveByoProviderForModel } from './byo-providers.js';
-import { ClaudeModelProvider } from './claude-model.js';
+import {
+  assertUnambiguousModelRouting,
+  resolveByoProviderForModel,
+  resolveDeclaredByoProviderForModel,
+} from './byo-providers.js';
+import { ClaudeModelProvider, claudeHarnessModelSupportsTools } from './claude-model.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { codexModelsAvailable, claudeModelsAvailable } from './model-role-options.js';
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
@@ -31,13 +35,13 @@ import pino from 'pino';
 
 const logger = pino({ name: 'clementine.router-model' });
 
-type BrainProvider = 'codex' | 'claude' | 'byo';
+export type BrainProvider = 'codex' | 'claude' | 'byo';
 
-/** Universal cross-provider brain-fallover: every turn runs through an ordered
- *  chain of ALL connected brains, so a single provider's overload/429/hang is
- *  invisible — Clem switches brains and finishes. Kill-switch default-on. */
+/** Cross-provider brain fallover is an explicit recovery mode. Default off:
+ *  each selected provider owns its request unless the operator opts into a
+ *  compatible provider switch. */
 function brainFalloverEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
 }
 /** First-byte fallover budget — set BELOW the loop's stall watchdog (modelFirstByteStallMs,
  *  default 75s) so a hung provider falls over to the next brain instead of dead-ending. */
@@ -51,6 +55,22 @@ function brainFalloverFirstByteMs(): number {
   // watchdog AND the fallover budget together (a coordinated follow-up), not this
   // value alone. Tunable via CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS.
   return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+}
+
+export function brainFalloverFirstByteMsForProvider(provider: BrainProvider): number | undefined {
+  // The BYO adapter deliberately completes a non-streaming request and then
+  // emits one synthetic stream chunk. Its "first byte" is therefore the full
+  // completion time, so a first-byte deadline would falsely fail healthy work.
+  return provider === 'byo' ? undefined : brainFalloverFirstByteMs();
+}
+
+function requestNeedsNativeTools(request: ModelRequest): boolean {
+  return (Array.isArray(request.tools) && request.tools.length > 0)
+    || (Array.isArray(request.handoffs) && request.handoffs.length > 0);
+}
+
+function claudeHarnessSupportsRequest(request: ModelRequest): boolean {
+  return !requestNeedsNativeTools(request) || claudeHarnessModelSupportsTools();
 }
 
 export class RouterModelProvider implements ModelProvider {
@@ -80,7 +100,7 @@ export class RouterModelProvider implements ModelProvider {
       const sessionId = harnessRunContextStorage.getStore()?.sessionId;
       resolved = withModelFallback(chain, {
         falloverOn429: true,
-        firstByteTimeoutMs: brainFalloverFirstByteMs(),
+        firstByteTimeoutMs: brainFalloverFirstByteMsForProvider(primary.provider),
         sessionId,
         workflowRunId: workflowRunIdFromSessionId(sessionId),
       });
@@ -109,13 +129,24 @@ export class RouterModelProvider implements ModelProvider {
     const mode = getModelRoutingMode();
     const requested = typeof modelName === 'string' ? modelName.trim() : '';
     const name = requested || MODELS.primary;
+    assertUnambiguousModelRouting(name, mode);
 
     if (mode === 'all_in') {
-      const backend = resolveByoProviderForModel(name) ?? byo;
+      const declaredBackend = resolveDeclaredByoProviderForModel(name);
+      const backend = declaredBackend ?? resolveByoProviderForModel(name) ?? byo;
       if (!backend.configured) throw new Error('BYO all-in mode is enabled, but no BYO backend is configured.');
-      const id = resolveProvider(name) === 'codex' ? (backend.primaryId || name) : name;
+      const id = !declaredBackend && resolveProvider(name) !== 'byo' ? (backend.primaryId || name) : name;
       logger.debug({ requested: name, routedTo: id, backend: 'byo' }, 'route (all_in)');
       return { model: getByoModel(id, backend), provider: 'byo', label: id };
+    }
+
+    // Exact ownership declared by a named BYO provider beats model-id regexes.
+    // This is how an OpenAI-compatible endpoint can intentionally serve a model
+    // called `gpt-4o` or `claude-*` without being mistaken for a subscription.
+    const declaredBackend = resolveDeclaredByoProviderForModel(name);
+    if (declaredBackend?.configured) {
+      logger.debug({ requested: name, backend: 'byo', provider: declaredBackend.providerLabel }, 'route (declared owner)');
+      return { model: getByoModel(name, declaredBackend), provider: 'byo', label: name };
     }
 
     switch (resolveProvider(name)) {
@@ -146,14 +177,25 @@ export class RouterModelProvider implements ModelProvider {
    *  connected brain (deduped by provider), most-reliable first. Lazy targets —
    *  a fallback brain is only constructed if reached. */
   private buildBrainChain(primary: { model: Model; provider: BrainProvider; label: string }): FallbackTarget[] {
-    const chain: FallbackTarget[] = [{ label: primary.label, getModel: () => primary.model }];
+    const chain: FallbackTarget[] = [{
+      label: primary.label,
+      getModel: () => primary.model,
+      ...(primary.provider === 'claude' ? { supportsRequest: claudeHarnessSupportsRequest } : {}),
+    }];
+    // all_in is a provider-isolation promise, not merely a primary preference.
+    // Even an explicitly enabled fallover must not spend subscription seats.
+    if (getModelRoutingMode() === 'all_in') return chain;
     // Codex (OpenAI) — generally the steadiest fallback.
     if (primary.provider !== 'codex' && codexModelsAvailable()) {
       chain.push({ label: 'codex', getModel: () => this.codex.getModel(MODELS.primary) });
     }
     // Claude subscription.
     if (primary.provider !== 'claude' && claudeModelsAvailable()) {
-      chain.push({ label: 'claude', getModel: () => this.claude.getModel(getClaudeBrainModel()) });
+      chain.push({
+        label: 'claude',
+        getModel: () => this.claude.getModel(getClaudeBrainModel()),
+        supportsRequest: claudeHarnessSupportsRequest,
+      });
     }
     // The configured BYO/OpenAI-compatible backend (GLM/DeepSeek/…), if it isn't
     // already the primary.

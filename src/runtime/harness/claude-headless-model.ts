@@ -551,7 +551,19 @@ async function* runClaudeHeadlessAttempt(request: ModelRequest, modelId: string,
 export class ClaudeHeadlessModel implements Model {
   constructor(private readonly modelId: string) {}
 
+  private assertTextOnlyRequest(request: ModelRequest): void {
+    const toolCount = Array.isArray(request.tools) ? request.tools.length : 0;
+    const handoffCount = Array.isArray(request.handoffs) ? request.handoffs.length : 0;
+    if (toolCount > 0 || handoffCount > 0) {
+      throw new Error(
+        'Claude Code headless is a text-only transport and cannot execute Clementine tools. '
+        + 'Use the Claude Agent SDK brain (CLEMMY_CLAUDE_AGENT_SDK_BRAIN=full).',
+      );
+    }
+  }
+
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.assertTextOnlyRequest(request);
     let response: ModelResponse | null = null;
     for await (const event of runClaudeHeadless(request, this.modelId)) {
       if (event.kind === 'done') response = event.response;
@@ -561,6 +573,7 @@ export class ClaudeHeadlessModel implements Model {
   }
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
+    this.assertTextOnlyRequest(request);
     yield { type: 'response_started' } as StreamEvent;
     for await (const event of runClaudeHeadless(request, this.modelId)) {
       if (event.kind === 'delta') {

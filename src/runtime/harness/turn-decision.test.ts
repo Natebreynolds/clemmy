@@ -78,12 +78,59 @@ test('golden sess-mrchgvkc: a zero-tool contract reply classifies as answer (ful
   assert.match(decision!.reply ?? '', /Good to send\?/);
 });
 
-test('golden sess-mrchgvkc counterpart: same text WITHOUT the contract is still a punt', () => {
-  // Without the directive, a sub-300-char announcement-verb reply defers to
-  // the stall machinery (that is the desired safety, unchanged).
+test('golden sess-mrchgvkc counterpart: a concrete closing question is preserved without the contract', () => {
+  // The question is a conversational deliverable. The loop decides whether it
+  // is awaiting input; the announcement detector must not erase it first.
   const { kind, decision } = classifyTurnText(PRESENTED_DRAFT, { toolCalls: 0 });
+  assert.equal(kind, 'answer');
+  assert.match(decision?.reply ?? '', /Good to send\?/);
+});
+
+test('golden live direction question: future-tense recommendation is not erased as a zero-work punt', () => {
+  const text =
+    'I’ll prioritize by win-back likelihood: recency, engagement history, loss reason, ' +
+    'next-step clarity, and deal value as a tiebreaker. ' +
+    'Should it refresh daily, or only when you click Refresh?';
+  const { kind, decision } = classifyTurnText(text, { toolCalls: 0 });
+  assert.equal(kind, 'answer');
+  assert.equal(decision?.nextAction, 'completed');
+  assert.match(decision?.reply ?? '', /refresh daily/);
+});
+
+test('promise-only announcements ending in vague sign-off questions remain punts', () => {
+  const promises = [
+    "I'll run the Outlook search now. Should I proceed?",
+    "I'll run the Outlook search now. Ready?",
+    "I'll prepare the draft. Good to send?",
+    "I'll do that now. Sound good?",
+    "I'll run it now. Should I proceed now or later?",
+    "I'll run it now. Should I run it here or in the background?",
+    "I'll run the Outlook search now. Should I run the Outlook search now or later?",
+  ];
+  for (const text of promises) {
+    assert.equal(
+      toOrchestratorDecision(text),
+      null,
+      `a vague sign-off must not launder a zero-tool action promise: ${text}`,
+    );
+    const { kind, decision } = classifyTurnText(text, { toolCalls: 0 });
+    assert.equal(kind, 'punt', text);
+    assert.equal(decision, null, text);
+  }
+});
+
+test('structured completed envelope cannot use a trailing permission question to hide a zero-tool promise', () => {
+  const text = "I'll run the Outlook search now. Should I proceed?";
+  const envelope = {
+    summary: text,
+    reply: text,
+    done: true,
+    nextAction: 'completed',
+    reason: null,
+  };
+  const { kind, decision } = classifyTurnText(JSON.stringify(envelope), { toolCalls: 0 });
   assert.equal(kind, 'punt');
-  assert.equal(decision, null);
+  assert.equal(decision?.nextAction, 'completed', 'the envelope parsed, then the stall classifier rejected it');
 });
 
 test('contract directive detection keys on the directive text itself', () => {

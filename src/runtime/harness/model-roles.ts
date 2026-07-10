@@ -37,6 +37,10 @@ import {
 import { validateRoleModelBinding } from './model-role-options.js';
 import { pickRoutePolicyModel } from './route-policy.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
+import {
+  resolveDeclaredByoProviderForModel,
+  resolveEffectiveProviderForModel,
+} from './byo-providers.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
 import {
   chooseBoundaryJudgeFamily,
@@ -160,7 +164,7 @@ function codexSafePrimary(): string {
  *  codex_oauth→codex (guarded) are all classified correctly, and a repurposed
  *  OPENAI_MODEL_* slot can't mislabel a Codex brain as 'byo'. */
 function activeBrainFamily(): ModelProviderClass {
-  return resolveProvider(defaultForRole('brain'));
+  return resolveEffectiveProviderForModel(defaultForRole('brain'));
 }
 
 /** MODELS.fast, guarded against a repurposed OPENAI_MODEL_FAST slot that holds a
@@ -193,10 +197,11 @@ export function defaultForRole(role: ModelRole): string {
     if (role === 'judge') return byo.judgeId || byo.primaryId;
     if (role === 'worker') {
       // getWorkerModel() never returns empty (falls back to MODELS.primary, a
-      // gpt-* id). In all_in the router collapses any codex-class id to the BYO
-      // primary, so report what the wire actually sends; a real BYO worker id is kept.
+      // built-in id). In all_in the router collapses any undeclared Codex/Claude
+      // id to the BYO primary, so report what the wire actually sends.
       const w = getWorkerModel();
-      return resolveProvider(w) === 'codex' ? byo.primaryId : w;
+      const declaredByo = resolveDeclaredByoProviderForModel(w);
+      return !declaredByo && resolveProvider(w) !== 'byo' ? byo.primaryId : w;
     }
     // role === 'brain': honor an explicit per-model brain override (set when the
     // user picks a SPECIFIC connected model as the brain — e.g. a Together AI
@@ -206,7 +211,10 @@ export function defaultForRole(role: ModelRole): string {
     // it's a real, configured connected model before writing it; if a stale id
     // ever slipped through, the router falls back to the default BYO backend.
     const brainOverride = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim();
-    return brainOverride || byo.primaryId;
+    if (!brainOverride) return byo.primaryId;
+    const declaredByo = resolveDeclaredByoProviderForModel(brainOverride);
+    if (declaredByo || resolveProvider(brainOverride) === 'byo') return brainOverride;
+    return byo.primaryId;
   }
 
   switch (role) {
@@ -291,7 +299,7 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
     if (pick) {
       return {
         modelId: pick.modelId,
-        provider: resolveProvider(pick.modelId),
+        provider: resolveEffectiveProviderForModel(pick.modelId),
         source: 'policy',
         ...(querySlug ? { matchedIntent: querySlug } : {}),
         policy: {
@@ -304,7 +312,7 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
           ? {
               inactiveBinding: {
                 modelId: firstInvalid.match.modelId,
-                provider: resolveProvider(firstInvalid.match.modelId),
+                provider: providerForInactiveBinding(firstInvalid.match.modelId),
                 source: firstInvalid.match.source,
                 reason: firstInvalid.reason,
               },
@@ -316,14 +324,25 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
   return firstInvalid
     ? {
         modelId,
-        provider: resolveProvider(modelId),
+        provider: resolveEffectiveProviderForModel(modelId),
         source: 'default',
         inactiveBinding: {
           modelId: firstInvalid.match.modelId,
-          provider: resolveProvider(firstInvalid.match.modelId),
+          provider: providerForInactiveBinding(firstInvalid.match.modelId),
           source: firstInvalid.match.source,
           reason: firstInvalid.reason,
         },
       }
-    : { modelId, provider: resolveProvider(modelId), source: 'default' };
+    : { modelId, provider: resolveEffectiveProviderForModel(modelId), source: 'default' };
+}
+
+/** Invalid legacy bindings can be ambiguous by definition. Preserve a usable
+ * inactive snapshot while the collision reason explains why no route was used;
+ * valid/default/policy routes always use the strict effective resolver above. */
+function providerForInactiveBinding(modelId: string): ModelProviderClass {
+  try {
+    return resolveEffectiveProviderForModel(modelId);
+  } catch {
+    return resolveProvider(modelId);
+  }
 }

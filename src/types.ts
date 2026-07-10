@@ -249,6 +249,9 @@ export interface RuntimeContextValue {
   sessionId: string;
   userId?: string;
   channel?: string;
+  /** Internal per-turn state: this run is executing the user's answer to a
+   * clarification, so tools must not inject another background-choice gate. */
+  suppressBackgroundOffer?: boolean;
 }
 
 export interface PendingApproval {

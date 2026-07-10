@@ -48,9 +48,11 @@ export function debateBrainsAvailable(): { claude: boolean; codex: boolean } {
   return { claude: claudeAvailable(), codex: codexAvailable() };
 }
 
-/** off ⇒ boundary judges keep MODELS.fast exactly as before (byte-identical). */
+/** Cross-provider judging is opt-in. Default-off keeps the selected provider as
+ *  the sole failure/latency domain unless the operator deliberately separates
+ *  brain and judge families. */
 export function judgeCrossFamilyEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_JUDGE_CROSS_FAMILY', 'on') || 'on').trim().toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_JUDGE_CROSS_FAMILY', 'off') || 'off').trim());
 }
 
 /** Wall-clock cap for hot-path judge calls. Judges are advisory or fail-open at

@@ -235,8 +235,12 @@ test('Move 1: the marker stays armed when final delivery fails before terminal r
   );
 });
 
-test('claudeAgentSdkBrainEnabled requires Claude auth, opt-in flag, and a supported surface', () => {
+test('Claude auth defaults to the full tool-capable SDK lane; off remains explicit', () => {
   process.env.AUTH_MODE = 'claude_oauth';
+  delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
+  assert.equal(claudeAgentSdkBrainEnabled('home'), true);
+  assert.equal(claudeAgentSdkBrainMode(), 'full');
+
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   assert.equal(claudeAgentSdkBrainEnabled('home'), true);
   assert.equal(claudeAgentSdkBrainMode(), 'local_authoring');
@@ -317,11 +321,43 @@ test('CONVERGE guard: after the user answers a clarifying question, the turn con
   appendEvent({ sessionId: sid2, turn: 1, role: 'system', type: 'conversation_completed', data: { summary: 'done, sent 3 emails' } });
   const normal = await renderClaudeAgentBrainTurnContext({ message: 'thanks', sessionId: sid2 });
   assert.doesNotMatch(normal, /CONVERGE/, 'a normal completion does not trip the steer');
+  const sid3 = createSession({ kind: 'chat' }).id;
+  appendEvent({ sessionId: sid3, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { question: 'Background, hold, or now?', source: 'offer_background' } });
+  appendEvent({ sessionId: sid3, turn: 1, role: 'system', type: 'conversation_completed', data: { awaitingUser: true } });
+  const backgroundChoice = await renderClaudeAgentBrainTurnContext({ message: 'Do it now here', sessionId: sid3 });
+  assert.doesNotMatch(backgroundChoice, /CONVERGE/, 'a background routing choice is not a clarification answer');
   // Kill-switch off → no steer even after a clarify.
   process.env.CLEMMY_BRAIN_CONVERGE = 'off';
   const killed = await renderClaudeAgentBrainTurnContext({ message: 'winback action please', sessionId: sid });
   assert.doesNotMatch(killed, /CONVERGE/, 'kill-switch disables the steer');
   delete process.env.CLEMMY_BRAIN_CONVERGE;
+});
+
+test('Claude SDK dispatch receives convergence state on a clarification answer', async () => {
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
+  process.env.CLEMMY_TOOL_JIT = 'off';
+  const sid = createSession({ kind: 'chat' }).id;
+  appendEvent({
+    sessionId: sid,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Win-back queue or loss diagnosis?', source: 'decision_awaiting' },
+  });
+  let capturedTurnContext = '';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    capturedTurnContext = options.turnContext ?? '';
+    return { text: 'Built the win-back queue.', sessionId: sid, model: 'claude-sonnet-5', toolUses: [] };
+  });
+
+  const response = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Use the win-back queue.',
+    sessionId: sid,
+  });
+
+  assert.equal(response.text, 'Built the win-back queue.');
+  assert.match(capturedTurnContext, /CONVERGE/);
+  assert.match(capturedTurnContext, /EXECUTE the work this turn/);
 });
 
 test('renderClaudeAgentBrainSystemAppend describes local-authoring workflow/model-role capability', () => {
@@ -1125,8 +1161,33 @@ test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-inpu
   assert.equal(judgeCalls, 0, 'completion judge must not convert a pause into more work');
   assert.equal(res.stoppedReason, 'awaiting-input');
   assert.match(res.text, /Which environment/);
+  const awaiting = listEvents('brain-ask-awaiting', { types: ['awaiting_user_input'] });
+  assert.equal(awaiting.length, 1, 'the production brain path durably records the pause');
+  assert.equal(awaiting[0].data.question, 'Which environment should I use?');
   const completions = listEvents('brain-ask-awaiting', { types: ['conversation_completed'] });
   assert.equal(completions.at(-1)?.data.reason, 'awaiting_user_input');
+  assert.equal(completions.at(-1)?.data.awaitingUser, true);
+
+  let nextTurnContext = '';
+  process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
+  setClaudeAgentSdkBrainRunForTest(async (options) => {
+    runCalls += 1;
+    nextTurnContext = options.turnContext ?? '';
+    return {
+      text: 'Configured the production deployment.',
+      sessionId: 'sdk-session',
+      model: 'claude-sonnet-5',
+      toolUses: [],
+    };
+  });
+  await respondViaClaudeAgentSdkBrain('background', {
+    message: 'Use production.',
+    sessionId: 'brain-ask-awaiting',
+  });
+  assert.equal(runCalls, 2);
+  assert.equal(judgeCalls, 0, 'the convergence assertion is independent of completion judging');
+  assert.match(nextTurnContext, /CONVERGE/);
+  assert.match(nextTurnContext, /EXECUTE the work this turn/);
 });
 
 test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local authoring tools but not broad execution', async () => {

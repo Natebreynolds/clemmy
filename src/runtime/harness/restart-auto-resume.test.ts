@@ -64,6 +64,113 @@ test('a clean interrupted run (no external writes) is AUTO-RESUMED with the trut
   );
 });
 
+test('answer -> successful space_save -> crash uses the generic durable-result reconciler', async () => {
+  const sess = HarnessSession.create({ kind: 'chat', title: 'workspace build' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'Should this refresh daily or only when you click Refresh?', source: 'decision_awaiting' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { awaitingUser: true, summary: 'Should this refresh daily or only when you click Refresh?' },
+  });
+  sess.setRunInFlight();
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Refresh it daily.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'space_save', callId: 'space-save-1' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'space_save',
+      callId: 'space-save-1',
+      result: 'Created workspace "Salesforce Daily Report" (salesforce-daily-report) - status active.',
+    },
+  });
+
+  const dispatched: Array<{ sessionId: string; directive: string }> = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (sessionId, directive) => {
+    dispatched.push({ sessionId, directive });
+  });
+
+  assert.equal(summary.records[0].autoResumed, true);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(dispatched.length, 1, 'restart recovery dispatches exactly one reconciliation turn');
+  assert.equal(dispatched[0].sessionId, sess.id);
+  assert.equal(dispatched[0].directive, AUTO_RESUME_DIRECTIVE);
+  assert.match(dispatched[0].directive, /never repeat a completed mutation, including space_save/i);
+  assert.match(dispatched[0].directive, /question as resolved when a later user_input_received event answers it/i);
+  assert.match(dispatched[0].directive, /read-only verification and report the result/i);
+});
+
+test('an intermediate space_save does not truncate clearly unfinished post-save work', async () => {
+  const sess = HarnessSession.create({ kind: 'chat', title: 'workspace build and publish' });
+  sess.setRunInFlight();
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Build the workspace, save it, then run its publish verification.' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'space_save', callId: 'space-save-intermediate' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'space_save',
+      callId: 'space-save-intermediate',
+      result: 'Updated workspace "Salesforce Daily Report" (salesforce-daily-report) - status active.',
+    },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: { tool: 'run_shell_command', callId: 'publish-verify-unfinished' },
+  });
+
+  const dispatched: Array<{ sessionId: string; directive: string }> = [];
+  recoverInterruptedChatRuns(Date.now, async (sessionId, directive) => {
+    dispatched.push({ sessionId, directive });
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].directive, AUTO_RESUME_DIRECTIVE);
+  assert.match(dispatched[0].directive, /successful space_save can be the final action or an intermediate checkpoint/i);
+  assert.match(dispatched[0].directive, /continue only work .* clearly unfinished/i);
+  assert.match(dispatched[0].directive, /last durable boundary/i);
+});
+
 test('an interrupted run WITH an external write keeps the manual banner (double-act guard)', async () => {
   const id = interruptedChatSession();
   appendEvent({ sessionId: id, turn: 1, role: 'Clem', type: 'external_write', data: { tool: 'composio_execute_tool', slug: 'OUTLOOK_SEND_EMAIL' } });

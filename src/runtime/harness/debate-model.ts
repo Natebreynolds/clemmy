@@ -42,7 +42,7 @@ import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
 import { resolveByoProviderForModel } from './byo-providers.js';
 import { classifyTurnIntent } from './turn-intent.js';
-import { resolveRoleModel, codexSafeFast, type ResolvedRoleModel } from './model-roles.js';
+import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome } from '../model-route-metrics.js';
@@ -888,8 +888,8 @@ function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, have
 // 2026 research's "coherence trap". This resolves a cheap judge from a family
 // DIFFERENT than the brain, and fails OPEN to the brain's own family
 // (selfJudge:true, tagged) when no other family is logged in — it never wedges.
-// Kill-switch CLEMMY_JUDGE_CROSS_FAMILY (default on; off ⇒ byte-identical to the
-// prior MODELS.fast judges). DELETE-WHEN-VALIDATED: once judge-calibration shows
+// Opt-in CLEMMY_JUDGE_CROSS_FAMILY (default off; off ⇒ byte-identical to the
+// prior MODELS.fast judges). Once judge-calibration shows
 // κ≥0.6 for the cross-family pairing and bench pass^k does not regress for two
 // releases (Lane A Phase 3), the route becomes unconditional and the flag drops.
 // ─────────────────────────────────────────────────────────────────
@@ -905,9 +905,53 @@ export interface BoundaryJudgeRouting {
   modelId: string;
   judgeFamily: ModelProviderClass;
   brainFamily: ModelProviderClass;
+  /** Concrete provider adapter used for the call. A non-null model plus this
+   * field prevents a model-id string from being resolved through a different
+   * globally registered provider. */
+  transport: 'codex_responses' | 'claude_subscription' | 'byo_openai_compatible';
   /** true ⇒ no different family was available, so the judge shares the brain's
    *  family (the correlated-error case — now OBSERVABLE, never silent). */
   selfJudge: boolean;
+}
+
+function boundaryTransport(provider: ModelProviderClass): BoundaryJudgeRouting['transport'] {
+  if (provider === 'codex') return 'codex_responses';
+  if (provider === 'claude') return 'claude_subscription';
+  return 'byo_openai_compatible';
+}
+
+/** Default-off cross-family judging still needs a concrete provider-bound
+ * model. Returning only a string lets the Agents SDK resolve that string via
+ * the process-global provider, which can silently put a Claude/BYO judge on the
+ * Codex wire (or vice versa). */
+function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel): BoundaryJudgeRouting {
+  let checker: ResolvedRoleModel;
+  if (brain.provider === 'codex') {
+    checker = { modelId: boundaryCodexJudgeModel(), provider: 'codex', source: 'default' };
+  } else if (brain.provider === 'claude') {
+    checker = { modelId: boundaryClaudeJudgeModel(), provider: 'claude', source: 'default' };
+  } else {
+    const configured = downshiftForBoundary(resolveRoleModel('judge'));
+    checker = configured.provider === 'byo'
+      ? configured
+      : { modelId: brain.modelId, provider: 'byo', source: 'default' };
+  }
+  const model = buildJudgeForRole(
+    checker,
+    checker.provider === 'claude' || claudeAvailable(),
+    checker.provider === 'codex' || codexAvailable(),
+  );
+  if (!model) {
+    throw new Error(`Boundary judge could not build a ${checker.provider} model for ${checker.modelId}.`);
+  }
+  return {
+    model,
+    modelId: checker.modelId,
+    judgeFamily: checker.provider,
+    brainFamily: brain.provider,
+    transport: boundaryTransport(checker.provider),
+    selfJudge: true,
+  };
 }
 
 // chooseBoundaryJudgeFamily moved to the judge-family leaf (imported + re-exported above).
@@ -940,7 +984,7 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
   const brain = resolveRoleModel('brain');
   const brainFamily = brain.provider;
   if (!judgeCrossFamilyEnabled()) {
-    return { model: null, modelId: codexSafeFast(), judgeFamily: brainFamily, brainFamily, selfJudge: true };
+    return resolveSameFamilyBoundaryJudge(brain);
   }
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
@@ -952,12 +996,13 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
       modelId: checker.modelId,
       judgeFamily: checker.provider,
       brainFamily,
+      transport: boundaryTransport(checker.provider),
       selfJudge: checker.provider === brain.provider,
     };
   }
-  // Fail-open: no usable resolved judge → the brain-family-safe cheap id (never a
-  // repurposed BYO fast slot that would storm an unintended provider), tagged.
-  return { model: null, modelId: codexSafeFast(), judgeFamily: brainFamily, brainFamily, selfJudge: true };
+  // Fail-open: no usable cross-family judge -> a concrete cheap model on the
+  // brain's own provider wire, tagged as self-judge.
+  return resolveSameFamilyBoundaryJudge(brain);
 }
 
 /**
@@ -985,6 +1030,7 @@ export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting): Bounda
       modelId: c.modelId,
       judgeFamily: c.provider,
       brainFamily: primary.brainFamily,
+      transport: boundaryTransport(c.provider),
       selfJudge: c.provider === primary.brainFamily,
     };
   }

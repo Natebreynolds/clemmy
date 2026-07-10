@@ -7,6 +7,7 @@ import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import { normalizeWorkerOutput } from '../../agents/worker-output.js';
 import { getRuntimeEnv } from '../../config.js';
+import { sessionHasBackgroundOffer } from './convergence-steer.js';
 import {
   isMutatingExternalWrite,
   isGateEnabled as isExecutionGateEnabled,
@@ -706,6 +707,9 @@ export interface HarnessRunContext {
    *  been evaluated, so a long grind nudges AT MOST once per step (the context is
    *  rebuilt per Runner.run, so this naturally resets each runTurn). */
   backgroundOfferNudged?: boolean;
+  /** This run is resolving the user's answer to a clarification. Do not inject
+   *  a second conversational gate by offering background execution mid-turn. */
+  suppressBackgroundOffer?: boolean;
   /** Per-turn budget for recall_tool_result calls. Optional — when
    *  absent (e.g. tests, non-harness call paths), recall is unmetered. */
   recallBudget?: RecallBudget;
@@ -789,7 +793,7 @@ export function harnessToolBracketsEnabled(): boolean {
   return (getRuntimeEnv('HARNESS_TOOL_BRACKETS', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
-// Inc A2 — mid-runTurn background-offer nudge. The loop's between-steps nudge
+// Optional Inc A2 — mid-runTurn background-offer nudge. The loop's between-steps nudge
 // can't catch a model that grinds a long task in a SINGLE runTurn (many tool
 // calls, then done/ask — no continuation). This rail fires WITHIN the runTurn,
 // appended to a tool result like the fan-out nudge, so the model reads it
@@ -797,20 +801,9 @@ export function harnessToolBracketsEnabled(): boolean {
 // as the loop nudge (CLEMMY_BG_OFFER_NUDGE). Defined locally to avoid a
 // brackets→loop import cycle.
 function backgroundOfferNudgeEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'on') ?? 'on').toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'off') ?? 'off').trim());
 }
 const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
-
-/** True if a background offer was already posted in this session — never re-offer
- *  after the user has seen the choice. Best-effort. */
-function backgroundOfferAlreadyMadeInSession(sessionId: string): boolean {
-  try {
-    return listEvents(sessionId, { types: ['awaiting_user_input'] })
-      .some((e) => (e.data as { source?: string } | undefined)?.source === 'offer_background');
-  } catch {
-    return false;
-  }
-}
 
 // Pre-write LATENCY: the irreversible-write/send path runs three independent,
 // fail-open model-judges (grounding, goal-fidelity, output-grounding) that today
@@ -2088,6 +2081,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     let bgOfferNudge: string | undefined;
     if (
       !ctx.backgroundOfferNudged
+      && !ctx.suppressBackgroundOffer
       && backgroundOfferNudgeEnabled()
       && !ctx.guardrailScopeId
       && ctx.counter.calls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS
@@ -2097,7 +2091,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (
           !ctx.sessionId.startsWith('background:')
           && getSession(ctx.sessionId)?.kind === 'chat'
-          && !backgroundOfferAlreadyMadeInSession(ctx.sessionId)
+          && !sessionHasBackgroundOffer(ctx.sessionId)
         ) {
           bgOfferNudge =
             '[background offer] You have already made several tool calls on this in the foreground while the user waits. '

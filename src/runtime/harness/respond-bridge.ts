@@ -46,8 +46,8 @@ import { listPending } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
-import { getRuntimeEnv } from '../../config.js';
-import { resolveProvider } from './model-wire-registry.js';
+import { getModelRoutingMode, getRuntimeEnv } from '../../config.js';
+import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
 import { withRouteDiagnostics, routeDiagnosticsFromResponse } from './response-route.js';
@@ -144,7 +144,7 @@ export function harnessSurfaceEnabled(surface: HarnessSurface): boolean {
 
 function providerFor(modelId: string | undefined): string | undefined {
   if (!modelId) return undefined;
-  try { return resolveProvider(modelId); } catch { return undefined; }
+  try { return resolveEffectiveProviderForModel(modelId); } catch { return undefined; }
 }
 
 function readRawString(value: unknown, key: string): string | undefined {
@@ -225,6 +225,7 @@ function routeForHarness(surface: HarnessSurface, request: AssistantRequest, mod
     effectiveModel,
     provider: providerFor(effectiveModel),
     transport: 'openai_agents_harness',
+    mode: getModelRoutingMode(),
   };
 }
 
@@ -435,7 +436,20 @@ export async function respondViaHarness(
     // event is the source of truth for brain-matrix assertions + route audit.
     try {
       const routed = routeForHarness(surface, request, opts.modelOverride);
-      appendEvent({ sessionId, turn: 0, role: 'system', type: 'turn_model_routed', data: { model: routed.effectiveModel, routeKind: routed.routeKind, surface } });
+      appendEvent({
+        sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'turn_model_routed',
+        data: {
+          model: routed.effectiveModel,
+          provider: routed.provider,
+          transport: routed.transport,
+          mode: routed.mode,
+          routeKind: routed.routeKind,
+          surface,
+        },
+      });
     } catch { /* telemetry only */ }
     // Baseline for the parse-exhaustion recovery gate below: a rerun on another
     // brain is only safe when THIS run committed no external write (the same
@@ -483,7 +497,8 @@ export async function respondViaHarness(
               'parse-exhaustion recovery SKIPPED — this run committed external write(s); not re-running another brain over side effects');
           } else try {
             const usedModel = modelForRun ?? resolveRoleModel('brain').modelId;
-            const currentBrain = resolveProvider(usedModel) as BrainProviderClass;
+            const currentBrain = providerFor(usedModel) as BrainProviderClass | undefined;
+            if (!currentBrain) throw new Error(`Could not resolve provider for ${usedModel}.`);
             const next = falloverBrainModelIds(currentBrain)[0];
             if (next) {
               bridgeLogger.warn({ surface, currentBrain, recoveryModel: next.modelId },
@@ -649,7 +664,20 @@ export async function respondPreferHarness(
       // harness-lane emit below; the route carries the model the SDK reported.
       try {
         const routed = routeForClaudeSdkBrain(surface, request, response);
-        appendEvent({ sessionId: request.sessionId, turn: 0, role: 'system', type: 'turn_model_routed', data: { model: routed.effectiveModel, routeKind: routed.routeKind, surface } });
+        appendEvent({
+          sessionId: request.sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'turn_model_routed',
+          data: {
+            model: routed.effectiveModel,
+            provider: routed.provider,
+            transport: routed.transport,
+            mode: routed.mode,
+            routeKind: routed.routeKind,
+            surface,
+          },
+        });
       } catch { /* telemetry only */ }
       return withRouteDiagnostics(response, routeForClaudeSdkBrain(surface, request, response));
     } catch (err) {
@@ -672,7 +700,7 @@ export async function respondPreferHarness(
 const bridgeLogger = pino({ name: 'clementine.respond-bridge' });
 
 function chatBrainFalloverEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
 }
 
 function recoveryHarnessModelAfterClaudeFailure(): string | undefined {
@@ -767,7 +795,8 @@ export function buildChatFalloverWiring(opts: {
 }): { falloverModelIds?: string[]; rebuildAgentForBrain?: (modelId: string) => Promise<BuiltAgent> } {
   if (!chatBrainFalloverEnabled()) return {};
   try {
-    const currentProvider = resolveProvider(resolveRoleModel('brain').modelId) as BrainProviderClass;
+    const currentProvider = providerFor(resolveRoleModel('brain').modelId) as BrainProviderClass | undefined;
+    if (!currentProvider) return {};
     const nextBrains = falloverBrainModelIds(currentProvider);
     if (nextBrains.length === 0) return {};
     return {

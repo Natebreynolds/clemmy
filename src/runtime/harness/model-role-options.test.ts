@@ -18,6 +18,7 @@ const {
   effectiveBrain,
   effectiveBrainValue,
   falloverBrainModelIds,
+  roleModelCapability,
 } = await import('./model-role-options.js');
 
 function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
@@ -199,6 +200,52 @@ test('brainOptions includes a BYO brain when configured; effectiveBrain reflects
     assert.equal(byId.get('api_key')?.available, true, 'BYO is a brain option');
     assert.equal(byId.get('api_key')?.modelId, 'glm-5.2');
     assert.equal(effectiveBrain(), 'api_key', 'all-in BYO → BYO is the brain');
+  });
+});
+
+test('all_in is provider-isolated and gpt-shaped BYO ids remain BYO in role/UI reporting', () => {
+  withEnv({
+    BYO_MODEL_BASE_URL: 'https://api.together.test/v1',
+    BYO_MODEL_ID: 'gpt-4o',
+    BYO_MODEL_API_KEY: 'key',
+    MODEL_ROUTING_MODE: 'all_in',
+    AUTH_MODE: 'api_key',
+  }, () => {
+    assert.deepEqual(roleModelCapability('worker', 'gpt-4o'), { ok: true, provider: 'byo' });
+    assert.equal(effectiveBrain(), 'api_key');
+    assert.equal(effectiveBrainValue(), 'api_key:gpt-4o');
+    const codex = roleModelCapability('worker', 'gpt-5.6');
+    assert.equal(codex.ok, false);
+    if (!codex.ok) assert.match(codex.reason, /not offered by any connected provider/);
+  });
+});
+
+test('role selection rejects built-in/BYO and multi-BYO identity collisions', () => {
+  withEnv({
+    MODEL_ROUTING_MODE: 'off',
+    BYO_MODEL_BASE_URL: '',
+    BYO_MODEL_ID: '',
+    BYO_MODEL_API_KEY: '',
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'together', label: 'Together', baseURL: 'https://api.together.test/v1', modelIds: ['gpt-4o', 'shared-model'] },
+      { id: 'second', label: 'Second', baseURL: 'https://api.second.test/v1', modelIds: ['shared-model'] },
+    ]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'together-key',
+    BYO_PROVIDER_SECOND_API_KEY: 'second-key',
+  }, () => {
+    const builtIn = roleModelCapability('worker', 'gpt-4o');
+    assert.equal(builtIn.ok, false);
+    if (!builtIn.ok) assert.match(builtIn.reason, /both Codex and BYO provider Together/);
+
+    const multiByo = validateRoleModelBinding('judge', 'shared-model');
+    assert.equal(multiByo.ok, false);
+    if (!multiByo.ok) assert.match(multiByo.reason, /multiple connected BYO providers/);
+
+    const offered = connectedModelGroupsForRole('worker').flatMap((group) => group.models.map((model) => model.id));
+    assert.equal(offered.includes('gpt-4o'), false, 'ambiguous built-in/BYO id is not selectable');
+    assert.equal(offered.includes('shared-model'), false, 'ambiguous multi-BYO id is not selectable');
+    assert.equal(brainOptions().some((option) => option.id === 'api_key' && option.modelId === 'shared-model'), false,
+      'ambiguous multi-BYO id is not selectable as the brain');
   });
 });
 

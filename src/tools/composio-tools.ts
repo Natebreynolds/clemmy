@@ -15,13 +15,13 @@ import {
   listAllToolkits,
   type ConnectedToolkit,
 } from '../integrations/composio/client.js';
-import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter } from '../integrations/composio/async-job.js';
+import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter, type JobReceipt } from '../integrations/composio/async-job.js';
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier, recallComposioForSearch } from '../memory/tool-choice-store.js';
-import { workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
+import { harnessRunContextStorage, workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { isTransientStepError } from '../execution/transient-error.js';
@@ -31,6 +31,7 @@ import { resolveCompliantSenderConnection } from '../runtime/harness/sender-veri
 import { validateComposioArgs, formatBatchValidationError } from './composio-batch-validator.js';
 import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { sessionHasBackgroundOffer } from '../runtime/harness/convergence-steer.js';
 import { shouldRetryToolCall, delayMs } from '../runtime/harness/retry-handler.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
 import { getCapabilitiesForIntent } from '../runtime/capability-registry.js';
@@ -725,6 +726,31 @@ function latestUserInputForContext(context: unknown): string {
   }
 }
 
+function backgroundOfferSuppressedForContext(context: unknown): boolean {
+  const outer = context && typeof context === 'object' ? context as Record<string, unknown> : undefined;
+  const inner = outer?.context && typeof outer.context === 'object'
+    ? outer.context as Record<string, unknown>
+    : undefined;
+  const sessionId = sessionIdFromRunContext(context);
+  return outer?.suppressBackgroundOffer === true
+    || inner?.suppressBackgroundOffer === true
+    || harnessRunContextStorage.getStore()?.suppressBackgroundOffer === true
+    || sessionHasBackgroundOffer(sessionId);
+}
+
+/** Keep the default long-job guidance byte-identical, but do not create a
+ * second conversational gate while executing the answer to a clarification. */
+export function formatComposioBudgetExceededOutput(
+  receipt: JobReceipt,
+  output: string,
+  context?: unknown,
+): string {
+  if (!backgroundOfferSuppressedForContext(context)) {
+    return `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (offer_background / dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
+  }
+  return `${asyncReceiptBanner(receipt)}\n\nThis is the existing LONG-running job from the direction the user just clarified. Continue from this receipt and its job id; do not add another background-choice gate, do not restart or re-invoke the job, and do not fire back-to-back polls.\n\n${output}`;
+}
+
 function suppressComposioConnectionAfterHardFailure(connectionId: string | undefined, err: unknown): string {
   if (!connectionId) return '';
   try {
@@ -983,7 +1009,7 @@ async function runComposioExecute(
             } else if (reason === 'budget-exceeded') {
               // No session / parking off — steer to backgrounding rather than grinding
               // manual polls in-chat with no wait primitive.
-              output = `${asyncReceiptBanner(receipt)}\n\nThis is a LONG-running job (still going after the auto-poll window). Prefer handing it to the background (offer_background / dispatch_background_task) so it finishes and reports back on its own — do NOT sit here firing back-to-back polls.\n\n${output}`;
+              output = formatComposioBudgetExceededOutput(receipt, output, options.context);
             } else {
               output = `${asyncReceiptBanner(receipt)}\n\n${output}`;
             }

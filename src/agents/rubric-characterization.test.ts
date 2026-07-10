@@ -33,18 +33,14 @@ const GOLDEN = {
   // HEAD → instructions+native; CLAUDE_BRAIN_RUBRIC_LINES → claudeBrain+lean).
   // 2026-07-08: DECISION_CONTRACT swapped from the OrchestratorDecision JSON
   // envelope to the plain-text MARKER contract (ASK:/CONTINUE:/no-marker).
-  // 2026-07-09: CONVERSE-FIRST + OFFER-BACKGROUND rewritten on the full/Codex
-  // rubric too (one bundled beat then execute; offer_background reserved for
-  // long/unattended work, never stacked after clarifying) — parity with the lean
-  // brain line, so the GPT/Codex lane stops the back-to-back questions.
-  instructions: { len: 36525, sha16: '58a4eccedd88d17e' },
-  native: { len: 35628, sha16: '9d7bef2cf5bf1c4b' },
-  // 2026-07-09: CONVERSE-FIRST line rewritten — one bundled clarifying beat then
-  // EXECUTE (no turn-by-turn interrogation), and offer_background no longer stacks
-  // as a question after clarifying. Fixes the "back-to-back questions" friction.
-  claudeBrain: { len: 5395, sha16: '52d8998bcb06b083' },
+  // 2026-07-09 stabilization: one beat MAXIMUM (a precise request is alignment),
+  // injected focus replaces per-turn focus_get, and completed work no longer
+  // manufactures a closing question.
+  instructions: { len: 35217, sha16: 'a62231446587c1a4' },
+  native: { len: 34320, sha16: '4a3c5498cb72386e' },
+  claudeBrain: { len: 5126, sha16: 'd8a6fb7b5476b40b' },
   // Phase-5 lean Codex variant (CLEMMY_RUBRIC_VARIANT=lean). Composed of proven text; default stays legacy.
-  lean: { len: 8895, sha16: '7126928e5c053338' },
+  lean: { len: 8385, sha16: 'd9cde196cfc11eba' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -103,6 +99,25 @@ test('shared source: renderClemRubric feeds all three lanes from clem-rubric', (
   assert.equal(renderClemRubric('claude_brain'), CLAUDE_BRAIN_RUBRIC, 'claude chat brain = the lean rubric');
   // and the lean brain rubric is genuinely lean vs the 34KB Codex one.
   assert.ok(CLAUDE_BRAIN_RUBRIC.length * 4 < ORCHESTRATOR_INSTRUCTIONS.length, 'claude brain rubric must stay far leaner than the Codex rubric');
+});
+
+test('provider parity: focus context is injected, never a mandatory per-turn tool ritual', () => {
+  for (const [lane, rubric] of [
+    ['standard', ORCHESTRATOR_INSTRUCTIONS],
+    ['claude', CLAUDE_BRAIN_RUBRIC],
+  ] as const) {
+    assert.doesNotMatch(rubric, /focus_get`? at the START of every turn|non-negotiable for chat\/Discord/i, lane);
+    assert.match(rubric, /Current Focus(?: block)? is already injected/i, lane);
+    assert.match(rubric, /only when (?:the user )?explicitly/i, lane);
+  }
+});
+
+test('interaction contract: clarification is at most one beat, never a required closing question', () => {
+  for (const rubric of [ORCHESTRATOR_INSTRUCTIONS, CLAUDE_BRAIN_RUBRIC]) {
+    assert.match(rubric, /at most ONE/i);
+    assert.match(rubric, /precise request is already alignment/i);
+    assert.doesNotMatch(rubric, /END your reply with ONE concrete offer/i);
+  }
 });
 
 // --- The two-lane invariant (Codex vs Claude native) -----------------------

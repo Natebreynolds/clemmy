@@ -50,7 +50,7 @@ import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, wa
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { isUngrantableMultiplexer } from '../../agents/plan-scope.js';
-import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
+import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer } from './convergence-steer.js';
 import {
   getActiveGoalForSession,
   recordGoalValidation,
@@ -735,6 +735,9 @@ export interface RunTurnOptions {
    *  WITHOUT writing the infra-recovery ask, so runConversation can attempt
    *  cross-brain fallover first. Off (default) = today's behavior verbatim. */
   deferInfraAsk?: boolean;
+  /** Internal conversation state: the current run is acting on the answer to a
+   *  prior clarification, so background-offer nudges must not add another gate. */
+  suppressBackgroundOffer?: boolean;
 }
 
 export type RunTurnStatus = 'completed' | 'awaiting_approval' | 'awaiting_user_input' | 'killed' | 'limit_exceeded' | 'failed';
@@ -1639,11 +1642,15 @@ async function runConversationCore(
   // CONVERGENCE (one beat, then execute): if Clem's previous turn ended by asking
   // a clarifying question and the user is now answering it, prepend an EXECUTE-now
   // directive so the model plans ONCE and acts — not another back-to-back question.
-  // This lane (Codex/GPT) is what a non-Claude brain model runs on; the steer must
-  // fire here too (2026-07-09 "it kept asking me redundant questions"). Kill-switch
-  // CLEMMY_BRAIN_CONVERGE=off. options.input is always the user's real message
-  // (harness continuations re-assign nextInput inside the loop, never options.input).
-  if (convergenceSteerEnabled() && priorTurnEndedAwaitingClarification(options.sessionId)) {
+  // This standard harness lane serves Codex, OpenAI, and BYO models. Derive the
+  // conversational state once and carry it through the run so prompt and code
+  // rails agree. options.input is always the user's real message (continuations
+  // re-assign nextInput inside the loop, never options.input).
+  const resolvingClarification = convergenceSteerEnabled()
+    && priorTurnEndedAwaitingClarification(options.sessionId);
+  const suppressBackgroundOffer = resolvingClarification
+    || sessionHasBackgroundOffer(options.sessionId);
+  if (resolvingClarification) {
     nextInput = `${CONVERGENCE_STEER}\n\n${options.input}`;
   }
   let lastDecision: OrchestratorDecisionShape | undefined;
@@ -1783,6 +1790,7 @@ async function runConversationCore(
       onChunk: options.onChunk,
       // Defer the infra ask only while another brain is still available to try.
       deferInfraAsk: canStillFallover,
+      suppressBackgroundOffer,
     });
     falloverReattempt = false;
     lastTurn = turnResult.turn;
@@ -2756,19 +2764,6 @@ async function runConversationCore(
           ].join(' ');
           continue;
         }
-        // Capability compounding (C2, no-goal): a judge-VERIFIED completion with
-        // no pinned goal is still a validated success — distill it into a reusable
-        // draft skill, exactly as the pinned-goal path does at satisfyGoal. Without
-        // this, a successful ad-hoc multi-step run never graduated into a skill
-        // (2026-07-09: extends the shipped distiller to the independent-completion
-        // path). The novelty gate inside distillSkillFromSession no-ops routine
-        // runs, so only genuinely multi-step, discovery-heavy work mints a skill.
-        // Fire-and-forget; never blocks the turn.
-        if (verdict.done) {
-          const distillEvidence = [responseText ?? '', skillContext.toolCallSummary]
-            .filter((s) => s && s.trim()).join('\n');
-          void maybeDistillSkill(options.sessionId, judgedObjective, distillEvidence, options.sessionId);
-        }
       }
       // Output-grounding (chat deliverable). The objective judge above verifies
       // work HAPPENED; this verifies the FIGURES in the user-facing reply trace
@@ -3192,6 +3187,7 @@ async function runConversationCore(
     const bgOfferLongRunning = bgOfferMinMs > 0 && (Date.now() - startedAt) >= bgOfferMinMs;
     if (
       !backgroundOfferNudged
+      && !suppressBackgroundOffer
       && backgroundOfferNudgeEnabled()
       && (objectiveJudgeActionIntent || bgOfferLongRunning)
       && totalToolCalls >= BACKGROUND_OFFER_NUDGE_MIN_TOOLS
@@ -3199,7 +3195,7 @@ async function runConversationCore(
     ) {
       let isForegroundChat = false;
       try { isForegroundChat = HarnessSession.load(options.sessionId)?.sessionRow.kind === 'chat'; } catch { isForegroundChat = false; }
-      if (isForegroundChat && !backgroundOfferAlreadyMade(options.sessionId)) {
+      if (isForegroundChat && !sessionHasBackgroundOffer(options.sessionId)) {
         backgroundOfferNudged = true;
         bgOfferNudge =
           ' NOTE: you have already done substantial work on this in the foreground and it is taking a while. If finishing it will take more than a step or two, call `offer_background` NOW with the objective — tell the user plainly that this is a longer task and you can keep working on it in the background and post updates as it goes (it shows up in Tasks), instead of making them watch here — then STOP. If you are about to finish (only a step or two left), just finish; do NOT offer.';
@@ -3384,12 +3380,12 @@ function goalContractEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
-/** Inc A code trigger (kill-switch, default ON): the one-time "offer to move
+/** Optional Inc A code trigger: the one-time "offer to move
  *  this to the background" nudge for a foreground chat grinding through a long
- *  multi-step action task without offering/dispatching. `=off` reverts to the
- *  plain continuation. */
+ *  multi-step action task without offering/dispatching. Default off: background
+ *  movement is a user/model choice, not a runtime-injected second gate. */
 function backgroundOfferNudgeEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'on') ?? 'on').toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE', 'off') ?? 'off').trim());
 }
 
 /** Tool-call floor before the background-offer nudge can fire — enough work that
@@ -3409,17 +3405,6 @@ const BACKGROUND_OFFER_NUDGE_MIN_TOOLS = 6;
 function backgroundOfferNudgeMinElapsedMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BG_OFFER_NUDGE_MIN_MS', '90000') ?? '90000', 10);
   return Number.isFinite(raw) && raw >= 0 ? raw : 90000;
-}
-
-/** True if a background offer was ALREADY posted in this session (so we never
- *  re-offer after the user has already seen the choice). Best-effort. */
-function backgroundOfferAlreadyMade(sessionId: string): boolean {
-  try {
-    return listEvents(sessionId, { limit: 80, desc: true })
-      .some((e) => e.type === 'awaiting_user_input' && (e.data as { source?: string } | undefined)?.source === 'offer_background');
-  } catch {
-    return false;
-  }
 }
 
 /** Stream-inactivity threshold for the turn-stall watchdog. Default 5 min —
@@ -4220,7 +4205,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   });
 
   const opts: Record<string, unknown> = {
-    context: { sessionId: options.sessionId, turn },
+    context: {
+      sessionId: options.sessionId,
+      turn,
+      suppressBackgroundOffer: options.suppressBackgroundOffer,
+    },
     maxTurns: options.maxTurns ?? maxTurnsForRole('orchestrator'),
     callModelInputFilter: modelInputFilter,
     // v0.5.22 SDK 0.11.5 — cap parallel function-tool execution at 8.
@@ -4312,7 +4301,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         );
         if (useToolWrapper) {
           return await withHarnessRunContext(
-            { sessionId: options.sessionId, counter: toolCounter, recallBudget },
+            {
+              sessionId: options.sessionId,
+              counter: toolCounter,
+              recallBudget,
+              suppressBackgroundOffer: options.suppressBackgroundOffer,
+            },
             () => run(runner, options.agent, items, opts),
           ) as RunOutcome;
         }
@@ -4320,7 +4314,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         // context so recall_tool_result can resolve the session id +
         // per-turn budget.
         return await withHarnessRunContext(
-          { sessionId: options.sessionId, counter: toolCounter, recallBudget },
+          {
+            sessionId: options.sessionId,
+            counter: toolCounter,
+            recallBudget,
+            suppressBackgroundOffer: options.suppressBackgroundOffer,
+          },
           () => run(runner, options.agent, items, opts),
         ) as RunOutcome;
       },

@@ -17,7 +17,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { createSession, appendEvent, resetEventLog } = await import('./eventlog.js');
-const { priorTurnEndedAwaitingClarification, convergenceSteerEnabled, CONVERGENCE_STEER } = await import('./convergence-steer.js');
+const { priorTurnEndedAwaitingClarification, sessionHasBackgroundOffer, convergenceSteerEnabled, CONVERGENCE_STEER } = await import('./convergence-steer.js');
 
 after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -26,9 +26,10 @@ test('no prior clarifying question → no convergence', () => {
   const sess = createSession({ kind: 'chat' });
   assert.equal(priorTurnEndedAwaitingClarification(sess.id), false);
   assert.equal(priorTurnEndedAwaitingClarification(undefined), false);
+  assert.equal(sessionHasBackgroundOffer(sess.id), false);
 });
 
-test('a bare awaiting_user_input (Codex/GPT lane shape) → converge', () => {
+test('a bare awaiting_user_input (standard harness lane shape) → converge', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   appendEvent({ sessionId: sess.id, turn: 1, role: 'system', type: 'awaiting_user_input', data: { question: 'win-back or diagnosis?' } });
@@ -53,6 +54,56 @@ test('execution AFTER the ask clears convergence (the answer was already acted o
   assert.equal(priorTurnEndedAwaitingClarification(sess.id), false, 'a send after the ask means the loop already moved on');
 });
 
+test('background, approval, stall, and infrastructure pauses never masquerade as clarification', () => {
+  for (const source of [
+    'offer_background',
+    'stall_recovery',
+    'infra_error_recovery',
+    'decision_awaiting_approval',
+    'decision_awaiting_handoff_terminal',
+  ]) {
+    resetEventLog();
+    const sess = createSession({ kind: 'chat' });
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: { question: 'choose', source },
+    });
+    assert.equal(priorTurnEndedAwaitingClarification(sess.id), false, source);
+  }
+});
+
+test('conversation_completed preserves the paired awaiting source classification', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: 'background, hold, or now?', source: 'offer_background' },
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { awaitingUser: true },
+  });
+  assert.equal(priorTurnEndedAwaitingClarification(sess.id), false);
+  assert.equal(sessionHasBackgroundOffer(sess.id), true, 'routing choice suppresses another offer without becoming clarification convergence');
+});
+
+test('a newer approval card clears an older clarification outcome', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  appendEvent({ sessionId: sess.id, turn: 1, role: 'Clem', type: 'awaiting_user_input', data: { question: 'which sheet?' } });
+  appendEvent({ sessionId: sess.id, turn: 2, role: 'Clem', type: 'approval_requested', data: { approvalId: 'approval-1' } });
+  assert.equal(priorTurnEndedAwaitingClarification(sess.id), false);
+});
+
 test('kill-switch CLEMMY_BRAIN_CONVERGE=off disables the steer', () => {
   const prev = process.env.CLEMMY_BRAIN_CONVERGE;
   process.env.CLEMMY_BRAIN_CONVERGE = 'off';
@@ -66,4 +117,5 @@ test('the steer text tells the model to execute and not re-ask / not stack a bac
   assert.match(CONVERGENCE_STEER, /EXECUTE the work this turn/);
   assert.match(CONVERGENCE_STEER, /do NOT ask another separate clarifying question/);
   assert.match(CONVERGENCE_STEER, /background/i);
+  assert.match(CONVERGENCE_STEER, /changed topics/i);
 });

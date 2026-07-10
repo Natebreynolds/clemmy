@@ -164,6 +164,57 @@ test('all_in BYO defaults report the BYO models the router will actually use', (
   });
 });
 
+test('all_in gpt-shaped BYO defaults report BYO for brain, worker, and judge', () => {
+  withEnv({
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.together.test/v1',
+    BYO_MODEL_API_KEY: 'together-key',
+    BYO_MODEL_PROVIDER: 'Together',
+    BYO_MODEL_ID: 'gpt-4o',
+    BYO_MODEL_JUDGE_ID: 'gpt-4o-mini',
+    OPENAI_MODEL_WORKER: 'gpt-4o',
+    BYO_PROVIDERS: '',
+    CLEMMY_MODEL_ROLES: undefined,
+  }, () => {
+    assert.deepEqual(
+      (['brain', 'worker', 'judge'] as const).map((role) => resolveRoleModel(role)),
+      [
+        { modelId: 'gpt-4o', provider: 'byo', source: 'default' },
+        { modelId: 'gpt-4o', provider: 'byo', source: 'default' },
+        { modelId: 'gpt-4o-mini', provider: 'byo', source: 'default' },
+      ],
+    );
+  });
+});
+
+test('all_in declared gpt-shaped BYO binding and inactive reporting stay on the BYO provider', () => {
+  const base = {
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.z.ai/v1',
+    BYO_MODEL_API_KEY: 'zai-key',
+    BYO_MODEL_PROVIDER: 'Z.ai',
+    BYO_MODEL_ID: 'glm-5.2',
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'together', label: 'Together', baseURL: 'https://api.together.test/v1', modelIds: ['gpt-4o'] },
+    ]),
+    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'gpt-4o', scope: 'durable', source: 'settings' }]),
+  };
+  withEnv({ ...base, BYO_PROVIDER_TOGETHER_API_KEY: 'together-key' }, () => {
+    assert.deepEqual(resolveRoleModel('worker'), { modelId: 'gpt-4o', provider: 'byo', source: 'settings' });
+  });
+  withEnv({ ...base, BYO_PROVIDER_TOGETHER_API_KEY: '' }, () => {
+    const resolved = resolveRoleModel('worker');
+    assert.equal(resolved.modelId, 'glm-5.2');
+    assert.equal(resolved.provider, 'byo');
+    assert.equal(resolved.inactiveBinding?.modelId, 'gpt-4o');
+    assert.equal(resolved.inactiveBinding?.provider, 'byo');
+    assert.match(resolved.inactiveBinding?.reason ?? '', /not offered by any connected provider/);
+  });
+});
+
 test('all_in BYO with an UNSET worker reports the BYO primary, not a phantom gpt id (BUG 2)', () => {
   withEnv({
     AUTH_MODE: 'api_key',
@@ -178,6 +229,36 @@ test('all_in BYO with an UNSET worker reports the BYO primary, not a phantom gpt
     // must report what the wire actually sends.
     assert.equal(resolveRoleModel('worker').modelId, 'deepseek-chat');
     assert.equal(resolveRoleModel('worker').provider, 'byo');
+  });
+});
+
+test('all_in preserves a built-in-shaped worker explicitly declared on the default BYO provider', () => {
+  withEnv({
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'glm-5.2',
+    OPENAI_MODEL_WORKER: 'gpt-4o',
+    CLEMMY_MODEL_ROLES: undefined,
+  }, () => {
+    assert.deepEqual(resolveRoleModel('worker'), { modelId: 'gpt-4o', provider: 'byo', source: 'default' });
+  });
+});
+
+test('all_in collapses a stale undeclared built-in brain override to the BYO primary', () => {
+  withEnv({
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.example.test',
+    BYO_MODEL_API_KEY: 'k',
+    BYO_MODEL_ID: 'glm-5.2',
+    OPENAI_MODEL_WORKER: '',
+    BYO_BRAIN_MODEL_ID: 'claude-opus-stale',
+    CLEMMY_MODEL_ROLES: undefined,
+  }, () => {
+    assert.deepEqual(resolveRoleModel('brain'), { modelId: 'glm-5.2', provider: 'byo', source: 'default' });
+    assert.deepEqual(resolveRoleModel('worker'), { modelId: 'glm-5.2', provider: 'byo', source: 'default' });
   });
 });
 
@@ -401,7 +482,7 @@ test('route policy: a measured winner overrides the default with source=policy; 
     expiresAt: Date.now() + 60 * 60 * 1000,
     scopes: ['user:inference'],
   }), 'utf-8');
-  withEnv({ CLEMMY_MODEL_ROLES: undefined, AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, () => {
+  withEnv({ CLEMMY_MODEL_ROLES: undefined, CLEMMY_ROUTE_POLICY: 'on', AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, () => {
     const staticDefault = defaultForRole('worker');
     // The default is measured WEAK; a validated alternative is measured STRONG.
     // Use a real Claude model id so validateRoleModelBinding accepts it.
@@ -421,6 +502,42 @@ test('route policy: a measured winner overrides the default with source=policy; 
       assert.equal(off.source, 'default');
       assert.equal(off.modelId, staticDefault);
     });
+  });
+  resetModelRouteMetricsForTest();
+  clearRoutePolicyCache();
+});
+
+test('route policy reports declared gpt-shaped all_in winners as BYO', async () => {
+  const { resetModelRouteMetricsForTest, recordModelRouteDecision, recordModelRouteOutcome } = await import('../model-route-metrics.js');
+  const { runRoutePolicyJob, clearRoutePolicyCache } = await import('./route-policy.js');
+  resetModelRouteMetricsForTest();
+  clearRoutePolicyCache();
+  const now = new Date('2026-07-02T12:00:00.000Z');
+  withEnv({
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    CLEMMY_ROUTE_POLICY: 'on',
+    CLEMMY_MODEL_ROLES: '',
+    BYO_MODEL_BASE_URL: 'https://api.z.ai/v1',
+    BYO_MODEL_API_KEY: 'zai-key',
+    BYO_MODEL_ID: 'glm-5.2',
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'together', label: 'Together', baseURL: 'https://api.together.test/v1', modelIds: ['gpt-4o'] },
+    ]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'together-key',
+  }, () => {
+    for (const [model, successCount] of [['glm-5.2', 4], ['gpt-4o', 12]] as const) {
+      for (let i = 0; i < 12; i++) {
+        const id = recordModelRouteDecision({ role: 'worker', resolvedModel: model, provider: 'byo', source: 'default', now });
+        recordModelRouteOutcome({ decisionId: id, status: i < successCount ? 'success' : 'failed', latencyMs: 1000, now });
+      }
+    }
+    runRoutePolicyJob({ now });
+    clearRoutePolicyCache();
+    const resolved = resolveRoleModel('worker');
+    assert.equal(resolved.source, 'policy');
+    assert.equal(resolved.modelId, 'gpt-4o');
+    assert.equal(resolved.provider, 'byo');
   });
   resetModelRouteMetricsForTest();
   clearRoutePolicyCache();

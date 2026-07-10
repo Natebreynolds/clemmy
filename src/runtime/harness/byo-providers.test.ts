@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  getByoProviders, resolveByoProviderForModel,
+  getByoProviders, resolveByoProviderForModel, resolveDeclaredByoProviderForModel,
   byoProviderKeyEnvKey, slugifyProviderId, serializeExtraProviders, getByoProviderSnapshots,
-  normalizeModelsList,
+  normalizeModelsList, resolveEffectiveProviderForModel, unqualifiedModelCollisionReason,
 } from './byo-providers.js';
 
 // These read process.env (getRuntimeEnv checks process.env before BASE_DIR/.env),
@@ -62,14 +62,22 @@ test('each model id routes to its OWN provider (GLM brain / DeepSeek worker / Mi
   });
 });
 
-test('a non-default provider takes precedence over the legacy default for a shared id', () => {
+test('a model id exposed by two BYO providers fails closed until identity is provider-qualified', () => {
   withEnv({
     BYO_MODEL_BASE_URL: ZAI, BYO_MODEL_ID: 'glm-5.2', BYO_MODEL_JUDGE_ID: 'MiniMax-M3', BYO_MODEL_API_KEY: 'zai-key',
     BYO_PROVIDERS: JSON.stringify([{ id: 'minimax', label: 'MiniMax', baseURL: MINIMAX, modelIds: ['MiniMax-M3'] }]),
     BYO_PROVIDER_MINIMAX_API_KEY: 'minimax-key',
   }, () => {
-    // default's stale judge id (MiniMax-M3) is overridden by the real MiniMax provider
-    assert.equal(resolveByoProviderForModel('MiniMax-M3')?.baseURL, MINIMAX);
+    assert.match(unqualifiedModelCollisionReason('MiniMax-M3', 'all_in') ?? '', /multiple connected BYO providers/);
+    assert.throws(() => resolveByoProviderForModel('MiniMax-M3'), /Provider-qualified model identity is required/);
+  });
+});
+
+test('built-in-shaped BYO ids are explicit in all_in and ambiguous in mixed routing', () => {
+  withEnv({ BYO_MODEL_BASE_URL: TOGETHER, BYO_MODEL_ID: 'gpt-4o', BYO_MODEL_API_KEY: 'key', BYO_MODEL_PROVIDER: 'Together' }, () => {
+    assert.equal(resolveEffectiveProviderForModel('gpt-4o', 'all_in'), 'byo');
+    assert.match(unqualifiedModelCollisionReason('gpt-4o', 'worker') ?? '', /both Codex and BYO provider Together/);
+    assert.throws(() => resolveEffectiveProviderForModel('gpt-4o', 'worker'), /Provider-qualified model identity is required/);
   });
 });
 
@@ -78,6 +86,29 @@ test('a single provider owns everything (byte-identical single-backend behavior)
     assert.equal(resolveByoProviderForModel('glm-5.2')?.baseURL, ZAI);
     // an id not in the list still resolves to the only provider
     assert.equal(resolveByoProviderForModel('some-other-model')?.baseURL, ZAI);
+  });
+});
+
+test('declared ownership recognizes BYO ids that resemble built-in providers without catch-all claims', () => {
+  withEnv({
+    BYO_PROVIDERS: JSON.stringify([{ id: 'together', label: 'Together', baseURL: TOGETHER, modelIds: ['gpt-4o', 'claude-custom'] }]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'together-key',
+  }, () => {
+    assert.equal(resolveDeclaredByoProviderForModel('gpt-4o')?.baseURL, TOGETHER);
+    assert.equal(resolveDeclaredByoProviderForModel('claude-custom')?.baseURL, TOGETHER);
+    assert.equal(resolveDeclaredByoProviderForModel('gpt-5.6'), undefined, 'no single-provider catch-all');
+  });
+  withEnv({ BYO_MODEL_BASE_URL: TOGETHER, BYO_MODEL_ID: 'gpt-4o', BYO_MODEL_API_KEY: 'key' }, () => {
+    assert.equal(resolveDeclaredByoProviderForModel('gpt-4o')?.baseURL, TOGETHER, 'default primary is genuine ownership');
+    assert.equal(resolveDeclaredByoProviderForModel('gpt-5.6'), undefined);
+  });
+  withEnv({
+    BYO_MODEL_BASE_URL: ZAI,
+    BYO_MODEL_ID: 'glm-5.2',
+    BYO_MODEL_JUDGE_ID: 'gpt-4o-mini',
+    BYO_MODEL_API_KEY: 'key',
+  }, () => {
+    assert.equal(resolveDeclaredByoProviderForModel('gpt-4o-mini')?.baseURL, ZAI, 'distinct default judge id is genuine ownership');
   });
 });
 

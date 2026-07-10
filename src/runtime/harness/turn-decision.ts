@@ -112,13 +112,79 @@ function deriveDecisionSummary(text: string): string {
 // nulled twice, burned 5 minutes of re-runs, and ended in the stall banner
 // instead of the answer).
 const ANNOUNCEMENT_STALL_MAX_CHARS = 300;
+const CLOSES_WITH_QUESTION_PATTERN = /\?[\s"'\u2019)\]]*$/u;
+
+// A trailing question only rescues announcement-shaped text when the question
+// itself is a real decision point. "I'll run it now. Should I proceed?" is still
+// a zero-work promise: the second sentence merely asks permission to perform the
+// action the first sentence claimed was already starting. By contrast, a
+// concrete implementation choice ("daily or on click?") or a sign-off question
+// after an actual draft is useful conversational output and must survive.
+const CONSEQUENTIAL_QUESTION_SIGNAL_PATTERN = /(?:\bor\b|^(?:which|what|how|when|where|who)\b)/i;
+const GENERIC_EXECUTION_CHOICE_WORDS = new Set([
+  'a', 'ahead', 'an', 'and', 'background', 'begin', 'can', 'continue', 'do', 'execute',
+  'foreground', 'go', 'good', 'here', 'hold', 'i', 'in', 'instead', 'it', 'later',
+  'may', 'me', 'now', 'on', 'one', 'or', 'please', 'proceed', 'ready', 'run',
+  'send', 'shall', 'should', 'sound', 'start', 'that', 'the', 'there', 'this',
+  'to', 'us', 'wait', 'want', 'we', 'when', 'where', 'which', 'who', 'would', 'you',
+]);
+const SUBSTANTIVE_PREFIX_PATTERN = /(?:```|(?:^|\n)\s*(?:to|subject):|(?:^|\n)\s*(?:[-*]|\d+\.)\s+|:\s*[^,\n]+(?:,\s*[^,\n]+){2,})/i;
+
+function questionCarriesConcreteChoice(question: string, prefix: string): boolean {
+  if (!CONSEQUENTIAL_QUESTION_SIGNAL_PATTERN.test(question)) return false;
+  const words = question.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  const promisedWords = new Set(prefix.toLowerCase().match(/[a-z0-9]+/g) ?? []);
+  return words.some((word) =>
+    !GENERIC_EXECUTION_CHOICE_WORDS.has(word) && !promisedWords.has(word));
+}
+
+function closingQuestionParts(text: string): { question: string; prefix: string } | null {
+  if (!CLOSES_WITH_QUESTION_PATTERN.test(text)) return null;
+  const questionMark = text.lastIndexOf('?');
+  const beforeQuestionMark = text.slice(0, questionMark);
+  const boundary = Math.max(
+    beforeQuestionMark.lastIndexOf('.'),
+    beforeQuestionMark.lastIndexOf('!'),
+    beforeQuestionMark.lastIndexOf('\n'),
+  );
+  return {
+    question: text.slice(boundary + 1).trim().replace(/["'\u2019)\]]+$/u, ''),
+    prefix: boundary >= 0 ? text.slice(0, boundary + 1).trim() : '',
+  };
+}
+
+function textClosesWithDeliverableQuestion(text: string): boolean {
+  const parts = closingQuestionParts(text.trim());
+  if (!parts) return false;
+  const announcementOnlyPrefix =
+    parts.prefix.length > 0 &&
+    parts.prefix.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
+    STALL_ANNOUNCEMENT_PATTERN.test(parts.prefix) &&
+    !STALL_REFLECTION_SUPPRESS_PATTERN.test(parts.prefix) &&
+    !SUBSTANTIVE_PREFIX_PATTERN.test(parts.prefix);
+  if (!announcementOnlyPrefix) return true;
+
+  // A specific choice is itself useful input even after a future-tense
+  // recommendation. Vague readiness/sign-off variants ("Ready?", "Sound
+  // good?", "Should I proceed?") do not carry a decision and therefore cannot
+  // turn an unexecuted action promise into a deliverable.
+  return questionCarriesConcreteChoice(parts.question, parts.prefix);
+}
+
+function decisionClosesWithQuestion(decision: OrchestratorDecisionShape): boolean {
+  const visible = decision.reply?.trim() || decision.summary?.trim() || '';
+  return textClosesWithDeliverableQuestion(visible);
+}
 
 function looksLikeZeroWorkStallText(trimmed: string): boolean {
   if (trimmed.length <= 60 && STALL_OUTPUT_PATTERN.test(trimmed)) return true;
   if (
     trimmed.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
     STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
-    !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)
+    !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed) &&
+    // A concrete closing question is a conversational deliverable, not an
+    // action claim. A generic "Should I proceed?" after a promise is not.
+    !textClosesWithDeliverableQuestion(trimmed)
   ) return true;
   if (looksLikeToolUnavailableSelfReport(trimmed)) return true;
   // A HALLUCINATED TOOL CALL rendered as text — a tool-shaped heading
@@ -430,6 +496,7 @@ export function evaluateStructuredDecisionStall(opts: {
     (decision.nextAction === 'completed' || decision.nextAction === 'abandoned') &&
     STALL_ANNOUNCEMENT_PATTERN.test(combined) &&
     !STALL_REFLECTION_SUPPRESS_PATTERN.test(combined) &&
+    !decisionClosesWithQuestion(decision) &&
     // Not a false "zero-tool claim" when the model is REPORTING a genuine
     // completion (done:true) whose work was done in PRIOR turns — a
     // "searched, found nothing" answer makes no NEW tool call but isn't a lie.
@@ -624,7 +691,8 @@ export function evaluateProgress(opts: {
       trimmed &&
       trimmed.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
       STALL_ANNOUNCEMENT_PATTERN.test(trimmed) &&
-      !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed)
+      !STALL_REFLECTION_SUPPRESS_PATTERN.test(trimmed) &&
+      !textClosesWithDeliverableQuestion(trimmed)
     ) {
       return {
         signal: 'A_zero_tools',
@@ -888,6 +956,7 @@ export function classifyTurnText(
       combined.length <= ANNOUNCEMENT_STALL_MAX_CHARS &&
       STALL_ANNOUNCEMENT_PATTERN.test(combined) &&
       !STALL_REFLECTION_SUPPRESS_PATTERN.test(combined) &&
+      !decisionClosesWithQuestion(decision) &&
       !(decision.done === true && evidence.priorSubstantiveWork)
     ) {
       return { kind: 'punt', decision };

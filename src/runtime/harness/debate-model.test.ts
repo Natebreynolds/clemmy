@@ -24,6 +24,8 @@ const {
   setJudgeOrderCoinForTest,
   resolveDebateBrains,
   verifyJudgeAvailable,
+  resolveBoundaryJudge,
+  resolveBoundaryJudgeHedge,
 } = await import('./debate-model.js');
 const { getDebateCheckerModel } = await import('../../config.js');
 
@@ -95,6 +97,49 @@ function withEnv(env: Record<string, string | undefined>, fn: () => void | Promi
   const r = fn();
   return r instanceof Promise ? r.finally(restore) : (restore(), r);
 }
+
+test('boundary judge default-off binds a concrete same-family wire and disables the cross-family hedge', () => {
+  const isolated = {
+    CLEMMY_JUDGE_CROSS_FAMILY: undefined,
+    BYO_PROVIDERS: '',
+    BYO_MODEL_BASE_URL: '',
+    BYO_MODEL_API_KEY: '',
+    BYO_MODEL_ID: '',
+  };
+  withEnv({ ...isolated, AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off', OPENAI_MODEL_PRIMARY: 'gpt-5.4' }, () => {
+    const route = resolveBoundaryJudge();
+    assert.equal(route.judgeFamily, 'codex');
+    assert.equal(route.brainFamily, 'codex');
+    assert.equal(route.transport, 'codex_responses');
+    assert.ok(route.model, 'the Codex provider model is bound directly');
+    assert.equal(resolveBoundaryJudgeHedge(route), null);
+  });
+  withEnv({ ...isolated, AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'off', CLAUDE_MODEL: 'claude-opus-4-8' }, () => {
+    const route = resolveBoundaryJudge();
+    assert.equal(route.judgeFamily, 'claude');
+    assert.equal(route.brainFamily, 'claude');
+    assert.equal(route.transport, 'claude_subscription');
+    assert.ok(route.model, 'the Claude subscription model is bound directly');
+    assert.equal(resolveBoundaryJudgeHedge(route), null);
+  });
+  withEnv({
+    ...isolated,
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.z.ai/v1',
+    BYO_MODEL_API_KEY: 'zai-key',
+    BYO_MODEL_ID: 'glm-5.2',
+    BYO_MODEL_JUDGE_ID: 'glm-judge',
+  }, () => {
+    const route = resolveBoundaryJudge();
+    assert.equal(route.judgeFamily, 'byo');
+    assert.equal(route.brainFamily, 'byo');
+    assert.equal(route.modelId, 'glm-judge');
+    assert.equal(route.transport, 'byo_openai_compatible');
+    assert.ok(route.model, 'the configured BYO model is bound directly');
+    assert.equal(resolveBoundaryJudgeHedge(route), null);
+  });
+});
 
 // --- mode + trigger ---------------------------------------------------------
 

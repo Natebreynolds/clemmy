@@ -161,11 +161,11 @@ function workerIntentRoutingEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_INTENT_ROUTING', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
-/** Cross-provider worker fallover (shares the brain-fallover kill-switch,
- *  default on): a Claude SDK worker that overloads before committing re-runs
+/** Optional cross-provider worker fallover (shares the brain-fallover switch):
+ *  a Claude SDK worker that overloads before committing re-runs
  *  the item on the next connected brain. */
 function workerBrainFalloverEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
 }
 
 interface ChatWorkerModelRoute {

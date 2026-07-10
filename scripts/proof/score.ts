@@ -8,11 +8,12 @@
  * narration check IMPORTS the runtime's own single-source shape detector so
  * the proof gate always tracks the live guard, never a parallel regex.
  */
+import { existsSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import path from 'node:path';
 
 import { looksLikeToolCallShape } from '../../src/runtime/harness/tool-narration-shapes.js';
-import type { Check, TurnLatency } from './types.js';
+import type { BrainKind, Check, TurnLatency } from './types.js';
 
 /** Tools whose effect leaves the machine or commits work on the user's behalf —
  *  the converse-first hard line: NONE of these may fire on an ambiguous ask
@@ -167,6 +168,105 @@ export function sessionMetrics(db: Database.Database, sessionId: string): Sessio
 export function summarizeAllSessions(db: Database.Database): SessionMetrics[] {
   const rows = db.prepare(`SELECT id FROM sessions ORDER BY updated_at DESC`).all() as { id: string }[];
   return rows.map((r) => sessionMetrics(db, r.id)).filter((m): m is SessionMetrics => m !== null);
+}
+
+type ServedModelFamily = 'claude' | 'codex' | 'byo';
+
+interface RouteMarker {
+  provider?: unknown;
+  model?: unknown;
+  modelId?: unknown;
+  transport?: unknown;
+}
+
+function routeFamily(data: RouteMarker): ServedModelFamily | null {
+  if (data.provider === 'claude' || data.provider === 'codex' || data.provider === 'byo') {
+    return data.provider;
+  }
+  const transport = typeof data.transport === 'string' ? data.transport.toLowerCase() : '';
+  if (transport.includes('claude_agent_sdk')) return 'claude';
+  const model = String(data.model ?? data.modelId ?? '').toLowerCase();
+  if (!model) return null;
+  if (model.includes('claude')) return 'claude';
+  if (/^(gpt|o\d)|codex/.test(model)) return 'codex';
+  return 'byo';
+}
+
+export interface SessionRouteEvidence {
+  markerCount: number;
+  explicitProviderCount: number;
+  families: ServedModelFamily[];
+  falloverCount: number;
+}
+
+/** Route evidence for exactly one proof session. Provider metadata wins over
+ * model-name inference so a BYO backend serving `gpt-*` is never called Codex. */
+export function sessionRouteEvidence(home: string, sessionId: string): SessionRouteEvidence {
+  const db = openHarnessDb(home);
+  const rows = db.prepare(
+    "SELECT data_json FROM events WHERE session_id = ? AND type = 'turn_model_routed' ORDER BY seq ASC",
+  ).all(sessionId) as Array<{ data_json: string }>;
+  db.close();
+
+  let explicitProviderCount = 0;
+  const families: ServedModelFamily[] = [];
+  for (const row of rows) {
+    try {
+      const data = JSON.parse(row.data_json) as RouteMarker;
+      if (data.provider === 'claude' || data.provider === 'codex' || data.provider === 'byo') {
+        explicitProviderCount += 1;
+      }
+      const family = routeFamily(data);
+      if (family) families.push(family);
+    } catch { /* malformed telemetry is missing evidence */ }
+  }
+
+  let falloverCount = 0;
+  const operationalPath = path.join(home, 'state', 'operational-telemetry.db');
+  if (existsSync(operationalPath)) {
+    try {
+      const operational = new Database(operationalPath, { readonly: true, fileMustExist: true });
+      const row = operational.prepare(
+        "SELECT COUNT(*) AS count FROM operational_events WHERE session_id = ? AND type = 'model_fallover'",
+      ).get(sessionId) as { count?: number } | undefined;
+      falloverCount = Number(row?.count ?? 0);
+      operational.close();
+    } catch { /* an absent/old telemetry schema contributes no fallover rows */ }
+  }
+
+  return { markerCount: rows.length, explicitProviderCount, families, falloverCount };
+}
+
+/** Exact-route proof for a multi-turn scenario. Every expected turn must carry
+ * explicit provider identity, all markers must name only the requested brain,
+ * and no same-session model fallover may have occurred. */
+export function exactBrainRouteChecks(
+  home: string,
+  sessionId: string,
+  brain: BrainKind,
+  expectedTurns: number,
+): Check[] {
+  const expected: ServedModelFamily = brain === 'glm' ? 'byo' : brain;
+  const evidence = sessionRouteEvidence(home, sessionId);
+  const unique = [...new Set(evidence.families)];
+  const markerDetail = `markers ${evidence.markerCount}, explicit providers ${evidence.explicitProviderCount}, families [${unique.join(', ') || 'none'}]`;
+  return [
+    {
+      name: `all ${expectedTurns} turns carry explicit provider identity`,
+      pass: evidence.markerCount >= expectedTurns && evidence.explicitProviderCount === evidence.markerCount,
+      detail: markerDetail,
+    },
+    {
+      name: `session served only by the requested ${expected} brain`,
+      pass: unique.length === 1 && unique[0] === expected,
+      detail: markerDetail,
+    },
+    {
+      name: 'no same-session model fallover',
+      pass: evidence.falloverCount === 0,
+      detail: `${evidence.falloverCount} model_fallover event(s)`,
+    },
+  ];
 }
 
 // ─── Cross-cutting checks ───────────────────────────────────────────────────

@@ -12,7 +12,15 @@
  * provider's secret lives in the vault/env via getByoProviderApiKey — never in
  * the JSON.
  */
-import { getRuntimeEnv, getByoBackendConfig, getByoProviderApiKey, type ByoBackendConfig } from '../../config.js';
+import {
+  getRuntimeEnv,
+  getByoBackendConfig,
+  getByoProviderApiKey,
+  getModelRoutingMode,
+  type ByoBackendConfig,
+  type ModelRoutingMode,
+} from '../../config.js';
+import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-providers' });
@@ -48,7 +56,13 @@ export function getByoProviders(): ByoProvider[] {
   // 'default' = the legacy single backend (authoritative), if configured.
   const legacy = getByoBackendConfig();
   if (legacy.configured || legacy.baseURL) {
-    const modelIds = [legacy.primaryId, legacy.judgeId, (getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '').trim()]
+    const worker = cleanId((getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '').trim());
+    // OPENAI_MODEL_WORKER is a shared legacy slot. Outside all_in, a built-in-
+    // shaped id is not BYO ownership proof; inside all_in the mode is itself the
+    // explicit provider choice, so preserve legitimate same-endpoint models such
+    // as primary=glm-5.2 + worker=gpt-4o.
+    const byoWorker = worker && (getModelRoutingMode() === 'all_in' || resolveProvider(worker) === 'byo') ? worker : '';
+    const modelIds = [legacy.primaryId, legacy.judgeId, byoWorker]
       .map(cleanId)
       .filter(Boolean);
     providers.push({ id: 'default', label: legacy.providerLabel, baseURL: legacy.baseURL, modelIds: Array.from(new Set(modelIds)) });
@@ -102,14 +116,79 @@ export function providerToBackendConfig(p: ByoProvider): ByoBackendConfig {
   };
 }
 
+/** Configured BYO providers that explicitly expose a model id. This includes
+ * the migrated default provider's worker slot for collision detection even
+ * though that legacy slot alone is not strong enough to claim a built-in-shaped
+ * id during normal routing. */
+export function configuredByoProvidersForModel(modelId: string): ByoProvider[] {
+  const id = (modelId || '').trim();
+  if (!id) return [];
+  return getByoProviders().filter((provider) =>
+    provider.modelIds.includes(id) && providerToBackendConfig(provider).configured,
+  );
+}
+
+function providerList(owners: ByoProvider[]): string {
+  return owners.map((owner) => owner.label || owner.id).join(', ');
+}
+
+/** Why an unqualified model id cannot be routed safely. Model ids are legacy
+ * identity; until persisted bindings become provider-qualified, duplicate ids
+ * must fail closed rather than silently choosing a key/endpoint. `all_in` is
+ * itself an explicit BYO provider choice, so a built-in-shaped BYO id is safe
+ * there, but two BYO owners remain ambiguous in every mode. */
+export function unqualifiedModelCollisionReason(
+  modelId: string,
+  mode: ModelRoutingMode = getModelRoutingMode(),
+): string | undefined {
+  const id = (modelId || '').trim();
+  if (!id) return undefined;
+  const owners = configuredByoProvidersForModel(id);
+  if (owners.length > 1) {
+    return `Model ${id} is exposed by multiple connected BYO providers (${providerList(owners)}). `
+      + 'Provider-qualified model identity is required; remove the duplicate model id before selecting or binding it.';
+  }
+  const builtIn = resolveProvider(id);
+  if (mode !== 'all_in' && owners.length === 1 && builtIn !== 'byo') {
+    const label = builtIn === 'codex' ? 'Codex' : 'Claude';
+    return `Model ${id} is exposed by both ${label} and BYO provider ${providerList(owners)}. `
+      + 'Provider-qualified model identity is required; rename or remove the duplicate BYO model id before selecting or binding it.';
+  }
+  return undefined;
+}
+
+export function assertUnambiguousModelRouting(
+  modelId: string,
+  mode: ModelRoutingMode = getModelRoutingMode(),
+): void {
+  const reason = unqualifiedModelCollisionReason(modelId, mode);
+  if (reason) throw new Error(reason);
+}
+
+/** Provider class the router will actually use for an unqualified model id.
+ * Unlike resolveProvider's wire-shape classifier, this understands declared BYO
+ * ownership and all-in provider isolation. It throws on identity collisions. */
+export function resolveEffectiveProviderForModel(
+  modelId: string,
+  mode: ModelRoutingMode = getModelRoutingMode(),
+): ModelProviderClass {
+  const id = (modelId || '').trim();
+  assertUnambiguousModelRouting(id, mode);
+  const owners = configuredByoProvidersForModel(id);
+  if (mode === 'all_in') {
+    const defaultByo = getByoBackendConfig();
+    if (defaultByo.configured || owners.length === 1) return 'byo';
+  }
+  if (owners.length === 1) return 'byo';
+  return resolveProvider(id);
+}
+
 /**
- * Resolve a model id → the backend config of the provider that OWNS it.
- * Precedence: an EXPLICIT (non-'default') provider that lists the id wins over
- * the migrated 'default' provider, so adding a real MiniMax provider re-routes
- * `MiniMax-M3` away from a Z.ai 'default'. When exactly one provider exists it
- * owns everything (preserves single-backend all_in/worker semantics). Returns
- * undefined when no provider claims the id — the caller then falls back to the
- * legacy getByoBackendConfig(), so this never broadens which ids hit BYO.
+ * Resolve a model id -> the backend config of the provider that OWNS it.
+ * Duplicate exact owners fail closed until persisted identity is provider-
+ * qualified. When exactly one provider exists it owns everything (preserves
+ * single-backend all_in/worker semantics). Returns undefined when no provider
+ * claims the id, so this never broadens which ids hit BYO.
  */
 export function resolveByoProviderForModel(modelId: string): ByoBackendConfig | undefined {
   const id = (modelId || '').trim();
@@ -117,11 +196,11 @@ export function resolveByoProviderForModel(modelId: string): ByoBackendConfig | 
   const providers = getByoProviders();
   if (providers.length === 0) return undefined;
 
-  // Explicit, non-default ownership wins (newer connected providers beat the
-  // migrated legacy 'default' for a shared id).
-  const explicit = providers.find((p) => p.id !== 'default' && p.modelIds.includes(id));
-  if (explicit) return providerToBackendConfig(explicit);
+  const collision = unqualifiedModelCollisionReason(id, 'all_in');
+  if (collision) throw new Error(collision);
 
+  const configuredOwners = configuredByoProvidersForModel(id);
+  if (configuredOwners.length === 1) return providerToBackendConfig(configuredOwners[0]);
   const anyOwner = providers.find((p) => p.modelIds.includes(id));
   if (anyOwner) return providerToBackendConfig(anyOwner);
 
@@ -129,6 +208,30 @@ export function resolveByoProviderForModel(modelId: string): ByoBackendConfig | 
   if (providers.length === 1) return providerToBackendConfig(providers[0]);
 
   return undefined;
+}
+
+/** Resolve only an explicitly declared model id. Unlike
+ * resolveByoProviderForModel, this never applies the single-provider catch-all,
+ * so a BYO provider can serve `gpt-*` or `claude-*` without accidentally
+ * claiming every built-in model. A named provider's explicit model list wins.
+ * The migrated default owns its primary/judge ids, plus its explicit worker id
+ * only in all_in where the routing mode has already selected BYO. */
+export function resolveDeclaredByoProviderForModel(modelId: string): ByoBackendConfig | undefined {
+  const id = (modelId || '').trim();
+  if (!id) return undefined;
+  const collision = unqualifiedModelCollisionReason(id, 'all_in');
+  if (collision) throw new Error(collision);
+  const owners = configuredByoProvidersForModel(id);
+  const explicit = owners.find((provider) => provider.id !== 'default');
+  if (explicit) return providerToBackendConfig(explicit);
+  const defaultProvider = owners.find((provider) => provider.id === 'default');
+  if (!defaultProvider) return undefined;
+  const declared = getByoBackendConfig();
+  const worker = (getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '').trim();
+  const ownsModel = id === declared.primaryId
+    || id === declared.judgeId
+    || (getModelRoutingMode() === 'all_in' && id === worker);
+  return ownsModel ? providerToBackendConfig(defaultProvider) : undefined;
 }
 
 // ── persistence helpers (pure — the console route does the updateEnvKey writes) ──

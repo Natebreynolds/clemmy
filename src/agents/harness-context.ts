@@ -119,7 +119,7 @@ export function renderCurrentTimeForInstructions(): string {
 /**
  * Render the Current Focus block (active / stale / parked). Extracted so BOTH
  * the harness self-assembler and the chat assembler emit the SAME focus surface
- * (CANON-SELFASM) — chat previously had none, forcing a focus_get every turn.
+ * (CANON-SELFASM) so every provider sees it without a redundant tool round-trip.
  * Returns the inner content (wrap with section('Current Focus', …)); '' on no
  * focus or error.
  */
@@ -364,10 +364,8 @@ export function renderHarnessMemoryContext(opts?: {
     skills = '';
   }
 
-  // Current Focus block — surfaced in persistent context so the model
-  // has at-a-glance awareness without a focus_get tool call. The
-  // instructions still require focus_get at turn start for the most
-  // current state (the persistent block is rendered once per turn).
+  // Current Focus block — rendered once for this turn, so it is the current
+  // state and does not need an immediate focus_get round-trip.
   const focus = renderFocusForInstructions();
 
   const constraints = renderActiveConstraints();

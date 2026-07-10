@@ -65,6 +65,33 @@ test('single-element chain returns the model as-is (no wrapper)', () => {
   assert.equal(withModelFallback([target('only', m)]), m);
 });
 
+test('request capability: a tool-bearing turn skips a text-only fallback target', async () => {
+  let textOnlyCalls = 0;
+  let toolCapableCalls = 0;
+  const textOnly = model({ getResponse: async () => { textOnlyCalls++; return resp('wrong'); } });
+  const toolCapable = model({ getResponse: async () => { toolCapableCalls++; return resp('right'); } });
+  const routed = withModelFallback([
+    { label: 'text-only', getModel: () => textOnly, supportsRequest: (request) => (request.tools?.length ?? 0) === 0 },
+    target('tool-capable', toolCapable),
+  ]);
+  const request = { ...req(), tools: [{ name: 'read_file' }] } as unknown as ModelRequest;
+  const result = await routed.getResponse(request);
+  assert.equal(textOnlyCalls, 0);
+  assert.equal(toolCapableCalls, 1);
+  assert.equal((result.output[0] as any).content, 'right');
+});
+
+test('request capability: a compatible text request may use the text-only target', async () => {
+  let textOnlyCalls = 0;
+  const textOnly = model({ getResponse: async () => { textOnlyCalls++; return resp('text'); } });
+  const routed = withModelFallback([
+    { label: 'text-only', getModel: () => textOnly, supportsRequest: (request) => (request.tools?.length ?? 0) === 0 },
+    target('other', model({ getResponse: async () => resp('other') })),
+  ]);
+  await routed.getResponse(req());
+  assert.equal(textOnlyCalls, 1);
+});
+
 test('getResponse: overload on primary falls back to the next brain', async () => {
   let opusCalls = 0, sonnetCalls = 0;
   const opus = model({ getResponse: async () => { opusCalls++; throw overload(); } });

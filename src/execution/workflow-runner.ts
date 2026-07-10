@@ -2374,10 +2374,10 @@ export async function runWithContractLoop<T>(
   }
 }
 
-/** Brain-fallover kill-switch — shared with the harness's CLEMMY_BRAIN_FALLOVER
- *  (default on). Off → a step runs on its resolved brain only (prior behavior). */
+/** Brain-fallover opt-in — shared with the harness's CLEMMY_BRAIN_FALLOVER.
+ *  Default off: a step runs on its resolved brain only. */
 function workflowBrainFalloverEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'on') ?? 'on').toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER', 'off') ?? 'off').trim());
 }
 
 /** Step-boundary cross-provider fallover. Runs the step on its resolved brain

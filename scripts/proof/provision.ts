@@ -165,6 +165,14 @@ export async function provisionDaemon(plan: BrainPlan, opts: ProvisionOptions = 
       DISCORD_ENABLED: 'false',
       SLACK_ENABLED: 'false',
       ...plan.env,
+      // A provider proof must fail on its selected brain, never look green
+      // because a recovery lane silently served the turn.
+      CLEMMY_BRAIN_FALLOVER: 'off',
+      CLEMMY_AUTH_FALLOVER: 'off',
+      CLEMMY_CLAUDE_OVERLOAD_FALLBACK: 'off',
+      CLEMMY_LEGACY_RESPOND_FALLBACK: 'off',
+      CLEMMY_ROUTE_POLICY: 'off',
+      CLEMMY_JUDGE_CROSS_FAMILY: 'off',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
