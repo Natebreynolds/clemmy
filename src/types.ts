@@ -35,8 +35,8 @@ export interface RunRequest {
    * the same exact-match rule. Filtering does not affect the on-disk
    * registry — only the tool surface visible to this single run.
    *
-   * Has no effect on the CodexCliRuntime (codex_oauth mode), which
-   * spawns the Codex CLI subprocess with its own tool surface.
+   * Has no effect in codex_oauth mode, which spawns the Codex CLI
+   * subprocess with its own tool surface.
    */
   excludeToolNames?: string[];
 }

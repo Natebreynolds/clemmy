@@ -64,8 +64,7 @@ export type ActionEvent =
       // can be sure that "no terminal event" means "the run is still
       // in flight" — never "the run died silently."
       //
-      // The Recent Errors dashboard panel listens for runtime.failed
-      // and renders the BoundaryError via boundary-error-renderer.
+      // The Recent Errors dashboard panel listens for runtime.failed.
       kind: 'runtime.failed';
       sessionId: string;
       runId?: string;

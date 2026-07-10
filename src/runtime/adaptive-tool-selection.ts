@@ -11,6 +11,10 @@
  * Day 1: User tries Outlook (fails), Gmail (succeeds) → learns "use Gmail first"
  * Day 2: Next email task automatically uses Gmail first
  * Day 30: After 30 email tasks, Clementine knows Gmail reliability in this user's env
+ *
+ * Live surface: recordToolOutcome / getToolSuccessRate / classifyToolReliability
+ * are consumed by graceful-degradation-engine.ts. The diagnostic/ranking/reset
+ * helpers were test-only and removed in the 2026-07-09 subtraction pass.
  */
 
 import { recordFallbackSuccess, recordFallbackFailure } from './fallback-chain-store.js';
@@ -129,29 +133,6 @@ export function getToolSuccessRate(toolName: string): number {
 }
 
 /**
- * Get recent trend for a tool (is it improving or degrading?).
- */
-export function getToolTrend(toolName: string): 'improving' | 'degrading' | 'stable' | 'unknown' {
-  const profile = toolProfiles.get(toolName);
-  if (!profile || profile.recentOutcomes.length < 3) {
-    return 'unknown';
-  }
-
-  const recent = profile.recentOutcomes.slice(-5); // Last 5 outcomes
-  const successCount = recent.filter((o) => o).length;
-  const successRate = successCount / recent.length;
-
-  // Compare to overall success rate
-  if (successRate > profile.successRate + 0.1) {
-    return 'improving';
-  }
-  if (successRate < profile.successRate - 0.1) {
-    return 'degrading';
-  }
-  return 'stable';
-}
-
-/**
  * Get tool reliability classification.
  */
 export function classifyToolReliability(toolName: string): 'highly_reliable' | 'reliable' | 'unreliable' | 'unknown' {
@@ -168,118 +149,4 @@ export function classifyToolReliability(toolName: string): 'highly_reliable' | '
   if (rate >= 0.7) return 'reliable';
   if (rate >= 0.0) return 'unreliable'; // Any data below 70% is unreliable
   return 'unknown';
-}
-
-/**
- * Recommend tool order based on learned success rates.
- * Used when multiple tools can achieve the same intent.
- */
-export function rankToolsByReliability(toolNames: string[]): Array<{ toolName: string; score: number }> {
-  return toolNames
-    .map((tool) => ({
-      toolName: tool,
-      score: getToolSuccessRate(tool),
-    }))
-    .sort((a, b) => b.score - a.score); // Highest success rate first
-}
-
-/**
- * Get diagnostic info about a tool's health.
- */
-export function getToolHealthDiagnostics(toolName: string): {
-  toolName: string;
-  reliability: string;
-  trend: string;
-  successRate: string;
-  failureTypes: string[];
-  recommendation: string;
-} {
-  const profile = toolProfiles.get(toolName);
-  const reliability = classifyToolReliability(toolName);
-  const trend = getToolTrend(toolName);
-
-  if (!profile) {
-    return {
-      toolName,
-      reliability: 'unknown',
-      trend: 'unknown',
-      successRate: 'No data',
-      failureTypes: [],
-      recommendation: `${toolName} has not been used yet`,
-    };
-  }
-
-  const failureTypes = Object.entries(profile.failureTypes)
-    .sort(([, a], [, b]) => b - a)
-    .slice(0, 3)
-    .map(([type, count]) => `${type} (${count}x)`)
-    .join(', ');
-
-  let recommendation = '';
-  if (reliability === 'highly_reliable') {
-    recommendation = `Prefer ${toolName} — it has proven reliability`;
-  } else if (reliability === 'reliable') {
-    recommendation = `${toolName} works well but has occasional issues`;
-  } else if (reliability === 'unreliable') {
-    recommendation = `Avoid ${toolName} — consider alternatives`;
-  }
-
-  if (trend === 'degrading') {
-    recommendation += '. Warning: recent performance has degraded.';
-  }
-
-  return {
-    toolName,
-    reliability,
-    trend,
-    successRate: `${(profile.successRate * 100).toFixed(1)}% (${profile.successCount}/${profile.totalAttempts})`,
-    failureTypes: failureTypes ? failureTypes.split(', ') : [],
-    recommendation,
-  };
-}
-
-/**
- * Reset learning for a tool (for debugging or recovery).
- */
-export function resetToolProfile(toolName: string): void {
-  toolProfiles.delete(toolName);
-}
-
-/**
- * Clear all learning data (for testing).
- */
-export function clearAllProfiles(): void {
-  toolProfiles.clear();
-}
-
-/**
- * Get summary of all learned tool profiles.
- */
-export function getSummary(): {
-  totalTools: number;
-  totalOutcomes: number;
-  averageSuccessRate: number;
-  toolSummaries: Array<{
-    toolName: string;
-    attempts: number;
-    successRate: string;
-    reliability: string;
-  }>;
-} {
-  const summaries = Array.from(toolProfiles.values()).map((profile) => ({
-    toolName: profile.toolName,
-    attempts: profile.totalAttempts,
-    successRate: `${(profile.successRate * 100).toFixed(1)}%`,
-    reliability: classifyToolReliability(profile.toolName),
-  }));
-
-  const totalOutcomes = Array.from(toolProfiles.values()).reduce((sum, p) => sum + p.totalAttempts, 0);
-  const avgRate = Array.from(toolProfiles.values()).reduce((sum, p) => sum + p.successRate, 0) / toolProfiles.size || 0;
-
-  return {
-    totalTools: toolProfiles.size,
-    totalOutcomes,
-    averageSuccessRate: avgRate,
-    toolSummaries: summaries.sort((a, b) => parseFloat(b.successRate) - parseFloat(a.successRate)),
-  };
 }

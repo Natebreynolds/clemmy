@@ -26,7 +26,6 @@
   "files": [
     "dist",
     "!dist/**/*.test.js",
-    "!dist/spaces/runner-path.js",
     "apps/mobile-web/dist",
     "apps/console-web/dist",
     "vendor/uv",
