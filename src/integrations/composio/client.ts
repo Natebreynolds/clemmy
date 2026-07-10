@@ -667,46 +667,73 @@ function extractAccountIdentity(state: unknown, data: unknown): AccountIdentity 
   return out;
 }
 
+let connectionsInflight: Promise<ConnectedToolkit[]> | null = null;
+
+/** The live broker fetch + cache write, deduped so concurrent callers (a parallel
+ *  wave of composio calls) share ONE upstream request instead of N. */
+async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
+  if (connectionsInflight) return connectionsInflight;
+  connectionsInflight = (async (): Promise<ConnectedToolkit[]> => {
+    const composio = getComposio();
+    if (!composio) return [];
+    try {
+      const resp = await (composio as any).connectedAccounts.list({ limit: 100 });
+      const items = Array.isArray(resp) ? resp : (resp?.items ?? []);
+      const data = (items as Array<Record<string, unknown>>).map((item) => {
+        const toolkit = obj(item.toolkit);
+        const authConfig = obj(item.authConfig);
+        const identity = extractAccountIdentity(item.state, item.data);
+        const slug =
+          str(toolkit.slug) ??
+          str(authConfig.toolkit_slug) ??
+          str(authConfig.toolkitSlug) ??
+          str(item.toolkit_slug) ??
+          str(item.toolkitSlug) ??
+          'unknown';
+
+        return {
+          slug,
+          connectionId: str(item.id) ?? str(item.nanoid) ?? str(item.connectionId) ?? '',
+          status: str(item.status) ?? 'UNKNOWN',
+          alias: str(item.alias),
+          accountLabel: identity.label,
+          accountEmail: identity.email,
+          accountName: identity.name,
+          accountAvatarUrl: identity.avatarUrl,
+          createdAt: str(item.createdAt) ?? str(item.created_at),
+        };
+      }).filter((connection) => connection.connectionId && connection.slug !== 'unknown');
+
+      connectionsCache = { at: Date.now(), data };
+      return data;
+    } catch {
+      return connectionsCache?.data ?? [];
+    } finally {
+      connectionsInflight = null;
+    }
+  })();
+  return connectionsInflight;
+}
+
 export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
-  const composio = getComposio();
-  if (!composio) return [];
-
+  if (!getComposio()) return [];
   const now = Date.now();
+  // Fresh → serve cached.
   if (connectionsCache && now - connectionsCache.at < CONNECTIONS_TTL_MS) return connectionsCache.data;
-
-  try {
-    const resp = await (composio as any).connectedAccounts.list({ limit: 100 });
-    const items = Array.isArray(resp) ? resp : (resp?.items ?? []);
-    const data = (items as Array<Record<string, unknown>>).map((item) => {
-      const toolkit = obj(item.toolkit);
-      const authConfig = obj(item.authConfig);
-      const identity = extractAccountIdentity(item.state, item.data);
-      const slug =
-        str(toolkit.slug) ??
-        str(authConfig.toolkit_slug) ??
-        str(authConfig.toolkitSlug) ??
-        str(item.toolkit_slug) ??
-        str(item.toolkitSlug) ??
-        'unknown';
-
-      return {
-        slug,
-        connectionId: str(item.id) ?? str(item.nanoid) ?? str(item.connectionId) ?? '',
-        status: str(item.status) ?? 'UNKNOWN',
-        alias: str(item.alias),
-        accountLabel: identity.label,
-        accountEmail: identity.email,
-        accountName: identity.name,
-        accountAvatarUrl: identity.avatarUrl,
-        createdAt: str(item.createdAt) ?? str(item.created_at),
-      };
-    }).filter((connection) => connection.connectionId && connection.slug !== 'unknown');
-
-    connectionsCache = { at: now, data };
-    return data;
-  } catch {
-    return connectionsCache?.data ?? [];
+  // STALE-WHILE-REVALIDATE (2026-07-10 speed fix): EVERY composio_execute/status
+  // resolves the connection through here, so after >60s idle (i.e. between most
+  // chat messages) the old hard-TTL BLOCKED ~3s on a cold refetch — measured as
+  // the fixed tax on the first composio call of every interaction. Now: serve the
+  // recent-but-stale list INSTANTLY and refresh in the background. A real connect/
+  // disconnect/save nulls connectionsCache (the bust points), so a genuine change
+  // is never masked; stale is bounded to the same window the hard-TTL already
+  // tolerated, just non-blocking (mirrors the dashboard SWR pattern above).
+  if (connectionsCache) {
+    void refreshConnectedToolkits().catch(() => { /* stale stays served; next call retries */ });
+    return connectionsCache.data;
   }
+  // Cold (first ever) → await one deduped live fetch.
+  return refreshConnectedToolkits();
 }
 
 export async function listUsableConnectedToolkits(): Promise<ConnectedToolkit[]> {
