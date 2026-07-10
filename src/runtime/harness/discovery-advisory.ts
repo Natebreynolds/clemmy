@@ -26,6 +26,16 @@
 const DISCOVERY_ADVICE_THRESHOLD = 3;
 const DISCOVERY_ADVICE_MAX_EMITS = 2; // re-arm cap per cluster
 const JACCARD_CLUSTER_THRESHOLD = 0.3;
+// Per-TOOLKIT total-find cap: the per-cluster threshold misses the "divergent
+// queries, same toolkit" thrash — the model searching ONE toolkit many times
+// with UNRELATED queries (each cluster stays low), e.g. 6 outlook searches
+// chasing an unread-count tool (list unread → count folder → raw http → folder
+// details), measured live 2026-07-10. Fire once the toolkit's TOTAL find-lane
+// searches cross this, even when no single cluster did. Set to 5 (not 4) so the
+// legitimate "two distinct intents in one toolkit, each searched twice" case (=4)
+// still never fires — only genuine 5+ thrash does, and even then it's a soft
+// nudge, never a block.
+const DISCOVERY_BUCKET_FIND_THRESHOLD = 5;
 
 type DiscoveryLane = 'find' | 'describe';
 
@@ -37,7 +47,7 @@ interface DiscoveryCluster {
   count: number;
   emits: number;
 }
-interface DiscoveryBucket { clusters: DiscoveryCluster[]; }
+interface DiscoveryBucket { clusters: DiscoveryCluster[]; findEmits: number; }
 interface DiscoverySessionTracker { buckets: Map<string, DiscoveryBucket>; }
 
 const trackerBySession = new Map<string, DiscoverySessionTracker>();
@@ -93,7 +103,7 @@ export function maybeDiscoveryAdvisory(params: DiscoveryAdvisoryParams): string 
     const lane: DiscoveryLane = kind === 'describe' ? 'describe' : 'find';
     const bucketKey = `${lane}::${toolkit.toLowerCase()}`;
     let bucket = t.buckets.get(bucketKey);
-    if (!bucket) { bucket = { clusters: [] }; t.buckets.set(bucketKey, bucket); }
+    if (!bucket) { bucket = { clusters: [], findEmits: 0 }; t.buckets.set(bucketKey, bucket); }
 
     const tokens = tokenize(signature);
     let cluster: DiscoveryCluster | undefined;
@@ -131,23 +141,41 @@ export function maybeDiscoveryAdvisory(params: DiscoveryAdvisoryParams): string 
     if (cluster.members.length < 8) cluster.members.push(tokens);
     if (cluster.samples.length < 4) cluster.samples.push(signature.slice(0, 60));
 
-    const shouldEmit = cluster.count >= DISCOVERY_ADVICE_THRESHOLD * (cluster.emits + 1)
+    const clusterShouldEmit = cluster.count >= DISCOVERY_ADVICE_THRESHOLD * (cluster.emits + 1)
       && cluster.emits < DISCOVERY_ADVICE_MAX_EMITS;
-    if (!shouldEmit) return null;
-    cluster.emits += 1;
-
-    const samples = cluster.samples.map((s) => `"${s}"`).join(', ');
-    if (lane === 'describe') {
+    if (clusterShouldEmit) {
+      cluster.emits += 1;
+      const samples = cluster.samples.map((s) => `"${s}"`).join(', ');
+      if (lane === 'describe') {
+        return (
+          `\n\n↗ DISCOVERY LOOP: you've described the '${toolkit}' schema ${cluster.count} times over overlapping targets this run (${samples}). `
+          + `You already have the field list — STOP re-describing and proceed with the actual query/update. Re-describe only if a specific field genuinely failed.`
+        );
+      }
       return (
-        `\n\n↗ DISCOVERY LOOP: you've described the '${toolkit}' schema ${cluster.count} times over overlapping targets this run (${samples}). `
-        + `You already have the field list — STOP re-describing and proceed with the actual query/update. Re-describe only if a specific field genuinely failed.`
+        `\n\n↗ DISCOVERY LOOP: you've searched the '${toolkit}' toolkit ${cluster.count} times with overlapping queries this run (${samples}). `
+        + `Stop broadening the search — pick the top viable result you already have and call composio_execute_tool now. `
+        + `If you truly can't tell which slug fits, call tool_choice_recall once, then commit. Do NOT issue another search/list for this toolkit.`
       );
     }
-    return (
-      `\n\n↗ DISCOVERY LOOP: you've searched the '${toolkit}' toolkit ${cluster.count} times with overlapping queries this run (${samples}). `
-      + `Stop broadening the search — pick the top viable result you already have and call composio_execute_tool now. `
-      + `If you truly can't tell which slug fits, call tool_choice_recall once, then commit. Do NOT issue another search/list for this toolkit.`
-    );
+
+    // Per-TOOLKIT total-find thrash: fires even when NO single cluster hit
+    // threshold — the "6 outlook searches, all divergent, none clustering" case.
+    // Guarded to ≥2 clusters so a SINGLE-cluster same-goal loop stays the per-
+    // cluster counter's job (it fires at 3/6) and the bucket never double-fires.
+    if (lane === 'find' && bucket.clusters.length >= 2) {
+      const bucketTotal = bucket.clusters.reduce((sum, c) => sum + c.count, 0);
+      const bucketShouldEmit = bucketTotal >= DISCOVERY_BUCKET_FIND_THRESHOLD * (bucket.findEmits + 1)
+        && bucket.findEmits < DISCOVERY_ADVICE_MAX_EMITS;
+      if (bucketShouldEmit) {
+        bucket.findEmits += 1;
+        const allSamples = bucket.clusters.flatMap((c) => c.samples).slice(0, 5).map((s) => `"${s}"`).join(', ');
+        return (
+          `\n\n↗ DISCOVERY LOOP: you've searched the '${toolkit}' toolkit ${bucketTotal} times this run with DIFFERENT queries (${allSamples}) — you are NOT converging on a better tool. STOP searching: use the best action you already found (a LIST/GET slug that returned results) and call composio_execute_tool now; if the exact capability genuinely doesn't exist, say so to the user. Do NOT issue another search/list for this toolkit.`
+        );
+      }
+    }
+    return null;
   } catch {
     return null; // a nudge must never break a tool call
   }

@@ -59,6 +59,29 @@ test('two genuinely-different intents in one toolkit never fire (distinctness gu
   assert.deepEqual(fires, [], 'no advisory — neither distinct cluster reaches the threshold');
 });
 
+test('per-toolkit total-find thrash fires even when NO single cluster clusters (2026-07-10 outlook unread-count loop)', () => {
+  const sessionId = 'sess-da-bucket';
+  const toolkit = 'outlook';
+  // The live 6-search loop: one goal (unread count) but each query so divergent it
+  // never clusters — the per-cluster threshold never fires. The per-toolkit total
+  // must catch it. Distinct token sets (Jaccard < 0.3 pairwise).
+  const q = [
+    'list unread messages inbox',
+    'count messages folder',
+    'get folder unread item count metadata',
+    'custom graph api raw http call',
+    'mail folder details inbox properties',
+  ];
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: q[0], sessionId }), null, '1');
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: q[1], sessionId }), null, '2');
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: q[2], sessionId }), null, '3');
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: q[3], sessionId }), null, '4 (<=4 distinct still ok)');
+  const advice = maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: q[4], sessionId });
+  assert.ok(advice && /DISCOVERY LOOP/.test(advice), 'the 5th divergent search on one toolkit fires the per-toolkit total');
+  assert.ok(advice && /NOT converging|different queries/i.test(advice), 'advice names the divergent-thrash shape');
+  assert.ok(advice && advice.includes(toolkit), 'names the toolkit');
+});
+
 test('a list folds into the toolkit find lane (search ×2 then list → fires)', () => {
   const sessionId = 'sess-da-list';
   const toolkit = 'googlesheets';
