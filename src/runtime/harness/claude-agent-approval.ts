@@ -1,4 +1,5 @@
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
+import { createHash } from 'node:crypto';
 import * as approvalRegistry from './approval-registry.js';
 import { isExpired } from './approval-registry.js';
 import { appendEvent } from './eventlog.js';
@@ -131,6 +132,48 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 type Resolution = 'approved' | 'rejected' | 'expired' | 'aborted';
 
+export type ClaudeAgentApprovalBoundaryState = 'pending' | 'rejected' | 'expired' | 'cancelled';
+
+export interface ClaudeAgentApprovalBoundary {
+  approvalId: string;
+  sessionId: string;
+  tool: string;
+  args: Record<string, unknown>;
+  state: ClaudeAgentApprovalBoundaryState;
+}
+
+export interface GatedToolPermissionOptions {
+  /** Default `wait` preserves chat/worker behavior. `park` is workflow-only: the
+   * SDK query is interrupted after the durable exact-payload card is stored. */
+  approvalMode?: 'wait' | 'park';
+  onApprovalBoundary?: (boundary: ClaudeAgentApprovalBoundary) => void;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+      .join(',')}}`;
+  }
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? 'null' : encoded;
+}
+
+/** Opaque and deterministic across daemon restarts; the hash keeps exact send
+ * contents out of the index while binding the grant to every payload field. */
+export function workflowApprovalResumeKey(
+  sessionId: string,
+  tool: string,
+  args: Record<string, unknown>,
+): string {
+  const digest = createHash('sha256')
+    .update(canonicalJson({ sessionId, tool: normalizeToolName(tool), args }))
+    .digest('hex');
+  return `claude-workflow-tool-v1:${digest}`;
+}
+
 async function awaitApproval(approvalId: string, signal?: AbortSignal): Promise<Resolution> {
   const interval = pollMs();
   for (;;) {
@@ -149,7 +192,11 @@ async function awaitApproval(approvalId: string, signal?: AbortSignal): Promise<
  * are the read/local tool names that never need a human (the lane's read-only /
  * local-authoring allowlist); everything else runs the approval decision.
  */
-export function buildGatedToolPermission(sessionId: string, fastAllowTools: string[]): CanUseTool {
+export function buildGatedToolPermission(
+  sessionId: string,
+  fastAllowTools: string[],
+  gateOptions: GatedToolPermissionOptions = {},
+): CanUseTool {
   const fastAllow = new Set(fastAllowTools.map(normalizeToolName).filter(Boolean));
   return (async (toolName, input, options) => {
     const bare = bareToolName(toolName);
@@ -187,6 +234,70 @@ export function buildGatedToolPermission(sessionId: string, fastAllowTools: stri
     let approvalId: string;
     try {
       const subject = approvalSubject(bare, args);
+      if (gateOptions.approvalMode === 'park') {
+        const resumeKey = workflowApprovalResumeKey(sessionId, bare, args);
+        const prior = approvalRegistry.claimResumableApproval(resumeKey);
+        if (prior.state === 'approved') {
+          // Atomic one-shot claim: this exact payload may proceed once. A later
+          // identical call cannot reuse the same human decision.
+          return { behavior: 'allow', updatedInput: args } as PermissionResult;
+        }
+        if (prior.state === 'pending') {
+          gateOptions.onApprovalBoundary?.({
+            approvalId: prior.row.approvalId,
+            sessionId,
+            tool: bare,
+            args,
+            state: 'pending',
+          });
+          return {
+            behavior: 'deny',
+            message: `Approval ${prior.row.approvalId} is pending; the workflow run has been parked.`,
+            interrupt: true,
+          } as PermissionResult;
+        }
+        if (prior.state === 'rejected' || prior.state === 'expired' || prior.state === 'cancelled') {
+          gateOptions.onApprovalBoundary?.({
+            approvalId: prior.row.approvalId,
+            sessionId,
+            tool: bare,
+            args,
+            state: prior.state,
+          });
+          const action = prior.state === 'rejected' ? 'rejected' : prior.state === 'cancelled' ? 'cancelled' : 'expired';
+          return {
+            behavior: 'deny',
+            message: `Approval ${prior.row.approvalId} was ${action}; the exact tool payload was not run.`,
+            interrupt: true,
+          } as PermissionResult;
+        }
+
+        // No prior decision, or the prior one-shot grant was already consumed:
+        // create a fresh exact-payload card. registerResumable is race-safe and
+        // tells us whether this process owns surfacing the card.
+        const registered = approvalRegistry.registerResumable({
+          sessionId,
+          subject,
+          tool: bare,
+          args,
+          resumeKey,
+        });
+        approvalId = registered.row.approvalId;
+        if (registered.created) surfaceApproval(sessionId, approvalId, bare, args, subject);
+        gateOptions.onApprovalBoundary?.({
+          approvalId,
+          sessionId,
+          tool: bare,
+          args,
+          state: 'pending',
+        });
+        return {
+          behavior: 'deny',
+          message: `Approval ${approvalId} is pending; the workflow run has been parked.`,
+          interrupt: true,
+        } as PermissionResult;
+      }
+
       const row = approvalRegistry.register({ sessionId, subject, tool: bare, args });
       approvalId = row.approvalId;
       surfaceApproval(sessionId, approvalId, bare, args, subject);

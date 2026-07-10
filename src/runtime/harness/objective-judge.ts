@@ -89,9 +89,7 @@ export interface ObjectiveJudgeGateInput {
   /** The objective classified as an explicit ACTION ("build/deploy/set up…"). */
   actionIntent: boolean;
   /** Tool calls made across the whole conversation so far. */
-  totalToolCalls: number;
-  /** A turn at/above this many tool calls did substantive multi-step work. */
-  workThreshold: number;
+  meaningfulToolEvidence: boolean;
   /** Independent judge continuations already spent this turn. */
   continuationsUsed: number;
   /** Hard cap on judge continuations. */
@@ -119,12 +117,10 @@ export interface ObjectiveJudgeGateInput {
 /**
  * Whether to run the independent completion judge on a self-declared `done`.
  *
- * Gate on OBSERVED WORK, not phrasing. A turn that fired several tool calls did
- * real multi-step work and is worth verifying — even when the request reads as
- * a "lookup" ("find me the accounts and drop them in a sheet" classifies as
- * lookup but is multi-step action). The intent branch keeps the cheap path for
- * a clearly-phrased ACTION objective. A trivial lookup ("what's on my
- * calendar") stays below the work threshold and is never judged.
+ * The judge is a recovery path for suspicious TEXT, not a second execution
+ * controller. A concrete completion backed by real tool calls already has
+ * durable evidence and must not be bounced into repeating those tools. A
+ * zero-tool ACTION claim still needs proof.
  *
  * PLUS: a PROMISE-SHAPED reply (future-tense intent, no artifact) is always
  * judged even when it looks low-effort — that is the precise turn where the
@@ -139,7 +135,7 @@ export function shouldRunObjectiveJudge(input: ObjectiveJudgeGateInput): boolean
     input.nextAction === 'completed' &&
     !input.openApprovalCard &&
     input.continuationsUsed < input.maxContinuations &&
-    (input.actionIntent || input.totalToolCalls >= input.workThreshold || Boolean(input.promiseShaped))
+    (Boolean(input.promiseShaped) || (input.actionIntent && !input.meaningfulToolEvidence))
   );
 }
 
@@ -665,11 +661,22 @@ const DIRECTION_QUESTION_RE = new RegExp(
   'i',
 );
 
+// A plain-text model reply does not always use ask_user_question. Treat a
+// substantive closing interrogative as the same pause, while excluding the
+// conversational sign-offs that do not carry a decision. This is intentionally
+// domain-neutral: clarification nouns should not require curated regex entries.
+const MATERIAL_CLOSING_QUESTION_RE =
+  /(?:^|[.!]\s+|\n+)(?:which|what|who|where|when|how|is|are|was|were|do|does|did|can|could|would|should|will|shall|may)\b[^?]{0,300}\?\s*$/i;
+const COURTESY_CLOSING_QUESTION_RE =
+  /(?:anything else|something else|(?:what|how) else can i help(?: with)?|does that (?:help|work|make sense)|sound good)\?\s*$/i;
+
 export function isDirectionSeekingQuestion(reply?: string | null): boolean {
   const text = (reply ?? '').trim();
   if (!text || !text.includes('?')) return false;
   // Only the CLOSING move counts — a question answered mid-reply followed by a
   // delivered artifact is not a pause. Inspect the final ~400 chars.
   const tail = text.slice(-400);
-  return DIRECTION_QUESTION_RE.test(tail);
+  if (!/\?[\s"'\u2019)\]*_`]*$/u.test(tail)) return false;
+  if (COURTESY_CLOSING_QUESTION_RE.test(tail)) return false;
+  return DIRECTION_QUESTION_RE.test(tail) || MATERIAL_CLOSING_QUESTION_RE.test(tail);
 }

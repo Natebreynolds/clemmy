@@ -177,6 +177,7 @@ interface RouteMarker {
   model?: unknown;
   modelId?: unknown;
   transport?: unknown;
+  modelRoute?: unknown;
 }
 
 function routeFamily(data: RouteMarker): ServedModelFamily | null {
@@ -197,6 +198,21 @@ export interface SessionRouteEvidence {
   explicitProviderCount: number;
   families: ServedModelFamily[];
   falloverCount: number;
+}
+
+function sessionFalloverCount(home: string, sessionId: string): number {
+  const operationalPath = path.join(home, 'state', 'operational-telemetry.db');
+  if (!existsSync(operationalPath)) return 0;
+  try {
+    const operational = new Database(operationalPath, { readonly: true, fileMustExist: true });
+    const row = operational.prepare(
+      "SELECT COUNT(*) AS count FROM operational_events WHERE session_id = ? AND type = 'model_fallover'",
+    ).get(sessionId) as { count?: number } | undefined;
+    operational.close();
+    return Number(row?.count ?? 0);
+  } catch {
+    return 0;
+  }
 }
 
 /** Route evidence for exactly one proof session. Provider metadata wins over
@@ -221,20 +237,12 @@ export function sessionRouteEvidence(home: string, sessionId: string): SessionRo
     } catch { /* malformed telemetry is missing evidence */ }
   }
 
-  let falloverCount = 0;
-  const operationalPath = path.join(home, 'state', 'operational-telemetry.db');
-  if (existsSync(operationalPath)) {
-    try {
-      const operational = new Database(operationalPath, { readonly: true, fileMustExist: true });
-      const row = operational.prepare(
-        "SELECT COUNT(*) AS count FROM operational_events WHERE session_id = ? AND type = 'model_fallover'",
-      ).get(sessionId) as { count?: number } | undefined;
-      falloverCount = Number(row?.count ?? 0);
-      operational.close();
-    } catch { /* an absent/old telemetry schema contributes no fallover rows */ }
-  }
-
-  return { markerCount: rows.length, explicitProviderCount, families, falloverCount };
+  return {
+    markerCount: rows.length,
+    explicitProviderCount,
+    families,
+    falloverCount: sessionFalloverCount(home, sessionId),
+  };
 }
 
 /** Exact-route proof for a multi-turn scenario. Every expected turn must carry
@@ -263,6 +271,90 @@ export function exactBrainRouteChecks(
     },
     {
       name: 'no same-session model fallover',
+      pass: evidence.falloverCount === 0,
+      detail: `${evidence.falloverCount} model_fallover event(s)`,
+    },
+  ];
+}
+
+export interface WorkflowStepRouteEvidence extends SessionRouteEvidence {
+  transports: string[];
+}
+
+/** Workflow steps use two route markers: normal Codex/BYO harness steps emit
+ * `turn_model_routed`, while the Claude Agent SDK step lane emits
+ * `worker_model_routed` with its normalized route nested under `modelRoute`.
+ * Read both so the release matrix proves the provider and transport that served
+ * this exact step session, rather than accepting an unrelated daemon call. */
+export function workflowStepRouteEvidence(home: string, sessionId: string): WorkflowStepRouteEvidence {
+  const db = openHarnessDb(home);
+  const rows = db.prepare(
+    "SELECT data_json FROM events WHERE session_id = ? AND type IN ('turn_model_routed', 'worker_model_routed') ORDER BY seq ASC",
+  ).all(sessionId) as Array<{ data_json: string }>;
+  db.close();
+
+  let explicitProviderCount = 0;
+  const families: ServedModelFamily[] = [];
+  const transports: string[] = [];
+  for (const row of rows) {
+    try {
+      const outer = JSON.parse(row.data_json) as RouteMarker;
+      const nested = outer.modelRoute && typeof outer.modelRoute === 'object'
+        ? outer.modelRoute as RouteMarker
+        : null;
+      const marker = nested ?? outer;
+      if (marker.provider === 'claude' || marker.provider === 'codex' || marker.provider === 'byo') {
+        explicitProviderCount += 1;
+      }
+      const family = routeFamily(marker);
+      if (family) families.push(family);
+      if (typeof marker.transport === 'string' && marker.transport.trim()) {
+        transports.push(marker.transport.trim());
+      }
+    } catch { /* malformed telemetry is missing evidence */ }
+  }
+
+  return {
+    markerCount: rows.length,
+    explicitProviderCount,
+    families,
+    transports,
+    falloverCount: sessionFalloverCount(home, sessionId),
+  };
+}
+
+/** Exact provider + transport proof for one workflow-step session. */
+export function exactWorkflowStepRouteChecks(
+  home: string,
+  sessionId: string,
+  brain: BrainKind,
+): Check[] {
+  const expectedFamily: ServedModelFamily = brain === 'glm' ? 'byo' : brain;
+  const expectedTransport = brain === 'claude'
+    ? 'claude_agent_sdk_workflow_step'
+    : 'openai_agents_harness';
+  const evidence = workflowStepRouteEvidence(home, sessionId);
+  const families = [...new Set(evidence.families)];
+  const transports = [...new Set(evidence.transports)];
+  const detail = `markers ${evidence.markerCount}, explicit providers ${evidence.explicitProviderCount}, families [${families.join(', ') || 'none'}], transports [${transports.join(', ') || 'none'}]`;
+  return [
+    {
+      name: 'workflow step carries explicit provider identity',
+      pass: evidence.markerCount >= 1 && evidence.explicitProviderCount >= 1,
+      detail,
+    },
+    {
+      name: `workflow step served only by the requested ${expectedFamily} brain`,
+      pass: families.length === 1 && families[0] === expectedFamily,
+      detail,
+    },
+    {
+      name: `workflow step used ${expectedTransport}`,
+      pass: transports.length === 1 && transports[0] === expectedTransport,
+      detail,
+    },
+    {
+      name: 'no workflow-step model fallover',
       pass: evidence.falloverCount === 0,
       detail: `${evidence.falloverCount} model_fallover event(s)`,
     },

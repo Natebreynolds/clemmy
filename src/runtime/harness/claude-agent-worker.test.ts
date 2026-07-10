@@ -32,6 +32,10 @@ beforeEach(() => {
   setClaudeAgentSdkWorkerRunForTest(null);
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS;
+  delete process.env.MODEL_ROUTING_MODE;
+  delete process.env.BYO_MODEL_BASE_URL;
+  delete process.env.BYO_MODEL_API_KEY;
+  delete process.env.BYO_MODEL_ID;
 });
 
 after(() => {
@@ -54,6 +58,14 @@ test('claudeAgentSdkWorkerEnabled defaults on for Claude models and is kill-swit
   assert.equal(claudeAgentSdkWorkerEnabled('gpt-5.4'), false);
   process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKER = 'off';
   assert.equal(claudeAgentSdkWorkerEnabled('claude-sonnet-4-6'), false);
+});
+
+test('Claude-shaped all_in BYO model does not enter the Claude SDK worker lane', () => {
+  process.env.MODEL_ROUTING_MODE = 'all_in';
+  process.env.BYO_MODEL_BASE_URL = 'https://byo.example.test/v1';
+  process.env.BYO_MODEL_API_KEY = 'byo-key';
+  process.env.BYO_MODEL_ID = 'claude-custom';
+  assert.equal(claudeAgentSdkWorkerEnabled('claude-custom'), false);
 });
 
 test('renderClaudeAgentWorkerSystemAppend tells Claude to use named skills and stay read-only', () => {

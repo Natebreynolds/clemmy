@@ -246,7 +246,7 @@ export interface RunAgent {
   workflowName?: string;
   stepId?: string;
   role?: string;
-  provider: 'claude' | 'codex' | 'glm' | 'unknown';
+  provider: 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
   model?: string;
   task: string;
   status: 'ok' | 'error' | 'capped';

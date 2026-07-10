@@ -5,6 +5,7 @@ import {
   __test__,
   filterSuppressedConnectedToolkits,
   getPreferredUserId,
+  listConnectedToolkits,
   listSuppressedConnectedToolkitViews,
   pickToolkitConnection,
 } from './client.js';
@@ -42,6 +43,54 @@ test('getPreferredUserId honors a real explicit COMPOSIO_USER_ID (short-circuits
   } finally {
     if (prev === undefined) delete process.env.COMPOSIO_USER_ID;
     else process.env.COMPOSIO_USER_ID = prev;
+  }
+});
+
+function account(id: string, slug: string, userId: string, status = 'ACTIVE') {
+  return { id, toolkit: { slug }, user_id: userId, status };
+}
+
+test('connected-account snapshot feeds preferred user and connection routing with one fetch', async () => {
+  const prev = process.env.COMPOSIO_USER_ID;
+  delete process.env.COMPOSIO_USER_ID;
+  let calls = 0;
+  __test__.setConnectedAccountsLoader(async () => {
+    calls += 1;
+    return [
+      account('ca_outlook', 'outlook', 'user-main'),
+      account('ca_drive', 'googledrive', 'user-main'),
+      account('ca_old', 'gmail', 'user-old', 'EXPIRED'),
+    ];
+  });
+  try {
+    assert.equal(await getPreferredUserId({ requireFresh: true }), 'user-main');
+    assert.deepEqual((await listConnectedToolkits({ requireFresh: true })).map((row) => row.connectionId), [
+      'ca_outlook',
+      'ca_drive',
+      'ca_old',
+    ]);
+    assert.equal(calls, 1, 'preferred user and connection routing share one snapshot');
+  } finally {
+    __test__.setConnectedAccountsLoader(null);
+    if (prev === undefined) delete process.env.COMPOSIO_USER_ID;
+    else process.env.COMPOSIO_USER_ID = prev;
+  }
+});
+
+test('cache invalidation rejects a late old-account refresh and preserves the new generation', async () => {
+  let resolveOld!: (items: Array<Record<string, unknown>>) => void;
+  const oldItems = new Promise<Array<Record<string, unknown>>>((resolve) => { resolveOld = resolve; });
+  __test__.setConnectedAccountsLoader(() => oldItems);
+  const oldRefresh = listConnectedToolkits({ requireFresh: true });
+
+  __test__.setConnectedAccountsLoader(async () => [account('ca_new', 'outlook', 'user-new')]);
+  try {
+    assert.deepEqual((await listConnectedToolkits({ requireFresh: true })).map((row) => row.connectionId), ['ca_new']);
+    resolveOld([account('ca_old', 'outlook', 'user-old')]);
+    await assert.rejects(oldRefresh, /account state changed during refresh/i);
+    assert.deepEqual((await listConnectedToolkits({ requireFresh: true })).map((row) => row.connectionId), ['ca_new']);
+  } finally {
+    __test__.setConnectedAccountsLoader(null);
   }
 });
 

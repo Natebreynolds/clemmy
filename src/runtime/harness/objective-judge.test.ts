@@ -12,29 +12,27 @@ const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJud
 const baseGate = {
   optIn: true,
   actionIntent: false,
-  totalToolCalls: 0,
-  workThreshold: 3,
+  meaningfulToolEvidence: false,
   continuationsUsed: 0,
   maxContinuations: 3,
   nextAction: 'completed',
 };
 
-test('gate: fires for an explicit ACTION intent even with few tool calls', () => {
-  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true, totalToolCalls: 0 }), true);
+test('gate: fires for an explicit ACTION intent without meaningful evidence', () => {
+  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true }), true);
 });
 
-test('gate: fires for a LOOKUP-classified turn that did real work (≥ threshold tool calls)', () => {
-  // "find me the accounts and drop them in a sheet" classifies as lookup but is
-  // multi-step action — many tool calls. This is the bug the run exposed.
-  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, totalToolCalls: 7 }), true);
+test('gate: skips concrete successful tool-backed completions instead of re-running work', () => {
+  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true, meaningfulToolEvidence: true }), false);
+  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, meaningfulToolEvidence: true }), false);
 });
 
-test('gate: does NOT fire for a trivial lookup (few tool calls, non-action)', () => {
-  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, totalToolCalls: 2 }), false);
+test('gate: does NOT fire for a trivial non-action lookup', () => {
+  assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: false }), false);
 });
 
 test('gate: does NOT fire when the caller did not opt in', () => {
-  assert.equal(shouldRunObjectiveJudge({ ...baseGate, optIn: false, actionIntent: true, totalToolCalls: 9 }), false);
+  assert.equal(shouldRunObjectiveJudge({ ...baseGate, optIn: false, actionIntent: true }), false);
 });
 
 test('gate: does NOT fire once the continuation budget is exhausted', () => {
@@ -50,12 +48,12 @@ test('gate: does NOT fire when nextAction is not completed (e.g. awaiting approv
 test('gate: FIRES for a promise-shaped reply even when it looks low-effort (the incident)', () => {
   // The exact shape that slipped through: non-action intent, 1 tool call, done.
   assert.equal(
-    shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, totalToolCalls: 1, promiseShaped: true }),
+    shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, meaningfulToolEvidence: true, promiseShaped: true }),
     true,
   );
   // Without the promise signal, the same low-effort turn is NOT judged (unchanged).
   assert.equal(
-    shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, totalToolCalls: 1, promiseShaped: false }),
+    shouldRunObjectiveJudge({ ...baseGate, actionIntent: false, meaningfulToolEvidence: true, promiseShaped: false }),
     false,
   );
 });
@@ -317,10 +315,15 @@ test('isDirectionSeekingQuestion: catches the sess-mrds80fu approval question; i
   ), true);
   assert.equal(isDirectionSeekingQuestion('Should I send these to the full list or just the top 10?'), true);
   assert.equal(isDirectionSeekingQuestion('Which account should I use for the export?'), true);
+  assert.equal(isDirectionSeekingQuestion('Which audience should this rollout brief target?'), true);
+  assert.equal(isDirectionSeekingQuestion('Where should I save the finished brief?'), true);
+  assert.equal(isDirectionSeekingQuestion('Is this intended for engineers or executives?'), true);
   assert.equal(isDirectionSeekingQuestion('The report is ready at /tmp/report.md. OK to publish it to the site?'), true);
   // NOT direction-seeking: statements, rhetorical/polite tails, no question mark.
   assert.equal(isDirectionSeekingQuestion('Done — report saved to /tmp/report.md.'), false);
   assert.equal(isDirectionSeekingQuestion('Done — report saved. Anything else?'), false);
+  assert.equal(isDirectionSeekingQuestion('Done — report saved. Does that help?'), false);
+  assert.equal(isDirectionSeekingQuestion('Should I publish it? I will wait for your approval.'), false);
   assert.equal(isDirectionSeekingQuestion('I sent the 10 emails.'), false);
   assert.equal(isDirectionSeekingQuestion(''), false);
   assert.equal(isDirectionSeekingQuestion(null), false);

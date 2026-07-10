@@ -703,6 +703,9 @@ export class RecallBudget {
 export interface HarnessRunContext {
   sessionId: string;
   counter: ToolCallsCounter;
+  /** One active model/tool run; loop/discovery counters key here so a long-lived
+   * chat session does not accumulate unrelated calls across user turns. */
+  behaviorScopeId?: string;
   /** Inc A2 — set once per runTurn after the mid-step background-offer nudge has
    *  been evaluated, so a long grind nudges AT MOST once per step (the context is
    *  rebuilt per Runner.run, so this naturally resets each runTurn). */
@@ -1228,7 +1231,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
     let fanoutNudge: string | undefined;
     let cacheNudge: string | undefined;
     try {
-      const rawDecision = evaluateToolCall(ctx.guardrailScopeId ?? ctx.sessionId, tool.name, parsedInput, callId);
+      const rawDecision = evaluateToolCall(
+        ctx.guardrailScopeId ?? ctx.behaviorScopeId ?? ctx.sessionId,
+        tool.name,
+        parsedInput,
+        callId,
+      );
       const decision = applyMode(rawDecision);
       // Fan-out nudge: only steer the ORCHESTRATOR's own context toward
       // run_worker — inside a worker scope (guardrailScopeId set) the nudge

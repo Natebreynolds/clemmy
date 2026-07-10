@@ -21,7 +21,10 @@ import { resolveMcpToolScope } from '../mcp-tool-scope.js';
 import { pinnedCalendarRuleLabels } from './constraint-guard.js';
 import type { ManagedMcpServer } from '../../types.js';
 import { buildClaudeHeadlessEnv, claudeCliModelArg, resolveClaudeCliPath } from './claude-headless-model.js';
-import { buildGatedToolPermission } from './claude-agent-approval.js';
+import {
+  buildGatedToolPermission,
+  type ClaudeAgentApprovalBoundary,
+} from './claude-agent-approval.js';
 import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
@@ -29,6 +32,11 @@ import { appendEvent, writeToolOutput } from './eventlog.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 import { createClementineMcpServer } from '../../tools/mcp-server.js';
+import {
+  isTerminalToolName,
+  terminalToolShouldHalt,
+} from './terminal-tool.js';
+import { completionEvidenceToolName, toolOutputLooksSuccessful } from './tool-evidence.js';
 import { externalMcpScopeFromResolvedTools } from '../../agents/external-mcp-scope-lock.js';
 import { recordHarnessCapabilityHealth } from './capability-health.js';
 
@@ -86,6 +94,17 @@ export class ClaudeSdkContextOverflowError extends Error {
   constructor(message: string, readonly committed: boolean) {
     super(message);
     this.name = 'ClaudeSdkContextOverflowError';
+  }
+}
+
+/** Workflow-only control boundary. The SDK query has already been interrupted
+ * and closed; the workflow runner converts `pending` into ParkRunSignal, while
+ * rejected/expired/cancelled decisions fail the step loudly. */
+export class ClaudeAgentSdkApprovalBoundaryError extends Error {
+  constructor(readonly boundary: ClaudeAgentApprovalBoundary) {
+    const action = boundary.state === 'pending' ? 'is pending' : `was ${boundary.state}`;
+    super(`Approval ${boundary.approvalId} ${action} for exact tool payload ${boundary.tool}.`);
+    this.name = 'ClaudeAgentSdkApprovalBoundaryError';
   }
 }
 
@@ -277,7 +296,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   sessionId?: string,
   gatedMutations = false,
   mcpToolAllowlist?: string[],
-  attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string },
+  attribution?: { workflowRunId?: string; workflowName?: string; stepId?: string; runScopeId?: string },
 ): Record<string, McpServerConfig> {
   const distEntry = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
   const srcEntry = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
@@ -296,6 +315,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
         name: 'clementine-local',
         instance: createClementineMcpServer({
           sessionId,
+          runScopeId: attribution?.runScopeId,
           gatedMutations,
           allowedTools: allowlist,
           workflowRunId: attribution?.workflowRunId,
@@ -308,6 +328,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   const env = mergedSpawnEnv({
     CLEMENTINE_HOME: BASE_DIR,
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
+    ...(attribution?.runScopeId?.trim() ? { CLEMENTINE_MCP_RUN_SCOPE_ID: attribution.runScopeId.trim() } : {}),
     ...(gatedMutations ? { CLEMENTINE_MCP_GATED_MUTATIONS: 'on' } : {}),
     ...(allowlist.length > 0 ? { CLEMENTINE_MCP_ALLOWED_TOOLS: allowlist.join(',') } : {}),
     ...(attribution?.workflowRunId?.trim() ? { CLEMENTINE_MCP_WORKFLOW_RUN_ID: attribution.workflowRunId.trim() } : {}),
@@ -738,6 +759,9 @@ export interface ClaudeAgentSdkRunOptions {
    * (sdkWallClockMs, 15 min, kill-switchable); 0 disables.
    */
   maxWallClockMs?: number;
+  /** Workflow-only. Interrupt and return control to the durable workflow park
+   * machinery instead of keeping query()/the MCP child alive while a human waits. */
+  approvalMode?: 'wait' | 'park';
   /** Caller-driven cancellation hook (background task cancel/deadline). */
   shouldCancel?: () => boolean | Promise<boolean>;
 }
@@ -748,6 +772,7 @@ export interface ClaudeAgentSdkRunResult {
   sessionId?: string;
   model?: string;
   toolUses: string[];
+  successfulToolUses?: string[];
   usage?: unknown;
   modelUsage?: unknown;
   /** True when the run stopped because it hit the turn budget (error_max_turns)
@@ -800,10 +825,8 @@ function bareMcpToolName(rawName: string): string {
   return rawName.split('__').at(-1) ?? rawName;
 }
 
-const TERMINAL_AFTER_TOOL_NAMES = new Set(['dispatch_background_task', 'ask_user_question']);
-
 function isTerminalAfterTool(rawName: string | null | undefined): boolean {
-  return typeof rawName === 'string' && TERMINAL_AFTER_TOOL_NAMES.has(bareMcpToolName(rawName));
+  return isTerminalToolName(rawName);
 }
 
 function renderTerminalToolReply(rawName: string, input: unknown, output: string): string {
@@ -828,17 +851,6 @@ function renderTerminalToolReply(rawName: string, input: unknown, output: string
 
 function terminalToolStoppedReason(rawName: string): RunStoppedReason | undefined {
   return bareMcpToolName(rawName) === 'ask_user_question' ? 'awaiting-input' : undefined;
-}
-
-function terminalToolShouldHalt(rawName: string, output: string): boolean {
-  const bare = bareMcpToolName(rawName);
-  if (bare !== 'ask_user_question') return true;
-  // ask_user_question can be intentionally non-halting in YOLO when the model
-  // only asked for sign-off on work already authorized. The tool result is the
-  // authoritative signal: it says NOT pausing and instructs the model to proceed.
-  // In that case the SDK run must keep going; otherwise Claude would strand a
-  // standing-approval turn as if it needed user input.
-  return !/NOT pausing|standing approval|not waiting/i.test(output);
 }
 
 function reflectionToolName(rawName: string | null, input: unknown): string | null {
@@ -980,6 +992,7 @@ function recordClaudeAgentSdkUsage(
     const totals = usageTotalsFromResult(result);
     if (!totals) return;
     const responseId = (result as { uuid?: unknown } | null)?.uuid;
+    const providerApiDurationMs = (result as { duration_api_ms?: unknown } | null)?.duration_api_ms;
     const contextWindowTokens = contextWindowFromResult(result);
     recordModelUsage({
       sessionId: options.sessionId?.trim() || result?.session_id || init?.session_id || 'unknown',
@@ -989,6 +1002,7 @@ function recordClaudeAgentSdkUsage(
       outputTokens: totals.outputTokens,
       totalTokens: totals.totalTokens,
       durationMs: numeric((result as { duration_ms?: unknown } | null)?.duration_ms),
+      ...(typeof providerApiDurationMs === 'number' && Number.isFinite(providerApiDurationMs) ? { providerApiDurationMs } : {}),
       responseId: typeof responseId === 'string' ? responseId : undefined,
       ...(timing && timing.firstByteMs !== null ? { firstByteMs: timing.firstByteMs } : {}),
       ...(contextWindowTokens
@@ -1113,17 +1127,24 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Anti-thrash bounding (Phase 2): a per-turn call ceiling that INTERRUPTS the
   // SDK turn, shared with the run loop so a self-stop reads as a graceful limit.
   const ceilingState: ToolCeilingState = { total: 0, mutating: 0, stopped: null, stoppedKind: null, pausedMs: 0 };
+  let approvalBoundary: ClaudeAgentApprovalBoundary | null = null;
   // Agentic: the async approval gate (read/local fast-allow, everything else
   // → decideToolApproval → register/surface/await). permissionMode 'default'
   // so non-allowlisted tools reach canUseTool. Non-agentic: deny-only allowlist.
   const baseCanUseTool = agentic
-    ? buildGatedToolPermission(options.sessionId as string, allowed)
+    ? buildGatedToolPermission(options.sessionId as string, allowed, {
+        approvalMode: options.approvalMode,
+        onApprovalBoundary: (boundary) => { approvalBoundary = boundary; },
+      })
     : buildAllowOnlyToolsPermission(allowed);
   // ALWAYS wrap (even with the ceiling off) so approval-wait time is metered into
   // pausedMs for the wall-clock; the ceiling COUNTING is what the flag gates.
   const canUseTool = withToolCeiling(baseCanUseTool, allowed, ceilingState, { countCeiling: sdkToolCeilingEnabled() });
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
   const localMcpToolAllowlist = options.mcpToolAllowlist ?? (agentic ? undefined : allowed);
+  const runScopeId = options.sessionId?.trim()
+    ? `${options.sessionId.trim()}::claude:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`
+    : undefined;
   const sdkOptions: ClaudeAgentOptions = {
     env,
     ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
@@ -1138,6 +1159,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         workflowRunId: options.workflowRunId,
         workflowName: options.workflowName,
         stepId: options.stepId,
+        runScopeId,
       }),
       // Native external MCP servers (scoped by intent), ONLY in agentic mode — the
       // canUseTool gate then covers every native call. Gives the Claude brain parity
@@ -1196,6 +1218,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   let result: SDKResultMessage | null = null;
   let init: SDKSystemMessage | null = null;
   let toolUses: string[] = [];
+  let successfulToolUses: string[] = [];
   const toolCallLedger: Array<{ callId: string; name: string; argsPreview: string }> = [];
   // WS5-L2: child-process spawn → first stream message. THE cold-start metric —
   // the SDK spawns a fresh `claude` process per query(), and this is the only
@@ -1243,6 +1266,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     result = null;
     init = null;
     toolUses = [];
+    successfulToolUses = [];
     toolCallLedger.length = 0;
     firstByteMs = null;
     lastAssistantText = '';
@@ -1251,6 +1275,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     threwTurnLimit = false;
     terminalToolReply = null;
     terminalToolReason = undefined;
+    approvalBoundary = null;
     // Fresh per attempt: an overload retry re-runs the turn from scratch (and only
     // happens pre-commit, so these are ~0 anyway), but reset for correctness.
     ceilingState.total = 0;
@@ -1350,6 +1375,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               })()
             : {};
           emitSdkToolCallEvent(options.sessionId, tr.isError ? 'tool_call_failed' : 'tool_call_completed', tr.callId, source?.name, failExtra);
+          if (source?.name && !tr.isError && toolOutputLooksSuccessful(tr.output)) {
+            successfulToolUses.push(completionEvidenceToolName(source.name, source.input));
+          }
           // Activity-strip lifecycle: claude-agent-approval emits 'tool_called' for
           // EVERY tool on this lane, but nothing here closes the loop (the @openai/agents
           // onToolEnd hook doesn't run on the SDK lane), so the console strip spun
@@ -1402,7 +1430,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       // Our OWN interrupt (tool ceiling / wall-clock) may surface as a thrown
       // stream error rather than a clean result — it's a graceful self-stop, not
       // a crash. Route it to the limitHit path below (handled after finally).
-      if (ceilingState.stopped !== null) {
+      if (approvalBoundary !== null) {
+        // Expected workflow park/rejection interrupt. The typed boundary is
+        // thrown after the stream closes below, so provider retries/fallover
+        // can never replay an approval-bearing action.
+      } else if (ceilingState.stopped !== null) {
         threwTurnLimit = true;
       } else if (/maximum number of turns|error_max_turns|max[_ ]turns/i.test(msg) && result?.subtype !== 'success') {
         threwTurnLimit = true;
@@ -1454,6 +1486,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // copy so the user sees WHY Clem held off.
   const partialLimitText = (): string => ceilingState.stopped ?? bestLimitHitText(lastAssistantText, streamedText);
 
+  const exactApprovalBoundary = approvalBoundary as ClaudeAgentApprovalBoundary | null;
+  if (exactApprovalBoundary) {
+    throw new ClaudeAgentSdkApprovalBoundaryError(exactApprovalBoundary);
+  }
+
   if (terminalToolReply) {
     recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
     return {
@@ -1461,6 +1498,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       sessionId: result?.session_id ?? init?.session_id,
       model: init?.model,
       toolUses,
+      successfulToolUses,
       toolCallLedger,
       usage: result?.usage,
       modelUsage: result?.modelUsage,
@@ -1476,6 +1514,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       sessionId: result?.session_id ?? init?.session_id,
       model: init?.model,
       toolUses,
+      successfulToolUses,
       toolCallLedger,
       usage: result?.usage,
       modelUsage: result?.modelUsage,
@@ -1497,6 +1536,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         sessionId: result.session_id,
         model: init?.model,
         toolUses,
+        successfulToolUses,
         toolCallLedger,
         usage: result.usage,
         modelUsage: result.modelUsage,
@@ -1530,6 +1570,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     sessionId: result.session_id,
     model: init?.model,
     toolUses,
+    successfulToolUses,
     toolCallLedger,
     usage: result.usage,
     modelUsage: result.modelUsage,

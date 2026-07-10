@@ -107,14 +107,15 @@ test('harness context prefers per-session working-memory checkpoints over global
   assert.match(context, /Recovered 12 prospects/);
 });
 
-test('Autonomy section: YOLO tells the model it has STANDING approval and not to seek sign-off', () => {
+test('Autonomy section: YOLO auto-runs reversible work but preserves one irreversible-action gate', () => {
   saveProactivityPolicy({ autoApproveScope: 'yolo' });
   try {
     const context = renderHarnessMemoryContext();
     assert.match(context, /## Autonomy/);
-    assert.match(context, /STANDING APPROVAL/);
-    assert.match(context, /do NOT use ask_user_question to get sign-off/i);
-    assert.match(context, /request_approval \(it auto-approves/);
+    assert.match(context, /STANDING APPROVAL for reversible work/);
+    assert.match(context, /do NOT use ask_user_question to seek sign-off/i);
+    assert.match(context, /Irreversible external sends\/posts\/calls and destructive actions remain exceptions/);
+    assert.match(context, /one approval card own the pause/);
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
   }

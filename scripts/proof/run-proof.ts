@@ -16,7 +16,7 @@ import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { planBrain, provisionDaemon } from './provision.js';
-import { exactBrainRouteChecks, openHarnessDb, summarizeAllSessions } from './score.js';
+import { exactBrainRouteChecks, exactWorkflowStepRouteChecks, openHarnessDb, summarizeAllSessions } from './score.js';
 import { fanoutMultiItem } from './scenarios/fanout-multi-item.js';
 import { continuityRecall } from './scenarios/continuity-recall.js';
 import { longToolSelfCorrect } from './scenarios/long-tool-self-correct.js';
@@ -165,6 +165,9 @@ async function main(): Promise<void> {
         if (scenario.routeExpectation === 'exact-brain') {
           if (result.sessionId) checks.push(...exactBrainRouteChecks(daemon.home, result.sessionId, brainKind, result.latency.length));
           else checks.push({ name: 'exact route has a scenario session id', pass: false, detail: 'scenario returned no sessionId' });
+        } else if (scenario.routeExpectation === 'exact-workflow-step') {
+          if (result.sessionId) checks.push(...exactWorkflowStepRouteChecks(daemon.home, result.sessionId, brainKind));
+          else checks.push({ name: 'exact workflow route has a step session id', pass: false, detail: 'scenario returned no sessionId' });
         }
         const failed = checks.some((c) => !c.pass);
         anyFailed ||= failed;

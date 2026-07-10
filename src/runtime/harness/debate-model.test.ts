@@ -128,13 +128,13 @@ test('boundary judge default-off binds a concrete same-family wire and disables 
     MODEL_ROUTING_MODE: 'all_in',
     BYO_MODEL_BASE_URL: 'https://api.z.ai/v1',
     BYO_MODEL_API_KEY: 'zai-key',
-    BYO_MODEL_ID: 'glm-5.2',
-    BYO_MODEL_JUDGE_ID: 'glm-judge',
+    BYO_MODEL_ID: 'gpt-4o',
+    BYO_MODEL_JUDGE_ID: 'gpt-4o-mini',
   }, () => {
     const route = resolveBoundaryJudge();
     assert.equal(route.judgeFamily, 'byo');
     assert.equal(route.brainFamily, 'byo');
-    assert.equal(route.modelId, 'glm-judge');
+    assert.equal(route.modelId, 'gpt-4o-mini');
     assert.equal(route.transport, 'byo_openai_compatible');
     assert.ok(route.model, 'the configured BYO model is bound directly');
     assert.equal(resolveBoundaryJudgeHedge(route), null);

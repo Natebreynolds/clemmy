@@ -67,13 +67,16 @@ export const clarifyThenExecute: ScenarioDef = {
   routeExpectation: 'exact-brain',
   async run(daemon: DaemonHandle) {
     const sessionId = `proof-converge-${Date.now().toString(36)}`;
-    const target = path.join(daemon.home, 'proof', 'clarify-then-execute.md');
+    const relativeTarget = path.join('proof', 'clarify-then-execute.md');
+    const target = path.join(daemon.home, relativeTarget);
     mkdirSync(path.dirname(target), { recursive: true });
 
     const turn1 = await daemon.chat(
-      `Prepare a rollout brief at the exact local path ${JSON.stringify(target)} for the fictional Zephyr service. `
+      `Prepare a rollout brief at the exact workspace-relative local path ${JSON.stringify(relativeTarget)} for the fictional Zephyr service. `
       + 'Once the audience is known, use write_file and verify the saved contents. The file must contain an exact '
-      + 'AUDIENCE=<UPPERCASE_AUDIENCE> marker and sections headed Rollout, Rollback, and Verification. '
+      + 'AUDIENCE=<UPPERCASE_AUDIENCE> marker and sections headed Rollout, Rollback, and Verification. Uppercase the '
+      + 'literal audience answer by changing letter case only; do not rewrite, singularize, or substitute it '
+      + '(for example, Customers. becomes AUDIENCE=CUSTOMERS). '
       + 'The intended audience is the only unresolved choice. Before writing anything, ask me only which audience it should target. '
       + 'Do not create or modify the file until I answer; after my answer, execute the saved brief without another question or a background offer.',
       sessionId,
@@ -88,7 +91,7 @@ export const clarifyThenExecute: ScenarioDef = {
     const artifactExistedAfterTurn1 = existsSync(target);
 
     const turn2 = await daemon.chat(
-      'Engineers.',
+      'Engineers',
       sessionId,
       420_000,
     );

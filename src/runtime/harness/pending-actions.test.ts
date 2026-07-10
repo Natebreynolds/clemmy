@@ -69,6 +69,27 @@ test('approval and result transitions update status without losing history', () 
   assert.ok((done?.history.length ?? 0) >= 4);
 });
 
+test('human approval provenance cannot be downgraded by later policy bookkeeping', () => {
+  const record = pending.queuePendingAction({
+    title: 'Send approved proof',
+    summary: 'Send after a real card decision.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+  });
+
+  pending.markPendingActionApprovalResolved(record.id, 'approved', 'apr-human');
+  pending.markPendingActionApprovalResolved(record.id, 'approved', null, {
+    by: 'policy',
+    evidence: { kind: 'policy', scope: 'yolo' },
+  });
+
+  const approved = pending.getPendingAction(record.id);
+  assert.equal(approved?.approvedBy, 'human');
+  assert.deepEqual(approved?.approvalEvidence, { kind: 'card', approvalId: 'apr-human' });
+  assert.equal(approved?.approvalId, 'apr-human');
+});
+
 test('parsePendingActionPayloadJson rejects malformed JSON with a corrective message', () => {
   assert.throws(
     () => pending.parsePendingActionPayloadJson('{bad json'),

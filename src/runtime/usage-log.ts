@@ -50,6 +50,9 @@ export interface UsageEvent {
   totalTokens: number;
   /** Wall-clock duration of the API call, in ms. Helpful for latency vs cost tradeoffs. */
   durationMs?: number;
+  /** Provider-reported time spent in remote API calls, in ms. This is a subset
+   *  of durationMs when the provider exposes both values (currently Claude SDK). */
+  providerApiDurationMs?: number;
   /** Optional response ID for cross-reference with provider logs. */
   responseId?: string;
   /** Approx token share of the assembled prompt by component (instructions =
@@ -125,6 +128,7 @@ export function recordModelUsage(args: {
   reasoningTokens?: number;
   totalTokens?: number;
   durationMs?: number;
+  providerApiDurationMs?: number;
   responseId?: string;
   promptComponents?: Record<string, number>;
   /** Context-window health (Claude SDK lane): how close this call ran to the
@@ -146,6 +150,7 @@ export function recordModelUsage(args: {
     reasoningTokens: args.reasoningTokens,
     totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
     durationMs: args.durationMs,
+    providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
     promptComponents: args.promptComponents,
     contextWindowTokens: args.contextWindowTokens,
@@ -175,6 +180,7 @@ export function recordModelUsage(args: {
       reasoningTokens: event.reasoningTokens,
       totalTokens: event.totalTokens,
       durationMs: event.durationMs,
+      providerApiDurationMs: event.providerApiDurationMs,
       responseId: event.responseId,
       runId: event.runId,
       stepId: event.stepId,

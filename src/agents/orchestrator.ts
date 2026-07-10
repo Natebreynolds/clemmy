@@ -41,8 +41,8 @@ import { workerItemAlreadyCapped } from './worker-respawn-guard.js';
 import { acquireWorkerSlot } from './worker-concurrency.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
-import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { recordSubagentRun, providerClassForModel } from './subagent-runs.js';
+import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
+import { recordSubagentRun } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   harnessInputGuardrails,
@@ -53,6 +53,11 @@ import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime
 import { ClaudeSdkProviderOverloadError } from '../runtime/harness/claude-agent-sdk.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
 import { resolveEffectiveToolPolicy } from '../runtime/harness/tool-policy.js';
+import {
+  bareTerminalToolName,
+  formatAutoResolvedAskUserQuestionOutput,
+  terminalToolShouldHalt,
+} from '../runtime/harness/terminal-tool.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -203,6 +208,35 @@ export const orchestratorInternalsForTest = {
   workerIntentRoutingEnabled,
 };
 
+type OrchestratorToolResult = {
+  type: string;
+  tool: { name?: string };
+  output?: unknown;
+};
+
+function stringifyToolOutput(output: unknown): string {
+  if (typeof output === 'string') return output;
+  try { return JSON.stringify(output); } catch { return String(output ?? ''); }
+}
+
+/** End a provider turn only after a real user-choice pause. Approval-shaped
+ * YOLO asks explicitly return a non-halting result and must run the model again. */
+export function userChoiceToolUseBehavior(
+  _context: unknown,
+  toolResults: OrchestratorToolResult[],
+) {
+  for (const result of toolResults) {
+    if (result.type !== 'function_output') continue;
+    const rawName = result.tool.name ?? '';
+    const bare = bareTerminalToolName(rawName);
+    if (bare !== 'ask_user_question' && bare !== 'offer_background') continue;
+    const output = stringifyToolOutput(result.output);
+    if (!terminalToolShouldHalt(rawName, output)) continue;
+    return { isFinalOutput: true as const, isInterrupted: undefined, finalOutput: output };
+  }
+  return { isFinalOutput: false as const, isInterrupted: undefined };
+}
+
 function extractSessionId(runContext: unknown): string | undefined {
   if (!runContext || typeof runContext !== 'object') return undefined;
   const ctx = (runContext as { context?: { sessionId?: unknown } }).context;
@@ -298,22 +332,17 @@ function isYoloAutoApprovalPolicy(): boolean {
   }
 }
 
-const SEND_CLASS_TEXT_RE = /\b(send|sending|sends|email|emails|e-mail|sms|text message|post|posting|publish|tweet|dm)\b/i;
+const IRREVERSIBLE_ACTION_TEXT_RE = /\b(send|sending|sent|post|posting|publish|publishing|tweet|tweeting|dm|sms|text message|call|calling|dial)\b/i;
 
 /**
- * YOLO must NOT auto-approve a BATCH of irreversible external sends
- * (2026-07-09, sess-mrds80fu: "Auto-approved by YOLO mode: Send market-leader
- * reactivation emails 1-10" put 10 unapproved emails on the wire). Detection
- * anchors on the queued pending action when one exists (kind external_send +
- * its plan's item count); otherwise falls back to send-vocabulary + an item
- * count parsed from the subject ("emails 1-10", "10 emails"). Single or
- * uncounted sends keep the YOLO contract unchanged.
+ * YOLO covers reversible work, never irreversible sends or destructive actions.
+ * Anchor on the queued payload when available; fall back to explicit action
+ * wording for legacy callers that have not queued a payload yet.
  */
-export const _yoloBlockedForSendBatchForTests = (args: RequestApprovalArgs): Promise<boolean> => yoloBlockedForSendBatch(args);
+export const _requestApprovalRequiresHumanForTests = (args: RequestApprovalArgs): Promise<boolean> => requestApprovalRequiresHuman(args);
 
-async function yoloBlockedForSendBatch(args: RequestApprovalArgs): Promise<boolean> {
-  const { sendBatchApprovalFloor } = await import('./proactivity-policy.js');
-  const floor = sendBatchApprovalFloor();
+async function requestApprovalRequiresHuman(args: RequestApprovalArgs): Promise<boolean> {
+  if (args.destructive) return true;
   const id = args.pendingActionId?.trim();
   if (id) {
     try {
@@ -328,21 +357,12 @@ async function yoloBlockedForSendBatch(args: RequestApprovalArgs): Promise<boole
         const payload = record.payload as { items?: unknown[]; composioSlug?: string } | undefined;
         const slugIrreversible = typeof payload?.composioSlug === 'string'
           && isIrreversibleSendSlug(payload.composioSlug);
-        if (record.kind !== 'external_send' && !slugIrreversible) return false;
-        // Unknown count on a queued SEND batch → conservative: require a human.
-        return !Array.isArray(payload?.items) || payload.items.length >= floor;
+        return record.kind === 'external_send' || slugIrreversible;
       }
     } catch { return true; /* fail-closed on the safety path */ }
   }
   const text = `${args.subject} ${args.reason ?? ''}`;
-  if (!SEND_CLASS_TEXT_RE.test(text)) return false;
-  // Count only numbers that plausibly denote batch size: an explicit range
-  // ("emails 1-10") or a number adjacent to a send-noun ("25 outreach emails").
-  // A bare number ("July 10 newsletter") must not block a single daily send.
-  const range = /(\d{1,4})\s*[-–]\s*(\d{1,4})/.exec(text);
-  const counted = /\b(\d{1,4})\s+(?:[a-z-]+\s+){0,2}?(?:emails?|e-mails?|messages?|recipients?|contacts?|prospects?|sends?|posts?|dms?|sms)\b/i.exec(text);
-  const count = range ? Math.abs(Number(range[2]) - Number(range[1])) + 1 : counted ? Number(counted[1]) : undefined;
-  return typeof count === 'number' && Number.isFinite(count) && count >= floor;
+  return IRREVERSIBLE_ACTION_TEXT_RE.test(text);
 }
 
 // Code-level backstop for the v0.5.59 context fix: in YOLO, ask_user_question is
@@ -419,21 +439,17 @@ async function openRequestApprovalScope(args: RequestApprovalArgs, runContext: u
   return allowedComposioSlugs;
 }
 
-async function markPendingActionApprovedFromRequest(args: RequestApprovalArgs): Promise<string> {
+async function pendingActionExecutionInstructions(args: RequestApprovalArgs): Promise<string> {
   const pendingActionId = args.pendingActionId?.trim();
   if (!pendingActionId) return '';
   try {
-    const { getPendingAction, markPendingActionApprovalResolved } = await import('../runtime/harness/pending-actions.js');
-    // POLICY consent, typed as such (THE-GRANT R1): this auto-approve path can
-    // never mint 'human' — irreversible kinds require a real card decision and
-    // are refused at execute without one.
-    markPendingActionApprovalResolved(pendingActionId, 'approved', null, {
-      by: 'policy',
-      evidence: { kind: 'policy', scope: loadProactivityPolicy().autoApproveScope },
-    });
+    const { getPendingAction } = await import('../runtime/harness/pending-actions.js');
     const record = getPendingAction(pendingActionId);
     if (!record) {
       return ` Queued action ${pendingActionId} is approved, but the queue record could not be read; do not reconstruct it from memory.`;
+    }
+    if (record.status !== 'approved') {
+      return ` Queued action ${record.id} is not recorded as approved; do not execute or reconstruct it.`;
     }
     return [
       ` Queued action ${record.id} is approved.`,
@@ -442,6 +458,23 @@ async function markPendingActionApprovedFromRequest(args: RequestApprovalArgs): 
     ].join(' ');
   } catch {
     // Approval is authoritative; pending-action status mirroring is best-effort.
+    return '';
+  }
+}
+
+async function markPendingActionPolicyApprovedFromRequest(args: RequestApprovalArgs): Promise<string> {
+  const pendingActionId = args.pendingActionId?.trim();
+  if (!pendingActionId) return '';
+  try {
+    const { markPendingActionApprovalResolved } = await import('../runtime/harness/pending-actions.js');
+    // Only the two true auto-approval branches call this helper. A resumed human
+    // card has already been recorded by approval-registry and must remain human.
+    markPendingActionApprovalResolved(pendingActionId, 'approved', null, {
+      by: 'policy',
+      evidence: { kind: 'policy', scope: loadProactivityPolicy().autoApproveScope },
+    });
+    return pendingActionExecutionInstructions(args);
+  } catch {
     return '';
   }
 }
@@ -465,22 +498,24 @@ export function buildRequestApprovalTool() {
       // to read like a local save ("save these emails to memory then send")
       // must never ride the local-save shortcut past the gate (adversarial-
       // review blocker, 2026-07-09).
-      if (await yoloBlockedForSendBatch(args)) return true;
+      if (await requestApprovalRequiresHuman(args)) return true;
       if (isLocalSaveApproval(args)) return false;
       if (isYoloAutoApprovalPolicy()) return false;
       return true;
     },
     execute: async (args, runContext) => {
-      const sendBatchBlocked = await yoloBlockedForSendBatch(args);
-      if (!sendBatchBlocked && isLocalSaveApproval(args)) {
-        const pendingActionText = await markPendingActionApprovedFromRequest(args);
+      const requiresHuman = await requestApprovalRequiresHuman(args);
+      if (!requiresHuman && isLocalSaveApproval(args)) {
+        const pendingActionText = await markPendingActionPolicyApprovedFromRequest(args);
         return `Auto-approved (local save — no external mutation): ${args.subject}. Proceed with the save and report back what landed.${pendingActionText}`;
       }
-      if (!sendBatchBlocked && isYoloAutoApprovalPolicy()) {
-        const pendingActionText = await markPendingActionApprovedFromRequest(args);
+      if (!requiresHuman && isYoloAutoApprovalPolicy()) {
+        const pendingActionText = await markPendingActionPolicyApprovedFromRequest(args);
         return `Auto-approved by YOLO mode: ${args.subject}. Proceed with the action you described.${pendingActionText}`;
       }
-      const pendingActionText = await markPendingActionApprovedFromRequest(args);
+      // Human approval was persisted by approval-registry before the SDK resumed
+      // this tool. Read that linked action without rewriting its provenance.
+      const pendingActionText = await pendingActionExecutionInstructions(args);
       const scopedSlugs = await openRequestApprovalScope(args, runContext);
       const scopeText = scopedSlugs.length > 0
         ? ` Approved scope opened for ${scopedSlugs.join(', ')} in this session, so matching concrete tool calls should not ask again.`
@@ -554,23 +589,28 @@ export function buildAskUserQuestionTool() {
             },
           });
         } catch { /* audit note is best-effort; never block the proceed path */ }
-        return (
+        return formatAutoResolvedAskUserQuestionOutput(
           'YOLO standing approval is in effect — NOT pausing for sign-off on an action you were already asked to do. '
           + 'Proceed now with your best default (reuse the approved copy/template the already-handled items used, or the same approach), '
           + `then report what you did and the assumption you made. (Noted, not waiting: "${args.question}")`
         );
       }
       if (sessionId) {
-        appendEvent({
-          sessionId,
-          turn: extractTurn(runContext),
-          role: 'Clem',
-          type: 'awaiting_user_input',
-          data: {
-            question: args.question,
-            options: args.options ?? null,
-          },
-        });
+        const turn = extractTurn(runContext);
+        const alreadyPosted = listEvents(sessionId, { types: ['awaiting_user_input'] })
+          .some((event) => event.turn === turn);
+        if (!alreadyPosted) {
+          appendEvent({
+            sessionId,
+            turn,
+            role: 'Clem',
+            type: 'awaiting_user_input',
+            data: {
+              question: args.question,
+              options: args.options ?? null,
+            },
+          });
+        }
       }
       return `Question posted: ${args.question}. Awaiting user reply.`;
     },
@@ -927,7 +967,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const workerModel = route.model ?? resolveRoleModel('worker').modelId;
-      const workerProvider = resolveProvider(workerModel);
+      const workerProvider = resolveEffectiveProviderForModel(workerModel);
       // P6: throttle concurrent worker fan-out per session so N parallel run_worker
       // calls can't open N provider calls at once and storm a rate limit. Bounds BOTH
       // worker lanes (this wraps before the route branch). Released in the finally.
@@ -1011,7 +1051,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             role: 'worker',
             intent: input.intent || undefined,
             resolvedModel: ranModel,
-            provider: resolveProvider(ranModel),
+            provider: resolveEffectiveProviderForModel(ranModel),
             source,
             reason: { lane: 'orchestrator', item: input.item },
           });
@@ -1063,6 +1103,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           const ok = !/^\s*ERROR:/i.test(text);
           const capped = !ok && /MaxTurnsExceeded|hit its turn cap/i.test(text);
           const model = ranModel || workerModel;
+          const provider = resolveEffectiveProviderForModel(model);
           recordSubagentRun({
             id: `w-${workerRouteStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
             parentRunId,
@@ -1070,7 +1111,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             workflowName: ctx?.workflowName,
             stepId: ctx?.stepId,
             role: input.intent || undefined,
-            provider: providerClassForModel(model),
+            provider,
             model,
             task: input.item,
             status: capped ? 'capped' : ok ? 'ok' : 'error',
@@ -1468,6 +1509,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // before the flag flips default-on.
     tools: toolPolicy.tools
       .map((t) => wrapToolForHarness(t as unknown as WrappableTool) as unknown as Tool<RuntimeContextValue>),
+    // A real pause is terminal. A YOLO approval-shaped ask is intentionally
+    // non-halting, so this must inspect the tool result instead of using a static
+    // stop-at-name list.
+    toolUseBehavior: userChoiceToolUseBehavior,
     // External MCP servers (DataForSEO, Supabase, browsermcp, etc.) the
     // user has configured. Tools surface as `<server>__<tool>` (e.g.
     // `dataforseo__serp_organic_live_advanced`). Without this the

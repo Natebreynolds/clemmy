@@ -36,6 +36,10 @@ beforeEach(() => {
   setClaudeAgentSdkWorkflowStepRunForTest(null);
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP_MAX_TURNS;
+  delete process.env.MODEL_ROUTING_MODE;
+  delete process.env.BYO_MODEL_BASE_URL;
+  delete process.env.BYO_MODEL_API_KEY;
+  delete process.env.BYO_MODEL_ID;
 });
 
 after(() => {
@@ -56,6 +60,14 @@ test('claudeAgentSdkWorkflowStepEnabled defaults on for Claude models and is kil
   assert.equal(claudeAgentSdkWorkflowStepEnabled('gpt-5.4'), false);
   process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'off';
   assert.equal(claudeAgentSdkWorkflowStepEnabled('claude-sonnet-4-6'), false);
+});
+
+test('Claude-shaped all_in BYO model does not enter the Claude SDK workflow-step lane', () => {
+  process.env.MODEL_ROUTING_MODE = 'all_in';
+  process.env.BYO_MODEL_BASE_URL = 'https://byo.example.test/v1';
+  process.env.BYO_MODEL_API_KEY = 'byo-key';
+  process.env.BYO_MODEL_ID = 'claude-custom';
+  assert.equal(claudeAgentSdkWorkflowStepEnabled('claude-custom'), false);
 });
 
 test('renderClaudeAgentWorkflowStepSystemAppend tells Claude to use skills and stay read-only', () => {
@@ -216,12 +228,14 @@ test('runClaudeAgentSdkWorkflowStep full lane runs the tool-capable gated profil
     modelId: 'claude-sonnet-4-6',
     sessionId: 'workflow:run-xyz:scrape',
     fullLane: true,
+    parkApprovals: true,
   });
 
   assert.deepEqual(result.output, { report: 'did the real work' });
   assert.equal(captured.agentic, true, 'full lane runs in agentic (gated-mutation) mode');
   assert.equal(captured.maxTurns, 24, 'full lane gets brain-level turn headroom (not the read-only 6)');
   assert.equal(captured.sessionId, 'workflow:run-xyz:scrape', 'gated tools run on the workflow session for plan-scope grants');
+  assert.equal(captured.approvalMode, 'park', 'workflow runner can release the SDK child while a concrete approval waits');
   assert.ok(captured.allowedLocalMcpTools.includes('composio_search_tools'), 'composio search exposed for action discovery');
   assert.ok(captured.allowedLocalMcpTools.includes('composio_list_tools'), 'composio list exposed for schema discovery');
   assert.ok(captured.allowedLocalMcpTools.includes('composio_execute_tool'), 'composio exposed for external read/write');

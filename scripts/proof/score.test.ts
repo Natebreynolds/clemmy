@@ -13,12 +13,14 @@ import Database from 'better-sqlite3';
 
 import {
   exactBrainRouteChecks,
+  exactWorkflowStepRouteChecks,
   narrationCheck,
   openHarnessDb,
   sessionMetrics,
   sessionRouteEvidence,
   stormCheck,
   summarizeAllSessions,
+  workflowStepRouteEvidence,
 } from './score.js';
 
 function buildFixtureHome(): string {
@@ -69,6 +71,20 @@ function addRouteMarker(home: string, sessionId: string, data: unknown, suffix: 
   db.prepare(
     `INSERT INTO events (id, session_id, turn, role, type, data_json, created_at) VALUES (?,?,?,?,?,?,?)`,
   ).run(`route-${suffix}`, sessionId, 0, 'system', 'turn_model_routed', JSON.stringify(data), new Date().toISOString());
+  db.close();
+}
+
+function addWorkflowRouteMarker(
+  home: string,
+  sessionId: string,
+  type: 'turn_model_routed' | 'worker_model_routed',
+  data: unknown,
+  suffix: string,
+): void {
+  const db = new Database(path.join(home, 'state', 'harness.db'));
+  db.prepare(
+    `INSERT INTO events (id, session_id, turn, role, type, data_json, created_at) VALUES (?,?,?,?,?,?,?)`,
+  ).run(`workflow-route-${suffix}`, sessionId, 0, 'system', type, JSON.stringify(data), new Date().toISOString());
   db.close();
 }
 
@@ -187,6 +203,61 @@ test('mixed same-session providers and a same-session fallover fail the exact ro
     const checks = exactBrainRouteChecks(home, 'sess-1', 'codex', 2);
     assert.equal(checks[1].pass, false, 'mixed providers are not an exact Codex route');
     assert.equal(checks[2].pass, false, 'a recorded fallover fails the route gate');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('workflow step route accepts the Claude SDK nested route marker and exact transport', () => {
+  const home = buildFixtureHome();
+  try {
+    addWorkflowRouteMarker(home, 'workflow:run-1:write', 'worker_model_routed', {
+      provider: 'claude',
+      modelId: 'claude-sonnet-4-6',
+      modelRoute: {
+        provider: 'claude',
+        effectiveModel: 'claude-sonnet-4-6',
+        transport: 'claude_agent_sdk_workflow_step',
+      },
+    }, 'claude');
+    const evidence = workflowStepRouteEvidence(home, 'workflow:run-1:write');
+    assert.deepEqual([...new Set(evidence.families)], ['claude']);
+    assert.deepEqual([...new Set(evidence.transports)], ['claude_agent_sdk_workflow_step']);
+    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-1:write', 'claude').every((check) => check.pass), true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('workflow step route preserves BYO identity for a gpt-shaped model on the harness transport', () => {
+  const home = buildFixtureHome();
+  try {
+    addWorkflowRouteMarker(home, 'workflow:run-2:write', 'turn_model_routed', {
+      provider: 'byo',
+      model: 'gpt-shaped-private-model',
+      transport: 'openai_agents_harness',
+    }, 'byo');
+    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-2:write', 'glm').every((check) => check.pass), true);
+    assert.equal(exactWorkflowStepRouteChecks(home, 'workflow:run-2:write', 'codex')[1].pass, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('workflow step route fails a wrong transport and same-step fallover', () => {
+  const home = buildFixtureHome();
+  try {
+    addWorkflowRouteMarker(home, 'workflow:run-3:write', 'worker_model_routed', {
+      modelRoute: {
+        provider: 'claude',
+        effectiveModel: 'claude-sonnet-4-6',
+        transport: 'openai_agents_harness',
+      },
+    }, 'wrong-transport');
+    addOperationalFallover(home, 'workflow:run-3:write');
+    const checks = exactWorkflowStepRouteChecks(home, 'workflow:run-3:write', 'claude');
+    assert.equal(checks[2].pass, false, 'wrong workflow transport fails');
+    assert.equal(checks[3].pass, false, 'same-step fallover fails');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

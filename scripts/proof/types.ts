@@ -78,7 +78,7 @@ export interface ScenarioDef {
   /** One line shown in the scoreboard. */
   summary: string;
   /** Require session-scoped provider identity and zero fallover for this run. */
-  routeExpectation?: 'exact-brain';
+  routeExpectation?: 'exact-brain' | 'exact-workflow-step';
   run(daemon: DaemonHandle): Promise<Omit<ScenarioOutcome, 'brain' | 'scenario' | 'status'> & { checks: Check[] }>;
 }
 

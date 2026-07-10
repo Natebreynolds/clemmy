@@ -1,5 +1,6 @@
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from '../../agents/worker-job-packet.js';
 import { getRuntimeEnv } from '../../config.js';
+import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import {
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
@@ -20,7 +21,12 @@ function flagEnabled(): boolean {
 }
 
 export function claudeAgentSdkWorkerEnabled(modelId: string | undefined | null): boolean {
-  return flagEnabled() && typeof modelId === 'string' && modelId.startsWith('claude-');
+  if (!flagEnabled() || typeof modelId !== 'string' || !modelId.trim()) return false;
+  try {
+    return resolveEffectiveProviderForModel(modelId) === 'claude';
+  } catch {
+    return false;
+  }
 }
 
 function maxTurns(): number {

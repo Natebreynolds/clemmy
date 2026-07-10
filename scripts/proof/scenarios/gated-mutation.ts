@@ -16,6 +16,7 @@ import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 export const gatedMutation: ScenarioDef = {
   name: 'gated-mutation',
   summary: 'non-allowlisted local tool → canUseTool allow → tool actually executes',
+  routeExpectation: 'exact-brain',
   async run(daemon: DaemonHandle) {
     const sessionId = `proof-gated-${Date.now().toString(36)}`;
 

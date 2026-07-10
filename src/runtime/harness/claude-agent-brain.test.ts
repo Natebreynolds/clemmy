@@ -21,6 +21,7 @@ const {
   looksLikeToolNarration,
   looksLikeStreamingNarration,
   looksLikeReasoningLeak,
+  shouldJudgeClaudeCompletion,
   frameTrustedMemory,
   sdkStreamingEnabled,
   invalidateStableMemorySnapshot,
@@ -67,6 +68,46 @@ test('JIT monotonic floor: the per-session advertised tool set only GROWS (cache
   assert.deepEqual([...bumpSessionToolFloor(sid, ['a'])].sort(), ['a', 'b', 'c']);
   // A different session has its own independent floor.
   assert.deepEqual([...bumpSessionToolFloor('other-session', ['x'])].sort(), ['x']);
+});
+
+test('completion judge targets suspicious text and skips concrete tool-backed results', () => {
+  assert.equal(
+    shouldJudgeClaudeCompletion('write the brief', 'Done - saved and verified the brief.', ['write_file', 'run_shell_command']),
+    false,
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('send the emails', "I'll send the remaining emails next.", ['composio_execute_tool']),
+    true,
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('create the workflow', 'Created the workflow.', []),
+    true,
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('send the emails', 'Sent the emails.', ['memory_search', 'composio_search_tools']),
+    true,
+    'probe-only calls are not completion evidence',
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('send the emails', 'Sent the emails.', ['ask_user_question']),
+    true,
+    'a control-only ask cannot certify a send',
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('build the app', 'Built the app.', ['read_file']),
+    true,
+    'a partial read cannot certify a mutating objective',
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('send the emails', 'Sent the emails.', ['GMAIL_FETCH_EMAILS']),
+    true,
+    'a concrete read slug cannot certify a send',
+  );
+  assert.equal(
+    shouldJudgeClaudeCompletion('send the emails', 'Sent the emails.', ['GMAIL_SEND_EMAIL']),
+    false,
+    'a successful concrete send slug is completion evidence',
+  );
 });
 
 test('JIT monotonic floor: the EMITTED allowlist string is byte-identical once converged (the actual prompt-cache precondition)', () => {
@@ -130,6 +171,33 @@ test('Claude SDK brain creates background sessions as execution sessions, not ch
   assert.equal(session?.metadata.source, 'claude-agent-sdk-brain:background');
 });
 
+test('Claude cron uses an execution SDK session, skips the expensive judge, and preserves plain-question awaiting', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  let judgeCalls = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judgeCalls += 1;
+    return { done: true, reason: 'done' };
+  });
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Which account should I update?',
+    sessionId: 'sdk',
+    model: 'claude-sonnet-4-6',
+    toolUses: [],
+  }));
+
+  const response = await respondViaClaudeAgentSdkBrain('cron', {
+    message: 'Update the account',
+    sessionId: 'brain-cron-kind',
+  });
+
+  const session = getSession('brain-cron-kind');
+  assert.equal(session?.kind, 'execution');
+  assert.equal(session?.metadata.source, 'claude-agent-sdk-brain:cron');
+  assert.equal(judgeCalls, 0, 'cron does not pay for completion-judge continuations');
+  assert.equal(response.stoppedReason, 'awaiting-input', 'plain blocking questions still pause canonically');
+});
+
 test('SDK brain auto-captures explicit remember turns even when the model skips memory_remember', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
@@ -167,7 +235,7 @@ test('Move 4: a judge-failed-open completion is TAGGED verification.failedOpen (
   createSession({ id: 'brain-verif-failopen', kind: 'chat', title: 'v' });
   setClaudeAgentSdkBrainRunForTest(async () => ({
     text: 'Done — sent the 3 emails.', sessionId: 'sdk', model: 'm',
-    toolUses: ['mcp__clementine-local__composio_execute_tool'],
+    toolUses: [],
   }));
   setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'judge timed out — accepting completion', failedOpen: true }));
   await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-verif-failopen' });
@@ -182,7 +250,7 @@ test('Move 4: a thrown completion judge is TAGGED verification.failedOpen', asyn
   createSession({ id: 'brain-verif-throw', kind: 'chat', title: 'v' });
   setClaudeAgentSdkBrainRunForTest(async () => ({
     text: 'Done — sent the 3 emails.', sessionId: 'sdk', model: 'm',
-    toolUses: ['mcp__clementine-local__composio_execute_tool'],
+    toolUses: [],
   }));
   setClaudeAgentSdkBrainJudgeForTest(async () => { throw new Error('judge unavailable'); });
   await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-verif-throw' });
@@ -197,11 +265,16 @@ test('Move 4: a clean cross-family done verdict leaves NO verification tag (full
   createSession({ id: 'brain-verif-clean', kind: 'chat', title: 'v' });
   setClaudeAgentSdkBrainRunForTest(async () => ({
     text: 'Done — sent the 3 emails.', sessionId: 'sdk', model: 'm',
-    toolUses: ['mcp__clementine-local__composio_execute_tool'],
+    toolUses: [],
   }));
-  setClaudeAgentSdkBrainJudgeForTest(async () => ({ done: true, reason: 'all three sent with links' }));
+  let judgeCalls = 0;
+  setClaudeAgentSdkBrainJudgeForTest(async () => {
+    judgeCalls += 1;
+    return { done: true, reason: 'all three sent with links' };
+  });
   await respondViaClaudeAgentSdkBrain('home', { message: 'send the 3 emails', sessionId: 'brain-verif-clean' });
   const completed = listEvents('brain-verif-clean').filter((e) => e.type === 'conversation_completed').at(-1);
+  assert.equal(judgeCalls, 1);
   assert.equal((completed!.data as { verification?: unknown }).verification, undefined, 'a clean verdict adds no tag');
 });
 
@@ -246,6 +319,7 @@ test('Claude auth defaults to the full tool-capable SDK lane; off remains explic
   assert.equal(claudeAgentSdkBrainMode(), 'local_authoring');
   assert.equal(claudeAgentSdkBrainEnabled('dashboard'), true);
   assert.equal(claudeAgentSdkBrainEnabled('background'), true, 'background tasks need the SDK lane so Claude can call Clementine tools');
+  assert.equal(claudeAgentSdkBrainEnabled('cron'), true, 'cron needs the SDK lane so Claude can call Clementine tools');
   assert.equal(claudeAgentSdkBrainEnabled('workflow'), false, 'execution surfaces stay on the guarded harness');
 
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
@@ -273,9 +347,9 @@ test('renderClaudeAgentBrainSystemAppend carries Clementine context and the read
   assert.doesNotMatch(prompt, /tool_called event|tool_returned event|\[clipped:/);
 });
 
-test('Win 2: the stable memory block is frozen per session — a mid-session vault edit does not bust the cached prefix, but a fresh session / invalidation picks it up', () => {
+test('stable memory freezing is opt-in and supports explicit invalidation', () => {
   process.env.CLEMMY_CLAUDE_SDK_CONTEXT_SPLIT = 'on'; // the freeze applies only on the split (cacheable-prefix) path
-  delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT;
+  process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT = 'on';
   const sid = 'brain-freeze-A';
   invalidateStableMemorySnapshot(); // clean slate
   // First render seeds this session's snapshot (before the vault edit).
@@ -294,12 +368,11 @@ test('Win 2: the stable memory block is frozen per session — a mid-session vau
   invalidateStableMemorySnapshot(sid);
   const third = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
   assert.match(third, /MARKER_ROLE_XYZZY/, 'invalidation re-renders the stable block');
-  // Kill-switch off → live render every turn (no freeze).
-  process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT = 'off';
-  saveUserProfile({ role: 'MARKER_ROLE_SECOND' });
-  const killed = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
-  assert.match(killed, /MARKER_ROLE_SECOND/, 'kill-switch off renders the vault live');
+  // Default/off → live render every turn (no freeze).
   delete process.env.CLEMMY_BRAIN_STABLE_SNAPSHOT;
+  saveUserProfile({ role: 'MARKER_ROLE_SECOND' });
+  const live = renderClaudeAgentBrainSystemAppend('home', { message: 'hi', sessionId: sid }, 'read_only');
+  assert.match(live, /MARKER_ROLE_SECOND/, 'default renders the vault live');
   invalidateStableMemorySnapshot();
 });
 
@@ -592,7 +665,7 @@ test('full mode: completion judge receives prior user context and SDK tool evide
     data: { text: 'Build and publish the Q3 microsite' },
   });
   setClaudeAgentSdkBrainRunForTest(async () => ({
-    text: 'Published the microsite at https://example.test/q3.',
+    text: "I'll finish publishing the Q3 microsite next.",
     sessionId: 'sdk',
     model: 'claude-opus-4-8',
     toolUses: [
@@ -614,7 +687,7 @@ test('full mode: completion judge receives prior user context and SDK tool evide
     sessionId: 'brain-judge-evidence',
   });
 
-  assert.match(res.text, /https:\/\/example\.test\/q3/);
+  assert.match(res.text, /finish publishing the Q3 microsite/);
   assert.match(judgedObjective, /Build and publish the Q3 microsite/);
   assert.match(judgedObjective, /Current user message .*ship it/);
   assert.match(toolSummary, /run_shell_command/);
@@ -704,14 +777,14 @@ test('streaming judge continuation suppresses retry deltas after stale streamed 
   ]);
 });
 
-test('local_authoring mode: completion judge verifies workflow-authoring claims before success', async () => {
+test('local_authoring mode: concrete tool-backed completion skips the redundant judge', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on'; // default Claude brain mode = local_authoring
   const prompts: string[] = [];
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     prompts.push(options.prompt);
     return {
-      text: prompts.length === 1 ? 'I created the workflow.' : 'Created workflow wf_daily_digest and scheduled it for 8am.',
+      text: 'Created workflow wf_daily_digest and scheduled it for 8am.',
       sessionId: 'sdk', model: 'claude-opus-4-8',
       toolUses: ['mcp__clementine-local__workflow_create'],
     };
@@ -719,13 +792,13 @@ test('local_authoring mode: completion judge verifies workflow-authoring claims 
   let judged = 0;
   setClaudeAgentSdkBrainJudgeForTest(async () => {
     judged += 1;
-    return judged === 1 ? { done: false, reason: 'missing workflow id and schedule evidence' } : { done: true, reason: 'workflow id present' };
+    return { done: false, reason: 'should not run for tool-backed completion' };
   });
 
   const res = await respondViaClaudeAgentSdkBrain('home', { message: 'create and schedule a daily digest workflow', sessionId: 'brain-author-judge' });
 
-  assert.equal(prompts.length, 2, 'local-authoring claims are judged and continued once when not done');
-  assert.match(prompts[1], /missing workflow id and schedule evidence/);
+  assert.equal(prompts.length, 1);
+  assert.equal(judged, 0);
   assert.match(res.text, /wf_daily_digest/);
 });
 
@@ -1188,6 +1261,30 @@ test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-inpu
   assert.equal(judgeCalls, 0, 'the convergence assertion is independent of completion judging');
   assert.match(nextTurnContext, /CONVERGE/);
   assert.match(nextTurnContext, /EXECUTE the work this turn/);
+});
+
+test('respondViaClaudeAgentSdkBrain persists a material plain-text clarification as awaiting-input', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  setClaudeAgentSdkBrainRunForTest(async () => ({
+    text: 'Which audience should this rollout brief target?',
+    sessionId: 'sdk-session',
+    model: 'claude-sonnet-5',
+    toolUses: [],
+  }));
+
+  const res = await respondViaClaudeAgentSdkBrain('home', {
+    message: 'Prepare a rollout brief; the audience is unresolved.',
+    sessionId: 'brain-plain-material-ask',
+  });
+
+  assert.equal(res.stoppedReason, 'awaiting-input');
+  const awaiting = listEvents('brain-plain-material-ask', { types: ['awaiting_user_input'] });
+  assert.equal(awaiting.length, 1);
+  assert.equal(awaiting[0].data.question, 'Which audience should this rollout brief target?');
+  const completed = listEvents('brain-plain-material-ask', { types: ['conversation_completed'] }).at(-1);
+  assert.equal(completed?.data.reason, 'awaiting_user_input');
+  assert.equal(completed?.data.awaitingUser, true);
 });
 
 test('respondViaClaudeAgentSdkBrain local_authoring mode exposes curated local authoring tools but not broad execution', async () => {

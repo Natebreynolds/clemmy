@@ -115,6 +115,9 @@ test('kill-switch CLEMMY_BRAIN_CONVERGE=off disables the steer', () => {
 
 test('the steer text tells the model to execute and not re-ask / not stack a background offer', () => {
   assert.match(CONVERGENCE_STEER, /EXECUTE the work this turn/);
+  assert.match(CONVERGENCE_STEER, /preserve its exact identifiers, labels, paths, quantities/i);
+  assert.match(CONVERGENCE_STEER, /do not normalize or paraphrase/i);
+  assert.match(CONVERGENCE_STEER, /changes letter case only, never spelling, plurality, or word choice/i);
   assert.match(CONVERGENCE_STEER, /do NOT ask another separate clarifying question/);
   assert.match(CONVERGENCE_STEER, /background/i);
   assert.match(CONVERGENCE_STEER, /changed topics/i);

@@ -193,3 +193,32 @@ test('listPending status:any includes resolved rows for history', () => {
   const all = reg.listPending({ sessionId: session.id, status: 'any' });
   assert.ok(all.some((row) => row.approvalId === r.approvalId));
 });
+
+test('resumable approval registration dedupes and an approved grant is claimed exactly once across reopen', () => {
+  const session = createSession({ kind: 'workflow' });
+  const input = {
+    sessionId: session.id,
+    subject: 'Send exact message?',
+    tool: 'composio_execute_tool',
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com', body: 'exact' } },
+    resumeKey: 'resume-exact-message-1',
+  };
+
+  const first = reg.registerResumable(input);
+  const duplicate = reg.registerResumable(input);
+  assert.equal(first.created, true);
+  assert.equal(duplicate.created, false);
+  assert.equal(duplicate.row.approvalId, first.row.approvalId);
+  assert.equal(reg.listPending({ sessionId: session.id }).length, 1);
+
+  reg.resolve(first.row.approvalId, 'approved', 'unit-test-human');
+  closeEventLog(); // simulate a daemon restart before the step reruns
+
+  const claimed = reg.claimResumableApproval(input.resumeKey);
+  assert.equal(claimed.state, 'approved');
+  assert.equal(claimed.state === 'approved' && claimed.row.approvalId, first.row.approvalId);
+  assert.ok(claimed.state === 'approved' && claimed.row.consumedAt, 'the one-shot grant is durably consumed');
+
+  const replay = reg.claimResumableApproval(input.resumeKey);
+  assert.equal(replay.state, 'consumed', 'the exact approved payload cannot reuse the grant twice');
+});

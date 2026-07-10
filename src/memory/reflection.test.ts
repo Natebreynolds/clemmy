@@ -50,6 +50,7 @@ const {
   _testOnly_sanitizeExtractionOutput,
   _testOnly_sanitizeRecursivePatternOutput,
   _testOnly_sanitizeConflictDecision,
+  _testOnly_reflectorRoute,
 } = await import('./reflection.js');
 const { rememberFact, getFact, setFactPinned, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
 const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
@@ -59,9 +60,65 @@ function factContentHash(id: number): string {
   return row.content_hash;
 }
 
+function withEnv(overrides: Record<string, string | undefined>, run: () => void): void {
+  const prior = Object.fromEntries(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    run();
+  } finally {
+    for (const [key, value] of Object.entries(prior)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 test.afterEach(() => {
   _setEmbeddingProviderForTest(undefined);
   _testOnly_setReflectionExtractor(null);
+});
+
+test('reflection extractor binds to the active provider instead of a gpt-shaped global model string', () => {
+  const common = {
+    CLEMMY_JUDGE_CROSS_FAMILY: 'off',
+    CLEMMY_MODEL_ROLES: undefined,
+    CLEMMY_BOUNDARY_JUDGE_CLAUDE_MODEL: undefined,
+    CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL: undefined,
+    BYO_PROVIDERS: undefined,
+  };
+  withEnv({
+    ...common,
+    AUTH_MODE: 'claude_oauth',
+    MODEL_ROUTING_MODE: 'off',
+    BYO_MODEL_BASE_URL: undefined,
+    BYO_MODEL_API_KEY: undefined,
+    BYO_MODEL_ID: undefined,
+  }, () => {
+    assert.deepEqual(_testOnly_reflectorRoute(), {
+      modelId: 'claude-haiku-4-5',
+      provider: 'claude',
+      transport: 'claude_subscription',
+    });
+  });
+
+  withEnv({
+    ...common,
+    AUTH_MODE: 'claude_oauth',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://byo.example.test/v1',
+    BYO_MODEL_API_KEY: 'byo-key',
+    BYO_MODEL_ID: 'gpt-shaped-reflector',
+    BYO_MODEL_JUDGE_ID: 'gpt-shaped-reflector-judge',
+  }, () => {
+    assert.deepEqual(_testOnly_reflectorRoute(), {
+      modelId: 'gpt-shaped-reflector-judge',
+      provider: 'byo',
+      transport: 'byo_openai_compatible',
+    });
+  });
 });
 
 test('entities: upsert is idempotent + merges aliases', () => {

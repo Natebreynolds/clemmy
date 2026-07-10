@@ -8,11 +8,19 @@ import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const WF_NAME = 'proof-cron-smoke';
 
-interface RunRow { id?: string; status?: string; source?: string }
+interface RunRow {
+  id?: string;
+  status?: string;
+  source?: string;
+  output?: unknown;
+  stepOutputs?: Record<string, unknown>;
+  notifiedAt?: string;
+}
 
 export const cronReportBack: ScenarioDef = {
   name: 'cron-report-back',
   summary: 'scheduled workflow fires unattended within its window',
+  routeExpectation: 'exact-workflow-step',
   async run(daemon: DaemonHandle) {
     const checks: Check[] = [];
     const started = Date.now();
@@ -42,19 +50,32 @@ export const cronReportBack: ScenarioDef = {
           const res = await daemon.request('GET', `/api/console/workflows/${WF_NAME}/runs`);
           const runs = ((res.json as { runs?: RunRow[] })?.runs ?? []) as RunRow[];
           run = runs.find((r) => r.status === 'completed') ?? runs[0];
-          if (run?.status === 'completed' || run?.status === 'failed') break;
+          if ((run?.status === 'completed' && run.notifiedAt) || run?.status === 'failed') break;
         } catch { /* poll again */ }
       }
     }
     checks.push({ name: 'run fired unattended within window', pass: Boolean(run), detail: run ? `status ${run.status}` : 'no run appeared' });
     checks.push({ name: 'run completed', pass: run?.status === 'completed', detail: run?.status ?? 'n/a' });
+    checks.push({ name: 'run originated from the scheduler', pass: run?.source === 'schedule', detail: run?.source ?? 'n/a' });
+    const persistedOutput = JSON.stringify({ output: run?.output, stepOutputs: run?.stepOutputs });
+    checks.push({
+      name: 'exact scheduled result was persisted',
+      pass: persistedOutput.includes('proof-cron-ok'),
+      detail: persistedOutput.slice(0, 260),
+    });
+    checks.push({
+      name: 'scheduled result report-back was durably marked',
+      pass: typeof run?.notifiedAt === 'string' && run.notifiedAt.length > 0,
+      detail: run?.notifiedAt ?? 'notifiedAt missing',
+    });
 
     try { await daemon.request('DELETE', `/api/console/workflows/${WF_NAME}`); } catch { /* best effort */ }
 
     return {
       checks,
       latency: [{ wallMs: Date.now() - started, ttftMs: null }],
-      metrics: { cron, runStatus: run?.status ?? null },
+      sessionId: run?.id ? `workflow:${run.id}:report` : undefined,
+      metrics: { cron, runStatus: run?.status ?? null, source: run?.source ?? null, notifiedAt: run?.notifiedAt ?? null },
     };
   },
 };

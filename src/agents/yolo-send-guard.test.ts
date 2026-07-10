@@ -3,9 +3,8 @@
  *
  * 2026-07-09 sess-mrds80fu regression: "Auto-approved by YOLO mode: Send
  * market-leader reactivation emails 1-10" put 10 unapproved emails on the
- * wire. YOLO must never auto-approve a BATCH of irreversible sends at/over
- * batchConfirmThreshold; single/uncounted sends (the daily standup brief)
- * keep the YOLO contract unchanged.
+ * wire. YOLO covers reversible work, never irreversible sends or destructive
+ * actions; the one concrete approval card owns those pauses.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,9 +15,8 @@ import path from 'node:path';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-yolo-guard-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
-const { _yoloBlockedForSendBatchForTests: guard } = await import('./orchestrator.js');
+const { _requestApprovalRequiresHumanForTests: guard } = await import('./orchestrator.js');
 const { queuePendingAction } = await import('../runtime/harness/pending-actions.js');
-const { sendBatchApprovalFloor } = await import('./proactivity-policy.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -38,19 +36,11 @@ function queueSendBatch(items: number, kind: 'external_send' | 'external_write' 
   });
 }
 
-test('default floor honors batchConfirmThreshold (>=2)', () => {
-  assert.ok(sendBatchApprovalFloor() >= 2);
-});
-
-test('queued send batch at/over the floor blocks YOLO auto-approval', async () => {
+test('queued irreversible send requires a human regardless of batch size', async () => {
   const record = queueSendBatch(10);
   assert.equal(await guard({ subject: 'Send market-leader reactivation emails 1-10', reason: null, destructive: false, pendingActionId: record.id } as never), true);
-});
-
-test('small send batch under the floor keeps YOLO flowing', async () => {
-  const record = queueSendBatch(2);
-  const floor = sendBatchApprovalFloor();
-  assert.equal(await guard({ subject: 'Send two follow-ups', reason: null, destructive: false, pendingActionId: record.id } as never), 2 >= floor);
+  const single = queueSendBatch(1);
+  assert.equal(await guard({ subject: 'Send one follow-up', reason: null, destructive: false, pendingActionId: single.id } as never), true);
 });
 
 test('non-send pending action never blocks YOLO', async () => {
@@ -58,9 +48,11 @@ test('non-send pending action never blocks YOLO', async () => {
   assert.equal(await guard({ subject: 'Update 50 sheet rows', reason: null, destructive: false, pendingActionId: record.id } as never), false);
 });
 
-test('text fallback: send vocabulary + counted range blocks; single uncounted send does not', async () => {
+test('text fallback: every explicit irreversible action blocks; reversible drafts and writes do not', async () => {
   assert.equal(await guard({ subject: 'Send market-leader reactivation emails 1-10', reason: null, destructive: false } as never), true);
   assert.equal(await guard({ subject: 'Send 25 outreach emails to the prospect list', reason: null, destructive: false } as never), true);
-  assert.equal(await guard({ subject: 'Send daily standup email', reason: null, destructive: false } as never), false);
+  assert.equal(await guard({ subject: 'Send daily standup email', reason: null, destructive: false } as never), true);
+  assert.equal(await guard({ subject: 'Create 30 Outlook email drafts for review', reason: null, destructive: false } as never), false);
   assert.equal(await guard({ subject: 'Create 30 draft rows in the sheet', reason: null, destructive: false } as never), false);
+  assert.equal(await guard({ subject: 'Delete the production workspace', reason: null, destructive: true } as never), true);
 });

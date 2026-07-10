@@ -15,6 +15,7 @@ import type { ActivityItem } from '@/lib/useChat';
 const PROVIDER_DOT: Record<NonNullable<ActivityItem['provider']>, string> = {
   claude: '#d97757',
   codex: '#10a37f',
+  byo: '#4f8fc0',
   glm: '#7c6cf0',
   unknown: '#8a8f98',
 };

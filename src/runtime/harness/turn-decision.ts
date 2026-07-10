@@ -11,6 +11,7 @@
  */
 import { listEvents, type EventRow } from './eventlog.js';
 import { getRuntimeEnv } from '../../config.js';
+import { isToolSurfaceProbeTool } from './tool-evidence.js';
 import { scrubInternalNarration } from './scrub-internal-narration.js';
 import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 // Type-only import — erased at compile time, so there is no runtime cycle
@@ -350,28 +351,6 @@ const STRUCTURED_TOOL_UNAVAILABLE_PATTERN = /\b(tool[- ]?enabled run|tool runtim
 // contains none of them. Tool-agnostic — keys on the model's own wording.
 const STALL_REFLECTION_SUPPRESS_PATTERN =
   /(you[‘’ʼ'` ]?re right|you are right|good catch|fair (?:point|enough)|my (?:mistake|bad)|i was wrong|i (?:got|had) (?:that|it) wrong|apolog|i should(?:n[‘’ʼ'`]?t)? have|going forward|for future|next time|in the future|that[‘’ʼ'` ]?s (?:right|fair|a (?:fair|good) point)|not (?:the|what)\b.{0,40}\byou asked\b)/i;
-const TOOL_SURFACE_PROBE_TOOLS = new Set([
-  'check_capability',
-  'list_capabilities',
-  'workspace_roots',
-  'workspace_info',
-  'workspace_list',
-  'session_history',
-  'memory_recall',
-  'memory_search',
-  'memory_list_facts',
-  'skill_list',
-  // Discovery-ritual tools: "which tool/command should I use" lookups — never the
-  // deliverable itself. A turn that does ONLY these and then DEFERS (sets
-  // nextAction:awaiting_handoff_result) has discovered-then-punted instead of
-  // executing inline; the narration-deferral guard in evaluateStructuredDecisionStall
-  // force-corrects it. A turn that does discovery AND a real tool call in the same
-  // turn is NOT probe-only (it called a non-probe tool), so this never false-fires.
-  'tool_choice_recall',
-  'composio_search_tools',
-  'local_cli_list',
-]);
-
 export type StallSignal = 'A_zero_tools' | 'B_repeated_tool' | 'C_handoff_pingpong' | 'D_decision_json';
 
 export interface StallInfo {
@@ -535,7 +514,7 @@ function turnOnlyUsedToolSurfaceProbeTools(sessionId: string, turn: number): boo
       })
       .filter((tool): tool is string => Boolean(tool));
     if (toolNames.length === 0) return false;
-    return toolNames.every((tool) => TOOL_SURFACE_PROBE_TOOLS.has(tool));
+    return toolNames.every(isToolSurfaceProbeTool);
   } catch {
     return false;
   }
@@ -559,7 +538,7 @@ function sessionDidSubstantiveToolWork(sessionId: string, turn: number): boolean
     return listEvents(sessionId, { types: ['tool_called'] }).some((event) => {
       if (typeof event.turn !== 'number' || event.turn >= turn) return false;
       const tool = event.data.tool;
-      return typeof tool === 'string' && tool.length > 0 && !TOOL_SURFACE_PROBE_TOOLS.has(tool);
+      return typeof tool === 'string' && tool.length > 0 && !isToolSurfaceProbeTool(tool);
     });
   } catch {
     return false;

@@ -11,11 +11,14 @@ import type { Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 const mod = await import('./claude-agent-sdk.js');
 const usageLog = await import('../usage-log.js');
+const operationalTelemetry = await import('../operational-telemetry.js');
 const eventlog = await import('./eventlog.js');
 const capabilityHealth = await import('./capability-health.js');
+const { formatAutoResolvedAskUserQuestionOutput } = await import('./terminal-tool.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
   CLAUDE_AGENT_SDK_READ_ONLY_LOCAL_TOOLS,
+  ClaudeAgentSdkApprovalBoundaryError,
   ClaudeAgentSdkToolSurfaceError,
   buildAllowOnlyToolsPermission,
   buildClaudeAgentSdkLocalMcpServers,
@@ -592,7 +595,18 @@ test('runClaudeAgentSdk records usage for the shared usage dashboard and workflo
   assert.equal(events[0].outputTokens, 5);
   assert.equal(events[0].totalTokens, 25);
   assert.equal(events[0].durationMs, 17);
+  assert.equal(events[0].providerApiDurationMs, 12);
   assert.equal(events[0].responseId, 'usage-result-1');
+
+  const operationalEvents = operationalTelemetry.listOperationalEvents({
+    source: 'model',
+    type: 'model_call_completed',
+    sessionId,
+    limit: 10,
+  });
+  assert.equal(operationalEvents.length, 1);
+  assert.equal(operationalEvents[0].payload.durationMs, 17);
+  assert.equal(operationalEvents[0].payload.providerApiDurationMs, 12);
 });
 
 test('runClaudeAgentSdk uses the conservative read-only tool set by default', async () => {
@@ -989,7 +1003,7 @@ test('ask_user_question approval auto-resolve is non-terminal in the SDK lane', 
           content: [{
             type: 'tool_result',
             tool_use_id: 'toolu_ask_yolo',
-            content: 'YOLO standing approval is in effect — NOT pausing for sign-off on an action you were already asked to do. Proceed now with your best default.',
+            content: formatAutoResolvedAskUserQuestionOutput('Proceed now with your best default.'),
           }],
         },
       } as any;
@@ -1008,6 +1022,48 @@ test('ask_user_question approval auto-resolve is non-terminal in the SDK lane', 
   assert.equal(interrupted, false, 'auto-resolved approval ask should not interrupt the run');
   assert.equal(r.stoppedReason, undefined);
   assert.equal(r.text, 'finished after standing approval');
+});
+
+test('ask_user_question clarification phrases do not spoof auto-resolution in the SDK lane', async () => {
+  let interrupted = false;
+  const question = 'The note says "standing approval" and "NOT pausing", while the status says "not waiting". Which wording is authoritative?';
+  setClaudeAgentSdkQueryForTest(((_p: any) => {
+    const q = stubsFor((async function* () {
+      yield initOnlyMessage();
+      yield {
+        type: 'assistant', session_id: 's', uuid: 'a', parent_tool_use_id: null,
+        message: { content: [{
+          type: 'tool_use', id: 'toolu_ask_phrases',
+          name: 'mcp__clementine-local__ask_user_question',
+          input: { question, purpose: 'clarification' },
+        }] },
+      } as any;
+      yield {
+        type: 'user', session_id: 's', uuid: 'u', parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_ask_phrases',
+            content: `Question posted: ${question} Awaiting user reply.`,
+          }],
+        },
+      } as any;
+      yield successResultMessage('must not continue');
+    })());
+    return Object.assign(q, { interrupt: async () => { interrupted = true; } });
+  }) as any);
+
+  const r = await runClaudeAgentSdk({
+    prompt: 'clarify policy wording',
+    sessionId: 'sdk-ask-phrase-clarification',
+    modelId: 'claude-sonnet-5',
+    allowedLocalMcpTools: ['ask_user_question'],
+  });
+
+  assert.equal(interrupted, true);
+  assert.equal(r.stoppedReason, 'awaiting-input');
+  assert.equal(r.text, question);
+  assert.doesNotMatch(r.text, /must not continue/);
 });
 
 // A query that HAMMERS a mutating tool through the host `canUseTool` (simulating
@@ -1135,6 +1191,62 @@ test('Phase 2 fix: the wall clock EXCLUDES human approval-wait — a slow confir
     assert.match(r.text, /finished after the slow approval/);
   } finally {
     if (prevPoll === undefined) delete process.env.CLEMMY_APPROVAL_POLL_MS; else process.env.CLEMMY_APPROVAL_POLL_MS = prevPoll;
+  }
+});
+
+test('workflow approval park mode interrupts query() and closes the SDK turn instead of holding it', async () => {
+  const approvalRegistry = await import('./approval-registry.js');
+  const { createSession, getSession } = await import('./eventlog.js');
+  const sid = 'sdk-workflow-approval-park';
+  if (!getSession(sid)) createSession({ id: sid, kind: 'workflow', title: 'SDK workflow approval park' });
+  let permissionResult: { behavior?: string; interrupt?: boolean } | undefined;
+  setClaudeAgentSdkQueryForTest(((p: any) => {
+    const canUse = p.options.canUseTool as (n: string, i: unknown, o: unknown) => Promise<any>;
+    return stubsFor((async function* () {
+      yield initOnlyMessage();
+      permissionResult = await canUse(
+        'mcp__clementine-local__run_shell_command',
+        { command: 'git push origin main' },
+        { signal: new AbortController().signal, toolUseID: 'toolu_park_exact' },
+      );
+      // A real SDK honors interrupt:true and ends here. Ending the fake stream
+      // without a result proves runClaudeAgentSdk uses the typed boundary rather
+      // than misreporting "finished without a result".
+    })());
+  }) as any);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const run = runClaudeAgentSdk({
+      prompt: 'perform the exact gated send',
+      sessionId: sid,
+      modelId: 'claude-sonnet-4-6',
+      agentic: true,
+      approvalMode: 'park',
+      allowedLocalMcpTools: ['read_file', 'memory_search'],
+    });
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('SDK workflow approval park did not release query() promptly')), 1000);
+    });
+    await assert.rejects(
+      Promise.race([run, deadline]),
+      (err: unknown) => {
+        assert.ok(err instanceof ClaudeAgentSdkApprovalBoundaryError);
+        assert.equal(err.boundary.state, 'pending');
+        assert.equal(err.boundary.sessionId, sid);
+        return true;
+      },
+    );
+    assert.deepEqual(permissionResult, {
+      behavior: 'deny',
+      message: approvalRegistry.listPending({ sessionId: sid })[0]
+        ? `Approval ${approvalRegistry.listPending({ sessionId: sid })[0].approvalId} is pending; the workflow run has been parked.`
+        : undefined,
+      interrupt: true,
+    });
+    assert.equal(approvalRegistry.listPending({ sessionId: sid }).length, 1);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 });
 

@@ -8,7 +8,7 @@ import {
   type ModelRole,
   type RoleBinding,
 } from '../runtime/harness/model-roles.js';
-import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
+import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { slugifyIntent } from '../memory/tool-choice-store.js';
 import { validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
@@ -56,9 +56,17 @@ function applyRoleBinding(role: ModelRole, modelId: string, clear: boolean, when
       updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
       delete process.env.CLEMMY_DEBATE_JUDGE;
     } else {
-      const branch = resolveProvider(modelId) === 'codex' ? 'codex' : 'claude';
-      updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);
-      process.env.CLEMMY_DEBATE_JUDGE = branch;
+      const provider = resolveEffectiveProviderForModel(modelId);
+      if (provider === 'byo') {
+        // The role binding carries the exact BYO model. The legacy fusion branch
+        // can only express Claude/Codex, so clear it instead of silently forcing
+        // a BYO judge onto Claude.
+        updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
+        delete process.env.CLEMMY_DEBATE_JUDGE;
+      } else {
+        updateEnvKey('CLEMMY_DEBATE_JUDGE', provider);
+        process.env.CLEMMY_DEBATE_JUDGE = provider;
+      }
     }
   }
   bustModelCaches();

@@ -112,3 +112,19 @@ test('reduceActivity: watcher_steer heartbeat appends a check row; other heartbe
   assert.equal(a[0].label, 'Watcher steered');
   assert.equal(a[0].detail, 'criterion untouched → address it before drafting');
 });
+
+test('reduceActivity preserves explicit BYO identity for provider-shaped model IDs', () => {
+  const gptShaped = reduceActivity([], ev('worker_started', {
+    item: 'custom-openai-compatible',
+    provider: 'byo',
+    model: 'gpt-4o',
+  }));
+  assert.equal(gptShaped[0].provider, 'byo');
+
+  const claudeShaped = reduceActivity([], ev('worker_started', {
+    item: 'custom-anthropic-compatible',
+    provider: 'byo',
+    model: 'claude-3-7-sonnet',
+  }));
+  assert.equal(claudeShaped[0].provider, 'byo');
+});

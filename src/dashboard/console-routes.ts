@@ -302,6 +302,7 @@ import {
   slugifyProviderId,
   serializeExtraProviders,
   discoverProviderModels,
+  resolveEffectiveProviderForModel,
   type ByoProvider,
 } from '../runtime/harness/byo-providers.js';
 import { resolveRoleModel, readDurableBindings, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
@@ -10504,10 +10505,14 @@ export function registerConsoleRoutes(
           updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
           delete process.env.CLEMMY_DEBATE_JUDGE;
         } else {
-          const prov = resolveProvider(modelId);
-          const branch = prov === 'codex' ? 'codex' : 'claude';
-          updateEnvKey('CLEMMY_DEBATE_JUDGE', branch);
-          process.env.CLEMMY_DEBATE_JUDGE = branch;
+          const provider = resolveEffectiveProviderForModel(modelId);
+          if (provider === 'byo') {
+            updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
+            delete process.env.CLEMMY_DEBATE_JUDGE;
+          } else {
+            updateEnvKey('CLEMMY_DEBATE_JUDGE', provider);
+            process.env.CLEMMY_DEBATE_JUDGE = provider;
+          }
         }
       }
 
@@ -10565,7 +10570,13 @@ export function registerConsoleRoutes(
         const bindings = readDurableBindings();
         const nextBindings = bindings.filter((b) => {
           if (!(b.role === 'judge' && !b.whenIntent)) return true;
-          const prov = resolveProvider(b.modelId);
+          if (getByoProviders().some((provider) => provider.modelIds.includes(b.modelId))) return true;
+          let prov: 'codex' | 'claude' | 'byo';
+          try {
+            prov = resolveEffectiveProviderForModel(b.modelId);
+          } catch {
+            return true; // ambiguous/stale identity must never be deleted by Fusion Save
+          }
           if (prov === 'byo') return true;
           return prov === judge;
         });

@@ -107,8 +107,7 @@ test('EXHIBIT B guard: the completion judge never fires while an approval card i
   const base = {
     optIn: true,
     actionIntent: true,
-    totalToolCalls: 10,
-    workThreshold: 3,
+    meaningfulToolEvidence: false,
     continuationsUsed: 0,
     maxContinuations: 2,
     nextAction: 'completed',
@@ -122,8 +121,18 @@ test('EXHIBIT B guard: the completion judge never fires while an approval card i
 const { looksLikeNativeMcpSend } = await import('./execution-gate.js');
 const { classifyExternalWrite } = await import('./confirm-first-gate.js');
 
-test('native MCP send names are classified as irreversible sends (lane 3)', () => {
-  for (const name of ['outlook_send_mail', 'gmail__send_email', 'vapi__make_outbound_call', 'create_call', 'slack__post_message', 'x__broadcast']) {
+test('native MCP send names are classified as irreversible sends across naming conventions', () => {
+  for (const name of [
+    'outlook_send_mail',
+    'gmail__send_email',
+    'gmail__sendEmail',
+    'vapi__make-outbound-call',
+    'create_call',
+    'slack__post_message',
+    'slack__postMessage',
+    'calendar__createEvent',
+    'x__broadcast',
+  ]) {
     assert.equal(looksLikeNativeMcpSend(name), true, `${name} should be a send`);
     const shape = classifyExternalWrite(name, {});
     assert.equal(shape.irreversible, true, `${name} classifies irreversible`);

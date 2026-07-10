@@ -32,7 +32,13 @@ process.env.CLEMMY_CLAUDE_TRANSPORT = 'headless';
 delete process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE; // default-on
 
 const { workflowRunnerInternalsForTest } = await import('./workflow-runner.js');
-const { resolveWorkflowStepModel, workflowStepCanRunOnClaudeAgentSdk } = workflowRunnerInternalsForTest;
+const {
+  resolveWorkflowStepModel,
+  workflowStepCanRunOnClaudeAgentSdk,
+  workflowStepUsesFullClaudeLane,
+  shouldUseDeclarativeStepApproval,
+  exactApprovedSendTools,
+} = workflowRunnerInternalsForTest;
 const { claudeAgentSdkWorkflowStepEnabled } = await import('../runtime/harness/claude-agent-workflow-step.js');
 const { buildClaudeHeadlessArgs } = await import('../runtime/harness/claude-headless-model.js');
 const { getClaudeBrainModel, MODELS } = await import('../config.js');
@@ -77,6 +83,43 @@ test('FIX: write/send steps may run on the full gated Claude lane (gates enforce
     true,
     'a send step should be allowed on the full gated Claude lane (grounding/approval gates still apply)',
   );
+});
+
+test('approved requiresApproval Claude step uses the full SDK lane after the runner gate resolves', () => {
+  const approved = {
+    id: 'send_approved',
+    prompt: 'Send the approved message with composio_execute_tool.',
+    model: 'claude-sonnet-4-6',
+    sideEffect: 'send' as const,
+    requiresApproval: true,
+  };
+  assert.equal(claudeAgentSdkWorkflowStepEnabled(approved.model), true);
+  assert.equal(workflowStepCanRunOnClaudeAgentSdk(approved as never), true);
+  assert.equal(workflowStepUsesFullClaudeLane(approved as never), true, 'fullLane keeps the real workflow session/plan scope');
+});
+
+test('generic send steps use the concrete tool card; exact sends keep one declarative grant', () => {
+  const workflow = { name: 'approval-shapes', allowedTools: ['composio_execute_tool'] } as never;
+  const generic = {
+    id: 'generic-send',
+    prompt: 'Choose and send the message.',
+    sideEffect: 'send' as const,
+    requiresApproval: true,
+    allowedTools: ['composio_execute_tool'],
+  };
+  assert.equal(shouldUseDeclarativeStepApproval(workflow, generic as never), false);
+  assert.deepEqual(exactApprovedSendTools(workflow, generic as never), []);
+
+  const exact = {
+    ...generic,
+    id: 'exact-send',
+    allowedTools: ['slack__postMessage'],
+  };
+  assert.equal(shouldUseDeclarativeStepApproval(workflow, exact as never), true);
+  assert.deepEqual(exactApprovedSendTools(workflow, exact as never), ['slack__postMessage']);
+
+  const reversible = { ...generic, id: 'draft', sideEffect: 'write' as const };
+  assert.equal(shouldUseDeclarativeStepApproval(workflow, reversible as never), true);
 });
 
 test('HEADLINE: under a CODEX brain, the full Claude lane is still available for an INJECTED Claude step', () => {

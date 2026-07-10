@@ -166,7 +166,10 @@ const DISPATCH_VERBS: ReadonlySet<string> = new Set(['CREATE', 'MAKE', 'RESPOND'
  *  reversible; a SEND/PUBLISH/CALL verb is a send; a CREATE/MAKE/RESPOND/POST
  *  of a communication object is a send. Pure + exported. */
 export function isIrreversibleSendSlug(slug: string): boolean {
-  const parts = slug.toUpperCase().split(/[_.]/);
+  const normalized = slug
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[-\s/]+/g, '_');
+  const parts = normalized.toUpperCase().split(/[_.]+/).filter(Boolean);
   // DRAFT handling must run BEFORE the send-verb match, but must NOT blanket-
   // exempt an explicit send-of-draft: SEND_DRAFT / PUBLISH_DRAFT actually
   // dispatch the composed draft, while CREATE_DRAFT / CREATE_REPLY_DRAFT do not.

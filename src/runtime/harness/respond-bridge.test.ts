@@ -252,6 +252,55 @@ test('respondPreferHarness: Claude auth + SDK brain opt-in routes chat through C
   assert.equal(runConversationCalled, 0, 'Claude SDK brain is a distinct route from the OpenAI SDK runner');
 });
 
+test('active-Claude cron dispatches through the tool-capable SDK lane', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  let sdkCalls = 0;
+  let harnessCalls = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => { harnessCalls += 1; return { status: 'completed' }; }) as never,
+    claudeAgentBrain: (async () => {
+      sdkCalls += 1;
+      return { text: 'cron complete', raw: { transport: 'claude_agent_sdk_brain', model: 'claude-sonnet-4-6', mode: 'full' } };
+    }) as never,
+  });
+
+  const res = await respondPreferHarness('cron', { message: 'run scheduled sync', sessionId: 'cron-sdk-route' }, async () => ({ text: 'legacy' }));
+  assert.equal(res.text, 'cron complete');
+  assert.equal(res.route?.routeKind, 'claude_agent_sdk_brain');
+  assert.equal(sdkCalls, 1);
+  assert.equal(harnessCalls, 0, 'cron never falls into the tool-bearing headless harness');
+});
+
+test('stale claude_oauth plus all_in Claude-shaped BYO stays on the harness/BYO lane', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.MODEL_ROUTING_MODE = 'all_in';
+  process.env.BYO_MODEL_BASE_URL = 'https://byo.example.test/v1';
+  process.env.BYO_MODEL_API_KEY = 'byo-key';
+  process.env.BYO_MODEL_ID = 'claude-custom';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
+  let sdkCalls = 0;
+  let harnessCalls = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string }) => {
+      harnessCalls += 1;
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, lastDecision: { reply: 'BYO complete', done: true, nextAction: 'completed' } };
+    }) as never,
+    claudeAgentBrain: (async () => { sdkCalls += 1; return { text: 'wrong lane' }; }) as never,
+  });
+
+  const res = await respondPreferHarness('home', { message: 'do the task', sessionId: 'allin-claude-shaped-byo' }, async () => ({ text: 'legacy' }));
+  assert.equal(res.text, 'BYO complete');
+  assert.equal(res.route?.routeKind, 'harness');
+  assert.equal(res.route?.provider, 'byo');
+  assert.equal(sdkCalls, 0, 'all_in provider isolation wins over stale Claude auth');
+  assert.equal(harnessCalls, 1);
+});
+
 test('respondPreferHarness: Discord and Slack are first-class chat bridge surfaces', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';

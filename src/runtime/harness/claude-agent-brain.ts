@@ -43,6 +43,7 @@ import {
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
 import { resolveEffectiveToolNames, type ToolNamePolicyResult } from './tool-policy.js';
+import { hasMeaningfulSuccessfulToolNames } from './tool-evidence.js';
 import { renderHarnessCapabilityHealthForContext } from './capability-health.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
@@ -284,11 +285,12 @@ function sdkAutoContinueWallMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 1_800_000;
 }
 
-export type ClaudeAgentBrainSurface = 'webhook' | 'cli' | 'dashboard' | 'home' | 'discord' | 'slack' | 'background';
+export type ClaudeAgentBrainSurface = 'webhook' | 'cron' | 'cli' | 'dashboard' | 'home' | 'discord' | 'slack' | 'background';
 export type ClaudeAgentBrainMode = 'read_only' | 'local_authoring' | 'full';
 
 function configuredMode(): ClaudeAgentBrainMode | null {
-  // Claude chat/background must use the tool-capable Agent SDK lane by default.
+  // Claude chat and unattended execution surfaces use the tool-capable Agent
+  // SDK lane by default.
   // The standard `claude -p` transport is intentionally text-only. Full-mode
   // writes still pass through Clementine's approval and tool-boundary gates.
   const raw = (getRuntimeEnv('CLEMMY_CLAUDE_AGENT_SDK_BRAIN', 'full') ?? 'full').trim().toLowerCase();
@@ -316,11 +318,16 @@ export function claudeAgentSdkBrainMode(): ClaudeAgentBrainMode | null {
 }
 
 export function isClaudeAgentBrainSurface(surface: string): surface is ClaudeAgentBrainSurface {
-  return surface === 'webhook' || surface === 'cli' || surface === 'dashboard' || surface === 'home' || surface === 'discord' || surface === 'slack' || surface === 'background';
+  return surface === 'webhook' || surface === 'cron' || surface === 'cli' || surface === 'dashboard' || surface === 'home' || surface === 'discord' || surface === 'slack' || surface === 'background';
 }
 
 export function claudeAgentSdkBrainEnabled(surface: string): surface is ClaudeAgentBrainSurface {
-  return configuredMode() !== null && getActiveAuthMode() === 'claude_oauth' && isClaudeAgentBrainSurface(surface);
+  if (configuredMode() === null || getActiveAuthMode() !== 'claude_oauth' || !isClaudeAgentBrainSurface(surface)) return false;
+  try {
+    return resolveRoleModel('brain').provider === 'claude';
+  } catch {
+    return false;
+  }
 }
 
 function maxTurns(): number {
@@ -386,6 +393,36 @@ const COMPLETION_CLAIM_RE =
 
 function looksLikeActionCompletionClaim(requestText: string, replyText: string): boolean {
   return ACTION_REQUEST_RE.test(requestText || '') && COMPLETION_CLAIM_RE.test(replyText || '');
+}
+
+/** The completion judge is a recovery path for suspicious text, not a tax on
+ * successful tool execution. Concrete tool-backed runs already carry durable
+ * tool/result evidence; bouncing them through another full model run adds
+ * latency and can repeat side effects. A promise remains suspicious even when a
+ * partial tool call happened, while a zero-tool action claim still needs proof. */
+export function shouldJudgeClaudeCompletion(
+  requestText: string,
+  replyText: string,
+  successfulToolUses: string[],
+): boolean {
+  return isPromiseShapedReply(replyText)
+    || (!hasMeaningfulSuccessfulToolNames(successfulToolUses, requestText)
+      && looksLikeActionCompletionClaim(requestText, replyText));
+}
+
+function mergeClaudeRunEvidence(
+  previous: ClaudeAgentSdkRunResult,
+  next: ClaudeAgentSdkRunResult,
+): ClaudeAgentSdkRunResult {
+  const hasSuccessfulEvidence = previous.successfulToolUses !== undefined
+    || next.successfulToolUses !== undefined;
+  return {
+    ...next,
+    toolUses: [...previous.toolUses, ...next.toolUses],
+    ...(hasSuccessfulEvidence
+      ? { successfulToolUses: [...(previous.successfulToolUses ?? []), ...(next.successfulToolUses ?? [])] }
+      : {}),
+  };
 }
 
 // JIT tool-RAG helpers (Claude-brain port).
@@ -497,16 +534,15 @@ export function frameTrustedMemory(persistentContext: string): string {
 // learned facts, data locations) is embedded in the CACHEABLE system append.
 // Re-rendering it every turn meant a single reflection-written fact changed the
 // block and busted the whole prompt-prefix cache (measured ~28% hit rate). We
-// snapshot it PER SESSION so the system append stays byte-stable across turns;
-// facts learned mid-session still reach the model via the volatile tail's hybrid
-// recall (renderClaudeAgentBrainTurnContext), so nothing is lost — only the cache
-// benefits. Kill-switch CLEMMY_BRAIN_STABLE_SNAPSHOT=off reverts to per-turn
-// rendering. (2026-07-09)
+// snapshot it PER SESSION so the system append stays byte-stable across turns.
+// This remains opt-in until every explicit memory/profile/connection mutation
+// shares a production invalidation generation; otherwise Claude can carry stale
+// preferences and capabilities for the rest of a live session.
 const stableMemorySnapshots = new Map<string, string>();
 const STABLE_SNAPSHOT_MAX = 256;
 
 function stableSnapshotEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_BRAIN_STABLE_SNAPSHOT', 'on') ?? 'on').trim().toLowerCase() !== 'off';
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BRAIN_STABLE_SNAPSHOT', 'off') ?? 'off').trim());
 }
 
 /** Invalidate a session's frozen stable-memory snapshot so the next turn
@@ -762,10 +798,11 @@ export async function respondViaClaudeAgentSdkBrain(
 ): Promise<AssistantResponse> {
   const sessionId = request.sessionId;
   const mode = claudeAgentSdkBrainMode() ?? 'read_only';
+  const completionJudgeForSurface = surface !== 'background' && surface !== 'cron' && completionJudgeEnabled();
   const isSpaceSession = workspaceSlugFromSessionId(sessionId) != null;
   if (!getSession(sessionId)) {
     const titleSeed = request.message.trim().replace(/\s+/g, ' ');
-    const sessionKind = surface === 'background' ? 'execution' : 'chat';
+    const sessionKind = surface === 'background' || surface === 'cron' ? 'execution' : 'chat';
     createSession({
       id: sessionId,
       kind: sessionKind,
@@ -1099,7 +1136,7 @@ export async function respondViaClaudeAgentSdkBrain(
         ...cleanContinuationRunOptions(),
       });
       continuationsUsed += 1; // a continuation was spent (a parse stumble → null still cost a query())
-      if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
+      if (retry) result = mergeClaudeRunEvidence(result, retry);
     }
 
     // Reasoning-leak backstop (defense-in-depth; the trusted-memory framing prevents
@@ -1118,7 +1155,7 @@ export async function respondViaClaudeAgentSdkBrain(
         ...cleanContinuationRunOptions(),
       });
       continuationsUsed += 1;
-      if (retry) result = { ...retry, toolUses: [...result.toolUses, ...retry.toolUses] };
+      if (retry) result = mergeClaudeRunEvidence(result, retry);
     }
 
     // Objective-completion judge (parity with the harness loop): on an authoring
@@ -1132,7 +1169,6 @@ export async function respondViaClaudeAgentSdkBrain(
     // deliverable — flip to awaiting-input and never judge it, instead of the
     // judge scolding the question into autonomous execution.
     if (
-      completionJudgeEnabled() &&
       modeCanAuthorOrExecute(mode) &&
       !resultIsAwaitingInput() &&
       !result.limitHit &&
@@ -1141,15 +1177,11 @@ export async function respondViaClaudeAgentSdkBrain(
       result = { ...result, stoppedReason: 'awaiting-input' };
     }
     if (
-      completionJudgeEnabled() &&
+      completionJudgeForSurface &&
       modeCanAuthorOrExecute(mode) &&
       !resultIsAwaitingInput() &&
       !result.limitHit &&
-      (
-        result.toolUses.length > 0 ||
-        isPromiseShapedReply(result.text) ||
-        looksLikeActionCompletionClaim(request.message, result.text)
-      )
+      shouldJudgeClaudeCompletion(request.message, result.text, result.successfulToolUses ?? result.toolUses)
     ) {
       const objective = composeJudgedObjective(
         request.message,
@@ -1203,7 +1235,7 @@ export async function respondViaClaudeAgentSdkBrain(
         });
         continuationsUsed += 1;
         if (!contResult) break; // parse stumble on a continuation → keep the prior good result
-        result = { ...contResult, toolUses: [...result.toolUses, ...contResult.toolUses] };
+        result = mergeClaudeRunEvidence(result, contResult);
         if (contResult.limitHit) break;
       }
     }
@@ -1268,7 +1300,7 @@ export async function respondViaClaudeAgentSdkBrain(
         autoContinues += 1;
         if (!cont) break; // a parse stumble on a continuation → keep the prior partial
         continuationLedger = [...continuationLedger, ...(cont.toolCallLedger ?? [])];
-        result = { ...cont, toolUses: [...result.toolUses, ...cont.toolUses] };
+        result = mergeClaudeRunEvidence(result, cont);
         try {
           appendEvent({ sessionId, turn: 0, role: 'system', type: 'sdk_auto_continue', data: { attempt: autoContinues, stillLimited: Boolean(cont.limitHit) } });
         } catch { /* telemetry best-effort */ }

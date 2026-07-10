@@ -25,7 +25,6 @@ const SECRET_VAULT_FILE = path.join(CACHE_DIR, 'secrets-vault.json');
 const DEFAULT_USER_ID = 'default';
 const CONNECTIONS_TTL_MS = 60_000;
 const CATALOG_TTL_MS = 60 * 60_000;
-const USER_ID_TTL_MS = 60_000;
 const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
 export const COMPOSIO_AUTH_CONFIGS_URL = 'https://dashboard.composio.dev/~/project/auth-configs';
 
@@ -231,9 +230,11 @@ interface AccountIdentity {
 
 let singleton: Composio | null = null;
 let localEnvCache: { at: number; env: Record<string, string> } | null = null;
-let connectionsCache: { at: number; data: ConnectedToolkit[] } | null = null;
+let connectionsCache: { at: number; data: ConnectedToolkit[]; preferredUserId: string } | null = null;
+let connectionsGeneration = 0;
+let connectionsInflight: { generation: number; promise: Promise<ConnectedToolkit[]> } | null = null;
+let connectedAccountsLoaderForTest: (() => Promise<Array<Record<string, unknown>>>) | null = null;
 let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
-let detectedPreferredUserId: { at: number; value: string } | null = null;
 
 // Per-toolkit tool-list cache (D3): composio_search_tools fans out to
 // listComposioToolkitTools once PER connected toolkit PER search, each a
@@ -559,55 +560,37 @@ export async function saveComposioCredentials(apiKey: string, userId?: string): 
 export function resetComposioClient(): void {
   singleton = null;
   localEnvCache = null;
-  connectionsCache = null;
+  invalidateConnectedAccountSnapshot();
   catalogCache = null;
-  detectedPreferredUserId = null;
   toolkitToolsCache.clear();
 }
 
 export function clearConnectedToolkitsCache(): void {
-  connectionsCache = null;
+  invalidateConnectedAccountSnapshot();
   // A new/changed connection can expose a toolkit's tools for the first time.
   toolkitToolsCache.clear();
 }
 
-let preferredUserIdInflight: Promise<string> | null = null;
-
-/** The live user-id detection (probes connected_accounts, picks the user with the
- *  most ACTIVE connections) + cache write, deduped so a parallel wave shares one
- *  probe. */
-async function refreshPreferredUserId(): Promise<string> {
-  if (preferredUserIdInflight) return preferredUserIdInflight;
-  preferredUserIdInflight = (async (): Promise<string> => {
-    try {
-      const composio = getComposio();
-      if (!composio) return DEFAULT_USER_ID;
-      const rawClient = rawComposioClient(composio);
-      const resp = await rawClient.connectedAccounts.list({ limit: 100 });
-      const items = Array.isArray(resp) ? resp : (resp?.items ?? []);
-      const counts = new Map<string, number>();
-      for (const item of items as Array<Record<string, unknown>>) {
-        const userId = str(item.user_id) ?? str(item.userId);
-        if (!userId) continue;
-        const weight = item.status === 'ACTIVE' ? 2 : 1;
-        counts.set(userId, (counts.get(userId) ?? 0) + weight);
-      }
-      const [top] = [...counts.entries()].sort((left, right) => right[1] - left[1])[0] ?? [];
-      const value = top ?? DEFAULT_USER_ID;
-      detectedPreferredUserId = { at: Date.now(), value };
-      return value;
-    } catch {
-      // Composio auth still works for first-run users; default is safe.
-      detectedPreferredUserId = { at: Date.now(), value: DEFAULT_USER_ID };
-      return DEFAULT_USER_ID;
-    } finally {
-      preferredUserIdInflight = null;
-    }
-  })();
-  return preferredUserIdInflight;
+function invalidateConnectedAccountSnapshot(): void {
+  connectionsGeneration += 1;
+  connectionsCache = null;
+  // A prior request cannot be cancelled, but detaching it prevents new callers
+  // from joining it. Its late result is ignored by the generation check.
+  connectionsInflight = null;
 }
 
-export async function getPreferredUserId(): Promise<string> {
+function preferredUserIdFromConnectedAccounts(items: Array<Record<string, unknown>>): string {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const userId = str(item.user_id) ?? str(item.userId);
+    if (!userId) continue;
+    const weight = /active/i.test(str(item.status) ?? '') ? 2 : 1;
+    counts.set(userId, (counts.get(userId) ?? 0) + weight);
+  }
+  return [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? DEFAULT_USER_ID;
+}
+
+export async function getPreferredUserId(options: { requireFresh?: boolean } = {}): Promise<string> {
   const explicit = readComposioEnv('COMPOSIO_USER_ID');
   // Treat the literal "default" sentinel as "not set" so already-installed
   // users whose .env still carries COMPOSIO_USER_ID=default also fall through
@@ -615,23 +598,8 @@ export async function getPreferredUserId(): Promise<string> {
   // DEFAULT_USER_ID ('default') anyway, and a user with real connections under
   // the literal "default" id is still surfaced as the top connected user.
   if (explicit && explicit !== DEFAULT_USER_ID) return explicit;
-
-  const now = Date.now();
-  // Fresh → cached.
-  if (detectedPreferredUserId && now - detectedPreferredUserId.at < USER_ID_TTL_MS) {
-    return detectedPreferredUserId.value;
-  }
-  // STALE → serve instantly + refresh in background. executeComposioTool calls
-  // this on EVERY dispatch and it hit the same connectedAccounts.list endpoint,
-  // blocking ~2-3s cold after >60s idle — the same tax the connections SWR fix
-  // removed (2026-07-10). A connect/disconnect nulls detectedPreferredUserId, so
-  // a genuine change is never masked.
-  if (detectedPreferredUserId) {
-    void refreshPreferredUserId().catch(() => { /* stale stays served */ });
-    return detectedPreferredUserId.value;
-  }
-  // Cold (first ever) → await one deduped detection.
-  return refreshPreferredUserId();
+  await listConnectedToolkits({ requireFresh: options.requireFresh });
+  return connectionsCache?.preferredUserId ?? DEFAULT_USER_ID;
 }
 
 function rawComposioClient(composio: Composio): any {
@@ -689,19 +657,23 @@ function extractAccountIdentity(state: unknown, data: unknown): AccountIdentity 
   return out;
 }
 
-let connectionsInflight: Promise<ConnectedToolkit[]> | null = null;
+async function loadConnectedAccountItems(): Promise<Array<Record<string, unknown>>> {
+  if (connectedAccountsLoaderForTest) return connectedAccountsLoaderForTest();
+  const composio = getComposio();
+  if (!composio) return [];
+  const resp = await (composio as any).connectedAccounts.list({ limit: 100 });
+  return Array.isArray(resp) ? resp : (resp?.items ?? []);
+}
 
-/** The live broker fetch + cache write, deduped so concurrent callers (a parallel
- *  wave of composio calls) share ONE upstream request instead of N. */
+/** One generation-safe account snapshot feeds connection routing and preferred
+ * user selection. This removes the duplicate connectedAccounts.list probes. */
 async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
-  if (connectionsInflight) return connectionsInflight;
-  connectionsInflight = (async (): Promise<ConnectedToolkit[]> => {
-    const composio = getComposio();
-    if (!composio) return [];
-    try {
-      const resp = await (composio as any).connectedAccounts.list({ limit: 100 });
-      const items = Array.isArray(resp) ? resp : (resp?.items ?? []);
-      const data = (items as Array<Record<string, unknown>>).map((item) => {
+  const generation = connectionsGeneration;
+  if (connectionsInflight?.generation === generation) return connectionsInflight.promise;
+  let promise!: Promise<ConnectedToolkit[]>;
+  promise = (async (): Promise<ConnectedToolkit[]> => {
+      const items = await loadConnectedAccountItems();
+      const data = items.map((item) => {
         const toolkit = obj(item.toolkit);
         const authConfig = obj(item.authConfig);
         const identity = extractAccountIdentity(item.state, item.data);
@@ -725,42 +697,48 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
           createdAt: str(item.createdAt) ?? str(item.created_at),
         };
       }).filter((connection) => connection.connectionId && connection.slug !== 'unknown');
-
-      connectionsCache = { at: Date.now(), data };
+      if (generation !== connectionsGeneration) {
+        throw new Error('Composio account state changed during refresh; retry the operation.');
+      }
+      connectionsCache = {
+        at: Date.now(),
+        data,
+        preferredUserId: preferredUserIdFromConnectedAccounts(items),
+      };
       return data;
-    } catch {
-      return connectionsCache?.data ?? [];
-    } finally {
-      connectionsInflight = null;
-    }
-  })();
-  return connectionsInflight;
+  })().finally(() => {
+    if (connectionsInflight?.promise === promise) connectionsInflight = null;
+  });
+  connectionsInflight = { generation, promise };
+  return promise;
 }
 
-export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
-  if (!getComposio()) return [];
+export async function listConnectedToolkits(
+  options: { requireFresh?: boolean } = {},
+): Promise<ConnectedToolkit[]> {
+  if (!connectedAccountsLoaderForTest && !getComposio()) return [];
   const now = Date.now();
   // Fresh → serve cached.
   if (connectionsCache && now - connectionsCache.at < CONNECTIONS_TTL_MS) return connectionsCache.data;
-  // STALE-WHILE-REVALIDATE (2026-07-10 speed fix): EVERY composio_execute/status
-  // resolves the connection through here, so after >60s idle (i.e. between most
-  // chat messages) the old hard-TTL BLOCKED ~3s on a cold refetch — measured as
-  // the fixed tax on the first composio call of every interaction. Now: serve the
-  // recent-but-stale list INSTANTLY and refresh in the background. A real connect/
-  // disconnect/save nulls connectionsCache (the bust points), so a genuine change
-  // is never masked; stale is bounded to the same window the hard-TTL already
-  // tolerated, just non-blocking (mirrors the dashboard SWR pattern above).
+  // Execution routing must use a fresh account snapshot. Dashboard/status reads
+  // may use SWR because they cannot produce a side effect.
+  if (options.requireFresh) return refreshConnectedToolkits();
   if (connectionsCache) {
     void refreshConnectedToolkits().catch(() => { /* stale stays served; next call retries */ });
     return connectionsCache.data;
   }
-  // Cold (first ever) → await one deduped live fetch.
-  return refreshConnectedToolkits();
+  try {
+    return await refreshConnectedToolkits();
+  } catch {
+    return [];
+  }
 }
 
-export async function listUsableConnectedToolkits(): Promise<ConnectedToolkit[]> {
+export async function listUsableConnectedToolkits(
+  options: { requireFresh?: boolean } = {},
+): Promise<ConnectedToolkit[]> {
   return filterSuppressedConnectedToolkits(
-    await listConnectedToolkits(),
+    await listConnectedToolkits(options),
     readComposioConnectionSuppressionState(),
   );
 }
@@ -977,7 +955,7 @@ export async function authorizeToolkit(slug: string): Promise<{ redirectUrl: str
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
 
-  const userId = await getPreferredUserId();
+  const userId = await getPreferredUserId({ requireFresh: true });
   try {
     const authConfigIdToUse = await findToolkitAuthConfigId(composio, slug);
     if (!authConfigIdToUse) {
@@ -992,8 +970,7 @@ export async function authorizeToolkit(slug: string): Promise<{ redirectUrl: str
     // Composio is retiring that path for managed OAuth orgs in favor of
     // Connect Link (/api/v3/connected_accounts/link).
     const connection = await (composio as any).connectedAccounts.link(userId, authConfigIdToUse, { allowMultiple: true });
-    detectedPreferredUserId = null;
-    connectionsCache = null;
+    invalidateConnectedAccountSnapshot();
     return {
       redirectUrl: connection.redirectUrl ?? connection.redirect_url ?? null,
       connectionId: connection.id ?? connection.connectedAccountId ?? connection.connected_account_id ?? '',
@@ -1110,8 +1087,7 @@ export async function setupOAuthToolkit(slug: string): Promise<{ ok: true; authC
   if (!authConfigId) {
     throw new Error(`Composio returned no auth_config id. Body: ${JSON.stringify(result).slice(0, 200)}`);
   }
-  connectionsCache = null;
-  detectedPreferredUserId = null;
+  invalidateConnectedAccountSnapshot();
   return { ok: true, authConfigId };
 }
 
@@ -1119,7 +1095,7 @@ export async function disconnectToolkit(connectionId: string): Promise<void> {
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
   await (composio as any).connectedAccounts.delete(connectionId);
-  connectionsCache = null;
+  invalidateConnectedAccountSnapshot();
 }
 
 /**
@@ -1151,7 +1127,7 @@ export async function setupApiKeyToolkit(
 ): Promise<{ ok: true; authConfigId: string; connectionId: string }> {
   const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
   if (!composioApiKey) throw new Error('COMPOSIO_API_KEY is not configured.');
-  const userId = await getPreferredUserId();
+  const userId = await getPreferredUserId({ requireFresh: true });
 
   // Step 1 — project-level auth_config (via raw fetch; see banner).
   const createAuthRes = await fetch('https://backend.composio.dev/api/v3/auth_configs', {
@@ -1215,8 +1191,7 @@ export async function setupApiKeyToolkit(
   const connectionId = str(connection.id) ?? str(connection.nanoid) ?? '';
 
   // Bust caches so the dashboard refresh picks up the new connection.
-  connectionsCache = null;
-  detectedPreferredUserId = null;
+  invalidateConnectedAccountSnapshot();
   return { ok: true, authConfigId, connectionId };
 }
 
@@ -1368,7 +1343,7 @@ export async function executeComposioTool(
   // user's data actually is. Without this, the CLI path emits
   // `ToolRouterV2_NoActiveConnection` for every toolkit a user has set
   // up via the dashboard.
-  const userId = await getPreferredUserId();
+  const userId = await getPreferredUserId({ requireFresh: true });
 
   // A model (esp. a BYO/GLM backend) can serialize a null account id as the
   // LITERAL string "null"/"undefined"/"none" — truthy, so it both bypasses the
@@ -1445,7 +1420,7 @@ export async function executeComposioTool(
  */
 export async function resolveToolkitConnectionId(toolSlug: string): Promise<string | undefined> {
   try {
-    return pickToolkitConnection(toolSlug, await listUsableConnectedToolkits());
+    return pickToolkitConnection(toolSlug, await listUsableConnectedToolkits({ requireFresh: true }));
   } catch {
     return undefined;
   }
@@ -1597,4 +1572,11 @@ export const __test__ = {
   authConfigId,
   authConfigToolkitSlug,
   selectAuthConfigIdForToolkit,
+  preferredUserIdFromConnectedAccounts,
+  setConnectedAccountsLoader(
+    loader: (() => Promise<Array<Record<string, unknown>>>) | null,
+  ): void {
+    connectedAccountsLoaderForTest = loader;
+    invalidateConnectedAccountSnapshot();
+  },
 };

@@ -11,7 +11,7 @@ import { processCalendarMonitor } from '../agents/calendar-monitor.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
-import { MODELS, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { processExecutionController } from '../execution/controller.js';
@@ -44,6 +44,7 @@ import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
 import { sweepStaleApprovals } from '../runtime/approval-store.js';
 import { getAuthStatus } from '../runtime/auth-store.js';
+import { getClaudeAuthSnapshot } from '../runtime/claude-oauth.js';
 import { tickAuthKeepalive, isAuthKeepaliveEnabled } from '../runtime/auth-keepalive.js';
 import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } from '../config.js';
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
@@ -148,6 +149,10 @@ interface BootModelWarmupGate {
 
 type ConfigureHarnessRuntimeFn = typeof configureHarnessRuntime;
 type ReadOpenAiApiKeyFn = typeof getOpenAiApiKey;
+
+export function bootModelWarmupEnabled(): boolean {
+  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_BOOT_WARMUP', 'off') ?? 'off').trim());
+}
 
 export async function resolveBootModelWarmupGate(
   configure: ConfigureHarnessRuntimeFn = configureHarnessRuntime,
@@ -605,7 +610,7 @@ function reportBootSetupIssues(): void {
 
   try {
     const auth = getAuthStatus();
-    if (!auth.configured) {
+    if (!bootAuthSetupSatisfied(auth.configured)) {
       issues.push({
         slug: 'auth',
         title: 'Authentication not configured — agent runs will fail',
@@ -646,6 +651,12 @@ function reportBootSetupIssues(): void {
       metadata: { errorCategory: 'setup_gap', slug: issue.slug },
     });
   }
+}
+
+export function bootAuthSetupSatisfied(authConfigured: boolean): boolean {
+  if (authConfigured) return true;
+  if (getModelRoutingMode() === 'all_in' && getByoBackendConfig().configured) return true;
+  return getActiveAuthMode() === 'claude_oauth' && getClaudeAuthSnapshot().configured;
 }
 
 // Marks due executions with a once-per-day "paused by policy" activity
@@ -1370,9 +1381,11 @@ export async function startDaemon(assistant: ClementineAssistant): Promise<void>
   // primes the provider prompt cache with a representative prefix. It fires
   // ONCE per boot, so it is a bounded cold-start cost, not a per-turn leak;
   // confirm/track it via `npx tsx scripts/measure-efficiency.ts` (the `warmup`
-  // kind row). Best-effort and non-blocking — failures only log. Disable with
-  // CLEMMY_BOOT_WARMUP=off.
-  if ((getRuntimeEnv('CLEMMY_BOOT_WARMUP', 'on') ?? 'on').toLowerCase() !== 'off') {
+  // kind row). Explicit opt-in only: this still enters through the legacy
+  // assistant runtime, which can select a different provider than the active
+  // harness brain and races the first real turn. Keep it dormant until the
+  // warmup uses the unified provider-qualified core.
+  if (bootModelWarmupEnabled()) {
     setTimeout(() => {
       void (async () => {
         try {

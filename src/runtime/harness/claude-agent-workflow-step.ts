@@ -1,6 +1,7 @@
 import type { WorkflowStepInput } from '../../memory/workflow-store.js';
 import { getRuntimeEnv } from '../../config.js';
-import { recordSubagentRun, providerClassForModel } from '../../agents/subagent-runs.js';
+import { resolveEffectiveProviderForModel } from './byo-providers.js';
+import { recordSubagentRun } from '../../agents/subagent-runs.js';
 import {
   ClaudeAgentSdkToolSurfaceError,
   defaultClaudeAgentSdkAllowedLocalTools,
@@ -22,7 +23,12 @@ function flagEnabled(): boolean {
 }
 
 export function claudeAgentSdkWorkflowStepEnabled(modelId: string | undefined | null): boolean {
-  return flagEnabled() && typeof modelId === 'string' && modelId.startsWith('claude-');
+  if (!flagEnabled() || typeof modelId !== 'string' || !modelId.trim()) return false;
+  try {
+    return resolveEffectiveProviderForModel(modelId) === 'claude';
+  } catch {
+    return false;
+  }
 }
 
 function maxTurns(step: WorkflowStepInput, fullLane: boolean): number {
@@ -211,6 +217,9 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   /** Tool-capable gated lane (read + write/send through the harness gate chain)
    *  rather than the read-only profile. */
   fullLane?: boolean;
+  /** Release the SDK child + workflow drain slot on a concrete human approval.
+   *  The durable exact-payload decision is claimed once on the rerun. */
+  parkApprovals?: boolean;
 }): Promise<ClaudeAgentSdkWorkflowStepResult> {
   const fullLane = Boolean(args.fullLane);
   // Subagent visibility: a workflow STEP (and each forEach item — this runs per
@@ -243,7 +252,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
         workflowName: args.workflowName,
         stepId: args.step.id,
         role: (args.step as { intent?: string }).intent || args.step.id,
-        provider: providerClassForModel(resolvedModel),
+        provider: 'claude',
         model: resolvedModel,
         task: taskLabel,
         status,
@@ -269,6 +278,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
     // auto-continue call below too, so the continuation keeps the same scope.
     nativeMcpScopeInput: args.prompt,
     agentic: fullLane,
+    approvalMode: args.parkApprovals ? 'park' as const : 'wait' as const,
     maxTurns: maxTurns(args.step, fullLane),
     outputSchema: claudeWorkflowStepOutputSchema(),
   };

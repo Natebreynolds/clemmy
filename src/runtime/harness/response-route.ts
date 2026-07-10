@@ -1,5 +1,5 @@
 import type { AssistantResponse, AssistantRouteDiagnostics } from '../../types.js';
-import { resolveProvider } from './model-wire-registry.js';
+import { resolveEffectiveProviderForModel } from './byo-providers.js';
 
 function clean(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
@@ -7,7 +7,7 @@ function clean(value: unknown): string | undefined {
 
 function providerFor(modelId: string | undefined): string | undefined {
   if (!modelId) return undefined;
-  try { return resolveProvider(modelId); } catch { return undefined; }
+  try { return resolveEffectiveProviderForModel(modelId); } catch { return undefined; }
 }
 
 function rawRecord(value: unknown): Record<string, unknown> | null {

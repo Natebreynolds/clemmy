@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
-import { recordSubagentRun, providerClassForModel } from '../agents/subagent-runs.js';
+import { recordSubagentRun } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
 import { workerItemAlreadyCapped } from '../agents/worker-respawn-guard.js';
@@ -10,7 +10,8 @@ import { appendEvent } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome } from '../runtime/model-route-metrics.js';
-import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
+import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
+import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { textResult } from './shared.js';
 
 /**
@@ -64,9 +65,9 @@ export interface SdkBrainWorkerRoute {
  *  the ignored model surfaced. No resolvable model ⇒ the Claude brain fallback. */
 export function pickSdkBrainWorkerLane(
   resolvedId: string | undefined,
-  opts: { crossEnabled: boolean; claudeBrainModel: string },
+  opts: { crossEnabled: boolean; claudeBrainModel: string; resolvedProvider?: ModelProviderClass },
 ): SdkBrainWorkerRoute {
-  const isClaude = typeof resolvedId === 'string' && resolvedId.startsWith('claude-');
+  const isClaude = Boolean(resolvedId && opts.resolvedProvider === 'claude');
   if (isClaude) return { modelId: resolvedId as string, claudeLane: true };
   if (resolvedId && opts.crossEnabled) return { modelId: resolvedId, claudeLane: false };
   // Kill-switch off, or no resolvable model ⇒ today's Claude-only fallback.
@@ -81,12 +82,16 @@ export function pickSdkBrainWorkerLane(
  *  intent-scoped WORKER binding. Fails open to the Claude brain model. */
 export function resolveSdkBrainWorker(intent?: string): SdkBrainWorkerRoute {
   let resolvedId: string | undefined;
+  let resolvedProvider: ModelProviderClass | undefined;
   try {
-    resolvedId = resolveRoleModel('worker', intent).modelId;
+    const resolved = resolveRoleModel('worker', intent);
+    resolvedId = resolved.modelId;
+    resolvedProvider = resolved.provider;
   } catch { /* fall through to the Claude brain model */ }
   return pickSdkBrainWorkerLane(resolvedId, {
     crossEnabled: sdkBrainCrossWorkerEnabled(),
     claudeBrainModel: getClaudeBrainModel(),
+    resolvedProvider,
   });
 }
 
@@ -155,7 +160,7 @@ export function registerWorkerTools(server: McpServer): void {
       }
       // P6 concurrency cap: at most K workers in flight per session; excess queue.
       // worker_queued fires only when this worker actually has to wait for a slot.
-      const workerProvider = resolveProvider(workerModel);
+      const workerProvider = resolveEffectiveProviderForModel(workerModel);
       const release = await acquireWorkerSlot(sessionId, (info) => {
         try {
           recordOperationalEvent({
@@ -233,6 +238,9 @@ export function registerWorkerTools(server: McpServer): void {
         try {
           const ctx = getToolOutputContext();
           const capped = !ok && /MaxTurnsExceeded|hit its turn cap/i.test(result.text ?? '');
+          const resultProvider = route.claudeLane
+            ? 'claude'
+            : resolveEffectiveProviderForModel(result.model ?? workerModel);
           recordSubagentRun({
             id: `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
             parentRunId: ctx?.workflowRunId || sessionId,
@@ -240,7 +248,7 @@ export function registerWorkerTools(server: McpServer): void {
             workflowName: ctx?.workflowName,
             stepId: ctx?.stepId,
             role: input.intent || undefined,
-            provider: route.claudeLane ? 'claude' : providerClassForModel(result.model ?? workerModel),
+            provider: resultProvider,
             model: result.model ?? workerModel,
             task: input.item,
             status: capped ? 'capped' : ok ? 'ok' : 'error',
@@ -263,6 +271,7 @@ export function registerWorkerTools(server: McpServer): void {
         // as a failed specialist so a crashed worker still shows up. Fail-open.
         try {
           const ctx = getToolOutputContext();
+          const failedProvider = route.claudeLane ? 'claude' : resolveEffectiveProviderForModel(workerModel);
           recordSubagentRun({
             id: `w-${routeStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
             parentRunId: ctx?.workflowRunId || sessionId,
@@ -270,7 +279,7 @@ export function registerWorkerTools(server: McpServer): void {
             workflowName: ctx?.workflowName,
             stepId: ctx?.stepId,
             role: input.intent || undefined,
-            provider: route.claudeLane ? 'claude' : providerClassForModel(workerModel),
+            provider: failedProvider,
             model: workerModel,
             task: input.item,
             status: 'error',

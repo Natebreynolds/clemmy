@@ -40,7 +40,7 @@ import { getRuntimeEnv, getActiveAuthMode, getClaudeBrainModel, getDebateChecker
 import { ClaudeModelProvider } from './claude-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
-import { resolveByoProviderForModel } from './byo-providers.js';
+import { resolveByoProviderForModel, resolveEffectiveProviderForModel } from './byo-providers.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
@@ -1614,7 +1614,7 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
       sessionId: harnessRunContextStorage.getStore()?.sessionId,
       role: 'judge',
       resolvedModel: judgeModel,
-      provider: resolveProvider(judgeModel),
+      provider: resolveEffectiveProviderForModel(judgeModel),
       source: 'default',
       reason: { seam: rec.path === 'verify' ? 'verify_checker' : 'debate', outcome },
     });

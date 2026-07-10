@@ -65,6 +65,10 @@ export interface PendingApprovalRow {
   resolution: ApprovalResolution | null;
   resolver: string | null;
   resolvedAt: string | null;
+  /** Opaque workflow SDK key for exact-tool park/resume. Never user-authored. */
+  resumeKey: string | null;
+  /** Set atomically when an approved parked payload is reused. */
+  consumedAt: string | null;
 }
 
 export const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
@@ -110,6 +114,8 @@ export interface RegisterApprovalInput {
   tool?: string | null;
   args?: Record<string, unknown> | null;
   ttlMs?: number;
+  /** Opaque exact-payload key used only by durable workflow SDK parking. */
+  resumeKey?: string | null;
 }
 
 interface ApprovalSqlRow {
@@ -126,6 +132,8 @@ interface ApprovalSqlRow {
   resolution: ApprovalResolution | null;
   resolver: string | null;
   resolved_at: string | null;
+  resume_key: string | null;
+  consumed_at: string | null;
 }
 
 function rowToPublic(row: ApprovalSqlRow): PendingApprovalRow {
@@ -143,6 +151,8 @@ function rowToPublic(row: ApprovalSqlRow): PendingApprovalRow {
     resolution: row.resolution,
     resolver: row.resolver,
     resolvedAt: row.resolved_at,
+    resumeKey: row.resume_key,
+    consumedAt: row.consumed_at,
   };
 }
 
@@ -198,8 +208,8 @@ export function register(input: RegisterApprovalInput): PendingApprovalRow {
       db.prepare(`
         INSERT INTO pending_approvals
           (approval_id, session_id, channel, channel_id, requested_at,
-           expires_at, subject, tool, args_json, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+           expires_at, subject, tool, args_json, status, resume_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
       `).run(
         approvalId,
         input.sessionId,
@@ -210,6 +220,7 @@ export function register(input: RegisterApprovalInput): PendingApprovalRow {
         input.subject,
         input.tool ?? null,
         input.args ? JSON.stringify(input.args) : null,
+        input.resumeKey ?? null,
       );
       const row = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?').get(approvalId) as ApprovalSqlRow;
       const publicRow = rowToPublic(row);
@@ -226,6 +237,95 @@ export function register(input: RegisterApprovalInput): PendingApprovalRow {
     }
   }
   throw new Error('approval-registry: failed to generate a unique approval ID after 4 attempts');
+}
+
+/**
+ * Register one durable workflow approval for an exact payload. The partial
+ * unique index makes this idempotent under process/thread races: a second
+ * caller receives the already-pending row and must not surface another card.
+ */
+export function registerResumable(
+  input: RegisterApprovalInput & { resumeKey: string },
+): { row: PendingApprovalRow; created: boolean } {
+  const db = openEventLog();
+  const existing = db.prepare(`
+    SELECT * FROM pending_approvals
+     WHERE resume_key = ? AND status = 'pending'
+     ORDER BY requested_at DESC, rowid DESC
+     LIMIT 1
+  `).get(input.resumeKey) as ApprovalSqlRow | undefined;
+  if (existing) return { row: rowToPublic(existing), created: false };
+
+  try {
+    return { row: register(input), created: true };
+  } catch (err) {
+    // Another process may have inserted the same pending resume key between
+    // the lookup and INSERT. Return that row; any other failure remains loud.
+    const code = (err as { code?: string }).code ?? '';
+    if (!code.startsWith('SQLITE_CONSTRAINT')) throw err;
+    const raced = db.prepare(`
+      SELECT * FROM pending_approvals
+       WHERE resume_key = ? AND status = 'pending'
+       ORDER BY requested_at DESC, rowid DESC
+       LIMIT 1
+    `).get(input.resumeKey) as ApprovalSqlRow | undefined;
+    if (!raced) throw err;
+    return { row: rowToPublic(raced), created: false };
+  }
+}
+
+export type ResumableApprovalClaim =
+  | { state: 'none' }
+  | { state: 'pending' | 'approved' | 'rejected' | 'expired' | 'cancelled' | 'consumed'; row: PendingApprovalRow };
+
+/**
+ * Inspect and, for an approved row, atomically consume the exact-payload grant.
+ * Only the first caller receives `approved`; every later caller sees `consumed`.
+ * Rejected/expired/cancelled decisions remain terminal for this parked step and
+ * can never be replaced by a silently minted approval.
+ */
+export function claimResumableApproval(resumeKey: string): ResumableApprovalClaim {
+  const db = openEventLog();
+  const claim = db.transaction((): ResumableApprovalClaim => {
+    const row = db.prepare(`
+      SELECT * FROM pending_approvals
+       WHERE resume_key = ?
+       ORDER BY requested_at DESC, rowid DESC
+       LIMIT 1
+    `).get(resumeKey) as ApprovalSqlRow | undefined;
+    if (!row) return { state: 'none' };
+
+    const current = rowToPublic(row);
+    if (current.status === 'pending' && isExpired(current)) {
+      const expired = resolve(current.approvalId, 'expired', 'approval-resume');
+      return { state: 'expired', row: expired.row ?? current };
+    }
+    if (current.status === 'pending') return { state: 'pending', row: current };
+    if (current.resolution === 'rejected') return { state: 'rejected', row: current };
+    if (current.resolution === 'expired' || current.status === 'expired') return { state: 'expired', row: current };
+    if (current.resolution === 'cancelled_by_user' || current.status === 'cancelled') {
+      return { state: 'cancelled', row: current };
+    }
+    if (current.resolution !== 'approved') return { state: 'expired', row: current };
+    if (current.consumedAt) return { state: 'consumed', row: current };
+
+    const consumedAt = new Date().toISOString();
+    const changes = db.prepare(`
+      UPDATE pending_approvals
+         SET consumed_at = ?
+       WHERE approval_id = ?
+         AND status = 'resolved'
+         AND resolution = 'approved'
+         AND consumed_at IS NULL
+    `).run(consumedAt, current.approvalId).changes;
+    const claimed = db.prepare('SELECT * FROM pending_approvals WHERE approval_id = ?')
+      .get(current.approvalId) as ApprovalSqlRow;
+    return {
+      state: changes === 1 ? 'approved' : 'consumed',
+      row: rowToPublic(claimed),
+    };
+  });
+  return claim();
 }
 
 /**

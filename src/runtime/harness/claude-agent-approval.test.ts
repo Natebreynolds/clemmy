@@ -16,7 +16,7 @@ const { buildGatedToolPermission } = await import('./claude-agent-approval.js');
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const opts = (): unknown => ({ signal: new AbortController().signal, toolUseID: 't' });
-type Perm = (name: string, input: Record<string, unknown>, o: unknown) => Promise<{ behavior: string; message?: string; updatedInput?: Record<string, unknown> }>;
+type Perm = (name: string, input: Record<string, unknown>, o: unknown) => Promise<{ behavior: string; message?: string; updatedInput?: Record<string, unknown>; interrupt?: boolean }>;
 
 async function waitForPending(sessionId: string): Promise<string> {
   for (let i = 0; i < 200; i++) {
@@ -103,6 +103,68 @@ test('gated permission: sf data create record is a CRM write → requires approv
   approvalRegistry.resolve(approvalId, 'rejected', 'test');
   const res = await p;
   assert.equal(res.behavior, 'deny', 'unapproved CRM write must not run');
+});
+
+test('workflow park mode interrupts promptly, reuses one exact approval after restart, and consumes it once', async () => {
+  const sess = createSession({ kind: 'workflow' });
+  const command = { command: 'git push origin main' };
+  const boundaries: Array<{ approvalId: string; state: string }> = [];
+  const build = (): Perm => buildGatedToolPermission(sess.id, ['memory_read'], {
+    approvalMode: 'park',
+    onApprovalBoundary: (boundary) => boundaries.push({ approvalId: boundary.approvalId, state: boundary.state }),
+  }) as unknown as Perm;
+
+  const first = await build()('mcp__clementine-local__run_shell_command', command, opts());
+  assert.equal(first.behavior, 'deny');
+  assert.equal(first.interrupt, true, 'the SDK query is interrupted instead of awaiting the human');
+  const pending = approvalRegistry.listPending({ sessionId: sess.id });
+  assert.equal(pending.length, 1);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 1, 'one concrete card/event');
+
+  // Re-entering before resolution must find the same durable row, not mint a
+  // duplicate card (covers drain retry / daemon restart while still pending).
+  const stillPending = await build()('mcp__clementine-local__run_shell_command', command, opts());
+  assert.equal(stillPending.interrupt, true);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 1);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 1);
+
+  approvalRegistry.resolve(pending[0].approvalId, 'approved', 'unit-test-human');
+  const resumed = await build()('mcp__clementine-local__run_shell_command', command, opts());
+  assert.equal(resumed.behavior, 'allow');
+  assert.deepEqual(resumed.updatedInput, command, 'the approved payload is reused byte-for-byte');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 1, 'resume minted no second card');
+  assert.ok(approvalRegistry.get(pending[0].approvalId)?.consumedAt);
+
+  // The grant is one-shot. A later identical call requires a fresh decision.
+  const replay = await build()('mcp__clementine-local__run_shell_command', command, opts());
+  assert.equal(replay.behavior, 'deny');
+  assert.equal(replay.interrupt, true);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 2);
+  assert.equal(boundaries.filter((boundary) => boundary.state === 'pending').length, 3);
+});
+
+test('workflow park mode treats rejected and expired exact decisions as terminal, without a replacement card', async () => {
+  for (const resolution of ['rejected', 'expired'] as const) {
+    const sess = createSession({ kind: 'workflow' });
+    const command = { command: `git push origin ${resolution}` };
+    let lastState = '';
+    const build = (): Perm => buildGatedToolPermission(sess.id, ['memory_read'], {
+      approvalMode: 'park',
+      onApprovalBoundary: (boundary) => { lastState = boundary.state; },
+    }) as unknown as Perm;
+
+    await build()('mcp__clementine-local__run_shell_command', command, opts());
+    const row = approvalRegistry.listPending({ sessionId: sess.id })[0];
+    assert.ok(row);
+    approvalRegistry.resolve(row.approvalId, resolution, 'unit-test-human');
+
+    const denied = await build()('mcp__clementine-local__run_shell_command', command, opts());
+    assert.equal(denied.behavior, 'deny');
+    assert.equal(denied.interrupt, true);
+    assert.match(denied.message ?? '', new RegExp(resolution));
+    assert.equal(lastState, resolution);
+    assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 1, 'no replacement approval after terminal decision');
+  }
 });
 
 test.after(() => {

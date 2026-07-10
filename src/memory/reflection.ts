@@ -1,7 +1,7 @@
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
-import { MODELS, getRuntimeEnv } from '../config.js';
+import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
 import {
   rememberFact,
@@ -22,6 +22,7 @@ import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
 
 /**
  * Reflection-on-tool-return — Phase 1 of the brain architecture.
@@ -215,8 +216,25 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
   return lines.join('\n');
 }
 
-function getReflectorModel(): string {
-  return MODELS.fast || MODELS.primary || 'gpt-5.4-mini';
+function getReflectorModel() {
+  try {
+    // Bind the extractor to a concrete model on the active brain's provider.
+    // A bare gpt-* string is resolved by the process-global Agents provider and
+    // silently sent Claude/BYO turns through Codex credentials.
+    return resolveBoundaryJudge().model;
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection model route unavailable');
+    return null;
+  }
+}
+
+export function _testOnly_reflectorRoute(): { modelId: string; provider: string; transport: string } | null {
+  try {
+    const route = resolveBoundaryJudge();
+    return { modelId: route.modelId, provider: route.judgeFamily, transport: route.transport };
+  } catch {
+    return null;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -545,6 +563,7 @@ function markReflected(key: string): void {
 async function runExtractor(serialized: string): Promise<Extraction | null> {
   if (extractorOverrideForTest) return extractorOverrideForTest(serialized);
   const model = getReflectorModel();
+  if (!model) return null;
   // Source-map: when on, ask the extractor for `resources` too (named
   // locations). Flag-off keeps the schema + prompt byte-identical to today.
   const withResources = isSourceMapEnabled();
@@ -642,6 +661,7 @@ export async function resolveConflict(
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
   const model = getReflectorModel();
+  if (!model) return { decision: 'ADD' };
   try {
     const agent = new Agent({
       name: 'Memory Conflict Resolver',
@@ -1541,6 +1561,7 @@ async function runRecursivePatternExtractor(
   facts: ConsolidatedFactRow[],
 ): Promise<{ patterns: { text: string; importance: number }[] } | null> {
   const model = getReflectorModel();
+  if (!model) return null;
   try {
     const agent = new Agent({
       name: 'Recursive Reflection Extractor',

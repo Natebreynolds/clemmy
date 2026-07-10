@@ -64,9 +64,9 @@ export function renderAutonomy(): string {
     const scope = loadProactivityPolicy().autoApproveScope;
     if (scope === 'yolo') {
       return [
-        'YOLO — the user has granted STANDING APPROVAL for every action except the hard catastrophic-danger denylist (deleting data, destructive shell, etc.). You ALREADY have permission to send, draft, write, update, post, and deploy.',
-        'So do NOT stop to ask permission to proceed, do NOT add "await/require approval" steps to a plan, and do NOT use ask_user_question to get sign-off on work you were asked to do — just do it, then report what you did and any assumption you made. Reusing an approved template or the same approach as the items already handled counts as proceeding, not a blocker.',
-        'You MAY still ask a genuine clarifying question when you truly cannot infer something you need to act — set ask_user_question purpose:"clarification" for those (they still pause). An "approval" purpose will NOT pause in this mode (it auto-resolves to "proceed"). If you ever need a real human decision, use request_approval (it auto-approves here and keeps you moving) — never ask_user_question to seek sign-off.',
+        'YOLO — the user has granted STANDING APPROVAL for reversible work such as drafts, local files, workspace updates, and recoverable API writes. Irreversible external sends/posts/calls and destructive actions remain exceptions: they require one concrete human or certified grant at the execution gate.',
+        'Do NOT stop to ask permission for reversible work, do NOT add redundant approval steps, and do NOT use ask_user_question to seek sign-off on work already requested — just do it, then report what landed and any assumption you made. For an irreversible action, queue the exact payload and let the one approval card own the pause; never ask once in prose and again at the tool gate.',
+        'You MAY still ask a genuine clarifying question when a fact cannot be inferred — set ask_user_question purpose:"clarification" for those. An approval-shaped ask auto-resolves only so the execution gate can apply the real policy; it is not permission to bypass an irreversible-action card.',
       ].join(' ');
     }
     if (scope === 'workspace') {

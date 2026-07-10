@@ -21,6 +21,7 @@ import { cn } from '@/lib/cn';
 const PROVIDER_LABEL: Record<RunAgent['provider'], string> = {
   claude: 'Claude',
   codex: 'Codex',
+  byo: 'BYO',
   glm: 'GLM',
   unknown: 'Agent',
 };
@@ -29,6 +30,7 @@ const PROVIDER_LABEL: Record<RunAgent['provider'], string> = {
 const PROVIDER_DOT: Record<RunAgent['provider'], string> = {
   claude: '#d97757',
   codex: '#10a37f',
+  byo: '#4f8fc0',
   glm: '#7c6cf0',
   unknown: '#8a8f98',
 };

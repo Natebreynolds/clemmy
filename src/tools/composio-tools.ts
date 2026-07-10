@@ -19,7 +19,7 @@ import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, auto
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
-import { callIdFromToolDetails, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { callIdFromToolDetails, runScopeIdFromRunContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { rememberToolChoice, peekToolChoice, invalidateToolChoice, stripBakedConnectionId, updateToolChoiceOutcomeForIdentifier, recallComposioForSearch } from '../memory/tool-choice-store.js';
 import { harnessRunContextStorage, workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
@@ -1047,11 +1047,16 @@ async function runComposioExecute(
             kind: 'describe',
             toolkit: toolkitOfSlug(toolSlug),
             signature: describeSignature(toolSlug, args),
-            sessionId: sid,
+            sessionId: runScopeIdFromRunContext(options.context) ?? sid,
           });
           return advisory ? output + advisory : output;
         }
-        const advisory = maybeFanoutAdvisory(toolSlug, args, sid, output);
+        const advisory = maybeFanoutAdvisory(
+          toolSlug,
+          args,
+          runScopeIdFromRunContext(options.context) ?? sid,
+          output,
+        );
         if (advisory) return output + advisory;
       }
       return output;
@@ -1280,7 +1285,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         kind: 'list',
         toolkit: toolkit_slug,
         signature: `list ${toolkit_slug}`,
-        sessionId: sessionIdFromRunContext(context),
+        sessionId: runScopeIdFromRunContext(context) ?? sessionIdFromRunContext(context),
       });
       return advisory ? output + advisory : output;
     },
@@ -1507,7 +1512,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         kind: 'search',
         toolkit: toolkit_slug ?? matches.find((m) => m.slug !== '__toolkit_error__')?.toolkit ?? '*',
         signature: query,
-        sessionId: sessionIdFromRunContext(context),
+        sessionId: runScopeIdFromRunContext(context) ?? sessionIdFromRunContext(context),
       });
       return advisory ? output + advisory : output;
     },

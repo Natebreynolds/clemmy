@@ -105,6 +105,7 @@ const { HarnessSession } = await import('../runtime/harness/session.js');
 const { resetEventLog, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
 const { setClaudeAgentSdkWorkflowStepRunForTest } = await import('../runtime/harness/claude-agent-workflow-step.js');
+const { ClaudeAgentSdkApprovalBoundaryError } = await import('../runtime/harness/claude-agent-sdk.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
@@ -988,6 +989,216 @@ test('workflow step explicit model wins over intent routing', () => {
     assert.equal(route.model, 'gpt-5.5');
     assert.equal(route.trace, undefined);
   });
+});
+
+test('normal harness route marker always names provider + transport for untagged Codex and BYO steps', () => {
+  const codex = workflowRunnerInternalsForTest.workflowHarnessRouteMarker(
+    { id: 'untagged_codex', prompt: 'Do the step.' },
+    'gpt-5.4',
+  );
+  assert.equal(codex.provider, 'codex');
+  assert.equal(codex.transport, 'openai_agents_harness');
+  assert.equal((codex.modelRoute as { routeKind?: string }).routeKind, 'harness');
+  assert.equal((codex.modelRoute as { requestedModel?: string }).requestedModel, 'gpt-5.4');
+  assert.equal((codex.modelRoute as { effectiveModel?: string }).effectiveModel, 'gpt-5.4');
+  assert.equal((codex.modelRoute as { provider?: string }).provider, 'codex');
+  assert.equal((codex.modelRoute as { transport?: string }).transport, 'openai_agents_harness');
+
+  withEnv({
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://byo.example.test/v1',
+    BYO_MODEL_API_KEY: 'key',
+    BYO_MODEL_ID: 'minimax-01',
+  }, () => {
+    const byo = workflowRunnerInternalsForTest.workflowHarnessRouteMarker(
+      { id: 'untagged_byo', prompt: 'Do the step.' },
+      'minimax-01',
+    );
+    assert.equal(byo.provider, 'byo');
+    assert.equal(byo.transport, 'openai_agents_harness');
+    assert.equal((byo.modelRoute as { provider?: string }).provider, 'byo');
+  });
+});
+
+test('generic Claude send parks the SDK boundary; rejected rerun fails instead of re-parking', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  const stateDir = path.join(tmp, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, 'auth.json'),
+    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-park-token', refreshToken: 'refresh' } }),
+    'utf-8',
+  );
+  writeFileSync(
+    path.join(stateDir, 'claude-auth.json'),
+    JSON.stringify({
+      accessToken: 'sk-ant-oat01-workflow-park-token',
+      refreshToken: 'refresh-token',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    }),
+    'utf-8',
+  );
+
+  const prev = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    WORKFLOW_USE_HARNESS: process.env.WORKFLOW_USE_HARNESS,
+    WORKFLOW_APPROVAL_PARKING: process.env.WORKFLOW_APPROVAL_PARKING,
+    CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP: process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP,
+    CLEMMY_CLAUDE_WORKFLOW_FULL_LANE: process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE,
+  };
+  const step = {
+    id: 'generic_send',
+    prompt: 'Choose the correct provider action and send the exact message.',
+    model: 'claude-sonnet-4-6',
+    sideEffect: 'send' as const,
+    requiresApproval: true,
+    allowedTools: ['composio_execute_tool'],
+  };
+  const ctx = {
+    workflow: {
+      name: 'Claude Generic Send Park',
+      description: 'test',
+      enabled: true,
+      trigger: { manual: true },
+      allowedTools: ['composio_execute_tool'],
+      steps: [step],
+    },
+    workflowSlug: 'claude-generic-send-park',
+    runId: 'wf-sdk-park-1',
+    inputs: {},
+    stepOutputs: {},
+    assistant: { respond: async () => { throw new Error('legacy assistant should not run'); } },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+  let approvalId = '';
+  let capturedMode: unknown;
+
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    process.env.WORKFLOW_USE_HARNESS = 'on';
+    process.env.WORKFLOW_APPROVAL_PARKING = 'on';
+    process.env.CLEMMY_CLAUDE_AGENT_SDK_WORKFLOW_STEP = 'on';
+    process.env.CLEMMY_CLAUDE_WORKFLOW_FULL_LANE = 'on';
+    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+      capturedMode = options.approvalMode;
+      const sessionId = options.sessionId as string;
+      const prior = approvalRegistry.claimResumableApproval('runner-park-exact-1');
+      const row = prior.state === 'none'
+        ? approvalRegistry.registerResumable({
+            sessionId,
+            subject: 'Run GMAIL_SEND_EMAIL?',
+            tool: 'composio_execute_tool',
+            args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com', body: 'exact' } },
+            resumeKey: 'runner-park-exact-1',
+          }).row
+        : prior.row;
+      approvalId = row.approvalId;
+      throw new ClaudeAgentSdkApprovalBoundaryError({
+        approvalId,
+        sessionId,
+        tool: 'composio_execute_tool',
+        args: row.args ?? {},
+        state: prior.state === 'rejected' ? 'rejected' : 'pending',
+      });
+    });
+
+    await assert.rejects(
+      () => executeStep(step, ctx),
+      (err: unknown) => {
+        assert.ok(err instanceof ParkRunSignal);
+        assert.deepEqual(err.parkedSteps, [{
+          stepId: step.id,
+          kind: 'sdk',
+          approvalIds: [approvalId],
+          sessionId: 'workflow:wf-sdk-park-1:generic_send',
+        }]);
+        return true;
+      },
+    );
+    assert.equal(capturedMode, 'park');
+    assert.notEqual(
+      HarnessSession.load('workflow:wf-sdk-park-1:generic_send')?.sessionRow.status,
+      'failed',
+      'a pending control boundary is parked, not marked as a failed SDK session',
+    );
+
+    approvalRegistry.resolve(approvalId, 'rejected', 'unit-test-human');
+    await assert.rejects(
+      () => executeStep(step, ctx),
+      (err: unknown) => {
+        assert.ok(err instanceof ClaudeAgentSdkApprovalBoundaryError);
+        assert.equal(err.boundary.state, 'rejected');
+        assert.equal(err.boundary.approvalId, approvalId);
+        return true;
+      },
+    );
+    assert.equal(
+      HarnessSession.load('workflow:wf-sdk-park-1:generic_send')?.sessionRow.status,
+      'failed',
+      'a rejected exact decision fails loudly and is never re-parked',
+    );
+
+    const fanStep = {
+      ...step,
+      id: 'generic_send_each',
+      forEach: 'pull',
+    };
+    const fanCtx = {
+      ...ctx,
+      workflow: { ...ctx.workflow, steps: [fanStep] },
+      workflowSlug: 'claude-generic-send-foreach-park',
+      runId: 'wf-sdk-park-each-1',
+      stepOutputs: { pull: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] },
+      completedItems: new Map(),
+      forEachFailures: [],
+      qualityAdvisories: [],
+    } as unknown as Parameters<typeof executeStep>[1];
+    let fanCalls = 0;
+    setClaudeAgentSdkWorkflowStepRunForTest(async (options) => {
+      fanCalls += 1;
+      const sessionId = options.sessionId as string;
+      const row = approvalRegistry.registerResumable({
+        sessionId,
+        subject: 'Run exact item send?',
+        tool: 'composio_execute_tool',
+        args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { item: sessionId } },
+        resumeKey: `runner-foreach:${sessionId}`,
+      }).row;
+      throw new ClaudeAgentSdkApprovalBoundaryError({
+        approvalId: row.approvalId,
+        sessionId,
+        tool: 'composio_execute_tool',
+        args: row.args ?? {},
+        state: 'pending',
+      });
+    });
+    await assert.rejects(
+      () => executeStep(fanStep, fanCtx),
+      (err: unknown) => {
+        assert.ok(err instanceof ParkRunSignal);
+        assert.equal(err.parkedSteps.length, 1);
+        assert.equal(err.parkedSteps[0].stepId, fanStep.id);
+        return true;
+      },
+    );
+    assert.equal(fanCalls, 1, 'generic send fan-out stops assigning items after the first concrete card');
+    assert.equal(
+      approvalRegistry.listPending({ status: 'pending' })
+        .filter((row) => row.sessionId.startsWith('workflow:wf-sdk-park-each-1:generic_send_each:')).length,
+      1,
+      'only one exact item approval is live at a time',
+    );
+  } finally {
+    setClaudeAgentSdkWorkflowStepRunForTest(null);
+    resetHarnessRuntimeConfig();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('workflow Claude-routed read-only step uses Claude Agent SDK and returns structured output', async () => {

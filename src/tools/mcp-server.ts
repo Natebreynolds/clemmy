@@ -50,6 +50,7 @@ const AMBIENT_COUNTER_LIMIT = 1000;
 
 export interface ClementineMcpServerOptions {
   sessionId?: string;
+  runScopeId?: string;
   gatedMutations?: boolean;
   allowedTools?: string[];
   /** Set for a workflow-step MCP surface so a fan-out spawned here (run_worker) is
@@ -67,6 +68,7 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
   const workflowRunId = opts.workflowRunId?.trim() || process.env.CLEMENTINE_MCP_WORKFLOW_RUN_ID?.trim() || undefined;
   const workflowName = opts.workflowName?.trim() || process.env.CLEMENTINE_MCP_WORKFLOW_NAME?.trim() || undefined;
   const stepId = opts.stepId?.trim() || process.env.CLEMENTINE_MCP_STEP_ID?.trim() || undefined;
+  const runScopeId = opts.runScopeId?.trim() || process.env.CLEMENTINE_MCP_RUN_SCOPE_ID?.trim() || undefined;
   const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
@@ -74,7 +76,7 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
     const handler = args[last];
     if (toolName && typeof handler === 'function') {
       args[last] = async (...handlerArgs: any[]) => withToolOutputContext(
-        { sessionId, toolName, ...(workflowRunId ? { workflowRunId } : {}), ...(workflowName ? { workflowName } : {}), ...(stepId ? { stepId } : {}) },
+        { sessionId, runScopeId, toolName, ...(workflowRunId ? { workflowRunId } : {}), ...(workflowName ? { workflowName } : {}), ...(stepId ? { stepId } : {}) },
         // Also establish the harness run context so tools that read it for the
         // active session (execution_create / execution_* / plan / goal, etc.)
         // resolve CLEMENTINE_MCP_SESSION_ID instead of failing with "requires a
@@ -84,7 +86,7 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
         // The gated mutating tools nest their own inner context (with the real
         // per-call counter), so this is a safe outer fallback for everything else.
         () => withHarnessRunContext(
-          { sessionId, counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT) },
+          { sessionId, behaviorScopeId: runScopeId, counter: new ToolCallsCounter(AMBIENT_COUNTER_LIMIT) },
           () => handler(...handlerArgs),
         ),
       );

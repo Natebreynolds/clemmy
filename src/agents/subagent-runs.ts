@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync, rea
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
-export type SubagentProvider = 'claude' | 'codex' | 'glm' | 'unknown';
+export type SubagentProvider = 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
 export type SubagentStatus = 'ok' | 'error' | 'capped';
 
 export interface SubagentRunRecord {

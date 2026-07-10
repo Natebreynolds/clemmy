@@ -119,6 +119,25 @@ function detectMcpArgsNetworkMutation(
   return { isNetworkMutation: false };
 }
 
+export function classifyMcpIntegrityScope(
+  toolName: string,
+  decisionKind: string,
+  args: Record<string, unknown> | null,
+): {
+  isIrreversibleSend: boolean;
+  needsIntegrityChecks: boolean;
+  shapeKey: string;
+} {
+  const argMutation = detectMcpArgsNetworkMutation(args);
+  const nameIsSend = looksLikeNativeMcpSend(toolName);
+  const isIrreversibleSend = decisionKind === 'send' || nameIsSend;
+  return {
+    isIrreversibleSend,
+    needsIntegrityChecks: isIrreversibleSend || argMutation.isNetworkMutation,
+    shapeKey: isIrreversibleSend ? toolName : (argMutation.shapeKey ?? toolName),
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -351,7 +370,8 @@ function appendMcpFanoutAdvisory(
   result: CallToolResultContent,
 ): CallToolResultContent {
   try {
-    const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+    const active = harnessRunContextStorage.getStore();
+    const sessionId = active?.sessionId;
     if (!sessionId || !Array.isArray(result)) return result;
     const resultText = result
       .map((block) => {
@@ -359,7 +379,12 @@ function appendMcpFanoutAdvisory(
         return typeof text === 'string' ? text : '';
       })
       .join('\n');
-    const advisory = appendFanoutAdvisory({ toolName, args: args ?? {}, sessionId, resultText });
+    const advisory = appendFanoutAdvisory({
+      toolName,
+      args: args ?? {},
+      sessionId: active.guardrailScopeId ?? active.behaviorScopeId ?? sessionId,
+      resultText,
+    });
     if (!advisory) return result;
     return [...result, { type: 'text', text: advisory }];
   } catch {
@@ -1069,20 +1094,16 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       const integritySessionId = activeRunContext?.sessionId;
       // Gate as a send when the tool is send-kind (audit #1) OR its args describe
       // a network mutation (audit #6 — kernel exec_command/browser_curl etc.).
-      const argMutation = detectMcpArgsNetworkMutation(args);
-      // Native MCP send-shaped names (outlook_send_mail, make_outbound_call,
-      // *_post_message) are irreversible even though decision.kind may not tag
-      // them (2026-07-09 bypass hunt lane 3). Fold the name-shape check in.
-      const nameIsSend = looksLikeNativeMcpSend(toolName);
-      const gateAsSend = decision.kind === 'send' || argMutation.isNetworkMutation || nameIsSend;
-      const integrityShapeKey = (decision.kind === 'send' || nameIsSend) ? toolName : (argMutation.shapeKey ?? toolName);
+      const integrityScope = classifyMcpIntegrityScope(toolName, decision.kind, args);
+      const { isIrreversibleSend, needsIntegrityChecks } = integrityScope;
+      const integrityShapeKey = integrityScope.shapeKey;
 
       // BATCH-CONSENT FLOOR for native MCP sends (bypass-hunt lane 3): the shim
       // dispatches OUTSIDE wrapToolForHarness, so the brackets confirm-first gate
       // never sees these. Mirror it here — an irreversible-send batch at/over the
       // threshold requires ONE human approval regardless of YOLO, unless it
       // rides a human-approved certified batch or a reviewed plan scope.
-      if (gateAsSend && integritySessionId && isConfirmFirstEnabled()) {
+      if (isIrreversibleSend && integritySessionId && isConfirmFirstEnabled()) {
         try {
           const { loadProactivityPolicy } = await import('../agents/proactivity-policy.js');
           const { decideInstructionReview } = await import('./harness/confirm-first-gate.js');
@@ -1125,7 +1146,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
           // count failure → fail toward not-a-batch (never wedge a legit send).
         }
       }
-      if (gateAsSend && isGroundingGateEnabled() && integritySessionId) {
+      if (needsIntegrityChecks && isGroundingGateEnabled() && integritySessionId) {
         try {
           // Duplicate-target speed bump: a same-shape send to a target already
           // written this session bumps ONCE (approval is not idempotency).
@@ -1170,7 +1191,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // goal+skill verification composio/shell sends get — the same FORK the
       // grounding mirror above was added to close. Throws surface as soft tool
       // errors via the SDK's invoke catch (the shim runs inside _invoke).
-      if (gateAsSend && isGoalFidelityGateEnabled() && integritySessionId) {
+      if (needsIntegrityChecks && isGoalFidelityGateEnabled() && integritySessionId) {
         try {
           const verdict = await evaluateGoalFidelity(integritySessionId, toolName, args ?? {});
           if (verdict.action === 'block') {
@@ -1197,7 +1218,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // sailed through while the byte-identical Composio/shell send was checked.
       // Same fail-open contract as the mirrors above; a contradiction bounces as a
       // soft tool error the model recovers from.
-      if (gateAsSend && isOutputGroundingGateEnabled() && integritySessionId) {
+      if (needsIntegrityChecks && isOutputGroundingGateEnabled() && integritySessionId) {
         try {
           const body = extractMessageBody(args ?? {});
           if (body && body.trim().length > 0) {
@@ -1253,7 +1274,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Record the irreversible send in the SHARED external_write ledger so a
         // later same-shape send (composio OR MCP) to the same target gets the
         // duplicate bump. Best-effort; telemetry must never affect the result.
-        if (gateAsSend && integritySessionId) {
+        if (needsIntegrityChecks && integritySessionId) {
           try {
             appendEvent({
               sessionId: integritySessionId,
@@ -1263,7 +1284,7 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
               data: {
                 shapeKey: integrityShapeKey,
                 toolName,
-                irreversible: true,
+                irreversible: isIrreversibleSend,
                 mcp: true,
                 targets: extractDuplicateIdentityKeys(args ?? {}).slice(0, 8),
               },

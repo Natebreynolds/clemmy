@@ -253,8 +253,11 @@ function updatePendingAction(
   record.updatedAt = now;
   if (opts.approvalId !== undefined) record.approvalId = opts.approvalId;
   if (opts.resultSummary !== undefined) record.resultSummary = opts.resultSummary;
-  if (opts.approvedBy !== undefined) record.approvedBy = opts.approvedBy;
-  if (opts.approvalEvidence !== undefined) record.approvalEvidence = opts.approvalEvidence;
+  // Human consent is monotonic. A later policy bookkeeping call may update the
+  // status, but it can never downgrade a real card/workflow grant to policy.
+  const wouldDowngradeHuman = record.approvedBy === 'human' && opts.approvedBy === 'policy';
+  if (opts.approvedBy !== undefined && !wouldDowngradeHuman) record.approvedBy = opts.approvedBy;
+  if (opts.approvalEvidence !== undefined && !wouldDowngradeHuman) record.approvalEvidence = opts.approvalEvidence;
   record.history = [
     ...(Array.isArray(record.history) ? record.history : []),
     { at: now, status, note: opts.note, actor: opts.actor },

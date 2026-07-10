@@ -18,7 +18,7 @@ export interface ActivityItem {
   kind: 'tool' | 'agent' | 'batch' | 'check';
   label: string;
   detail?: string;
-  provider?: 'claude' | 'codex' | 'glm' | 'unknown';
+  provider?: 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
   status: 'running' | 'done' | 'failed';
   /** Client-clock start, for the live per-row elapsed timer while running. */
   startedAt?: number;
@@ -59,10 +59,11 @@ function providerFromModel(model: string): ActivityItem['provider'] {
 function providerFor(d: Record<string, unknown>, model: string): ActivityItem['provider'] {
   const explicit = typeof d.provider === 'string' ? d.provider.toLowerCase() : '';
   if (explicit) {
+    if (explicit === 'byo') return 'byo';
     if (/claude|anthropic/.test(explicit)) return 'claude';
     if (/glm|zhipu|zai/.test(explicit)) return 'glm';
     if (/codex|openai|gpt/.test(explicit)) return 'codex';
-    // Unrecognized (BYO id): fall through to the model regex.
+    // Unrecognized custom provider id: fall through to the model regex.
   }
   return providerFromModel(model);
 }

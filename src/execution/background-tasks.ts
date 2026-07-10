@@ -1983,13 +1983,13 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	    processed += 1;
 	    logger.info({ taskId: task.id, title: task.title }, 'Background task started');
 
-	    // Sticky approval: launching a background task IS the user's approval
-	    // for the work it does. A background run is autonomous-by-default —
-	    // the user already consented when they kicked it off, so internal
-	    // mutating tools must NOT re-pause mid-run ("approve once, runs to
-	    // completion"). We reuse the canonical plan-scope mechanism (the same
+	    // Launching a background task authorizes its reversible work. Exact
+	    // irreversible sends remain owned by the concrete approval card because
+	    // a wildcard task prompt cannot enumerate recipients/payloads safely.
+	    // We reuse the canonical plan-scope mechanism (the same
 	    // one request_approval and plan-first approval open) keyed on this
-	    // task's run session. allowedTools `*` covers every non-read tool that
+	    // task's run session. allowedTools `*` covers reversible non-read tools;
+	    // the send lock deliberately ignores wildcards and parks exact sends.
 	    // survives the taxonomy safety floor — admin tools and destructive-hint
 	    // invocations are still gated BEFORE evaluateAutoApprove is consulted
 	    // (decideToolApproval), so the parking sites below remain a real

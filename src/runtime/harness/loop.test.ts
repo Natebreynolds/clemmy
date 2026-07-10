@@ -2008,6 +2008,40 @@ test('runConversation: a tool-driven ask (ask_user_question already emitted the 
   assert.equal(askEvents.length, 1, 'no double-emit — the tool-emitted event is the only one');
 });
 
+test('runConversation: a tool-driven ask with an unparsed prose tail stops without retrying or re-asking', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let runs = 0;
+  const runRunner: RunRunnerFn = async () => {
+    runs += 1;
+    appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: { question: 'Which audience should the brief target?' },
+    });
+    return {
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: "Waiting on your audience choice. I won't touch the file until you answer.",
+    };
+  };
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'write the brief after asking for its audience',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(runs, 1, 'the durable ask is terminal; no parse-recovery model turn');
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 1);
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0);
+});
+
 test('objective judge: gates premature completion and continues (action intent)', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
@@ -2030,6 +2064,60 @@ test('objective judge: gates premature completion and continues (action intent)'
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 2, 'judge forced a second step before completing');
   assert.equal(judgeCalls.length, 2);
+});
+
+test('objective judge: a successful read cannot certify a claimed build', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeInvoked = false;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'read_file' };
+    const details = { toolCall: { callId: 'read-only-1', arguments: '{"path":"README.md"}' } };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'README contents', details);
+    const decision = { summary: 'built', reply: 'Built the app.', done: true, nextAction: 'completed', reason: null };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'build the app',
+    judgeCompletion: true,
+    judgeFn: async () => { judgeInvoked = true; return { done: true, reason: 'verified by test' }; },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(judgeInvoked, true);
+});
+
+test('objective judge: a successful concrete send slug is completion evidence', async () => {
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let judgeInvoked = false;
+  const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
+    const ee = runner as unknown as EventEmitter;
+    const runContext = { context: opts.context };
+    const tool = { name: 'composio_execute_tool' };
+    const details = { toolCall: { callId: 'send-1', arguments: '{"tool_slug":"GMAIL_SEND_EMAIL"}' } };
+    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
+    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, 'sent', details);
+    const decision = { summary: 'sent', reply: 'Sent the email.', done: true, nextAction: 'completed', reason: null };
+    ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
+    return { history: items, lastResponseId: undefined, finalOutput: decision };
+  };
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'send the email',
+    judgeCompletion: true,
+    judgeFn: async () => { judgeInvoked = true; return { done: false, reason: 'unexpected' }; },
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(judgeInvoked, false);
 });
 
 test('objective judge: fail-open accepted completions are tagged in conversation_completed', async () => {
@@ -4446,33 +4534,26 @@ test('AWAITING judge verdict yields awaiting_user_input with the reply delivered
   assert.equal((completed.data as { awaitingUser?: boolean }).awaitingUser, true);
 });
 
-test('consent-then-re-ask: a short affirmation followed by ANOTHER direction question auto-proceeds instead of halting', async () => {
-  // Live 2026-07-09: "send out 20 of them please" → Clem asked which 20 →
-  // "that sounds perfect" → Clem asked AGAIN (background/hold/now?). The
-  // second ask must auto-resolve — approve-once-then-run.
+test('an old question plus a short affirmation never suppresses a new material question', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
-  // Prior turn asked a question (the one the user is now affirming).
+  // A stale turn-0 question is not identity-bearing consent for a later choice.
   appendEvent({ sessionId: sess.id, turn: 0, role: 'Clem', type: 'awaiting_user_input', data: { question: 'Should I send the next 20?' } });
   const runner = scriptedRunner([
-    { finalOutput: { summary: 'asked venue', reply: 'Want me to run it in the background, hold it, or do it now?', done: false, nextAction: 'awaiting_user_input', reason: null } },
-    { finalOutput: { summary: 'ran it', reply: 'Done — batch queued for its approval card.', done: true, nextAction: 'completed', reason: null } },
+    { finalOutput: { summary: 'asked mailbox', reply: 'Which mailbox should I send from?', done: false, nextAction: 'awaiting_user_input', reason: null } },
   ]);
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
-    input: 'that sounds perfect',
+    input: 'yes',
     makeRunner: makeRunnerStub,
     runRunner: runner,
   });
-  assert.equal(result.steps, 2, 'the re-ask was auto-continued, not halted');
-  assert.equal(result.status, 'completed');
-  const reconciled = listEvents(sess.id, { types: ['heartbeat'] })
-    .filter((e) => (e.data as { kind?: string }).kind === 'consent_reask_reconciled');
-  assert.equal(reconciled.length, 1);
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.steps, 1);
 });
 
-test('consent-then-re-ask: a NON-affirmation reply still halts on a follow-up question', async () => {
+test('a qualified reply still halts on a follow-up question', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   appendEvent({ sessionId: sess.id, turn: 0, role: 'Clem', type: 'awaiting_user_input', data: { question: 'Should I send the next 20?' } });

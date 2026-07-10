@@ -24,23 +24,32 @@ const BRAIN = 'claude-opus-4-8';
 
 // ── pickSdkBrainWorkerLane: the pure lane decision (deterministic, no connectivity)
 test('a Claude worker role runs on the Claude SDK lane (honors "workers = Sonnet 5")', () => {
-  const r = pickSdkBrainWorkerLane('claude-sonnet-5', { crossEnabled: true, claudeBrainModel: BRAIN });
+  const r = pickSdkBrainWorkerLane('claude-sonnet-5', { crossEnabled: true, claudeBrainModel: BRAIN, resolvedProvider: 'claude' });
   assert.deepEqual(r, { modelId: 'claude-sonnet-5', claudeLane: true });
 });
 
 test('a NON-Claude worker role runs on the CROSS-PROVIDER lane when enabled (the parity fix)', () => {
-  const r = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: true, claudeBrainModel: BRAIN });
+  const r = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: true, claudeBrainModel: BRAIN, resolvedProvider: 'codex' });
   assert.deepEqual(r, { modelId: 'gpt-5.4-mini', claudeLane: false });
 });
 
 test('a NON-Claude worker role reverts to the Claude brain when the kill-switch is off (ignored model surfaced)', () => {
-  const r = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: false, claudeBrainModel: BRAIN });
+  const r = pickSdkBrainWorkerLane('gpt-5.4-mini', { crossEnabled: false, claudeBrainModel: BRAIN, resolvedProvider: 'codex' });
   assert.deepEqual(r, { modelId: BRAIN, claudeLane: true, ignoredNonClaudeModel: 'gpt-5.4-mini' });
 });
 
 test('an unset worker role falls open to the Claude brain on the Claude SDK lane (no ignored-model warning)', () => {
   const r = pickSdkBrainWorkerLane(undefined, { crossEnabled: true, claudeBrainModel: BRAIN });
   assert.deepEqual(r, { modelId: BRAIN, claudeLane: true });
+});
+
+test('a Claude-shaped BYO worker stays on the cross-provider lane', () => {
+  const r = pickSdkBrainWorkerLane('claude-custom', {
+    crossEnabled: true,
+    claudeBrainModel: BRAIN,
+    resolvedProvider: 'byo',
+  });
+  assert.deepEqual(r, { modelId: 'claude-custom', claudeLane: false });
 });
 
 // ── sdkBrainCrossWorkerEnabled: default-ON kill-switch, reverts on off/0/false

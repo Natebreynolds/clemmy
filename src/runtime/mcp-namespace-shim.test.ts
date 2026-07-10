@@ -30,7 +30,31 @@ const {
   parseNamespacedTool,
   slugifyServerName,
   listMcpServerHealth,
+  classifyMcpIntegrityScope,
 } = await import('./mcp-namespace-shim.js');
+
+test('MCP integrity classification separates reversible network writes from irreversible sends', () => {
+  assert.deepEqual(
+    classifyMcpIntegrityScope('browser__request', 'write', {
+      method: 'PATCH',
+      url: 'https://example.test/records/1',
+      body: { status: 'reviewed' },
+    }),
+    {
+      isIrreversibleSend: false,
+      needsIntegrityChecks: true,
+      shapeKey: 'mcp:http_mutation',
+    },
+  );
+  assert.deepEqual(
+    classifyMcpIntegrityScope('slack__postMessage', 'write', { channel: 'C1', text: 'hello' }),
+    {
+      isIrreversibleSend: true,
+      needsIntegrityChecks: true,
+      shapeKey: 'slack__postMessage',
+    },
+  );
+});
 
 /**
  * Minimal MCPServer-shaped fake. We don't extend the SDK's classes

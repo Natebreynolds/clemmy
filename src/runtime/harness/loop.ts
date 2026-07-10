@@ -92,6 +92,11 @@ import {
   evaluateProgress,
   type StallInfo,
 } from './turn-decision.js';
+import {
+  completionEvidenceToolName,
+  hasMeaningfulSuccessfulToolNames,
+  toolOutputLooksSuccessful,
+} from './tool-evidence.js';
 // Turn-decision classification lives in turn-decision.ts (extracted 2026-07-08);
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
@@ -118,6 +123,43 @@ function safeAppend(input: AppendEventInput): void {
       turn: input.turn,
       err: normalizeError(err),
     });
+  }
+}
+
+function toolCallInput(data: Record<string, unknown>): unknown {
+  const raw = data.args ?? data.arguments;
+  if (typeof raw !== 'string') return raw;
+  try { return JSON.parse(raw); } catch { return undefined; }
+}
+
+function turnHasMeaningfulSuccessfulToolEvidence(
+  sessionId: string,
+  turn: number,
+  objectiveText: string,
+): boolean {
+  try {
+    const events = listEvents(sessionId).filter((event) => event.turn === turn);
+    const returned = events.filter((event) => event.type === 'tool_returned');
+    return events.some((event) => {
+      if (event.type !== 'tool_called') return false;
+      const tool = typeof event.data.tool === 'string' ? event.data.tool : '';
+      if (!tool) return false;
+      const callId = typeof event.data.callId === 'string' ? event.data.callId : '';
+      const match = returned.find((candidate) => {
+        const returnedId = typeof candidate.data.callId === 'string' ? candidate.data.callId : '';
+        const returnedTool = typeof candidate.data.tool === 'string' ? candidate.data.tool : '';
+        return callId ? returnedId === callId : returnedTool === tool;
+      });
+      if (!match) return false;
+      if (!toolOutputLooksSuccessful(
+        match.data.result ?? match.data.output,
+        match.data.ok,
+      )) return false;
+      const evidenceName = completionEvidenceToolName(tool, toolCallInput(event.data));
+      return hasMeaningfulSuccessfulToolNames([evidenceName], objectiveText);
+    });
+  } catch {
+    return false;
   }
 }
 
@@ -998,32 +1040,6 @@ function yoloAutoResolvedAskThisTurn(sessionId: string, turn: number): boolean {
   }
 }
 
-/**
- * A short, unqualified affirmation — the user saying yes to the previous
- * question without adding constraints ("that sounds perfect", "yes", "go
- * ahead"). Deliberately strict: any number, name, or qualifier in the reply
- * means the user CHANGED something, and a follow-up question stays legitimate.
- * Pure + exported for tests.
- */
-const AFFIRMATION_RE = /^(?:yes|yeah|yep|yup|sure|ok(?:ay)?|sounds (?:good|great|perfect)|that sounds (?:good|great|perfect)|perfect|great|go ahead|go for it|do it|please do|proceed|approved?|confirm(?:ed)?|lgtm|👍|✅)[.! ]*$/i;
-
-export function isShortAffirmation(text: string | null | undefined): boolean {
-  const t = (text ?? '').trim();
-  return t.length > 0 && t.length <= 40 && AFFIRMATION_RE.test(t);
-}
-
-/** Did an EARLIER turn of this session end asking the user a question?
- *  (The consent-then-re-ask guard needs proof the affirmation was answering
- *  something.) */
-function priorTurnAskedQuestion(sessionId: string, currentTurn: number): boolean {
-  try {
-    return listEvents(sessionId, { types: ['awaiting_user_input'] })
-      .some((evt) => evt.turn < currentTurn);
-  } catch {
-    return false;
-  }
-}
-
 /** An approval card is OPEN for this session (THE-GRANT question-immunity:
  *  the completion judge never fires while the human's decision is pending).
  *  Fail-open to false — a registry read error must not suppress the judge. */
@@ -1668,13 +1684,9 @@ async function runConversationCore(
   // yielding. Bounded so a stubborn judge can't loop forever; fails open (judge
   // defaults to done) so it never wedges.
   //
-  // Gating is on OBSERVED WORK, not phrasing: a turn that ran several tool calls
-  // did substantive multi-step work and is worth verifying — even when the
-  // request reads as a "lookup" ("find me the accounts and drop them in a
-  // sheet" classifies as lookup but is real multi-step action). The intent
-  // branch keeps the cheap path: a clear ACTION objective is judged even if it
-  // somehow finished with few tool calls. A trivial lookup ("what's on my
-  // calendar") makes 1–2 tool calls and is below threshold → never judged.
+  // A concrete tool-backed completion is structural evidence and must not be
+  // bounced into repeating successful tools. The judge is reserved for
+  // suspicious no-tool action claims and promise-shaped replies.
   const objectiveJudge = options.judgeFn ?? judgeObjectiveComplete;
   const objectiveJudgeOptIn = options.judgeCompletion === true;
   const objectiveJudgeActionIntent = classifyMessageIntent(options.input).intent === 'action';
@@ -1690,11 +1702,9 @@ async function runConversationCore(
   // of how the request was phrased.
   const OBJECTIVE_JUDGE_WORK_THRESHOLD = 3;
   let objectiveJudgeContinuations = 0;
-  // Consent-then-re-ask guard: at most ONE auto-proceed per conversation so a
-  // genuinely open follow-up question can still halt on the next iteration.
-  let consentReAskContinuationUsed = false;
   let completionVerification: { failedOpen?: boolean; selfJudge?: boolean } | null = null;
   let totalToolCalls = 0;
+  let meaningfulToolEvidence = false;
   // Inc A code trigger: fire the "offer to move this to the background" nudge at
   // most ONCE per run (a foreground chat grinding through a long action task).
   let backgroundOfferNudged = false;
@@ -1795,6 +1805,8 @@ async function runConversationCore(
     falloverReattempt = false;
     lastTurn = turnResult.turn;
     totalToolCalls += turnResult.toolCalls ?? 0;
+    meaningfulToolEvidence = meaningfulToolEvidence
+      || turnHasMeaningfulSuccessfulToolEvidence(options.sessionId, turnResult.turn, objective);
 
     // W1a — chat step-boundary brain fallover. A deferred transient model/codex
     // error (infraTransientKind set, ask NOT yet written) → re-attempt on the next
@@ -2033,6 +2045,28 @@ async function runConversationCore(
     }
 
     if (!decision) {
+      // A real ask_user_question tool call is already the canonical terminal
+      // decision. Some models follow it with ordinary prose ("Waiting on your
+      // answer") instead of an ASK marker; treating that prose as unparseable
+      // re-runs the brain and emits the same question twice. Trust the durable
+      // current-turn pause event before any parse/stall recovery.
+      const toolAskThisTurn = (() => {
+        try {
+          return listEvents(options.sessionId, { types: ['awaiting_user_input'] })
+            .find((event) => event.turn === turnResult.turn);
+        } catch {
+          return undefined;
+        }
+      })();
+      if (toolAskThisTurn) {
+        return {
+          sessionId: options.sessionId,
+          status: 'awaiting_user_input',
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+        };
+      }
       // PLAIN-TEXT-CONTRACT FULFILLMENT (2026-07-08). This turn's input was a
       // harness directive that said "do NOT call a tool — reply to the user
       // NOW" (the draft-present stall retry). A zero-tool text reply is exactly
@@ -2571,8 +2605,7 @@ async function runConversationCore(
         shouldRunObjectiveJudge({
           optIn: objectiveJudgeOptIn,
           actionIntent: objectiveJudgeActionIntent,
-          totalToolCalls,
-          workThreshold: OBJECTIVE_JUDGE_WORK_THRESHOLD,
+          meaningfulToolEvidence,
           continuationsUsed: objectiveJudgeContinuations,
           maxContinuations: MAX_OBJECTIVE_JUDGE_CONTINUATIONS,
           nextAction: decision.nextAction,
@@ -2932,33 +2965,6 @@ async function runConversationCore(
           },
         });
         nextInput = 'You already auto-resolved that approval question under YOLO standing approval — do NOT wait for the user. Proceed with your best default and keep going until the work is done, then report what you did.';
-        continue;
-      }
-      // CONSENT-THEN-RE-ASK guard (2026-07-09, live: user said "send out 20 of
-      // them please", Clem asked which 20, user said "that sounds perfect",
-      // Clem asked AGAIN — "run in background, hold, or do it now?"). When THIS
-      // conversation began with the user's short unqualified affirmation of the
-      // PREVIOUS turn's question, a fresh direction-question is a re-ask of
-      // granted consent — approve-once-then-run says proceed with the default.
-      // Deterministic + bounded (once per conversation); the send-batch
-      // approval card remains the real gate for anything irreversible.
-      if (
-        !consentReAskContinuationUsed
-        && isShortAffirmation(options.input)
-        && priorTurnAskedQuestion(options.sessionId, turnResult.turn)
-      ) {
-        consentReAskContinuationUsed = true;
-        safeAppend({
-          sessionId: options.sessionId,
-          turn: turnResult.turn,
-          role: 'system',
-          type: 'heartbeat',
-          data: {
-            kind: 'consent_reask_reconciled',
-            message: 'User already affirmed the previous question — proceeding with the default instead of re-asking.',
-          },
-        });
-        nextInput = 'The user ALREADY approved your previous question with their last message. That approval covers this — do NOT ask another question. Proceed NOW with the sensible default (run the work right here unless it clearly must be backgrounded), complete it, and report the result. Any genuinely irreversible batch still goes through its one approval card.';
         continue;
       }
       // DELIVER the question (review/live fix 2026-06-14). The model can ask a
@@ -4304,6 +4310,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             {
               sessionId: options.sessionId,
               counter: toolCounter,
+              behaviorScopeId: `${options.sessionId}::turn:${turn}`,
               recallBudget,
               suppressBackgroundOffer: options.suppressBackgroundOffer,
             },
@@ -4317,6 +4324,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           {
             sessionId: options.sessionId,
             counter: toolCounter,
+            behaviorScopeId: `${options.sessionId}::turn:${turn}`,
             recallBudget,
             suppressBackgroundOffer: options.suppressBackgroundOffer,
           },

@@ -13,6 +13,7 @@
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import Database from 'better-sqlite3';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-eventlog-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -41,6 +42,7 @@ const {
   clearKill,
   reapStaleSessions,
   openEventLog,
+  HARNESS_DB_PATH,
 } = await import('./eventlog.js');
 type EventType = import('./eventlog.js').EventType;
 
@@ -50,6 +52,50 @@ test.after(() => {
   } catch {
     /* best effort */
   }
+});
+
+test('schema v5 upgrades an existing v4 approval table without losing rows', () => {
+  resetEventLog();
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+    INSERT INTO schema_version (version, applied_at) VALUES (4, '2026-07-01T00:00:00.000Z');
+    CREATE TABLE pending_approvals (
+      approval_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      channel TEXT,
+      channel_id TEXT,
+      requested_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      tool TEXT,
+      args_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      resolution TEXT,
+      resolver TEXT,
+      resolved_at TEXT
+    );
+    INSERT INTO pending_approvals
+      (approval_id, session_id, requested_at, expires_at, subject, status)
+    VALUES
+      ('apr-old1', 'workflow:old', '2026-07-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', 'existing approval', 'pending');
+  `);
+  raw.close();
+
+  const migrated = openEventLog();
+  const columns = migrated.prepare('PRAGMA table_info(pending_approvals)').all() as Array<{ name: string }>;
+  assert.ok(columns.some((column) => column.name === 'resume_key'));
+  assert.ok(columns.some((column) => column.name === 'consumed_at'));
+  assert.equal(
+    (migrated.prepare("SELECT subject FROM pending_approvals WHERE approval_id = 'apr-old1'").get() as { subject: string }).subject,
+    'existing approval',
+  );
+  assert.equal(
+    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    5,
+  );
+  resetEventLog();
 });
 
 test('creates a session and appends events with monotonic seq', () => {

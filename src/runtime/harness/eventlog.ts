@@ -519,6 +519,24 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    // Workflow-owned Claude SDK approval parking. A workflow query must be able
+    // to release its child process + drain slot while a human reviews the exact
+    // tool payload, then reuse that decision once after a daemon restart. The
+    // resume key identifies the session/tool/payload; consumed_at is claimed
+    // atomically before the approved call is allowed through.
+    version: 5,
+    sql: `
+      ALTER TABLE pending_approvals ADD COLUMN resume_key TEXT;
+      ALTER TABLE pending_approvals ADD COLUMN consumed_at TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_approvals_pending_resume_key
+        ON pending_approvals(resume_key)
+        WHERE resume_key IS NOT NULL AND status = 'pending';
+      CREATE INDEX IF NOT EXISTS idx_pending_approvals_resume_history
+        ON pending_approvals(resume_key, requested_at DESC)
+        WHERE resume_key IS NOT NULL;
+    `,
+  },
 ];
 
 function runMigrations(db: Database.Database): void {

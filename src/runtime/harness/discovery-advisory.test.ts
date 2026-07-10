@@ -59,6 +59,20 @@ test('two genuinely-different intents in one toolkit never fire (distinctness gu
   assert.deepEqual(fires, [], 'no advisory — neither distinct cluster reaches the threshold');
 });
 
+test('discovery counters do not bleed across separate run scopes in one chat session', () => {
+  const toolkit = 'outlook';
+  const firstTurn = 'sess-long-chat::turn:1';
+  const laterTurn = 'sess-long-chat::turn:5';
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: 'find unread mail', sessionId: firstTurn }), null);
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: 'search inbox unread', sessionId: firstTurn }), null);
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: 'find calendar invites', sessionId: laterTurn }), null);
+  assert.equal(maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: 'find pending calendar invites', sessionId: laterTurn }), null);
+  assert.ok(
+    maybeDiscoveryAdvisory({ kind: 'search', toolkit, signature: 'find calendar meeting invites', sessionId: laterTurn }),
+    'the later run fires only on its own third overlapping search',
+  );
+});
+
 test('per-toolkit total-find thrash fires even when NO single cluster clusters (2026-07-10 outlook unread-count loop)', () => {
   const sessionId = 'sess-da-bucket';
   const toolkit = 'outlook';

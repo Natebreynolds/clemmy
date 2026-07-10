@@ -13,6 +13,7 @@ import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrai
 import { resolveRoleModel, defaultForRole } from '../runtime/harness/model-roles.js';
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
+import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
@@ -122,6 +123,7 @@ import {
   claudeAgentSdkWorkflowStepEnabled,
   runClaudeAgentSdkWorkflowStep,
 } from '../runtime/harness/claude-agent-workflow-step.js';
+import { ClaudeAgentSdkApprovalBoundaryError } from '../runtime/harness/claude-agent-sdk.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import type { AssistantRouteDiagnostics } from '../types.js';
 
@@ -1140,21 +1142,27 @@ async function runWithConcurrency<T, R>(
   items: T[],
   limit: number,
   worker: (item: T, index: number) => Promise<R>,
-): Promise<Array<{ ok: true; value: R } | { ok: false; error: string }>> {
-  const results: Array<{ ok: true; value: R } | { ok: false; error: string }> = new Array(items.length);
+): Promise<Array<{ ok: true; value: R } | { ok: false; error: string; reason: unknown }>> {
+  const results: Array<{ ok: true; value: R } | { ok: false; error: string; reason: unknown }> = new Array(items.length);
   let cursor = 0;
+  let halted = false;
   const runners: Promise<void>[] = [];
   const N = Math.max(1, Math.min(limit, items.length));
   for (let i = 0; i < N; i++) {
     runners.push((async () => {
       while (true) {
+        if (halted) return;
         const idx = cursor++;
         if (idx >= items.length) return;
         try {
           const value = await worker(items[idx], idx);
           results[idx] = { ok: true, value };
         } catch (err) {
-          results[idx] = { ok: false, error: err instanceof Error ? err.message : String(err) };
+          results[idx] = { ok: false, error: err instanceof Error ? err.message : String(err), reason: err };
+          // A human-approval park is a control signal, not an item failure to
+          // fan past. Stop assigning new work; completed siblings are already
+          // durable in events.jsonl and resume will skip them.
+          if (err instanceof ParkRunSignal) halted = true;
         }
       }
     })());
@@ -1364,7 +1372,12 @@ function claudeWorkflowLaneFlagEnabled(): boolean {
  *  Codex-brain path stays byte-identical: untagged steps never silently move to
  *  Claude — only an intent-routed step the user explicitly bound to Claude does. */
 function claudeIsActiveWorkflowBrain(): boolean {
-  return getActiveAuthMode() === 'claude_oauth' && claudeWorkflowLaneFlagEnabled();
+  if (!claudeWorkflowLaneFlagEnabled()) return false;
+  try {
+    return resolveRoleModel('brain').provider === 'claude';
+  } catch {
+    return false;
+  }
 }
 
 function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRoute {
@@ -1434,9 +1447,8 @@ function resolveWorkflowStepModel(step: WorkflowStepInput): WorkflowStepModelRou
 // So they gate purely on the kill-switch — a Claude step is a Claude step whether
 // Claude is the brain or a Codex-brain workflow injected it via intent routing.
 function workflowStepCanRunOnClaudeAgentSdk(step: WorkflowStepInput): boolean {
-  // requiresApproval steps always use the runner's declarative approval
-  // orchestration (the SDK lane returns early, before the approval-parking loop).
-  if (step.requiresApproval) return false;
+  // executeStep awaits runner-owned declarative approval before dispatch reaches
+  // this predicate. An approved step can use the gated, tool-capable SDK lane.
   // Full gated lane: write/send run through the harness gate chain (grounding /
   // goal-fidelity / confirm-first / async approval) on the SDK worker tool
   // profile, with the step's session carrying the workflow's auto-approval grants.
@@ -1453,7 +1465,6 @@ function workflowStepCanRunOnClaudeAgentSdk(step: WorkflowStepInput): boolean {
  *  injected Claude step (Codex brain) exactly as to a Claude-brain step. */
 function workflowStepUsesFullClaudeLane(step: WorkflowStepInput): boolean {
   if (!claudeWorkflowLaneFlagEnabled()) return false;
-  if (step.requiresApproval) return false;
   return true;
 }
 
@@ -1474,6 +1485,26 @@ function workflowAutoApprovalTools(workflow: WorkflowDefinition, step: WorkflowS
   // plan scope removes per-tool approval churn while the shared taxonomy
   // still gates admin/destructive calls before plan-scope is consulted.
   return allowed.length > 0 ? [...new Set(allowed)] : ['*'];
+}
+
+function exactApprovedSendTools(workflow: WorkflowDefinition, step: WorkflowStepInput): string[] {
+  const candidates = [
+    ...(step.call?.tool ? [step.call.tool] : []),
+    ...workflowAutoApprovalTools(workflow, step),
+  ];
+  return [...new Set(candidates.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool)))];
+}
+
+/** A generic model step cannot turn an early prose approval into permission for
+ * an unknown future send payload. In that case the concrete tool card owns the
+ * single pause. Exact call/native-send steps keep the declarative preview gate. */
+function shouldUseDeclarativeStepApproval(
+  workflow: WorkflowDefinition,
+  step: WorkflowStepInput,
+): boolean {
+  if (!step.requiresApproval) return false;
+  if (step.sideEffect !== 'send') return true;
+  return exactApprovedSendTools(workflow, step).length > 0;
 }
 
 interface HarnessStepResult {
@@ -1518,8 +1549,32 @@ function workflowHarnessRoute(step: WorkflowStepInput, stepModel: string | undef
     surface: 'workflow',
     requestedModel: step.model ?? stepModel,
     effectiveModel,
-    provider: resolveProvider(effectiveModel),
+    provider: resolveEffectiveProviderForModel(effectiveModel),
     transport: 'openai_agents_harness',
+  };
+}
+
+/** Every harness workflow step emits the same explicit route evidence, even
+ * when model resolution returned no intent trace (the normal untagged
+ * Codex/BYO path). Proofs must never infer provider/transport from absence. */
+function workflowHarnessRouteMarker(
+  step: WorkflowStepInput,
+  stepModel: string | undefined,
+  trace?: WorkflowStepModelRoute['trace'],
+): Record<string, unknown> {
+  const route = workflowHarnessRoute(step, stepModel);
+  return {
+    ...(trace ?? {
+      seam: 'workflow',
+      stepId: step.id,
+      attemptedIntent: step.intent ?? '',
+      matchedIntent: null,
+      source: step.model ? 'step-model' : 'brain-default',
+    }),
+    modelId: route.effectiveModel,
+    provider: route.provider,
+    transport: route.transport,
+    modelRoute: workflowModelRouteMeta(route),
   };
 }
 
@@ -1616,6 +1671,10 @@ export const workflowRunnerInternalsForTest = {
   selfHealAutoMaxAttempts,
   resolveWorkflowStepModel,
   workflowStepCanRunOnClaudeAgentSdk,
+  workflowStepUsesFullClaudeLane,
+  shouldUseDeclarativeStepApproval,
+  exactApprovedSendTools,
+  workflowHarnessRouteMarker,
 };
 
 async function runStepViaHarness(
@@ -1627,9 +1686,8 @@ async function runStepViaHarness(
   workflowRunId: string,
   stepContext?: { values: Record<string, unknown>; upstream: Record<string, unknown>; item?: unknown; project?: WorkflowStepProjectContext },
   // P0 parking: true only at call sites where a thrown ParkRunSignal can
-  // unwind to processOneRunFile (plain step + synthesis). forEach items
-  // run inside a per-item try/catch that would swallow the signal as an
-  // item failure, so those pass false and keep the in-place poll.
+  // unwind to processOneRunFile. Plain/synthesis propagate directly; forEach
+  // preserves the typed reason through its bounded pool and then propagates.
   canPark = false,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
@@ -1661,6 +1719,9 @@ async function runStepViaHarness(
     approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
     ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
     allowedTools,
+    allowedSends: step.requiresApproval
+      ? allowedTools.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool))
+      : [],
   });
 
   const approvalIds: string[] = [];
@@ -1717,8 +1778,18 @@ async function runStepViaHarness(
           // SDK lane's gated tools — required for unattended write/send steps.
           sessionId: fullLane ? realSessionId : undefined,
           fullLane,
+          parkApprovals: canPark && parkingEnabled(),
         });
       } catch (err) {
+        if (err instanceof ClaudeAgentSdkApprovalBoundaryError && err.boundary.state === 'pending') {
+          markWorkflowRunPausedForApproval(workflowRunId);
+          throw new ParkRunSignal([{
+            stepId: step.id,
+            kind: 'sdk',
+            approvalIds: [err.boundary.approvalId],
+            sessionId: realSessionId,
+          }]);
+        }
         markWorkflowHarnessSessionTerminal(session, 'failed');
         throw err;
       }
@@ -1766,8 +1837,8 @@ async function runStepViaHarness(
         route,
       };
     }
-    if (modelRoute.trace) appendWorkerRoute(modelRoute.trace);
     const route = workflowHarnessRoute(step, stepModel);
+    appendWorkerRoute(workflowHarnessRouteMarker(step, stepModel, modelRoute.trace));
     const agent = useWorkflowStepAgent()
       ? await buildWorkflowStepAgent({ userInput: message, sessionId: realSessionId, lockTools: step.allowedTools, model: stepModel })
       : await buildOrchestratorAgent({ userInput: message, sessionId: realSessionId, model: stepModel });
@@ -2397,7 +2468,9 @@ async function executeStepVerified(
   if (!workflowBrainFalloverEnabled() || step.deterministic) {
     return runStepVerifiedAttempt(step, ctx);
   }
-  const currentProvider = resolveProvider(resolveWorkflowStepModel(step).model ?? MODELS.primary) as BrainProviderClass;
+  const currentProvider = resolveEffectiveProviderForModel(
+    resolveWorkflowStepModel(step).model ?? defaultForRole('brain'),
+  ) as BrainProviderClass;
   const nextBrains = falloverBrainModelIds(currentProvider);
   if (nextBrains.length === 0) return runStepVerifiedAttempt(step, ctx);
 
@@ -2987,7 +3060,7 @@ export async function executeStep(
   //    of the workflow proceeds autonomously. Declarative + runner-owned,
   //    so the constrained step agent never needs request_approval and a
   //    workflow pauses at most where it explicitly opts in.
-  if (step.requiresApproval) {
+  if (shouldUseDeclarativeStepApproval(ctx.workflow, step)) {
     await awaitDeclarativeStepApproval(ctx, step);
   }
 
@@ -3129,7 +3202,14 @@ export async function executeStep(
     }
 
     const activeCount = alreadyCompleted.length + pendingItems.length;
-    const concurrency = Math.max(1, Math.min(RUNNER_CONCURRENCY, Math.min(maxItems, pendingItems.length || 1)));
+    // Generic sends have no safe wildcard grant: serialize them so exactly ONE
+    // concrete payload card is surfaced before the run parks. On each resume the
+    // approved item completes, then the next exact payload may ask separately.
+    const serializeConcreteSendApprovals = stepSideEffectClass(step) === 'send'
+      && exactApprovedSendTools(ctx.workflow, step).length === 0;
+    const concurrency = serializeConcreteSendApprovals
+      ? 1
+      : Math.max(1, Math.min(RUNNER_CONCURRENCY, Math.min(maxItems, pendingItems.length || 1)));
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_started',
       stepId: step.id,
@@ -3159,7 +3239,7 @@ export async function executeStep(
     const runPendingWindow = async (windowItems: typeof pendingItems): Promise<SettledItemResult[]> => {
       const settled = await runWithConcurrency<typeof pendingItems[number], ItemResult>(
         windowItems,
-        Math.max(1, Math.min(RUNNER_CONCURRENCY, windowItems.length || 1)),
+        Math.max(1, Math.min(concurrency, windowItems.length || 1)),
         async (work) => {
           const { item, index: idx, key } = work;
           // Resume: skip items we already completed in a prior run pass.
@@ -3234,6 +3314,7 @@ export async function executeStep(
                   workflowAutoApprovalTools(ctx.workflow, step),
                   ctx.runId,
                   itemContext,
+                  true, // approval parks propagate through runWithConcurrency
                 );
                 output = r.output;
                 itemSessionId = r.sessionId;
@@ -3315,6 +3396,11 @@ export async function executeStep(
           }
         },
       );
+      const parkedSteps = settled.flatMap((result) =>
+        result && !result.ok && result.reason instanceof ParkRunSignal
+          ? result.reason.parkedSteps
+          : []);
+      if (parkedSteps.length > 0) throw new ParkRunSignal(parkedSteps);
       return settled.map((r, localIndex) => {
         if (r.ok) return r;
         const item = windowItems[localIndex];
@@ -4498,7 +4584,9 @@ async function executeWorkflow(
       // Step-boundary brain fallover, mirroring executeStepVerified. Synthesis
       // is read-only, so there is no external-write guard to respect.
       if (workflowBrainFalloverEnabled() && (isTransientStepError(err) || isUnparseableToolCallError(err) || isWorkflowStepStructuralResultError(err))) {
-        const currentProvider = resolveProvider(synthesisStep.model ?? MODELS.primary) as BrainProviderClass;
+        const currentProvider = resolveEffectiveProviderForModel(
+          synthesisStep.model ?? defaultForRole('brain'),
+        ) as BrainProviderClass;
         for (const target of falloverBrainModelIds(currentProvider)) {
           appendWorkflowEvent(workflowSlug, runId, {
             kind: 'step_advisory',

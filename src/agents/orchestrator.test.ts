@@ -25,6 +25,9 @@ import assert from 'node:assert/strict';
 import { z } from 'zod';
 
 const { resetEventLog, createSession, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const pendingActions = await import('../runtime/harness/pending-actions.js');
+const { formatAutoResolvedAskUserQuestionOutput } = await import('../runtime/harness/terminal-tool.js');
 const { getPlanScope } = await import('./plan-scope.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const {
@@ -36,6 +39,7 @@ const {
   recentPriorUserInputsForScope,
   ORCHESTRATOR_INSTRUCTIONS,
   orchestratorInternalsForTest,
+  userChoiceToolUseBehavior,
 } = await import('./orchestrator.js');
 const { resolveMcpToolScopeWithContinuity } = await import('../runtime/mcp-tool-scope.js');
 const { TOOL_JIT_CORE } = await import('./tool-jit.js');
@@ -171,6 +175,27 @@ test('Orchestrator: model override rides through (workflow-step worker-model rou
   const overridden = await buildOrchestratorAgent({ model: 'gpt-5.4-mini' });
   assert.notEqual(dflt.model, 'gpt-5.4-mini', 'default is not the override');
   assert.equal(overridden.model, 'gpt-5.4-mini', 'override is honored');
+});
+
+test('Orchestrator: user-choice tools terminate only when they really pause', async () => {
+  const agent = await buildOrchestratorAgent();
+  assert.equal(agent.toolUseBehavior, userChoiceToolUseBehavior);
+  const result = (name: string, output: string) => userChoiceToolUseBehavior({}, [
+    { type: 'function_output', tool: { name }, output },
+  ]);
+  assert.equal(result('ask_user_question', 'Question posted: Which environment? Awaiting user reply.').isFinalOutput, true);
+  assert.equal(result('offer_background', 'Offer posted. STOP now.').isFinalOutput, true);
+  assert.equal(
+    result('ask_user_question', formatAutoResolvedAskUserQuestionOutput('Proceed now.')).isFinalOutput,
+    false,
+  );
+  for (const phrase of ['standing approval', 'NOT pausing', 'not waiting']) {
+    assert.equal(
+      result('ask_user_question', `Question posted: What does "${phrase}" mean here? Awaiting user reply.`).isFinalOutput,
+      true,
+      `clarification containing ${phrase} must remain terminal`,
+    );
+  }
 });
 
 test('Orchestrator: excludeToolNames narrows the harness surface (unblocks architect/autonomy on the one loop)', async () => {
@@ -719,6 +744,75 @@ test('request_approval execute carries auto-approval reason when the action was 
   assert.equal(events.length, 0);
 });
 
+test('request_approval human resume preserves linked pending-action provenance', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const action = pendingActions.queuePendingAction({
+    title: 'Send queued proof',
+    summary: 'Send one proof email after approval.',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payload: { composioSlug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    sessionId: sess.id,
+  });
+  const args = {
+    subject: 'Send queued proof',
+    reason: 'The exact payload is ready.',
+    destructive: false,
+    preview: null,
+    pendingActionId: action.id,
+  };
+  const approval = approvalRegistry.register({
+    sessionId: sess.id,
+    subject: args.subject,
+    tool: 'request_approval',
+    args,
+  });
+  assert.equal(pendingActions.getPendingAction(action.id)?.status, 'approval_requested');
+  assert.equal(approvalRegistry.resolve(approval.approvalId, 'approved', 'unit-test-human').ok, true);
+  assert.equal(pendingActions.getPendingAction(action.id)?.approvedBy, 'human');
+
+  const result = await invokeFunctionTool(buildRequestApprovalTool(), args, { sessionId: sess.id, turn: 2 });
+  assert.match(result, /Queued action .* is approved/);
+  const resumed = pendingActions.getPendingAction(action.id);
+  assert.equal(resumed?.approvedBy, 'human');
+  assert.deepEqual(resumed?.approvalEvidence, { kind: 'card', approvalId: approval.approvalId });
+});
+
+test('request_approval mints policy provenance only on a true YOLO auto-approval', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const action = pendingActions.queuePendingAction({
+      title: 'Create queued draft',
+      summary: 'Create one reversible Outlook draft.',
+      kind: 'external_write',
+      toolName: 'composio_execute_tool',
+      payload: { composioSlug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: 'Proof' } },
+      sessionId: sess.id,
+    });
+    const args = {
+      subject: 'Create one Outlook draft',
+      reason: 'The user requested the reversible draft.',
+      destructive: false,
+      preview: null,
+      pendingActionId: action.id,
+    };
+    const tool = buildRequestApprovalTool();
+    const needsApproval = tool.needsApproval as unknown as (ctx: unknown, input: typeof args) => Promise<boolean>;
+    assert.equal(await needsApproval({}, args), false, 'YOLO should auto-approve this reversible write');
+
+    const result = await invokeFunctionTool(tool, args, { sessionId: sess.id, turn: 3 });
+    assert.match(result, /Auto-approved by YOLO mode/);
+    const approved = pendingActions.getPendingAction(action.id);
+    assert.equal(approved?.approvedBy, 'policy');
+    assert.deepEqual(approved?.approvalEvidence, { kind: 'policy', scope: 'yolo' });
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
 // The SDK's tool() exposes `invoke(runContext, inputString)` rather
 // than a raw execute. Tests drive the tool via invoke with a JSON
 // args string, matching what the Runner does during a real run.
@@ -821,6 +915,23 @@ test('ask_user_question emits awaiting_user_input with options', async () => {
   assert.equal(events.length, 1);
   assert.equal(events[0].data.question, 'which environment?');
   assert.deepEqual(events[0].data.options, ['staging', 'prod']);
+});
+
+test('ask_user_question publishes at most one pause per provider turn', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const t = buildAskUserQuestionTool();
+  await invokeFunctionTool(
+    t,
+    { question: 'Which environment?', options: ['staging', 'prod'], purpose: 'clarification' },
+    { sessionId: sess.id, turn: 4 },
+  );
+  await invokeFunctionTool(
+    t,
+    { question: 'Which environment should I use?', options: ['staging', 'prod'], purpose: 'clarification' },
+    { sessionId: sess.id, turn: 4 },
+  );
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1);
 });
 
 // ─── YOLO: approval-purpose ask_user_question must NOT halt; clarification must ───

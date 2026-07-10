@@ -54,6 +54,7 @@ function readPendingActions(home: string): PendingActionFile[] {
 export const pendingActionGate: ScenarioDef = {
   name: 'pending-action-gate',
   summary: 'prepare exact external payload → queue locally → ask ready to execute',
+  routeExpectation: 'exact-brain',
   async run(daemon: DaemonHandle) {
     const sessionId = `proof-pending-action-${Date.now().toString(36)}`;
     const turn = await daemon.chat(PROMPT, sessionId, 420_000);
