@@ -141,7 +141,25 @@ function renderValue(v: unknown, budget: number, depth: number): string {
   }
   const obj = v as Record<string, unknown>;
   const keys = Object.keys(obj);
-  if (depth >= 3) return `object(${keys.length} keys)`;
+  if (depth >= 3) {
+    // Don't collapse a CONTENT-bearing object to a useless shape — surface a
+    // BOUNDED clip of its first text leaf (content/text/body/…) so the payload the
+    // user actually needs (e.g. an email body at data.response_data.body.content,
+    // depth 4) reaches context instead of forcing a shell-dig of the on-disk
+    // result. Compaction-safe: the clip is length-capped AND rides the caller's
+    // `budget`, and the parent digest still caps the TOTAL — so a huge read never
+    // balloons, it just shows useful text within the same size (2026-07-09).
+    for (const ck of ['content', 'text', 'body', 'message', 'snippet', 'value', 'plainText', 'bodyPreview']) {
+      const leaf = obj[ck];
+      if (typeof leaf === 'string' && leaf.trim()) {
+        const cap = Math.max(80, Math.min(240, budget));
+        const clip = leaf.length > cap ? `${leaf.slice(0, cap)}… (${leaf.length} chars)` : leaf;
+        const moreKeys = keys.length - 1;
+        return `{ ${JSON.stringify(ck)}: ${JSON.stringify(clip)}${moreKeys > 0 ? `, …(+${moreKeys} more)` : ''} }`;
+      }
+    }
+    return `object(${keys.length} keys)`;
+  }
   const parts: string[] = [];
   let used = 2;
   let shown = 0;

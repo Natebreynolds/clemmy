@@ -62,6 +62,36 @@ test('Composio envelope: digest surfaces the data payload (tables/ids), not data
   assert.match(digest, /Prospecting 0/);                 // and its name
 });
 
+test('deep content leaf: an email body at depth 3+ surfaces its TEXT, not object(N keys) — the shell-dig fix', () => {
+  // The exact Microsoft Graph shape from the 2026-07-09 thrash: the body the user
+  // asked about is nested at data.response_data.body.content (depth 4). The old
+  // depth-3 collapse hid it as `body: object(2 keys)`, forcing a shell-dig of the
+  // on-disk result. Now its text reaches context directly.
+  const emailBody = 'Hi Nate, thanks for reaching out but we have decided to go another direction with our SEO vendor for now. Best, Ailyn';
+  const graph = { data: { response_data: {
+    subject: 'Re: Win-back', from: { emailAddress: { address: 'ailyn@galbraith.example' } },
+    body: { contentType: 'html', content: emailBody },
+  } } };
+  const digest = digestToolOutput(JSON.stringify(graph), { maxChars: 2000, toolName: 'composio_execute_tool', callId: 'call_email' });
+  assert.match(digest, /Hi Nate, thanks for reaching out/, 'the email body text is now visible in-context');
+  assert.doesNotMatch(digest, /body: object\(2 keys\)/, 'the useless shape collapse is gone');
+});
+
+test('deep content leaf stays COMPACTION-safe: a huge body is clipped, never ballooned', () => {
+  const huge = 'A'.repeat(200_000); // a 200KB email/scrape body
+  const graph = { data: { response_data: { body: { contentType: 'text', content: huge } } } };
+  const digest = digestToolOutput(JSON.stringify(graph), { maxChars: 1500, toolName: 'composio_execute_tool', callId: 'call_huge' });
+  assert.ok(digest.length < 1200, `digest must stay bounded (compaction), got ${digest.length}`);
+  assert.match(digest, /200000 chars/, 'shows the TRUE size so the model knows to recall for more');
+  assert.doesNotMatch(digest, /A{500,}/, 'the 200KB body is clipped, not dumped into context');
+});
+
+test('deep object WITHOUT a content key is unchanged (still object(N keys))', () => {
+  const graph = { data: { response_data: { config: { retries: 3, timeoutMs: 5000 } } } };
+  const digest = digestToolOutput(JSON.stringify(graph), { maxChars: 2000, toolName: 't', callId: 'call_cfg' });
+  assert.match(digest, /object\(2 keys\)/, 'a non-content object at the depth cap collapses exactly as before');
+});
+
 test('plain text: head+tail + line/char count, points to recall', () => {
   const text = Array.from({ length: 500 }, (_, i) => `line ${i} ${'x'.repeat(40)}`).join('\n');
   const digest = digestToolOutput(text, { maxChars: 1200, toolName: 'run_shell_command', callId: 'call_t1' });
