@@ -1333,9 +1333,15 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   }
 
   const active = ordered.slice(0, limit);
+  // FIT-VALIDATED reuse (2026-07-09): the store mixes tools from MANY past tasks
+  // (an email task can surface an SEO tool that once ranked high on a different
+  // job). A remembered tool is a HINT to verify, never a blind directive — so the
+  // header tells the model to reuse only a line whose intent AND target resource
+  // match the CURRENT task, and to ignore/rediscover otherwise. Reusing a tool
+  // bound to a different job is worse than a quick rediscovery.
   const header = relevantIntents.size > 0
-    ? 'These tools previously worked for these intents on this machine (★ = relevant to your current task). Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.'
-    : 'These tools previously worked for these intents on this machine. Prefer them directly — skip rediscovery (composio_search_tools / local_cli_list). If one fails, call tool_choice_invalidate and rediscover.';
+    ? 'PAST-task tools (★ = fits your task; intent shown per line). Reuse a ★ line ONLY if its intent+resource match what you\'re doing NOW — else ignore it and rediscover. A tool from a different job (e.g. an SEO tool for an email task) is the wrong tool.'
+    : 'PAST-task tools (intent shown per line; NOT filtered to your task). Reuse a line ONLY if its intent+resource match what you\'re doing NOW — else ignore it and discover fresh. A tool from a different job (e.g. an SEO tool for an email task) is the wrong tool.';
   const clip = (s: string): string => (s.length <= TOOL_CHOICE_LINE_MAX ? s : `${s.slice(0, TOOL_CHOICE_LINE_MAX - 1)}…`);
   // Accumulate lines until the block budget is hit (header counts toward it),
   // so the highest-ranked choices win the space.
