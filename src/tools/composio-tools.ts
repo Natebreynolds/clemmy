@@ -1138,17 +1138,23 @@ export async function resolveComposioDispatch(
   }
 
   // "Use the account I named": alias alone resolves through the alias store —
-  // by stable email when known, else by its last-known live connection.
+  // by stable email when known, else by its last-known live connection. A raw
+  // EMAIL is accepted directly as the identity hint (the model often knows the
+  // address from a memory fact before a name binding exists).
   let aliasHint: string | undefined;
   if (!owner && aliasArg) {
-    const alias = resolveAccountAlias(aliasArg, toolkit);
-    if (alias?.email) {
-      aliasHint = alias.email;
-    } else if (alias?.connectionId && usable.some((c) => c.connectionId === alias.connectionId)) {
-      owner = alias.connectionId;
-      notes.push(`[account-route] Routed to your saved "${alias.label}" ${toolkit} account.`);
+    if (aliasArg.includes('@')) {
+      aliasHint = aliasArg.toLowerCase();
     } else {
-      notes.push(`[account-memory] No saved ${toolkit} account named "${aliasArg}" — resolving normally. To save it: re-call with connected_account_id + account_alias.`);
+      const alias = resolveAccountAlias(aliasArg, toolkit);
+      if (alias?.email) {
+        aliasHint = alias.email;
+      } else if (alias?.connectionId && usable.some((c) => c.connectionId === alias.connectionId)) {
+        owner = alias.connectionId;
+        notes.push(`[account-route] Routed to your saved "${alias.label}" ${toolkit} account.`);
+      } else {
+        notes.push(`[account-memory] No saved ${toolkit} account named "${aliasArg}" — resolving normally. To save it: re-call with connected_account_id + account_alias.`);
+      }
     }
   }
 
