@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -47,6 +48,22 @@ function listFilesRecursive(dir) {
     if (entry.isDirectory()) return listFilesRecursive(filePath);
     return [filePath];
   });
+}
+
+export function sha512FileSync(filePath) {
+  const hash = createHash('sha512');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  const descriptor = openSync(filePath, 'r');
+  try {
+    let bytesRead;
+    do {
+      bytesRead = readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead > 0) hash.update(buffer.subarray(0, bytesRead));
+    } while (bytesRead > 0);
+  } finally {
+    closeSync(descriptor);
+  }
+  return hash.digest('base64');
 }
 
 export function verifyDesktopReleaseAssets(options = {}) {
@@ -111,6 +128,9 @@ export function verifyDesktopReleaseAssets(options = {}) {
     const actualSize = statSync(artifactPath).size;
     if (Number.isFinite(file.size) && actualSize !== file.size) {
       errors.push(`${file.url} size mismatch: feed=${file.size} actual=${actualSize}`);
+    }
+    if (file.sha512 && sha512FileSync(artifactPath) !== file.sha512) {
+      errors.push(`${file.url} sha512 mismatch`);
     }
     const blockmapPath = `${artifactPath}.blockmap`;
     if (!existsSync(blockmapPath)) {

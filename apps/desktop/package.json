@@ -154,6 +154,7 @@
       ]
     },
     "dmg": {
+      "sign": true,
       "title": "${productName} ${version}",
       "iconSize": 100,
       "contents": [

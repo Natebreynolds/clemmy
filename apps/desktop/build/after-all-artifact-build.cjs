@@ -13,9 +13,13 @@
  *   shows "damaged, move to trash" before the user ever sees the
  *   .app inside.
  *
+ *   electron-builder's `dmg.sign` option signs each DMG while its temporary
+ *   CSC_LINK keychain still exists. This hook runs after that keychain has been
+ *   disposed, so it must verify the existing signature instead of trying to
+ *   rediscover or reuse the certificate.
+ *
  *   This hook:
- *     1. Code-signs each .dmg with the Developer ID Application cert
- *        (notarytool requires a signed artifact).
+ *     1. Verifies each .dmg has the expected Developer ID team signature.
  *     2. Submits the signed DMG to Apple's notarytool service.
  *     3. Staples the ticket onto the DMG so Gatekeeper works offline.
  *
@@ -26,13 +30,6 @@
  *   APPLE_ID
  *   APPLE_APP_PASSWORD
  *   APPLE_TEAM_ID
- *
- * Optional:
- *   APPLE_SIGNING_IDENTITY — full common name of the Developer ID
- *     Application cert (defaults to the team-id-derived form
- *     "Developer ID Application: <name> (<teamId>)"). Set this
- *     explicitly when the cert in the keychain has a non-default
- *     common name.
  *
  * If APPLE_NOTARIZE_SKIP=true is set, the whole pipeline is bypassed
  * (matches the .app-level hook behavior for local dev builds).
@@ -53,13 +50,13 @@ function run(cmd, args, opts = {}) {
   }
 }
 
-function findSigningIdentity(teamId) {
-  if (process.env.APPLE_SIGNING_IDENTITY) return process.env.APPLE_SIGNING_IDENTITY;
-  const result = spawnSync('security', ['find-identity', '-v', '-p', 'codesigning'], { encoding: 'utf-8' });
-  if (result.status !== 0) return null;
-  const re = new RegExp(`"(Developer ID Application:[^"]*\\(${teamId}\\))"`);
-  const match = result.stdout.match(re);
-  return match ? match[1] : null;
+function capture(cmd, args) {
+  const result = spawnSync(cmd, args, { encoding: 'utf-8' });
+  if (result.status !== 0) {
+    const details = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    throw new Error(`${cmd} ${args.join(' ')} exited with status ${result.status}${details ? `: ${details}` : ''}`);
+  }
+  return `${result.stdout || ''}${result.stderr || ''}`;
 }
 
 exports.default = async function afterAllArtifactBuild({ artifactPaths }) {
@@ -82,11 +79,6 @@ exports.default = async function afterAllArtifactBuild({ artifactPaths }) {
     throw new Error('[notarize-dmg] missing APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID; set APPLE_NOTARIZE_SKIP=true only for an explicit unsigned developer build');
   }
 
-  const identity = findSigningIdentity(teamId);
-  if (!identity) {
-    throw new Error(`[notarize-dmg] no Developer ID Application certificate for team ${teamId} was found in the keychain`);
-  }
-
   let notarizeFn;
   try {
     ({ notarize: notarizeFn } = require('@electron/notarize'));
@@ -98,9 +90,12 @@ exports.default = async function afterAllArtifactBuild({ artifactPaths }) {
   for (const dmgPath of dmgs) {
     const filename = path.basename(dmgPath);
 
-    console.log(`  [notarize-dmg] signing ${filename} with "${identity}"…`);
-    run('codesign', ['--sign', identity, '--timestamp', '--force', dmgPath]);
+    console.log(`  [notarize-dmg] verifying electron-builder signature on ${filename}…`);
     run('codesign', ['--verify', '--verbose=2', dmgPath]);
+    const signature = capture('codesign', ['--display', '--verbose=4', dmgPath]);
+    if (!signature.includes(`TeamIdentifier=${teamId}`)) {
+      throw new Error(`[notarize-dmg] ${filename} is not signed by expected team ${teamId}`);
+    }
 
     console.log(`  [notarize-dmg] uploading ${filename} to Apple notary service (this can take a few minutes)…`);
     const start = Date.now();

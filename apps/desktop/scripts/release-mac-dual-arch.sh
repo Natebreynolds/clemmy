@@ -205,6 +205,14 @@ build_arch() {
   echo "-> Building macOS artifacts ($arch)"
   (cd "$DESKTOP_DIR" && "$BUILDER_BIN" "${builder_args[@]}")
 
+  # Notarization/stapling mutates the DMG after electron-builder generated its
+  # first blockmap and feed hash. Rebuild both from the final distributable.
+  if is_signed_release; then
+    echo "-> Refreshing updater metadata after DMG notarization ($arch)"
+    (cd "$ROOT_DIR" && node scripts/refresh-notarized-dmg-metadata.mjs \
+      --feed apps/desktop/release/latest-mac.yml)
+  fi
+
   local uvtarget
   case "$arch" in
     arm64) uvtarget="aarch64-apple-darwin" ;;

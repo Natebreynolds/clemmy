@@ -17,6 +17,11 @@ const dualArchScriptText = readFileSync(
   new URL('../apps/desktop/scripts/release-mac-dual-arch.sh', import.meta.url),
   'utf-8',
 );
+const desktopPackage = JSON.parse(readFileSync(new URL('../apps/desktop/package.json', import.meta.url), 'utf-8'));
+const dmgHookText = readFileSync(
+  new URL('../apps/desktop/build/after-all-artifact-build.cjs', import.meta.url),
+  'utf-8',
+);
 
 function runScripts(job) {
   return (job?.steps ?? [])
@@ -57,6 +62,13 @@ test('candidate dispatcher defaults to the next patch prerelease and rejects dow
 test('unsigned macOS rehearsal overrides the configured production signing identity', () => {
   assert.match(dualArchScriptText, /if ! is_signed_release/);
   assert.match(dualArchScriptText, /--config\.mac\.identity=null/);
+});
+
+test('DMGs are signed before electron-builder disposes its temporary keychain', () => {
+  assert.equal(desktopPackage.build?.dmg?.sign, true);
+  assert.doesNotMatch(dmgHookText, /find-identity|\['--sign'/);
+  assert.match(dmgHookText, /TeamIdentifier=/);
+  assert.match(dualArchScriptText, /refresh-notarized-dmg-metadata\.mjs/);
 });
 
 test('production desktop publishing is gated on exact-main preflight', () => {

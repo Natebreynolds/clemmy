@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -27,7 +28,9 @@ function writeFeed(dir, version, files, pathEntry = files[0]?.url ?? '') {
     'files:',
     ...files.flatMap((file) => [
       `  - url: ${file.url}`,
-      `    sha512: ${file.sha512 ?? 'abc='}`,
+      `    sha512: ${file.sha512 ?? (existsSync(path.join(dir, file.url))
+        ? createHash('sha512').update(readFileSync(path.join(dir, file.url))).digest('base64')
+        : 'abc=')}`,
       `    size: ${file.size}`,
     ]),
     `path: ${pathEntry}`,
@@ -123,12 +126,13 @@ test('verifyDesktopReleaseAssets catches size mismatches and missing blockmaps',
     const dmgSize = writeAsset(dir, 'Clementine-1.2.3.dmg', 'dmg payload');
     writeFeed(dir, '1.2.3', [
       { url: 'Clementine-1.2.3-mac.zip', size: 999 },
-      { url: 'Clementine-1.2.3.dmg', size: dmgSize },
+      { url: 'Clementine-1.2.3.dmg', size: dmgSize, sha512: 'stale=' },
     ]);
 
     const result = verifyDesktopReleaseAssets({ dir, version: '1.2.3' });
     assert.equal(result.ok, false);
     assert.match(result.errors.join('\n'), /size mismatch/);
+    assert.match(result.errors.join('\n'), /sha512 mismatch/);
     assert.match(result.errors.join('\n'), /missing blockmap/);
   });
 });
