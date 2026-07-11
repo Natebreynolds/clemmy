@@ -6,6 +6,7 @@ import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
 import { getMachineId } from '../../runtime/machine-id.js';
 import { getSecretStore } from '../../runtime/secrets/index.js';
 import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
+import { cachedIdentityEmail } from './identity-cache.js';
 import {
   executeComposioCliTool,
   getComposioCliStatus,
@@ -837,7 +838,16 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
           wordId: str(item.wordId) ?? str(item.word_id),
           ownerUserId: str(item.user_id) ?? str(item.userId),
         };
-      }).filter((connection) => connection.connectionId && connection.slug !== 'unknown');
+      }).filter((connection) => connection.connectionId && connection.slug !== 'unknown')
+        .map((connection) => {
+          // Identity enrichment: when the listing carries no email (Microsoft
+          // tokens expose none), serve the mailbox a profile probe learned for
+          // this connection — so same-mailbox re-auths merge and named accounts
+          // ("use my scorpion email") resolve. See identity-cache.ts.
+          if (connection.accountEmail) return connection;
+          const learned = cachedIdentityEmail(connection.connectionId);
+          return learned ? { ...connection, accountEmail: learned } : connection;
+        });
       if (generation !== connectionsGeneration) {
         throw new Error('Composio account state changed during refresh; retry the operation.');
       }

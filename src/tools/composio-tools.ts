@@ -34,7 +34,9 @@ import { maybeDiscoveryAdvisory, isDescribeSlug, toolkitOfSlug, describeSignatur
 import { isTransientStepError } from '../execution/transient-error.js';
 import { asyncJobTimeoutCorrective } from '../runtime/harness/tool-error-corrective.js';
 import { checkConstraintViolation, formatConstraintEscalation, findEmailSendConstraint, findOutlookCalendarReadConstraint, renderToolkitConstraintBanner } from '../runtime/harness/constraint-guard.js';
-import { resolveCompliantSenderConnection } from '../runtime/harness/sender-verify.js';
+import { resolveCompliantSenderConnection, extractMailboxEmails } from '../runtime/harness/sender-verify.js';
+import { rememberAccountAlias, resolveAccountAlias, aliasLabelFor } from '../memory/account-alias-store.js';
+import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from '../integrations/composio/identity-cache.js';
 import { validateComposioArgs, formatBatchValidationError } from './composio-batch-validator.js';
 import { rememberToolSchema, getCachedToolSchema } from './composio-schema-cache.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
@@ -895,24 +897,71 @@ export function buildComposioStatusPayload(
 
 /** Deterministic ASK for a genuinely-ambiguous multi-mailbox toolkit — never
  *  dispatch under a guessed/default account. Lists the candidate mailboxes WITH
- *  their connection ids so the model can pin the named one on the retry
- *  (connected_account_id), which in turn teaches recall the chosen mailbox. */
+ *  their saved names and connection ids so the model can pin the named one on
+ *  the retry (connected_account_id), and TEACHES the naming gesture: passing
+ *  `account_alias` with the pin makes the binding permanent. */
 function composioMultiAccountAskMessage(
   toolSlug: string,
   outcome: { kind: 'ambiguous' | 'identity-absent'; want?: string; candidates: Array<{ email?: string; wordId?: string; connectionId: string }> },
 ): string {
   const toolkit = toolkitOfSlug(toolSlug);
   const mailboxes = outcome.candidates
-    .map((c, i) => `  ${i + 1}. ${c.email ?? c.wordId ?? c.connectionId} (connected_account_id: ${c.connectionId})`)
+    .map((c, i) => {
+      const label = aliasLabelFor(toolkit, c.email, c.connectionId);
+      const display = [label ? `"${label}"` : undefined, c.email ?? c.wordId ?? c.connectionId].filter(Boolean).join(' — ');
+      return `  ${i + 1}. ${display} (connected_account_id: ${c.connectionId})`;
+    })
     .join('\n');
   const lead = outcome.kind === 'identity-absent'
-    ? `The ${toolkit} mailbox this action expects (${outcome.want}) is no longer connected.`
+    ? `The ${toolkit} account this action expects (${outcome.want}) is no longer connected.`
     : `You have ${outcome.candidates.length} ${toolkit} accounts connected, so I need to know WHICH account to use for this action.`;
   return (
     `⚠️ NEEDS-YOUR-CHOICE (${toolkit}): ${lead}\n\n`
     + `Connected ${toolkit} accounts:\n${mailboxes}\n\n`
-    + `Nothing was dispatched. Ask the user which account to use (by email), then re-call this tool with \`connected_account_id\` set to the chosen connection id. Do NOT guess — acting on the wrong account is exactly the mistake this guard prevents.`
+    + `Nothing was dispatched. Ask the user which account to use, then re-call this tool with \`connected_account_id\` set to the chosen connection id. `
+    + `If the user NAMES the account (e.g. "that's my scorpion email"), ALSO pass \`account_alias\` (e.g. "scorpion") with the pinned re-call — the name is then remembered permanently, and future calls can use \`account_alias\` alone instead of asking again. Do NOT guess — acting on the wrong account is exactly the mistake this guard prevents.`
   );
+}
+
+// ─── Account identity enrichment (probe-once) + named aliases ────────────────
+// Some listings expose NO mailbox identity (Microsoft tokens carry no email),
+// so same-mailbox re-auths can't merge and names can't bind. On the first
+// ambiguous encounter the gateway probes each candidate's profile ONCE (pinned
+// read; owner-pair dispatch), caches connection→email durably, and re-resolves.
+// Toolkits without a known profile slug are skipped (and never re-probed).
+const PROFILE_SLUG_BY_TOOLKIT: Record<string, string> = {
+  outlook: 'OUTLOOK_GET_PROFILE',
+  gmail: 'GMAIL_GET_PROFILE',
+};
+
+async function enrichToolkitIdentities(toolkit: string, candidates: ConnectedToolkit[]): Promise<number> {
+  const profileSlug = PROFILE_SLUG_BY_TOOLKIT[toolkit];
+  if (!profileSlug) return 0;
+  const targets = candidates
+    .filter((c) => !c.accountEmail && c.connectionId && !identityProbeAttempted(c.connectionId))
+    .slice(0, 4); // bounded — one-time cost per connection, cached forever
+  if (targets.length === 0) return 0;
+  let learned = 0;
+  await Promise.all(targets.map(async (c) => {
+    try {
+      const profile = await executeComposioTool(profileSlug, {}, c.connectionId);
+      const email = extractMailboxEmails(profile)[0] ?? null;
+      recordIdentityProbe(c.connectionId, email);
+      if (email) learned += 1;
+    } catch {
+      recordIdentityProbe(c.connectionId, null); // probed, nothing learned — never re-probe
+    }
+  }));
+  return learned;
+}
+
+/** Re-serve a conns array with any newly-learned identities filled in. */
+function withEnrichedIdentities(conns: ConnectedToolkit[]): ConnectedToolkit[] {
+  return conns.map((c) => {
+    if (c.accountEmail) return c;
+    const learned = cachedIdentityEmail(c.connectionId);
+    return learned ? { ...c, accountEmail: learned } : c;
+  });
 }
 
 // ─── Composio dispatch gateway ────────────────────────────────────────────────
@@ -1037,6 +1086,14 @@ export async function resolveComposioDispatch(
   const sid = opts.sessionId;
   const notes: string[] = [];
 
+  // `account_alias` meta-arg (never reaches the provider): WITH a pinned
+  // connection it is the "remember this one by name" gesture; alone it means
+  // "use the account I named" and resolves through the alias store.
+  const aliasArg = typeof (args as Record<string, unknown>).account_alias === 'string'
+    ? String((args as Record<string, unknown>).account_alias).trim()
+    : undefined;
+  delete (args as Record<string, unknown>).account_alias;
+
   // One SWR snapshot reused by every stage below (breaker verify + identity).
   let conns: ConnectedToolkit[] = [];
   try { conns = await listUsableConnectedToolkits(); } catch { conns = []; }
@@ -1060,6 +1117,41 @@ export async function resolveComposioDispatch(
   // OWNER RESOLUTION (before constraints validate it, before backend selection).
   let owner = pinned;
   let identity: string | undefined;
+
+  // "Remember this one by name": pin + alias → bind the name to the pinned
+  // connection's stable identity (probing its profile once if the email isn't
+  // known yet) so future calls resolve by name with no ask.
+  if (owner && aliasArg) {
+    let email = cachedIdentityEmail(owner) ?? usable.find((c) => c.connectionId === owner)?.accountEmail;
+    if (!email && PROFILE_SLUG_BY_TOOLKIT[toolkit] && !identityProbeAttempted(owner)) {
+      try {
+        const profile = await executeComposioTool(PROFILE_SLUG_BY_TOOLKIT[toolkit], {}, owner);
+        email = extractMailboxEmails(profile)[0];
+        recordIdentityProbe(owner, email ?? null);
+      } catch { recordIdentityProbe(owner, null); }
+    }
+    const saved = rememberAccountAlias({ toolkit, label: aliasArg, email, connectionId: owner });
+    if (saved) {
+      identity = saved.email ?? identity;
+      notes.push(`[account-memory] Saved: "${saved.label}" is your ${toolkit} account${saved.email ? ` ${saved.email}` : ''}. Future calls can pass account_alias:"${saved.label}" — no need to ask again.`);
+    }
+  }
+
+  // "Use the account I named": alias alone resolves through the alias store —
+  // by stable email when known, else by its last-known live connection.
+  let aliasHint: string | undefined;
+  if (!owner && aliasArg) {
+    const alias = resolveAccountAlias(aliasArg, toolkit);
+    if (alias?.email) {
+      aliasHint = alias.email;
+    } else if (alias?.connectionId && usable.some((c) => c.connectionId === alias.connectionId)) {
+      owner = alias.connectionId;
+      notes.push(`[account-route] Routed to your saved "${alias.label}" ${toolkit} account.`);
+    } else {
+      notes.push(`[account-memory] No saved ${toolkit} account named "${aliasArg}" — resolving normally. To save it: re-call with connected_account_id + account_alias.`);
+    }
+  }
+
   if (!owner) {
     const calendarRoute = findOutlookCalendarReadConstraint(toolSlug, args, opts.userInput);
     if (calendarRoute) {
@@ -1073,13 +1165,24 @@ export async function resolveComposioDispatch(
   // pre-block it. Everything else resolves by identity here.
   const ruleOwnedSend = !owner && isIrreversibleSendSlug(toolSlug) && Boolean(findEmailSendConstraint(toolSlug, args));
   if (!owner && !ruleOwnedSend) {
-    const hint = opts.preferredIdentity ?? recallComposioAccountIdentity(toolSlug);
-    const outcome = selectToolkitConnection(toolSlug, conns, hint);
+    const hint = opts.preferredIdentity ?? aliasHint ?? recallComposioAccountIdentity(toolSlug);
+    let outcome = selectToolkitConnection(toolSlug, conns, hint);
+    if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
+      // Identity enrichment before blocking: probe unidentified candidates ONCE
+      // (cached durably) — same-mailbox re-auths then merge, and a named/
+      // recalled mailbox can match. Only then is a residual ambiguity real.
+      const learned = await enrichToolkitIdentities(toolkit, usable);
+      if (learned > 0) {
+        conns = withEnrichedIdentities(conns);
+        outcome = selectToolkitConnection(toolSlug, conns, hint);
+      }
+    }
     if (outcome.kind === 'resolved') {
       owner = outcome.connectionId;
       identity = outcome.identity;
       if (hint && outcome.identity === hint) {
-        notes.push(`[account-route] Routed to your remembered ${hint} mailbox for ${toolkit}.`);
+        const label = aliasLabelFor(toolkit, hint);
+        notes.push(`[account-route] Routed to your ${label ? `"${label}" (${hint})` : `remembered ${hint}`} ${toolkit} account.`);
       }
     } else if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
       // Ambiguity → typed block for ALL operations (reads included: reading the

@@ -33,6 +33,8 @@ const { __test__ } = await import('../integrations/composio/client.js');
 const { resolveComposioDispatch, dispatchComposioTool, __gatewayTest__ } = await import('./composio-tools.js');
 const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
 const { createSession, listEvents } = await import('../runtime/harness/eventlog.js');
+const { rememberAccountAlias, resolveAccountAlias } = await import('../memory/account-alias-store.js');
+const { recordIdentityProbe } = await import('../integrations/composio/identity-cache.js');
 
 type LoaderItem = Record<string, unknown>;
 function account(id: string, toolkit: string, email?: string, status = 'ACTIVE'): LoaderItem {
@@ -149,6 +151,86 @@ test('breaker is NARROW: fires only when the snapshot confirms zero usable conne
   const alive = await resolveComposioDispatch('NOTION_SEARCH_PAGES', {}, undefined, { sessionId: sid });
   assert.equal(alive.ok, true, 'a visible reconnect disarms the breaker without waiting for TTL');
   __gatewayTest__.clearReconnectBreaker(sid, 'NOTION_SEARCH_PAGES');
+});
+
+test('named accounts: "remember this as scorpion" binds pin→name; alias alone then resolves with no ask', async () => {
+  setAccounts([
+    account('ca_scorpion', 'outlook', 'nate@scorpion.co'),
+    account('ca_personal', 'outlook', 'nate@personal.me'),
+  ]);
+  // The remember gesture: pinned connection + account_alias meta-arg.
+  const saved = await resolveComposioDispatch(
+    'OUTLOOK_LIST_MESSAGES',
+    { account_alias: 'scorpion' },
+    'ca_scorpion',
+    {},
+  );
+  assert.equal(saved.ok, true);
+  if (saved.ok) {
+    assert.equal(saved.connectionId, 'ca_scorpion');
+    assert.ok(saved.notes.some((n) => n.includes('"scorpion"')), 'confirms the name was saved');
+    assert.ok(!('account_alias' in saved.args), 'meta-arg never reaches the provider');
+  }
+  assert.equal(resolveAccountAlias('scorpion', 'outlook')?.email, 'nate@scorpion.co');
+
+  // The use gesture: alias alone — resolves through the store, zero ambiguity ask.
+  const used = await resolveComposioDispatch(
+    'OUTLOOK_LIST_MESSAGES',
+    { account_alias: 'scorpion' },
+    undefined,
+    {},
+  );
+  assert.equal(used.ok, true);
+  if (used.ok) {
+    assert.equal(used.connectionId, 'ca_scorpion');
+    assert.equal(used.identity, 'nate@scorpion.co');
+  }
+  // Fuzzy phrasing still lands ("my scorpion email").
+  const fuzzy = await resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', { account_alias: 'my scorpion email' }, undefined, {});
+  assert.equal(fuzzy.ok, true);
+  if (fuzzy.ok) assert.equal(fuzzy.connectionId, 'ca_scorpion');
+});
+
+test('named accounts survive re-auth: the alias re-attaches by EMAIL to the new connection id', async () => {
+  rememberAccountAlias({ toolkit: 'gmail', label: 'newsletter', email: 'news@brand.com', connectionId: 'ca_old_rotated' });
+  // Re-auth minted a NEW connection id for the same mailbox; old id is gone.
+  setAccounts([
+    account('ca_new_id', 'gmail', 'news@brand.com'),
+    account('ca_other2', 'gmail', 'me@brand.com'),
+  ]);
+  const out = await resolveComposioDispatch('GMAIL_FETCH_EMAILS', { account_alias: 'newsletter' }, undefined, {});
+  assert.equal(out.ok, true);
+  if (out.ok) assert.equal(out.connectionId, 'ca_new_id', 'alias followed the mailbox, not the rotated ca_ id');
+});
+
+test('identity enrichment: cached probe results merge no-email duplicates so the ask disappears', async () => {
+  // Two re-auths of ONE mailbox whose listing exposes NO email (the Microsoft
+  // case) — unmergeable → would ask. A prior profile probe cached their real
+  // mailbox; resolution must now merge them and pick the freshest, no ask.
+  recordIdentityProbe('ca_ms_old', 'nate@scorpion.co');
+  recordIdentityProbe('ca_ms_new', 'nate@scorpion.co');
+  setAccounts([
+    { ...account('ca_ms_old', 'outlook'), createdAt: '2026-07-01T00:00:00Z' },
+    { ...account('ca_ms_new', 'outlook'), createdAt: '2026-07-10T00:00:00Z' },
+  ]);
+  // A slug with NO per-intent recall in this suite — isolates the enrichment merge.
+  const out = await resolveComposioDispatch('OUTLOOK_LIST_MAIL_FOLDERS', {}, undefined, {});
+  assert.equal(out.ok, true, 'no ask — enriched identities merged the duplicates');
+  if (out.ok) assert.equal(out.connectionId, 'ca_ms_new');
+});
+
+test('the ambiguous ASK teaches the naming gesture and shows saved names', async () => {
+  rememberAccountAlias({ toolkit: 'slack', label: 'work', email: 'ops@corp.com', connectionId: 'ca_slack_work' });
+  setAccounts([
+    account('ca_slack_work', 'slack', 'ops@corp.com'),
+    account('ca_slack_side', 'slack', 'side@indie.dev'),
+  ]);
+  const out = await resolveComposioDispatch('SLACK_SEND_MESSAGE', {}, undefined, {});
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.message, /"work"/, 'saved name shown on its candidate');
+    assert.match(out.message, /account_alias/, 'teaches the remember gesture');
+  }
 });
 
 test('CLI/SDK selection boundary: a pinned owner is NEVER dispatched via the CLI', async () => {
