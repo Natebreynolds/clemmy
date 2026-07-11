@@ -221,6 +221,103 @@ test('run_tool_program surface follows CLEMMY_CODE_MODE: absent when off, presen
   }
 });
 
+// ─── Move 5: clem.run_worker (bounded sub-agent spawning from a program) ───
+const VALID_WORKER_SPEC = {
+  objective: 'Summarize the sentiment of one review',
+  item: 'review-42',
+  resolvedTools: 'none needed',
+  context: 'Review text: "great product, fast shipping"',
+  instructions: 'Return one word: positive, negative, or neutral.',
+  expectedOutput: '{ "sentiment": "positive|negative|neutral" }',
+  intent: null,
+};
+
+test('clem.run_worker: recursion guard refuses a worker spawned INSIDE a worker (depth ≤ 1)', async () => {
+  const { dispatchCodeModeTool, _setCodeModeWorkerRunnerForTests } = await import('./code-mode-tool.js');
+  const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  _setCodeModeWorkerRunnerForTests(async () => ({ text: 'should-not-run', model: 'x' }));
+  try {
+    // guardrailScopeId set → we are inside a worker run → run_worker must refuse.
+    const out = await withHarnessRunContext(
+      { sessionId: 'sess-w', counter: new ToolCallsCounter(100), guardrailScopeId: 'sess-w::w:1' },
+      () => dispatchCodeModeTool('run_worker', VALID_WORKER_SPEC, 'sess-w', new ToolCallsCounter(100)),
+    ) as { ok: boolean; error?: string };
+    assert.equal(out.ok, false);
+    assert.match(out.error ?? '', /worker-of-worker|inside a worker/);
+  } finally {
+    _setCodeModeWorkerRunnerForTests(null);
+  }
+});
+
+test('clem.run_worker: per-program count cap refuses beyond the limit', async () => {
+  const { dispatchCodeModeTool, _setCodeModeWorkerRunnerForTests } = await import('./code-mode-tool.js');
+  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  _setCodeModeWorkerRunnerForTests(async () => ({ text: 'ok', model: 'x' }));
+  const counter = new ToolCallsCounter(100); // ONE program run
+  try {
+    for (let i = 0; i < 4; i++) {
+      const out = await dispatchCodeModeTool('run_worker', VALID_WORKER_SPEC, 'sess-cap', counter) as { ok: boolean };
+      assert.equal(out.ok, true, `worker ${i + 1} of 4 should run`);
+    }
+    const overflow = await dispatchCodeModeTool('run_worker', VALID_WORKER_SPEC, 'sess-cap', counter) as { ok: boolean; error?: string };
+    assert.equal(overflow.ok, false, '5th worker refused');
+    assert.match(overflow.error ?? '', /limit reached/);
+  } finally {
+    _setCodeModeWorkerRunnerForTests(null);
+  }
+});
+
+test('clem.run_worker: invalid spec returns a structured error (no dispatch)', async () => {
+  const { dispatchCodeModeTool } = await import('./code-mode-tool.js');
+  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const out = await dispatchCodeModeTool('run_worker', { objective: 'too short' }, 'sess-bad', new ToolCallsCounter(100)) as { ok: boolean; error?: string };
+  assert.equal(out.ok, false);
+  assert.match(out.error ?? '', /invalid spec/);
+});
+
+test('clem.run_worker: kill-switch CLEMMY_CODE_MODE_WORKERS=off disables it', async () => {
+  const { dispatchCodeModeTool } = await import('./code-mode-tool.js');
+  const { ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+  const prev = process.env.CLEMMY_CODE_MODE_WORKERS;
+  process.env.CLEMMY_CODE_MODE_WORKERS = 'off';
+  try {
+    const out = await dispatchCodeModeTool('run_worker', VALID_WORKER_SPEC, 'sess-off', new ToolCallsCounter(100)) as { ok: boolean; error?: string };
+    assert.equal(out.ok, false);
+    assert.match(out.error ?? '', /disabled/);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_CODE_MODE_WORKERS; else process.env.CLEMMY_CODE_MODE_WORKERS = prev;
+  }
+});
+
+test('a PROGRAM can fetch then fan out clem.run_worker on the result (the north-star shape)', async () => {
+  const { runCodeModeForSession, _setCodeModeToolsForTests, _setCodeModeWorkerRunnerForTests } = await import('./code-mode-tool.js');
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'off';
+  _setCodeModeToolsForTests(new Map([
+    ['memory_search', { name: 'memory_search', invoke: async () => ({ items: ['a', 'b'] }) }],
+  ]));
+  // fake worker echoes the item it was given
+  _setCodeModeWorkerRunnerForTests(async (input) => ({ text: `judged:${input.item}`, model: 'test' }));
+  try {
+    const r = await runCodeModeForSession(
+      `const found = await clem.memory_search({ q: 'x' });
+       const out = [];
+       for (const item of found.items) {
+         const w = await clem.run_worker({ objective: 'judge one item here', item, resolvedTools: 'none needed', context: 'ctx', instructions: 'do it', expectedOutput: '{}', intent: null });
+         out.push(w.ok ? w.text : ('ERR:' + w.error));
+       }
+       return { verdicts: out };`,
+      'sess-fanout',
+    );
+    assert.equal(r.ok, true, r.error);
+    assert.deepEqual(r.value, { verdicts: ['judged:a', 'judged:b'] });
+  } finally {
+    _setCodeModeToolsForTests(null);
+    _setCodeModeWorkerRunnerForTests(null);
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+  }
+});
+
 // ─── Track 4: clem.describe + result handles ───
 test('clem.describe returns schema info for a local tool and never dispatches it', async () => {
   const { describeCodeModeTool } = await import('./code-mode-tool.js');

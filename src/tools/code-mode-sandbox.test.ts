@@ -223,13 +223,33 @@ test('partial results: a program killed mid-run returns what its completed calls
   const r = await runCodeModeProgram(
     `const out = []; for (let i = 0; i < 10; i++) { out.push(await clem.fetch_item({ i })); } return out;`,
     dispatch,
-    { timeoutMs: 30_000, idleTimeoutMs: 2_500 },
+    // A hung DISPATCH is "waiting on the host", not idle — so it now rides to the
+    // hard ceiling (a short one here), not the idle timer. Partials still salvage.
+    { timeoutMs: 3_000, idleTimeoutMs: 1_000 },
   );
   assert.equal(r.ok, false, 'the hung program is killed');
-  assert.match(r.error ?? '', /idle for 2500ms/);
+  assert.match(r.error ?? '', /ceiling/);
   assert.ok(r.partial, 'partials are attached to the failure');
   assert.equal(r.partial!.completed, 5, 'the five completed fetches are reported');
   assert.match(r.partial!.recent.at(-1)!.preview, /"item":5/, 'result previews survive');
+});
+
+// Move 5 prerequisite: a single dispatch legitimately longer than the idle window
+// (a slow tool call or a 30-60s sub-agent) is NOT idle-killed — the program is
+// waiting on the host, not wedged. The hard ceiling remains the real bound.
+test('idle deadline: a single dispatch longer than the idle window is NOT killed (waits on host)', async () => {
+  const dispatch: CodeModeDispatch = async () => { await new Promise((r) => setTimeout(r, 2_500)); return { done: true }; };
+  const r = await runCodeModeProgram('return await clem.longCall({});', dispatch, { timeoutMs: 10_000, idleTimeoutMs: 1_000 });
+  assert.equal(r.ok, true, `slow in-flight dispatch survived (got: ${r.error ?? 'ok'})`);
+  assert.deepEqual(r.value, { done: true });
+});
+
+// The wedge case MUST still die: a program stuck with NO dispatch in flight (no
+// host wait) is genuinely idle and is killed at the idle window.
+test('idle deadline: a program stuck with NO dispatch in flight is still idle-killed', async () => {
+  const r = await runCodeModeProgram('await new Promise(() => {}); return 1;', noDispatch, { timeoutMs: 30_000, idleTimeoutMs: 1_000 });
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? '', /idle for 1000ms/);
 });
 
 test('idle deadline: a SLOW but ACTIVE program is NOT killed at the idle window', async () => {

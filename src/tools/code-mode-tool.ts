@@ -17,6 +17,8 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { wrapToolForHarness, withHarnessRunContext, ToolCallsCounter, harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { appendEvent, getToolOutput, writeToolOutput } from '../runtime/harness/eventlog.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
@@ -57,6 +59,19 @@ export function codeModeWritesEnabled(): boolean {
 export function codeModeSendGuardEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CODE_MODE_SEND_GUARD', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
+
+/** clem.run_worker inside a program (default ON; kill-switch CLEMMY_CODE_MODE_WORKERS=off).
+ *  Lets a program fetch/aggregate, then fan out bounded reasoning sub-agents on
+ *  the interesting subset — read-aggregation and reasoning-fan-out in ONE program
+ *  (the 100-subagent-handoff bridge). HARD depth ≤ 1 (no worker-of-worker) via
+ *  guardrailScopeId, and a per-program count cap. */
+export function codeModeWorkersEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_CODE_MODE_WORKERS', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+/** Ceiling on sub-agents ONE program may spawn — beyond this, return items and
+ *  let the parent batch. Bounds cost/recursion blast radius. */
+const MAX_WORKERS_PER_PROGRAM = 4;
+const programWorkerCounts = new WeakMap<ToolCallsCounter, number>();
 
 /** Mutating-call count per PROGRAM RUN, keyed by the run's counter identity
  *  (one ToolCallsCounter spans one program). WeakMap → no cleanup needed. */
@@ -322,6 +337,55 @@ export async function listCodeModeTools(): Promise<unknown> {
   };
 }
 
+type WorkerRunner = (input: WorkerToolInput, modelId: string, sessionId: string) => Promise<{ text: string; model: string }>;
+let workerRunnerForTest: WorkerRunner | null = null;
+/** Test seam: inject the worker runner so run_worker can be tested without a live model. */
+export function _setCodeModeWorkerRunnerForTests(fn: WorkerRunner | null): void {
+  workerRunnerForTest = fn;
+}
+async function runCodeModeWorker(input: WorkerToolInput, modelId: string, sessionId: string): Promise<{ text: string; model: string }> {
+  if (workerRunnerForTest) return workerRunnerForTest(input, modelId, sessionId);
+  const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
+  const r = await runCrossProviderWorker(input, modelId, sessionId);
+  return { text: r.text, model: r.model };
+}
+
+/** `clem.run_worker(spec)` — spawn ONE bounded reasoning sub-agent from inside a
+ *  program (Move 5 / G6). Returns { ok, text } or { ok:false, error } so the
+ *  program can branch. Guards: (1) HARD depth ≤ 1 — refused inside a worker run
+ *  (guardrailScopeId), so no worker-of-worker recursion; (2) a per-program count
+ *  cap. The worker's own tool grants + read-only-worker boundary gate what it can
+ *  do — spawning one is safe. */
+async function dispatchCodeModeWorker(args: unknown, sessionId: string, counter?: ToolCallsCounter): Promise<unknown> {
+  if (!codeModeWorkersEnabled()) {
+    return { ok: false, error: 'run_worker is disabled in code mode (CLEMMY_CODE_MODE_WORKERS=off)' };
+  }
+  // RECURSION GUARD: guardrailScopeId is set ONLY on worker runs, so its presence
+  // means this program is itself running inside a worker → refuse (depth ≤ 1).
+  if (harnessRunContextStorage.getStore()?.guardrailScopeId) {
+    return { ok: false, error: 'run_worker is not available inside a worker (no worker-of-worker). Do the reasoning inline, or return the items so the parent can fan them out.' };
+  }
+  // COUNT CAP per program run (keyed by the run's counter, like mutations).
+  if (counter) {
+    const used = programWorkerCounts.get(counter) ?? 0;
+    if (used >= MAX_WORKERS_PER_PROGRAM) {
+      return { ok: false, error: `run_worker limit reached (${MAX_WORKERS_PER_PROGRAM} per program). For a bigger fan-out, return the items and let the parent run a batch.` };
+    }
+    programWorkerCounts.set(counter, used + 1);
+  }
+  const parsed = WorkerToolInputSchema.safeParse(args);
+  if (!parsed.success) {
+    return { ok: false, error: `run_worker: invalid spec — ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}` };
+  }
+  try {
+    const modelId = resolveRoleModel('worker').modelId;
+    const { text, model } = await runCodeModeWorker(parsed.data, modelId, sessionId);
+    return { ok: true, text, model };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function describeCodeModeTool(name: unknown): Promise<unknown> {
   const toolName = typeof name === 'string' ? name : String((name as { tool?: unknown; name?: unknown })?.tool ?? (name as { name?: unknown })?.name ?? '');
   if (!toolName) return { error: 'describe: pass a tool name string, e.g. clem.describe("list_files")' };
@@ -360,6 +424,7 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
   // Host-answered helpers — never tool dispatches, never gated, never counted.
   if (method === 'describe') return describeCodeModeTool(args);
   if (method === 'listTools') return listCodeModeTools();
+  if (method === 'run_worker') return dispatchCodeModeWorker(args, sessionId, counter);
   if (!isCodeModeToolAllowed(method)) {
     const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
     throw new Error(`code-mode: tool "${method}" is not available — ${why}`);
@@ -587,6 +652,7 @@ export function codeModeDescription(): string {
       : 'Local writes are off, but MCP reads work; a destructive MCP tool is still blocked by its approval gate.',
     'Example: `const [a,b] = await Promise.all([clem["dataforseo__serp_organic_live_advanced"]({...}), clem["dataforseo__serp_organic_live_advanced"]({...})]); return { aTop: a.items?.[0], bTop: b.items?.[0] };`',
     'Helpers (free — host-answered, not tool calls): `await clem.listTools()` lists the connected external MCP tools (names + descriptions) so you know what is callable; `await clem.describe("tool_name")` returns a tool\'s REAL arg schema — including external MCP tools — so check it before guessing arg shapes; `await clem.progress("34/60 fetched")` narrates status to the user.',
+    'FAN-OUT: `await clem.run_worker({ objective, item, resolvedTools, context, instructions, expectedOutput, intent })` runs ONE isolated reasoning sub-agent and returns `{ ok, text }` — use it to fetch/aggregate, then fan reasoning out over the interesting subset (Promise.all a few for parallelism). Bounded: at most 4 per program, and a worker cannot itself call run_worker (no worker-of-worker). For a large uniform per-item batch, prefer run_batch.',
     'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Tool-call budget applies; a program is killed after ~20s with NO tool activity (an actively-fetching program can run to a ~3-minute ceiling). If it is killed mid-run you receive the completed calls\' results as PARTIAL RESULTS — salvage them, only redo what is missing.',
     'HARD LIMIT: this is for READ-ONLY aggregation. NEVER loop irreversible external SENDS/writes (email send, publish) inside it — a batch of gated sends cannot finish inside the program ceiling, so it dies mid-batch and loses track of what was sent. For ANY batch of sends/writes use `run_batch` instead (it certifies once, then runs a deterministic per-item loop with its own budget and an honest ledger). An irreversible send attempted here is refused.',
   ].join(' ');

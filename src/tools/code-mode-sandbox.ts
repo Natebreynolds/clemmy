@@ -352,6 +352,12 @@ export async function runCodeModeProgram(
       resolve({ ...r, intermediateBytes });
     };
 
+    // Host-side dispatch semaphore — Promise.all over N items must not
+    // stampede a provider; beyond maxConcurrent, dispatches queue in order.
+    // Declared before the idle timer so it can distinguish "wedged" from
+    // "legitimately waiting on a slow dispatch" (e.g. a 30-60s sub-agent).
+    let inFlight = 0;
+
     // Two deadlines: a HARD ceiling, and an IDLE deadline that resets on any
     // observable activity (RPC traffic, progress, stderr). A program actively
     // completing calls runs up to the ceiling; a wedged one dies in ~idleMs.
@@ -363,14 +369,15 @@ export async function runCodeModeProgram(
       if (idleMs <= 0 || settled) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
+        if (settled) return;
+        // A dispatch is still running (a slow tool call or an in-flight
+        // sub-agent) — the program is waiting on the HOST, not wedged. Re-arm
+        // instead of killing; the HARD ceiling remains the real upper bound.
+        if (inFlight > 0) { touchActivity(); return; }
         finish({ ok: false, error: `code-mode program was idle for ${idleMs}ms (no tool activity) and was killed`, rpcCalls, logs, partial: partialOnFailure() });
       }, idleMs);
     };
     touchActivity();
-
-    // Host-side dispatch semaphore — Promise.all over N items must not
-    // stampede a provider; beyond maxConcurrent, dispatches queue in order.
-    let inFlight = 0;
     const dispatchQueue: Array<() => void> = [];
     // After finish(), NOTHING new may start: a queued write dispatched post-kill
     // would be a real side effect the (dead) program can never observe. Pending
