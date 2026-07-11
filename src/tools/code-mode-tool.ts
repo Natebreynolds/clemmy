@@ -346,6 +346,12 @@ export function _setCodeModeWorkerRunnerForTests(fn: WorkerRunner | null): void 
 async function runCodeModeWorker(input: WorkerToolInput, modelId: string, sessionId: string): Promise<{ text: string; model: string }> {
   if (workerRunnerForTest) return workerRunnerForTest(input, modelId, sessionId);
   const { runCrossProviderWorker } = await import('../agents/sub-agents.js');
+  // KNOWN GAP (break-it 2026-07-11, medium): a killed program leaves its in-flight
+  // workers running in the daemon (they self-terminate at their turn cap — bounded
+  // waste — but a WEDGED provider call has no per-call timeout to rescue it). The
+  // clean fix is an AbortSignal.timeout passed as a 4th arg; runCrossProviderWorker
+  // does not yet accept a signal on this branch, so it's deferred until that lands
+  // rather than reaching into the worker subsystem here.
   const r = await runCrossProviderWorker(input, modelId, sessionId);
   return { text: r.text, model: r.model };
 }

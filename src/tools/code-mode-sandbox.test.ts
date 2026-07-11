@@ -114,6 +114,20 @@ test('cleanCodeModeStderr: keeps console breadcrumbs, empty logs → empty, boun
   assert.ok(cleanCodeModeStderr(['x'.repeat(5000)]).length <= 801, 'bounded to ~800 chars');
 });
 
+// Break-it 2026-07-11: a large non-whitespace stderr blob (a program that
+// console.log's a huge minified token then fails) made the path-rewrite regex
+// run superlinearly and freeze the single-threaded daemon for seconds. The input
+// is now bounded BEFORE the regex — the scan is O(1) in the blob size, and the
+// real error text (at the END of stderr) survives.
+test('cleanCodeModeStderr: a 256KB non-whitespace blob is handled fast and keeps the trailing error', () => {
+  const t0 = performance.now();
+  const out = cleanCodeModeStderr([`${'x'.repeat(256 * 1024)}\nSyntaxError: boom\n`]);
+  const ms = performance.now() - t0;
+  assert.ok(out.length <= 801, 'bounded');
+  assert.match(out, /SyntaxError: boom/, 'the real error at the tail survives the pre-bound');
+  assert.ok(ms < 250, `must not block the event loop (took ${ms.toFixed(0)}ms; pre-fix was ~10000ms)`);
+});
+
 test('LEGIBILITY end-to-end: a real SyntaxError populates .logs with the user line and error text', async () => {
   const r = await runCodeModeProgram('const a = 1;\nconst x = ;\nreturn a;', noDispatch, { timeoutMs: 15_000 });
   assert.equal(r.ok, false);

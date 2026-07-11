@@ -263,7 +263,16 @@ const USER_PROGRAM_LINE_OFFSET = (() => {
  * model can fix in-run. Pure + exported for testing.
  */
 export function cleanCodeModeStderr(logs: string[], maxChars = 800): string {
-  let text = logs.join('').trim();
+  let text = logs.join('');
+  // BOUND BEFORE the regex work: the path-rewrite scan below has superlinear
+  // cost on a large non-whitespace, no-match blob (a program can console.log a
+  // huge minified token then fail), and running it on 64KB would freeze the
+  // single-threaded daemon for seconds. We only ever KEEP the tail (last
+  // maxChars) anyway, so cap the scan input to a small multiple of it first —
+  // the real error text (SyntaxError / stack) lives at the end of stderr.
+  const scanCap = Math.max(maxChars * 4, 4_000);
+  if (text.length > scanCap) text = text.slice(text.length - scanCap);
+  text = text.trim();
   if (!text) return '';
   // program.mjs:<N> → the user's own line number.
   text = text.replace(/(?:file:\/\/)?\S*?program\.mjs:(\d+)(?::(\d+))?/g, (_m, line, col) => {
