@@ -17,6 +17,10 @@ test('isMissingReleaseMetadataError detects generic missing updater yml metadata
   assert.equal(isMissingReleaseMetadataError('Cannot find latest-linux.yml in the latest release artifacts'), true);
 });
 
+test('isMissingReleaseMetadataError detects a repository with no published releases', () => {
+  assert.equal(isMissingReleaseMetadataError(new Error('No published versions on GitHub')), true);
+});
+
 test('isMissingReleaseMetadataError does not hide unrelated updater failures', () => {
   assert.equal(isMissingReleaseMetadataError(new Error('download failed: sha512 mismatch')), false);
   assert.equal(isMissingReleaseMetadataError(new Error('GitHub API rate limit exceeded')), false);
