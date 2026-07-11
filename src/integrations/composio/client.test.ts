@@ -9,6 +9,7 @@ import {
   listSuppressedConnectedToolkitViews,
   pickToolkitConnection,
   selectToolkitConnection,
+  dispatchUserIdFor,
   toComposioDashboardConnection,
   type ConnectedToolkit,
 } from './client.js';
@@ -95,6 +96,31 @@ test('cache invalidation rejects a late old-account refresh and preserves the ne
   } finally {
     __test__.setConnectedAccountsLoader(null);
   }
+});
+
+test('dispatchUserIdFor: a pinned connection dispatches under the entity that OWNS it, never the env fallback', () => {
+  const conns: ConnectedToolkit[] = [
+    { slug: 'outlook', connectionId: 'ca_dash', status: 'ACTIVE', ownerUserId: 'pg-test-dashboard-entity' },
+    { slug: 'outlook', connectionId: 'ca_clem', status: 'ACTIVE', ownerUserId: 'clementine-machine' },
+    { slug: 'gmail', connectionId: 'ca_no_owner', status: 'ACTIVE' }, // SDK-fallback listing: owner unknown
+  ];
+  // Composio validates userId ↔ connectedAccountId; the owner must win over a
+  // stale COMPOSIO_USER_ID (the 2026-07-11 entity-mismatch class).
+  assert.equal(dispatchUserIdFor('ca_dash', conns, 'user-main'), 'pg-test-dashboard-entity');
+  assert.equal(dispatchUserIdFor('ca_clem', conns, 'user-main'), 'clementine-machine');
+  // Owner unknown (SDK fallback) or nothing pinned → the fallback entity.
+  assert.equal(dispatchUserIdFor('ca_no_owner', conns, 'user-main'), 'user-main');
+  assert.equal(dispatchUserIdFor(undefined, conns, 'user-main'), 'user-main');
+  assert.equal(dispatchUserIdFor('ca_unknown', conns, 'fallback'), 'fallback');
+});
+
+test('refreshConnectedToolkits maps the raw-v3 user_id to ownerUserId', async () => {
+  __test__.setConnectedAccountsLoader(async () => [
+    { id: 'ca_owned', toolkit: { slug: 'outlook' }, status: 'ACTIVE', user_id: 'pg-test-owner' },
+  ]);
+  const conns = await listConnectedToolkits();
+  assert.equal(conns.find((c) => c.connectionId === 'ca_owned')?.ownerUserId, 'pg-test-owner');
+  __test__.setConnectedAccountsLoader(null);
 });
 
 test('selectToolkitConnection: 3 re-auths of ONE mailbox collapse → freshest ACTIVE (the reported bug)', () => {

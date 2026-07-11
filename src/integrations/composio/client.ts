@@ -84,6 +84,11 @@ export interface ConnectedToolkit {
    *  secondary identity key for connection selection when no accountEmail is
    *  known — see selectToolkitConnection(). */
   wordId?: string;
+  /** The Composio entity (user_id) that OWNS this connection — dispatch must
+   *  send this userId with the pinned connectedAccountId or Composio 400s with
+   *  ConnectedAccountEntityIdMismatch. From the raw v3 listing (the SDK strips
+   *  it); absent when only the SDK fallback listing was available. */
+  ownerUserId?: string;
 }
 
 export interface ComposioConnectionSuppression {
@@ -762,10 +767,41 @@ function extractAccountIdentity(state: unknown, data: unknown): AccountIdentity 
 
 async function loadConnectedAccountItems(): Promise<Array<Record<string, unknown>>> {
   if (connectedAccountsLoaderForTest) return connectedAccountsLoaderForTest();
+  const apiKey = readComposioEnv('COMPOSIO_API_KEY');
+  if (!apiKey) return [];
+  // RAW v3 REST first: it exposes each account's OWNER user_id, which the
+  // @composio/core SDK transform strips from connectedAccounts.list(). The
+  // owner is required at dispatch time — Composio validates that userId and
+  // connectedAccountId MATCH, so pinning a connection under the wrong entity
+  // 400s with ConnectedAccountEntityIdMismatch (2026-07-11 live probe:
+  // dashboard-created accounts under pg-test-… vs a stale env user-main).
+  try {
+    const res = await fetch('https://backend.composio.dev/api/v3/connected_accounts?limit=100', {
+      headers: { 'x-api-key': apiKey },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) {
+      const body = (await res.json()) as { items?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>;
+      const items = Array.isArray(body) ? body : (body?.items ?? []);
+      if (Array.isArray(items)) return items;
+    }
+  } catch { /* fall through to the SDK listing (no owner ids, but functional) */ }
   const composio = getComposio();
   if (!composio) return [];
   const resp = await (composio as any).connectedAccounts.list({ limit: 100 });
   return Array.isArray(resp) ? resp : (resp?.items ?? []);
+}
+
+/** Dispatch entity for a resolved/pinned connection: the userId that OWNS it
+ *  (from the snapshot), else the configured/derived fallback. Pure. */
+export function dispatchUserIdFor(
+  connectionId: string | undefined,
+  conns: ConnectedToolkit[],
+  fallback: string,
+): string {
+  if (!connectionId) return fallback;
+  const owner = conns.find((c) => c.connectionId === connectionId)?.ownerUserId;
+  return owner && owner.trim() ? owner : fallback;
 }
 
 /** One generation-safe account snapshot feeds connection routing and preferred
@@ -799,6 +835,7 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
           accountAvatarUrl: identity.avatarUrl,
           createdAt: str(item.createdAt) ?? str(item.created_at),
           wordId: str(item.wordId) ?? str(item.word_id),
+          ownerUserId: str(item.user_id) ?? str(item.userId),
         };
       }).filter((connection) => connection.connectionId && connection.slug !== 'unknown');
       if (generation !== connectionsGeneration) {
@@ -1521,8 +1558,15 @@ export async function executeComposioTool(
   // the self-heal below backstops a just-changed connection.
   let selfHealedConnection = false;
   const resolvedConnection = pinnedAccountId ?? (await resolveToolkitConnectionId(toolSlug, preferredIdentity));
+  // OWNER-PAIR dispatch: Composio validates that userId and connectedAccountId
+  // MATCH — a pinned connection dispatched under a different entity 400s with
+  // ConnectedAccountEntityIdMismatch. So the dispatch userId is the entity that
+  // OWNS the resolved connection (raw-v3 snapshot), falling back to the
+  // configured/derived entity only when no specific connection is pinned.
+  let snapshotConns: ConnectedToolkit[] = [];
+  try { snapshotConns = await listUsableConnectedToolkits(); } catch { snapshotConns = []; }
   const body: Record<string, unknown> = {
-    userId,
+    userId: dispatchUserIdFor(resolvedConnection, snapshotConns, userId),
     arguments: args,
     dangerouslySkipVersionCheck: true,
   };
@@ -1546,7 +1590,13 @@ export async function executeComposioTool(
       invalidateConnectedAccountSnapshot();
       const fresh = await resolveToolkitConnectionId(toolSlug, preferredIdentity);
       if (fresh && fresh !== resolvedConnection) {
-        return await (composio as any).tools.execute(toolSlug, { ...body, connectedAccountId: fresh });
+        let freshConns: ConnectedToolkit[] = [];
+        try { freshConns = await listUsableConnectedToolkits(); } catch { freshConns = []; }
+        return await (composio as any).tools.execute(toolSlug, {
+          ...body,
+          userId: dispatchUserIdFor(fresh, freshConns, userId),
+          connectedAccountId: fresh,
+        });
       }
     }
     if (isComposioReconnectRequiredError(err)) {

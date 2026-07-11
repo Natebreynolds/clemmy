@@ -988,13 +988,16 @@ export interface ComposioGatewayOptions {
 // so entity-mismatch entries recorded before this build are presumed
 // bug-artifacts and dropped ONCE (a genuinely-mismatched connection re-records
 // within one call). Real OAuth expiry ('expired') suppressions are kept.
+// v2: re-cleared after the OWNER-PAIR dispatch fix (dispatch userId = the
+// entity that owns the pinned connection) — v1-era dispatches could still
+// record artifact mismatches between the identity fix and the owner-pair fix.
 let suppressionsRevalidated = false;
 function revalidateStaleSuppressionsOnce(): void {
   if (suppressionsRevalidated) return;
   suppressionsRevalidated = true;
   try {
     const stateDir = path.join(BASE_DIR, 'state');
-    const marker = path.join(stateDir, 'composio-suppressions-revalidated-v1');
+    const marker = path.join(stateDir, 'composio-suppressions-revalidated-v2');
     if (existsSync(marker)) return;
     const state = readComposioConnectionSuppressionState() as unknown as ComposioConnectionSuppressionState;
     const entries = state.suppressedConnections ?? {};
