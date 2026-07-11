@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runCodeModeProgram, type CodeModeDispatch } from './code-mode-sandbox.js';
+import { runCodeModeProgram, cleanCodeModeStderr, type CodeModeDispatch } from './code-mode-sandbox.js';
 
 const noDispatch: CodeModeDispatch = async () => null;
 
@@ -73,6 +73,37 @@ test('a program that throws surfaces the error (not a crash)', async () => {
   const r = await runCodeModeProgram('throw new Error("boom");', noDispatch, { timeoutMs: 15_000 });
   assert.equal(r.ok, false);
   assert.match(r.error ?? '', /boom/);
+});
+
+// LEGIBILITY (G3): a SyntaxError used to vanish behind the generic "exited (1)"
+// message — its real text sat in .logs, dropped. cleanCodeModeStderr rewrites the
+// wrapper's line numbers to the USER's own lines and strips internal noise.
+test('cleanCodeModeStderr: rewrites program.mjs:<wrapperLine> to the user program line', () => {
+  const logs = [
+    'file:///tmp/clem-codemode-abc/program.mjs:23\n    const __ret = await (async () => { const x = ;\n                                                 ^\n\n',
+    "SyntaxError: Unexpected token ';'\n    at compileSourceTextModule (node:internal/modules/esm/utils:346:16)\n",
+    '    at async onImport.tracePromise (node:internal/modules/esm/loader:664:25)\nNode.js v22.22.0\n',
+  ];
+  const out = cleanCodeModeStderr(logs);
+  assert.match(out, /your program \(line 1\)/, 'wrapper line 23 → user line 1');
+  assert.match(out, /SyntaxError: Unexpected token ';'/);
+  assert.doesNotMatch(out, /node:internal/, 'internal frames stripped');
+  assert.doesNotMatch(out, /program\.mjs/, 'temp path stripped');
+  assert.doesNotMatch(out, /Node\.js v/, 'runtime footer stripped');
+});
+
+test('cleanCodeModeStderr: keeps console breadcrumbs, empty logs → empty, bounds length', () => {
+  assert.equal(cleanCodeModeStderr(['fetched 3 rows\nabout to fail\n']), 'fetched 3 rows\nabout to fail');
+  assert.equal(cleanCodeModeStderr([]), '');
+  assert.ok(cleanCodeModeStderr(['x'.repeat(5000)]).length <= 801, 'bounded to ~800 chars');
+});
+
+test('LEGIBILITY end-to-end: a real SyntaxError populates .logs with the user line and error text', async () => {
+  const r = await runCodeModeProgram('const a = 1;\nconst x = ;\nreturn a;', noDispatch, { timeoutMs: 15_000 });
+  assert.equal(r.ok, false);
+  const detail = cleanCodeModeStderr(r.logs);
+  assert.match(detail, /your program \(line 2\)/, 'error de-offset to the user\'s own line 2');
+  assert.match(detail, /SyntaxError/);
 });
 
 // 2026-07-08 (sess-mrco803b): a program iterated a PATH STRING char-by-char —

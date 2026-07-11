@@ -21,7 +21,7 @@ import { appendEvent, getToolOutput, writeToolOutput } from '../runtime/harness/
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { deriveCodeModeSets } from './tool-registry.js';
-import { runCodeModeProgram, type CodeModeResult } from './code-mode-sandbox.js';
+import { runCodeModeProgram, cleanCodeModeStderr, type CodeModeResult } from './code-mode-sandbox.js';
 // NB: getCoreTools is reached via DYNAMIC import in realToolsByName() — a static
 // import would form a registry ↔ code-mode-tool cycle (registry exposes
 // buildCodeModeTool). The dynamic import resolves at first dispatch, by when the
@@ -97,7 +97,7 @@ export function codeModeMandateDirective(opts: {
   const rule = [
     `BATCH-SHAPE RULE — external data-fetch tools are in scope this turn (${fetchTools}). Pick the lane by the SHAPE of the work:`,
     '(a) 3+ same-shape items whose tool arguments you can FULLY MATERIALIZE right now (send N drafted emails, update N records with known values, pull N known lookups) → `run_batch` ONE plan: certified once, then executed deterministically with zero model calls between items — the fastest and most auditable lane. ANY batch of external SENDS/WRITES MUST use run_batch — never loop sends yourself and never put sends in run_tool_program (its program ceiling will lose a partial batch).',
-    '(b) 3+ independent items that each need their own REASONING/discovery (research each firm, judge each doc) → FAN OUT: `run_worker` once PER ITEM, in parallel, each with a complete job packet — do NOT grind the items one-by-one in your own context;',
+    '(b) 3+ independent items that each need their own REASONING/discovery (research each firm, judge each doc) → FAN OUT: call `run_worker` ONCE with the complete stable-id items array and shared output contract; the harness runs isolated Workers with bounded concurrency — do NOT grind the items one-by-one in your own context;',
     '(c) several DIFFERENT read-only fetches feeding ONE deliverable → ONE `run_tool_program` (Promise.all the independent fetches inside), distill, return ONLY the small result. run_tool_program is READ-ONLY aggregation with an activity-based deadline — no sends/writes inside it;',
     '(d) a SINGLE read → call the tool directly.',
   ].join(' ');
@@ -534,6 +534,29 @@ export function codeModeDescription(): string {
   ].join(' ');
 }
 
+/**
+ * Format a FAILED program for the model so it can FIX and re-run instead of
+ * blindly re-emitting. Surfaces (in order): the error, the cleaned stderr detail
+ * — a SyntaxError with the user's own line number, or console breadcrumbs, both
+ * previously DROPPED behind the generic "exited (1)" — then any salvaged partial
+ * results. Exported for testing.
+ */
+export function formatCodeModeFailure(result: CodeModeResult): string {
+  const lines = [`code-mode program failed: ${result.error}`];
+  const detail = cleanCodeModeStderr(result.logs);
+  if (detail) lines.push(`Program error output (fix and re-run):\n${detail}`);
+  // A failed program still hands over what its completed calls produced —
+  // salvage beats redoing every fetch (Track 4: partial results).
+  if (result.partial && result.partial.completed > 0) {
+    lines.push(
+      `PARTIAL RESULTS SALVAGED — ${result.partial.completed} call(s) completed, ${result.partial.failed} failed before the abort. Most recent completed results (previews):`,
+      JSON.stringify(result.partial.recent.filter((r) => r.ok).slice(-10)),
+      'Use these instead of re-fetching; only redo what is missing.',
+    );
+  }
+  return lines.join('\n');
+}
+
 /** The run_tool_program tool def. Only meaningful when codeModeEnabled(). */
 export function buildCodeModeTool() {
   return tool({
@@ -548,17 +571,7 @@ export function buildCodeModeTool() {
       if (result.ok) {
         return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}`;
       }
-      // A failed program still hands over what its completed calls produced —
-      // salvage beats redoing every fetch (Track 4: partial results).
-      if (result.partial && result.partial.completed > 0) {
-        return [
-          `code-mode program failed: ${result.error}`,
-          `PARTIAL RESULTS SALVAGED — ${result.partial.completed} call(s) completed, ${result.partial.failed} failed before the abort. Most recent completed results (previews):`,
-          JSON.stringify(result.partial.recent.filter((r) => r.ok).slice(-10)),
-          'Use these instead of re-fetching; only redo what is missing.',
-        ].join('\n');
-      }
-      return `code-mode program failed: ${result.error}`;
+      return formatCodeModeFailure(result);
     },
   });
 }

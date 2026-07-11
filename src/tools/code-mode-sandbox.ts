@@ -230,6 +230,45 @@ const clem = new Proxy({}, { get: (_t, prop) => (args) => __rpc(String(prop), ar
 `;
 }
 
+/** Lines of preamble buildProgramSource() prepends before the user's line 1.
+ *  A SyntaxError/stack references program.mjs:<wrapperLine>; subtracting this
+ *  yields the user's OWN line number. Computed from the wrapper (not hardcoded)
+ *  so it can't silently drift if the preamble changes. */
+const USER_PROGRAM_LINE_OFFSET = (() => {
+  const marker = '__CM_USER_PROGRAM_MARKER__';
+  const idx = buildProgramSource(marker).split('\n').findIndex((l) => l.includes(marker));
+  return idx >= 0 ? idx : 0; // 0-based index of the marker line = # of preamble lines
+})();
+
+/**
+ * Make a failed program's stderr LEGIBLE to the model: rewrite the sandbox temp
+ * path + wrapper line numbers to the user's own program lines, drop internal ESM
+ * loader frames (pure noise), and bound the length. A SyntaxError — otherwise
+ * lost behind the generic "exited (1)" message — becomes an actionable error the
+ * model can fix in-run. Pure + exported for testing.
+ */
+export function cleanCodeModeStderr(logs: string[], maxChars = 800): string {
+  let text = logs.join('').trim();
+  if (!text) return '';
+  // program.mjs:<N> → the user's own line number.
+  text = text.replace(/(?:file:\/\/)?\S*?program\.mjs:(\d+)(?::(\d+))?/g, (_m, line, col) => {
+    const userLine = Math.max(1, Number(line) - USER_PROGRAM_LINE_OFFSET);
+    return col ? `your program (line ${userLine}, col ${col})` : `your program (line ${userLine})`;
+  });
+  // Bare path with no line number.
+  text = text.replace(/(?:file:\/\/)?\S*?program\.mjs/g, 'your program');
+  // Drop deep internal loader/module frames (point at Node internals, not the
+  // user's code) and the trailing "Node.js vX" runtime footer — pure noise that
+  // only crowds the budget.
+  text = text
+    .split('\n')
+    .filter((l) => !/^\s+at .*node:internal\//.test(l) && !/^Node\.js v/.test(l))
+    .join('\n')
+    .trim();
+  if (text.length > maxChars) text = `…${text.slice(text.length - maxChars)}`;
+  return text;
+}
+
 /**
  * Run a model-authored program in the sandbox. `dispatch(method, args)` is how a
  * `clem.<method>(args)` call is fulfilled — the caller decides which tools are
