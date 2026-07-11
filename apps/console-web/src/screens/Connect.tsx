@@ -18,10 +18,10 @@ import { BrowserHarness } from '@/components/connect/BrowserHarness';
 import { usePoll } from '@/lib/poll';
 import { CodexReauth } from './settings/CodexLoginForm';
 import {
-  getComposioStatus, getComposioToolkits, authorizeComposio, refreshComposio, disconnectComposio, activeConnectionId,
+  getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio, activeConnectionId,
   getCredentials, setCredential, setDiscordOwner,
   normalizeCredentialRows, isConnected, CODEX_MANAGED_SECRETS,
-  connectedToolkits, searchToolkits, toolkitStatus,
+  connectedToolkits, reconnectConnectionId, searchToolkits, toolkitStatus,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit,
 } from '@/lib/connect';
 
@@ -74,6 +74,18 @@ export function Connect() {
   const [refreshing, setRefreshing] = useState(false);
   const [appNotice, setAppNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 
+  const openAuthorization = (res: { url?: string; redirectUrl?: string }, prefix = '') => {
+    const url = res.url || res.redirectUrl;
+    if (url) {
+      window.open(url, '_blank', 'noopener');
+      setAppNotice({ tone: 'info', text: `${prefix}Finish connecting in the window that opened — this list refreshes when you come back.` });
+      const onFocus = () => { window.removeEventListener('focus', onFocus); void refreshApps(); };
+      window.addEventListener('focus', onFocus);
+    } else {
+      setAppNotice({ tone: 'error', text: 'No authorization URL was returned.' });
+    }
+  };
+
   const refreshApps = async () => {
     setRefreshing(true); setAppNotice(null);
     try {
@@ -86,20 +98,25 @@ export function Connect() {
     finally { setRefreshing(false); }
   };
 
-  const connectApp = async (slug: string) => {
+  const connectApp = async (slug: string, prefix = '') => {
     setAppNotice(null);
     try {
       const res = await authorizeComposio(slug);
-      const url = res.url || res.redirectUrl;
-      if (url) {
-        window.open(url, '_blank', 'noopener');
-        setAppNotice({ tone: 'info', text: 'Finish connecting in the window that opened — this list refreshes when you come back.' });
-        // Auto-refresh when the user returns from the OAuth window.
-        const onFocus = () => { window.removeEventListener('focus', onFocus); void refreshApps(); };
-        window.addEventListener('focus', onFocus);
-      } else {
-        setAppNotice({ tone: 'error', text: 'No authorization URL was returned.' });
-      }
+      openAuthorization(res, prefix);
+    } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
+  };
+
+  const reconnectApp = async (t: ComposioToolkit) => {
+    const staleId = reconnectConnectionId(t);
+    setAppNotice(null);
+    try {
+      const res = await reconnectComposio(t.slug, staleId);
+      const prefix = !staleId
+        ? ''
+        : res.staleRemoved
+          ? 'Removed the stale connection. '
+          : 'The stale record could not be removed; the new connection will replace it for Clementine. ';
+      openAuthorization(res, prefix);
     } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
   };
 
@@ -159,13 +176,13 @@ export function Connect() {
           results.length === 0
             ? <Card className="p-4 text-body text-muted">No apps match “{appQuery}”.</Card>
             : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {results.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onDisconnect={() => disconnectApp(t)} />)}
+                {results.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnect={() => disconnectApp(t)} />)}
               </div>
         ) : connected.length === 0 ? (
           <Card className="p-5 text-body text-muted">No apps connected yet — search above to connect Gmail, Slack, your CRM, and more.</Card>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {connected.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onDisconnect={() => disconnectApp(t)} />)}
+            {connected.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnect={() => disconnectApp(t)} />)}
           </div>
         )}
       </Section>
@@ -209,7 +226,12 @@ export function Connect() {
   );
 }
 
-function AppCard({ t, onConnect, onDisconnect }: { t: ComposioToolkit; onConnect: () => void; onDisconnect?: () => void | Promise<void> }) {
+function AppCard({ t, onConnect, onReconnect, onDisconnect }: {
+  t: ComposioToolkit;
+  onConnect: () => void | Promise<void>;
+  onReconnect?: () => void | Promise<void>;
+  onDisconnect?: () => void | Promise<void>;
+}) {
   const status = toolkitStatus(t);
   const name = t.displayName || t.slug;
   const [imgOk, setImgOk] = useState(Boolean(t.logoUrl));
@@ -220,6 +242,14 @@ function AppCard({ t, onConnect, onDisconnect }: { t: ComposioToolkit; onConnect
   const doDisconnect = async () => {
     setBusy(true);
     try { await onDisconnect?.(); } finally { setBusy(false); setConfirming(false); }
+  };
+
+  const doConnect = async (reconnect: boolean) => {
+    setBusy(true);
+    try {
+      if (reconnect && onReconnect) await onReconnect();
+      else await onConnect();
+    } finally { setBusy(false); }
   };
 
   return (
@@ -238,9 +268,13 @@ function AppCard({ t, onConnect, onDisconnect }: { t: ComposioToolkit; onConnect
         <div className="flex items-center gap-1.5">
           {status === 'active'
             ? <StatusPill tone="success">Connected</StatusPill>
-            : status === 'expired'
-              ? <Button size="sm" variant="secondary" onClick={onConnect}><RotateCw className="h-4 w-4" aria-hidden /> Reconnect</Button>
-              : <Button size="sm" variant="secondary" onClick={onConnect}>Connect</Button>}
+            : status === 'expired' || status === 'reconnect'
+              ? <Button size="sm" variant="secondary" onClick={() => void doConnect(true)} disabled={busy}>
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RotateCw className="h-4 w-4" aria-hidden />} Reconnect
+                </Button>
+              : <Button size="sm" variant="secondary" onClick={() => void doConnect(false)} disabled={busy}>
+                  {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />} Connect
+                </Button>}
           {canDisconnect && (
             <Button size="sm" variant="ghost" aria-label={`Disconnect ${name}`} title="Disconnect" onClick={() => setConfirming(true)}>
               <Unplug className="h-4 w-4" aria-hidden />

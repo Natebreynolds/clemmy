@@ -6,7 +6,17 @@ import { getAuthToken } from './bootstrap';
 
 export interface ComposioStatus { connected?: boolean; configured?: boolean; enabled?: boolean; apiKeyPresent?: boolean; userId?: string; [k: string]: unknown }
 
-export interface ComposioConnection { id?: string; status?: string; accountEmail?: string | null; createdAt?: string }
+export interface ComposioConnection {
+  id?: string;
+  connectionId?: string;
+  status?: string;
+  providerStatus?: string;
+  usable?: boolean;
+  needsReconnect?: boolean;
+  suppressionReason?: string | null;
+  accountEmail?: string | null;
+  createdAt?: string;
+}
 export interface ComposioToolkit {
   slug: string;
   displayName?: string;
@@ -25,10 +35,16 @@ export interface ComposioSnapshot {
 }
 
 /** One toolkit's connection state, collapsing its connection history. */
-export type ToolkitStatus = 'active' | 'expired' | 'none';
+export type ToolkitStatus = 'active' | 'reconnect' | 'expired' | 'none';
 export function toolkitStatus(t: ComposioToolkit): ToolkitStatus {
-  const statuses = (t.connections ?? []).map((c) => (c.status ?? '').toUpperCase());
-  if (statuses.includes('ACTIVE')) return 'active';
+  const connections = t.connections ?? [];
+  // A toolkit is healthy when at least one account is explicitly usable. Keep
+  // compatibility with older snapshots that only carried status=ACTIVE.
+  if (connections.some((c) => c.usable === true)) return 'active';
+  if (connections.some((c) => c.needsReconnect === true)) return 'reconnect';
+  const statuses = connections.map((c) => (c.status ?? '').toUpperCase());
+  if (connections.some((c) => c.usable !== false && c.needsReconnect !== true && (c.status ?? '').toUpperCase() === 'ACTIVE')) return 'active';
+  if (statuses.includes('NEEDS_RECONNECT')) return 'reconnect';
   if (statuses.some((s) => s === 'EXPIRED' || s === 'INACTIVE' || s === 'INITIATED')) return 'expired';
   return 'none';
 }
@@ -37,7 +53,10 @@ export function toolkitStatus(t: ComposioToolkit): ToolkitStatus {
 export function connectedToolkits(snap?: ComposioSnapshot): ComposioToolkit[] {
   const list = (snap?.toolkits ?? []).filter((t) => toolkitStatus(t) !== 'none');
   return list.sort((a, b) => {
-    const order = (t: ComposioToolkit) => (toolkitStatus(t) === 'active' ? 0 : 1);
+    const order = (t: ComposioToolkit) => {
+      const status = toolkitStatus(t);
+      return status === 'active' ? 0 : status === 'reconnect' ? 1 : 2;
+    };
     return order(a) - order(b) || (a.displayName || a.slug).localeCompare(b.displayName || b.slug);
   });
 }
@@ -68,11 +87,48 @@ export const refreshComposio = () => apiPost<{ ok: boolean }>('/api/composio/ref
 export const disconnectComposio = (slug: string, connectionId: string) =>
   apiPost<{ ok: boolean }>(`/api/composio/toolkits/${encodeURIComponent(slug)}/disconnect`, { connectionId });
 
+export interface ComposioAuthorization { url?: string; redirectUrl?: string }
+export interface ComposioReconnectResult extends ComposioAuthorization { staleRemoved: boolean }
+
+/** Replace a known-bad account before opening the normal authorization flow.
+ * Some legacy entity-owned records cannot be deleted; authorization still
+ * proceeds because Composio can add a usable account for the current user. */
+export async function reconnectComposio(
+  slug: string,
+  connectionId: string | undefined,
+  actions: {
+    disconnect: typeof disconnectComposio;
+    authorize: typeof authorizeComposio;
+  } = { disconnect: disconnectComposio, authorize: authorizeComposio },
+): Promise<ComposioReconnectResult> {
+  let staleRemoved = false;
+  if (connectionId) {
+    try {
+      await actions.disconnect(slug, connectionId);
+      staleRemoved = true;
+    } catch {
+      // A replacement connection is still useful even if Composio retains the
+      // inaccessible legacy record in its project history.
+    }
+  }
+  return { ...await actions.authorize(slug), staleRemoved };
+}
+
 /** The connection id to act on — the ACTIVE one if present, else the first. */
 export function activeConnectionId(t: ComposioToolkit): string | undefined {
   const conns = t.connections ?? [];
-  const active = conns.find((c) => (c.status ?? '').toUpperCase() === 'ACTIVE');
-  return (active ?? conns[0])?.id;
+  const usable = conns.find((c) => c.usable === true && (c.status ?? '').toUpperCase() === 'ACTIVE');
+  const legacyActive = conns.find((c) => c.usable !== false && c.needsReconnect !== true && (c.status ?? '').toUpperCase() === 'ACTIVE');
+  const selected = usable ?? legacyActive ?? conns.find((c) => c.needsReconnect !== true) ?? conns[0];
+  return selected?.id ?? selected?.connectionId;
+}
+
+/** The stale account Reconnect should replace before starting a fresh OAuth flow. */
+export function reconnectConnectionId(t: ComposioToolkit): string | undefined {
+  const conns = t.connections ?? [];
+  const selected = conns.find((c) => c.needsReconnect === true)
+    ?? conns.find((c) => /NEEDS_RECONNECT|EXPIRED|INACTIVE|FAILED|REVOKED/.test((c.status ?? '').toUpperCase()));
+  return selected?.id ?? selected?.connectionId;
 }
 
 /** Codex/OpenAI auth snapshot (getAuthStatus on the daemon). codexOauthPresent

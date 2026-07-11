@@ -107,10 +107,10 @@ export async function runSetupWizard(): Promise<number> {
     AUTONOMY_V2_AGENTS: existing.AUTONOMY_V2_AGENTS || 'clementine',
     AUTONOMY_ORCHESTRATOR_SLUGS: existing.AUTONOMY_ORCHESTRATOR_SLUGS || '',
     COMPOSIO_API_KEY: existing.COMPOSIO_API_KEY || '',
-    // Leave blank by default. Persisting the literal "default" defeats
-    // getPreferredUserId's auto-detection (Composio's real ids look like
-    // pg-test-…), stranding every dashboard-connected toolkit on
-    // NoActiveConnection. Migrate an already-persisted "default" to blank.
+    // Leave blank by default. The Composio client preserves an explicit id,
+    // detects ids exposed by the legacy API, or persists this device's stable
+    // Clementine id for the current API shape. Migrate the old "default"
+    // sentinel to blank so it can never become an execution route.
     COMPOSIO_USER_ID:
       existing.COMPOSIO_USER_ID && existing.COMPOSIO_USER_ID !== 'default'
         ? existing.COMPOSIO_USER_ID
@@ -360,10 +360,11 @@ export async function runSetupWizard(): Promise<number> {
     });
     if (composioKey) values.COMPOSIO_API_KEY = composioKey;
     const composioUserId = await input({
-      message: 'Composio user ID (leave blank to auto-detect from your connections)',
+      message: 'Composio user ID (leave blank to use this device\'s stable Clementine ID)',
       default: values.COMPOSIO_USER_ID,
     });
-    // Blank → auto-detect at runtime. Never re-persist the "default" sentinel.
+    // Blank → legacy auto-detect or stable device id at runtime. Never
+    // re-persist the "default" sentinel.
     const trimmedUserId = composioUserId.trim();
     values.COMPOSIO_USER_ID = trimmedUserId && trimmedUserId !== 'default' ? trimmedUserId : '';
     if (values.COMPOSIO_API_KEY) {

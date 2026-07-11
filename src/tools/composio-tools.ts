@@ -10,6 +10,7 @@ import {
   listComposioToolkitTools,
   listUsableConnectedToolkits,
   listSuppressedConnectedToolkits,
+  isComposioReconnectRequiredError,
   readComposioConnectionSuppressionState,
   saveComposioConnectionSuppressionState,
   listAllToolkits,
@@ -121,7 +122,7 @@ const COMPOSIO_NOT_FOUND_RE =
  *  table/field ids that will never resolve. The cure here is to connect the
  *  toolkit (composio_status / ask the user), not to discover ids. */
 const COMPOSIO_NOT_CONNECTED_RE =
-  /connected account[^.]{0,30}not found|no connected accounts?\s+found|ConnectedAccountNotFound|no connected account\b/i;
+  /connected account[^.]{0,30}not found|no connected accounts?\s+found|ConnectedAccountNotFound|no connected account\b|ConnectedAccountEntityIdMismatch|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|\bno active connection\b/i;
 
 export function detectComposioFailure(value: unknown): { failed: boolean; summary: string; notFound: boolean; notConnected: boolean } {
   const none = { failed: false, summary: '', notFound: false, notConnected: false } as const;
@@ -158,7 +159,7 @@ export function detectComposioFailure(value: unknown): { failed: boolean; summar
   // Test not-found/not-connected against ALL the error fields, not just the one
   // that won the summary — Airtable puts http_error="403" but the phrase in message.
   const allFields = `${httpError} ${topError} ${dataMessage}`;
-  const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(allFields);
+  const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(allFields) || isComposioReconnectRequiredError(value);
   const notFound = COMPOSIO_NOT_FOUND_RE.test(allFields);
   return { failed: true, summary, notFound, notConnected };
 }
@@ -271,8 +272,8 @@ function composioFailureCorrective(
     const toolkit = (opts.toolSlug?.split('_')[0] || '').toUpperCase() || 'this toolkit';
     return [
       `⚠️ ${label} NOT CONNECTED${where}: ${summary}`,
-      `The toolkit "${toolkit}" is NOT connected — there is no connected account for it. This is NOT a wrong id and NOT a schema problem, so do NOT hunt for table/field/record ids (that will loop).`,
-      `Do this: call \`composio_status\` to confirm which toolkits are connected, then tell the user that ${toolkit} needs to be connected (via the Composio connections screen) before this action can run. Do NOT retry the identical call until ${toolkit} is connected.`,
+      `The saved ${toolkit} connection is missing or belongs to a different Composio user. This is NOT an argument or schema problem.`,
+      `Open Connect and reconnect ${toolkit}. Do NOT retry this action until the app has been reconnected.`,
     ].join('\n');
   }
   // Timeout FIRST (before the transient branch): a long-running job (an actor
@@ -430,7 +431,7 @@ export function composioThrownErrorOutput(
   const rawMessage = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
   const message = enrichComposioErrorMessage(err, rawMessage).replace(/\s+/g, ' ').trim();
   const summary = message.slice(0, 240) || 'unknown error';
-  const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(message);
+  const notConnected = COMPOSIO_NOT_CONNECTED_RE.test(message) || isComposioReconnectRequiredError(err);
   const notFound = COMPOSIO_NOT_FOUND_RE.test(message);
   const body = formatComposioToolOutput({ error: message, toolSlug: options.toolSlug ?? null }, options);
   // The thrown path carries the real error object (status/cause) — classify on
@@ -1064,6 +1065,14 @@ async function runComposioExecute(
       lastError = err;
       const errorMsg = err instanceof Error ? err.message : String(err ?? '');
       recentErrors.push(errorMsg);
+
+      // Entity/user mismatches and NoActiveConnection are deterministic. In
+      // particular, do not spend the generic retry budget repeating a call
+      // that can only be repaired by reconnecting the app under this user.
+      if (isComposioReconnectRequiredError(err)) {
+        return composioThrownErrorOutput(err, { ...options, toolSlug })
+          + suppressComposioConnectionAfterHardFailure(effectiveConnectionId, err);
+      }
 
       // Check if we should retry
       const decision = shouldRetryToolCall(err, attempt, recentErrors);

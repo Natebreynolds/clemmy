@@ -8,6 +8,7 @@ import {
   listConnectedToolkits,
   listSuppressedConnectedToolkitViews,
   pickToolkitConnection,
+  toComposioDashboardConnection,
 } from './client.js';
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {
@@ -163,4 +164,35 @@ test('filterSuppressedConnectedToolkits hides active-looking stale accounts befo
     undefined,
     'two usable Outlook accounts remain ambiguous; the stale account is not considered',
   );
+});
+
+test('dashboard connection state never presents a suppressed ACTIVE account as healthy', () => {
+  const now = Date.parse('2026-07-10T12:00:00Z');
+  const connection = { slug: 'outlook', connectionId: 'ca_legacy', status: 'ACTIVE' };
+  const suppression = {
+    suppressedConnections: {
+      ca_legacy: {
+        reason: 'entity-mismatch',
+        suppressUntil: '2026-07-17T12:00:00Z',
+        lastErrorAt: '2026-07-10T11:59:00Z',
+        failures: 1,
+      },
+    },
+  };
+
+  const stale = toComposioDashboardConnection(connection, suppression, now);
+  assert.equal(stale.providerStatus, 'ACTIVE');
+  assert.equal(stale.status, 'NEEDS_RECONNECT');
+  assert.equal(stale.usable, false);
+  assert.equal(stale.needsReconnect, true);
+  assert.equal(stale.suppressionReason, 'entity-mismatch');
+
+  const healthy = toComposioDashboardConnection(
+    { ...connection, connectionId: 'ca_current' },
+    suppression,
+    now,
+  );
+  assert.equal(healthy.status, 'ACTIVE');
+  assert.equal(healthy.usable, true);
+  assert.equal(healthy.needsReconnect, false);
 });

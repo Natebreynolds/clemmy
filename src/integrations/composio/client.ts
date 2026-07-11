@@ -3,6 +3,7 @@ import path from 'node:path';
 import { Composio } from '@composio/core';
 import { BASE_DIR } from '../../config.js';
 import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
+import { getMachineId } from '../../runtime/machine-id.js';
 import { getSecretStore } from '../../runtime/secrets/index.js';
 import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
 import {
@@ -23,6 +24,9 @@ const CONNECTION_SUPPRESSION_SOURCE_FILES = [
 ];
 const SECRET_VAULT_FILE = path.join(CACHE_DIR, 'secrets-vault.json');
 const DEFAULT_USER_ID = 'default';
+const DERIVED_USER_ID_PREFIX = 'clementine-';
+const RECONNECT_REQUIRED_RE =
+  /ConnectedAccountEntityIdMismatch|connected account[^\n]{0,100}(?:user|entity)[ _-]?id[^\n]{0,80}(?:does not match|mismatch)|user[ _-]?id[^\n]{0,80}does not match[^\n]{0,80}provided user[ _-]?id|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|\bno active connection\b/i;
 const CONNECTIONS_TTL_MS = 60_000;
 const CATALOG_TTL_MS = 60 * 60_000;
 const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
@@ -163,6 +167,9 @@ export function saveComposioConnectionSuppressionState(
     CONNECTION_SUPPRESSION_FILE,
     JSON.stringify({ suppressedConnections }, null, 2),
   );
+  // A connection that just failed ownership/auth validation must stop looking
+  // healthy on the next Connect read, not after the dashboard SWR window.
+  bustComposioDashboardCaches();
 }
 
 export function filterSuppressedConnectedToolkits(
@@ -186,6 +193,25 @@ export function listSuppressedConnectedToolkitViews(
   return out;
 }
 
+export interface ComposioDashboardConnection {
+  slug: string;
+  /** Keep both names: legacy dashboard consumes connectionId; SPA consumes id. */
+  connectionId: string;
+  id: string;
+  status: string;
+  providerStatus: string;
+  usable: boolean;
+  needsReconnect: boolean;
+  suppressionReason: string | null;
+  suppressUntil: string | null;
+  alias: string | null;
+  accountLabel: string | null;
+  accountEmail: string | null;
+  accountName: string | null;
+  accountAvatarUrl: string | null;
+  createdAt: string | null;
+}
+
 export interface ComposioDashboardToolkit {
   slug: string;
   displayName: string;
@@ -195,16 +221,7 @@ export interface ComposioDashboardToolkit {
   description: string | null;
   toolCount: number | null;
   categories: { slug: string; name: string }[];
-  connections: Array<{
-    id: string;
-    status: string;
-    alias: string | null;
-    accountLabel: string | null;
-    accountEmail: string | null;
-    accountName: string | null;
-    accountAvatarUrl: string | null;
-    createdAt: string | null;
-  }>;
+  connections: ComposioDashboardConnection[];
 }
 
 export interface ComposioDashboardSnapshot {
@@ -214,7 +231,7 @@ export interface ComposioDashboardSnapshot {
   userId: string;
   executionBackend: ComposioExecutionBackend;
   cli: ComposioCliStatus;
-  connected: ConnectedToolkit[];
+  connected: ComposioDashboardConnection[];
   toolkits: ComposioDashboardToolkit[];
   featured: string[];
   totalCount: number;
@@ -230,7 +247,7 @@ interface AccountIdentity {
 
 let singleton: Composio | null = null;
 let localEnvCache: { at: number; env: Record<string, string> } | null = null;
-let connectionsCache: { at: number; data: ConnectedToolkit[]; preferredUserId: string } | null = null;
+let connectionsCache: { at: number; data: ConnectedToolkit[]; preferredUserId?: string } | null = null;
 let connectionsGeneration = 0;
 let connectionsInflight: { generation: number; promise: Promise<ConnectedToolkit[]> } | null = null;
 let connectedAccountsLoaderForTest: (() => Promise<Array<Record<string, unknown>>>) | null = null;
@@ -301,6 +318,57 @@ function str(value: unknown): string | undefined {
 
 function obj(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+/** Current Composio failures can hide the useful code/message under cause or
+ * getErrorData(). Keep this classifier at the client boundary so AUTO never
+ * repeats a deterministic CLI connection failure through the SDK. */
+export function isComposioReconnectRequiredError(value: unknown): boolean {
+  const seen = new Set<unknown>();
+  const parts: string[] = [];
+  let hasReconnectCode = false;
+
+  const visit = (input: unknown, depth: number): void => {
+    if (input === null || input === undefined || depth > 4 || seen.has(input)) return;
+    if (typeof input === 'string' || typeof input === 'number') {
+      parts.push(String(input));
+      return;
+    }
+    if (typeof input !== 'object') return;
+    seen.add(input);
+
+    const record = input as Record<string, unknown> & { getErrorData?: () => unknown };
+    for (const [key, nested] of Object.entries(record)) {
+      if (/^(?:code|errorCode|error_code)$/i.test(key) && (nested === 1810 || nested === 1812 || nested === '1810' || nested === '1812')) {
+        hasReconnectCode = true;
+      }
+      visit(nested, depth + 1);
+    }
+    if (input instanceof Error) {
+      parts.push(input.name, input.message);
+      visit((input as Error & { cause?: unknown }).cause, depth + 1);
+    }
+    try {
+      if (typeof record.getErrorData === 'function') visit(record.getErrorData(), depth + 1);
+    } catch {
+      // Best-effort classification only.
+    }
+  };
+
+  visit(value, 0);
+  return hasReconnectCode || RECONNECT_REQUIRED_RE.test(parts.join(' ').slice(0, 8_000));
+}
+
+export class ComposioReconnectRequiredError extends Error {
+  readonly cause: unknown;
+
+  constructor(toolSlug: string, cause: unknown) {
+    const toolkitSlug = toolSlug.split('_')[0]?.toLowerCase() || 'this app';
+    const app = toolkitSlug === 'this app' ? toolkitSlug : displayNameFor(toolkitSlug);
+    super(`The saved ${app} connection cannot be used by Clementine's current Composio user. Open Connect and reconnect ${app}. Do not retry this action until it is reconnected.`);
+    this.name = 'ComposioReconnectRequiredError';
+    this.cause = cause;
+  }
 }
 
 export function maskApiKey(value: string): string {
@@ -396,7 +464,7 @@ export function getComposioCredentialStatus(): {
     enabled: Boolean(apiKey),
     apiKeyPresent: Boolean(apiKey),
     maskedApiKey: apiKey ? maskApiKey(apiKey) : undefined,
-    userId: readComposioEnv('COMPOSIO_USER_ID') || DEFAULT_USER_ID,
+    userId: configuredUserId() ?? derivedComposioUserId(),
     executionBackend: getComposioExecutionBackend(),
   };
 }
@@ -418,7 +486,7 @@ export function saveComposioExecutionBackend(backend: string): ComposioExecution
 
 function composioCliOptions(): { apiKey?: string; userId?: string } {
   const apiKey = readComposioEnv('COMPOSIO_API_KEY');
-  const userId = readComposioEnv('COMPOSIO_USER_ID') || DEFAULT_USER_ID;
+  const userId = configuredUserId() ?? derivedComposioUserId();
   return {
     ...(apiKey ? { apiKey } : {}),
     ...(userId ? { userId } : {}),
@@ -579,27 +647,61 @@ function invalidateConnectedAccountSnapshot(): void {
   connectionsInflight = null;
 }
 
-function preferredUserIdFromConnectedAccounts(items: Array<Record<string, unknown>>): string {
+function configuredUserId(): string | undefined {
+  const value = readComposioEnv('COMPOSIO_USER_ID');
+  return value && value !== DEFAULT_USER_ID ? value : undefined;
+}
+
+function derivedComposioUserId(): string {
+  const machineId = getMachineId()
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 96);
+  return `${DERIVED_USER_ID_PREFIX}${machineId || 'local-machine'}`;
+}
+
+/** Persist an auto-resolved id once so the SDK, CLI subprocesses, and future
+ * daemon boots all route through the same Composio entity without another
+ * account-list probe. Re-check the file immediately before writing so a
+ * user-supplied id that arrived during the probe always wins. */
+function persistResolvedComposioUserId(resolved: string): string {
+  const processValue = process.env.COMPOSIO_USER_ID?.trim();
+  if (processValue && processValue !== DEFAULT_USER_ID) return processValue;
+
+  const env = readEnvFile(ENV_FILE);
+  const fileValue = env.COMPOSIO_USER_ID?.trim();
+  if (fileValue && fileValue !== DEFAULT_USER_ID) {
+    process.env.COMPOSIO_USER_ID = fileValue;
+    localEnvCache = { at: Date.now(), env };
+    return fileValue;
+  }
+
+  env.COMPOSIO_USER_ID = resolved;
+  writeEnvFile(ENV_FILE, env);
+  process.env.COMPOSIO_USER_ID = resolved;
+  localEnvCache = { at: Date.now(), env };
+  return resolved;
+}
+
+function preferredUserIdFromConnectedAccounts(items: Array<Record<string, unknown>>): string | undefined {
   const counts = new Map<string, number>();
   for (const item of items) {
     const userId = str(item.user_id) ?? str(item.userId);
-    if (!userId) continue;
+    if (!userId || userId === DEFAULT_USER_ID) continue;
     const weight = /active/i.test(str(item.status) ?? '') ? 2 : 1;
     counts.set(userId, (counts.get(userId) ?? 0) + weight);
   }
-  return [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? DEFAULT_USER_ID;
+  return [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
 }
 
 export async function getPreferredUserId(options: { requireFresh?: boolean } = {}): Promise<string> {
-  const explicit = readComposioEnv('COMPOSIO_USER_ID');
-  // Treat the literal "default" sentinel as "not set" so already-installed
-  // users whose .env still carries COMPOSIO_USER_ID=default also fall through
-  // to auto-detection. Safe: if detection finds nothing we return
-  // DEFAULT_USER_ID ('default') anyway, and a user with real connections under
-  // the literal "default" id is still surfaced as the top connected user.
-  if (explicit && explicit !== DEFAULT_USER_ID) return explicit;
+  const explicit = configuredUserId();
+  if (explicit) return explicit;
   await listConnectedToolkits({ requireFresh: options.requireFresh });
-  return connectionsCache?.preferredUserId ?? DEFAULT_USER_ID;
+  const legacyDetected = connectionsCache?.preferredUserId;
+  return persistResolvedComposioUserId(legacyDetected ?? derivedComposioUserId());
 }
 
 function rawComposioClient(composio: Composio): any {
@@ -746,6 +848,41 @@ export async function listUsableConnectedToolkits(
 export async function listSuppressedConnectedToolkits(): Promise<Array<ConnectedToolkit & { suppression: ComposioConnectionSuppression }>> {
   const all = await listConnectedToolkits();
   return listSuppressedConnectedToolkitViews(all, readComposioConnectionSuppressionState());
+}
+
+/** Convert provider connection state into the dashboard's truthful health
+ * contract. Composio may still label a legacy account ACTIVE after execution
+ * proves that it belongs to a different entity; active suppression evidence
+ * wins over that stale provider label. */
+export function toComposioDashboardConnection(
+  connection: ConnectedToolkit,
+  suppressionState: ComposioConnectionSuppressionState,
+  nowMs = Date.now(),
+): ComposioDashboardConnection {
+  const suppression = suppressionState.suppressedConnections?.[connection.connectionId];
+  const suppressed = isSuppressionActive(suppression, nowMs);
+  const providerStatus = connection.status || 'UNKNOWN';
+  const providerNeedsReconnect = /expired|inactive|failed|revoked|deleted/i.test(providerStatus);
+  const needsReconnect = suppressed || providerNeedsReconnect;
+  const usable = !needsReconnect && /active|enabled/i.test(providerStatus);
+
+  return {
+    slug: connection.slug,
+    connectionId: connection.connectionId,
+    id: connection.connectionId,
+    status: suppressed ? 'NEEDS_RECONNECT' : providerStatus,
+    providerStatus,
+    usable,
+    needsReconnect,
+    suppressionReason: suppressed ? suppression.reason ?? 'suppressed' : null,
+    suppressUntil: suppressed ? suppression.suppressUntil : null,
+    alias: connection.alias ?? null,
+    accountLabel: connection.accountLabel ?? null,
+    accountEmail: connection.accountEmail ?? null,
+    accountName: connection.accountName ?? null,
+    accountAvatarUrl: connection.accountAvatarUrl ?? null,
+    createdAt: connection.createdAt ?? null,
+  };
 }
 
 interface RawCatalogItem {
@@ -1334,15 +1471,10 @@ export async function executeComposioTool(
   connectedAccountId?: string,
 ): Promise<unknown> {
   const backend = getComposioExecutionBackend();
-  // Resolve the actual Composio user_id ONCE up front. The setup wizard
-  // writes `COMPOSIO_USER_ID=default` into .env, but Composio's real
-  // user ids look like `pg-test-04a26016-…` — connections live under
-  // the real id, not under literal "default". getPreferredUserId()
-  // probes connected_accounts and picks the user with the most ACTIVE
-  // connections, so both the CLI and SDK paths route to where the
-  // user's data actually is. Without this, the CLI path emits
-  // `ToolRouterV2_NoActiveConnection` for every toolkit a user has set
-  // up via the dashboard.
+  // Resolve one stable Composio user up front. Older connected-account API
+  // responses expose user_id and remain auto-detectable; current responses do
+  // not, so getPreferredUserId() persists a per-machine Clementine id instead
+  // of silently routing through Composio's literal "default" entity.
   const userId = await getPreferredUserId({ requireFresh: true });
 
   // A model (esp. a BYO/GLM backend) can serialize a null account id as the
@@ -1365,6 +1497,9 @@ export async function executeComposioTool(
       try {
         return await executeComposioCliTool(toolSlug, args, cliOptions);
       } catch (error) {
+        if (isComposioReconnectRequiredError(error)) {
+          throw new ComposioReconnectRequiredError(toolSlug, error);
+        }
         if (backend === 'cli') throw error;
         // In auto mode, a CLI auth/version mismatch should not break
         // existing users. Fall through to the SDK path.
@@ -1393,6 +1528,9 @@ export async function executeComposioTool(
   try {
     return await (composio as any).tools.execute(toolSlug, body);
   } catch (err) {
+    if (isComposioReconnectRequiredError(err)) {
+      throw new ComposioReconnectRequiredError(toolSlug, err);
+    }
     // v0.5.65 — discover/execute version split. The SDK resolves a slug under
     // toolkit_versions=latest, but CURATED slugs (now discoverable via the
     // version-free broker fetch) live in the PUBLISHED namespace and 404 under
@@ -1500,8 +1638,12 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
     listToolkitSlugsWithAuthConfig(),
   ]);
 
-  const connectionsBySlug = new Map<string, ConnectedToolkit[]>();
-  for (const connection of connected) {
+  const suppressionState = readComposioConnectionSuppressionState();
+  const dashboardConnections = connected.map((connection) =>
+    toComposioDashboardConnection(connection, suppressionState));
+
+  const connectionsBySlug = new Map<string, ComposioDashboardConnection[]>();
+  for (const connection of dashboardConnections) {
     const list = connectionsBySlug.get(connection.slug) ?? [];
     list.push(connection);
     connectionsBySlug.set(connection.slug, list);
@@ -1509,17 +1651,6 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
 
   const catalogBySlug = new Map(catalog.map((toolkit) => [toolkit.slug, toolkit]));
   const orphanSlugs = [...connectionsBySlug.keys()].filter((slug) => !catalogBySlug.has(slug));
-  const toConnectionView = (connection: ConnectedToolkit) => ({
-    id: connection.connectionId,
-    status: connection.status,
-    alias: connection.alias ?? null,
-    accountLabel: connection.accountLabel ?? null,
-    accountEmail: connection.accountEmail ?? null,
-    accountName: connection.accountName ?? null,
-    accountAvatarUrl: connection.accountAvatarUrl ?? null,
-    createdAt: connection.createdAt ?? null,
-  });
-
   const toolkits: ComposioDashboardToolkit[] = [
     ...catalog.map((toolkit) => ({
       slug: toolkit.slug,
@@ -1530,7 +1661,7 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
       description: toolkit.description ?? null,
       toolCount: toolkit.toolsCount ?? null,
       categories: toolkit.categories,
-      connections: (connectionsBySlug.get(toolkit.slug) ?? []).map(toConnectionView),
+      connections: connectionsBySlug.get(toolkit.slug) ?? [],
     })),
     ...orphanSlugs.map((slug) => ({
       slug,
@@ -1541,7 +1672,7 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
       description: null,
       toolCount: null,
       categories: [],
-      connections: (connectionsBySlug.get(slug) ?? []).map(toConnectionView),
+      connections: connectionsBySlug.get(slug) ?? [],
     })),
   ];
 
@@ -1560,7 +1691,7 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
   return {
     ...credentials,
     cli,
-    connected,
+    connected: dashboardConnections,
     toolkits,
     featured,
     totalCount: toolkits.length,
@@ -1573,6 +1704,7 @@ export const __test__ = {
   authConfigToolkitSlug,
   selectAuthConfigIdForToolkit,
   preferredUserIdFromConnectedAccounts,
+  derivedComposioUserId,
   setConnectedAccountsLoader(
     loader: (() => Promise<Array<Record<string, unknown>>>) | null,
   ): void {

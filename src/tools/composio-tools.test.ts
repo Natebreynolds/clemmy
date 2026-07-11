@@ -353,7 +353,8 @@ test('formatComposioExecuteOutput: a NOT-CONNECTED toolkit steers to connect it,
   const out = formatComposioExecuteOutput(notConnected, { toolSlug: 'GMAIL_SEND_EMAIL' });
   assert.match(out, /NOT CONNECTED \(slug=GMAIL_SEND_EMAIL\)/);
   assert.match(out, /GMAIL/);
-  assert.match(out, /composio_status/);
+  assert.match(out, /Open Connect and reconnect GMAIL/);
+  assert.match(out, /Do NOT retry/);
   assert.match(out, /not\s+connected/i);
   // Crucially it is NOT the wrong-identifier corrective (which claims the connection works).
   assert.doesNotMatch(out, /the connection works/);
@@ -369,6 +370,28 @@ test('composioThrownErrorOutput: a THROWN not-connected error also gets the conn
   assert.match(out, /NOT CONNECTED \(slug=SLACK_SEND_MESSAGE\)/);
   assert.match(out, /SLACK/);
   assert.doesNotMatch(out, /the connection works/);
+});
+
+test('current Composio entity-mismatch and no-active-connection errors go straight to reconnect guidance', () => {
+  resetEventLog();
+  const mismatch = formatComposioExecuteOutput({
+    successful: false,
+    error: 'ConnectedAccountEntityIdMismatch: connected account user ID does not match the provided user ID',
+    data: { code: 1812 },
+  }, { toolSlug: 'OUTLOOK_LIST_CALENDAR_EVENTS' });
+  assert.match(mismatch, /Open Connect and reconnect OUTLOOK/);
+  assert.match(mismatch, /Do NOT retry/);
+  assert.doesNotMatch(mismatch, /Retry this EXACT call ONCE/);
+
+  const noActive = composioThrownErrorOutput(
+    Object.assign(new Error('Composio CLI execute failed: ToolRouterV2_NoActiveConnection'), {
+      cause: { error: { code: 1810 } },
+    }),
+    { toolSlug: 'GMAIL_LIST_EMAILS' },
+  );
+  assert.match(noActive, /Open Connect and reconnect GMAIL/);
+  assert.match(noActive, /Do NOT retry/);
+  assert.doesNotMatch(noActive, /Retry this EXACT call ONCE/);
 });
 
 test('formatComposioExecuteOutput: a genuine record-not-found STILL gets the id-discovery corrective (characterization)', () => {
