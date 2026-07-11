@@ -56,7 +56,12 @@ function account(id: string, slug: string, userId: string, status = 'ACTIVE') {
 
 test('connected-account snapshot feeds preferred user and connection routing with one fetch', async () => {
   const prev = process.env.COMPOSIO_USER_ID;
-  delete process.env.COMPOSIO_USER_ID;
+  // getPreferredUserId is now PURE: configuredUserId() (COMPOSIO_USER_ID) else a
+  // machine-derived id — it no longer reads the account list. Set the env
+  // explicitly so this asserts the configured path deterministically (deleting
+  // it made the result depend on the dev's ~/.clementine-next/.env, which passed
+  // locally off a leftover but returned the derived id on a clean CI checkout).
+  process.env.COMPOSIO_USER_ID = 'user-main';
   let calls = 0;
   __test__.setConnectedAccountsLoader(async () => {
     calls += 1;
