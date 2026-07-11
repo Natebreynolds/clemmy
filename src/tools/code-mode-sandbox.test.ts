@@ -75,6 +75,22 @@ test('a program that throws surfaces the error (not a crash)', async () => {
   assert.match(r.error ?? '', /boom/);
 });
 
+// Break-it 2026-07-11: a return value larger than the pipe buffer (~64KB) is not
+// written synchronously; a bare process.exit(0) TRUNCATED it, so the parent saw
+// "exited (0) without returning a value" and the result (or its parking) was
+// silently lost. The wrapper now flushes before exiting.
+test('a LARGE return value is flushed + parked, not silently lost (flush-before-exit)', async () => {
+  let parked = false;
+  const r = await runCodeModeProgram(
+    'return "Z".repeat(1024 * 1024);', // 1MB — well over any pipe buffer
+    noDispatch,
+    { timeoutMs: 15_000, onLargeResult: (json) => { parked = true; return `handle-${json.length}`; } },
+  );
+  assert.equal(r.ok, true, `1MB return must succeed, not be lost (got: ${r.error ?? 'ok'})`);
+  assert.equal(parked, true, 'the oversized value was parked via onLargeResult');
+  assert.match(JSON.stringify(r.value), /resultHandle/, 'the model gets a handle, not a truncated blob');
+});
+
 // LEGIBILITY (G3): a SyntaxError used to vanish behind the generic "exited (1)"
 // message — its real text sat in .logs, dropped. cleanCodeModeStderr rewrites the
 // wrapper's line numbers to the USER's own lines and strips internal noise.

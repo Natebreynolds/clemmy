@@ -225,13 +225,22 @@ const __rpc = (method, args) => new Promise((resolve, reject) => {
 // clem.<toolName>(args) → one gated tool call, dispatched by the parent.
 const clem = new Proxy({}, { get: (_t, prop) => (args) => __rpc(String(prop), args) });
 (async () => {
+  let __payload;
   try {
     const __ret = await (async () => { ${userProgram}\n })();
-    process.stdout.write(JSON.stringify({ __cm: 'return', value: __ret === undefined ? null : __ret }) + '\\n');
+    __payload = JSON.stringify({ __cm: 'return', value: __ret === undefined ? null : __ret }) + '\\n';
   } catch (e) {
-    process.stdout.write(JSON.stringify({ __cm: 'error', error: (e && e.message) || String(e) }) + '\\n');
+    __payload = JSON.stringify({ __cm: 'error', error: (e && e.message) || String(e) }) + '\\n';
   }
-  process.exit(0);
+  // Flush BEFORE exiting: a large payload does not write synchronously to the
+  // pipe, and a bare process.exit(0) would TRUNCATE it — the parent would then
+  // see "exited (0) without returning a value" and the result (or the
+  // onLargeResult parking) would be silently lost. Exit in the write callback so
+  // the whole payload is drained first; a 5s guard exits anyway if the pipe is
+  // gone (parent already killed us).
+  const __done = () => process.exit(0);
+  setTimeout(__done, 5000).unref?.();
+  process.stdout.write(__payload, __done);
 })();
 `;
 }
