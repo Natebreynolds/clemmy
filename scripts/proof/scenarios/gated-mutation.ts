@@ -16,6 +16,26 @@ import path from 'node:path';
 import { openHarnessDb, sessionMetrics, narrationCheck, reportBackCheck, stormCheck } from '../score.js';
 import type { Check, DaemonHandle, ScenarioDef } from '../types.js';
 
+export interface HygieneReturnEvidence {
+  data_json: string;
+  output_full: string | null;
+}
+
+export function isSuccessfulHygieneReturn(row: HygieneReturnEvidence): boolean {
+  try {
+    const data = JSON.parse(row.data_json) as { result?: unknown; preview?: unknown; error?: unknown };
+    // Codex/BYO keep a bounded result on the activity event. Claude keeps
+    // that event compact and parks the full result in the recall store.
+    const output = String(data.result ?? data.preview ?? data.error ?? row.output_full ?? '');
+    return /Task ledger hygiene \(apply\)/.test(output)
+      && /Repaired: 1\b/.test(output)
+      && /Compacted rows out of Pending: 1\b/.test(output)
+      && !/hygiene failed/i.test(output);
+  } catch {
+    return false;
+  }
+}
+
 export const gatedMutation: ScenarioDef = {
   name: 'gated-mutation',
   summary: 'catalog local mutation → provider gate → successful inner execution',
@@ -65,24 +85,16 @@ export const gatedMutation: ScenarioDef = {
       const db = openHarnessDb(daemon.home);
       metrics = sessionMetrics(db, turn.sessionId);
       const rows = db.prepare(
-        `SELECT data_json
-           FROM events
-          WHERE session_id = ?
-            AND type = 'tool_returned'
-            AND json_extract(data_json, '$.tool') = 'task_hygiene'`,
-      ).all(turn.sessionId) as Array<{ data_json: string }>;
-      successfulHygieneReturns = rows.filter((row) => {
-        try {
-          const data = JSON.parse(row.data_json) as { result?: unknown; preview?: unknown; error?: unknown };
-          const output = String(data.result ?? data.preview ?? data.error ?? '');
-          return /Task ledger hygiene \(apply\)/.test(output)
-            && /Repaired: 1\b/.test(output)
-            && /Compacted rows out of Pending: 1\b/.test(output)
-            && !/hygiene failed/i.test(output);
-        } catch {
-          return false;
-        }
-      }).length;
+        `SELECT e.data_json, o.output_full
+           FROM events AS e
+           LEFT JOIN tool_outputs AS o
+             ON o.session_id = e.session_id
+            AND o.call_id = json_extract(e.data_json, '$.callId')
+          WHERE e.session_id = ?
+            AND e.type = 'tool_returned'
+            AND json_extract(e.data_json, '$.tool') = 'task_hygiene'`,
+      ).all(turn.sessionId) as HygieneReturnEvidence[];
+      successfulHygieneReturns = rows.filter(isSuccessfulHygieneReturn).length;
       db.close();
     } catch { /* covered by the check below */ }
     const hygieneCalls = metrics?.toolCalls?.task_hygiene ?? 0;
