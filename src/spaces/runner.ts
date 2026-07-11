@@ -17,7 +17,6 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { resolveInSpace, runnerFilenameError, spaceStore, type SpaceDataSource, type SpaceAction } from './store.js';
 import { readData, writeData, appendAudit, type WriteDataResult, type WriteDataError } from './data-store.js';
-import { executeComposioTool } from '../integrations/composio/client.js';
 import { augmentPath } from '../runtime/spawn-env.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
@@ -80,6 +79,17 @@ export async function runScript(slug: string, runner: string, extra?: Record<str
   }
 }
 
+/** Space composio dispatch — through the SAME gateway as chat/workflow (owner
+ *  resolution, sender constraints, typed blocks). A blocked resolution surfaces
+ *  as the source/action error with the gateway's deterministic message, so a
+ *  Space can never dispatch under an ambiguous or non-compliant account. */
+async function runSpaceComposio(slug: string, toolSlug: string, args: Record<string, unknown>): Promise<RunSourceResult> {
+  const { dispatchComposioTool } = await import('../tools/composio-tools.js');
+  const outcome = await dispatchComposioTool(toolSlug, args, { sessionId: `space:${slug}` });
+  if (!outcome.ok) return { ok: false, error: `blocked (${outcome.reason}): ${outcome.message}` };
+  return { ok: true, data: outcome.result };
+}
+
 /** Run a single declared data source (no persistence). */
 export async function runSpaceDataSource(slug: string, source: SpaceDataSource): Promise<RunSourceResult> {
   if (source.runner && source.runner.trim()) {
@@ -87,8 +97,7 @@ export async function runSpaceDataSource(slug: string, source: SpaceDataSource):
   }
   if (source.composioSlug && source.composioSlug.trim()) {
     try {
-      const data = await executeComposioTool(source.composioSlug.trim(), source.composioArgs ?? {});
-      return { ok: true, data };
+      return await runSpaceComposio(slug, source.composioSlug.trim(), source.composioArgs ?? {});
     } catch (err) {
       return { ok: false, error: `composio call failed: ${(err as Error).message}` };
     }
@@ -101,8 +110,7 @@ export async function runSpaceAction(slug: string, action: SpaceAction, callerAr
   const args = { ...(action.argsTemplate ?? {}), ...(callerArgs ?? {}) };
   if (action.composioSlug && action.composioSlug.trim()) {
     try {
-      const data = await executeComposioTool(action.composioSlug.trim(), args);
-      return { ok: true, data };
+      return await runSpaceComposio(slug, action.composioSlug.trim(), args);
     } catch (err) {
       return { ok: false, error: `action failed: ${(err as Error).message}` };
     }

@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
+import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
+import { BASE_DIR } from '../config.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
 import { classifyTool, needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
@@ -14,7 +17,7 @@ import {
   readComposioConnectionSuppressionState,
   saveComposioConnectionSuppressionState,
   listAllToolkits,
-  resolveToolkitConnectionOutcome,
+  selectToolkitConnection,
   type ConnectedToolkit,
 } from '../integrations/composio/client.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
@@ -493,6 +496,13 @@ function clearReconnectBreaker(sid: string | undefined, toolSlug: string): void 
   if (sid) reconnectBreakerBySession.delete(reconnectBreakerKey(sid, toolSlug));
 }
 
+/** Test seam for the gateway's breaker (module-private state). */
+export const __gatewayTest__ = {
+  recordReconnectBreaker,
+  reconnectBreakerTripped,
+  clearReconnectBreaker,
+};
+
 /** Record the discovery query (and, when known, the candidate slugs the search
  *  surfaced) so a following successful execute can learn from it — and only
  *  learn a slug the search actually returned. Exported for tests. */
@@ -884,24 +894,271 @@ export function buildComposioStatusPayload(
 }
 
 /** Deterministic ASK for a genuinely-ambiguous multi-mailbox toolkit — never
- *  dispatch a send under a guessed/default account. Lists the candidate
- *  mailboxes so the user (or model) can name one. */
+ *  dispatch under a guessed/default account. Lists the candidate mailboxes WITH
+ *  their connection ids so the model can pin the named one on the retry
+ *  (connected_account_id), which in turn teaches recall the chosen mailbox. */
 function composioMultiAccountAskMessage(
   toolSlug: string,
-  outcome: Extract<Awaited<ReturnType<typeof resolveToolkitConnectionOutcome>>, { kind: 'ambiguous' | 'identity-absent' }>,
+  outcome: { kind: 'ambiguous' | 'identity-absent'; want?: string; candidates: Array<{ email?: string; wordId?: string; connectionId: string }> },
 ): string {
   const toolkit = toolkitOfSlug(toolSlug);
   const mailboxes = outcome.candidates
-    .map((c, i) => `  ${i + 1}. ${c.email ?? c.wordId ?? c.connectionId}`)
+    .map((c, i) => `  ${i + 1}. ${c.email ?? c.wordId ?? c.connectionId} (connected_account_id: ${c.connectionId})`)
     .join('\n');
   const lead = outcome.kind === 'identity-absent'
-    ? `The ${toolkit} mailbox this action last used (${outcome.want}) is no longer connected.`
-    : `You have ${outcome.candidates.length} ${toolkit} accounts connected, so I need to know WHICH mailbox to use for this action.`;
+    ? `The ${toolkit} mailbox this action expects (${outcome.want}) is no longer connected.`
+    : `You have ${outcome.candidates.length} ${toolkit} accounts connected, so I need to know WHICH account to use for this action.`;
   return (
     `⚠️ NEEDS-YOUR-CHOICE (${toolkit}): ${lead}\n\n`
-    + `Connected ${toolkit} mailboxes:\n${mailboxes}\n\n`
-    + `Tell me which account to use and I'll proceed. I did NOT act — picking the wrong mailbox for a send is exactly the mistake this guard prevents.`
+    + `Connected ${toolkit} accounts:\n${mailboxes}\n\n`
+    + `Nothing was dispatched. Ask the user which account to use (by email), then re-call this tool with \`connected_account_id\` set to the chosen connection id. Do NOT guess — acting on the wrong account is exactly the mistake this guard prevents.`
   );
+}
+
+// ─── Composio dispatch gateway ────────────────────────────────────────────────
+// THE single front door for every Composio dispatch — chat (all brain lanes),
+// workflow exact-call steps, Space sources/actions, batch, and background all
+// resolve here. Owner (which connected account) is resolved FIRST — before
+// sender constraints validate it and before CLI/SDK backend selection — and
+// ambiguity or resolution failure returns a TYPED blocked result with zero
+// CLI/SDK dispatch. Every block is ledgered (guardrail_tripped:composio_gateway).
+
+export type ComposioGatewayBlockReason =
+  | 'ambiguous-account'  // >1 distinct mailbox, no disambiguator → ASK
+  | 'identity-absent'    // required/remembered mailbox no longer connected → ASK
+  | 'constraint'         // standing-rule block (sender mismatch etc.)
+  | 'suppressed'         // suppression policy blocked the only route
+  | 'invalid-args'       // provably-incomplete args (schema/heuristic gate)
+  | 'not-connected';     // toolkit provably dead (breaker + zero usable connections)
+
+export interface ComposioGatewayBlocked {
+  ok: false;
+  reason: ComposioGatewayBlockReason;
+  /** Deterministic model/user-facing corrective (the ASK / reconnect guidance). */
+  message: string;
+  toolkit: string;
+  candidates?: Array<{ email?: string; connectionId: string }>;
+}
+
+export interface ComposioGatewayResolved {
+  ok: true;
+  /** Args with inline connection junk normalized + meta-args stripped. */
+  args: Record<string, unknown>;
+  /** The resolved owner connection — undefined = defer to composio's default entity. */
+  connectionId?: string;
+  /** Normalized mailbox identity of the owner, when known. */
+  identity?: string;
+  /** True when a standing sender rule verified the route (surface the sender-verify note). */
+  senderVerified: boolean;
+  /** Human-readable route notes to append to the tool output. */
+  notes: string[];
+}
+
+export type ComposioGatewayResolution = ComposioGatewayResolved | ComposioGatewayBlocked;
+
+function emitComposioGatewayBlock(
+  sessionId: string | undefined,
+  toolSlug: string,
+  reason: ComposioGatewayBlockReason,
+  extra?: Record<string, unknown>,
+): void {
+  try {
+    if (!sessionId) return;
+    appendEvent({
+      sessionId,
+      turn: 0,
+      role: 'tool',
+      type: 'guardrail_tripped',
+      data: { guardrail: 'composio_gateway', reason, toolSlug, toolkit: toolkitOfSlug(toolSlug), ...extra },
+    });
+  } catch { /* ledger write must never break the block path */ }
+}
+
+export interface ComposioGatewayOptions {
+  sessionId?: string;
+  /** Latest user input, for standing calendar-read routing. */
+  userInput?: string;
+  /** Caller-supplied mailbox preference (email) — wins over recall. */
+  preferredIdentity?: string;
+}
+
+// One-shot suppression revalidation: the pre-gateway user-routing bug (querying
+// under the wrong Composio user_id) MANUFACTURED entity-mismatch failures, and
+// their suppressions bench healthy connections for 7-30 days. Routing is fixed,
+// so entity-mismatch entries recorded before this build are presumed
+// bug-artifacts and dropped ONCE (a genuinely-mismatched connection re-records
+// within one call). Real OAuth expiry ('expired') suppressions are kept.
+let suppressionsRevalidated = false;
+function revalidateStaleSuppressionsOnce(): void {
+  if (suppressionsRevalidated) return;
+  suppressionsRevalidated = true;
+  try {
+    const stateDir = path.join(BASE_DIR, 'state');
+    const marker = path.join(stateDir, 'composio-suppressions-revalidated-v1');
+    if (existsSync(marker)) return;
+    const state = readComposioConnectionSuppressionState() as unknown as ComposioConnectionSuppressionState;
+    const entries = state.suppressedConnections ?? {};
+    let changed = false;
+    for (const [id, rec] of Object.entries(entries)) {
+      if (rec.reason === 'entity-mismatch') {
+        delete entries[id];
+        changed = true;
+      }
+    }
+    if (changed) {
+      saveComposioConnectionSuppressionState(state as unknown as Parameters<typeof saveComposioConnectionSuppressionState>[0]);
+    }
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(marker, `${new Date().toISOString()}\n`, 'utf-8');
+  } catch { /* best-effort — revalidation must never break a dispatch */ }
+}
+
+/**
+ * Stages: normalize pin → breaker (verified-dead only) → owner resolution
+ * (pin > standing calendar route > rule-owned send (constraint stage resolves,
+ * probe-verified) > identity: preferred/recalled email > single distinct
+ * mailbox) → constraint validation of the owner → suppression policy →
+ * arg validation. Pure resolution: NO dispatch happens here.
+ */
+export async function resolveComposioDispatch(
+  toolSlug: string,
+  rawArgs: Record<string, unknown>,
+  connectedAccountId: string | undefined,
+  opts: ComposioGatewayOptions = {},
+): Promise<ComposioGatewayResolution> {
+  revalidateStaleSuppressionsOnce();
+  const toolkit = toolkitOfSlug(toolSlug);
+  const normalized = normalizeInlineConnectedAccountId(rawArgs, connectedAccountId);
+  let args = normalized.args;
+  const pinned = normalized.connectedAccountId;
+  const sid = opts.sessionId;
+  const notes: string[] = [];
+
+  // One SWR snapshot reused by every stage below (breaker verify + identity).
+  let conns: ConnectedToolkit[] = [];
+  try { conns = await listUsableConnectedToolkits(); } catch { conns = []; }
+  const toolkitConns = conns.filter((c) => {
+    const s = (c.slug ?? '').toLowerCase();
+    const t = toolSlug.toLowerCase();
+    return s && (t === s || t.startsWith(`${s}_`));
+  });
+  const usable = toolkitConns.filter((c) => /active|enabled|initiat/i.test(c.status ?? ''));
+
+  // Breaker — SHARPLY NARROWED: only when this session already saw a
+  // reconnect-required failure for the toolkit AND the current snapshot
+  // confirms zero usable connections (provably dead). A reconnect (snapshot
+  // shows a usable connection again) disarms it without waiting for TTL.
+  if (!pinned && usable.length === 0 && reconnectBreakerTripped(sid, toolSlug)) {
+    const message = `⚠️ ${toolkit} is not connected (a call already failed this session with "no connected account", and no usable ${toolkit} connection exists right now). Not retrying — reconnect ${toolkit} in Connect first, then try again. Tell the user rather than re-calling ${toolkit} tools.`;
+    emitComposioGatewayBlock(sid, toolSlug, 'not-connected');
+    return { ok: false, reason: 'not-connected', message, toolkit };
+  }
+
+  // OWNER RESOLUTION (before constraints validate it, before backend selection).
+  let owner = pinned;
+  let identity: string | undefined;
+  if (!owner) {
+    const calendarRoute = findOutlookCalendarReadConstraint(toolSlug, args, opts.userInput);
+    if (calendarRoute) {
+      owner = calendarRoute.routeConnectionId;
+      notes.push(`[account-route] Routed Outlook calendar read to connection ${calendarRoute.routeConnectionId} from standing rule #${calendarRoute.constraint.id}.`);
+    }
+  }
+  // A send governed by a standing sender rule is RULE-owned: the constraint
+  // stage below resolves it probe-verified (snapshot emails can be stale/absent,
+  // the profile probe is authoritative) — so identity resolution must not
+  // pre-block it. Everything else resolves by identity here.
+  const ruleOwnedSend = !owner && isIrreversibleSendSlug(toolSlug) && Boolean(findEmailSendConstraint(toolSlug, args));
+  if (!owner && !ruleOwnedSend) {
+    const hint = opts.preferredIdentity ?? recallComposioAccountIdentity(toolSlug);
+    const outcome = selectToolkitConnection(toolSlug, conns, hint);
+    if (outcome.kind === 'resolved') {
+      owner = outcome.connectionId;
+      identity = outcome.identity;
+      if (hint && outcome.identity === hint) {
+        notes.push(`[account-route] Routed to your remembered ${hint} mailbox for ${toolkit}.`);
+      }
+    } else if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
+      // Ambiguity → typed block for ALL operations (reads included: reading the
+      // wrong mailbox produces confidently-wrong answers). Zero dispatch.
+      const message = composioMultiAccountAskMessage(toolSlug, outcome);
+      emitComposioGatewayBlock(sid, toolSlug, outcome.kind === 'ambiguous' ? 'ambiguous-account' : 'identity-absent', {
+        candidates: outcome.candidates.map((c) => c.email ?? c.connectionId),
+      });
+      return {
+        ok: false,
+        reason: outcome.kind === 'ambiguous' ? 'ambiguous-account' : 'identity-absent',
+        message,
+        toolkit,
+        candidates: outcome.candidates.map((c) => ({ email: c.email, connectionId: c.connectionId })),
+      };
+    }
+    // 'defer' → owner stays undefined (composio default entity).
+  }
+
+  // CONSTRAINT VALIDATION of the resolved owner (sender rules verify the
+  // mailbox by live profile probe; a rule route OVERRIDES the identity pick).
+  const gate = await enforceStandingConstraints(toolSlug, args, owner);
+  if (gate.block) {
+    emitComposioGatewayBlock(sid, toolSlug, 'constraint');
+    return { ok: false, reason: 'constraint', message: gate.block, toolkit };
+  }
+  let senderVerified = false;
+  if (gate.routeConnectedAccountId) {
+    owner = gate.routeConnectedAccountId;
+    senderVerified = true;
+  }
+
+  // Suppression policy (skipped when the sender rule owns the route, as before).
+  if (!gate.routeConnectedAccountId) {
+    const route = applySuppressedComposioConnectionPolicy(
+      toolSlug,
+      owner,
+      readComposioConnectionSuppressionState() as unknown as ComposioConnectionSuppressionState,
+    );
+    if (route.block) {
+      emitComposioGatewayBlock(sid, toolSlug, 'suppressed');
+      return { ok: false, reason: 'suppressed', message: route.block, toolkit };
+    }
+    owner = route.connectedAccountId;
+    if (route.note) notes.push(route.note);
+  }
+
+  // Arg validation — provably-incomplete args never dispatch (any path).
+  const validation = validateComposioArgs(toolSlug, args, getCachedToolSchema(toolSlug));
+  if (validation.error) {
+    const message = formatBatchValidationError(validation.error, toolSlug, validation.mode);
+    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+      mode: validation.mode,
+      field: validation.error.field,
+      validationReason: validation.error.reason,
+    });
+    return { ok: false, reason: 'invalid-args', message, toolkit };
+  }
+
+  return { ok: true, args, connectionId: owner, identity, senderVerified, notes };
+}
+
+/**
+ * One-shot gateway dispatch for non-chat paths (workflow exact-call steps,
+ * Space sources/actions, batch/background helpers): resolve through the SAME
+ * gateway, return the typed block untouched, otherwise dispatch exactly once.
+ */
+export async function dispatchComposioTool(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  opts: ComposioGatewayOptions & { connectedAccountId?: string } = {},
+): Promise<{ ok: true; result: unknown; connectionId?: string; identity?: string } | ComposioGatewayBlocked> {
+  const resolved = await resolveComposioDispatch(toolSlug, args, opts.connectedAccountId, opts);
+  if (!resolved.ok) return resolved;
+  try {
+    const result = await executeComposioTool(toolSlug, resolved.args, resolved.connectionId, resolved.identity);
+    clearReconnectBreaker(opts.sessionId, toolSlug);
+    return { ok: true, result, connectionId: resolved.connectionId, identity: resolved.identity };
+  } catch (err) {
+    if (isComposioReconnectRequiredError(err)) recordReconnectBreaker(opts.sessionId, toolSlug);
+    throw err;
+  }
 }
 
 async function runComposioExecute(
@@ -910,103 +1167,19 @@ async function runComposioExecute(
   connectedAccountId: string | undefined,
   options: FormatComposioToolOutputOptions,
 ): Promise<string> {
-  const normalized = normalizeInlineConnectedAccountId(args, connectedAccountId);
-  args = normalized.args;
-  connectedAccountId = normalized.connectedAccountId;
   const runSid = sessionIdFromRunContext(options.context);
 
-  // F2 — cross-call reconnect breaker: this toolkit already failed
-  // reconnect-required this session and the caller hasn't pinned a specific
-  // connection, so attempts #2..#N would just re-hit the same dead toolkit.
-  // Short-circuit deterministically (no network) instead of thrashing.
-  if (!connectedAccountId && reconnectBreakerTripped(runSid, toolSlug)) {
-    const toolkit = toolkitOfSlug(toolSlug);
-    return `⚠️ ${toolkit} is not connected (a call already failed this session with "no connected account"). Not retrying — that only loops. Reconnect ${toolkit} in Connect, then try again. Tell the user rather than re-calling ${toolkit} tools.`;
-  }
-
-  const gate = await enforceStandingConstraints(toolSlug, args, connectedAccountId);
-  if (gate.block) return gate.block;
-  let effectiveConnectionId = gate.routeConnectedAccountId ?? connectedAccountId;
-  let accountRouteNote = '';
-  if (!effectiveConnectionId) {
-    const calendarRoute = findOutlookCalendarReadConstraint(toolSlug, args, latestUserInputForContext(options.context));
-    if (calendarRoute) {
-      effectiveConnectionId = calendarRoute.routeConnectionId;
-      accountRouteNote = `[account-route] Routed Outlook calendar read to connection ${calendarRoute.routeConnectionId} from standing rule #${calendarRoute.constraint.id}.`;
-    }
-  }
-  if (!gate.routeConnectedAccountId) {
-    const route = applySuppressedComposioConnectionPolicy(
-      toolSlug,
-      effectiveConnectionId,
-      readComposioConnectionSuppressionState() as unknown as ComposioConnectionSuppressionState,
-    );
-    if (route.block) return route.block;
-    effectiveConnectionId = route.connectedAccountId;
-    if (route.note) accountRouteNote = accountRouteNote ? `${accountRouteNote}\n${route.note}` : route.note;
-  }
-
-  // Identity-based routing (D1/D4): no standing rule / calendar / suppression
-  // route pinned a connection, so resolve the toolkit's mailbox by IDENTITY. A
-  // recalled email routes to its current live connection; a single mailbox
-  // resolves deterministically; genuinely-distinct mailboxes ASK for a SEND
-  // (never dispatch under the wrong default) and auto-pick-with-a-note for a read.
-  if (!effectiveConnectionId) {
-    const recalledIdentity = recallComposioAccountIdentity(toolSlug);
-    const outcome = await resolveToolkitConnectionOutcome(toolSlug, recalledIdentity);
-    if (outcome.kind === 'resolved') {
-      effectiveConnectionId = outcome.connectionId;
-      if (recalledIdentity && outcome.identity === recalledIdentity) {
-        const note = `[account-route] Routed to your remembered ${recalledIdentity} mailbox for ${toolkitOfSlug(toolSlug)}.`;
-        accountRouteNote = accountRouteNote ? `${accountRouteNote}\n${note}` : note;
-      }
-    } else if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
-      if (isIrreversibleSendSlug(toolSlug)) {
-        return composioMultiAccountAskMessage(toolSlug, outcome);
-      }
-      const pick = outcome.candidates[0];
-      if (pick) {
-        effectiveConnectionId = pick.connectionId;
-        const note = `[account-route] ${toolkitOfSlug(toolSlug)} has ${outcome.candidates.length} connected mailboxes${pick.email ? ` — this read used ${pick.email}` : ''}. Tell me which to use if that's the wrong one.`;
-        accountRouteNote = accountRouteNote ? `${accountRouteNote}\n${note}` : note;
-      }
-    }
-    // 'defer' → executeComposioTool resolves live / falls to the composio default.
-  }
-
-  // Pre-dispatch arg validation — schema-grounded when the action's real
-  // inputParameters schema has been seen this session (search/list/
-  // dynamic-build populate the cache), slug-name heuristics otherwise.
-  // Lives HERE (not in the composio_execute_tool handler) so the dynamic
-  // cx_* path is covered too. Capability gate: fails open on uncertainty;
-  // blocks only provably-incomplete args. See composio-batch-validator.ts.
-  const validation = validateComposioArgs(toolSlug, args, getCachedToolSchema(toolSlug));
-  if (validation.error) {
-    const blockMessage = formatBatchValidationError(validation.error, toolSlug, validation.mode);
-    // Telemetry: a validation block must be visible in audits. Reuses
-    // guardrail_tripped so existing audit tooling surfaces it for free.
-    try {
-      const sid = sessionIdFromRunContext(options.context);
-      if (sid) {
-        appendEvent({
-          sessionId: sid,
-          turn: 0,
-          role: 'tool',
-          type: 'guardrail_tripped',
-          data: {
-            guardrail: 'composio_validation',
-            mode: validation.mode,
-            toolSlug,
-            field: validation.error.field,
-            reason: validation.error.reason,
-          },
-        });
-      }
-    } catch {
-      // Telemetry must never break the block message path.
-    }
-    return blockMessage;
-  }
+  // THE gateway: owner-first resolution + typed blocks (ledgered). A block is
+  // returned verbatim as the tool output — deterministic, zero dispatch.
+  const resolved = await resolveComposioDispatch(toolSlug, args, connectedAccountId, {
+    sessionId: runSid,
+    userInput: latestUserInputForContext(options.context),
+  });
+  if (!resolved.ok) return resolved.message;
+  args = resolved.args;
+  const effectiveConnectionId = resolved.connectionId;
+  let accountRouteNote = resolved.notes.join('\n');
+  const gate = { routeConnectedAccountId: resolved.senderVerified ? resolved.connectionId : undefined };
 
   // Tool-bound standing rules ride with EVERY call's output — the model
   // re-reads them at the moment it acts on this toolkit, independent of

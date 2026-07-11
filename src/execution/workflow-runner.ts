@@ -936,12 +936,21 @@ export function renderCallArgs(args: Record<string, unknown> | undefined, inputs
 }
 
 /** Execute a structured call node directly — zero LLM. v1: composio slug via
- *  executeComposioTool. Args are rendered against inputs/upstream/(item). */
+ *  the composio dispatch GATEWAY (same owner resolution, sender constraints,
+ *  and typed blocks as chat/Space) — a workflow exact-call can never dispatch
+ *  under an ambiguous or non-compliant account. Args are rendered against
+ *  inputs/upstream/(item). */
 async function executeWorkflowCallNode(step: WorkflowStepInput, ctx: StepExecutionContext, item?: unknown): Promise<unknown> {
   const call = step.call!;
   const args = renderCallArgs(call.args, ctx.inputs, ctx.stepOutputs, item, resolveWorkflowStepProjectContext(step, ctx.workflow));
-  const { executeComposioTool } = await import('../integrations/composio/client.js');
-  return executeComposioTool(call.tool, args);
+  const { dispatchComposioTool } = await import('../tools/composio-tools.js');
+  const outcome = await dispatchComposioTool(call.tool, args, { sessionId: `workflow:${ctx.runId}:${step.id}` });
+  if (!outcome.ok) {
+    // Typed gateway block → fail the step VISIBLY with the deterministic
+    // corrective (which account / reconnect / fix args) instead of dispatching.
+    throw new Error(`composio dispatch blocked (${outcome.reason}): ${outcome.message}`);
+  }
+  return outcome.result;
 }
 
 interface DeterministicStepPayload {
