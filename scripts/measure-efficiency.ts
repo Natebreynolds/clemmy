@@ -21,6 +21,7 @@
  */
 import { readUsageEventsForDate, listUsageDates, rollupUsage, classifyUsageKind, type UsageEvent } from '../src/runtime/usage-log.js';
 import { openEventLog } from '../src/runtime/harness/eventlog.js';
+import { summarizeCodeModeEfficiency, formatCodeModeEfficiency, type CodeModeSummaryEvent } from '../src/runtime/harness/code-mode-metrics.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -163,7 +164,17 @@ try {
   ).all(cutoffStart, cutoffEnd) as Array<{ session_id: string }>;
   const cmSessions = new Set(cmRows.map((r) => r.session_id)).size;
   console.log(`CODE MODE          in-program calls ${cmRows.length} across ${cmSessions} session(s)  (adoption signal — 0 ⇒ the model isn't reaching for run_tool_program yet)`);
-  console.log(`  (deferred: per-turn latency-by-arm + rubric-arm correlation — the rubric A/B isn't evented and the NDJSON↔eventlog per-call join is imprecise; not built to avoid a fragile number)`);
+
+  // The efficiency readout the DELETE-WHEN-VALIDATED mandate was waiting on:
+  // aggregate codemode_program_summary (savedBytes = intermediate − distilled).
+  const cmSummaryRows = db.prepare(
+    `SELECT data_json FROM events WHERE type = 'codemode_program_summary' AND created_at >= ? AND created_at <= ?`,
+  ).all(cutoffStart, cutoffEnd) as Array<{ data_json: string }>;
+  const cmEvents: CodeModeSummaryEvent[] = [];
+  for (const row of cmSummaryRows) {
+    try { cmEvents.push(JSON.parse(row.data_json) as CodeModeSummaryEvent); } catch { /* skip corrupt row */ }
+  }
+  console.log(formatCodeModeEfficiency(summarizeCodeModeEfficiency(cmEvents)));
 } catch (err) {
   console.log(`\nTOOL JIT / CODE MODE: (eventlog unavailable — ${err instanceof Error ? err.message : String(err)})`);
 }

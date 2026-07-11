@@ -496,14 +496,21 @@ export async function runCodeModeForSession(program: string, sessionId: string):
     },
   );
   // ONE summary event per program — the adoption/efficiency measurement the
-  // mandate's DELETE-WHEN-VALIDATED note is waiting on.
+  // mandate's DELETE-WHEN-VALIDATED note is waiting on. intermediateBytes is what
+  // stayed in the sandbox; returnBytes is what actually entered context; savedBytes
+  // is the token-proxy win an aggregator sums to prove (or disprove) the benefit.
   try {
+    const returnBytes = result.ok ? JSON.stringify(result.value ?? null).length : 0;
+    const intermediateBytes = result.intermediateBytes ?? 0;
     appendEvent({
       sessionId, turn: 0, role: 'system', type: 'codemode_program_summary',
       data: {
         ok: result.ok,
         rpcCalls: result.rpcCalls,
         durationMs: Date.now() - startedAt,
+        intermediateBytes,
+        returnBytes,
+        savedBytes: Math.max(0, intermediateBytes - returnBytes),
         ...(result.partial ? { completed: result.partial.completed, failed: result.partial.failed } : {}),
         ...(result.ok ? {} : { error: (result.error ?? '').slice(0, 300) }),
       },

@@ -44,6 +44,12 @@ export interface CodeModeResult {
   rpcCalls: number;
   logs: string[];
   partial?: CodeModePartial;
+  /** Total bytes of the tool-call RESULTS dispatched during the run — i.e. the
+   *  intermediate payloads that stayed in the sandbox and would otherwise have
+   *  entered the model's context as N discrete tool_returned events. The
+   *  numerator of the code-mode token win; the distilled return (returnBytes,
+   *  computed at emission) is subtracted from it. */
+  intermediateBytes: number;
 }
 
 export interface CodeModeOptions {
@@ -295,7 +301,11 @@ export async function runCodeModeProgram(
 
   const logs: string[] = [];
   let rpcCalls = 0;
-  let result: CodeModeResult | null = null;
+  // Sum of dispatched tool-result payload sizes — the context that DIDN'T enter
+  // the conversation because it stayed in the sandbox (the token-win numerator).
+  let intermediateBytes = 0;
+  // Result literals below omit intermediateBytes; finish() injects it uniformly.
+  let result: Omit<CodeModeResult, 'intermediateBytes'> | null = null;
 
   return await new Promise<CodeModeResult>((resolve) => {
     const child = spawn(opts.nodeBin ?? process.execPath, ['--no-warnings', '--import', blockerPath, progPath], {
@@ -330,14 +340,16 @@ export async function runCodeModeProgram(
     // closed stdin — EPIPE arrives asynchronously on the stream and, unhandled,
     // becomes an uncaughtException. Swallow it: the child is gone by design.
     child.stdin.on('error', () => { /* child killed mid-write — expected */ });
-    const finish = (r: CodeModeResult): void => {
+    const finish = (r: Omit<CodeModeResult, 'intermediateBytes'>): void => {
       if (settled) return;
       settled = true;
       clearTimeout(ceilingTimer);
       if (idleTimer) clearTimeout(idleTimer);
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
-      resolve(r);
+      // Attach the accumulated intermediate-byte total to EVERY finish path
+      // (success, timeout, breaker, exit) — one place, no per-literal edits.
+      resolve({ ...r, intermediateBytes });
     };
 
     // Two deadlines: a HARD ceiling, and an IDLE deadline that resets on any
@@ -427,7 +439,12 @@ export async function runCodeModeProgram(
                 rpcCompleted += 1;
                 recordPartial(method, true, res);
               }
-              try { child.stdin.write(JSON.stringify({ id, result: res ?? null }) + '\n'); } catch { /* child gone */ }
+              // Every dispatched result is a payload that would have entered the
+              // model's context as a discrete tool_returned — count its bytes as
+              // the intermediate that code mode kept OUT of the conversation.
+              const resultLine = JSON.stringify({ id, result: res ?? null }) + '\n';
+              try { intermediateBytes += JSON.stringify(res ?? null).length; } catch { /* unserializable — skip accounting */ }
+              try { child.stdin.write(resultLine); } catch { /* child gone */ }
             })
             .catch((e: unknown) => {
               releaseSlot();
