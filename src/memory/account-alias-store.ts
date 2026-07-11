@@ -94,8 +94,18 @@ export function rememberAccountAlias(input: {
   const aliases = load();
   const existing = aliases.find((a) => a.toolkit === toolkit && a.label === label);
   if (existing) {
-    if (email) existing.email = email;
-    if (connectionId) existing.connectionId = connectionId;
+    if (connectionId && connectionId !== existing.connectionId) {
+      // Re-pointed to a DIFFERENT connection: the stored email described the OLD
+      // account, so it must not linger (resolution prefers email over
+      // connectionId — a stale email would route the name back to the old
+      // mailbox). Set the new email if known, else clear it and fall back to the
+      // new connectionId until a probe learns the new mailbox.
+      existing.email = email;
+      existing.connectionId = connectionId;
+    } else {
+      if (email) existing.email = email;
+      if (connectionId) existing.connectionId = connectionId;
+    }
     existing.updatedAt = now;
     persist();
     return existing;
@@ -106,17 +116,27 @@ export function rememberAccountAlias(input: {
   return record;
 }
 
-/** Look up a name. Exact label first, then a contains-match so "my scorpion
- *  email" still resolves the label "scorpion". Toolkit narrows when given. */
+/** Look up a name. Exact label first, then a WHOLE-WORD match so "my scorpion
+ *  email" resolves the label "scorpion" — but "s" never matches "scorpion" and
+ *  an unrelated request never binds a substring alias. A multi-word label must
+ *  have all its words present. Ambiguous (2+ labels match) → undefined so the
+ *  gateway ASKS rather than routing (a send) to an arbitrary account. */
 export function resolveAccountAlias(labelish: string, toolkit?: string): AccountAlias | undefined {
   const wanted = normalizeLabel(labelish);
   if (!wanted) return undefined;
   const tk = toolkit?.trim().toLowerCase();
   const pool = load().filter((a) => !tk || a.toolkit === tk);
-  return (
-    pool.find((a) => a.label === wanted)
-    ?? pool.find((a) => wanted.includes(a.label) || a.label.includes(wanted))
-  );
+  const exact = pool.find((a) => a.label === wanted);
+  if (exact) return exact;
+  // Whole-word containment ONLY (no bidirectional substring): every token of a
+  // saved label must appear as a whole word in the request. Guards against both
+  // the "s"→"scorpion" (request-substring-of-label) and unrelated-substring bugs.
+  const requestWords = new Set(wanted.split(/[^a-z0-9]+/i).filter(Boolean));
+  const matches = pool.filter((a) => {
+    const labelWords = a.label.split(/[^a-z0-9]+/i).filter((w) => w.length >= 2);
+    return labelWords.length > 0 && labelWords.every((w) => requestWords.has(w));
+  });
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 /** All aliases for a toolkit (for rendering names into the ambiguous ASK). */

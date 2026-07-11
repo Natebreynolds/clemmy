@@ -944,12 +944,21 @@ async function enrichToolkitIdentities(toolkit: string, candidates: ConnectedToo
   let learned = 0;
   await Promise.all(targets.map(async (c) => {
     try {
-      const profile = await executeComposioTool(profileSlug, {}, c.connectionId);
-      const email = extractMailboxEmails(profile)[0] ?? null;
-      recordIdentityProbe(c.connectionId, email);
+      // user_id:'me' matches sender-verify's probe (a bare {} can mis-scope).
+      const profile = await executeComposioTool(profileSlug, { user_id: 'me' }, c.connectionId);
+      // A Composio FAILURE envelope is returned as data (it does not throw); its
+      // error text can contain a stray email literal (e.g. support@composio.dev)
+      // that extractMailboxEmails' regex fallback would scavenge and cache as the
+      // mailbox — merging DISTINCT accounts under a bogus identity. Guard exactly
+      // as sender-verify does, and extract from STRUCTURED fields only (no
+      // whole-JSON regex) so even a success envelope can't leak a stray address.
+      if (detectComposioFailure(profile).failed) return; // transient/not-connected — leave unprobed, retry later
+      const email = extractMailboxEmails(profile, { structuredOnly: true })[0] ?? null;
+      recordIdentityProbe(c.connectionId, email); // email, or a DEFINITIVE no-email (probe succeeded)
       if (email) learned += 1;
     } catch {
-      recordIdentityProbe(c.connectionId, null); // probed, nothing learned — never re-probe
+      // Transient throw (network blip, 429, abort) — do NOT negative-cache, or a
+      // one-off failure would permanently blind a real mailbox (no re-probe).
     }
   }));
   return learned;
@@ -1125,10 +1134,14 @@ export async function resolveComposioDispatch(
     let email = cachedIdentityEmail(owner) ?? usable.find((c) => c.connectionId === owner)?.accountEmail;
     if (!email && PROFILE_SLUG_BY_TOOLKIT[toolkit] && !identityProbeAttempted(owner)) {
       try {
-        const profile = await executeComposioTool(PROFILE_SLUG_BY_TOOLKIT[toolkit], {}, owner);
-        email = extractMailboxEmails(profile)[0];
-        recordIdentityProbe(owner, email ?? null);
-      } catch { recordIdentityProbe(owner, null); }
+        // Same failure-envelope guard as enrichToolkitIdentities: never bind an
+        // alias to an email scavenged from an error payload.
+        const profile = await executeComposioTool(PROFILE_SLUG_BY_TOOLKIT[toolkit], { user_id: 'me' }, owner);
+        if (!detectComposioFailure(profile).failed) {
+          email = extractMailboxEmails(profile, { structuredOnly: true })[0];
+          recordIdentityProbe(owner, email ?? null);
+        }
+      } catch { /* transient — don't negative-cache; the alias still saves by connectionId */ }
     }
     const saved = rememberAccountAlias({ toolkit, label: aliasArg, email, connectionId: owner });
     if (saved) {
@@ -1234,6 +1247,36 @@ export async function resolveComposioDispatch(
     }
     owner = route.connectedAccountId;
     if (route.note) notes.push(route.note);
+  }
+
+  // SEND SAFETY NET: an irreversible send must NEVER dispatch with an unresolved
+  // owner when multiple accounts exist — Composio's default entity would pick an
+  // arbitrary mailbox (the 2026-06-11 wrong-mailbox incident class). This backs
+  // up the paths that legitimately skip identity resolution: sender_override
+  // without a pin, rule-owned sends the constraint stage couldn't route, and the
+  // 'defer' fall-through. A wrong-account READ is recoverable and allowed to
+  // defer; a wrong-account SEND is not.
+  if (!owner && isIrreversibleSendSlug(toolSlug) && usable.length > 1) {
+    const outcome = selectToolkitConnection(toolSlug, conns);
+    if (outcome.kind === 'resolved') {
+      owner = outcome.connectionId; // one distinct mailbox (e.g. duplicate re-auths) — safe
+    } else {
+      const candidates = outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent'
+        ? outcome.candidates
+        : usable.map((c) => ({ email: c.accountEmail, connectionId: c.connectionId, wordId: c.wordId }));
+      const message = composioMultiAccountAskMessage(toolSlug, { kind: 'ambiguous', candidates });
+      emitComposioGatewayBlock(sid, toolSlug, 'ambiguous-account', {
+        candidates: candidates.map((c) => c.email ?? c.connectionId),
+        guard: 'send-safety-net',
+      });
+      return {
+        ok: false,
+        reason: 'ambiguous-account',
+        message,
+        toolkit,
+        candidates: candidates.map((c) => ({ email: c.email, connectionId: c.connectionId })),
+      };
+    }
   }
 
   // Arg validation — provably-incomplete args never dispatch (any path).

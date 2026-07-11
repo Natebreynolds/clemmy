@@ -20,6 +20,10 @@ import { BASE_DIR } from '../../config.js';
 interface IdentityCacheEntry {
   email: string | null;
   probedAt: string;
+  /** The Composio entity (user_id) that owns this connection — learned from the
+   *  raw v3 listing and persisted so a later transient v3 outage (SDK fallback
+   *  strips user_id) still pairs the correct owner at dispatch. */
+  ownerUserId?: string;
 }
 
 interface IdentityCacheFile {
@@ -65,13 +69,36 @@ export function identityProbeAttempted(connectionId: string): boolean {
   return Boolean(load()[connectionId]);
 }
 
-/** Record a probe result. email=null records "probed, nothing learned". */
+/** Record a probe result. email=null records "probed, nothing learned".
+ *  Preserves any previously-cached ownerUserId. */
 export function recordIdentityProbe(connectionId: string, email: string | null): void {
   if (!connectionId) return;
   const normalized = email ? email.trim().toLowerCase().replace(/^smtp:/, '') : null;
+  const prev = load()[connectionId];
   load()[connectionId] = {
     email: normalized && normalized.includes('@') ? normalized : null,
     probedAt: new Date().toISOString(),
+    ownerUserId: prev?.ownerUserId,
+  };
+  persist();
+}
+
+/** The owning entity for a connection, if ever learned from the raw v3 listing. */
+export function cachedConnectionOwner(connectionId: string): string | undefined {
+  const owner = load()[connectionId]?.ownerUserId;
+  return owner && owner.trim() ? owner : undefined;
+}
+
+/** Persist a connection's owning entity (raw v3 exposes it; the SDK strips it).
+ *  Durable so a later v3 outage still pairs the right owner at dispatch. */
+export function recordConnectionOwner(connectionId: string, ownerUserId: string | undefined): void {
+  if (!connectionId || !ownerUserId || !ownerUserId.trim()) return;
+  const prev = load()[connectionId];
+  if (prev?.ownerUserId === ownerUserId) return; // no-op, avoid churny writes
+  load()[connectionId] = {
+    email: prev?.email ?? null,
+    probedAt: prev?.probedAt ?? new Date().toISOString(),
+    ownerUserId: ownerUserId.trim(),
   };
   persist();
 }

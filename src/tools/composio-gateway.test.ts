@@ -233,6 +233,40 @@ test('the ambiguous ASK teaches the naming gesture and shows saved names', async
   }
 });
 
+test('send safety net: an irreversible SEND to a multi-account toolkit never resolves to ok with no owner (findings 2,10)', async () => {
+  setAccounts([
+    account('ca_a', 'outlook', 'a@x.com'),
+    account('ca_b', 'outlook', 'b@y.com'),
+  ]);
+  // Two distinct mailboxes, no pin/name/hint, override flag set — a send must be
+  // blocked (asked), NEVER dispatched to Composio's default entity.
+  const out = await resolveComposioDispatch('OUTLOOK_SEND_EMAIL', { sender_override_confirmed: true, to_email: 'x@z.com', subject: 's', body: 'b' }, undefined, {});
+  assert.equal(out.ok, false, 'send with unresolved owner + multiple accounts must block');
+  if (!out.ok) assert.equal(out.reason, 'ambiguous-account');
+  // Never returns ok:true with connectionId undefined (the wrong-account send).
+  if (out.ok) assert.notEqual(out.connectionId, undefined);
+});
+
+test('identity enrichment does NOT permanently blind a mailbox on a transient probe failure (finding 13)', async () => {
+  setAccounts([
+    account('ca_ms1', 'outlook'), // no email in listing
+    account('ca_ms2', 'outlook'),
+  ]);
+  // No COMPOSIO_API_KEY in tests → the enrichment profile probe THROWS (transient
+  // class). The gateway must NOT cache a negative identity for these connections
+  // (which would permanently exclude them from future probes); it must still
+  // block ambiguously rather than silently merging or resolving.
+  const blockReasons = ['ambiguous-account', 'identity-absent'];
+  const first = await resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', {}, undefined, {});
+  assert.equal(first.ok, false, 'must block — never silently merge/resolve two unidentified accounts');
+  if (!first.ok) assert.ok(blockReasons.includes(first.reason), `blocked (${first.reason})`);
+  // A second call still sees two candidates (not blinded to zero/one) — proving
+  // the transient failure did not poison the durable cache.
+  const second = await resolveComposioDispatch('OUTLOOK_LIST_MESSAGES', {}, undefined, {});
+  assert.equal(second.ok, false);
+  if (!second.ok) assert.equal(second.candidates?.length, 2, 'both connections still resolvable — not permanently negative-cached');
+});
+
 test('CLI/SDK selection boundary: a pinned owner is NEVER dispatched via the CLI', async () => {
   // With backend forced to 'cli' and NO CLI installed:
   //   - an UNPINNED dispatch takes the CLI branch → "CLI is not installed" error

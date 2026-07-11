@@ -44,7 +44,10 @@ export function normalizeEmail(value: unknown): string {
 /** Pull every mailbox identity out of a profile result, tolerating both the
  *  structured shape ({data: {mail, userPrincipalName, proxyAddresses}}) and
  *  wrapper drift — falls back to scanning the JSON for email literals. */
-export function extractMailboxEmails(profileResult: unknown): string[] {
+export function extractMailboxEmails(
+  profileResult: unknown,
+  opts: { structuredOnly?: boolean } = {},
+): string[] {
   const emails = new Set<string>();
   const root = (profileResult ?? {}) as Record<string, unknown>;
   const data = (root.data ?? root) as Record<string, unknown>;
@@ -61,7 +64,11 @@ export function extractMailboxEmails(profileResult: unknown): string[] {
       if (v.includes('@')) emails.add(v);
     }
   }
-  if (emails.size === 0) {
+  // structuredOnly callers (identity enrichment / alias binding) MUST NOT accept
+  // an address scavenged out of arbitrary JSON — a stray literal there would be
+  // cached as a mailbox and merge distinct accounts. The regex fallback exists
+  // only for sender-verify's own probe, which pre-checks successful===false.
+  if (emails.size === 0 && !opts.structuredOnly) {
     try {
       const text = JSON.stringify(profileResult ?? '');
       for (const m of text.matchAll(/[\w\-.+]+@[\w\-.]+\.[a-z]{2,}/gi)) {

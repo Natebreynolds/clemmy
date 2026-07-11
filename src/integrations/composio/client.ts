@@ -6,7 +6,7 @@ import { readEnvFile, writeEnvFile } from '../../setup/env-file.js';
 import { getMachineId } from '../../runtime/machine-id.js';
 import { getSecretStore } from '../../runtime/secrets/index.js';
 import { currentToolAbortSignal } from '../../runtime/tool-abort-context.js';
-import { cachedIdentityEmail } from './identity-cache.js';
+import { cachedIdentityEmail, cachedConnectionOwner, recordConnectionOwner } from './identity-cache.js';
 import {
   executeComposioCliTool,
   getComposioCliStatus,
@@ -801,7 +801,10 @@ export function dispatchUserIdFor(
   fallback: string,
 ): string {
   if (!connectionId) return fallback;
-  const owner = conns.find((c) => c.connectionId === connectionId)?.ownerUserId;
+  // Owner from the live snapshot, else the durable cache (survives a transient
+  // raw-v3 outage where the SDK fallback strips user_id), else the fallback.
+  const owner = conns.find((c) => c.connectionId === connectionId)?.ownerUserId
+    ?? cachedConnectionOwner(connectionId);
   return owner && owner.trim() ? owner : fallback;
 }
 
@@ -844,6 +847,9 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
           // tokens expose none), serve the mailbox a profile probe learned for
           // this connection — so same-mailbox re-auths merge and named accounts
           // ("use my scorpion email") resolve. See identity-cache.ts.
+          // Also persist the owning entity (raw v3 exposes it; the SDK strips it)
+          // so a later v3 outage still pairs the correct owner at dispatch.
+          if (connection.ownerUserId) recordConnectionOwner(connection.connectionId, connection.ownerUserId);
           if (connection.accountEmail) return connection;
           const learned = cachedIdentityEmail(connection.connectionId);
           return learned ? { ...connection, accountEmail: learned } : connection;
