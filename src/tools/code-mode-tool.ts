@@ -286,12 +286,62 @@ export function isCodeModeToolAllowed(method: string): boolean {
  *  arg-shape bug class ({directory} vs {path}) costs a failed call + retry.
  *  describe() answers from host memory at zero context cost. Never throws —
  *  an unknown name reports allowed:false so the program can branch. */
+type ExternalMcpTool = { name: string; description?: string; inputSchema?: unknown };
+let externalMcpToolListForTest: (() => Promise<ExternalMcpTool[]>) | null = null;
+/** Test seam: inject the external MCP tool list so describe()/listTools() can be
+ *  tested without spawning real MCP servers. */
+export function _setExternalMcpToolsForTests(fn: (() => Promise<ExternalMcpTool[]>) | null): void {
+  externalMcpToolListForTest = fn;
+}
+
+/** The connected external MCP tools with their real schemas, via the same shim
+ *  the dispatch path uses. Best-effort + cached by the shim — never throws (an
+ *  unavailable shim just yields []). Shared by describe() and listTools(). */
+async function externalMcpToolList(): Promise<ExternalMcpTool[]> {
+  if (externalMcpToolListForTest) return externalMcpToolListForTest();
+  try {
+    const { getOrCreateExternalMcpServers } = await import('../runtime/mcp-servers.js');
+    const shim = getOrCreateExternalMcpServers() as unknown as { listTools?: () => Promise<unknown> } | null;
+    if (!shim || typeof shim.listTools !== 'function') return [];
+    const tools = await shim.listTools();
+    return Array.isArray(tools) ? (tools as Array<{ name: string; description?: string; inputSchema?: unknown }>) : [];
+  } catch { return []; }
+}
+
+/** `clem.listTools()` — in-program DISCOVERY of the connected external MCP tools
+ *  (name + short description) so a batching program can find what to call without
+ *  the model guessing names. Host-answered, zero context cost, never throws. */
+export async function listCodeModeTools(): Promise<unknown> {
+  const mcp = await externalMcpToolList();
+  return {
+    builtin: [...READ_ONLY_TOOLS, ...(codeModeWritesEnabled() ? WRITE_TOOLS : [])].sort(),
+    mcp: mcp.map((t) => ({ name: t.name, description: (t.description ?? '').slice(0, 120) })),
+    note: mcp.length === 0
+      ? 'no external MCP servers connected in this session'
+      : 'call clem.describe("<name>") for a tool\'s full arg schema before calling it',
+  };
+}
+
 export async function describeCodeModeTool(name: unknown): Promise<unknown> {
   const toolName = typeof name === 'string' ? name : String((name as { tool?: unknown; name?: unknown })?.tool ?? (name as { name?: unknown })?.name ?? '');
   if (!toolName) return { error: 'describe: pass a tool name string, e.g. clem.describe("list_files")' };
   const allowed = isCodeModeToolAllowed(toolName);
   if (isMcpNamespacedTool(toolName)) {
-    return { name: toolName, allowed, source: 'mcp', note: 'external MCP tool — args follow the server\'s schema; a destructive call is still gated' };
+    // Return the REAL schema from the shim's listTools so the model stops
+    // guessing MCP arg shapes (the {directory}-vs-{path} bug class code mode is
+    // meant to batch through). Falls back to the generic note if unavailable.
+    const t = (await externalMcpToolList()).find((x) => x.name === toolName);
+    if (t) {
+      return {
+        name: toolName,
+        allowed,
+        source: 'mcp',
+        description: typeof t.description === 'string' ? t.description.slice(0, 600) : undefined,
+        parameters: t.inputSchema,
+        note: 'a destructive MCP call is still gated by its approval',
+      };
+    }
+    return { name: toolName, allowed, source: 'mcp', note: 'external MCP tool not found in the connected set — call clem.listTools() to see what is available; a destructive call is still gated' };
   }
   const byName = await realToolsByName();
   const t = byName.get(toolName) as (InvokableTool & { description?: string; parameters?: unknown }) | undefined;
@@ -309,6 +359,7 @@ export async function describeCodeModeTool(name: unknown): Promise<unknown> {
 export async function dispatchCodeModeTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter): Promise<unknown> {
   // Host-answered helpers — never tool dispatches, never gated, never counted.
   if (method === 'describe') return describeCodeModeTool(args);
+  if (method === 'listTools') return listCodeModeTools();
   if (!isCodeModeToolAllowed(method)) {
     const why = WRITE_TOOLS.has(method) ? 'writes are disabled (set CLEMMY_CODE_MODE_WRITES=on)' : 'not in the code-mode allowlist';
     throw new Error(`code-mode: tool "${method}" is not available — ${why}`);
@@ -535,7 +586,7 @@ export function codeModeDescription(): string {
       ? 'Writes ARE allowed and pass the SAME approval/grounding/destination gates as a normal tool call — a blocked write throws inside your program (catch it or let it surface).'
       : 'Local writes are off, but MCP reads work; a destructive MCP tool is still blocked by its approval gate.',
     'Example: `const [a,b] = await Promise.all([clem["dataforseo__serp_organic_live_advanced"]({...}), clem["dataforseo__serp_organic_live_advanced"]({...})]); return { aTop: a.items?.[0], bTop: b.items?.[0] };`',
-    'Helpers: `await clem.describe("tool_name")` returns a tool\'s arg schema (check before guessing arg shapes); `await clem.progress("34/60 fetched")` narrates status to the user (free — not a tool call).',
+    'Helpers (free — host-answered, not tool calls): `await clem.listTools()` lists the connected external MCP tools (names + descriptions) so you know what is callable; `await clem.describe("tool_name")` returns a tool\'s REAL arg schema — including external MCP tools — so check it before guessing arg shapes; `await clem.progress("34/60 fetched")` narrates status to the user.',
     'Sandboxed: no network, no filesystem, no other modules — only `clem` calls reach Clementine. Tool-call budget applies; a program is killed after ~20s with NO tool activity (an actively-fetching program can run to a ~3-minute ceiling). If it is killed mid-run you receive the completed calls\' results as PARTIAL RESULTS — salvage them, only redo what is missing.',
     'HARD LIMIT: this is for READ-ONLY aggregation. NEVER loop irreversible external SENDS/writes (email send, publish) inside it — a batch of gated sends cannot finish inside the program ceiling, so it dies mid-batch and loses track of what was sent. For ANY batch of sends/writes use `run_batch` instead (it certifies once, then runs a deterministic per-item loop with its own budget and an honest ledger). An irreversible send attempted here is refused.',
   ].join(' ');

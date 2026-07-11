@@ -231,8 +231,81 @@ test('clem.describe returns schema info for a local tool and never dispatches it
   const unknown = await describeCodeModeTool('no_such_tool_xyz') as { allowed: boolean; error?: string };
   assert.equal(unknown.allowed, false);
   assert.match(unknown.error ?? '', /unknown tool/);
-  const mcp = await describeCodeModeTool('dataforseo__serp_organic_live_advanced') as { source: string };
-  assert.equal(mcp.source, 'mcp');
+});
+
+// Move 4 / G4: describe now returns the REAL schema for external MCP tools (was a
+// prose note) so the model stops guessing arg shapes for the batch case.
+test('clem.describe returns the real inputSchema for an external MCP tool', async () => {
+  const { describeCodeModeTool, _setExternalMcpToolsForTests } = await import('./code-mode-tool.js');
+  const schema = { type: 'object', properties: { keyword: { type: 'string' }, location: { type: 'number' } }, required: ['keyword'] };
+  _setExternalMcpToolsForTests(async () => [
+    { name: 'dataforseo__serp_organic_live_advanced', description: 'SERP organic results', inputSchema: schema },
+  ]);
+  try {
+    const mcp = await describeCodeModeTool('dataforseo__serp_organic_live_advanced') as { source: string; parameters?: unknown; description?: string };
+    assert.equal(mcp.source, 'mcp');
+    assert.deepEqual(mcp.parameters, schema, 'the real arg schema is surfaced, not a prose note');
+    assert.match(mcp.description ?? '', /SERP organic/);
+    // a name not in the connected set → graceful pointer to listTools, still source mcp
+    const miss = await describeCodeModeTool('dataforseo__not_a_tool') as { source: string; note?: string };
+    assert.equal(miss.source, 'mcp');
+    assert.match(miss.note ?? '', /listTools/);
+  } finally {
+    _setExternalMcpToolsForTests(null);
+  }
+});
+
+test('a PROGRAM can call clem.listTools() and clem.describe() through the sandbox (real dispatch)', async () => {
+  const { runCodeModeForSession, _setExternalMcpToolsForTests } = await import('./code-mode-tool.js');
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'off';
+  _setExternalMcpToolsForTests(async () => [
+    { name: 'dataforseo__serp', description: 'SERP results', inputSchema: { type: 'object', properties: { keyword: { type: 'string' } }, required: ['keyword'] } },
+  ]);
+  try {
+    const r = await runCodeModeForSession(
+      `const list = await clem.listTools();
+       const schema = await clem.describe('dataforseo__serp');
+       return { count: list.mcp.length, name: list.mcp[0].name, params: schema.parameters };`,
+      'sess-codemode-describe',
+    );
+    assert.equal(r.ok, true, r.error);
+    assert.deepEqual(r.value, {
+      count: 1,
+      name: 'dataforseo__serp',
+      params: { type: 'object', properties: { keyword: { type: 'string' } }, required: ['keyword'] },
+    });
+  } finally {
+    _setExternalMcpToolsForTests(null);
+    if (prevBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+  }
+});
+
+test('clem.listTools enumerates built-in + connected MCP tools for discovery', async () => {
+  const { listCodeModeTools, _setExternalMcpToolsForTests } = await import('./code-mode-tool.js');
+  _setExternalMcpToolsForTests(async () => [
+    { name: 'dataforseo__serp_organic_live_advanced', description: 'x'.repeat(300) },
+    { name: 'salesforce__query', description: 'SOQL query' },
+  ]);
+  try {
+    const out = await listCodeModeTools() as { builtin: string[]; mcp: Array<{ name: string; description: string }>; note: string };
+    assert.ok(out.builtin.includes('read_file'), 'lists built-in read tools');
+    assert.equal(out.mcp.length, 2);
+    assert.equal(out.mcp[0].name, 'dataforseo__serp_organic_live_advanced');
+    assert.ok(out.mcp[0].description.length <= 120, 'descriptions are bounded');
+    assert.match(out.note, /describe/);
+  } finally {
+    _setExternalMcpToolsForTests(null);
+  }
+  // no MCP connected → empty list + honest note
+  _setExternalMcpToolsForTests(async () => []);
+  try {
+    const out = await listCodeModeTools() as { mcp: unknown[]; note: string };
+    assert.equal(out.mcp.length, 0);
+    assert.match(out.note, /no external MCP/);
+  } finally {
+    _setExternalMcpToolsForTests(null);
+  }
 });
 
 test('dispatchBatchItemTool establishes tool-output context for the inner tool (background-handoff regression)', async () => {
