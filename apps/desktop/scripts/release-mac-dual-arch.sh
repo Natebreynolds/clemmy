@@ -183,6 +183,15 @@ verify_dmg_artifacts() {
 build_arch() {
   local arch="$1"
   local expected="$2"
+  local builder_args=(--mac dmg zip "--$arch" --publish never)
+
+  # The desktop config pins the production Developer ID. Override it explicitly
+  # for local unsigned rehearsals; disabling auto-discovery alone does not win
+  # over a configured identity.
+  if ! is_signed_release; then
+    builder_args+=(--config.mac.identity=null)
+  fi
+
   echo "-> Rebuilding daemon native modules for Electron $ELECTRON_VERSION ($arch)"
   (cd "$ROOT_DIR" && "$REBUILD_BIN" \
     --version "$ELECTRON_VERSION" \
@@ -194,7 +203,7 @@ build_arch() {
   verify_native_arch "$arch" "$expected"
 
   echo "-> Building macOS artifacts ($arch)"
-  (cd "$DESKTOP_DIR" && "$BUILDER_BIN" --mac dmg zip "--$arch" --publish never)
+  (cd "$DESKTOP_DIR" && "$BUILDER_BIN" "${builder_args[@]}")
 
   local uvtarget
   case "$arch" in

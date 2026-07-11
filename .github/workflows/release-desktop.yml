@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_version:
-        description: 'Prerelease SemVer without v (for example, 1.4.4-rc.1)'
+        description: 'Prerelease SemVer newer than package.json, without v (for example, 1.4.5-rc.1)'
         required: true
         type: string
 
@@ -64,10 +64,15 @@ jobs:
           const build = '[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*';
           const candidate = new RegExp(`^${core}-${prerelease}(?:\\+${build})?$`);
           if (!candidate.test(version)) {
-            console.error(`::error::candidate_version must be a prerelease SemVer without v (for example, 1.4.4-rc.1), not '${version}'.`);
+            console.error(`::error::candidate_version must be a prerelease SemVer without v (for example, 1.4.5-rc.1), not '${version}'.`);
             process.exit(1);
           }
           NODE
+            current_version="$(node -p "require('./package.json').version")"
+            if ! node scripts/release-candidate-version.mjs validate "$CANDIDATE_VERSION" "$current_version"; then
+              echo "::error::candidate_version must be newer than package.json ($current_version)."
+              exit 1
+            fi
             echo "version=$CANDIDATE_VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
             echo "candidate=true" >> "$GITHUB_OUTPUT"
