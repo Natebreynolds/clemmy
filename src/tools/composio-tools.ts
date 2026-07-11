@@ -14,8 +14,11 @@ import {
   readComposioConnectionSuppressionState,
   saveComposioConnectionSuppressionState,
   listAllToolkits,
+  resolveToolkitConnectionOutcome,
   type ConnectedToolkit,
 } from '../integrations/composio/client.js';
+import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { recallComposioAccountIdentity } from '../memory/tool-choice-store.js';
 import { detectJobReceipt, asyncReceiptBanner, composioAsyncResolveEnabled, autoPollJob, recipeFor, resolveJobGetter, type JobReceipt } from '../integrations/composio/async-job.js';
 import { parkComposioJob } from '../integrations/composio/job-watcher.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
@@ -459,6 +462,37 @@ export function composioThrownErrorOutput(
 const AUTO_REMEMBER_WINDOW_MS = 5 * 60 * 1000;
 const lastComposioSearchBySession = new Map<string, { query: string; at: number; slugs?: string[] }>();
 
+// F2 — cross-call reconnect breaker. 90870d8c stops the WITHIN-call retry, but the
+// 15-call thrash was the MODEL re-calling composio_execute_tool for the same dead
+// toolkit across separate runs (each with no connection resolved, so the
+// connection-keyed suppression short-returned ''). Keyed by toolkit (not
+// connectionId) so it fires even when nothing resolved. Once a toolkit has failed
+// reconnect-required this session, later attempts short-circuit deterministically
+// (no network) until a successful execute or a cache invalidation clears it.
+const RECONNECT_BREAKER_TTL_MS = 3 * 60 * 1000;
+const reconnectBreakerBySession = new Map<string, number>();
+function reconnectBreakerEnabled(): boolean {
+  return (process.env.CLEMMY_COMPOSIO_RECONNECT_BREAKER ?? 'on').toLowerCase() !== 'off';
+}
+function reconnectBreakerKey(sid: string, toolSlug: string): string {
+  return `${sid}::${toolkitOfSlug(toolSlug)}`;
+}
+function recordReconnectBreaker(sid: string | undefined, toolSlug: string): void {
+  if (!sid) return;
+  reconnectBreakerBySession.set(reconnectBreakerKey(sid, toolSlug), Date.now());
+  if (reconnectBreakerBySession.size > 500) reconnectBreakerBySession.clear(); // crude bound
+}
+function reconnectBreakerTripped(sid: string | undefined, toolSlug: string): boolean {
+  if (!sid || !reconnectBreakerEnabled()) return false;
+  const at = reconnectBreakerBySession.get(reconnectBreakerKey(sid, toolSlug));
+  if (at === undefined) return false;
+  if (Date.now() - at > RECONNECT_BREAKER_TTL_MS) { reconnectBreakerBySession.delete(reconnectBreakerKey(sid, toolSlug)); return false; }
+  return true;
+}
+function clearReconnectBreaker(sid: string | undefined, toolSlug: string): void {
+  if (sid) reconnectBreakerBySession.delete(reconnectBreakerKey(sid, toolSlug));
+}
+
 /** Record the discovery query (and, when known, the candidate slugs the search
  *  surfaced) so a following successful execute can learn from it — and only
  *  learn a slug the search actually returned. Exported for tests. */
@@ -507,6 +541,7 @@ export async function maybeAutoRememberComposioChoice(
   args: Record<string, unknown>,
   result: unknown,
   sessionId: string | undefined,
+  connectionId?: string,
 ): Promise<void> {
   try {
     const failed = detectComposioFailure(result).failed;
@@ -568,6 +603,26 @@ export async function maybeAutoRememberComposioChoice(
     } catch {
       template = undefined;
     }
+    // C4 — learn the MAILBOX (stable email, never the ca_ id): only when a
+    // specific connection was used AND the toolkit has >1 connection (so the
+    // binding actually disambiguates). Single-account toolkits stay byte-
+    // identical; a genuinely-ambiguous execute never reaches here with a pinned
+    // connectionId. Zero network (SWR cache in hand).
+    let accountIdentity: string | undefined;
+    if (connectionId) {
+      try {
+        const conns = await listUsableConnectedToolkits();
+        const lower = toolSlug.toLowerCase();
+        const forToolkit = conns.filter((c) => {
+          const s = (c.slug ?? '').toLowerCase();
+          return s && (lower === s || lower.startsWith(`${s}_`));
+        });
+        if (forToolkit.length > 1) {
+          const email = forToolkit.find((c) => c.connectionId === connectionId)?.accountEmail?.trim().toLowerCase();
+          if (email && email.includes('@')) accountIdentity = email;
+        }
+      } catch { /* fail-open: identity capture must never break learning */ }
+    }
     rememberToolChoice({
       intent,
       description: 'Auto-remembered: this Composio slug satisfied the searched intent.',
@@ -575,6 +630,7 @@ export async function maybeAutoRememberComposioChoice(
         kind: 'composio',
         identifier: toolSlug,
         invocationTemplate: template,
+        accountIdentity,
         testEvidence: 'auto-remembered after a successful composio_execute_tool call',
       },
     });
@@ -827,6 +883,27 @@ export function buildComposioStatusPayload(
   };
 }
 
+/** Deterministic ASK for a genuinely-ambiguous multi-mailbox toolkit — never
+ *  dispatch a send under a guessed/default account. Lists the candidate
+ *  mailboxes so the user (or model) can name one. */
+function composioMultiAccountAskMessage(
+  toolSlug: string,
+  outcome: Extract<Awaited<ReturnType<typeof resolveToolkitConnectionOutcome>>, { kind: 'ambiguous' | 'identity-absent' }>,
+): string {
+  const toolkit = toolkitOfSlug(toolSlug);
+  const mailboxes = outcome.candidates
+    .map((c, i) => `  ${i + 1}. ${c.email ?? c.wordId ?? c.connectionId}`)
+    .join('\n');
+  const lead = outcome.kind === 'identity-absent'
+    ? `The ${toolkit} mailbox this action last used (${outcome.want}) is no longer connected.`
+    : `You have ${outcome.candidates.length} ${toolkit} accounts connected, so I need to know WHICH mailbox to use for this action.`;
+  return (
+    `⚠️ NEEDS-YOUR-CHOICE (${toolkit}): ${lead}\n\n`
+    + `Connected ${toolkit} mailboxes:\n${mailboxes}\n\n`
+    + `Tell me which account to use and I'll proceed. I did NOT act — picking the wrong mailbox for a send is exactly the mistake this guard prevents.`
+  );
+}
+
 async function runComposioExecute(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -836,6 +913,16 @@ async function runComposioExecute(
   const normalized = normalizeInlineConnectedAccountId(args, connectedAccountId);
   args = normalized.args;
   connectedAccountId = normalized.connectedAccountId;
+  const runSid = sessionIdFromRunContext(options.context);
+
+  // F2 — cross-call reconnect breaker: this toolkit already failed
+  // reconnect-required this session and the caller hasn't pinned a specific
+  // connection, so attempts #2..#N would just re-hit the same dead toolkit.
+  // Short-circuit deterministically (no network) instead of thrashing.
+  if (!connectedAccountId && reconnectBreakerTripped(runSid, toolSlug)) {
+    const toolkit = toolkitOfSlug(toolSlug);
+    return `⚠️ ${toolkit} is not connected (a call already failed this session with "no connected account"). Not retrying — that only loops. Reconnect ${toolkit} in Connect, then try again. Tell the user rather than re-calling ${toolkit} tools.`;
+  }
 
   const gate = await enforceStandingConstraints(toolSlug, args, connectedAccountId);
   if (gate.block) return gate.block;
@@ -857,6 +944,34 @@ async function runComposioExecute(
     if (route.block) return route.block;
     effectiveConnectionId = route.connectedAccountId;
     if (route.note) accountRouteNote = accountRouteNote ? `${accountRouteNote}\n${route.note}` : route.note;
+  }
+
+  // Identity-based routing (D1/D4): no standing rule / calendar / suppression
+  // route pinned a connection, so resolve the toolkit's mailbox by IDENTITY. A
+  // recalled email routes to its current live connection; a single mailbox
+  // resolves deterministically; genuinely-distinct mailboxes ASK for a SEND
+  // (never dispatch under the wrong default) and auto-pick-with-a-note for a read.
+  if (!effectiveConnectionId) {
+    const recalledIdentity = recallComposioAccountIdentity(toolSlug);
+    const outcome = await resolveToolkitConnectionOutcome(toolSlug, recalledIdentity);
+    if (outcome.kind === 'resolved') {
+      effectiveConnectionId = outcome.connectionId;
+      if (recalledIdentity && outcome.identity === recalledIdentity) {
+        const note = `[account-route] Routed to your remembered ${recalledIdentity} mailbox for ${toolkitOfSlug(toolSlug)}.`;
+        accountRouteNote = accountRouteNote ? `${accountRouteNote}\n${note}` : note;
+      }
+    } else if (outcome.kind === 'ambiguous' || outcome.kind === 'identity-absent') {
+      if (isIrreversibleSendSlug(toolSlug)) {
+        return composioMultiAccountAskMessage(toolSlug, outcome);
+      }
+      const pick = outcome.candidates[0];
+      if (pick) {
+        effectiveConnectionId = pick.connectionId;
+        const note = `[account-route] ${toolkitOfSlug(toolSlug)} has ${outcome.candidates.length} connected mailboxes${pick.email ? ` — this read used ${pick.email}` : ''}. Tell me which to use if that's the wrong one.`;
+        accountRouteNote = accountRouteNote ? `${accountRouteNote}\n${note}` : note;
+      }
+    }
+    // 'defer' → executeComposioTool resolves live / falls to the composio default.
   }
 
   // Pre-dispatch arg validation — schema-grounded when the action's real
@@ -911,13 +1026,18 @@ async function runComposioExecute(
       }
       if (accountRouteNote) output += `\n\n${accountRouteNote}`;
       if (constraintBanner) output += `\n${constraintBanner}`;
-      const sid = sessionIdFromRunContext(options.context);
-      maybeAutoRememberComposioChoice(toolSlug, args, result, sid);
+      const sid = runSid;
+      maybeAutoRememberComposioChoice(toolSlug, args, result, sid, effectiveConnectionId);
 
       // PHASE 5: Record outcome for adaptive tool selection & learning
       const failure = detectComposioFailure(result);
       if (failure.failed) {
         output += suppressComposioConnectionAfterHardFailure(effectiveConnectionId, result);
+        // F2: a not-connected RESULT (returned, not thrown) also trips the breaker.
+        if (isComposioReconnectRequiredError(result)) recordReconnectBreaker(sid, toolSlug);
+      } else {
+        // F2: a genuine success proves the toolkit is reachable again → reset.
+        clearReconnectBreaker(sid, toolSlug);
       }
       try {
         recordExecution({
@@ -1070,6 +1190,7 @@ async function runComposioExecute(
       // particular, do not spend the generic retry budget repeating a call
       // that can only be repaired by reconnecting the app under this user.
       if (isComposioReconnectRequiredError(err)) {
+        recordReconnectBreaker(runSid, toolSlug); // F2: trip the cross-call breaker
         return composioThrownErrorOutput(err, { ...options, toolSlug })
           + suppressComposioConnectionAfterHardFailure(effectiveConnectionId, err);
       }

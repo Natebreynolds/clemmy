@@ -47,7 +47,54 @@ const {
   matchToolChoicesForStep,
   evidenceLooksFailedOrBlocked,
   recallComposioForSearch,
+  recallComposioAccountIdentity,
 } = await import('./tool-choice-store.js');
+
+test('accountIdentity: persists a valid email, rejects a ca_ id and non-email; recalls by slug', () => {
+  rememberToolChoice({
+    intent: 'send weekly update to the team',
+    choice: { kind: 'composio', identifier: 'OUTLOOK_SEND_EMAIL', accountIdentity: 'Nathan@Scorpion.co' },
+  });
+  // Stored normalized (lowercased).
+  assert.equal(recallComposioAccountIdentity('OUTLOOK_SEND_EMAIL'), 'nathan@scorpion.co');
+  // A volatile ca_ id is rejected at write → not learned as an identity.
+  rememberToolChoice({
+    intent: 'list my drive files',
+    choice: { kind: 'composio', identifier: 'GOOGLEDRIVE_LIST', accountIdentity: 'ca_uDzrJqqniJFk' as unknown as string },
+  });
+  assert.equal(recallComposioAccountIdentity('GOOGLEDRIVE_LIST'), undefined);
+  // A non-email is rejected too.
+  rememberToolChoice({
+    intent: 'search airtable',
+    choice: { kind: 'composio', identifier: 'AIRTABLE_SEARCH', accountIdentity: 'not-an-email' as unknown as string },
+  });
+  assert.equal(recallComposioAccountIdentity('AIRTABLE_SEARCH'), undefined);
+});
+
+test('accountIdentity: re-validating the same slug carries the learned mailbox forward; a new valid email overrides', () => {
+  rememberToolChoice({
+    intent: 'draft reply to a client',
+    choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', accountIdentity: 'first@x.com' },
+  });
+  // Re-remember same slug WITHOUT an identity → keeps the learned one.
+  rememberToolChoice({
+    intent: 'draft reply to a client',
+    choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', invocationTemplate: '{"a":1}' },
+  });
+  assert.equal(recallComposioAccountIdentity('OUTLOOK_CREATE_DRAFT'), 'first@x.com');
+  // A new valid email wins.
+  rememberToolChoice({
+    intent: 'draft reply to a client',
+    choice: { kind: 'composio', identifier: 'OUTLOOK_CREATE_DRAFT', accountIdentity: 'second@y.com' },
+  });
+  assert.equal(recallComposioAccountIdentity('OUTLOOK_CREATE_DRAFT'), 'second@y.com');
+});
+
+test('recallComposioAccountIdentity: disagreeing mailboxes across intents for one slug → undefined (must ASK)', () => {
+  rememberToolChoice({ intent: 'send invoice reminders', choice: { kind: 'composio', identifier: 'GMAIL_SEND', accountIdentity: 'billing@co.com' } });
+  rememberToolChoice({ intent: 'send launch announcement', choice: { kind: 'composio', identifier: 'GMAIL_SEND', accountIdentity: 'press@co.com' } });
+  assert.equal(recallComposioAccountIdentity('GMAIL_SEND'), undefined);
+});
 
 test('recallToolChoice returns null when there is no record', () => {
   assert.equal(recallToolChoice('something.that.was.never.remembered'), null);

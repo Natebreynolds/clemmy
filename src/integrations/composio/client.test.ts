@@ -8,7 +8,9 @@ import {
   listConnectedToolkits,
   listSuppressedConnectedToolkitViews,
   pickToolkitConnection,
+  selectToolkitConnection,
   toComposioDashboardConnection,
+  type ConnectedToolkit,
 } from './client.js';
 
 test('selectAuthConfigIdForToolkit handles current auth config response shapes', () => {
@@ -93,6 +95,76 @@ test('cache invalidation rejects a late old-account refresh and preserves the ne
   } finally {
     __test__.setConnectedAccountsLoader(null);
   }
+});
+
+test('selectToolkitConnection: 3 re-auths of ONE mailbox collapse → freshest ACTIVE (the reported bug)', () => {
+  const conn = (connectionId: string, status: string, createdAt: string): ConnectedToolkit =>
+    ({ slug: 'outlook', connectionId, status, accountEmail: 'nathan@scorpion.co', createdAt });
+  const out = selectToolkitConnection('OUTLOOK_LIST_MESSAGES', [
+    conn('ca_old', 'ACTIVE', '2026-07-01T00:00:00Z'),
+    conn('ca_mid', 'ACTIVE', '2026-07-05T00:00:00Z'),
+    conn('ca_new', 'ACTIVE', '2026-07-10T00:00:00Z'),
+  ]);
+  assert.deepEqual(out, { kind: 'resolved', connectionId: 'ca_new', identity: 'nathan@scorpion.co' });
+});
+
+test('selectToolkitConnection: active-tier beats createdAt (a fresh INITIATED re-auth cannot hijack a working ACTIVE)', () => {
+  const out = selectToolkitConnection('OUTLOOK_LIST_MESSAGES', [
+    { slug: 'outlook', connectionId: 'ca_active', status: 'ACTIVE', accountEmail: 'a@x.com', createdAt: '2026-07-01T00:00:00Z' },
+    { slug: 'outlook', connectionId: 'ca_initiated', status: 'INITIATED', accountEmail: 'a@x.com', createdAt: '2026-07-10T00:00:00Z' },
+  ]);
+  assert.equal(out.kind === 'resolved' && out.connectionId, 'ca_active');
+});
+
+test('selectToolkitConnection: two DISTINCT mailboxes with no hint → ambiguous (ASK), never a silent pick', () => {
+  const out = selectToolkitConnection('OUTLOOK_SEND_EMAIL', [
+    { slug: 'outlook', connectionId: 'ca_work', status: 'ACTIVE', accountEmail: 'work@x.com' },
+    { slug: 'outlook', connectionId: 'ca_home', status: 'ACTIVE', accountEmail: 'home@y.com' },
+  ]);
+  assert.equal(out.kind, 'ambiguous');
+  assert.equal(out.kind === 'ambiguous' && out.candidates.length, 2);
+});
+
+test('selectToolkitConnection: identity hint routes to the matching mailbox; a miss is identity-absent (ASK)', () => {
+  const conns: ConnectedToolkit[] = [
+    { slug: 'outlook', connectionId: 'ca_work', status: 'ACTIVE', accountEmail: 'work@x.com' },
+    { slug: 'outlook', connectionId: 'ca_home', status: 'ACTIVE', accountEmail: 'home@y.com' },
+  ];
+  assert.deepEqual(
+    selectToolkitConnection('OUTLOOK_SEND_EMAIL', conns, 'HOME@y.com'),
+    { kind: 'resolved', connectionId: 'ca_home', identity: 'home@y.com' },
+  );
+  const miss = selectToolkitConnection('OUTLOOK_SEND_EMAIL', conns, 'gone@z.com');
+  assert.equal(miss.kind, 'identity-absent');
+  assert.equal(miss.kind === 'identity-absent' && miss.want, 'gone@z.com');
+});
+
+test('selectToolkitConnection: unknown-identity connections are NEVER merged → ambiguous', () => {
+  const out = selectToolkitConnection('OUTLOOK_SEND_EMAIL', [
+    { slug: 'outlook', connectionId: 'ca_a', status: 'ACTIVE' },
+    { slug: 'outlook', connectionId: 'ca_b', status: 'ACTIVE' },
+  ]);
+  assert.equal(out.kind, 'ambiguous');
+});
+
+test('selectToolkitConnection: all matched connections inactive → defer', () => {
+  const out = selectToolkitConnection('OUTLOOK_LIST_MESSAGES', [
+    { slug: 'outlook', connectionId: 'ca_x', status: 'EXPIRED', accountEmail: 'a@x.com' },
+    { slug: 'outlook', connectionId: 'ca_y', status: 'REVOKED', accountEmail: 'a@x.com' },
+  ]);
+  assert.deepEqual(out, { kind: 'defer' });
+});
+
+test('selectToolkitConnection: canonical matcher — underscore toolkit slugs match, bare prefixes do not', () => {
+  const oneDrive = selectToolkitConnection('ONE_DRIVE_UPLOAD_FILE', [
+    { slug: 'one_drive', connectionId: 'ca_od', status: 'ACTIVE', accountEmail: 'a@x.com' },
+  ]);
+  assert.equal(oneDrive.kind === 'resolved' && oneDrive.connectionId, 'ca_od');
+  // A bare `google` connection must NOT match a GOOGLEDRIVE_* tool.
+  const noMatch = selectToolkitConnection('GOOGLEDRIVE_DOWNLOAD_FILE', [
+    { slug: 'google', connectionId: 'ca_g', status: 'ACTIVE', accountEmail: 'a@x.com' },
+  ]);
+  assert.deepEqual(noMatch, { kind: 'defer' });
 });
 
 test('pickToolkitConnection: resolves the live connection only when unambiguous (no stale-id guessing)', () => {

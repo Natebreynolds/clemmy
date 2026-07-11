@@ -20,7 +20,6 @@ const {
   __test__,
   getPreferredUserId,
   isComposioReconnectRequiredError,
-  resetComposioClient,
 } = await import('./client.js');
 const { BASE_DIR } = await import('../../config.js');
 
@@ -33,18 +32,16 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-test('current connected-account shape gets one stable non-default machine user and persists it', async () => {
+test('getPreferredUserId: COMPOSIO_USER_ID=default derives a stable non-default machine user, persists it, NEVER probes the network', () => {
   assert.equal(BASE_DIR, TMP_HOME, 'this persistence test is isolated from the real Clementine home');
-  let calls = 0;
+  // getPreferredUserId is a pure local resolve now — the old auto-detect read
+  // user_id off the account list, which the SDK strips (so it was dead). It must
+  // therefore never touch the connected-account loader.
   __test__.setConnectedAccountsLoader(async () => {
-    calls += 1;
-    return [
-      { id: 'ca_outlook', toolkit: { slug: 'outlook' }, status: 'ACTIVE' },
-      { id: 'ca_drive', toolkit: { slug: 'googledrive' }, status: 'ACTIVE' },
-    ];
+    throw new Error('getPreferredUserId must NOT probe the network');
   });
 
-  const userId = await getPreferredUserId({ requireFresh: true });
+  const userId = getPreferredUserId();
   assert.equal(userId, 'clementine-machine-a-01');
   assert.notEqual(userId, 'default');
   assert.equal(process.env.COMPOSIO_USER_ID, userId);
@@ -53,38 +50,15 @@ test('current connected-account shape gets one stable non-default machine user a
   assert.match(persisted, /^COMPOSIO_USER_ID=clementine-machine-a-01$/m);
   assert.match(persisted, /^KEEP_ME=yes$/m, 'unrelated env values survive persistence');
 
-  __test__.setConnectedAccountsLoader(async () => {
-    throw new Error('a persisted id must short-circuit before the network');
-  });
-  assert.equal(await getPreferredUserId({ requireFresh: true }), userId);
-  assert.equal(calls, 1);
+  // Stable + still no network on the second call (now configured, short-circuits).
+  assert.equal(getPreferredUserId(), userId);
 });
 
-test('legacy API user ids still win and are persisted to skip later probes', async () => {
-  delete process.env.COMPOSIO_USER_ID;
-  writeFileSync(path.join(TMP_HOME, '.env'), 'KEEP_ME=yes\n', 'utf-8');
-  resetComposioClient();
-  __test__.setConnectedAccountsLoader(async () => [
-    { id: 'ca_legacy', toolkit: { slug: 'outlook' }, user_id: 'legacy-user', status: 'ACTIVE' },
-  ]);
-
-  assert.equal(await getPreferredUserId({ requireFresh: true }), 'legacy-user');
-  assert.match(readFileSync(path.join(TMP_HOME, '.env'), 'utf-8'), /^COMPOSIO_USER_ID=legacy-user$/m);
-
-  __test__.setConnectedAccountsLoader(async () => {
-    throw new Error('the persisted legacy id must short-circuit before the network');
-  });
-  assert.equal(await getPreferredUserId({ requireFresh: true }), 'legacy-user');
-
-  assert.equal(__test__.preferredUserIdFromConnectedAccounts([
-    { user_id: 'legacy-user', status: 'ACTIVE' },
-    { userId: 'legacy-user', status: 'ACTIVE' },
-    { user_id: 'old-user', status: 'EXPIRED' },
-  ]), 'legacy-user');
-  assert.equal(__test__.preferredUserIdFromConnectedAccounts([
-    { id: 'ca_current', toolkit: { slug: 'outlook' }, status: 'ACTIVE' },
-  ]), undefined);
-});
+// NOTE: the former "legacy API user ids still win" test was DELETED — it mocked a
+// `user_id` field the @composio/core SDK strips from connectedAccounts.list(), so
+// it was false-green: it exercised an auto-detect path that can never fire in
+// production. The mailbox is now decided by the identity-resolved connectedAccountId
+// (see selectToolkitConnection), not a `user_id` probe.
 
 test('connection mismatch classifier recognizes current Composio errors without broad 4xx matching', () => {
   assert.equal(isComposioReconnectRequiredError(

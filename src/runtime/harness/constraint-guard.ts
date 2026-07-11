@@ -10,6 +10,7 @@
  */
 
 import { listConstraints, type ConsolidatedFact } from '../../memory/facts.js';
+import { isIrreversibleSendSlug } from './execution-gate.js';
 
 export interface ConstraintViolation {
   constraint: ConsolidatedFact;
@@ -85,8 +86,11 @@ export function findEmailSendConstraint(
   _args: Record<string, unknown>,
 ): EmailSendConstraint | null {
   try {
-    const slug = toolSlug.toLowerCase();
-    if (!slug.includes('send') && !slug.includes('draft')) return null;
+    // Unify send detection on the single canonical chokepoint predicate: this
+    // catches FORWARD/REPLY-send slugs (which contain neither "send" nor "draft"
+    // — the pre-fix hole) and SEND_DRAFT, while correctly leaving reversible
+    // CREATE_*_DRAFT ungated (a draft is not a send).
+    if (!isIrreversibleSendSlug(toolSlug)) return null;
     for (const constraint of listConstraints()) {
       const content = constraint.content.toLowerCase();
       if (!content.includes('email') && !content.includes('mail')) continue;

@@ -34,7 +34,10 @@ export function clearSenderVerificationCache(): void {
   verifiedMailboxCache.clear();
 }
 
-function normalizeEmail(value: unknown): string {
+/** Canonical email normalizer shared by the connection resolver, the recall
+ *  store, and sender-verify so every layer compares mailbox identities
+ *  identically. */
+export function normalizeEmail(value: unknown): string {
   return String(value ?? '').trim().toLowerCase().replace(/^smtp:/, '');
 }
 

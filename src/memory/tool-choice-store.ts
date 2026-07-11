@@ -38,6 +38,12 @@ export interface ToolChoiceRecordChoice {
   identifier: string;
   /** Free-form template the Executor renders. May contain `{{var}}` placeholders. */
   invocationTemplate?: string;
+  /** kind=composio only: the STABLE mailbox identity (normalized email) this
+   *  intent last used, so a multi-account user recalls the RIGHT mailbox. NEVER
+   *  a volatile `ca_…` connection id (that rotates on re-auth) — the email is
+   *  resolved to the current live connection at execute time. Absent on legacy
+   *  / single-account choices. */
+  accountIdentity?: string;
   /** ISO-8601 of when this choice was last validated. Informational. */
   testedAt: string;
   /** Short string describing how validation passed (e.g. "sf --version exit 0"). */
@@ -159,6 +165,7 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
     // read source means every consumer — context injection, recall, the authoring
     // matcher — sees a connection-less template and always falls to live resolve.
     invocationTemplate: cleanInvocationTemplate(r.invocationTemplate),
+    accountIdentity: parseAccountIdentity(r.accountIdentity),
     testedAt: typeof r.testedAt === 'string' ? r.testedAt : new Date().toISOString(),
     testEvidence: typeof r.testEvidence === 'string' ? r.testEvidence : undefined,
     // Outcome counters — only present once measured, so legacy files round-trip
@@ -174,6 +181,17 @@ function parseChoice(raw: unknown): ToolChoiceRecordChoice | null {
 
 function numOrUndef(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+/** kind=composio mailbox identity guard: accept ONLY a real, normalized email;
+ *  reject a volatile `ca_…` connection id or any non-email so a confused/hostile
+ *  caller can never re-smuggle a volatile handle as a stable recall binding.
+ *  Mirrors normalizeEmail (sender-verify) so identities compare identically. */
+function parseAccountIdentity(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.trim().toLowerCase().replace(/^smtp:/, '');
+  if (!t || /^ca_/i.test(t) || !t.includes('@')) return undefined;
+  return t;
 }
 
 function parseFallback(raw: unknown): ToolChoiceRecordFallback | null {
@@ -426,6 +444,9 @@ export function rememberToolChoice(input: RememberToolChoiceInput): ToolChoiceRe
     kind: input.choice.kind,
     identifier: input.choice.identifier.trim(),
     invocationTemplate: cleanInvocationTemplate(input.choice.invocationTemplate),
+    // Learn the mailbox: a new valid email wins; else keep the one this same
+    // slug last used (re-validating the intent must not forget its mailbox).
+    accountIdentity: parseAccountIdentity(input.choice.accountIdentity) ?? (samePath ? prev.accountIdentity : undefined),
     testedAt: input.choice.testedAt ?? now,
     testEvidence: input.choice.testEvidence,
     ...(samePath ? {
@@ -976,6 +997,10 @@ export interface RememberedComposioMatch {
   successCount: number;
   /** Distinctive choice tokens found in the search query. */
   matched: string[];
+  /** The mailbox identity (email) this slug last used, when EVERY stored
+   *  fragment for the slug agrees. Dropped (undefined) on disagreement so the
+   *  consumer treats it as ambiguous → ASK rather than picking a stale mailbox. */
+  accountIdentity?: string;
 }
 
 /**
@@ -1013,7 +1038,7 @@ export function recallComposioForSearch(
   }
   const outcomesOn = isProceduralOutcomesEnabled();
 
-  type Agg = { best: RememberedComposioMatch; totalSuccess: number; bestMatched: number };
+  type Agg = { best: RememberedComposioMatch; totalSuccess: number; bestMatched: number; identities: Set<string> };
   const bySlug = new Map<string, Agg>();
   for (const rec of records) {
     const c = rec.choice;
@@ -1048,16 +1073,47 @@ export function recallComposioForSearch(
     };
     const prev = bySlug.get(c.identifier);
     if (!prev) {
-      bySlug.set(c.identifier, { best: cand, totalSuccess: successCount, bestMatched: matched.length });
+      bySlug.set(c.identifier, {
+        best: cand,
+        totalSuccess: successCount,
+        bestMatched: matched.length,
+        identities: new Set(c.accountIdentity ? [c.accountIdentity] : []),
+      });
     } else {
       prev.totalSuccess += successCount;
       if (matched.length > prev.bestMatched) { prev.best = cand; prev.bestMatched = matched.length; }
+      if (c.accountIdentity) prev.identities.add(c.accountIdentity);
     }
   }
 
-  const results = [...bySlug.values()].map((a) => ({ ...a.best, successCount: a.totalSuccess }));
+  // Carry the mailbox identity ONLY when every stored fragment for the slug
+  // agrees (one distinct email); disagreement → undefined → consumer must ASK.
+  const results = [...bySlug.values()].map((a) => ({
+    ...a.best,
+    successCount: a.totalSuccess,
+    accountIdentity: a.identities.size === 1 ? [...a.identities][0] : undefined,
+  }));
   results.sort((x, y) => (y.matched.length - x.matched.length) || (y.successCount - x.successCount));
   return results.slice(0, opts.limit ?? 3);
+}
+
+/**
+ * Slug-keyed mailbox recall: the STABLE email identity every remembered choice
+ * for this exact composio slug agrees on, else undefined (no memory, or the
+ * mailboxes disagree → the consumer must ASK). Used at execute time to route a
+ * multi-account toolkit to the mailbox this slug last used. Zero network.
+ */
+export function recallComposioAccountIdentity(slug: string): string | undefined {
+  if (!slug) return undefined;
+  let records: ToolChoiceRecord[];
+  try { records = listToolChoices(); } catch { return undefined; }
+  const identities = new Set<string>();
+  for (const rec of records) {
+    const c = rec.choice;
+    if (!c || c.kind !== 'composio' || c.identifier !== slug) continue;
+    if (c.accountIdentity) identities.add(c.accountIdentity);
+  }
+  return identities.size === 1 ? [...identities][0] : undefined;
 }
 
 /** The `allowedTools` family a step should be locked to when bound to a choice.

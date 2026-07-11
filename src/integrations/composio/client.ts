@@ -80,6 +80,10 @@ export interface ConnectedToolkit {
   accountName?: string;
   accountAvatarUrl?: string;
   createdAt?: string;
+  /** Composio's own stable per-connection handle (e.g. `gmail_red-castle`). A
+   *  secondary identity key for connection selection when no accountEmail is
+   *  known — see selectToolkitConnection(). */
+  wordId?: string;
 }
 
 export interface ComposioConnectionSuppression {
@@ -247,7 +251,7 @@ interface AccountIdentity {
 
 let singleton: Composio | null = null;
 let localEnvCache: { at: number; env: Record<string, string> } | null = null;
-let connectionsCache: { at: number; data: ConnectedToolkit[]; preferredUserId?: string } | null = null;
+let connectionsCache: { at: number; data: ConnectedToolkit[] } | null = null;
 let connectionsGeneration = 0;
 let connectionsInflight: { generation: number; promise: Promise<ConnectedToolkit[]> } | null = null;
 let connectedAccountsLoaderForTest: (() => Promise<Array<Record<string, unknown>>>) | null = null;
@@ -685,23 +689,20 @@ function persistResolvedComposioUserId(resolved: string): string {
   return resolved;
 }
 
-function preferredUserIdFromConnectedAccounts(items: Array<Record<string, unknown>>): string | undefined {
-  const counts = new Map<string, number>();
-  for (const item of items) {
-    const userId = str(item.user_id) ?? str(item.userId);
-    if (!userId || userId === DEFAULT_USER_ID) continue;
-    const weight = /active/i.test(str(item.status) ?? '') ? 2 : 1;
-    counts.set(userId, (counts.get(userId) ?? 0) + weight);
-  }
-  return [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
-}
-
-export async function getPreferredUserId(options: { requireFresh?: boolean } = {}): Promise<string> {
+/**
+ * The Composio ENTITY this daemon acts as. NOT the mailbox selector — the
+ * mailbox is decided by the identity-resolved connectedAccountId (see
+ * selectToolkitConnection). This is only: `configuredUserId()` (advanced
+ * per-org override via COMPOSIO_USER_ID) → else `derivedComposioUserId()`
+ * (`clementine-<machine>`, the entity Clem creates connections under and the
+ * tools.execute fallback when no specific connection resolves). Pure + local:
+ * no network. (The old auto-detect read `user_id` off the account list, which
+ * the @composio/core SDK strips — it could never return a value, so it's gone.)
+ */
+export function getPreferredUserId(): string {
   const explicit = configuredUserId();
   if (explicit) return explicit;
-  await listConnectedToolkits({ requireFresh: options.requireFresh });
-  const legacyDetected = connectionsCache?.preferredUserId;
-  return persistResolvedComposioUserId(legacyDetected ?? derivedComposioUserId());
+  return persistResolvedComposioUserId(derivedComposioUserId());
 }
 
 function rawComposioClient(composio: Composio): any {
@@ -797,6 +798,7 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
           accountName: identity.name,
           accountAvatarUrl: identity.avatarUrl,
           createdAt: str(item.createdAt) ?? str(item.created_at),
+          wordId: str(item.wordId) ?? str(item.word_id),
         };
       }).filter((connection) => connection.connectionId && connection.slug !== 'unknown');
       if (generation !== connectionsGeneration) {
@@ -805,7 +807,6 @@ async function refreshConnectedToolkits(): Promise<ConnectedToolkit[]> {
       connectionsCache = {
         at: Date.now(),
         data,
-        preferredUserId: preferredUserIdFromConnectedAccounts(items),
       };
       return data;
   })().finally(() => {
@@ -1092,7 +1093,7 @@ export async function authorizeToolkit(slug: string): Promise<{ redirectUrl: str
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
 
-  const userId = await getPreferredUserId({ requireFresh: true });
+  const userId = getPreferredUserId();
   try {
     const authConfigIdToUse = await findToolkitAuthConfigId(composio, slug);
     if (!authConfigIdToUse) {
@@ -1264,7 +1265,7 @@ export async function setupApiKeyToolkit(
 ): Promise<{ ok: true; authConfigId: string; connectionId: string }> {
   const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
   if (!composioApiKey) throw new Error('COMPOSIO_API_KEY is not configured.');
-  const userId = await getPreferredUserId({ requireFresh: true });
+  const userId = getPreferredUserId();
 
   // Step 1 — project-level auth_config (via raw fetch; see banner).
   const createAuthRes = await fetch('https://backend.composio.dev/api/v3/auth_configs', {
@@ -1469,21 +1470,21 @@ export async function executeComposioTool(
   toolSlug: string,
   args: Record<string, unknown>,
   connectedAccountId?: string,
+  preferredIdentity?: string,
 ): Promise<unknown> {
   const backend = getComposioExecutionBackend();
-  // Resolve one stable Composio user up front. Older connected-account API
-  // responses expose user_id and remain auto-detectable; current responses do
-  // not, so getPreferredUserId() persists a per-machine Clementine id instead
-  // of silently routing through Composio's literal "default" entity.
-  const userId = await getPreferredUserId({ requireFresh: true });
+  // The Composio ENTITY (user_id) is only the fallback when no specific
+  // connection resolves; the MAILBOX is chosen by the identity-resolved
+  // connectedAccountId below. Pure/local, no network (getPreferredUserId).
+  const userId = getPreferredUserId();
 
   // A model (esp. a BYO/GLM backend) can serialize a null account id as the
   // LITERAL string "null"/"undefined"/"none" — truthy, so it both bypasses the
   // live-connection auto-resolver below AND is forwarded to Composio as a bogus
   // account id it cannot resolve, surfacing only as a generic dispatch error
   // (the 2026-06-29 Apify incident: every call carried connected_account_id:"null").
-  // Treat those as "no pinned account" so resolveToolkitConnectionId picks the
-  // real live connection. Mirrors the same junk-string guard in computer-tools.ts.
+  // Treat those as "no pinned account" so the resolver picks the real live
+  // connection. Same junk-string guard as normalizeInlineConnectedAccountId.
   const pinnedAccountId =
     connectedAccountId
     && !['null', 'undefined', 'none', ''].includes(connectedAccountId.trim().toLowerCase())
@@ -1514,11 +1515,12 @@ export async function executeComposioTool(
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
   // "Know about the connection, then query the right one": when the caller
-  // didn't pin a connection, deliberately resolve the toolkit's LIVE connection
-  // from connectedAccounts rather than relying on a stale baked id or an opaque
-  // default. resolveToolkitConnectionId only picks when UNAMBIGUOUS, so it can
-  // never guess wrong (falls back to composio's default otherwise).
-  const resolvedConnection = pinnedAccountId ?? (await resolveToolkitConnectionId(toolSlug));
+  // didn't pin a connection, resolve the toolkit's live connection by IDENTITY
+  // (selectToolkitConnection) rather than relying on a stale baked id or the
+  // opaque user_id default. Served SWR-instant from the cached snapshot (E1);
+  // the self-heal below backstops a just-changed connection.
+  let selfHealedConnection = false;
+  const resolvedConnection = pinnedAccountId ?? (await resolveToolkitConnectionId(toolSlug, preferredIdentity));
   const body: Record<string, unknown> = {
     userId,
     arguments: args,
@@ -1528,6 +1530,25 @@ export async function executeComposioTool(
   try {
     return await (composio as any).tools.execute(toolSlug, body);
   } catch (err) {
+    // Self-heal (E2): we picked this connection from a possibly-stale SWR
+    // snapshot. If the dispatch failed because the account isn't connected
+    // (rotated/just-disconnected), bust the cache, re-resolve FRESH once, and
+    // retry only if we land on a DIFFERENT connection. Never fires for a
+    // caller-pinned account (that's the user's explicit choice), and at most one
+    // extra round-trip. Strictly more correct than pre-emptive requireFresh.
+    if (
+      connSwrEnabled()
+      && pinnedAccountId === undefined
+      && !selfHealedConnection
+      && isComposioReconnectRequiredError(err)
+    ) {
+      selfHealedConnection = true;
+      invalidateConnectedAccountSnapshot();
+      const fresh = await resolveToolkitConnectionId(toolSlug, preferredIdentity);
+      if (fresh && fresh !== resolvedConnection) {
+        return await (composio as any).tools.execute(toolSlug, { ...body, connectedAccountId: fresh });
+      }
+    }
     if (isComposioReconnectRequiredError(err)) {
       throw new ComposioReconnectRequiredError(toolSlug, err);
     }
@@ -1556,24 +1577,138 @@ export async function executeComposioTool(
  * stale-connection rot: the live connection is queried per call, never cached
  * into a tool-choice (see stripBakedConnectionId).
  */
-export async function resolveToolkitConnectionId(toolSlug: string): Promise<string | undefined> {
+/** Normalized email for identity comparison — mirrors sender-verify's
+ *  normalizeEmail so every layer keys mailboxes identically. */
+function normEmail(value: unknown): string {
+  return String(value ?? '').trim().toLowerCase().replace(/^smtp:/, '');
+}
+
+/** Canonical toolkit match: a `one_drive` connection matches an
+ *  `ONE_DRIVE_UPLOAD_FILE` tool, and a bare `google` connection does NOT match a
+ *  `GOOGLEDRIVE_*` tool. Shared by resolution so every layer selects the same set. */
+function toolMatchesConnection(toolSlugLower: string, connSlugLower: string): boolean {
+  if (!connSlugLower) return false;
+  return toolSlugLower === connSlugLower || toolSlugLower.startsWith(`${connSlugLower}_`);
+}
+
+export interface DistinctIdentity {
+  email?: string;
+  connectionId: string;
+  wordId?: string;
+}
+
+export type ToolkitConnectionOutcome =
+  | { kind: 'resolved'; connectionId: string; identity?: string }
+  | { kind: 'defer' } // 0 usable candidates → let composio pick its default entity
+  | { kind: 'ambiguous'; candidates: DistinctIdentity[] } // N distinct mailboxes, no disambiguator → ASK
+  | { kind: 'identity-absent'; want: string; candidates: DistinctIdentity[] }; // recalled mailbox no longer connected → ASK
+
+function identityResolveEnabled(): boolean {
+  return (process.env.CLEMMY_COMPOSIO_IDENTITY_RESOLVE ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Kill-switch for the SWR-serve + self-heal hot path (E). Off → the execute
+ *  path re-resolves fresh each call (the pre-E behavior) and skips self-heal. */
+function connSwrEnabled(): boolean {
+  return (process.env.CLEMMY_COMPOSIO_CONN_SWR ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Identity-layered connection selection (pure + testable). Collapses same-mailbox
+ * re-auths into one identity (keyed by normalized accountEmail, else Composio's
+ * wordId, else the connection id — unknown identities are NEVER merged), picks
+ * the freshest genuinely-active representative, and returns a three/four-valued
+ * outcome so a genuinely multi-mailbox user is ASKED rather than guessed for.
+ * The old "give up on >1 active → defer to user_id" behavior lives behind the
+ * CLEMMY_COMPOSIO_IDENTITY_RESOLVE=off kill-switch.
+ */
+export function selectToolkitConnection(
+  toolSlug: string,
+  conns: ConnectedToolkit[],
+  identityHint?: string,
+): ToolkitConnectionOutcome {
+  const toolLower = toolSlug.toLowerCase();
+
+  if (!identityResolveEnabled()) {
+    // Legacy: single match, or a single ACTIVE among many, resolves; else defer.
+    const matched = conns.filter((c) => c.slug && c.connectionId && toolLower.startsWith(c.slug.toLowerCase()));
+    if (matched.length === 0) return { kind: 'defer' };
+    if (matched.length === 1) return { kind: 'resolved', connectionId: matched[0].connectionId };
+    const active = matched.filter((c) => /active|enabled|initiat/i.test(c.status));
+    return active.length === 1 ? { kind: 'resolved', connectionId: active[0].connectionId } : { kind: 'defer' };
+  }
+
+  const matched = conns.filter((c) => c.connectionId && toolMatchesConnection(toolLower, (c.slug ?? '').toLowerCase()));
+  if (matched.length === 0) return { kind: 'defer' };
+  const liveish = matched.filter((c) => /active|enabled|initiat/i.test(c.status ?? ''));
+  if (liveish.length === 0) return { kind: 'defer' };
+
+  const groups = new Map<string, ConnectedToolkit[]>();
+  for (const c of liveish) {
+    const email = normEmail(c.accountEmail);
+    const key = email.includes('@') ? email : c.wordId ? `word:${c.wordId}` : `conn:${c.connectionId}`;
+    let arr = groups.get(key);
+    if (!arr) { arr = []; groups.set(key, arr); }
+    arr.push(c);
+  }
+
+  const activeTier = (s: string): number => (/^(active|enabled)$/i.test(s.trim()) ? 0 : 1);
+  const representative = (members: ConnectedToolkit[]): ConnectedToolkit =>
+    [...members].sort((a, b) => {
+      const ta = activeTier(a.status ?? '');
+      const tb = activeTier(b.status ?? '');
+      if (ta !== tb) return ta - tb; // genuine ACTIVE beats an in-flight INITIATED re-auth
+      const da = a.createdAt ?? '';
+      const db = b.createdAt ?? '';
+      if (da !== db) return da < db ? 1 : -1; // createdAt DESC (freshest)
+      return a.connectionId < b.connectionId ? -1 : 1;
+    })[0];
+
+  const distinct: DistinctIdentity[] = [...groups.entries()].map(([key, members]) => {
+    const rep = representative(members);
+    return {
+      email: key.includes('@') ? key : (normEmail(rep.accountEmail).includes('@') ? normEmail(rep.accountEmail) : undefined),
+      connectionId: rep.connectionId,
+      wordId: rep.wordId,
+    };
+  });
+
+  const wantEmail = normEmail(identityHint);
+  if (wantEmail.includes('@')) {
+    const hit = distinct.find((d) => d.email === wantEmail);
+    if (hit) return { kind: 'resolved', connectionId: hit.connectionId, identity: hit.email };
+    return { kind: 'identity-absent', want: wantEmail, candidates: distinct }; // recalled mailbox gone → ASK, never fall through
+  }
+
+  if (distinct.length === 1) return { kind: 'resolved', connectionId: distinct[0].connectionId, identity: distinct[0].email };
+  return { kind: 'ambiguous', candidates: distinct }; // genuinely different mailboxes → ASK
+}
+
+export async function resolveToolkitConnectionOutcome(
+  toolSlug: string,
+  identityHint?: string,
+): Promise<ToolkitConnectionOutcome> {
   try {
-    return pickToolkitConnection(toolSlug, await listUsableConnectedToolkits({ requireFresh: true }));
+    // SWR-serve the cached snapshot on the hot path (E1); the self-heal in
+    // executeComposioTool busts + refetches only on a real connection error.
+    // Kill-switch off → pre-emptive fresh fetch (the pre-E behavior).
+    const conns = await listUsableConnectedToolkits({ requireFresh: !connSwrEnabled() });
+    return selectToolkitConnection(toolSlug, conns, identityHint);
   } catch {
-    return undefined;
+    return { kind: 'defer' };
   }
 }
 
-/** Pure selection core of resolveToolkitConnectionId (testable without a live
- *  Composio call). Picks a connectionId ONLY when unambiguous. */
+export async function resolveToolkitConnectionId(toolSlug: string, identityHint?: string): Promise<string | undefined> {
+  const outcome = await resolveToolkitConnectionOutcome(toolSlug, identityHint);
+  return outcome.kind === 'resolved' ? outcome.connectionId : undefined;
+}
+
+/** Back-compat pure wrapper (legacy `string | undefined`): only `resolved`
+ *  yields an id; defer/ambiguous/identity-absent → undefined. */
 export function pickToolkitConnection(toolSlug: string, conns: ConnectedToolkit[]): string | undefined {
-  const lower = toolSlug.toLowerCase();
-  const matched = conns.filter(
-    (c) => c.slug && c.connectionId && lower.startsWith(c.slug.toLowerCase()),
-  );
-  if (matched.length <= 1) return matched[0]?.connectionId; // 0 → undefined; 1 → deterministic
-  const active = matched.filter((c) => /active|enabled|initiat/i.test(c.status));
-  return active.length === 1 ? active[0].connectionId : undefined; // single active wins; else defer
+  const outcome = selectToolkitConnection(toolSlug, conns);
+  return outcome.kind === 'resolved' ? outcome.connectionId : undefined;
 }
 
 export async function searchComposioToolsViaCli(
@@ -1703,7 +1838,6 @@ export const __test__ = {
   authConfigId,
   authConfigToolkitSlug,
   selectAuthConfigIdForToolkit,
-  preferredUserIdFromConnectedAccounts,
   derivedComposioUserId,
   setConnectedAccountsLoader(
     loader: (() => Promise<Array<Record<string, unknown>>>) | null,
