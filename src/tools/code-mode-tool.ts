@@ -489,7 +489,7 @@ export async function dispatchCodeModeTool(method: string, args: unknown, sessio
   try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, codeMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
-      ? await dispatchCodeModeMcpTool(method, args)
+      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter);
     const normalized = normalizeCodeModeToolResult(method, out, { sessionId, callId });
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, codeMode: true, preview: (typeof normalized === 'string' ? normalized : JSON.stringify(normalized ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
@@ -549,8 +549,14 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
  *  uses, so it inherits the shim's `decideToolApproval` gating + server-health
  *  checks — gate-parity with a discrete MCP call (a destructive/admin tool throws
  *  `mcp.approval_blocked`; a read passes). The shim is loaded lazily to keep the
- *  MCP/SDK module graph off code-mode's static surface. */
-async function dispatchCodeModeMcpTool(method: string, args: unknown): Promise<unknown> {
+ *  MCP/SDK module graph off code-mode's static surface.
+ *
+ *  Runs under `codeMode: true` harness context (mirroring the local lane above)
+ *  so the shim's read-fanout guardrail mount exempts a program's own batched
+ *  MCP reads — without this, the block would refuse the very program it
+ *  demanded (the shim mount is where discrete native-MCP serial reads are
+ *  refused as of 2026-07-12). `certifiedBatch` rides along for the batch lane. */
+async function dispatchCodeModeMcpTool(method: string, args: unknown, sessionId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }): Promise<unknown> {
   const { getOrCreateExternalMcpServers } = await import('../runtime/mcp-servers.js');
   const shim = getOrCreateExternalMcpServers() as unknown as {
     listTools?: () => Promise<unknown>;
@@ -563,7 +569,10 @@ async function dispatchCodeModeMcpTool(method: string, args: unknown): Promise<u
   // tool→server routing map exists before callTool resolves the name.
   if (typeof shim.listTools === 'function') { try { await shim.listTools(); } catch { /* routing rebuilds on call */ } }
   const argObj = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
-  return shim.callTool(method, argObj);
+  return withHarnessRunContext(
+    { sessionId, counter: counter ?? new ToolCallsCounter(1000), codeMode: true, ...(certifiedBatch ? { certifiedBatch } : {}) },
+    () => shim.callTool(method, argObj),
+  );
 }
 
 /**
@@ -588,7 +597,7 @@ export async function dispatchBatchItemTool(
   try { appendEvent({ sessionId, turn: 0, role: 'Clem', type: 'tool_called', data: { tool: method, callId, batchMode: true, args: JSON.stringify(args ?? {}).slice(0, 300) } }); } catch { /* telemetry never blocks */ }
   try {
     const out = isMcpNamespacedTool(method)
-      ? await dispatchCodeModeMcpTool(method, args)
+      ? await dispatchCodeModeMcpTool(method, args, sessionId, counter, certifiedBatch)
       : await dispatchCodeModeLocalTool(method, args, sessionId, callId, counter, certifiedBatch);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok: true, batchMode: true, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;

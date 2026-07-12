@@ -20,8 +20,12 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-mcp-fanout-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-mcp-fanout-test\n', 'utf-8');
+// The shim now registers calls with the tool-guardrail (read-fanout block mount);
+// synthetic session ids have no sessions row, so skip sqlite write-through.
+process.env.CLEMMY_GUARDRAIL_PERSIST = 'off';
 
 const { createMcpNamespaceShim, namespaceToolName, slugifyServerName } = await import('./mcp-namespace-shim.js');
+const { _resetAllTrackersForTests } = await import('./harness/tool-guardrail.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brackets.js');
 type HarnessRunContext = import('./harness/brackets.js').HarnessRunContext;
 
@@ -103,6 +107,124 @@ test('MCP shim leaves results untouched when there is no harness session context
     last = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-xxxxxx.com` }));
   }
   assert.ok(!/FAN-OUT NOW/.test(last), 'no advisory without a session context (cannot key the bucket)');
+});
+
+// ─── READ-FANOUT HARD BLOCK at the shim mount (2026-07-12) ──────────────────
+// Native MCP dispatches bypass wrapToolForHarness, so the deterministic block
+// lives HERE too. These integration tests drive the REAL shim -> guardrail
+// path: a genuine serial batch (6+ distinct entities) is refused with the
+// standing-turn-rule recovery message and the server is NOT contacted; the
+// entity gate, code-mode/certified-batch exemptions, and the default-off
+// kill-switch each keep legitimate shapes untouched.
+
+/** Fake server that counts dispatches, so a refusal is provably pre-dispatch. */
+function makeCountingServer(name: string, toolName: string): { server: MCPServer; calls: () => number } {
+  let n = 0;
+  const server = {
+    name,
+    cacheToolsList: false,
+    toolFilter: undefined,
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [{ name: toolName, description: 'read', inputSchema: { type: 'object' } }] as unknown as Awaited<ReturnType<MCPServer['listTools']>>;
+    },
+    async callTool(_toolName: string, _args: Record<string, unknown> | null) {
+      n += 1;
+      return [{ type: 'text', text: 'serp rank 4, volume 320' }] as unknown as Awaited<ReturnType<MCPServer['callTool']>>;
+    },
+    async invalidateToolsCache() {},
+  } as unknown as MCPServer;
+  return { server, calls: () => n };
+}
+
+test('shim block: 6 distinct-entity serial reads → 6th REFUSED pre-dispatch with the program recovery', async () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
+    const shim = createMcpNamespaceShim({ servers: [server] });
+    const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
+    await withHarnessRunContext(ctx('sess-shimblock-batch'), async () => {
+      await shim.listTools();
+      for (let i = 1; i <= 5; i += 1) {
+        const r = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-aaaa.com` }));
+        assert.ok(!/REFUSED/.test(r), `read #${i} (< threshold) dispatches normally`);
+      }
+      assert.equal(calls(), 5, 'first five reads reached the server');
+      const r6 = JSON.stringify(await shim.callTool(namespaced, { target: 'firm-6-zzzz.com' }));
+      assert.ok(/REFUSED/.test(r6), '6th distinct entity → refused');
+      assert.ok(/run_tool_program/.test(r6), 'refusal carries the program recovery skeleton');
+      assert.equal(calls(), 5, 'the refused read NEVER reached the server');
+    });
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
+test('shim block entity gate: re-reading ONE entity 8 ways (pagination/refinement) never refuses', async () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
+    const shim = createMcpNamespaceShim({ servers: [server] });
+    const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
+    await withHarnessRunContext(ctx('sess-shimblock-refine'), async () => {
+      await shim.listTools();
+      for (let i = 1; i <= 8; i += 1) {
+        const r = JSON.stringify(await shim.callTool(namespaced, { target: 'same-firm.com', depth: i * 10 }));
+        assert.ok(!/REFUSED/.test(r), `refinement read #${i} on ONE entity must not be refused`);
+      }
+      assert.equal(calls(), 8, 'all refinement reads dispatched');
+    });
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
+test('shim block exemptions: code-mode program reads and certified-batch items are never refused', async () => {
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    for (const [label, extra] of [
+      ['codeMode', { codeMode: true }],
+      ['certifiedBatch', { certifiedBatch: { batchId: 'b1', payloadHash: 'h1' } }],
+    ] as const) {
+      _resetAllTrackersForTests();
+      const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
+      const shim = createMcpNamespaceShim({ servers: [server] });
+      const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
+      await withHarnessRunContext({ ...ctx(`sess-shimblock-${label}`), ...extra }, async () => {
+        await shim.listTools();
+        for (let i = 1; i <= 8; i += 1) {
+          const r = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-${label}.com` }));
+          assert.ok(!/REFUSED/.test(r), `${label}: read #${i} exempt from the block`);
+        }
+        assert.equal(calls(), 8, `${label}: all 8 reads dispatched`);
+      });
+    }
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
+test('shim block kill-switch: OFF → 10 distinct-entity serial reads all dispatch (byte-identical)', async () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'off';
+  try {
+    const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
+    const shim = createMcpNamespaceShim({ servers: [server] });
+    const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
+    await withHarnessRunContext(ctx('sess-shimblock-off'), async () => {
+      await shim.listTools();
+      for (let i = 1; i <= 10; i += 1) {
+        const r = JSON.stringify(await shim.callTool(namespaced, { target: `firm-${i}-off.com` }));
+        assert.ok(!/REFUSED/.test(r), `switch off: read #${i} never refused`);
+      }
+      assert.equal(calls(), 10, 'switch off: every read dispatched');
+    });
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
 });
 
 after(() => {

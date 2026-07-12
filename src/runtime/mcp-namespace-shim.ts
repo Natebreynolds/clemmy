@@ -28,6 +28,7 @@ import {
 import { looksLikeNativeMcpSend } from './harness/execution-gate.js';
 import { isConfirmFirstEnabled } from './harness/confirm-first-gate.js';
 import { appendEvent, listEvents } from './harness/eventlog.js';
+import { evaluateToolCall, applyMode } from './harness/tool-guardrail.js';
 import { classifyShellNetworkMutation } from './harness/destination-gate.js';
 import { formatRecallableToolText } from './harness/tool-output-format.js';
 import {
@@ -1245,6 +1246,46 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         } catch (err) {
           if (err instanceof OutputGroundingCheckFailedError) throw err;
           // Any other evaluation error is fail-open — never block a legit send.
+        }
+      }
+
+      // READ-FANOUT GUARDRAIL for native MCP (2026-07-12, live Call-3 finding):
+      // native MCP dispatches OUTSIDE wrapToolForHarness, so the deterministic
+      // read-fanout block (tool-guardrail) never saw these calls — 8 discrete
+      // serial SERP reads sailed past the exact anti-pattern the block exists
+      // to stop. Mirror the brackets mount HERE (the pattern this file already
+      // uses for approval / integrity / batch-consent parity): register the
+      // call with the guardrail under the QUALIFIED `<server>__<tool>` name
+      // (this callTool always receives it — parseNamespacedTool throws above
+      // otherwise), and past the threshold REFUSE the serialized READ with the
+      // standing-turn-rule recovery message as the tool result. Returned as a
+      // text block — NOT thrown — so the model reads the verbatim batching
+      // instruction instead of a corrective-wrapped "tool failed" framing.
+      // Exemptions mirror brackets exactly: a code-mode program's own reads
+      // (ctx.codeMode — the sanctioned execution the block steers TO), worker
+      // scope (guardrailScopeId), and certified batch items. Loop-detection
+      // actions (exact-repeat block/halt) stay UNENFORCED here — status quo;
+      // this mount changes read-fanout behavior only. Registration happens
+      // after the approval gates so an approval-blocked call never inflates
+      // the serial-read count.
+      {
+        const guardCtx = harnessRunContextStorage.getStore();
+        const guardScopeId = guardCtx?.guardrailScopeId ?? guardCtx?.behaviorScopeId ?? guardCtx?.sessionId;
+        if (guardScopeId) {
+          const guardDecision = applyMode(evaluateToolCall(guardScopeId, toolName, args ?? {}));
+          const guardExempt = Boolean(guardCtx?.codeMode || guardCtx?.guardrailScopeId || guardCtx?.certifiedBatch);
+          if (guardDecision.fanoutBlock && !guardExempt) {
+            try {
+              appendEvent({
+                sessionId: guardScopeId,
+                turn: 0,
+                role: 'system',
+                type: 'guardrail_tripped',
+                data: { kind: 'fanout_block', toolName: guardDecision.toolName, count: guardDecision.count, reason: guardDecision.fanoutBlock, mcp: true },
+              });
+            } catch { /* telemetry write must never block */ }
+            return [{ type: 'text', text: guardDecision.fanoutBlock }] as CallToolResultContent;
+          }
         }
       }
 
