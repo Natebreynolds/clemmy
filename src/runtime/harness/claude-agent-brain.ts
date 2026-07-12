@@ -1035,6 +1035,10 @@ export async function respondViaClaudeAgentSdkBrain(
     allowedLocalMcpTools: jitAllowed,
     mcpToolAllowlist,
     agentic: mode === 'full',
+    // Mount the read-fanout block on native external MCP: the orchestrator brain
+    // is the ONE lane with run_tool_program (the recovery), so serial native-MCP
+    // reads here get refused + steered to a program; workers/steps opt out.
+    readFanoutGuard: mode === 'full',
     // TOOL-STARVATION GUARD (live 2026-07-01: the local MCP server's ~13s cold
     // boot intermittently missed the CLI's startup window under load — the brain
     // then ran with ONLY external MCP tools and narrated/refused local actions,

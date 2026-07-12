@@ -29,6 +29,7 @@ import { renderTranscriptTurns } from './session-transcript.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, writeToolOutput } from './eventlog.js';
+import { evaluateToolCall, applyMode } from './tool-guardrail.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
 import type { RunStoppedReason } from '../../types.js';
 import { createClementineMcpServer, listClementineMcpToolNames } from '../../tools/mcp-server.js';
@@ -234,6 +235,43 @@ function withToolCeiling(base: CanUseTool, fastAllowTools: string[], state: Tool
     } finally {
       state.pausedMs += Date.now() - t0;
     }
+  }) as CanUseTool;
+}
+
+/** Mount the deterministic read-fanout block on the SDK's canUseTool gate. Native
+ *  external MCP tools dispatch INSIDE the SDK — they never reach wrapToolForHarness
+ *  (brackets) nor the namespace shim WITH a live harness AsyncLocalStorage context,
+ *  so this permission callback is the one harness-controlled point that sees them
+ *  (as `mcp__<server>__<tool>`, per the split at line ~220). We register ONLY those
+ *  native-external names (local/clementine + composio are already covered by
+ *  brackets — evaluating them here would double-count), stripping the SDK's `mcp__`
+ *  prefix so the fanout key + the run_tool_program recovery skeleton name the tool
+ *  exactly as code mode dispatches it. On a fanout refusal we DENY (interrupt:false)
+ *  with the recovery message so the model reads the "write ONE program" steer. */
+export function withReadFanoutGuard(base: CanUseTool, sessionId: string | undefined): CanUseTool {
+  return (async (toolName, input, options) => {
+    if (sessionId && typeof toolName === 'string') {
+      // SDK native external MCP name: mcp__<server>__<tool>. Strip the leading
+      // mcp__, then require a remaining <server>__<tool> shape that is NOT the
+      // in-process clementine-local server (whose tools ride brackets).
+      const stripped = toolName.replace(/^mcp__/, '');
+      const isNativeExternalMcp = stripped.includes('__') && !/clement/i.test(stripped);
+      if (isNativeExternalMcp) {
+        try {
+          const decision = applyMode(evaluateToolCall(sessionId, stripped, input));
+          if (decision.fanoutBlock) {
+            try {
+              appendEvent({
+                sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                data: { kind: 'fanout_block', toolName: decision.toolName, count: decision.count, reason: decision.fanoutBlock, sdk: true },
+              });
+            } catch { /* telemetry never blocks */ }
+            return { behavior: 'deny', message: decision.fanoutBlock, interrupt: false } as PermissionResult;
+          }
+        } catch { /* the guardrail must never itself break a tool call */ }
+      }
+    }
+    return base(toolName, input, options);
   }) as CanUseTool;
 }
 
@@ -736,6 +774,13 @@ export interface ClaudeAgentSdkRunOptions {
   /** Interpret nativeMcpScopeInput as exact worker-packet resolvedTools instead
    *  of a free-form prompt. This disables fail-open for "none needed" workers. */
   nativeMcpScopeMode?: 'prompt' | 'resolved_tools';
+  /** Mount the deterministic read-fanout block on this run's canUseTool gate —
+   *  native external MCP tools dispatch INSIDE the SDK (outside wrapToolForHarness
+   *  and outside the harness AsyncLocalStorage), so canUseTool is the only harness
+   *  chokepoint that sees them. Set ONLY for the orchestrator brain lane, where
+   *  run_tool_program (the recovery the refusal steers to) exists; workers/steps
+   *  leave it off so a refusal never strands a run with no recovery. */
+  readFanoutGuard?: boolean;
   /**
    * JIT tool-RAG (Claude-brain port). When set, the in-process MCP server is
    * spawned advertising ONLY these tools, so the model receives only their schemas
@@ -1159,7 +1204,12 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     : buildAllowOnlyToolsPermission(allowed);
   // ALWAYS wrap (even with the ceiling off) so approval-wait time is metered into
   // pausedMs for the wall-clock; the ceiling COUNTING is what the flag gates.
-  const canUseTool = withToolCeiling(baseCanUseTool, allowed, ceilingState, { countCeiling: sdkToolCeilingEnabled() });
+  const ceilingGated = withToolCeiling(baseCanUseTool, allowed, ceilingState, { countCeiling: sdkToolCeilingEnabled() });
+  // Read-fanout block on the native-external-MCP lane (orchestrator only — the
+  // recovery tool run_tool_program must exist, so workers/steps opt out).
+  const canUseTool = options.readFanoutGuard
+    ? withReadFanoutGuard(ceilingGated, options.sessionId)
+    : ceilingGated;
   const wallClockMs = options.maxWallClockMs ?? sdkWallClockMs();
   const localMcpToolAllowlist = options.mcpToolAllowlist ?? (agentic ? undefined : allowed);
   const runScopeId = options.sessionId?.trim()
