@@ -293,6 +293,47 @@ test('fanoutBlock: ON → a serialized WRITE is NEVER blocked (sends belong in r
   }
 });
 
+// SAFETY ENVELOPE (2026-07-11): the block must fire ONLY on the serial-external-
+// read anti-pattern and be provably silent on every legitimate shape. This is the
+// false-fire gate for default-on. Each row = a sequence in a fresh session; we
+// assert whether the LAST call would be refused (fanoutBlock set).
+test('fanoutBlock safety envelope: fires only on serial external reads, silent on everything else', () => {
+  const prev = process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  const composio = (slug: string, i: number) => ['composio_execute_tool', { tool_slug: slug, arguments: JSON.stringify({ page: i }) }] as [string, unknown];
+  const lastFires = (sess: string, calls: Array<[string, unknown]>): boolean => {
+    _resetAllTrackersForTests();
+    let last: ReturnType<typeof evaluateToolCall> | undefined;
+    for (const [tool, args] of calls) last = applyMode(evaluateToolCall(sess, tool, args));
+    return Boolean(last?.fanoutBlock);
+  };
+  const seq = (n: number, f: (i: number) => [string, unknown]) => Array.from({ length: n }, (_, i) => f(i));
+  try {
+    // FIRES:
+    assert.equal(lastFires('e1', seq(8, i => composio('OUTLOOK_LIST_MESSAGES', i))), true, 'serial same composio READ');
+    assert.equal(lastFires('e2', seq(8, i => ['dataforseo__serp_organic', { q: i }] as [string, unknown])), true, 'serial external-MCP READ');
+    // SILENT (must never false-fire on legitimate work):
+    assert.equal(lastFires('e3', [composio('OUTLOOK_LIST_MESSAGES',0),composio('GMAIL_FETCH_EMAILS',0),composio('AIRTABLE_LIST_RECORDS',0),composio('SLACK_FETCH_HISTORY',0),composio('GOOGLEDRIVE_LIST_FILES',0),composio('GOOGLECALENDAR_LIST_EVENTS',0)]), false, '6 DIFFERENT reads — varied work');
+    assert.equal(lastFires('e4', seq(10, () => composio('OUTLOOK_LIST_MESSAGES', 0))), false, 're-poll same id (identical args)');
+    assert.equal(lastFires('e5', seq(5, i => composio('OUTLOOK_LIST_MESSAGES', i))), false, 'below threshold');
+    assert.equal(lastFires('e6', seq(8, i => composio('OUTLOOK_SEND_EMAIL', i))), false, 'serial WRITE — send (exempt)');
+    assert.equal(lastFires('e7', seq(8, i => composio('AIRTABLE_UPDATE_RECORD', i))), false, 'serial WRITE — update (exempt)');
+    assert.equal(lastFires('e8', seq(8, i => ['read_file', { path: '/f' + i }] as [string, unknown])), false, 'local read_file (no fanoutKey)');
+    assert.equal(lastFires('e9', seq(8, i => ['clementine__memory_search', { q: i }] as [string, unknown])), false, 'clementine-local MCP (excluded)');
+    // interleaved: the READS fire mid-flow, the trailing WRITE does not.
+    _resetAllTrackersForTests();
+    const read6 = applyMode(evaluateToolCall('e10', ...composio('OUTLOOK_LIST_MESSAGES', 0) as [string, unknown]));
+    for (let i = 1; i < 6; i++) applyMode(evaluateToolCall('e10', ...composio('OUTLOOK_LIST_MESSAGES', i) as [string, unknown]));
+    const at6 = applyMode(evaluateToolCall('e10', ...composio('OUTLOOK_LIST_MESSAGES', 6) as [string, unknown]));
+    const write = applyMode(evaluateToolCall('e10', ...composio('OUTLOOK_SEND_EMAIL', 0) as [string, unknown]));
+    void read6;
+    assert.ok(at6.fanoutBlock, 'interleaved: the 6th READ fires');
+    assert.equal(write.fanoutBlock, undefined, 'interleaved: the WRITE is never blocked');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; else process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = prev;
+  }
+});
+
 // REGRESSION GUARD (2026-07-11): the original recovery skeleton emitted
 // clem["<lowercased slug>"] for composio slugs — NOT a dispatchable code-mode
 // method (composio dispatches via clem.composio_execute_tool), so every forced
