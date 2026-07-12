@@ -293,6 +293,44 @@ test('fanoutBlock: ON → a serialized WRITE is NEVER blocked (sends belong in r
   }
 });
 
+// ENTITY GATE (2026-07-11, from the historical replay of 621 real sessions): the
+// block requires 6+ distinct ENTITIES, not just 6+ distinct arg-signatures, so
+// pagination / query-refinement / retry on a handful of entities never fires
+// (that was 5/31 false-fires in the replay, incl. one workflow retry-scrape).
+test('fanoutBlock entity gate: re-reading ONE entity 8 ways (refinement) NEVER fires', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    let last;
+    for (let i = 1; i <= 8; i += 1) {
+      // same table (one entity), different field projection each time → 8 distinct
+      // signatures but only 1 distinct entity: the model refining ONE read.
+      last = evaluateToolCall('sess-fb-refine', 'composio_execute_tool', {
+        tool_slug: 'AIRTABLE_LIST_RECORDS',
+        arguments: JSON.stringify({ tableIdOrName: 'tblSAME', fields: [`col${i}`], pageSize: i * 5 }),
+      });
+    }
+    assert.equal(last?.fanoutBlock, undefined, 'refinement on 1 entity (paginate/re-project) must never be forced into a program');
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
+test('fanoutBlock entity gate: 6 DISTINCT entities (real batch) still fires', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    const call = (n: number) => evaluateToolCall('sess-fb-batch', 'composio_execute_tool', {
+      tool_slug: 'AIRTABLE_LIST_RECORDS',
+      arguments: JSON.stringify({ tableIdOrName: `tbl${n}` }),
+    });
+    for (let i = 1; i <= 5; i += 1) assert.equal(call(i).fanoutBlock, undefined, `entity #${i} (< 6) not blocked`);
+    assert.ok(call(6).fanoutBlock, '6th DISTINCT entity → a genuine serial-read batch is still refused');
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
 // SAFETY ENVELOPE (2026-07-11): the block must fire ONLY on the serial-external-
 // read anti-pattern and be provably silent on every legitimate shape. This is the
 // false-fire gate for default-on. Each row = a sequence in a fresh session; we

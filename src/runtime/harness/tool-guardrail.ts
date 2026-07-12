@@ -75,6 +75,7 @@ function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
   const countBySignature = new Map<string, number>();
   const distinctArgsByMutTool = new Map<string, Set<string>>();
   const distinctArgsByFanoutKey = new Map<string, Set<string>>();
+  const distinctEntitiesByFanoutKey = new Map<string, Set<string>>();
   for (const call of recent) {
     countBySignature.set(call.signature, (countBySignature.get(call.signature) ?? 0) + 1);
     if (MUTATING_TOOLS.has(call.toolName)) {
@@ -92,9 +93,17 @@ function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
         distinctArgsByFanoutKey.set(call.fanoutKey, set);
       }
       set.add(call.signature);
+      if (call.fanoutEntity != null) {
+        let eset = distinctEntitiesByFanoutKey.get(call.fanoutKey);
+        if (!eset) {
+          eset = new Set();
+          distinctEntitiesByFanoutKey.set(call.fanoutKey, eset);
+        }
+        eset.add(call.fanoutEntity);
+      }
     }
   }
-  return { recent, countBySignature, distinctArgsByMutTool, distinctArgsByFanoutKey };
+  return { recent, countBySignature, distinctArgsByMutTool, distinctArgsByFanoutKey, distinctEntitiesByFanoutKey };
 }
 
 function persistTracker(sessionId: string, tracker: SessionTrackerState): void {
@@ -185,6 +194,36 @@ function composioSlugOf(args: unknown): string | undefined {
   if (!args || typeof args !== 'object') return undefined;
   const slug = (args as Record<string, unknown>).tool_slug;
   return typeof slug === 'string' && slug.length > 0 ? slug : undefined;
+}
+
+/** The ENTITY a fan-out read is fetching — the "what" behind the call, so we
+ *  can tell a real per-item batch (6+ DISTINCT entities → force a program) from
+ *  pagination / query-refinement / retry on a HANDFUL of entities (re-reading
+ *  the same table or URL N ways → NOT a batch; forcing a program is wrong and
+ *  would strand the turn). Priority list names the identity field; unknown
+ *  shapes fall back to the full args JSON, so a tool we can't identify keeps
+ *  firing exactly as today (entities == distinct signatures). Never throws.
+ *  Proven against the 2026-07-11 historical replay: entity-distinctness splits
+ *  the 26 genuine serial-read batches from the 5 refinement/retry false-fires. */
+const FANOUT_ENTITY_KEYS = ['id', 'message_id', 'thread_id', 'target', 'targets', 'url', 'keyword', 'q', 'query', 'tableIdOrName', 'domain'] as const;
+function fanoutEntityOf(toolName: string, args: unknown): string | undefined {
+  try {
+    let inner: unknown = toolName === 'composio_execute_tool'
+      ? (args as Record<string, unknown> | undefined)?.arguments
+      : args;
+    if (typeof inner === 'string') {
+      const s = inner;
+      try { inner = JSON.parse(s); } catch { return s; }
+    }
+    if (!inner || typeof inner !== 'object') return inner == null ? undefined : String(inner);
+    const o = inner as Record<string, unknown>;
+    for (const k of FANOUT_ENTITY_KEYS) {
+      if (o[k] != null) return `${k}:${JSON.stringify(o[k])}`;
+    }
+    return JSON.stringify(o);
+  } catch {
+    return undefined;
+  }
 }
 
 function composioSlugIsMutating(slug: string): boolean {
@@ -443,6 +482,10 @@ interface TrackedCall {
   /** Fan-out grouping key (composio_execute_tool keyed by inner slug).
    *  Optional — absent on rows persisted before this field existed. */
   fanoutKey?: string;
+  /** The ENTITY this fan-out read fetched (see fanoutEntityOf). Distinct-entity
+   *  count gates the block so pagination/refinement on few entities never fires.
+   *  Optional — absent on non-fanout rows and rows persisted before this field. */
+  fanoutEntity?: string;
   /** SDK call_id of this invocation — lets the within-task fetch-memory nudge
    *  (FIX 2) point at the PRIOR identical call's tool_outputs row. Optional:
    *  absent on the legacy/test path and on rows persisted before this field. */
@@ -459,6 +502,10 @@ interface SessionTrackerState {
   /** Fan-out key (e.g. composio::DATAFORSEO_…_TASK_POST) → distinct arg
    *  signatures seen recently. Drives the serial-batch fan-out nudge. */
   distinctArgsByFanoutKey: Map<string, Set<string>>;
+  /** Fan-out key → distinct ENTITIES seen recently (fanoutEntityOf). Gates the
+   *  hard block: refuse only when 6+ DISTINCT entities are being serialized, not
+   *  when the same handful is paginated/refined/retried. */
+  distinctEntitiesByFanoutKey: Map<string, Set<string>>;
 }
 
 const trackers = new Map<string, SessionTrackerState>();
@@ -471,7 +518,7 @@ function getOrCreateTracker(sessionId: string): SessionTrackerState {
     // get their loop-detection state back. New sessions just see null
     // and start fresh.
     t = rehydrateFromSqlite(sessionId)
-      ?? { recent: [], countBySignature: new Map(), distinctArgsByMutTool: new Map(), distinctArgsByFanoutKey: new Map() };
+      ?? { recent: [], countBySignature: new Map(), distinctArgsByMutTool: new Map(), distinctArgsByFanoutKey: new Map(), distinctEntitiesByFanoutKey: new Map() };
     trackers.set(sessionId, t);
   }
   return t;
@@ -542,9 +589,10 @@ export function evaluateToolCall(
   const slug = toolName === 'composio_execute_tool' ? composioSlugOf(args) : undefined;
   const mcpFanoutTool = !slug && toolName.includes('__') && !/clementine/i.test(toolName);
   const fanoutKey = slug ? `composio::${slug}` : mcpFanoutTool ? `mcp::${toolName}` : undefined;
+  const fanoutEntity = fanoutKey ? fanoutEntityOf(toolName, args) : undefined;
 
   // Push + bound the window
-  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}), ...(callId ? { callId } : {}) });
+  tracker.recent.push({ signature, toolName, firstSeenMs: Date.now(), ...(fanoutKey ? { fanoutKey } : {}), ...(fanoutEntity != null ? { fanoutEntity } : {}), ...(callId ? { callId } : {}) });
   if (tracker.recent.length > thresholds.recentWindowSize) {
     const dropped = tracker.recent.shift();
     if (dropped) {
@@ -585,6 +633,15 @@ export function evaluateToolCall(
     }
     set.add(signature);
     const distinct = set.size;
+    // Distinct-ENTITY count on the same key — how many different things are
+    // being fetched, not just how many different arg blobs. Gates the block.
+    let entitySet = tracker.distinctEntitiesByFanoutKey.get(fanoutKey);
+    if (!entitySet) {
+      entitySet = new Set();
+      tracker.distinctEntitiesByFanoutKey.set(fanoutKey, entitySet);
+    }
+    if (fanoutEntity != null) entitySet.add(fanoutEntity);
+    const distinctEntities = entitySet.size;
     const at = thresholds.fanoutNudgeAt;
     const callLabel = slug ?? toolName;
     if (distinct >= at && (distinct - at) % 5 === 0) {
@@ -607,7 +664,21 @@ export function evaluateToolCall(
     // want to catch). A serialized WRITE is the run_batch case and must never be
     // forced into a program. Consumer (brackets) skips this for calls originating
     // INSIDE a program/worker/batch.
-    if (fanoutBlockEnabled() && !isMutatingExternalWrite(toolName, args) && distinct >= thresholds.fanoutBlockAt) {
+    //
+    // ENTITY GATE (2026-07-11, from historical replay): also require 6+ DISTINCT
+    // ENTITIES, not just 6+ distinct arg-signatures. The replay of 621 real
+    // sessions showed the block firing on 5 refinement/pagination/retry runs
+    // (re-reading 1–4 tables/URLs N ways) — genuine false-fires where forcing a
+    // program is wrong and could strand the turn. All 26 true serial-read batches
+    // had 6+ distinct entities; all 5 false-fires had ≤4. Gating on entities
+    // keeps every real batch and drops every false-fire. Unknown tool shapes fall
+    // back to full-args entities (== signatures), so they fire exactly as before.
+    if (
+      fanoutBlockEnabled()
+      && !isMutatingExternalWrite(toolName, args)
+      && distinct >= thresholds.fanoutBlockAt
+      && distinctEntities >= thresholds.fanoutBlockAt
+    ) {
       fanoutBlock = buildFanoutRecoveryMessage({ toolName, slug, args, distinct, fanoutBlockAt: thresholds.fanoutBlockAt });
     }
   }
