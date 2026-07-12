@@ -252,6 +252,59 @@ test('fanoutNudge: re-polling the SAME id never nudges (identical args = one dis
   }
 });
 
+// DETERMINISTIC read-fanout block (Move: adoption enforcement, default OFF).
+test('fanoutBlock: OFF by default → never set (guardrail byte-identical)', () => {
+  _resetAllTrackersForTests();
+  delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  let last;
+  for (let i = 0; i < 8; i += 1) {
+    last = evaluateToolCall('sess-fb-off', 'composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: JSON.stringify({ page: i }) });
+  }
+  assert.equal(last?.fanoutBlock, undefined, 'switch off → no block signal ever');
+});
+
+test('fanoutBlock: ON → a serialized READ is blocked past the threshold (nudge precedes it)', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    const call = (i: number) => evaluateToolCall('sess-fb-on', 'composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: JSON.stringify({ page: i }) });
+    for (let i = 1; i <= 5; i += 1) assert.equal(call(i).fanoutBlock, undefined, `read #${i} (< block threshold 6) not blocked`);
+    const d6 = call(6);
+    assert.ok(d6.fanoutBlock, '6th distinct read → blocked');
+    assert.match(d6.fanoutBlock!, /run_tool_program/, 'the refusal steers to a program');
+    assert.match(d6.fanoutBlock!, /REFUSED/);
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
+test('fanoutBlock: ON → a serialized WRITE is NEVER blocked (sends belong in run_batch)', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    let last;
+    for (let i = 0; i < 8; i += 1) {
+      last = evaluateToolCall('sess-fb-write', 'composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to: `x${i}@y.com` }) });
+    }
+    assert.equal(last?.fanoutBlock, undefined, 'writes route to run_batch — the read-fanout block must never touch them');
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
+test('fanoutBlock: ON → re-polling the SAME id is never blocked (identical args = one distinct)', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    const args = { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{"folder":"inbox"}' };
+    for (let i = 0; i < 10; i += 1) {
+      assert.equal(evaluateToolCall('sess-fb-poll', 'composio_execute_tool', args).fanoutBlock, undefined, 'legitimate polling must never be blocked');
+    }
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
+});
+
 test('fanoutNudge: native MCP data tools (<server>__<tool>) are keyed too — 3rd DISTINCT call nudges', () => {
   // 2026-07-07 live gap: only composio_execute_tool was keyed, so the 18-firm
   // run's 29 dataforseo__serp_organic_live_advanced calls (native MCP server)

@@ -735,6 +735,11 @@ export interface HarnessRunContext {
    *  judges (goal-fidelity, output-grounding) are redundant latency, not safety,
    *  and are skipped. Every DETERMINISTIC gate still runs (see the write boundary). */
   certifiedBatch?: { batchId: string; payloadHash: string };
+  /** This tool call originates INSIDE a code-mode program (clem.<tool> dispatch).
+   *  The deterministic read-fanout block must never fire here — a program's
+   *  batched reads ARE the sanctioned execution the block steers the model toward;
+   *  refusing them would break the very recovery the block demands. */
+  codeMode?: boolean;
 }
 
 /** CLEMMY_WORKER_THRASH_GUARD: per-worker loop-guard isolation + bounded
@@ -1260,6 +1265,27 @@ export function wrapToolForHarness<T extends WrappableTool>(
             },
           });
         } catch { /* telemetry write must never block */ }
+      }
+      // DETERMINISTIC read-fanout BLOCK (kill-switch CLEMMY_GUARDRAIL_FANOUT_BLOCK,
+      // default off). The advisory nudge above is provably ignored; when enabled,
+      // a model that keeps serializing the SAME read past the block threshold is
+      // REFUSED so it must batch the remainder in one run_tool_program. Enforced
+      // ONLY for the model's DIRECT calls — a call from a code-mode program
+      // (ctx.codeMode), a worker (guardrailScopeId), or a certified batch is the
+      // batched execution we're steering toward and must NEVER be blocked (that
+      // would refuse the very program the block demands). Reads are idempotent, so
+      // refusing one loses nothing.
+      if (decision.fanoutBlock && !ctx.codeMode && !ctx.guardrailScopeId && !ctx.certifiedBatch) {
+        try {
+          appendEvent({
+            sessionId: ctx.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'guardrail_tripped',
+            data: { kind: 'fanout_block', toolName: decision.toolName, count: decision.count, reason: decision.fanoutBlock },
+          });
+        } catch { /* telemetry write must never block */ }
+        throw new ToolGuardrailBlocked({ ...decision, action: 'block', reason: decision.fanoutBlock });
       }
       // Within-task fetch-memory nudge (FIX 2). Only in the ORCHESTRATOR scope
       // (guardrailScopeId unset) — there the guardrail tracker and tool_outputs

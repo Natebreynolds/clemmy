@@ -537,7 +537,9 @@ async function dispatchCodeModeLocalTool(method: string, args: unknown, sessionI
   // call_tool/code-mode refused with "no session context here" (live
   // 2026-07-09: background handoff looked broken on every chat surface).
   return withToolOutputContext({ sessionId, callId, toolName: method }, () =>
-    withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000), ...(certifiedBatch ? { certifiedBatch } : {}) }, () =>
+    // codeMode:true exempts these reads from the deterministic read-fanout block —
+    // a program's batched reads ARE the sanctioned execution the block steers to.
+    withHarnessRunContext({ sessionId, counter: counter ?? new ToolCallsCounter(1000), codeMode: true, ...(certifiedBatch ? { certifiedBatch } : {}) }, () =>
       wrapped.invoke!(runContext, JSON.stringify(args ?? {}), details),
     ),
   );

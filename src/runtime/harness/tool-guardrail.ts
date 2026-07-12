@@ -34,7 +34,7 @@ import {
   deriveGuardrailCacheSafeReads,
   deriveGuardrailReadMutators,
 } from '../../tools/tool-registry.js';
-import { MUTATING_VERBS } from './execution-gate.js';
+import { MUTATING_VERBS, isMutatingExternalWrite } from './execution-gate.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
 
@@ -261,6 +261,10 @@ interface Thresholds {
   /** Same external tool/slug with this many DISTINCT arg sets in the
    *  window → attach a fan-out nudge to the decision (advisory). */
   fanoutNudgeAt: number;
+  /** Same external READ tool/slug with this many DISTINCT arg sets → attach a
+   *  fan-out BLOCK signal (enforced for the model's direct calls only, when the
+   *  kill-switch is on). Above fanoutNudgeAt so nudges precede the block. */
+  fanoutBlockAt: number;
 }
 
 function readThresholds(): Thresholds {
@@ -285,6 +289,11 @@ function readThresholds(): Thresholds {
     sameMutToolHaltAt: num('CLEMMY_GUARDRAIL_MUT_HALT', 8),
     recentWindowSize: num('CLEMMY_GUARDRAIL_WINDOW', 100),
     fanoutNudgeAt: num('CLEMMY_GUARDRAIL_FANOUT_NUDGE', 3),
+    // Deterministic read-fanout ENFORCE threshold — well above the nudge, so the
+    // model gets several advisory nudges first. Only consulted when the
+    // fanout-block kill-switch is ON; otherwise the block signal is never set and
+    // the guardrail is byte-identical.
+    fanoutBlockAt: num('CLEMMY_GUARDRAIL_FANOUT_BLOCK_AT', num('CLEMMY_GUARDRAIL_FANOUT_NUDGE', 3) + 3),
   };
 }
 
@@ -331,6 +340,14 @@ export interface GuardrailDecision {
    *  to the tool's RESULT so the model actually reads it mid-stride and can
    *  switch to run_worker / the service's batch API. Never blocks. */
   fanoutNudge?: string;
+  /** DETERMINISTIC read-fanout block reason. Set ONLY when the fanout-block
+   *  kill-switch is on AND a READ has been serialized past fanoutBlockAt. The
+   *  consumer (brackets) throws ToolGuardrailBlocked with this reason — but ONLY
+   *  for the model's direct calls; a call from a code-mode program / worker /
+   *  certified batch is exempt (that IS the batched execution we're steering to).
+   *  Separate from `action` so the existing block/halt demotion logic is
+   *  untouched. */
+  fanoutBlock?: string;
   /** Within-task fetch memory (FIX 2). Set when THIS call is a byte-identical
    *  repeat of a CACHE_SAFE read whose source hasn't mutated in-session — the
    *  call_id of the PRIOR identical call, which the harness turns into a
@@ -355,6 +372,17 @@ function readMode(): GuardrailMode {
  *  model at recall_tool_result instead of re-fetching. */
 function readNudgeEnabled(): boolean {
   return (process.env.CLEMMY_WITHIN_TASK_RECALL_NUDGE ?? 'off').toLowerCase() === 'on';
+}
+
+/** DETERMINISTIC read-fanout enforcement (default OFF). The advisory fan-out
+ *  nudge is provably ignored (live 2026-07-11: nudge fired mid-stride, model made
+ *  another discrete call). When ON, a model that keeps serializing the SAME read
+ *  past fanoutBlockAt is REFUSED and told to batch the remaining reads in ONE
+ *  run_tool_program. OFF → the fanoutBlock signal is never set, so the guardrail
+ *  is byte-identical (no regression). Reads only (idempotent, re-doable via the
+ *  program); the block is skipped for calls FROM a program/worker/batch. */
+function fanoutBlockEnabled(): boolean {
+  return (process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK ?? 'off').toLowerCase() === 'on';
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -503,6 +531,7 @@ export function evaluateToolCall(
   // RESULT in brackets.ts (warn events are telemetry the model never sees;
   // that gap is exactly how the live 2026-06-11 serial run slipped through).
   let fanoutNudge: string | undefined;
+  let fanoutBlock: string | undefined;
   if (fanoutKey) {
     let set = tracker.distinctArgsByFanoutKey.get(fanoutKey);
     if (!set) {
@@ -512,17 +541,32 @@ export function evaluateToolCall(
     set.add(signature);
     const distinct = set.size;
     const at = thresholds.fanoutNudgeAt;
+    const callLabel = slug ?? toolName;
     if (distinct >= at && (distinct - at) % 5 === 0) {
       const batchHint = slug ? batchApiHintFor(slug) : undefined;
-      const callLabel = slug ?? toolName;
       fanoutNudge =
         `[harness fan-out check] You have now made ${distinct} DISTINCT ${callLabel} calls in this conversation's recent window — `
         + `you are serializing per-item batch work through your own context. STOP looping serially: `
-        + `fan the REMAINING items out with run_worker (one item per worker, waves of up to 8), `
+        + `fan the REMAINING items out with one run_worker call carrying the complete stable-id items array, `
         + `or use the service's real batch API if it accepts an array of items in one call. `
         + `For very large batches (>50), author a workflow with forEach instead. `
         + `Serial looping piles every item's payload into your context and is dramatically slower.`
         + (batchHint ? ` ${batchHint}` : '');
+    }
+    // DETERMINISTIC read-fanout block (kill-switch off by default). The nudge is
+    // ignored; past fanoutBlockAt, REFUSE a further serialized READ so the model
+    // must batch the remainder in ONE run_tool_program. READ-only, via the
+    // AUTHORITATIVE isMutatingExternalWrite (NOT the guardrail's own
+    // composioSlugIsMutating, which over-flags reads like OUTLOOK_LIST_MESSAGES /
+    // DataForSEO as mutating — see line ~800 — and would skip the exact reads we
+    // want to catch). A serialized WRITE is the run_batch case and must never be
+    // forced into a program. Consumer (brackets) skips this for calls originating
+    // INSIDE a program/worker/batch.
+    if (fanoutBlockEnabled() && !isMutatingExternalWrite(toolName, args) && distinct >= thresholds.fanoutBlockAt) {
+      fanoutBlock =
+        `[harness fan-out check — REFUSED] You have made ${distinct} DISTINCT ${callLabel} reads one-at-a-time; further serialized ${callLabel} reads are refused this turn. `
+        + `Do the REMAINING reads in ONE run_tool_program: \`const results = await Promise.all(items.map(it => clem.${slug ? `["${slug.toLowerCase()}"]` : callLabel}(argsFor(it)))); return distill(results);\` — Promise.all the reads inside the program, distill, and return ONLY the small result. `
+        + `Batch reads belong in one program (dramatically fewer tokens); acting on them one-by-one is the exact anti-pattern this guard stops.`;
     }
   }
 
@@ -605,6 +649,7 @@ export function evaluateToolCall(
       count: exactCount,
       mutating: isMut,
       ...(fanoutNudge ? { fanoutNudge } : {}),
+      ...(fanoutBlock ? { fanoutBlock } : {}),
       ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
     };
   }
@@ -633,6 +678,7 @@ export function evaluateToolCall(
         count: distinctArgsCount,
         mutating: isMut,
         ...(fanoutNudge ? { fanoutNudge } : {}),
+      ...(fanoutBlock ? { fanoutBlock } : {}),
       };
     }
   }
@@ -651,6 +697,7 @@ export function evaluateToolCall(
     count: exactCount,
     mutating: isMut,
     ...(fanoutNudge ? { fanoutNudge } : {}),
+    ...(fanoutBlock ? { fanoutBlock } : {}),
     ...(cachedCallId ? { cachedCallId, cachedAgeMs } : {}),
   };
 }
@@ -698,7 +745,7 @@ function mutatedSince(tracker: SessionTrackerState, readTool: string, signature:
 /** Strict-mode promotion: in warn mode, block→warn and halt→warn.
  *  In strict mode, decisions enforce as-is. Off mode always allows. */
 export function applyMode(decision: GuardrailDecision, mode: GuardrailMode = readMode()): GuardrailDecision {
-  if (mode === 'off') return { ...decision, action: 'allow', fanoutNudge: undefined, cachedCallId: undefined, cachedAgeMs: undefined };
+  if (mode === 'off') return { ...decision, action: 'allow', fanoutNudge: undefined, fanoutBlock: undefined, cachedCallId: undefined, cachedAgeMs: undefined };
   // 'escalate' is a terminal-stuck signal — it is NEVER downgraded (even in
   // warn mode) because the model cannot recover by retrying. The ONLY way to
   // suppress it is mode 'off' (handled above). This is what actually stops the
