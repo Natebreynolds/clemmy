@@ -229,6 +229,51 @@ function batchApiHintFor(slug: string): string | undefined {
   return BATCH_API_HINTS.find((h) => h.test(slug))?.hint;
 }
 
+/** The model-facing refusal for a read serialized past the block threshold. A
+ *  STANDING TURN RULE (not "this call failed" — the framing that made the model
+ *  keep trying the next item and thrash), with a dispatch-CORRECT, paste-ready
+ *  run_tool_program skeleton carrying the arg shape it was varying, plus a hard
+ *  distill directive. Composio slugs dispatch via
+ *  clem.composio_execute_tool({tool_slug, arguments}) — NOT clem["slug"], which
+ *  is not a code-mode method (the 2026-07-11 bug that made every recovery
+ *  UNRUNNABLE → "tool not available" → fallback to raw serial reads). Pure +
+ *  exported for the regression test that pins the dispatch shapes. */
+export function buildFanoutRecoveryMessage(opts: {
+  toolName: string;
+  slug?: string;
+  args: unknown;
+  distinct: number;
+  fanoutBlockAt: number;
+}): string {
+  const { toolName, slug, args, distinct, fanoutBlockAt } = opts;
+  const label = slug ?? toolName;
+  const innerArgs = slug ? (args as { arguments?: unknown })?.arguments : args;
+  let exampleArgs: string;
+  try { exampleArgs = JSON.stringify(innerArgs ?? {}).slice(0, 160); } catch { exampleArgs = '{...}'; }
+  // Dispatch-correct fetch line: composio via composio_execute_tool (the fix),
+  // native MCP by its namespaced name.
+  const fetchLine = slug
+    ? `clem.composio_execute_tool({ tool_slug: "${slug}", arguments: a })`
+    : `clem[${JSON.stringify(toolName)}](a)`;
+  const skeleton =
+    `  const items = [/* the ${label} args, one per remaining item you were about to read */];\n`
+    + `  const results = await Promise.all(items.map(a => ${fetchLine}));\n`
+    + `  return Object.fromEntries(results.map(r => [/* key, e.g. r.data?.displayName */, /* value, e.g. r.data?.totalItemCount */]));`;
+  // Refusal-count escalation (derived from the tracked set — zero new state):
+  // after 2+ ignored refusals, a harder stop for families that ride through one.
+  const refusals = distinct - fanoutBlockAt;
+  const escalate = refusals >= 2
+    ? `You have ALREADY been refused ${refusals}× for this — discrete ${label} reads will NOT resume this turn. Write the run_tool_program NOW or tell the user you are blocked. `
+    : '';
+  return (
+    `[harness fan-out check — REFUSED] ${escalate}`
+    + `You have read ${label} one-at-a-time ${distinct} times. STOP — every further one-at-a-time ${label} call is refused for the rest of this turn; this is NOT this item failing, the next one is refused identically. `
+    + `Do ALL remaining reads in ONE run_tool_program, building the array from the items you already have (same arg shape as the call just refused: ${exampleArgs}):\n`
+    + `${skeleton}\n`
+    + `Return ONLY that small distilled value (the answering field per item) — returning the raw payloads wastes the exact tokens this redirect exists to save.`
+  );
+}
+
 /** Slug-aware: a composio read slug is idempotent (looping is legitimate). */
 function isIdempotentCall(toolName: string, args: unknown): boolean {
   if (toolName === 'composio_execute_tool') {
@@ -563,10 +608,7 @@ export function evaluateToolCall(
     // forced into a program. Consumer (brackets) skips this for calls originating
     // INSIDE a program/worker/batch.
     if (fanoutBlockEnabled() && !isMutatingExternalWrite(toolName, args) && distinct >= thresholds.fanoutBlockAt) {
-      fanoutBlock =
-        `[harness fan-out check — REFUSED] You have made ${distinct} DISTINCT ${callLabel} reads one-at-a-time; further serialized ${callLabel} reads are refused this turn. `
-        + `Do the REMAINING reads in ONE run_tool_program: \`const results = await Promise.all(items.map(it => clem.${slug ? `["${slug.toLowerCase()}"]` : callLabel}(argsFor(it)))); return distill(results);\` — Promise.all the reads inside the program, distill, and return ONLY the small result. `
-        + `Batch reads belong in one program (dramatically fewer tokens); acting on them one-by-one is the exact anti-pattern this guard stops.`;
+      fanoutBlock = buildFanoutRecoveryMessage({ toolName, slug, args, distinct, fanoutBlockAt: thresholds.fanoutBlockAt });
     }
   }
 

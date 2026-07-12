@@ -18,6 +18,7 @@ import {
   hashToolCall,
   evaluateToolCall,
   applyMode,
+  buildFanoutRecoveryMessage,
   _peekTracker,
   _resetAllTrackersForTests,
   resetTracker,
@@ -290,6 +291,34 @@ test('fanoutBlock: ON → a serialized WRITE is NEVER blocked (sends belong in r
   } finally {
     delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
   }
+});
+
+// REGRESSION GUARD (2026-07-11): the original recovery skeleton emitted
+// clem["<lowercased slug>"] for composio slugs — NOT a dispatchable code-mode
+// method (composio dispatches via clem.composio_execute_tool), so every forced
+// recovery was UNRUNNABLE and the model fell back to raw serial reads. Pin the
+// dispatch shapes so that bug can never silently return.
+test('buildFanoutRecoveryMessage: composio dispatches via composio_execute_tool, MCP by name', () => {
+  const composio = buildFanoutRecoveryMessage({
+    toolName: 'composio_execute_tool', slug: 'OUTLOOK_GET_MAIL_FOLDER',
+    args: { tool_slug: 'OUTLOOK_GET_MAIL_FOLDER', arguments: JSON.stringify({ folder_id: 'inbox' }) },
+    distinct: 6, fanoutBlockAt: 6,
+  });
+  assert.match(composio, /clem\.composio_execute_tool\(\{ tool_slug: "OUTLOOK_GET_MAIL_FOLDER"/, 'composio → composio_execute_tool');
+  assert.doesNotMatch(composio, /clem\["outlook_get_mail_folder"\]/, 'the broken lowercased-slug dispatch must never return');
+  assert.match(composio, /distilled value/i, 'carries the distill directive (fixes savedBytes=0)');
+  assert.match(composio, /folder_id/, 'carries the literal arg shape the model was varying');
+  assert.match(composio, /run_tool_program/);
+
+  const mcp = buildFanoutRecoveryMessage({ toolName: 'dataforseo__serp', args: { keyword: 'x' }, distinct: 6, fanoutBlockAt: 6 });
+  assert.match(mcp, /clem\["dataforseo__serp"\]\(a\)/, 'native MCP dispatched by its namespaced name');
+});
+
+test('buildFanoutRecoveryMessage: escalation prefix appears only at refusals >= 2', () => {
+  const first = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 6, fanoutBlockAt: 6 });
+  assert.doesNotMatch(first, /ALREADY been refused/, 'first refusal (distinct == blockAt) has no escalation prefix');
+  const third = buildFanoutRecoveryMessage({ toolName: 'composio_execute_tool', slug: 'X_LIST', args: {}, distinct: 8, fanoutBlockAt: 6 });
+  assert.match(third, /ALREADY been refused 2×/, 'refusals >= 2 → hardened stop prefix');
 });
 
 test('fanoutBlock: ON → re-polling the SAME id is never blocked (identical args = one distinct)', () => {
