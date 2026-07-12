@@ -4,7 +4,7 @@ import { decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent } from '../agents/tool-observability.js';
 import { BoundaryError } from './boundary-error.js';
 import { rateLimitedAlert } from './rate-limited-alert.js';
-import { withTimeout, harnessRunContextStorage } from './harness/brackets.js';
+import { withTimeout, harnessRunContextStorage, guardrailScopeKey } from './harness/brackets.js';
 import { appendFanoutAdvisory } from './harness/fanout-advisory.js';
 import {
   isGroundingGateEnabled,
@@ -1270,7 +1270,10 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
       // the serial-read count.
       {
         const guardCtx = harnessRunContextStorage.getStore();
-        const guardScopeId = guardCtx?.guardrailScopeId ?? guardCtx?.behaviorScopeId ?? guardCtx?.sessionId;
+        // Same scope helper as brackets: EXEMPT lanes register under their OWN
+        // window so a program/batch never poisons the orchestrator's direct-read
+        // fanout counts (2026-07-12 strand-hunt finding).
+        const guardScopeId = guardCtx ? guardrailScopeKey(guardCtx) : undefined;
         if (guardScopeId) {
           const guardDecision = applyMode(evaluateToolCall(guardScopeId, toolName, args ?? {}));
           const guardExempt = Boolean(guardCtx?.codeMode || guardCtx?.guardrailScopeId || guardCtx?.certifiedBatch);

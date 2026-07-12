@@ -331,6 +331,71 @@ test('fanoutBlock entity gate: 6 DISTINCT entities (real batch) still fires', ()
   }
 });
 
+// ─── STRAND HUNT regression guards (2026-07-12) ─────────────────────────────
+// A 5-lens adversarial hunt (2 refuters each) found 6 ways the block could
+// strand/turn-kill/evaporate before default-on. Each of these locks a fix.
+
+test('strand-hunt C: a fanout-refused READ slug re-hammered past hardStop NEVER escalates (no turn-kill)', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    // DATAFORSEO_*_TASK_POST reads as a WRITE to the coarse composioSlugIsMutating
+    // (POST token) but is a READ per the authoritative classifier — it must never
+    // be hard-killable. 6 distinct reads → the 6th is fanout-refused.
+    for (let i = 1; i <= 6; i += 1)
+      evaluateToolCall('sess-sh-C', 'composio_execute_tool', { tool_slug: 'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASK_POST', arguments: JSON.stringify({ keyword: `kw-${i}` }) });
+    let last;
+    for (let i = 0; i < 15; i += 1) // re-hammer the SAME call far past hardStopAt(12)
+      last = applyMode(evaluateToolCall('sess-sh-C', 'composio_execute_tool', { tool_slug: 'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASK_POST', arguments: JSON.stringify({ keyword: 'kw-6' }) }));
+    assert.notEqual(last?.action, 'escalate', 'a READ must NEVER escalate to a hard turn-kill');
+    assert.equal(last?.mutating, false, 'the read/write classifiers now agree it is a read');
+    assert.ok(last?.fanoutBlock, 'it stays a soft, recoverable fanout refusal');
+  } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; }
+});
+
+test('strand-hunt B: re-hammering a fanout-refused read keeps the program recovery on the exact-repeat block branch', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    for (let i = 1; i <= 6; i += 1) // 6 distinct native-MCP reads → fanout-refused
+      evaluateToolCall('sess-sh-B', 'dataforseo__serp_organic_live_advanced', { keyword: `k${i}` });
+    let last;
+    for (let i = 0; i < 5; i += 1) // re-hammer identical → exactCount hits block branch
+      last = applyMode(evaluateToolCall('sess-sh-B', 'dataforseo__serp_organic_live_advanced', { keyword: 'k6' }));
+    assert.equal(last?.rule, 'exact_args_repeat', 'the exact-repeat branch is what returns at this count');
+    assert.ok(last?.fanoutBlock, 'but it STILL carries the fanout recovery (does not degrade to generic loop advice)');
+    assert.match(last!.fanoutBlock!, /run_tool_program/);
+  } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; }
+});
+
+test('strand-hunt D: with code mode OFF the block falls back to advisory — never refuses toward a tool that is not registered', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  process.env.CLEMMY_CODE_MODE = 'off';
+  try {
+    let last;
+    for (let i = 1; i <= 8; i += 1)
+      last = applyMode(evaluateToolCall('sess-sh-D', 'dataforseo__serp_organic_live_advanced', { keyword: `k${i}` }));
+    assert.equal(last?.fanoutBlock, undefined, 'no hard refusal when run_tool_program is unavailable (would strand)');
+  } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; delete process.env.CLEMMY_CODE_MODE; }
+});
+
+test('strand-hunt E: the block DECAYS with the window — a tripped slug frees up after the window rotates past it', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  process.env.CLEMMY_GUARDRAIL_WINDOW = '12'; // small window so decay is observable fast
+  try {
+    for (let i = 1; i <= 6; i += 1) // trip it
+      evaluateToolCall('sess-sh-E', 'dataforseo__serp_organic_live_advanced', { keyword: `k${i}` });
+    // push > window unrelated reads to rotate the 6 fanout entries out
+    for (let i = 0; i < 20; i += 1)
+      evaluateToolCall('sess-sh-E', 'read_file', { path: `/f-${i}` });
+    // a fresh read of the same slug now sees a nearly-empty fanout window → allowed
+    const after = applyMode(evaluateToolCall('sess-sh-E', 'dataforseo__serp_organic_live_advanced', { keyword: 'k-new' }));
+    assert.equal(after.fanoutBlock, undefined, 'the block is NOT session-permanent — it ages out with the window');
+  } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; delete process.env.CLEMMY_GUARDRAIL_WINDOW; }
+});
+
 // SAFETY ENVELOPE (2026-07-11): the block must fire ONLY on the serial-external-
 // read anti-pattern and be provably silent on every legitimate shape. This is the
 // false-fire gate for default-on. Each row = a sequence in a fresh session; we

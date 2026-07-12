@@ -742,6 +742,25 @@ export interface HarnessRunContext {
   codeMode?: boolean;
 }
 
+/** The tracker scope a call registers under. EXEMPT lanes (code-mode programs,
+ *  certified-batch items, workers) get their OWN window so their reads never
+ *  inflate the ORCHESTRATOR's direct-read fanout counts — otherwise a batch/
+ *  program of 6+ reads poisoned the shared session tracker and the orchestrator's
+ *  very NEXT direct read of that tool was refused with a nonsensical "batch this
+ *  single read" message (2026-07-12 strand-hunt finding). Workers already isolate
+ *  via guardrailScopeId; this extends the same isolation to code-mode/batch.
+ *  Direct orchestrator calls fall through to behaviorScopeId ?? sessionId — the
+ *  ENFORCED scope — exactly as before (byte-identical for the non-exempt path). */
+export function guardrailScopeKey(
+  ctx: Pick<HarnessRunContext, 'sessionId' | 'guardrailScopeId' | 'behaviorScopeId' | 'codeMode' | 'certifiedBatch'>,
+): string {
+  if (ctx.guardrailScopeId) return ctx.guardrailScopeId; // worker: already isolated
+  const base = ctx.behaviorScopeId ?? ctx.sessionId;
+  if (ctx.certifiedBatch) return `${base}::batch:${ctx.certifiedBatch.batchId}`;
+  if (ctx.codeMode) return `${base}::codeMode`;
+  return base;
+}
+
 /** CLEMMY_WORKER_THRASH_GUARD: per-worker loop-guard isolation + bounded
  *  worker turns + structured per-item give-up. Default ON (validated live
  *  2026-06-02: 8-worker fan-out, 0 cap-hits at maxTurns=8, 0 thrash, honest
@@ -1237,7 +1256,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     let cacheNudge: string | undefined;
     try {
       const rawDecision = evaluateToolCall(
-        ctx.guardrailScopeId ?? ctx.behaviorScopeId ?? ctx.sessionId,
+        guardrailScopeKey(ctx),
         tool.name,
         parsedInput,
         callId,

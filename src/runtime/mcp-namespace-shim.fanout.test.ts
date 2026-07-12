@@ -207,6 +207,32 @@ test('shim block exemptions: code-mode program reads and certified-batch items a
   }
 });
 
+test('shim block A: exempt program reads do NOT poison the orchestrator scope — the next DIRECT read is not refused', async () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'on';
+  try {
+    const { server, calls } = makeCountingServer('dataforseo', 'serp_organic_live_advanced');
+    const shim = createMcpNamespaceShim({ servers: [server] });
+    const namespaced = namespaceToolName(slugifyServerName('dataforseo'), 'serp_organic_live_advanced');
+    // Phase 1: a code-mode PROGRAM reads 6 distinct entities (exempt — the sanctioned
+    // batched execution). Under the fix these register in the program's OWN window.
+    await withHarnessRunContext({ ...ctx('sess-poison'), codeMode: true }, async () => {
+      await shim.listTools();
+      for (let i = 1; i <= 6; i += 1)
+        await shim.callTool(namespaced, { target: `firm-${i}-aaaa.com` });
+    });
+    assert.equal(calls(), 6, 'all 6 exempt program reads dispatched');
+    // Phase 2: the ORCHESTRATOR makes ONE direct read of the SAME tool. Before the
+    // fix this was refused (the 6 exempt reads inflated the shared session ceiling).
+    let directResult = '';
+    await withHarnessRunContext(ctx('sess-poison'), async () => {
+      directResult = JSON.stringify(await shim.callTool(namespaced, { target: 'single-followup.com' }));
+    });
+    assert.ok(!/REFUSED/.test(directResult), 'the first DIRECT read must NOT be refused — exempt reads live in their own window');
+    assert.equal(calls(), 7, 'the direct read dispatched normally');
+  } finally { delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; }
+});
+
 test('shim block kill-switch: OFF → 10 distinct-entity serial reads all dispatch (byte-identical)', async () => {
   _resetAllTrackersForTests();
   process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'off';

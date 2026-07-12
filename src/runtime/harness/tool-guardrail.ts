@@ -35,6 +35,7 @@ import {
   deriveGuardrailReadMutators,
 } from '../../tools/tool-registry.js';
 import { MUTATING_VERBS, isMutatingExternalWrite } from './execution-gate.js';
+import { getRuntimeEnv } from '../../config.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
 
@@ -93,17 +94,39 @@ function rehydrateFromSqlite(sessionId: string): SessionTrackerState | null {
         distinctArgsByFanoutKey.set(call.fanoutKey, set);
       }
       set.add(call.signature);
-      if (call.fanoutEntity != null) {
-        let eset = distinctEntitiesByFanoutKey.get(call.fanoutKey);
-        if (!eset) {
-          eset = new Set();
-          distinctEntitiesByFanoutKey.set(call.fanoutKey, eset);
-        }
-        eset.add(call.fanoutEntity);
+      // Entity fallback (2026-07-12): rows persisted BEFORE fanoutEntity existed
+      // (or any row missing it) fall back to the signature — mirroring the live
+      // path where unknown shapes use full-args entities (== signatures). Without
+      // this, a mid-batch daemon UPGRADE+restart rehydrated signatures full but
+      // entities EMPTY, disarming the entity gate (distinctEntities < threshold
+      // while distinct stays high) and silently killing the block after restart.
+      let eset = distinctEntitiesByFanoutKey.get(call.fanoutKey);
+      if (!eset) {
+        eset = new Set();
+        distinctEntitiesByFanoutKey.set(call.fanoutKey, eset);
       }
+      eset.add(call.fanoutEntity ?? call.signature);
     }
   }
   return { recent, countBySignature, distinctArgsByMutTool, distinctArgsByFanoutKey, distinctEntitiesByFanoutKey };
+}
+
+/** Recompute the fanout distinct-args + distinct-entity maps from the current
+ *  (bounded) recent window, so a block ages out with the window instead of
+ *  becoming session-permanent. Called after any window drop. O(window). Uses the
+ *  same entity fallback as the live path (entity ?? signature). */
+function rebuildFanoutMaps(tracker: SessionTrackerState): void {
+  tracker.distinctArgsByFanoutKey.clear();
+  tracker.distinctEntitiesByFanoutKey.clear();
+  for (const call of tracker.recent) {
+    if (!call.fanoutKey) continue;
+    let s = tracker.distinctArgsByFanoutKey.get(call.fanoutKey);
+    if (!s) { s = new Set(); tracker.distinctArgsByFanoutKey.set(call.fanoutKey, s); }
+    s.add(call.signature);
+    let e = tracker.distinctEntitiesByFanoutKey.get(call.fanoutKey);
+    if (!e) { e = new Set(); tracker.distinctEntitiesByFanoutKey.set(call.fanoutKey, e); }
+    e.add(call.fanoutEntity ?? call.signature);
+  }
 }
 
 function persistTracker(sessionId: string, tracker: SessionTrackerState): void {
@@ -239,7 +262,16 @@ function isMutatingCall(toolName: string, args: unknown): boolean {
   if (toolName === 'composio_execute_tool') {
     const slug = composioSlugOf(args);
     if (!slug) return true;
-    return composioSlugIsMutating(slug);
+    // AUTHORITATIVE (2026-07-12 turn-kill fix): defer to the SAME classifier the
+    // fanout block + execution gate use, not the coarse composioSlugIsMutating.
+    // The coarse one over-flags reads whose verb TOKEN reads as a write —
+    // DATAFORSEO_..._TASK_POST, FIRECRAWL_..._SEARCH — as mutating; that armed
+    // the exact-args ESCALATE (hard turn-kill) and same_mut_tool HALT for a READ
+    // (a fanout-refused DataForSEO read re-hammered to count 12 ended the turn).
+    // A call the fanout block treats as a READ must never be hard-killable; the
+    // two classifiers must agree. isMutatingExternalWrite honors the exempt
+    // read-slug patterns, so composio WRITES (GMAIL_SEND) stay mutating.
+    return isMutatingExternalWrite(toolName, args);
   }
   return MUTATING_TOOLS.has(toolName);
 }
@@ -469,6 +501,16 @@ function fanoutBlockEnabled(): boolean {
   return (process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK ?? 'off').toLowerCase() === 'on';
 }
 
+/** The read-fanout refusal steers the model to run_tool_program — which is ONLY
+ *  registered when code mode is enabled (mirrors codeModeEnabled() in
+ *  code-mode-tool.ts; inlined to avoid a tools→guardrail import cycle). If an
+ *  operator disabled code mode, refusing a read while prescribing a tool that
+ *  does not exist would STRAND the turn, so we fall back to the advisory nudge
+ *  (never a hard refusal) in that case (2026-07-12 strand-hunt finding). */
+function codeModeRecoveryAvailable(): boolean {
+  return (getRuntimeEnv('CLEMMY_CODE_MODE', 'on') || 'on').trim().toLowerCase() !== 'off';
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Per-session tracker
 // ─────────────────────────────────────────────────────────────────
@@ -603,6 +645,14 @@ export function evaluateToolCall(
       // it precisely on window drop because tracking which args
       // dropped requires a more complex structure. Reset on every
       // window-full as an approximation.
+      //
+      // FANOUT DECAY (2026-07-12): the fanout sets, by contrast, MUST age out
+      // with the window — otherwise a slug that once tripped stays PERMANENTLY
+      // blocked across every future turn in the session, contradicting the
+      // refusal's own "for the rest of this turn" framing. Rebuild both fanout
+      // maps from the (bounded) window after any drop so they reflect exactly
+      // the live window, just as loop detection decays.
+      rebuildFanoutMaps(tracker);
     }
   }
   tracker.countBySignature.set(signature, (tracker.countBySignature.get(signature) ?? 0) + 1);
@@ -675,6 +725,7 @@ export function evaluateToolCall(
     // back to full-args entities (== signatures), so they fire exactly as before.
     if (
       fanoutBlockEnabled()
+      && codeModeRecoveryAvailable()
       && !isMutatingExternalWrite(toolName, args)
       && distinct >= thresholds.fanoutBlockAt
       && distinctEntities >= thresholds.fanoutBlockAt
@@ -735,6 +786,10 @@ export function evaluateToolCall(
       rule: 'exact_args_repeat',
       count: exactCount,
       mutating: isMut,
+      // Carry fanoutBlock so the consumer's fanoutBlock check (which precedes the
+      // escalate/halt enforcement) wins: a fanout-keyed READ over threshold gets
+      // the soft, recoverable refusal instead of a hard turn-kill (2026-07-12).
+      ...(fanoutBlock ? { fanoutBlock } : {}),
     };
   }
   if (exactCount >= thresholds.exactArgsBlockAt) {
@@ -750,6 +805,10 @@ export function evaluateToolCall(
       rule: 'exact_args_repeat',
       count: exactCount,
       mutating: isMut,
+      // Carry fanoutBlock: past threshold the standing recovery skeleton must win
+      // over the generic loop message, else re-hammering a fanout-refused read
+      // swaps the actionable "write ONE program" steer for vague loop advice.
+      ...(fanoutBlock ? { fanoutBlock } : {}),
     };
   }
   if (exactCount >= thresholds.exactArgsWarnAt) {
@@ -779,6 +838,10 @@ export function evaluateToolCall(
         rule: 'same_mut_tool_repeat',
         count: distinctArgsCount,
         mutating: isMut,
+        // Carry fanoutBlock so the recoverable refusal wins over a mutating-halt
+        // for a fanout-keyed read (2026-07-12). With the isMutatingCall fix a read
+        // no longer reaches here, but keep the belt-and-suspenders.
+        ...(fanoutBlock ? { fanoutBlock } : {}),
       };
     }
     if (distinctArgsCount >= thresholds.sameMutToolWarnAt) {
