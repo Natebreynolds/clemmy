@@ -94,11 +94,16 @@ export function codeModeMandateEnabled(): boolean {
 export function codeModeMandateDirective(opts: {
   mcpServersInScope?: number;
   allowAllMcp?: boolean;
+  /** Composio data tools (composio_execute_tool) are in scope this turn. The
+   *  original trigger keyed ONLY on external MCP servers, so a composio-heavy
+   *  turn (email/CRM/calendar — the common case) never tripped the mandate.
+   *  Session-stable, so appending the base rule stays prompt-cache-safe. */
+  composioInScope?: boolean;
   fanoutPreferred?: boolean;
   multiItem?: { count: number; kind: string | null; carried?: boolean };
 }): string {
   if (!codeModeMandateEnabled()) return '';
-  const hasMcpData = !!opts.allowAllMcp || (opts.mcpServersInScope ?? 0) >= 1;
+  const hasMcpData = !!opts.allowAllMcp || (opts.mcpServersInScope ?? 0) >= 1 || !!opts.composioInScope;
   if (!hasMcpData) return '';
   const fetchTools = codeModeWritesEnabled()
     ? 'MCP tools (`<server>__<tool>`) and `composio_execute_tool`'

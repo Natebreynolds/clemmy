@@ -1,5 +1,7 @@
 import { renderCanonicalMemoryContext } from './canonical-context.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
+import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
+import { getComposio } from '../../integrations/composio/client.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
 import {
   buildWorkspaceContextPrimer, workspaceSlugFromSessionId, WORKSPACE_DOCK_TOOLS,
@@ -661,6 +663,15 @@ export function renderClaudeAgentBrainSystemAppend(
     // skipped the prescribed procedure. Compact index only (names + one-liners); the
     // body loads on demand via skill_read.
     renderClaudeBrainSkillsBlock(),
+    '',
+    // Code-mode BATCH-SHAPE RULE (Move 3 / adoption): the brain lane had the
+    // run_tool_program tool but NO steer, so it ground multi-fetch turns through
+    // discrete calls (live: 6 discrete Outlook calls, 0 programs). The base rule
+    // is a constant and getComposio() is session-stable, so this stays in the
+    // cacheable stable append. Fires whenever composio data tools are in scope
+    // (the common chat case) — the per-turn fan-out sharpening stays in the
+    // turn context. '' (dropped by filter) when composio isn't configured.
+    codeModeMandateDirective({ composioInScope: getComposio() != null }),
     '',
     'How you operate here:',
     CLAUDE_BRAIN_RUBRIC,

@@ -109,6 +109,21 @@ test('codeModeMandateDirective: fires on a data-heavy turn (MCP servers in scope
   assert.match(codeModeMandateDirective({ allowAllMcp: true }), /run_tool_program/);
 });
 
+// Move 3 / adoption: the trigger used to key ONLY on external MCP servers, so a
+// composio-heavy turn (email/CRM/calendar — the common case, and the lane where a
+// live probe showed 6 discrete calls + 0 programs) never tripped the mandate.
+test('codeModeMandateDirective: composioInScope fires the mandate (was MCP-only)', () => {
+  // no data tools at all → still silent (byte-identical prompt)
+  assert.equal(codeModeMandateDirective({}), '');
+  assert.equal(codeModeMandateDirective({ composioInScope: false }), '');
+  // composio in scope with no MCP → NOW fires
+  const d = codeModeMandateDirective({ composioInScope: true });
+  assert.match(d, /BATCH-SHAPE RULE/);
+  assert.match(d, /run_tool_program/);
+  // base rule is constant across calls → safe to sit in the cacheable stable append
+  assert.equal(d, codeModeMandateDirective({ composioInScope: true }));
+});
+
 test('codeModeMandateDirective: fan-out-shaped turns get a POSITIVE lane-(a) directive, not silence', () => {
   // 2026-07-07: the old contract returned '' on fanoutPreferred, so a missed
   // detection actively steered batch work into code mode and a hit detection

@@ -1,5 +1,6 @@
 import type { WorkflowStepInput } from '../../memory/workflow-store.js';
 import { getRuntimeEnv } from '../../config.js';
+import { codeModeMandateDirective } from '../../tools/code-mode-tool.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { recordSubagentRun } from '../../agents/subagent-runs.js';
 import {
@@ -121,6 +122,11 @@ export function renderClaudeAgentWorkflowStepSystemAppend(args: {
     ...boundary,
     '- If the step declares a skill, names a taste/design/style skill, or says to use installed skill rules, call `skill_read` for that skill before producing the result.',
     '- Finish by returning the structured output requested by the schema. Do not call `workflow_step_result`; this SDK lane returns the step result directly.',
+    // Code-mode BATCH-SHAPE RULE (Move 3 / adoption): a full-lane step with data
+    // tools in scope should aggregate several fetches through ONE run_tool_program
+    // instead of grinding discrete calls. Only on the full (write-capable) lane —
+    // the read-only lane's rule mentions send/write tools it doesn't have.
+    fullLane ? codeModeMandateDirective({ composioInScope: true }) : '',
     '',
     `Workflow: ${workflowName}`,
     `Step id: ${step.id}`,
