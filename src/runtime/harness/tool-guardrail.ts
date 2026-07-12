@@ -498,7 +498,12 @@ function readNudgeEnabled(): boolean {
  *  is byte-identical (no regression). Reads only (idempotent, re-doable via the
  *  program); the block is skipped for calls FROM a program/worker/batch. */
 function fanoutBlockEnabled(): boolean {
-  return (process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK ?? 'off').toLowerCase() === 'on';
+  // DEFAULT ON (2026-07-12): validated behavior is the default (no rollout flags).
+  // Earned it: 621-session historical replay = 26/26 correct fires, 0 false-fire;
+  // native-MCP shim mount closed the bare-name bypass; a 5-lens adversarial strand
+  // hunt (2 refuters each) found + fixed 6 strand/turn-kill/decay holes. Kill-switch
+  // CLEMMY_GUARDRAIL_FANOUT_BLOCK=off remains for emergencies.
+  return (process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK ?? 'on').toLowerCase() !== 'off';
 }
 
 /** The read-fanout refusal steers the model to run_tool_program — which is ONLY

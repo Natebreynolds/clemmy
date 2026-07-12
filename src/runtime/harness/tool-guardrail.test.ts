@@ -253,15 +253,30 @@ test('fanoutNudge: re-polling the SAME id never nudges (identical args = one dis
   }
 });
 
-// DETERMINISTIC read-fanout block (Move: adoption enforcement, default OFF).
-test('fanoutBlock: OFF by default → never set (guardrail byte-identical)', () => {
+// DETERMINISTIC read-fanout block — DEFAULT ON as of 2026-07-12 (validated:
+// replay 26/26, strand hunt closed). Kill-switch =off remains.
+test('fanoutBlock: ON by default → a serialized READ past threshold is refused with no env set', () => {
   _resetAllTrackersForTests();
-  delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK; // rely on the shipped default
   let last;
   for (let i = 0; i < 8; i += 1) {
-    last = evaluateToolCall('sess-fb-off', 'composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: JSON.stringify({ page: i }) });
+    last = evaluateToolCall('sess-fb-default', 'composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: JSON.stringify({ page: i }) });
   }
-  assert.equal(last?.fanoutBlock, undefined, 'switch off → no block signal ever');
+  assert.ok(last?.fanoutBlock, 'default-on → 6+ distinct serial reads are refused with no env set');
+});
+
+test('fanoutBlock: kill-switch =off → never set (emergency byte-identical bypass)', () => {
+  _resetAllTrackersForTests();
+  process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK = 'off';
+  try {
+    let last;
+    for (let i = 0; i < 8; i += 1) {
+      last = evaluateToolCall('sess-fb-off', 'composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: JSON.stringify({ page: i }) });
+    }
+    assert.equal(last?.fanoutBlock, undefined, 'switch off → no block signal ever');
+  } finally {
+    delete process.env.CLEMMY_GUARDRAIL_FANOUT_BLOCK;
+  }
 });
 
 test('fanoutBlock: ON → a serialized READ is blocked past the threshold (nudge precedes it)', () => {
