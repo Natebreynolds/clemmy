@@ -694,6 +694,23 @@ export function formatCodeModeFailure(result: CodeModeResult): string {
   return lines.join('\n');
 }
 
+/**
+ * F2 distill re-steer (advisory, appended to a SUCCESSFUL program result — not a
+ * refusal, the answer is usually already correct): a MULTI-fetch program that
+ * returned ~as many bytes as it fetched didn't distill (savedBytes≈0), so the
+ * whole point — keeping the raw payloads out of context — was missed. Nudge the
+ * next program to return only the answering field. '' for a single fetch (rpc≤1)
+ * or a program that already distilled. Pure + exported for testing.
+ */
+export function codeModeDistillReSteer(result: CodeModeResult): string {
+  if (!result.ok || result.rpcCalls <= 1) return '';
+  const intermediateBytes = result.intermediateBytes ?? 0;
+  if (intermediateBytes <= 0) return '';
+  const returnBytes = JSON.stringify(result.value ?? null).length;
+  if (Math.max(0, intermediateBytes - returnBytes) > 0) return ''; // it distilled
+  return '\n[note] This program returned the raw fetch payloads (~0 tokens saved). When a program aggregates several reads, return ONLY the answering field per item (e.g. a name→value map), not the raw objects — that is where the token win is.';
+}
+
 /** The run_tool_program tool def. Only meaningful when codeModeEnabled(). */
 export function buildCodeModeTool() {
   return tool({
@@ -706,7 +723,7 @@ export function buildCodeModeTool() {
       const sessionId = harnessRunContextStorage.getStore()?.sessionId ?? '';
       const result = await runCodeModeForSession(program, sessionId);
       if (result.ok) {
-        return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}`;
+        return `code-mode program returned (${result.rpcCalls} tool call${result.rpcCalls === 1 ? '' : 's'}):\n${JSON.stringify(result.value)}${codeModeDistillReSteer(result)}`;
       }
       return formatCodeModeFailure(result);
     },

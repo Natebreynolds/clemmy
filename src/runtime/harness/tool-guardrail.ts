@@ -268,7 +268,7 @@ export function buildFanoutRecoveryMessage(opts: {
   return (
     `[harness fan-out check — REFUSED] ${escalate}`
     + `You have read ${label} one-at-a-time ${distinct} times. STOP — every further one-at-a-time ${label} call is refused for the rest of this turn; this is NOT this item failing, the next one is refused identically. `
-    + `Do ALL remaining reads in ONE run_tool_program, building the array from the items you already have (same arg shape as the call just refused: ${exampleArgs}):\n`
+    + `Write ONE run_tool_program that covers EVERY remaining item in a single array — do NOT write several small programs (that just re-fragments the work into more turns). Build the array from the items you already have (same arg shape as the call just refused: ${exampleArgs}):\n`
     + `${skeleton}\n`
     + `Return ONLY that small distilled value (the answering field per item) — returning the raw payloads wastes the exact tokens this redirect exists to save.`
   );

@@ -236,6 +236,21 @@ test('run_tool_program surface follows CLEMMY_CODE_MODE: absent when off, presen
   }
 });
 
+// F2 distill re-steer (round-2 tune): a multi-fetch program that returned raw
+// payloads (savedBytes≈0) gets an advisory to distill; single/distilled don't.
+test('codeModeDistillReSteer: fires only on a multi-fetch program that returned raw payloads', async () => {
+  const { codeModeDistillReSteer } = await import('./code-mode-tool.js');
+  // raw: 3 fetches, return ~= intermediate (no distill)
+  assert.match(codeModeDistillReSteer({ ok: true, rpcCalls: 3, value: 'x'.repeat(1500), logs: [], intermediateBytes: 1500 }), /raw fetch payloads/);
+  // distilled: returned a tiny value vs large intermediate
+  assert.equal(codeModeDistillReSteer({ ok: true, rpcCalls: 3, value: { count: 3 }, logs: [], intermediateBytes: 1500 }), '');
+  // single fetch: exempt (a single read shouldn't be a program anyway)
+  assert.equal(codeModeDistillReSteer({ ok: true, rpcCalls: 1, value: 'x'.repeat(1500), logs: [], intermediateBytes: 1500 }), '');
+  // no fetches / failed: exempt
+  assert.equal(codeModeDistillReSteer({ ok: true, rpcCalls: 0, value: {}, logs: [], intermediateBytes: 0 }), '');
+  assert.equal(codeModeDistillReSteer({ ok: false, rpcCalls: 3, error: 'x', logs: [], intermediateBytes: 1500 }), '');
+});
+
 // ─── Move 5: clem.run_worker (bounded sub-agent spawning from a program) ───
 const VALID_WORKER_SPEC = {
   objective: 'Summarize the sentiment of one review',
