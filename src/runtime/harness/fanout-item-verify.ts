@@ -70,11 +70,14 @@ export interface FanoutItemVerdict { fabricated: boolean; reason: string }
 export function parseFanoutItemVerdict(finalOutput: unknown): FanoutItemVerdict | null {
   const raw = String(finalOutput ?? '').trim();
   if (!raw) return null;
+  // Accept ONLY the two contract markers (no BAD/FAIL/OK/PASS aliases — those are
+  // ordinary English words that would misparse a genuine reply opening with "Bad
+  // news, this is real. GENUINE" as fabricated). Require the delimiter/EOL so a
+  // prose sentence merely containing the word isn't read as a verdict.
   for (const line of raw.split(/\r?\n/)) {
-    const m = /^[ \t>*_-]*(GENUINE|FABRICATED|OK|BAD|PASS|FAIL)\b[ \t]*[:—–-]?[ \t]*(.*)$/i.exec(line.trim());
+    const m = /^[ \t>*_-]*(GENUINE|FABRICATED)\b[ \t]*(?:[:—–-][ \t]*(.*))?$/i.exec(line.trim());
     if (!m) continue;
-    const fabricated = /^(FABRICATED|BAD|FAIL)$/i.test(m[1]);
-    return { fabricated, reason: (m[2] || '').trim().slice(0, 200) };
+    return { fabricated: /^FABRICATED$/i.test(m[1]), reason: (m[2] || '').trim().slice(0, 200) };
   }
   return null;
 }

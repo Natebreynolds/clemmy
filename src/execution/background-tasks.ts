@@ -39,7 +39,7 @@ import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
-import { getSession as getHarnessSessionRow, createSession as createHarnessSession } from '../runtime/harness/eventlog.js';
+import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent } from '../runtime/harness/eventlog.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
@@ -1181,6 +1181,12 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     if (!getHarnessSessionRow(runSessionId)) {
       createHarnessSession({ id: runSessionId, kind: 'execution', title: updated?.title ?? task.title ?? 'Background task' });
     }
+    // Wave 4 Stage 2: mark a run/continue boundary. A background task's runSessionId
+    // is STABLE for its whole life, so worker_result events accumulate across every
+    // run. summarizeFanoutCoverage counts only worker_results AFTER the latest
+    // boundary, so a prior run's (or continue's) failures don't leak into THIS run's
+    // authoritative coverage gate and permanently block a re-completed task.
+    appendEvent({ sessionId: runSessionId, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { taskId: id } });
   } catch { /* trace pre-registration is best-effort; the worker creates it anyway */ }
   if (updated) emitBackgroundTaskOperational('background_task_started', updated);
   return updated;

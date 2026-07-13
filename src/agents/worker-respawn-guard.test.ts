@@ -193,3 +193,21 @@ test('summarizeFanoutCoverage: empty / no-fanout session → zeroed coverage (ne
   assert.deepEqual(summarizeFanoutCoverage(sess.id), { total: 0, done: 0, failed: 0, failedItems: [] });
   assert.deepEqual(summarizeFanoutCoverage(''), { total: 0, done: 0, failed: 0, failedItems: [] });
 });
+
+test('summarizeFanoutCoverage: scoped to the CURRENT run — a prior run/continue\'s failures do NOT leak past a run boundary (re-review regression fix)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'execution' });
+  const sid = sess.id;
+  // Run 1: fans out; item B fails (a raw ERROR: / capped worker). Task parks + continues.
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'A', ok: true, packetKey: 'pkA1' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'B', ok: false, packetKey: 'pkB1' } });
+  // Run 2 boundary (markBackgroundTaskRunning on the continue).
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { taskId: 'bg-x' } });
+  // Run 2 re-completes B cleanly (a DIFFERENT packetKey — re-planned context).
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'B', ok: true, packetKey: 'pkB2' } });
+
+  const cov = summarizeFanoutCoverage(sid);
+  assert.equal(cov.failed, 0, 'run-1 failure of B does not leak into run-2 coverage');
+  assert.equal(cov.total, 1, 'only run-2 worker_results (after the boundary) are counted');
+  assert.equal(cov.done, 1);
+});

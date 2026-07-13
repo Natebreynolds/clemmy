@@ -110,10 +110,18 @@ export function summarizeFanoutCoverage(sessionId: string): LedgerSummary {
   const empty: LedgerSummary = { total: 0, done: 0, failed: 0, failedItems: [] };
   try {
     if (!sessionId) return empty;
-    const results = listEvents(sessionId, { types: ['worker_result'] });
+    const events = listEvents(sessionId, { types: ['worker_result', 'fanout_run_boundary'] });
+    // Scope to the CURRENT run: a background task's runSessionId is stable across
+    // all its runs/continues, so ignore worker_results before the latest run
+    // boundary — a prior run's failures must not leak into this run's coverage
+    // (else a re-completed continue-heavy task blocks forever). No boundary (e.g.
+    // a chat-lane fan-out) → count the whole session, as before.
+    let boundarySeq = -1;
+    for (const e of events) if (e.type === 'fanout_run_boundary' && e.seq > boundarySeq) boundarySeq = e.seq;
     const byKey = new Map<string, { item: string | null; ok: boolean }>();
     let idx = 0;
-    for (const e of results) {
+    for (const e of events) {
+      if (e.type !== 'worker_result' || e.seq <= boundarySeq) continue;
       const d = e.data as { item?: unknown; ok?: unknown; packetKey?: unknown } | undefined;
       if (!d || typeof d.ok !== 'boolean') continue;
       const key = (typeof d.packetKey === 'string' && d.packetKey)
