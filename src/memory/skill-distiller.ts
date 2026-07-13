@@ -27,12 +27,19 @@ import {
 import { evidenceLooksFailedOrBlocked } from './tool-choice-store.js';
 import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
+import { rememberFact } from './facts.js';
 
 const logger = pino({ name: 'clementine-next.skill-distiller' });
 
 function distillerEnabled(): boolean {
   if ((getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() === 'off') return false;
   return (getRuntimeEnv('CLEMMY_SKILL_DISTILLER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Wave 2 Move B: on a quarantine (a proven-repeated failure), persist the lesson
+ *  as a durable, recallable fact so it outlives the draft. Kill-switch =off. */
+function failureLearningEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_FAILURE_LEARNING', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
 /** A coarse tool "family" for the novelty gate (≥2 distinct ⇒ multi-system). */
@@ -516,7 +523,26 @@ export function reinforceDraftSkills(
         const failureCount = (skill.frontmatter.failureCount ?? 0) + 1;
         const line = recoveryTip ?? (reason ? `FAILED: ${reason}` : 'FAILED (unspecified)');
         appendSkillPitfall(name, line.slice(0, 200));
-        updateSkillFrontmatter(name, failureCount >= 2 ? { failureCount, quarantined: true } : { failureCount });
+        const quarantined = failureCount >= 2;
+        updateSkillFrontmatter(name, quarantined ? { failureCount, quarantined: true } : { failureCount });
+        // Wave 2 Move B: when an approach is QUARANTINED (2+ real failures — proven
+        // bad, not transient), persist the lesson as a durable, deduped 'feedback'
+        // fact. Today the lesson lives only on the quarantined draft and dies with
+        // it; as a fact it survives deletion AND surfaces via unified recall on a
+        // future relevant turn, so a proven failure doesn't silently repeat in an
+        // unrelated later session. High-signal + rare + content-hash-deduped, so it
+        // never pollutes recall. Best-effort; a lesson write must never break
+        // reinforcement.
+        if (quarantined && failureLearningEnabled()) {
+          try {
+            rememberFact({
+              kind: 'feedback',
+              content: `Avoid repeating this: the "${name}" approach failed repeatedly and was retired. ${line}`.slice(0, 400),
+              ...(sessionId ? { derivedFrom: { sessionId, tool: 'skill_reinforce' } } : {}),
+              trustLevel: 0.6,
+            });
+          } catch { /* best-effort */ }
+        }
       }
     } catch { /* reinforcement is best-effort */ }
   }

@@ -23,6 +23,7 @@ const {
   updateSkillFrontmatter, appendSkillPitfall, SKILLS_DIR,
 } = await import('./skill-store.js');
 const { assessNovelty, reinforceDraftSkills, _testOnly_sanitizeDistilledSkillOutput } = await import('./skill-distiller.js');
+const { searchFactsByText } = await import('./facts.js');
 import type { TraceToolCall } from '../execution/trace-to-workflow.js';
 
 beforeEach(() => {
@@ -167,11 +168,31 @@ test('reinforce failure quarantines a draft after 2 failures and appends pitfall
   writeDistilledSkill({ name: 'rein-bad', description: 'd', body: 'steps', origin: { kind: 'chat' } });
   reinforceDraftSkills(['rein-bad'], 'failure', 'tool 500');
   assert.equal(loadSkill('rein-bad')!.frontmatter.quarantined ?? false, false, 'one failure tolerated');
+  // Move B: no durable fact after a SINGLE failure (not yet proven-bad).
+  assert.ok(!searchFactsByText('rein-bad', 20).some((f) => /rein-bad/.test(String(f.content))), 'no avoid-fact after one failure');
   reinforceDraftSkills(['rein-bad'], 'failure', 'bad slug');
   const s = loadSkill('rein-bad')!;
   assert.equal(s.frontmatter.quarantined, true, 'quarantined at 2');
   assert.match(s.body, /tool 500/);
   assert.match(s.body, /bad slug/);
+  // Move B: quarantine (2+ failures) mints a durable, recallable 'feedback' avoid-fact
+  // so the proven-bad approach doesn't repeat in an unrelated later session.
+  const avoid = searchFactsByText('rein-bad', 20).find((f) => f.kind === 'feedback' && /Avoid repeating this.*rein-bad/.test(String(f.content)));
+  assert.ok(avoid, 'quarantine persisted a durable avoid-fact');
+});
+
+test('failure-learning kill-switch: CLEMMY_FAILURE_LEARNING=off mints no avoid-fact on quarantine', () => {
+  const prev = process.env.CLEMMY_FAILURE_LEARNING;
+  process.env.CLEMMY_FAILURE_LEARNING = 'off';
+  try {
+    writeDistilledSkill({ name: 'rein-off', description: 'd', body: 'steps', origin: { kind: 'chat' } });
+    reinforceDraftSkills(['rein-off'], 'failure', 'e1');
+    reinforceDraftSkills(['rein-off'], 'failure', 'e2');
+    assert.equal(loadSkill('rein-off')!.frontmatter.quarantined, true, 'still quarantines');
+    assert.ok(!searchFactsByText('rein-off', 20).some((f) => /rein-off/.test(String(f.content))), 'kill-switch → no avoid-fact');
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_FAILURE_LEARNING; else process.env.CLEMMY_FAILURE_LEARNING = prev;
+  }
 });
 
 test('reinforce never demotes an APPROVED (user-blessed) skill', () => {
