@@ -181,14 +181,23 @@ test('reinforce failure quarantines a draft after 2 failures and appends pitfall
   assert.ok(avoid, 'quarantine persisted a durable avoid-fact');
 });
 
-test('Move B review fix: a TRANSIENT failure never quarantines nor mints an avoid-fact', () => {
+test('Move B review fix: a genuine infra-TRANSIENT failure quarantines but mints NO permanent avoid-fact', () => {
   writeDistilledSkill({ name: 'rein-transient', description: 'd', body: 'steps', origin: { kind: 'chat' } });
-  reinforceDraftSkills(['rein-transient'], 'failure', 'the upstream API timed out');
-  reinforceDraftSkills(['rein-transient'], 'failure', '429 rate limited, overloaded');
-  const s = loadSkill('rein-transient')!;
-  assert.notEqual(s.frontmatter.quarantined, true, 'flaky-infra failures must not quarantine a valid approach');
-  assert.equal(s.frontmatter.failureCount ?? 0, 0, 'transient failures do not count toward quarantine');
-  assert.ok(!searchFactsByText('rein-transient', 20).some((f) => /rein-transient/.test(String(f.content))), 'no permanent avoid-fact from transient failures');
+  reinforceDraftSkills(['rein-transient'], 'failure', 'the request timed out');
+  reinforceDraftSkills(['rein-transient'], 'failure', '429 rate limited by upstream');
+  // Quarantine still happens (baseline) — but the PERMANENT, auto-recalled avoid-fact
+  // (the harmful part) is NOT minted from flaky infra.
+  assert.ok(!searchFactsByText('rein-transient', 20).some((f) => /rein-transient/.test(String(f.content))), 'no permanent avoid-fact from infra-transient failures');
+});
+
+test('Move B review fix: a real bug whose reason MENTIONS a transient word still learns (no over-skip)', () => {
+  writeDistilledSkill({ name: 'rein-prose', description: 'd', body: 'steps', origin: { kind: 'chat' } });
+  // "timeout" as PROSE (not an infra error) must not be mistaken for a transient blip.
+  reinforceDraftSkills(['rein-prose'], 'failure', 'the timeout config value was set incorrectly by the agent');
+  reinforceDraftSkills(['rein-prose'], 'failure', 'the timeout field was hardcoded wrong again');
+  assert.equal(loadSkill('rein-prose')!.frontmatter.quarantined, true, 'a real repeated bug still quarantines');
+  const avoid = searchFactsByText('rein-prose', 20).find((f) => f.kind === 'feedback' && /Avoid repeating this.*rein-prose/.test(String(f.content)));
+  assert.ok(avoid, 'a real failure that merely mentions "timeout" STILL mints the lesson');
 });
 
 test('failure-learning kill-switch: CLEMMY_FAILURE_LEARNING=off mints no avoid-fact on quarantine', () => {

@@ -1393,6 +1393,9 @@ async function crossStoreBreadcrumbs(query: string): Promise<string> {
       stores: ['entity', 'resource', 'tool-recall'],
       perStore: TURN_XSTORE_PER_STORE,
       limit: TURN_XSTORE_PER_STORE * 3,
+      // Stricter resource floor than general recall: a lone shared common word
+      // ("report") must not inject an off-topic resource into EVERY turn primer.
+      resourceMinOverlap: 2,
     });
     if (result.hits.length === 0) return '';
     const label: Record<string, string> = { entity: 'WHO/WHAT', resource: 'WHERE', 'tool-recall': 'HOW' };

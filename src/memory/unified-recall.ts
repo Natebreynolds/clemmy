@@ -37,6 +37,11 @@ export interface UnifiedRecallOptions {
   perStore?: number;
   /** Restrict which stores participate. Default: all. */
   stores?: UnifiedHitType[];
+  /** Minimum query-token overlap for a RESOURCE hit (default 1). The resource
+   *  store matches on shared tokens; a floor of 1 surfaces a resource on a single
+   *  common word ("report"). Auto-recall callers (the turn primer) pass a stricter
+   *  floor so a lone common token doesn't inject an off-topic resource every turn. */
+  resourceMinOverlap?: number;
 }
 
 export interface UnifiedRecallResult {
@@ -115,6 +120,7 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
   if (want.has('resource')) {
     try {
       const objTokens = new Set(obj.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3));
+      const minOverlap = Math.max(1, opts.resourceMinOverlap ?? 1);
       const scored = listResourcePointers({ limit: 200 })
         .map((p) => {
           const hay = `${p.name} ${p.whatsHere ?? ''} ${p.whenToUse ?? ''}`.toLowerCase();
@@ -122,7 +128,7 @@ export async function recallEverything(objective: string, opts: UnifiedRecallOpt
           for (const t of objTokens) if (hay.includes(t)) overlap += 1;
           return { p, overlap };
         })
-        .filter((x) => x.overlap > 0)
+        .filter((x) => x.overlap >= minOverlap)
         .sort((a, b) => b.overlap - a.overlap)
         .slice(0, perStore);
       perStoreCounts.resource = scored.length;
