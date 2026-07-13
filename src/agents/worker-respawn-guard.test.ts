@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 
 const { normalizeWorkerItemKey, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } = await import('./worker-respawn-guard.js');
 const { resetEventLog, createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
-const { summarizeLedger, rehydrateFanoutLedger, clearLedger } = await import('../runtime/harness/fanout-ledger.js');
+const { summarizeFanoutCoverage } = await import('../runtime/harness/fanout-ledger.js');
 
 test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -127,13 +127,26 @@ test('workerAlreadyCompletedForPacket: a pre-Stage-1 worker_result with NO packe
   assert.equal(workerAlreadyCompletedForPacket(sid, 'pk_alpha'), false);
 });
 
-test('workerResumeIdempotencyEnabled: default ON, kill-switch off', () => {
+test('workerAlreadyCompletedForPacket: a CHAT session never short-circuits (F5 — no cross-turn suppression)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const sid = sess.id;
+  // Same durable ok result as the execution case, but on a chat session — an
+  // identical packet re-issued in a later user turn ("resend those emails") must
+  // run, not be reused. The guard is scoped to unattended run sessions only.
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Firm A', ok: true, packetKey: 'pk_alpha' } });
+  assert.equal(workerAlreadyCompletedForPacket(sid, 'pk_alpha'), false, 'chat session → guard inert');
+});
+
+test('workerResumeIdempotencyEnabled: default ON; off|0|false|no all disable', () => {
   const prev = process.env.CLEMMY_WORKER_RESUME_IDEMPOTENCY;
   try {
     delete process.env.CLEMMY_WORKER_RESUME_IDEMPOTENCY;
     assert.equal(workerResumeIdempotencyEnabled(), true, 'default ON');
-    process.env.CLEMMY_WORKER_RESUME_IDEMPOTENCY = 'off';
-    assert.equal(workerResumeIdempotencyEnabled(), false, '=off disables');
+    for (const off of ['off', '0', 'false', 'no', 'OFF', 'False']) {
+      process.env.CLEMMY_WORKER_RESUME_IDEMPOTENCY = off;
+      assert.equal(workerResumeIdempotencyEnabled(), false, `${off} disables`);
+    }
     process.env.CLEMMY_WORKER_RESUME_IDEMPOTENCY = 'on';
     assert.equal(workerResumeIdempotencyEnabled(), true);
   } finally {
@@ -141,44 +154,42 @@ test('workerResumeIdempotencyEnabled: default ON, kill-switch off', () => {
   }
 });
 
-test('rehydrateFanoutLedger: a restart-wiped coverage ledger is rebuilt from durable worker_result events (honest M of N)', () => {
+test('summarizeFanoutCoverage: honest M of N read DIRECTLY from the durable worker_result log (restart-safe, no in-memory rehydrate)', () => {
   resetEventLog();
   const sess = createSession({ kind: 'execution' });
   const sid = sess.id;
-  // A swarm ran: 2 done, 1 failed — each durably recorded a worker_result.
   appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Acme LLP', ok: true, packetKey: 'pk1' } });
   appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Bar Law', ok: true, packetKey: 'pk2' } });
   appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Qux Legal', ok: false, reason: 'ERROR: no email', packetKey: 'pk3' } });
 
-  // Simulate the daemon restart: the in-memory ledger is empty.
-  clearLedger(sid);
-  assert.equal(summarizeLedger(sid).total, 0, 'ledger starts empty after a restart');
-
-  const folded = rehydrateFanoutLedger(sid);
-  assert.equal(folded, 3);
-  const s = summarizeLedger(sid);
+  const s = summarizeFanoutCoverage(sid);
   assert.equal(s.total, 3);
   assert.equal(s.done, 2);
   assert.equal(s.failed, 1);
   assert.deepEqual(s.failedItems, ['Qux Legal']);
-
-  // IDEMPOTENT: rehydrating again (clear-then-rebuild) must not double-count.
-  rehydrateFanoutLedger(sid);
-  assert.equal(summarizeLedger(sid).total, 3, 'a second rehydrate does not double-count');
-  clearLedger(sid);
 });
 
-test('rehydrateFanoutLedger: an item that FAILED then SUCCEEDED (same packetKey) collapses to its FINAL ok outcome', () => {
+test('summarizeFanoutCoverage: a re-driven / reused worker (same packetKey twice) is NOT double-counted; failed-then-succeeded → ok', () => {
   resetEventLog();
   const sess = createSession({ kind: 'execution' });
   const sid = sess.id;
-  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Retry Me', ok: false, reason: 'ERROR: transient', packetKey: 'pkR' } });
-  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Retry Me', ok: true, packetKey: 'pkR' } });
-  clearLedger(sid);
-  rehydrateFanoutLedger(sid);
-  const s = summarizeLedger(sid);
-  assert.equal(s.total, 1, 'the two attempts of one packet collapse to a single ledger entry');
-  assert.equal(s.done, 1);
-  assert.equal(s.failed, 0, 'final outcome (ok) wins — no phantom failure after a successful retry');
-  clearLedger(sid);
+  // Item B fails pre-restart, then succeeds on resume (the sharp cross-restart
+  // case the old rehydrate double-counted / left stale-failed). Same packetKey.
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'B', ok: false, reason: 'ERROR: transient', packetKey: 'pkB' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'A', ok: true, packetKey: 'pkA' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'B', ok: true, packetKey: 'pkB' } });
+  // And a reuse short-circuit re-emits A's ok result (same packetKey again).
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'A', ok: true, packetKey: 'pkA' } });
+
+  const s = summarizeFanoutCoverage(sid);
+  assert.equal(s.total, 2, 'two distinct packets → two items, never inflated by replays');
+  assert.equal(s.done, 2);
+  assert.equal(s.failed, 0, 'B\'s final ok wins — no phantom failure after the successful resume');
+});
+
+test('summarizeFanoutCoverage: empty / no-fanout session → zeroed coverage (never a hollow-done trigger)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'execution' });
+  assert.deepEqual(summarizeFanoutCoverage(sess.id), { total: 0, done: 0, failed: 0, failedItems: [] });
+  assert.deepEqual(summarizeFanoutCoverage(''), { total: 0, done: 0, failed: 0, failedItems: [] });
 });

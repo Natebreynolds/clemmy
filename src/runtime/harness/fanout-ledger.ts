@@ -93,43 +93,43 @@ export function clearLedger(sessionId: string): void {
 }
 
 /**
- * Wave 4 Stage 1 (durable swarm resume): rebuild the in-memory coverage ledger
- * from the DURABLE `worker_result` event log after a daemon restart cleared it
- * (this ledger is per-process). Without it a resumed swarm's `summarizeLedger`
- * reports empty, silently breaking the honest "M of N failed" report-back that
- * `fanoutCoverageBlock` depends on — the resumed run would look fully-done. Keyed
- * by packetKey when present (so an item that failed-then-succeeded collapses to
- * its FINAL outcome), else the item label. Idempotent (re-keying overwrites, never
- * double-counts) and best-effort. Returns the number of results folded in.
+ * Wave 4 Stage 1 (durable swarm resume): coverage summarized DIRECTLY from the
+ * durable `worker_result` event log — the true, restart-surviving source — instead
+ * of the per-process in-memory ledger. This is what `fanoutCoverageBlock` reads,
+ * so a resumed swarm reports honest "M of N" with NO reliance on rehydrating a
+ * volatile ledger (the earlier rehydrate keyed `pk:`/`it:` while the live hook
+ * keyed by raw callId, so the two double-counted after resume, and the
+ * auto-continue `clearLedger` wiped the rehydrated entries — adversarial review
+ * ledger F1/F2). Dedups by packetKey (else item, else a per-event id); events
+ * arrive ASC by seq so the LAST outcome wins (a failed-then-succeeded item
+ * collapses to ok — no phantom failure after a successful retry/resume).
+ * Best-effort: any read error yields empty coverage (callers treat total:0 as
+ * "no fan-out to gate", never a hollow done).
  */
-export function rehydrateFanoutLedger(sessionId: string): number {
+export function summarizeFanoutCoverage(sessionId: string): LedgerSummary {
+  const empty: LedgerSummary = { total: 0, done: 0, failed: 0, failedItems: [] };
   try {
-    if (!sessionId) return 0;
-    // Rebuild from the durable log as the source of truth. Clear first so the
-    // result is IDEMPOTENT: the rehydrated keys (pk:/it:-prefixed) differ from the
-    // live path's real callId keys, so folding into a non-empty ledger would
-    // double-count the same worker. On a real restart the map is already empty;
-    // clearing also makes a mid-process reattach safe.
-    clearLedger(sessionId);
+    if (!sessionId) return empty;
     const results = listEvents(sessionId, { types: ['worker_result'] });
-    let n = 0;
+    const byKey = new Map<string, { item: string | null; ok: boolean }>();
+    let idx = 0;
     for (const e of results) {
-      const d = e.data as { item?: unknown; ok?: unknown; reason?: unknown; packetKey?: unknown } | undefined;
+      const d = e.data as { item?: unknown; ok?: unknown; packetKey?: unknown } | undefined;
       if (!d || typeof d.ok !== 'boolean') continue;
       const key = (typeof d.packetKey === 'string' && d.packetKey)
         ? `pk:${d.packetKey}`
-        : (typeof d.item === 'string' && d.item ? `it:${d.item}` : `idx:${n}`);
-      recordWorkerResult({
-        sessionId,
-        callId: key,
-        item: typeof d.item === 'string' ? d.item : null,
-        ok: d.ok,
-        reason: typeof d.reason === 'string' ? d.reason : undefined,
-      });
-      n += 1;
+        : (typeof d.item === 'string' && d.item ? `it:${d.item}` : `idx:${idx}`);
+      byKey.set(key, { item: typeof d.item === 'string' ? d.item : null, ok: d.ok });
+      idx += 1;
     }
-    return n;
+    let done = 0;
+    const failedItems: string[] = [];
+    for (const v of byKey.values()) {
+      if (v.ok) done += 1;
+      else failedItems.push(v.item ?? '(unlabeled item)');
+    }
+    return { total: byKey.size, done, failed: failedItems.length, failedItems };
   } catch {
-    return 0;
+    return empty;
   }
 }

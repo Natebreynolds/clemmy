@@ -37,6 +37,10 @@ export interface SubagentRunRecord {
   model?: string;
   /** The single item/task this agent handled. */
   task: string;
+  /** Wave 4 Stage 1: the job-packet key (workerPacketKey), so durable-resume reuse
+   *  matches the SAME identity the idempotency guard matched — not a coarse item
+   *  label two distinct packets could share. Absent on pre-Stage-1 records. */
+  packetKey?: string;
   status: SubagentStatus;
   /** First slice of the output for at-a-glance display (full output in outputRef). */
   outputPreview: string;
@@ -138,6 +142,7 @@ export function recordSubagentRun(
       provider: input.provider,
       ...(input.model ? { model: input.model } : {}),
       task: input.task,
+      ...(input.packetKey ? { packetKey: input.packetKey } : {}),
       status: input.status,
       outputPreview: output.slice(0, PREVIEW_MAX).replace(/\s+/g, ' ').trim(),
       ...(outputRef ? { outputRef } : {}),
@@ -175,28 +180,37 @@ export function readSubagentOutput(parentRunId: string, id: string): string | nu
 }
 
 /**
- * Wave 4 Stage 1 (durable swarm resume): the full persisted work-product of the
- * most-recent SUCCESSFUL subagent run for `item` under this parent (workflow run
- * or chat session), or null. The durable-resume idempotency guard uses it to
- * REUSE a completed worker's real output when the run resumes, instead of
- * re-executing the worker. Matches the task label exact-first, then case/space-
- * folded (the resumed run replays the identical item string). Fail-open.
+ * Wave 4 Stage 1 (durable swarm resume): the FULL persisted work-product of the
+ * most-recent SUCCESSFUL subagent run matching this job packet under `parentRunId`,
+ * or null. The durable-resume idempotency guard uses it to REUSE a completed
+ * worker's real output on resume instead of re-executing.
+ *
+ * Matches by `packetKey` FIRST (the same identity the guard matched) so two
+ * DISTINCT packets that share an item label — e.g. "research acme.com" then
+ * "draft outreach for acme.com" — never cross-contaminate (adversarial review
+ * Defect 1). Falls back to the item-string match ONLY for legacy records that
+ * predate the packetKey field. Returns ONLY a real persisted work-product (the
+ * `outputRef` file) — never the 600-char preview — so a missing/blank output
+ * yields null and the caller RE-EXECUTES rather than passing a truncated preview
+ * off as the deliverable (Defect 3 / F4). Fail-open.
  */
-export function findCompletedSubagentOutput(parentRunId: string, item: string): string | null {
+export function findCompletedSubagentOutput(parentRunId: string, item: string, packetKey?: string | null): string | null {
   try {
     const target = (item ?? '').trim();
-    if (!target) return null;
     const targetFold = target.toLowerCase().replace(/\s+/g, ' ');
+    const wantKey = (packetKey ?? '').trim();
     const runs = listSubagentRuns(parentRunId);
     for (let i = runs.length - 1; i >= 0; i -= 1) {
       const r = runs[i];
       if (r.status !== 'ok') continue;
-      const task = (r.task ?? '').trim();
-      if (task === target || task.toLowerCase().replace(/\s+/g, ' ') === targetFold) {
-        const full = r.outputRef ? readSubagentOutput(parentRunId, r.id) : null;
-        const reused = full ?? r.outputPreview ?? '';
-        return reused.trim() ? reused : null;
-      }
+      const matches = wantKey && r.packetKey
+        ? r.packetKey === wantKey
+        // Legacy record (no packetKey) OR no key supplied: fall back to the label.
+        : !r.packetKey && !!target && ((r.task ?? '').trim() === target
+            || (r.task ?? '').trim().toLowerCase().replace(/\s+/g, ' ') === targetFold);
+      if (!matches) continue;
+      const full = r.outputRef ? readSubagentOutput(parentRunId, r.id) : null;
+      return full && full.trim() ? full : null;
     }
     return null;
   } catch {

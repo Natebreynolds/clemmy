@@ -127,6 +127,29 @@ export function registerWorkerTools(server: McpServer): void {
         } catch { /* durable trace is best-effort */ }
       };
 
+      // Wave 4 Stage 1 — durable-resume idempotency (checked BEFORE the fuzzy
+      // cap-guard: an exact-packet ok match is a STRONGER signal than the
+      // domain-collapsing cap match, and must win so a worker that genuinely
+      // COMPLETED isn't refused-as-failed on resume because a same-domain sibling
+      // capped — adversarial review F1). If this exact packet already completed
+      // successfully in this run session, REUSE the prior work-product instead of
+      // re-executing (re-running would redo the work and re-issue its external
+      // writes). ONLY short-circuit when the real output is recoverable — else
+      // fall through and re-execute rather than pass a placeholder off as success
+      // (F4); the duplicate-send wall backstops any repeated send. Fail-open;
+      // kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY.
+      try {
+        if (workerResumeIdempotencyEnabled() && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
+          const parentRunId = getToolOutputContext()?.workflowRunId || sessionId;
+          const prior = findCompletedSubagentOutput(parentRunId, input.item, packetKey);
+          if (prior && prior.trim()) {
+            recordResult(true, 'resume: reused prior completed result');
+            return textResult(prior);
+          }
+          // No recoverable output → do NOT claim success; re-execute below.
+        }
+      } catch { /* fail-open */ }
+
       // HARD respawn guard: if THIS item already hit its turn cap earlier this run,
       // refuse to re-spawn it (a re-run with the same packet just caps again — the
       // non-converging loop). Fail-open so it can never block a first spawn.
@@ -135,23 +158,6 @@ export function registerWorkerTools(server: McpServer): void {
           const msg = `ERROR: worker for "${input.item}" already exhausted its turn budget on a prior attempt this run and was NOT re-spawned. Report this item as failed / needs-attention; do not retry it.`;
           recordResult(false, firstLine(msg));
           return textResult(msg);
-        }
-      } catch { /* fail-open */ }
-
-      // Wave 4 Stage 1 — durable-resume idempotency: if THIS exact packet already
-      // completed successfully earlier in this (interrupted, now-resumed) run,
-      // REUSE the prior result instead of re-executing — re-running would redo the
-      // work and re-issue any external writes the completed worker performed.
-      // Fail-open; kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY=off.
-      try {
-        if (workerResumeIdempotencyEnabled() && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
-          const parentRunId = getToolOutputContext()?.workflowRunId || sessionId;
-          const prior = findCompletedSubagentOutput(parentRunId, input.item);
-          const reused = prior && prior.trim()
-            ? prior
-            : `Already completed on a prior attempt this run — result reused, not re-executed (avoids duplicate side effects). Item: ${input.item}`;
-          recordResult(true, 'resume: reused prior completed result');
-          return textResult(reused);
         }
       } catch { /* fail-open */ }
 
@@ -271,6 +277,7 @@ export function registerWorkerTools(server: McpServer): void {
             provider: resultProvider,
             model: result.model ?? workerModel,
             task: input.item,
+            packetKey,
             status: capped ? 'capped' : ok ? 'ok' : 'error',
             output: result.text ?? '',
             startedAt: new Date(routeStartedAt).toISOString(),
@@ -302,6 +309,7 @@ export function registerWorkerTools(server: McpServer): void {
             provider: failedProvider,
             model: workerModel,
             task: input.item,
+            packetKey,
             status: 'error',
             output: `ERROR: worker for "${input.item}" failed: ${firstLine(err)}`,
             startedAt: new Date(routeStartedAt).toISOString(),

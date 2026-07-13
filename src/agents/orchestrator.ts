@@ -1120,6 +1120,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             provider,
             model,
             task: input.item,
+            packetKey,
             status: capped ? 'capped' : ok ? 'ok' : 'error',
             output: text,
             startedAt: new Date(workerRouteStartedAt).toISOString(),
@@ -1127,6 +1128,28 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           });
         } catch { /* visibility trace is best-effort */ }
       };
+      // Wave 4 Stage 1 — durable-resume idempotency, checked BEFORE the fuzzy
+      // cap-guard so an exact-packet ok match (the stronger signal) wins: a worker
+      // that genuinely COMPLETED must not be refused-as-failed on resume because a
+      // same-domain sibling capped (adversarial review F1). REUSE the prior
+      // work-product instead of re-executing (which would redo the work + re-issue
+      // its external writes). ONLY short-circuit when the real output is
+      // recoverable — else fall through and re-execute rather than pass a
+      // placeholder off as success (F4); the duplicate-send wall backstops any
+      // repeated send. Fail-open; kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY.
+      if (workerResumeIdempotencyEnabled() && sessionId && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
+        const ctx = getToolOutputContext();
+        const parentRunId = ctx?.workflowRunId || sessionId;
+        const prior = findCompletedSubagentOutput(parentRunId, input.item, packetKey);
+        if (prior && prior.trim()) {
+          // preRun:true → durable worker_result is written but no phantom
+          // route-outcome metric is recorded (this worker did not actually run).
+          appendWorkerResult({ item: input.item, ok: true, model: workerModel, toolUses: [], reason: 'resume: reused prior completed result', preRun: true });
+          return prior;
+        }
+        // No recoverable output → do NOT claim success; re-execute below.
+      }
+
       // HARD respawn guard (covers BOTH worker lanes — placed before the route
       // branch). If THIS item already hit its turn cap (worker_capped) earlier in
       // this run, refuse to re-spawn it: a re-run with the same packet just caps
@@ -1141,22 +1164,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const message = `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
         return message;
-      }
-
-      // Wave 4 Stage 1 — durable-resume idempotency: if THIS exact packet already
-      // completed successfully earlier in this (interrupted, now-resumed) run,
-      // REUSE the prior result instead of re-executing — re-running would redo the
-      // work and re-issue any external writes the completed worker performed.
-      // Fail-open; kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY=off.
-      if (workerResumeIdempotencyEnabled() && sessionId && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
-        const ctx = getToolOutputContext();
-        const parentRunId = ctx?.workflowRunId || sessionId;
-        const prior = findCompletedSubagentOutput(parentRunId, input.item);
-        const reused = prior && prior.trim()
-          ? prior
-          : `Already completed on a prior attempt this run — result reused, not re-executed (avoids duplicate side effects). Item: ${input.item}`;
-        appendWorkerResult({ item: input.item, ok: true, model: workerModel, toolUses: [], reason: 'resume: reused prior completed result' });
-        return reused;
       }
       if (claudeAgentSdkWorkerEnabled(workerModel)) {
         // Pass the PARENT chat session so the Claude SDK worker's gates +

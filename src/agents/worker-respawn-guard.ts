@@ -1,4 +1,4 @@
-import { listEvents } from '../runtime/harness/eventlog.js';
+import { listEvents, getSession } from '../runtime/harness/eventlog.js';
 import { getRuntimeEnv } from '../config.js';
 
 /**
@@ -48,7 +48,9 @@ export function workerItemAlreadyCapped(sessionId: string, item: string | null |
 // the brain replays the SAME run_worker calls — without this guard a worker that
 // already finished re-runs from scratch AND re-issues any external writes it made.
 export function workerResumeIdempotencyEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_WORKER_RESUME_IDEMPOTENCY', 'on') ?? 'on').toLowerCase() !== 'off';
+  // Accept the full off convention (off|0|false|no), matching sibling switches.
+  const v = (getRuntimeEnv('CLEMMY_WORKER_RESUME_IDEMPOTENCY', 'on') ?? 'on').trim().toLowerCase();
+  return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
 }
 
 /**
@@ -67,6 +69,15 @@ export function workerResumeIdempotencyEnabled(): boolean {
 export function workerAlreadyCompletedForPacket(sessionId: string, packetKey: string | null | undefined): boolean {
   try {
     if (!packetKey) return false;
+    // Scope to unattended RUN sessions (execution/workflow/agent), NEVER a plain
+    // chat session (adversarial review F5). A chat session persists across user
+    // turns, so an identical packet re-issued in a LATER turn ("resend those
+    // emails, I don't think they went") must NOT be short-circuited as a resume
+    // replay. Background/workflow run sessions are per-run (unique id), so the
+    // whole-session scan has no cross-turn ambiguity. Unknown/missing session →
+    // do not fire (fail toward re-execution, which the duplicate-send wall backstops).
+    const kind = getSession(sessionId)?.kind;
+    if (!kind || kind === 'chat') return false;
     const results = listEvents(sessionId, { types: ['worker_result'] });
     return results.some((e) => {
       const d = e.data as { ok?: unknown; packetKey?: unknown } | undefined;

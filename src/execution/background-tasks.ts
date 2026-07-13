@@ -31,7 +31,7 @@ import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
-import { fanoutLedgerEnabled, summarizeLedger, clearLedger, rehydrateFanoutLedger } from '../runtime/harness/fanout-ledger.js';
+import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
@@ -1656,7 +1656,11 @@ async function verifyBackgroundTaskDelivery(
 function fanoutCoverageBlock(runSessionId: string): { outcome: 'blocked'; reason: string } | null {
   if (!fanoutLedgerEnabled()) return null;
   try {
-    const cov = summarizeLedger(runSessionId);
+    // Wave 4 Stage 1: read coverage from the DURABLE worker_result log (restart-
+    // surviving, deduped by packetKey) rather than the per-process in-memory
+    // ledger, so a resumed swarm reports honest "M of N" without a rehydrate that
+    // double-counted against the live path or got wiped by clearLedger-on-continue.
+    const cov = summarizeFanoutCoverage(runSessionId);
     if (cov.total > 0 && cov.failed > 0) {
       const shown = cov.failedItems.slice(0, 8).join(', ');
       const more = cov.failedItems.length > 8 ? `, +${cov.failedItems.length - 8} more` : '';
@@ -1834,13 +1838,11 @@ function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null
     },
   });
   if (updated) {
-    // Wave 4 Stage 1 (durable swarm resume): rebuild the in-memory fan-out
-    // coverage ledger from the durable worker_result log — the ledger is
-    // per-process and was wiped by the restart, so without this a resumed swarm's
-    // summarizeLedger (fanoutCoverageBlock) reports empty and the run looks
-    // fully-done. Best-effort. The per-worker idempotency guard (worker-tools /
-    // orchestrator) separately prevents completed workers being re-executed.
-    try { rehydrateFanoutLedger(updated.runSessionId); } catch { /* best-effort */ }
+    // Wave 4 Stage 1 (durable swarm resume): no ledger rehydrate needed — coverage
+    // is now summarized directly from the durable worker_result log at the check
+    // point (fanoutCoverageBlock → summarizeFanoutCoverage), which survives the
+    // restart by construction. The per-worker idempotency guard separately skips
+    // re-executing workers that already completed.
     addNotification({
       id: `${Date.now()}-background-${updated.id}-reattached`,
       kind: 'execution',

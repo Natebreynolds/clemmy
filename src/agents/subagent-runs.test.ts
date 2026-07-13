@@ -115,3 +115,31 @@ test('findCompletedSubagentOutput returns the LATEST ok run when an item complet
   });
   assert.equal(findCompletedSubagentOutput(runId, 'X'), 'second');
 });
+
+test('findCompletedSubagentOutput: matches by PACKET KEY so two distinct packets sharing an item label never cross-contaminate (Defect 1)', () => {
+  const runId = 'wfrun-multiphase';
+  // Multi-phase over the same entity: research acme.com, then draft outreach for
+  // acme.com — same item label, DIFFERENT packet keys.
+  recordSubagentRun({
+    id: 'ph1', parentRunId: runId, parentKind: 'session', provider: 'claude', model: 'm',
+    task: 'acme.com', packetKey: 'pk_research', status: 'ok', output: 'RESEARCH: 40 employees, Series B', startedAt: 't', finishedAt: 't',
+  });
+  recordSubagentRun({
+    id: 'ph2', parentRunId: runId, parentKind: 'session', provider: 'claude', model: 'm',
+    task: 'acme.com', packetKey: 'pk_outreach', status: 'ok', output: 'DRAFT EMAIL: Hi Acme team...', startedAt: 't', finishedAt: 't',
+  });
+  // Resuming phase 1 must reuse the RESEARCH output, not the later outreach draft.
+  assert.equal(findCompletedSubagentOutput(runId, 'acme.com', 'pk_research'), 'RESEARCH: 40 employees, Series B');
+  assert.equal(findCompletedSubagentOutput(runId, 'acme.com', 'pk_outreach'), 'DRAFT EMAIL: Hi Acme team...');
+  // A packet key with no matching record → null (re-execute), never a wrong-phase reuse.
+  assert.equal(findCompletedSubagentOutput(runId, 'acme.com', 'pk_unknown'), null);
+});
+
+test('findCompletedSubagentOutput: an ok run with NO persisted output → null (re-execute, never a placeholder/preview) (F4/Defect 3)', () => {
+  const runId = 'wfrun-nooutput';
+  recordSubagentRun({
+    id: 'e1', parentRunId: runId, parentKind: 'session', provider: 'claude', model: 'm',
+    task: 'Empty', packetKey: 'pk_empty', status: 'ok', output: '', startedAt: 't', finishedAt: 't',
+  });
+  assert.equal(findCompletedSubagentOutput(runId, 'Empty', 'pk_empty'), null, 'no work-product → caller re-executes');
+});

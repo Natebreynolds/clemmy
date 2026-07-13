@@ -62,7 +62,7 @@ test('workerPacketKey: identical packets → identical key (a resumed run replay
   const a = workerPacketKey({ ...validPacket });
   const b = workerPacketKey({ ...validPacket });
   assert.equal(a, b);
-  assert.match(a, /^[a-z0-9]+$/, 'stable base36 key');
+  assert.match(a, /^[a-z0-9]+-[a-z0-9]+$/, 'stable two-part (~64-bit) key');
 });
 
 test('workerPacketKey: changing ANY material field yields a distinct key (a real re-processing runs, not reused)', () => {
@@ -73,4 +73,13 @@ test('workerPacketKey: changing ANY material field yields a distinct key (a real
   assert.notEqual(workerPacketKey({ ...validPacket, objective: 'A different objective entirely for this item.' }), base);
   assert.notEqual(workerPacketKey({ ...validPacket, context: 'Different source facts.' }), base);
   assert.notEqual(workerPacketKey({ ...validPacket, expectedOutput: 'A different shape.' }), base);
+});
+
+test('workerPacketKey: length-prefixing defeats the field-boundary collision (adversarial review F2)', () => {
+  // Two DISTINCT packets that a plain-space join would serialize identically:
+  // 'Summarize the' + 'company Acme' vs 'Summarize the company' + 'Acme'. They
+  // must now hash DIFFERENTLY so a resume of one never reuses the other's result.
+  const p1 = { ...validPacket, objective: 'Summarize the', item: 'company Acme Corp' };
+  const p2 = { ...validPacket, objective: 'Summarize the company', item: 'Acme Corp' };
+  assert.notEqual(workerPacketKey(p1), workerPacketKey(p2), 'field boundaries are unambiguous');
 });

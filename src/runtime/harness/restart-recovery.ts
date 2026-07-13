@@ -20,7 +20,6 @@
  * Entirely best-effort and flag-gated (CLEMMY_CHAT_RESTART_RECOVERY).
  */
 import { listSessions, listEvents, appendEvent, type SessionRow } from './eventlog.js';
-import { rehydrateFanoutLedger } from './fanout-ledger.js';
 import { HarnessSession } from './session.js';
 import { addNotification } from '../notifications.js';
 
@@ -237,12 +236,6 @@ export function recoverInterruptedChatRuns(
     else if (externalWritesSinceInterrupt === null || externalWritesSinceInterrupt > 0) record.autoResumeSkipped = 'external_write';
     const willAutoResume = record.autoResumeSkipped === undefined;
     try {
-      // Wave 4 Stage 1 (durable swarm resume): rebuild the in-memory fan-out
-      // coverage ledger from the durable worker_result log (per-process, wiped by
-      // the restart) so a resumed chat swarm still reports honest "M of N". The
-      // per-worker idempotency guard separately skips re-executing completed
-      // workers. Best-effort; a rehydrate error must never block recovery.
-      try { rehydrateFanoutLedger(row.id); } catch { /* best-effort */ }
       record.snapshotItemsBefore = sess.toInputItems().length;
       record.lastResponseIdPresent = !!sess.previousResponseId();
       record.replayPrimerChanged = sess.setContextPrimer(REPLAY_PRIMER_PREFIX, buildReplayPrimer(row.id, since));
