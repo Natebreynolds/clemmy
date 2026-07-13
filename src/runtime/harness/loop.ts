@@ -81,7 +81,7 @@ import { primeTurnRecallVector, searchFactsByText, touchFactAccess } from '../..
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
-import { recallEverything, formatUnifiedRecall } from '../../memory/unified-recall.js';
+import { recallEverything } from '../../memory/unified-recall.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
@@ -1172,18 +1172,16 @@ function factsBlockForPrimer(query: string): string {
   }
 }
 const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 800);
-// Wave 2 Move A: the turn primer upgrades from vault-only to UNIFIED cross-store
-// recall (facts + notes + people/entities + resources + proven tools, semantically
-// ranked and RRF-merged) — so paraphrased / cross-store knowledge auto-surfaces
-// every turn instead of only when the model happens to call memory_recall_all.
-// Default ON; kill-switch CLEMMY_UNIFIED_RECALL=off restores the vault-only primer.
-// Bounded: on timeout/miss it FALLS BACK to the vault-only path, so worst case is
-// no latency regression vs today. entity/resource/tool stores are sync sqlite;
-// the only network cost is the fact-embed query, which primeTurnRecallVector has
-// already warmed (breaker- + cache-guarded).
-const TURN_UNIFIED_RECALL_TIMEOUT_MS = positiveIntEnv('CLEMMY_UNIFIED_RECALL_TIMEOUT_MS', 1500);
-const TURN_UNIFIED_RECALL_LIMIT = positiveIntEnv('CLEMMY_UNIFIED_RECALL_LIMIT', 12);
-const TURN_UNIFIED_RECALL_PER_STORE = positiveIntEnv('CLEMMY_UNIFIED_RECALL_PER_STORE', 5);
+// Wave 2 Move A (v2, hardened after adversarial review): AUGMENT the turn primer
+// with the three cross-store recall types that had NO auto-recall before —
+// entities (people/what), resources (where), and proven tools (how). These are
+// APPENDED to the existing facts+vault+episodic primer, never replacing it (so
+// session breadcrumbs + fresh lexical facts are preserved), and they are the
+// SYNC sqlite stores only (entity/resource/tool-recall) — no embed, no network,
+// so zero first-token latency cost. Facts + vault keep their existing, better-
+// ranked paths (recency/trust-aware), so no stale-fact injection. Default ON;
+// kill-switch CLEMMY_UNIFIED_RECALL=off.
+const TURN_XSTORE_PER_STORE = positiveIntEnv('CLEMMY_UNIFIED_RECALL_PER_STORE', 4);
 function unifiedRecallEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_UNIFIED_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
 }
@@ -1341,19 +1339,19 @@ interface TurnMemoryPrimer {
   query: string;
   hitCount: number;
   injectedBytes: number;
-  source?: 'fts5' | 'hybrid' | 'fts5_hybrid_timeout' | 'fts5_hybrid_error' | 'unified';
+  source?: 'fts5' | 'hybrid' | 'fts5_hybrid_timeout' | 'fts5_hybrid_error';
   text?: string;
   skippedReason?: string;
 }
 
-function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = ''): TurnMemoryPrimer {
+function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = '', breadcrumbs = ''): TurnMemoryPrimer {
   const formatted = formatSearchHits(hits, TURN_MEMORY_PRIMER_MAX_CHARS);
   // Durable facts relevant to THIS message — the primer's vault search alone
   // never surfaced consolidated_facts, so a just-remembered fact was invisible.
   const factsBlock = factsBlockForPrimer(query);
   // Recently-observed breadcrumbs for this session (was a write-only table).
   const episodicBlock = episodicBlockForPrimer(sessionId);
-  if (!formatted && !factsBlock && !episodicBlock) {
+  if (!formatted && !factsBlock && !episodicBlock && !breadcrumbs) {
     return { enabled: true, query, hitCount: hits.length, injectedBytes: 0, source, skippedReason: 'no_hits' };
   }
   const sourceLabel = source === 'hybrid'
@@ -1366,6 +1364,10 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     ...(factsBlock ? ['', factsBlock] : []),
     ...(episodicBlock ? ['', episodicBlock] : []),
     ...(formatted ? ['', formatted] : []),
+    // Wave 2 Move A: cross-store breadcrumbs (people/places/proven tools) — the
+    // stores that had no per-turn auto-recall, appended so the existing blocks
+    // above are never lost.
+    ...(breadcrumbs ? ['', breadcrumbs] : []),
   ].join('\n');
   return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text };
 }
@@ -1380,25 +1382,26 @@ async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<ty
   ]);
 }
 
-/** Unified cross-store recall as the turn primer (Wave 2 Move A). Bounded by a
- *  timeout; returns null on timeout / no hits / error so the caller falls back to
- *  the vault-only primer (no latency or coverage regression vs today). */
-async function buildUnifiedRecallPrimer(query: string): Promise<TurnMemoryPrimer | null> {
-  const timeout = new Promise<null>((resolve) => {
-    const t = setTimeout(() => resolve(null), TURN_UNIFIED_RECALL_TIMEOUT_MS);
-    (t as unknown as { unref?: () => void }).unref?.();
-  });
-  let result: Awaited<ReturnType<typeof recallEverything>> | null;
+/** Cross-store breadcrumbs for the turn primer (Wave 2 Move A): the entity,
+ *  resource, and proven-tool stores that had NO per-turn auto-recall before. SYNC
+ *  sqlite only — recallEverything with these three stores does no embed and no
+ *  network, so it resolves in ~a query and adds no first-token latency. Returns a
+ *  compact appendable block, or '' when nothing on-topic. Fails soft to ''. */
+async function crossStoreBreadcrumbs(query: string): Promise<string> {
   try {
-    result = await Promise.race([
-      recallEverything(query, { limit: TURN_UNIFIED_RECALL_LIMIT, perStore: TURN_UNIFIED_RECALL_PER_STORE }),
-      timeout,
-    ]);
-  } catch { return null; }
-  if (!result || result.hits.length === 0) return null;
-  const text = formatUnifiedRecall(result, TURN_MEMORY_PRIMER_MAX_CHARS);
-  if (!text.trim()) return null;
-  return { enabled: true, query, hitCount: result.hits.length, injectedBytes: text.length, source: 'unified', text };
+    const result = await recallEverything(query, {
+      stores: ['entity', 'resource', 'tool-recall'],
+      perStore: TURN_XSTORE_PER_STORE,
+      limit: TURN_XSTORE_PER_STORE * 3,
+    });
+    if (result.hits.length === 0) return '';
+    const label: Record<string, string> = { entity: 'WHO/WHAT', resource: 'WHERE', 'tool-recall': 'HOW' };
+    const lines = ['[ALSO IN MEMORY — people/things, places, and proven tools relevant to this message]'];
+    for (const h of result.hits) {
+      lines.push(`- [${label[h.type] ?? h.type}] ${h.title}${h.snippet ? `: ${h.snippet}` : ''}`);
+    }
+    return lines.join('\n');
+  } catch { return ''; }
 }
 
 async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<TurnMemoryPrimer> {
@@ -1412,34 +1415,32 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
   }
 
   try {
-    // Wave 2 Move A: prefer the UNIFIED cross-store recall; fall back to the
-    // vault-only path on timeout / no hits so behavior degrades, never regresses.
-    if (unifiedRecallEnabled()) {
-      const unified = await buildUnifiedRecallPrimer(query);
-      if (unified) return unified;
-    }
+    // Wave 2 Move A: APPEND sync cross-store breadcrumbs (people/places/tools) to
+    // the existing facts+vault+episodic primer — never replacing it. Computed once
+    // (sync stores → no latency), passed into every format path below.
+    const breadcrumbs = unifiedRecallEnabled() ? await crossStoreBreadcrumbs(query) : '';
     const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
-    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId);
+    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
 
     try {
       const hybridHits = await searchVaultAsyncWithTimeout(query);
       if (hybridHits && hybridHits.length > 0) {
-        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId);
+        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId, breadcrumbs);
       }
       if (hybridHits === null) {
         return {
-          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId),
+          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId, breadcrumbs),
           skippedReason: ftsHits.length > 0 ? 'hybrid_timeout' : 'hybrid_timeout_no_fts_hits',
         };
       }
     } catch {
       return {
-        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId),
+        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId, breadcrumbs),
         skippedReason: ftsHits.length > 0 ? 'hybrid_error' : 'hybrid_error_no_fts_hits',
       };
     }
 
-    return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId);
+    return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
   } catch (err) {
     return {
       enabled: true,

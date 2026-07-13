@@ -181,6 +181,16 @@ test('reinforce failure quarantines a draft after 2 failures and appends pitfall
   assert.ok(avoid, 'quarantine persisted a durable avoid-fact');
 });
 
+test('Move B review fix: a TRANSIENT failure never quarantines nor mints an avoid-fact', () => {
+  writeDistilledSkill({ name: 'rein-transient', description: 'd', body: 'steps', origin: { kind: 'chat' } });
+  reinforceDraftSkills(['rein-transient'], 'failure', 'the upstream API timed out');
+  reinforceDraftSkills(['rein-transient'], 'failure', '429 rate limited, overloaded');
+  const s = loadSkill('rein-transient')!;
+  assert.notEqual(s.frontmatter.quarantined, true, 'flaky-infra failures must not quarantine a valid approach');
+  assert.equal(s.frontmatter.failureCount ?? 0, 0, 'transient failures do not count toward quarantine');
+  assert.ok(!searchFactsByText('rein-transient', 20).some((f) => /rein-transient/.test(String(f.content))), 'no permanent avoid-fact from transient failures');
+});
+
 test('failure-learning kill-switch: CLEMMY_FAILURE_LEARNING=off mints no avoid-fact on quarantine', () => {
   const prev = process.env.CLEMMY_FAILURE_LEARNING;
   process.env.CLEMMY_FAILURE_LEARNING = 'off';

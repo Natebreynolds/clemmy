@@ -512,6 +512,14 @@ export function reinforceDraftSkills(
       recoveryTip = deriveRecoveryTip(readSessionTrace(sessionId), readSessionToolReturns(sessionId));
     } catch { /* best-effort — fall back to the flat reason */ }
   }
+  // Review fix (#3): a TRANSIENT failure (rate-limit / timeout / 5xx / conn-reset)
+  // is not the approach's fault. It must NOT count toward quarantine — and, since
+  // quarantine now mints a durable, auto-recalled "avoid this" fact, a flaky-infra
+  // failure must never be able to permanently suppress a valid approach. Skip the
+  // whole failure-penalty pass when the signal is transient.
+  if (outcome === 'failure' && (isTransientFailure(reason ?? '') || (!!recoveryTip && isTransientFailure(recoveryTip)))) {
+    return;
+  }
   for (const name of new Set(skillNames)) {
     try {
       const skill = loadSkill(name);

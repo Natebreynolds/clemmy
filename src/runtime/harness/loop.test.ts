@@ -54,12 +54,6 @@ process.env.HARNESS_MAX_STALL_RETRIES = '1';
 // and make a real, nondeterministic call. Pin =off for a deterministic same-family
 // judge. Cross-family routing is covered in boundary-judge.test.ts.
 process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
-// This suite asserts the primer-INJECTION mechanism against the deterministic
-// vault-format primer. Wave 2 Move A made the DEFAULT primer unified cross-store
-// recall (different header/content); pin =off so these mechanics tests stay
-// deterministic. The unified path is covered by unified-recall.test.ts + the live
-// smoke; primer injection here is format-agnostic.
-process.env.CLEMMY_UNIFIED_RECALL = 'off';
 // This suite drives the loop with SCRIPTED runners that simulate tool calls by
 // emitting agent_tool_start events (no real wrapped-tool invoke). Tool-call
 // counting for those simulated calls comes from the loop's event-based fallback
