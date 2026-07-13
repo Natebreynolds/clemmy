@@ -81,6 +81,7 @@ import { primeTurnRecallVector, searchFactsByText, touchFactAccess } from '../..
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
+import { recallEverything, formatUnifiedRecall } from '../../memory/unified-recall.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
@@ -1171,6 +1172,21 @@ function factsBlockForPrimer(query: string): string {
   }
 }
 const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 800);
+// Wave 2 Move A: the turn primer upgrades from vault-only to UNIFIED cross-store
+// recall (facts + notes + people/entities + resources + proven tools, semantically
+// ranked and RRF-merged) — so paraphrased / cross-store knowledge auto-surfaces
+// every turn instead of only when the model happens to call memory_recall_all.
+// Default ON; kill-switch CLEMMY_UNIFIED_RECALL=off restores the vault-only primer.
+// Bounded: on timeout/miss it FALLS BACK to the vault-only path, so worst case is
+// no latency regression vs today. entity/resource/tool stores are sync sqlite;
+// the only network cost is the fact-embed query, which primeTurnRecallVector has
+// already warmed (breaker- + cache-guarded).
+const TURN_UNIFIED_RECALL_TIMEOUT_MS = positiveIntEnv('CLEMMY_UNIFIED_RECALL_TIMEOUT_MS', 1500);
+const TURN_UNIFIED_RECALL_LIMIT = positiveIntEnv('CLEMMY_UNIFIED_RECALL_LIMIT', 12);
+const TURN_UNIFIED_RECALL_PER_STORE = positiveIntEnv('CLEMMY_UNIFIED_RECALL_PER_STORE', 5);
+function unifiedRecallEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_UNIFIED_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
+}
 
 function isSyntheticStallRetryInput(text: string): boolean {
   return text.startsWith('Your previous response was prose, not an action.')
@@ -1325,7 +1341,7 @@ interface TurnMemoryPrimer {
   query: string;
   hitCount: number;
   injectedBytes: number;
-  source?: 'fts5' | 'hybrid' | 'fts5_hybrid_timeout' | 'fts5_hybrid_error';
+  source?: 'fts5' | 'hybrid' | 'fts5_hybrid_timeout' | 'fts5_hybrid_error' | 'unified';
   text?: string;
   skippedReason?: string;
 }
@@ -1364,6 +1380,27 @@ async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<ty
   ]);
 }
 
+/** Unified cross-store recall as the turn primer (Wave 2 Move A). Bounded by a
+ *  timeout; returns null on timeout / no hits / error so the caller falls back to
+ *  the vault-only primer (no latency or coverage regression vs today). */
+async function buildUnifiedRecallPrimer(query: string): Promise<TurnMemoryPrimer | null> {
+  const timeout = new Promise<null>((resolve) => {
+    const t = setTimeout(() => resolve(null), TURN_UNIFIED_RECALL_TIMEOUT_MS);
+    (t as unknown as { unref?: () => void }).unref?.();
+  });
+  let result: Awaited<ReturnType<typeof recallEverything>> | null;
+  try {
+    result = await Promise.race([
+      recallEverything(query, { limit: TURN_UNIFIED_RECALL_LIMIT, perStore: TURN_UNIFIED_RECALL_PER_STORE }),
+      timeout,
+    ]);
+  } catch { return null; }
+  if (!result || result.hits.length === 0) return null;
+  const text = formatUnifiedRecall(result, TURN_MEMORY_PRIMER_MAX_CHARS);
+  if (!text.trim()) return null;
+  return { enabled: true, query, hitCount: result.hits.length, injectedBytes: text.length, source: 'unified', text };
+}
+
 async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<TurnMemoryPrimer> {
   const enabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER', 'on') ?? 'on').toLowerCase() !== 'off';
   const hybridEnabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID', 'on') ?? 'on').toLowerCase() !== 'off';
@@ -1375,6 +1412,12 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
   }
 
   try {
+    // Wave 2 Move A: prefer the UNIFIED cross-store recall; fall back to the
+    // vault-only path on timeout / no hits so behavior degrades, never regresses.
+    if (unifiedRecallEnabled()) {
+      const unified = await buildUnifiedRecallPrimer(query);
+      if (unified) return unified;
+    }
     const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
     if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId);
 
