@@ -11,6 +11,7 @@ import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
+import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
@@ -729,6 +730,14 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
       if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
     } catch { recall = ''; }
   }
+  // Wave 2 Move A: append cross-store breadcrumbs (people/things, places, proven
+  // tools) — the entity/resource/tool stores that had no per-turn auto-recall on
+  // THIS lane either (the SDK brain's recall above is facts-only). Sync stores →
+  // no first-token latency; self-gating via CLEMMY_UNIFIED_RECALL.
+  let breadcrumbs = '';
+  if (q) {
+    try { breadcrumbs = await crossStoreBreadcrumbs(q); } catch { breadcrumbs = ''; }
+  }
   let sessionActions = '';
   if (sessionHistoryEnabled()) {
     try { sessionActions = renderRecentActionsForHarnessHistory(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
@@ -765,7 +774,7 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   if (convergenceSteerEnabled() && priorTurnEndedAwaitingClarification(request.sessionId)) {
     convergenceSteer = CONVERGENCE_STEER;
   }
-  return [convergenceSteer, volatile, continuationContext, harnessHealth, recall, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n');
+  return [convergenceSteer, volatile, continuationContext, harnessHealth, recall, breadcrumbs, sessionActions, fanoutDirective, pitfalls].filter(Boolean).join('\n\n');
 }
 
 function emitClaudeAgentSdkBrainContextTelemetry(

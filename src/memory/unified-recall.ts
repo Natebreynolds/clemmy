@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb } from './db.js';
 import { findSimilarFactsScored } from './facts.js';
 import { recallHybrid } from './recall.js';
@@ -165,4 +166,44 @@ export function formatUnifiedRecall(result: UnifiedRecallResult, maxChars = 2400
     used += line.length + 1;
   }
   return lines.join('\n');
+}
+
+/** Whether the auto-injected cross-store recall breadcrumbs are enabled (default
+ *  on; kill-switch CLEMMY_UNIFIED_RECALL=off). */
+export function unifiedRecallEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_UNIFIED_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Wave 2 Move A: a compact, appendable cross-store breadcrumbs block for the
+ *  turn context — the entity (who/what), resource (where), and proven-tool (how)
+ *  stores that had NO per-turn auto-recall before. SYNC sqlite stores ONLY (no
+ *  fact/vault → no embed, no network → zero first-token latency); facts/vault keep
+ *  their existing recency/trust-aware paths, so no stale-fact injection. Self-
+ *  gating (returns '' when disabled or on empty/no-hit/throw), so callers just
+ *  append it. Shared by BOTH brain lanes (loop primer + Claude SDK brain context). */
+export async function crossStoreBreadcrumbs(
+  query: string,
+  opts: { perStore?: number; resourceMinOverlap?: number } = {},
+): Promise<string> {
+  if (!unifiedRecallEnabled()) return '';
+  const q = (query || '').replace(/\s+/g, ' ').trim();
+  if (!q) return '';
+  try {
+    const perStore = opts.perStore ?? 4;
+    const result = await recallEverything(q, {
+      stores: ['entity', 'resource', 'tool-recall'],
+      perStore,
+      limit: perStore * 3,
+      // Stricter resource floor than general recall: a lone shared common word
+      // must not inject an off-topic resource into every turn context.
+      resourceMinOverlap: opts.resourceMinOverlap ?? 2,
+    });
+    if (result.hits.length === 0) return '';
+    const label: Record<string, string> = { entity: 'WHO/WHAT', resource: 'WHERE', 'tool-recall': 'HOW' };
+    const lines = ['[ALSO IN MEMORY — people/things, places, and proven tools relevant to this message]'];
+    for (const h of result.hits) {
+      lines.push(`- [${label[h.type] ?? h.type}] ${h.title}${h.snippet ? `: ${h.snippet}` : ''}`);
+    }
+    return lines.join('\n');
+  } catch { return ''; }
 }
