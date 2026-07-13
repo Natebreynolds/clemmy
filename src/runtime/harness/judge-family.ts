@@ -48,11 +48,15 @@ export function debateBrainsAvailable(): { claude: boolean; codex: boolean } {
   return { claude: claudeAvailable(), codex: codexAvailable() };
 }
 
-/** Cross-provider judging is opt-in. Default-off keeps the selected provider as
- *  the sole failure/latency domain unless the operator deliberately separates
- *  brain and judge families. */
+/** Cross-provider judging is the DEFAULT (2026-07-12): the judge should never be
+ *  the brain's own family (the "coherence trap" of correlated-error self-grading).
+ *  This is safe to default because the failure/latency concerns that kept it opt-in
+ *  are now covered — a slow primary is covered by the judge HEDGE (withJudgeHedge,
+ *  default on), and a single-provider user (no distinct family logged in) falls
+ *  back cleanly to a same-family judge tagged selfJudge in resolveBoundaryJudge.
+ *  Kill-switch CLEMMY_JUDGE_CROSS_FAMILY=off restores the sole-provider domain. */
 export function judgeCrossFamilyEnabled(): boolean {
-  return /^(1|true|on|yes)$/i.test((getRuntimeEnv('CLEMMY_JUDGE_CROSS_FAMILY', 'off') || 'off').trim());
+  return (getRuntimeEnv('CLEMMY_JUDGE_CROSS_FAMILY', 'on') || 'on').trim().toLowerCase() !== 'off';
 }
 
 /** Wall-clock cap for hot-path judge calls. Judges are advisory or fail-open at

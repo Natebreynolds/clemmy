@@ -1530,6 +1530,25 @@ export function classifyBackgroundTaskOutcome(
   return { outcome: 'done' };
 }
 
+/** The objective string the deliverable probe checks a background run against.
+ *  A GOAL-bound run uses its plan objective + success criteria (verbatim); an
+ *  AD-HOC run (no goal contract) falls back to its own prompt/title so the probe
+ *  still runs on every task, not just goal-bound ones (2026-07-13 Wave 1). Pure +
+ *  exported for the gate test. */
+export function probeObjectiveForTask(
+  task: Pick<BackgroundTaskRecord, 'prompt' | 'title'>,
+  goal: { approvedPlan?: { objective?: string; successCriteria?: string[] }; plan?: { objective?: string; successCriteria?: string[] } } | null | undefined,
+): string {
+  if (goal) {
+    const plan = goal.approvedPlan ?? goal.plan;
+    const fromPlan = [plan?.objective ?? '', ...((plan?.successCriteria ?? []) as string[])]
+      .filter((s) => typeof s === 'string' && s.trim())
+      .join('\n');
+    if (fromPlan.trim()) return fromPlan;
+  }
+  return task.prompt || task.title || '';
+}
+
 async function verifyBackgroundTaskDelivery(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title'>,
   finalText: string,
@@ -1551,12 +1570,14 @@ async function verifyBackgroundTaskDelivery(
   let probeEvidence = '';
   if (deliverableProbesEnabled()) {
     try {
-      const goal = getActiveGoalForSession(task.runSessionId);
-      if (goal) {
-        const plan = goal.approvedPlan ?? goal.plan;
-        const objective = [plan?.objective ?? '', ...((plan?.successCriteria ?? []) as string[])]
-          .filter((s) => typeof s === 'string' && s.trim())
-          .join('\n') || task.prompt || task.title || '';
+      // Objective for the deterministic artifact readback. A GOAL-bound run uses
+      // its plan objective + success criteria; an AD-HOC run (no goal contract)
+      // falls back to its own prompt/title. 2026-07-13 Wave 1: the probe caught
+      // the "shipped 5 BLANK sheets as done" class only for goal-bound runs —
+      // extend it to EVERY background task so a hollow deliverable is caught by
+      // deterministic readback, not just the (now cross-family) judge.
+      const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
+      if (objective.trim()) {
         const probe = await probeSessionDeliverables(task.runSessionId, objective);
         if (probe.failures.length > 0) {
           return coverageBlock ?? { outcome: 'blocked', reason: probe.summary.slice(0, 400) };

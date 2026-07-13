@@ -47,6 +47,13 @@ writeFileSync(
 // in scripts/verify-long-running.mjs → stall-converts-to-question.
 process.env.HARNESS_STALL_ASK_USER = 'off';
 process.env.HARNESS_MAX_STALL_RETRIES = '1';
+// Determinism: cross-family judging is now DEFAULT ON (2026-07-13), but this
+// suite tests delivery/completion mechanics, NOT judge routing. On a dev machine
+// with Claude Code logged in, judge availability falls back to ~/.claude creds
+// (NOT isolated by CLEMENTINE_HOME), so a cross-family judge would resolve LIVE
+// and make a real, nondeterministic call. Pin =off for a deterministic same-family
+// judge. Cross-family routing is covered in boundary-judge.test.ts.
+process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
 // This suite drives the loop with SCRIPTED runners that simulate tool calls by
 // emitting agent_tool_start events (no real wrapped-tool invoke). Tool-call
 // counting for those simulated calls comes from the loop's event-based fallback

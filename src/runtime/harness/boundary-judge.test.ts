@@ -17,10 +17,26 @@ import { chooseBoundaryJudgeFamily } from './debate-model.js';
 import {
   boundaryJudgeTimeoutMs,
   getJudgeMetricsSnapshot,
+  judgeCrossFamilyEnabled,
   recordJudgeMetric,
   resetJudgeMetricsForTests,
   withJudgeTimeout,
 } from './judge-family.js';
+
+test('cross-family judging is DEFAULT ON (2026-07-12) with a =off kill-switch', () => {
+  const prev = process.env.CLEMMY_JUDGE_CROSS_FAMILY;
+  try {
+    delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
+    assert.equal(judgeCrossFamilyEnabled(), true, 'unset → default on (never self-grade)');
+    process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
+    assert.equal(judgeCrossFamilyEnabled(), false, '=off → kill-switch (single-provider domain)');
+    process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'on';
+    assert.equal(judgeCrossFamilyEnabled(), true);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_JUDGE_CROSS_FAMILY;
+    else process.env.CLEMMY_JUDGE_CROSS_FAMILY = prev;
+  }
+});
 
 test('codex brain + both families → cheap CLAUDE judge (cross-family, the common-default fix)', () => {
   const t = chooseBoundaryJudgeFamily('codex', true, true);
