@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createServer } from 'node:http';
+import { createServer, type RequestListener } from 'node:http';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -94,6 +94,62 @@ function isOAuthCallbackPath(pathname: string): boolean {
   return pathname === CALLBACK_PATH || pathname === LEGACY_CALLBACK_PATH;
 }
 
+type CallbackServer = ReturnType<typeof createServer>;
+
+function closeCallbackServers(servers: CallbackServer[]): void {
+  for (const server of servers) {
+    try { server.close(); } catch { /* already closed / never opened */ }
+  }
+}
+
+function listenCallbackServer(
+  server: CallbackServer,
+  options: { port: number; host: string; ipv6Only?: boolean },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const onListening = () => { cleanup(); resolve(); };
+    const cleanup = () => {
+      server.off('error', onError);
+      server.off('listening', onListening);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(options);
+  });
+}
+
+function isUnavailableIpv6(error: unknown): boolean {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return code === 'EAFNOSUPPORT' || code === 'EADDRNOTAVAIL';
+}
+
+/** OpenAI redirects to `localhost`, which Safari may resolve as ::1 while
+ * Chromium resolves it as 127.0.0.1. Listen on both loopback families so the
+ * setup wizard works with either browser without exposing the callback on LAN. */
+async function listenOnLoopbacks(port: number, listener: RequestListener): Promise<CallbackServer[]> {
+  const ipv4 = createServer(listener);
+  try {
+    await listenCallbackServer(ipv4, { port, host: '127.0.0.1' });
+  } catch (error) {
+    closeCallbackServers([ipv4]);
+    throw error;
+  }
+
+  const address = ipv4.address();
+  const boundPort = address && typeof address === 'object' ? address.port : port;
+  const ipv6 = createServer(listener);
+  try {
+    await listenCallbackServer(ipv6, { port: boundPort, host: '::1', ipv6Only: true });
+    return [ipv4, ipv6];
+  } catch (error) {
+    closeCallbackServers([ipv6]);
+    if (isUnavailableIpv6(error)) return [ipv4];
+    closeCallbackServers([ipv4]);
+    throw error;
+  }
+}
+
 function listenForOAuthCallback(
   state: string,
   codeChallenge: string,
@@ -104,9 +160,9 @@ function listenForOAuthCallback(
     let settled = false;
     let timeout: NodeJS.Timeout | null = null;
     let lastListenError: Error | null = null;
+    let activeServers: CallbackServer[] = [];
 
     const finish = (
-      server: ReturnType<typeof createServer> | null,
       error?: Error,
       result?: OAuthCallbackResult,
     ) => {
@@ -116,11 +172,8 @@ function listenForOAuthCallback(
         clearTimeout(timeout);
         timeout = null;
       }
-      try {
-        server?.close();
-      } catch {
-        // The server may already be closed after a callback response.
-      }
+      closeCallbackServers(activeServers);
+      activeServers = [];
       if (error) reject(error);
       else if (result) resolve(result);
     };
@@ -128,14 +181,14 @@ function listenForOAuthCallback(
     const tryPort = (index: number) => {
       if (index >= CALLBACK_PORTS.length) {
         const detail = lastListenError ? ` Last error: ${lastListenError.message}` : '';
-        reject(new Error(`OAuth callback server could not bind to localhost ports ${CALLBACK_PORTS.join(', ')}.${detail}`));
+        finish(new Error(`OAuth callback server could not bind to localhost ports ${CALLBACK_PORTS.join(', ')}.${detail}`));
         return;
       }
 
       const port = CALLBACK_PORTS[index];
       const redirectUri = `http://localhost:${port}${CALLBACK_PATH}`;
       const authorizeUrl = buildAuthorizeUrl(redirectUri, state, codeChallenge, prompt);
-      const server = createServer((req, res) => {
+      const handleCallback: RequestListener = (req, res) => {
         const requestUrl = new URL(req.url ?? '/', redirectUri);
         if (!isOAuthCallbackPath(requestUrl.pathname)) {
           res.statusCode = 404;
@@ -153,33 +206,29 @@ function listenForOAuthCallback(
         res.statusCode = 200;
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.end('<html><body style="background:#07070a;color:#e5e5ea;font-family:monospace;text-align:center;padding-top:80px"><h1 style="color:#b9ff36">Sign-in completed.</h1><p>You can return to Clementine.</p></body></html>');
-        finish(server, undefined, { payload, redirectUri });
-      });
+        finish(undefined, { payload, redirectUri });
+      };
 
-      server.once('error', (error: Error & { code?: string }) => {
-        if (settled) return;
-        if (error.code === 'EADDRINUSE' || error.code === 'EACCES') {
-          lastListenError = error;
-          try {
-            server.close();
-          } catch {
-            // ignore and try the next port
-          }
-          tryPort(index + 1);
-          return;
-        }
-        finish(server, error);
-      });
-
-      server.listen(port, '127.0.0.1', () => {
+      void listenOnLoopbacks(port, handleCallback).then((servers) => {
+        if (settled) { closeCallbackServers(servers); return; }
+        activeServers = servers;
+        for (const server of servers) server.once('error', (error) => finish(error));
         timeout = setTimeout(() => {
-          finish(server, new Error('OAuth login timed out after 15 minutes.'));
+          finish(new Error('OAuth login timed out after 15 minutes.'));
         }, LOGIN_TIMEOUT_MS);
 
         Promise.resolve(openUrl(authorizeUrl.toString())).catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
-          finish(server, new Error(`Could not open the browser for OAuth login: ${message}`));
+          finish(new Error(`Could not open the browser for OAuth login: ${message}`));
         });
+      }).catch((error: Error & { code?: string }) => {
+        if (settled) return;
+        if (error.code === 'EADDRINUSE' || error.code === 'EACCES') {
+          lastListenError = error;
+          tryPort(index + 1);
+          return;
+        }
+        finish(error);
       });
     };
 
@@ -434,11 +483,7 @@ function atomicWriteJson(filePath: string, value: unknown): void {
   try { chmodSync(filePath, 0o600); } catch { /* best-effort; rename usually preserves the mode */ }
 }
 
-/**
- * Write the tokens to both the daemon's local auth store and the codex
- * CLI compatibility file, matching the shape the daemon's
- * `loginWithNativeOAuth` writes.
- */
+/** Write the tokens to Clementine's private auth store. */
 export function persistCodexOAuthTokens(tokens: CodexOAuthTokens): void {
   const localState = {
     importedAt: new Date().toISOString(),

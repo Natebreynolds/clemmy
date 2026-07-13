@@ -173,18 +173,11 @@ try {
   if (persist.ok) ok(`auth-store.loginWithNativeOAuth: ${persist.message}`);
   else fail(`auth-store.loginWithNativeOAuth failed: ${persist.message}`);
 
-  if (existsSync(codexAuthFile)) {
-    const mode = statSync(codexAuthFile).mode & 0o777;
-    if (mode === 0o600) ok(`codex auth.json written 0o600 (got ${mode.toString(8)})`);
-    else fail(`codex auth.json mode is ${mode.toString(8)}, expected 600`);
-    const data = JSON.parse(readFileSync(codexAuthFile, 'utf-8'));
-    if (data.tokens?.access_token === FAKE_ACCESS_TOKEN) ok('persisted auth.json has access_token');
-    else fail('persisted auth.json missing access_token');
-    if (data.tokens?.refresh_token === FAKE_REFRESH_TOKEN) ok('persisted auth.json has refresh_token');
-    else fail('persisted auth.json missing refresh_token');
-  } else {
-    fail(`codex auth.json not written to ${codexAuthFile}`);
-  }
+  // Clementine must keep its rotating refresh-token family independent from
+  // the external Codex CLI. Writing this compatibility file lets either app
+  // consume the other's refresh token and can revoke the shared family.
+  if (!existsSync(codexAuthFile)) ok('external Codex CLI auth.json remains untouched');
+  else fail(`Clementine unexpectedly wrote the external Codex CLI auth file: ${codexAuthFile}`);
 
   const localAuthFile = path.join(tmpHome, '.clementine-next', 'state', 'auth.json');
   if (existsSync(localAuthFile)) {

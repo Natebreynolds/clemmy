@@ -93,6 +93,8 @@ let splashWindow: BrowserWindow | null = null;
 let setupWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let dashboardUrl = '';
+let pendingDashboardUrl = '';
+let dashboardNavigationGeneration = 0;
 let recallCapture: RecallDesktopCapture | null = null;
 let quitPrepared = false;
 
@@ -127,13 +129,47 @@ let cachedWebhookSecret = '';
 
 type RendererSurface = 'dashboard' | 'setup' | 'splash';
 
-function dashboardOrigin(): string | null {
-  if (!dashboardUrl) return null;
-  try {
-    return new URL(dashboardUrl).origin;
-  } catch {
-    return null;
+function dashboardOrigins(): Set<string> {
+  const origins = new Set<string>();
+  for (const rawUrl of [dashboardUrl, pendingDashboardUrl]) {
+    if (!rawUrl) continue;
+    try { origins.add(new URL(rawUrl).origin); }
+    catch { /* ignore invalid transition URLs */ }
   }
+  return origins;
+}
+
+function currentSupervisorDashboardUrl(): string {
+  if (!supervisor?.getPort()) return dashboardUrl;
+  return supervisor.getDashboardUrl(getWebhookSecret());
+}
+
+function repointDashboardToLiveDaemon(): void {
+  const nextUrl = currentSupervisorDashboardUrl();
+  if (!nextUrl) return;
+  const navigationGeneration = ++dashboardNavigationGeneration;
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) {
+    dashboardUrl = nextUrl;
+    pendingDashboardUrl = '';
+    return;
+  }
+
+  // Keep both the old and new origins trusted while Electron performs the
+  // main-process-owned navigation. Commit the new origin only after loadURL
+  // succeeds, so a failed load leaves the old renderer able to use recovery
+  // IPC. Reload even when the port is unchanged: a ready event means a new
+  // daemon instance and its page/session should be bootstrapped afresh.
+  pendingDashboardUrl = nextUrl;
+  void win.loadURL(nextUrl).then(() => {
+    if (dashboardNavigationGeneration !== navigationGeneration) return;
+    dashboardUrl = nextUrl;
+    pendingDashboardUrl = '';
+  }).catch((error) => {
+    if (dashboardNavigationGeneration === navigationGeneration) pendingDashboardUrl = '';
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[main] failed to reconnect dashboard to live daemon:', redactSensitiveText(message));
+  });
 }
 
 function isSafeExternalHttps(rawUrl: string): boolean {
@@ -182,8 +218,7 @@ function senderSurface(url: string): RendererSurface | null {
       const setupRoot = path.join(app.getPath('userData'), 'wizard');
       if (filePath.startsWith(setupRoot + path.sep) || filePath === path.join(setupRoot, 'setup.html')) return 'setup';
     }
-    const origin = dashboardOrigin();
-    if (origin && parsed.origin === origin) return 'dashboard';
+    if (dashboardOrigins().has(parsed.origin)) return 'dashboard';
   } catch {
     return null;
   }
@@ -773,6 +808,10 @@ async function launchDaemon(): Promise<void> {
       splashWindow?.webContents.executeJavaScript(
         `window.dispatchEvent(new CustomEvent('supervisor', { detail: ${JSON.stringify(event)} }));`,
       ).catch(() => { /* splash gone */ });
+      // A crash/restart can select a different free port. Keep the canonical
+      // URL current and move an already-open dashboard off the dead origin as
+      // soon as the replacement daemon is ready.
+      if (event.type === 'ready') repointDashboardToLiveDaemon();
       rebuildTrayMenu();
       showSupervisorEventNotification(event);
     },
@@ -794,7 +833,7 @@ async function launchDaemon(): Promise<void> {
     // Surface real renderer failures (rare) so a packaged user can see
     // them in Console.app instead of staring at a blank window.
     mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
-      console.error('[main] renderer did-fail-load', code, desc, url);
+      console.error('[main] renderer did-fail-load', code, desc, redactSensitiveText(url));
     });
     mainWindow.webContents.on('render-process-gone', (_e, details) => {
       console.error('[main] renderer process gone', JSON.stringify(details));
@@ -843,7 +882,7 @@ ipcMain.handle('clemmy:supervisor-status', (evt: IpcMainInvokeEvent) => {
   return {
   running: supervisor?.isRunning() ?? false,
   port: supervisor?.getPort() ?? 0,
-  url: dashboardUrl,
+  url: currentSupervisorDashboardUrl(),
   };
 });
 

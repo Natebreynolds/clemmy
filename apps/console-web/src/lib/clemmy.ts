@@ -12,7 +12,7 @@ export interface UpdaterEvent {
 }
 
 interface ClemmyBridge {
-  supervisorStatus?: () => Promise<unknown>;
+  supervisorStatus?: () => Promise<{ running: boolean; port: number; url: string }>;
   restartDaemon?: () => Promise<unknown>;
   openLogs?: () => Promise<unknown>;
   updaterStatus?: () => Promise<unknown>;

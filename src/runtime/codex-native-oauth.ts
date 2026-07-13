@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createServer } from 'node:http';
+import { createServer, type RequestListener } from 'node:http';
 import { spawn } from 'node:child_process';
 
 // CODEX_OAUTH_AUTH_BASE_URL overrides the base URL for local testing
@@ -79,6 +79,63 @@ function isOAuthCallbackPath(pathname: string): boolean {
   return pathname === CALLBACK_PATH || pathname === LEGACY_CALLBACK_PATH;
 }
 
+type CallbackServer = ReturnType<typeof createServer>;
+
+function closeCallbackServers(servers: CallbackServer[]): void {
+  for (const server of servers) {
+    try { server.close(); } catch { /* already closed / never opened */ }
+  }
+}
+
+function listenCallbackServer(
+  server: CallbackServer,
+  options: { port: number; host: string; ipv6Only?: boolean },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const onListening = () => { cleanup(); resolve(); };
+    const cleanup = () => {
+      server.off('error', onError);
+      server.off('listening', onListening);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(options);
+  });
+}
+
+function isUnavailableIpv6(error: unknown): boolean {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return code === 'EAFNOSUPPORT' || code === 'EADDRNOTAVAIL';
+}
+
+/** Bind the OAuth callback to BOTH loopback families. The redirect URI must
+ * remain `localhost` for OpenAI's registered public client, but browsers may
+ * resolve that name to either 127.0.0.1 or ::1. Binding only IPv4 caused Safari
+ * to finish authorization and then show "can't connect to localhost". */
+async function listenOnLoopbacks(port: number, listener: RequestListener): Promise<CallbackServer[]> {
+  const ipv4 = createServer(listener);
+  try {
+    await listenCallbackServer(ipv4, { port, host: '127.0.0.1' });
+  } catch (error) {
+    closeCallbackServers([ipv4]);
+    throw error;
+  }
+
+  const address = ipv4.address();
+  const boundPort = address && typeof address === 'object' ? address.port : port;
+  const ipv6 = createServer(listener);
+  try {
+    await listenCallbackServer(ipv6, { port: boundPort, host: '::1', ipv6Only: true });
+    return [ipv4, ipv6];
+  } catch (error) {
+    closeCallbackServers([ipv6]);
+    if (isUnavailableIpv6(error)) return [ipv4];
+    closeCallbackServers([ipv4]);
+    throw error;
+  }
+}
+
 function openBrowser(url: string): void {
   const platform = process.platform;
   if (platform === 'darwin') {
@@ -99,9 +156,9 @@ function listenForOAuthCallback(state: string, codeChallenge: string, opener?: B
     let settled = false;
     let timeout: NodeJS.Timeout | null = null;
     let lastListenError: Error | null = null;
+    let activeServers: CallbackServer[] = [];
 
     const finish = (
-      server: ReturnType<typeof createServer> | null,
       error?: Error,
       result?: OAuthCallbackResult,
     ) => {
@@ -111,11 +168,8 @@ function listenForOAuthCallback(state: string, codeChallenge: string, opener?: B
         clearTimeout(timeout);
         timeout = null;
       }
-      try {
-        server?.close();
-      } catch {
-        // The server may already be closed after a callback response.
-      }
+      closeCallbackServers(activeServers);
+      activeServers = [];
       if (error) reject(error);
       else if (result) resolve(result);
     };
@@ -123,14 +177,14 @@ function listenForOAuthCallback(state: string, codeChallenge: string, opener?: B
     const tryPort = (index: number) => {
       if (index >= CALLBACK_PORTS.length) {
         const detail = lastListenError ? ` Last error: ${lastListenError.message}` : '';
-        reject(new Error(`Native OAuth callback server could not bind to localhost ports ${CALLBACK_PORTS.join(', ')}.${detail}`));
+        finish(new Error(`Native OAuth callback server could not bind to localhost ports ${CALLBACK_PORTS.join(', ')}.${detail}`));
         return;
       }
 
       const port = CALLBACK_PORTS[index];
       const redirectUri = `http://localhost:${port}${CALLBACK_PATH}`;
       const authorizeUrl = buildAuthorizeUrl(redirectUri, state, codeChallenge);
-      const server = createServer((req, res) => {
+      const handleCallback: RequestListener = (req, res) => {
         const requestUrl = new URL(req.url ?? '/', redirectUri);
         if (!isOAuthCallbackPath(requestUrl.pathname)) {
           res.statusCode = 404;
@@ -148,27 +202,15 @@ function listenForOAuthCallback(state: string, codeChallenge: string, opener?: B
         res.statusCode = 200;
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.end('<html><body><h1>Sign-in completed.</h1><p>You can return to Clementine.</p></body></html>');
-        finish(server, undefined, { payload, redirectUri });
-      });
+        finish(undefined, { payload, redirectUri });
+      };
 
-      server.once('error', (error: Error & { code?: string }) => {
-        if (settled) return;
-        if (error.code === 'EADDRINUSE' || error.code === 'EACCES') {
-          lastListenError = error;
-          try {
-            server.close();
-          } catch {
-            // ignore and try the next port
-          }
-          tryPort(index + 1);
-          return;
-        }
-        finish(server, error);
-      });
-
-      server.listen(port, '127.0.0.1', () => {
+      void listenOnLoopbacks(port, handleCallback).then((servers) => {
+        if (settled) { closeCallbackServers(servers); return; }
+        activeServers = servers;
+        for (const server of servers) server.once('error', (error) => finish(error));
         timeout = setTimeout(() => {
-          finish(server, new Error('Native OAuth login timed out after 15 minutes.'));
+          finish(new Error('Native OAuth login timed out after 15 minutes.'));
         }, LOGIN_TIMEOUT_MS);
         try {
           const launch = opener ?? openBrowser;
@@ -176,13 +218,21 @@ function listenForOAuthCallback(state: string, codeChallenge: string, opener?: B
           if (result && typeof (result as Promise<void>).catch === 'function') {
             (result as Promise<void>).catch((error: unknown) => {
               const message = error instanceof Error ? error.message : String(error);
-              finish(server, new Error(`Could not open the browser for native OAuth login: ${message}`));
+              finish(new Error(`Could not open the browser for native OAuth login: ${message}`));
             });
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          finish(server, new Error(`Could not open the browser for native OAuth login: ${message}`));
+          finish(new Error(`Could not open the browser for native OAuth login: ${message}`));
         }
+      }).catch((error: Error & { code?: string }) => {
+        if (settled) return;
+        if (error.code === 'EADDRINUSE' || error.code === 'EACCES') {
+          lastListenError = error;
+          tryPort(index + 1);
+          return;
+        }
+        finish(error);
       });
     };
 
@@ -426,3 +476,5 @@ export async function loginWithNativeCodexOAuth(opener?: BrowserOpener): Promise
 
   return exchangeAuthorizationCode(callback.code, redirectUri, codeVerifier);
 }
+
+export const __test__ = { listenOnLoopbacks };
