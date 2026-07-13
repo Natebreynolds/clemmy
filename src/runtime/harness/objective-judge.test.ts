@@ -7,7 +7,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, parseCompletionVerdict } = await import('./objective-judge.js');
+const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, parseCompletionVerdict, parseProgressVerdict } = await import('./objective-judge.js');
+
+test('parseProgressVerdict: PROGRESS/STUCK single-line verdicts (Wave 3 self-resume)', () => {
+  assert.deepEqual(parseProgressVerdict('PROGRESS: fetched 12 new firm records this cycle'), { progressing: true, reason: 'fetched 12 new firm records this cycle' });
+  assert.deepEqual(parseProgressVerdict('STUCK: re-running the same failing search'), { progressing: false, reason: 're-running the same failing search' });
+  assert.equal(parseProgressVerdict('PROGRESSING nicely toward the sheet')?.progressing, true);
+  assert.equal(parseProgressVerdict('STOP — no new output')?.progressing, false);
+  assert.equal(parseProgressVerdict('PARK: looping')?.progressing, false);
+  assert.equal(parseProgressVerdict('some unparseable blob'), null);
+  assert.equal(parseProgressVerdict(''), null);
+});
 
 const baseGate = {
   optIn: true,

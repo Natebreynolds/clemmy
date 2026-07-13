@@ -34,6 +34,7 @@ import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
+import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
@@ -196,6 +197,44 @@ const BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP = (() => {
   if (Number.isNaN(raw)) return 4;
   return Math.max(0, Math.min(24, raw));
 })();
+// Wave 3 Move A: past the free auto-continue cap, a run that is VERIFIABLY
+// PROGRESSING (independent cross-family progress judge) may self-resume up to this
+// HARD ceiling instead of parking awaiting_continue — so a genuinely-advancing
+// 60-min task finishes unattended. Absolute bounds remain: the 240-min wall clock
+// (shouldCancel) and this ceiling; the judge FAILS CLOSED (park) on any doubt.
+// Kill-switch CLEMMY_BACKGROUND_SELF_RESUME=off restores hard-park at the cap.
+const BACKGROUND_SELF_RESUME_HARD_CAP = (() => {
+  const raw = parseInt(process.env.CLEMMY_BACKGROUND_SELF_RESUME_CAP || '', 10);
+  if (Number.isNaN(raw)) return 24;
+  return Math.max(BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP, Math.min(200, raw));
+})();
+function backgroundSelfResumeEnabled(): boolean {
+  return (process.env.CLEMMY_BACKGROUND_SELF_RESUME ?? 'on').toLowerCase() !== 'off';
+}
+
+/** PURE decision for whether a budget-exhausted background run should self-resume,
+ *  BEFORE the (expensive, network) progress judge. Returns a concrete resume/park
+ *  verdict for the cheap cases, or {needJudge:true} when only an independent
+ *  progress judge can decide. Fail-safe by construction: disabled, at the hard
+ *  ceiling, or a cycle with no new tool activity all → park. Exported + tested. */
+export function selfResumeDecision(p: {
+  enabled: boolean;
+  autoContinueAttempts: number;
+  hardCap: number;
+  cycleToolCalls: number;
+}): { resume?: boolean; needJudge?: boolean; reason: string } {
+  if (!p.enabled) return { resume: false, reason: 'self-resume disabled' };
+  if (p.autoContinueAttempts >= p.hardCap) return { resume: false, reason: `hard self-resume ceiling reached (${p.hardCap})` };
+  if (p.cycleToolCalls <= 0) return { resume: false, reason: 'no new tool activity this cycle' };
+  return { needJudge: true, reason: 'progress check required' };
+}
+
+/** Test seam for the progress judge (a real cross-family model call in prod). */
+type RunProgressJudgeFn = typeof judgeRunProgress;
+let runProgressJudgeImpl: RunProgressJudgeFn = judgeRunProgress;
+export function _setRunProgressJudgeForTests(fn: RunProgressJudgeFn | null): void {
+  runProgressJudgeImpl = fn ?? judgeRunProgress;
+}
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
 let backgroundProcessorInFlight = false;
 
@@ -248,7 +287,8 @@ type BackgroundTaskOperationalType =
   | 'background_task_created'
   | 'background_task_started'
   | 'background_task_finished'
-  | 'background_task_parked';
+  | 'background_task_parked'
+  | 'background_self_resume_check';
 
 function emitBackgroundTaskOperational(
   type: BackgroundTaskOperationalType,
@@ -2202,6 +2242,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      }
 	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
 	      let autoContinueAttempts = 0;
+	      let toolCountAtLastCap = 0; // Wave 3: tool activity at each budget cycle
 	      let response: AssistantResponse;
 	      while (true) {
 	        // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
@@ -2272,9 +2313,29 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        task = recordBackgroundTaskRoute(task, run.id, response, requestedModel);
 
 	        if (response.stoppedReason !== 'max-turns-with-grace') break;
-	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) break;
+	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) {
+	          // Wave 3 Move A: past the free auto-continue cap, SELF-RESUME only if an
+	          // independent cross-family judge confirms genuine PROGRESS, under the hard
+	          // ceiling, with new tool activity — else park (baseline). Cheap checks first
+	          // (selfResumeDecision, pure/tested); the judge fails CLOSED (park). The
+	          // 240-min wall clock bounds everything regardless.
+	          const cycleToolCalls = toolCount - toolCountAtLastCap;
+	          const dec = selfResumeDecision({ enabled: backgroundSelfResumeEnabled(), autoContinueAttempts, hardCap: BACKGROUND_SELF_RESUME_HARD_CAP, cycleToolCalls });
+	          let selfResumeOk = dec.resume === true;
+	          let progressReason = dec.reason;
+	          if (dec.needJudge) {
+	            const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
+	            const prog = await runProgressJudgeImpl(objective, response.text ?? '', cycleToolCalls);
+	            selfResumeOk = prog.verdict?.progressing === true;
+	            progressReason = prog.verdict?.reason ?? `progress judge ${prog.failure ?? 'no-verdict'} → park`;
+	            emitBackgroundTaskOperational('background_self_resume_check', task, { progressing: selfResumeOk, attempt: autoContinueAttempts, hardCap: BACKGROUND_SELF_RESUME_HARD_CAP, cycleToolCalls, reason: progressReason, selfJudge: prog.selfJudge, judgeFailure: prog.failure ?? null }, selfResumeOk ? 'info' : 'warn');
+	          }
+	          addRunEvent(run.id, { type: 'status', message: `Self-resume at continue ${autoContinueAttempts}: ${selfResumeOk ? 'PROGRESSING → continuing unattended' : 'STOP → parking'} — ${progressReason}`, data: { selfResume: selfResumeOk, autoContinueAttempts, reason: progressReason, cycleToolCalls } });
+	          if (!selfResumeOk) break;
+	        }
 	        clearLedger(task.runSessionId);
 	        autoContinueAttempts += 1;
+	        toolCountAtLastCap = toolCount;
 	        addRunEvent(run.id, {
 	          type: 'status',
 	          message: `Background task hit an internal run budget; continuing automatically (${autoContinueAttempts}/${BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP}).`,

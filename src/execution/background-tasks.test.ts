@@ -53,6 +53,7 @@ const {
   sweepInvalidDoneBackgroundTasks,
   replayBackgroundTaskReportBack,
   probeObjectiveForTask,
+  selfResumeDecision,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -66,6 +67,21 @@ const { runBackgroundTaskWatchdog } = await import('./background-task-watchdog.j
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('selfResumeDecision (Wave 3): fail-safe cheap checks + defer to judge only when warranted', () => {
+  const base = { enabled: true, autoContinueAttempts: 4, hardCap: 24, cycleToolCalls: 5 };
+  // Genuinely-continuable case → the (expensive) progress judge decides.
+  assert.deepEqual(selfResumeDecision(base), { needJudge: true, reason: 'progress check required' });
+  // Kill-switch off → park, no judge.
+  assert.equal(selfResumeDecision({ ...base, enabled: false }).resume, false);
+  assert.equal(selfResumeDecision({ ...base, enabled: false }).needJudge, undefined);
+  // Hard ceiling → park, no judge (absolute bound even while "progressing").
+  assert.equal(selfResumeDecision({ ...base, autoContinueAttempts: 24 }).resume, false);
+  assert.match(selfResumeDecision({ ...base, autoContinueAttempts: 24 }).reason, /ceiling/);
+  // No new tool activity this cycle → park without spending a judge call.
+  assert.equal(selfResumeDecision({ ...base, cycleToolCalls: 0 }).resume, false);
+  assert.equal(selfResumeDecision({ ...base, cycleToolCalls: 0 }).needJudge, undefined);
 });
 
 test('probeObjectiveForTask: goal-bound uses plan objective+criteria; ad-hoc (no goal) falls back to prompt/title', () => {

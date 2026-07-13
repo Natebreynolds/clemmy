@@ -134,6 +134,7 @@ export const HARNESS_OPERATIONAL_EVENT_TYPES = [
   'background_task_started',
   'background_task_finished',
   'background_task_parked',
+  'background_self_resume_check',
 ] as const;
 
 // Scheduler (cron) run lifecycle — direct emits from the daemon runner.
