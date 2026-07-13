@@ -33,6 +33,7 @@ import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proacti
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { verifyFanoutItems, fanoutItemVerifyEnabled } from '../runtime/harness/fanout-item-verify.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -1607,6 +1608,22 @@ async function verifyBackgroundTaskDelivery(
 ): Promise<{ outcome: 'done' | 'blocked'; reason?: string }> {
   const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
   if (classified.outcome === 'blocked') return classified;
+
+  // Wave 4 Stage 2 — per-item verification of the fan-out worker OUTPUTS (anti-
+  // silent-success). A zero-LLM tripwire flags hollow / blocked / off-objective /
+  // unsupported ok-status worker outputs; ONE batched cross-family judge confirms
+  // the flagged subset; a confirmed fabrication is recorded as worker_result
+  // ok:false so the coverage read below counts it failed (honest "M of N"). Reduce-
+  // time + fail-open — never touches the hot fan-out return path. Kill-switch
+  // CLEMMY_FANOUT_ITEM_VERIFY. Runs BEFORE the coverage read so its verdicts land.
+  if (fanoutItemVerifyEnabled()) {
+    try {
+      const verifyObjective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
+      if (verifyObjective.trim()) await verifyFanoutItems(task.runSessionId, verifyObjective);
+    } catch {
+      // A verify hiccup must NEVER block a run — fall through to the existing checks.
+    }
+  }
 
   const coverageBlock = fanoutCoverageBlock(task.runSessionId);
 
