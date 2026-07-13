@@ -21,7 +21,31 @@ process.env.SLACK_ALLOWED_USERS = 'U_PRIMARY';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { getNotificationDestinationsForRecord } = await import('./notifications.js');
+const { getNotificationDestinationsForRecord, upsertWebPushDestination, removeWebPushDestinationByEndpoint } = await import('./notifications.js');
+
+test('Wave 3 Move B: a TERMINAL origin_chat report-back pings the user\'s own web-push devices; non-terminal + kill-switch stay silent', () => {
+  const endpoint = 'https://push.example/dev1';
+  upsertWebPushDestination({ endpoint, p256dh: 'k', auth: 'a', deviceId: 'dev1' });
+  try {
+    const origin = (extra: Record<string, unknown>) => getNotificationDestinationsForRecord(
+      record({ reportBackTargetType: 'origin_chat', ...extra }),
+    );
+    // Terminal completion → the user's registered devices get pinged (never a channel).
+    assert.deepEqual(origin({ terminalReportBack: true }).map((d) => d.type), ['web_push'], 'terminal report-back pings web-push only');
+    // A non-terminal in-app notification (heartbeat/progress) stays silent.
+    assert.equal(origin({}).length, 0, 'non-terminal origin_chat notification pushes nothing');
+    // Kill-switch restores the silent behavior even for a terminal report-back.
+    const prev = process.env.CLEMMY_REPORTBACK_PUSH;
+    process.env.CLEMMY_REPORTBACK_PUSH = 'off';
+    try {
+      assert.equal(origin({ terminalReportBack: true }).length, 0, 'kill-switch off → no web-push');
+    } finally {
+      if (prev === undefined) delete process.env.CLEMMY_REPORTBACK_PUSH; else process.env.CLEMMY_REPORTBACK_PUSH = prev;
+    }
+  } finally {
+    removeWebPushDestinationByEndpoint(endpoint); // isolation: don't leak into the parity tests
+  }
+});
 
 function record(metadata?: Record<string, unknown>, silent = false) {
   return {

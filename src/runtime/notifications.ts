@@ -640,7 +640,20 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
   // Origin-chat report-back is delivered into the chat transcript, not pushed to
   // any external surface — resolve ZERO destinations so it never falls through to
   // the Discord/Slack DM fallback below.
-  if (metadata.reportBackTargetType === 'origin_chat') return [];
+  if (metadata.reportBackTargetType === 'origin_chat') {
+    // Wave 3 Move B: a TERMINAL report-back (done/blocked/failed) still pings the
+    // user's OWN registered devices (web-push) so an away user learns their task
+    // finished, instead of the completion sitting unseen in the transcript until
+    // the watchdog replay (3min–12h later). Web-push targets the user's own
+    // devices only (never a Discord/Slack channel they didn't choose), and only
+    // for terminal report-backs (heartbeats/progress stay silent).
+    // Kill-switch CLEMMY_REPORTBACK_PUSH=off.
+    if (metadata.terminalReportBack === true
+      && (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() !== 'off') {
+      return listNotificationDestinations().filter((e) => e.enabled && e.type === 'web_push');
+    }
+    return [];
+  }
   const configured = listNotificationDestinations().filter((entry) => entry.enabled);
   const explicitDiscordUserId = typeof metadata.discordUserId === 'string' ? metadata.discordUserId : '';
   const explicitDiscordChannelId = typeof metadata.discordChannelId === 'string' ? metadata.discordChannelId : '';

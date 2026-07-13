@@ -1260,6 +1260,7 @@ export function replayBackgroundTaskReportBack(
       status: task.status,
       reportBackReplay: true,
       replayReason,
+      terminalReportBack: true,
     }),
   });
 
@@ -1296,7 +1297,7 @@ export function markBackgroundTaskDone(
       body: truncateResultBody(notificationBody),
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated),
+      metadata: taskNotificationMetadata(updated, { terminalReportBack: true }),
     });
     // Async report-back: also feed the result into the origin session's
     // context so Clementine resumes from it, not just a notification.
@@ -1437,7 +1438,7 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
       ].join('\n'),
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated, { status: 'blocked', blockerType }),
+      metadata: taskNotificationMetadata(updated, { status: 'blocked', blockerType, terminalReportBack: true }),
     });
     // Report-back without fail: a BLOCKED task must reach Clementine's context,
     // not just a notification — so she can surface the blocker or resolve it.
@@ -1462,7 +1463,7 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
       body: updated.error ?? status,
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated),
+      metadata: taskNotificationMetadata(updated, { status, terminalReportBack: true }),
     });
     // Report-back without fail: a genuine FAILURE re-enters the origin session
     // so Clementine can retry/adjust or tell the user. Skip 'interrupted'
