@@ -27,7 +27,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { attachEventLogHooks, extractSessionIdFromContext } = await import('./hooks.js');
-const { resetEventLog, createSession, listEvents } = await import('./eventlog.js');
+const { resetEventLog, createSession, listEvents, appendEvent } = await import('./eventlog.js');
 const { summarizeLedger, clearLedger } = await import('./fanout-ledger.js');
 const { classifyBackgroundTaskOutcome } = await import('../../execution/background-tasks.js');
 const { normalizeWorkerOutput } = await import('../../agents/worker-output.js');
@@ -84,6 +84,10 @@ test('synthetic fan-out: failing items are counted failed, siblings done, run re
     const normalized = normalizeWorkerOutput(raw);
     stub.emit('agent_tool_end', ctx(runSessionId), { name: 'orchestrator' }, { name: 'run_worker' },
       normalized, { toolCall: { callId } });
+    // The run_worker HANDLER (worker-tools / orchestrator) also emits a durable
+    // worker_result on every outcome — coverage now reads THAT log (Wave 4 Stage 1).
+    appendEvent({ sessionId: runSessionId, turn: 0, role: 'system', type: 'worker_result',
+      data: { item, ok: !/^\s*ERROR:/i.test(normalized), lane: 'orchestrator' } });
   }
 
   // (a)+(b): coverage counts — 3 failed (2 explicit ERROR + 1 turn-cap), 7 done.
@@ -121,6 +125,8 @@ test('synthetic fan-out: a fully-successful batch still reports done', () => {
       { toolCall: { callId, arguments: JSON.stringify({ item: `Firm ${i}` }) } });
     stub.emit('agent_tool_end', ctx(runSessionId), { name: 'orchestrator' }, { name: 'run_worker' },
       `Enriched Firm ${i}`, { toolCall: { callId } });
+    appendEvent({ sessionId: runSessionId, turn: 0, role: 'system', type: 'worker_result',
+      data: { item: `Firm ${i}`, ok: true, lane: 'orchestrator' } });
   }
   assert.equal(summarizeLedger(runSessionId).failed, 0);
   assert.equal(classifyBackgroundTaskOutcome({ runSessionId }, 'All done.').outcome, 'done');

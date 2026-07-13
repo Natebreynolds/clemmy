@@ -1300,6 +1300,38 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         args,
         mcp: true,
       });
+      // Wave 4 Stage 1 (adversarial review finding G): record an irreversible SEND
+      // in the SHARED external_write ledger PRE-dispatch — mirroring the composio
+      // and shell paths — so a throw AFTER the backend already committed (timeout /
+      // dropped response / 5xx-after-send, a routine network mode) still leaves a
+      // ledger entry and the duplicate-send wall refuses a re-send on resume.
+      // Previously the ledger entry was written ONLY on the return path below, so a
+      // throw-after-commit left NO entry → a real irreversible double-send on the
+      // exact autonomous-resume flow Wave 4 relies on. Conservative: a send that
+      // truly never left over-blocks its own retry (the safe direction, matching
+      // compensateFailedExternalWrite's "anything ambiguous stays counted"). Only
+      // irreversible sends are pre-recorded; reversible integrity writes keep the
+      // post-dispatch record. Best-effort — telemetry must never block the send.
+      let preRecordedSend = false;
+      if (needsIntegrityChecks && isIrreversibleSend && integritySessionId) {
+        try {
+          appendEvent({
+            sessionId: integritySessionId,
+            turn: 0,
+            role: 'system',
+            type: 'external_write',
+            data: {
+              shapeKey: integrityShapeKey,
+              toolName,
+              irreversible: true,
+              mcp: true,
+              preDispatch: true,
+              targets: extractDuplicateIdentityKeys(args ?? {}).slice(0, 8),
+            },
+          });
+          preRecordedSend = true;
+        } catch { /* telemetry write must never block the send */ }
+      }
       try {
         // Forward to the underlying server with the ORIGINAL tool name.
         const rawResult = await server.callTool(parsed.toolName, args);
@@ -1315,10 +1347,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
         const result = clipMcpResultForRecall(toolName, normalized.result);
-        // Record the irreversible send in the SHARED external_write ledger so a
-        // later same-shape send (composio OR MCP) to the same target gets the
-        // duplicate bump. Best-effort; telemetry must never affect the result.
-        if (needsIntegrityChecks && integritySessionId) {
+        // Record the write in the SHARED external_write ledger so a later
+        // same-shape send (composio OR MCP) to the same target gets the duplicate
+        // bump. An irreversible send was already recorded PRE-dispatch above
+        // (finding G) — skip the double-record for it; reversible integrity writes
+        // record here on the return path. Best-effort; must never affect the result.
+        if (needsIntegrityChecks && integritySessionId && !preRecordedSend) {
           try {
             appendEvent({
               sessionId: integritySessionId,
@@ -1344,6 +1378,27 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
+        // Finding G: the send may have COMMITTED before the transport threw
+        // (timeout / dropped response). The pre-recorded external_write STAYS so a
+        // resume re-send is refused; leave an orphan marker for the audit /
+        // reconciliation trail (mirrors the composio external_write_orphaned path).
+        // NOT compensated — a throw is ambiguous, so the write stays counted.
+        if (preRecordedSend && integritySessionId && !(err instanceof BoundaryError)) {
+          try {
+            appendEvent({
+              sessionId: integritySessionId,
+              turn: 0,
+              role: 'system',
+              type: 'external_write_orphaned',
+              data: {
+                shapeKey: integrityShapeKey,
+                toolName,
+                mcp: true,
+                reason: (err instanceof Error ? err.message : String(err)).slice(0, 200),
+              },
+            });
+          } catch { /* telemetry write must never block */ }
+        }
         if (!(err instanceof BoundaryError) && isInvalidMcpCallResultValidationError(err)) {
           const msg = err instanceof Error ? err.message : String(err);
           const result = makeInvalidMcpResult(toolName, msg);

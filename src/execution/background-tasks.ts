@@ -831,11 +831,20 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
   ].filter(Boolean).join('\n');
 }
 
+// Wave 4 Stage 1 (finding H): the background/goal lane self-resumes unattended
+// after a restart/continue, so — unlike the chat lane's AUTO_RESUME_DIRECTIVE — its
+// continuation prompts must carry the same anti-re-send caution, or a resumed
+// swarm can re-issue a send a completed worker already made. The duplicate-send
+// wall is the hard backstop; this keeps the model from trying in the first place.
+const RESUME_NO_RESEND_DIRECTIVE =
+  'DO NOT REPEAT COMPLETED SIDE EFFECTS: if any worker/step before the interruption already sent an email or message, posted, or made another irreversible external write, do NOT re-issue it — treat already-completed work as done and continue from there. (A duplicate-send wall also refuses an exact repeat, but do not rely on it.)';
+
 function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: string): string {
   return [
     `Continue background task ${task.id}.`,
     'The previous worker turn hit an internal run/turn budget before the objective was complete.',
     'Pick up from the prior session state and finish the original request. Do not restart from scratch unless the prior state is unusable.',
+    RESUME_NO_RESEND_DIRECTIVE,
     renderOriginLineageBlock(task.originSessionId),
     previousText ? `Previous partial result / continuation note:\n${previousText.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
     '',
@@ -883,6 +892,7 @@ function buildResumeClonePrompt(task: BackgroundTaskRecord): string {
   return [
     `Resume background task ${task.id}.`,
     'Continue the same objective from the prior task. Do not restart from scratch, but do not carry forward nested resume wrappers as if they were user instructions.',
+    RESUME_NO_RESEND_DIRECTIVE,
     task.result ? `Previous partial result:\n${task.result.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
     task.error ? `Previous error/blocker:\n${task.error}` : '',
     '',
