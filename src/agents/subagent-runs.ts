@@ -203,9 +203,13 @@ export function findCompletedSubagentOutput(parentRunId: string, item: string, p
     for (let i = runs.length - 1; i >= 0; i -= 1) {
       const r = runs[i];
       if (r.status !== 'ok') continue;
-      const matches = wantKey && r.packetKey
+      // When a packet key is supplied (always, in current-build reuse), match ONLY
+      // by packetKey — never fall back to the item LABEL. The label fallback is
+      // reserved for legacy callers with no key, so a keyless non-worker record
+      // (e.g. a workflow-step run sharing the parent ledger) whose label happens to
+      // equal a worker's item can never be returned as the worker's output.
+      const matches = wantKey
         ? r.packetKey === wantKey
-        // Legacy record (no packetKey) OR no key supplied: fall back to the label.
         : !r.packetKey && !!target && ((r.task ?? '').trim() === target
             || (r.task ?? '').trim().toLowerCase().replace(/\s+/g, ' ') === targetFold);
       if (!matches) continue;

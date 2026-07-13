@@ -1378,23 +1378,39 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
-        // Finding G: the send may have COMMITTED before the transport threw
-        // (timeout / dropped response). The pre-recorded external_write STAYS so a
-        // resume re-send is refused; leave an orphan marker for the audit /
-        // reconciliation trail (mirrors the composio external_write_orphaned path).
-        // NOT compensated — a throw is ambiguous, so the write stays counted.
+        // Finding G (+ re-review): the pre-recorded external_write must be resolved
+        // by whether the send DEMONSTRABLY never left vs. MIGHT have committed.
+        //   - Demonstrably-never-sent (auth / 404-not-found / rate-limit-rejected /
+        //     bad-params / connection-refused / DNS) → compensate with
+        //     external_write_failed, which BOTH the shim's own duplicate check
+        //     (:1158) AND the workflow forEach resume guards (sendAlreadyClaimed =
+        //     writes>fails) net out — so a legit retry / resume isn't blocked and a
+        //     genuinely-failed send isn't dropped on resume. Parity with composio's
+        //     compensateFailedExternalWrite; without it a native send that 401'd or
+        //     ECONNREFUSED'd mid-batch was silently skipped for that recipient.
+        //   - Genuinely ambiguous (timeout / dropped response / transient) → stays
+        //     counted as an external_write_orphaned (the send may have landed → a
+        //     resume re-send is refused, the safe direction for an irreversible send).
         if (preRecordedSend && integritySessionId && !(err instanceof BoundaryError)) {
+          const errMsg = (err instanceof Error ? err.message : String(err));
+          const kind = classifyToolError(errMsg, err);
+          const demonstrablyNeverSent = kind === 'permission_denied' || kind === 'not_found'
+            || kind === 'rate_limit' || isInvalidMcpCallResultValidationError(err)
+            || /econnrefused|enotfound|eai_again|getaddrinfo|dns|connection refused/i.test(errMsg);
+          const targets = extractDuplicateIdentityKeys(args ?? {}).slice(0, 8);
           try {
             appendEvent({
               sessionId: integritySessionId,
               turn: 0,
               role: 'system',
-              type: 'external_write_orphaned',
+              type: demonstrablyNeverSent ? 'external_write_failed' : 'external_write_orphaned',
               data: {
                 shapeKey: integrityShapeKey,
                 toolName,
+                slug: parsed.serverSlug,
+                targets,
                 mcp: true,
-                reason: (err instanceof Error ? err.message : String(err)).slice(0, 200),
+                reason: errMsg.slice(0, 200),
               },
             });
           } catch { /* telemetry write must never block */ }
