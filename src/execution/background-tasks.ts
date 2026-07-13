@@ -1626,6 +1626,16 @@ async function verifyBackgroundTaskDelivery(
   }
 
   const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+  // Fan-out coverage is AUTHORITATIVE: if any worker failed (a raw ERROR: from
+  // Stage 1, or a Stage-2-confirmed hollow output just recorded above), the run is
+  // a partial and MUST NOT report a hollow "done" — per the run_worker contract
+  // ("never report a batch complete if any worker returned ERROR"). Previously
+  // coverageBlock was only ever used as a fallback REASON on the probe/verify-fail
+  // paths, so a confident aggregate that passed verifyDelivered discarded it and
+  // the honest "M of N" never surfaced (Stage-2 adversarial review #1 — the feature
+  // was inert on exactly its target path). Gate here, before the probe/judge, so
+  // their model calls are also skipped when coverage already says blocked.
+  if (coverageBlock) return coverageBlock;
 
   // DELIVERABLE PROBE — deterministic readback of the artifacts THIS run produced
   // (created sheet ids, written file paths, space views), gated to GOAL-BOUND
@@ -1648,7 +1658,7 @@ async function verifyBackgroundTaskDelivery(
       if (objective.trim()) {
         const probe = await probeSessionDeliverables(task.runSessionId, objective);
         if (probe.failures.length > 0) {
-          return coverageBlock ?? { outcome: 'blocked', reason: probe.summary.slice(0, 400) };
+          return { outcome: 'blocked', reason: probe.summary.slice(0, 400) };
         }
         probeEvidence = probe.evidenceText;
       }
@@ -1664,10 +1674,9 @@ async function verifyBackgroundTaskDelivery(
       ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
     });
     if (!verdict.delivered) {
-      return coverageBlock ?? { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
+      return { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
     }
   } catch {
-    if (coverageBlock) return coverageBlock;
     return { outcome: 'done' };
   }
 

@@ -2,11 +2,15 @@
  * Run: npx tsx --test src/runtime/harness/fanout-item-verify.test.ts
  *
  * Wave 4 Stage 2 — per-item verification of fan-out worker outputs. Proves:
- *  (a) the zero-LLM tripwire flags hollow/blocked/unsupported outputs, passes clean;
- *  (b) the batched-verdict parser is strict (all-or-null);
- *  (c) verifyFanoutItems judges ONLY the flagged subset and records a confirmed
- *      fabrication as worker_result ok:false → summarizeFanoutCoverage counts it failed;
- *  (d) fail-open: a null judge marks nothing; kill-switch disables the whole thing.
+ *  (a) the zero-LLM tripwire flags blocked/promise-shaped non-completions and does
+ *      NOT flag a genuine result (incl. a terse NUMERIC one — the fail-closed hazard
+ *      the adversarial review surfaced);
+ *  (b) the single-verdict parser only fails an item on an explicit FABRICATED;
+ *  (c) verifyFanoutItems judges ONLY the flagged subset, ONE item per call (no
+ *      sibling can be steered by an injection in another output), and records a
+ *      confirmed hollow output as worker_result ok:false → summarizeFanoutCoverage
+ *      counts it failed;
+ *  (d) fail-open: a null judge marks nothing; kill-switch disables it.
  */
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -19,32 +23,31 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { fanoutItemTripwire, parseFanoutVerdicts, verifyFanoutItems, fanoutItemVerifyEnabled, _setFanoutBatchJudgeForTests } = await import('./fanout-item-verify.js');
+const { fanoutItemTripwire, parseFanoutItemVerdict, verifyFanoutItems, fanoutItemVerifyEnabled, _setFanoutItemJudgeForTests } = await import('./fanout-item-verify.js');
 const { resetEventLog, createSession, appendEvent } = await import('./eventlog.js');
-const { summarizeFanoutCoverage } = await import('./fanout-ledger.js');
+const { summarizeFanoutCoverage, clearLedger } = await import('./fanout-ledger.js');
 const { recordSubagentRun } = await import('../../agents/subagent-runs.js');
 
 after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
-test('fanoutItemTripwire: flags hollow/blocked/unsupported outputs; passes a clean evidence-bearing result', () => {
+test('fanoutItemTripwire: flags blocked/promise non-completions; does NOT flag a genuine result (incl. terse numeric)', () => {
   assert.equal(fanoutItemTripwire("I'll gather Firm B's contacts and send them over shortly.").flagged, true, 'promise-shaped');
   assert.equal(fanoutItemTripwire('Unable to complete: I could not access the CRM, need credentials.').flagged, true, 'blocked');
-  assert.equal(fanoutItemTripwire('Firm C has 88 employees and $12M revenue.').flagged, true, 'unsupported figures');
-  // Clean: figures WITH an evidence marker (URL) → not flagged.
-  assert.equal(fanoutItemTripwire('Firm D: 42 attorneys per https://firmd.com/about').flagged, false, 'figures with evidence');
-  // Clean: substantive, no numbers, not promise/blocked.
+  // #3 fix: a genuine terse NUMERIC result is NOT flagged (no fail-closed hazard).
+  assert.equal(fanoutItemTripwire('Processed 1,240 records; 47 flagged, 1,193 clean. Error rate 3.8%.').flagged, false, 'terse numeric is genuine');
+  assert.equal(fanoutItemTripwire('Firm C has 88 employees and $12M revenue.').flagged, false, 'bare figures are not flagged');
   assert.equal(fanoutItemTripwire('Firm A is a litigation boutique focused on appellate work.').flagged, false, 'clean qualitative');
   assert.equal(fanoutItemTripwire('').flagged, false, 'empty is not flagged (ERROR-handled upstream)');
 });
 
-test('parseFanoutVerdicts: strict all-or-null; maps GENUINE/FABRICATED', () => {
-  const v = parseFanoutVerdicts('1: GENUINE\n2: FABRICATED: promise, no artifact\n3: GENUINE', 3);
-  assert.ok(v);
-  assert.deepEqual(v!.map((x) => x.fabricated), [false, true, false]);
-  assert.equal(v![1].reason, 'promise, no artifact');
-  // Missing a verdict → null (caller fails open).
-  assert.equal(parseFanoutVerdicts('1: GENUINE\n2: FABRICATED', 3), null);
-  assert.equal(parseFanoutVerdicts('garbage', 2), null);
+test('parseFanoutItemVerdict: only an explicit FABRICATED fails; GENUINE/prose/empty → not fabricated / null', () => {
+  assert.deepEqual(parseFanoutItemVerdict('FABRICATED: promise, no artifact'), { fabricated: true, reason: 'promise, no artifact' });
+  assert.equal(parseFanoutItemVerdict('GENUINE')?.fabricated, false);
+  assert.equal(parseFanoutItemVerdict('GENUINE: real result present')?.fabricated, false);
+  assert.equal(parseFanoutItemVerdict('some unparseable prose with no marker'), null, 'no marker → null → caller fails open');
+  assert.equal(parseFanoutItemVerdict(''), null);
+  // Anchored to a marker LINE — a mention of the word inside prose is not a verdict.
+  assert.equal(parseFanoutItemVerdict('The output looks fabricated to me maybe'), null);
 });
 
 function seedWorker(sid: string, item: string, pk: string, output: string): void {
@@ -55,36 +58,34 @@ function seedWorker(sid: string, item: string, pk: string, output: string): void
   appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item, ok: true, packetKey: pk } });
 }
 
-test('verifyFanoutItems: judges ONLY flagged items; a confirmed fabrication flips coverage to failed', async () => {
+test('verifyFanoutItems: judges ONLY flagged items (one per call); a confirmed hollow output flips coverage to failed', async () => {
   resetEventLog();
   const sid = createSession({ kind: 'execution' }).id;
-  // A: clean (not flagged) · B: promise-shaped (flagged) · C: unsupported figures (flagged)
+  clearLedger(sid);
+  // A: clean qualitative (not flagged) · B: promise (flagged) · C: terse numeric (not flagged)
   seedWorker(sid, 'Firm A', 'pkA', 'Firm A is a litigation boutique focused on appellate work; strong reputation.');
   seedWorker(sid, 'Firm B', 'pkB', "I'll compile Firm B's contacts and send them over shortly.");
-  seedWorker(sid, 'Firm C', 'pkC', 'Firm C has 88 employees and $12M revenue.');
+  seedWorker(sid, 'Firm C', 'pkC', 'Firm C: 88 employees, $12M revenue, founded 1998.');
   assert.deepEqual(
     { total: summarizeFanoutCoverage(sid).total, failed: summarizeFanoutCoverage(sid).failed },
     { total: 3, failed: 0 }, 'all 3 start done',
   );
 
   const judged: string[] = [];
-  _setFanoutBatchJudgeForTests(async (_obj, outputs) => {
-    for (const o of outputs) judged.push(o.item);
-    // B is a hollow promise → fabricated; C's figures are (say) plausible → genuine.
-    return outputs.map((o) => ({ fabricated: o.item === 'Firm B', reason: o.item === 'Firm B' ? 'hollow promise, no artifact' : 'ok' }));
+  _setFanoutItemJudgeForTests(async (_obj, item) => {
+    judged.push(item);
+    return { fabricated: item === 'Firm B', reason: item === 'Firm B' ? 'hollow promise, no artifact' : 'ok' };
   });
   try {
     const fab = await verifyFanoutItems(sid, 'Enrich each firm with real contact + firmographic data.');
-    assert.deepEqual(fab.map((f) => f.item), ['Firm B'], 'only Firm B confirmed fabricated');
+    assert.deepEqual(fab.map((f) => f.item), ['Firm B'], 'only Firm B confirmed');
   } finally {
-    _setFanoutBatchJudgeForTests(null);
+    _setFanoutItemJudgeForTests(null);
   }
 
-  // Clean Firm A was NEVER sent to the judge (tripwire skipped it).
-  assert.ok(!judged.includes('Firm A'), 'clean item is not judged');
-  assert.deepEqual(judged.sort(), ['Firm B', 'Firm C'], 'only the flagged subset is judged');
+  // Only the flagged item (Firm B) was judged; A (clean) and C (terse numeric) never were.
+  assert.deepEqual(judged, ['Firm B'], 'only the flagged item is judged, one per call');
 
-  // Coverage now reflects the fabrication: 3 total, 2 done, 1 failed (Firm B).
   const cov = summarizeFanoutCoverage(sid);
   assert.equal(cov.total, 3);
   assert.equal(cov.done, 2);
@@ -95,28 +96,29 @@ test('verifyFanoutItems: judges ONLY flagged items; a confirmed fabrication flip
 test('verifyFanoutItems: fail-open — a null judge verdict marks NOTHING failed', async () => {
   resetEventLog();
   const sid = createSession({ kind: 'execution' }).id;
+  clearLedger(sid);
   seedWorker(sid, 'Firm X', 'pkX', "I'll get to Firm X next.");
-  _setFanoutBatchJudgeForTests(async (_obj, outputs) => outputs.map(() => null)); // judge unavailable
+  _setFanoutItemJudgeForTests(async () => null); // judge unavailable
   try {
-    const fab = await verifyFanoutItems(sid, 'Enrich each firm.');
-    assert.deepEqual(fab, [], 'a null judge confirms nothing');
+    assert.deepEqual(await verifyFanoutItems(sid, 'Enrich each firm.'), []);
   } finally {
-    _setFanoutBatchJudgeForTests(null);
+    _setFanoutItemJudgeForTests(null);
   }
   assert.equal(summarizeFanoutCoverage(sid).failed, 0, 'nothing marked failed on a judge hiccup');
 });
 
-test('verifyFanoutItems: no flagged items → ZERO judge calls (the clean-batch common case)', async () => {
+test('verifyFanoutItems: no flagged items → ZERO judge calls (clean batch)', async () => {
   resetEventLog();
   const sid = createSession({ kind: 'execution' }).id;
+  clearLedger(sid);
   seedWorker(sid, 'Firm A', 'pkA', 'Firm A: litigation boutique, appellate focus, established 1998.');
+  seedWorker(sid, 'Firm C', 'pkC', 'Firm C: 88 employees, $12M revenue.');
   let called = false;
-  _setFanoutBatchJudgeForTests(async (_obj, outputs) => { called = true; return outputs.map(() => null); });
+  _setFanoutItemJudgeForTests(async () => { called = true; return null; });
   try {
-    const fab = await verifyFanoutItems(sid, 'Enrich each firm.');
-    assert.deepEqual(fab, []);
+    assert.deepEqual(await verifyFanoutItems(sid, 'Enrich each firm.'), []);
   } finally {
-    _setFanoutBatchJudgeForTests(null);
+    _setFanoutItemJudgeForTests(null);
   }
   assert.equal(called, false, 'a clean batch never spends a judge call');
 });
