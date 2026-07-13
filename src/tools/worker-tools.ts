@@ -1,9 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
-import { recordSubagentRun } from '../agents/subagent-runs.js';
+import { WorkerToolInputSchema, workerPacketKey, type WorkerToolInput } from '../agents/worker-job-packet.js';
+import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
-import { workerItemAlreadyCapped } from '../agents/worker-respawn-guard.js';
+import { workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
@@ -118,9 +118,12 @@ export function registerWorkerTools(server: McpServer): void {
       if (!sessionId) {
         return textResult('ERROR: run_worker needs a live session context. Do this item inline instead.');
       }
+      // Wave 4 Stage 1: packet key identifies this exact job so a resumed run can
+      // detect a worker that already completed and skip re-executing it.
+      const packetKey = workerPacketKey(input);
       const recordResult = (ok: boolean, reason?: string, model?: string): void => {
         try {
-          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
+          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
         } catch { /* durable trace is best-effort */ }
       };
 
@@ -132,6 +135,23 @@ export function registerWorkerTools(server: McpServer): void {
           const msg = `ERROR: worker for "${input.item}" already exhausted its turn budget on a prior attempt this run and was NOT re-spawned. Report this item as failed / needs-attention; do not retry it.`;
           recordResult(false, firstLine(msg));
           return textResult(msg);
+        }
+      } catch { /* fail-open */ }
+
+      // Wave 4 Stage 1 — durable-resume idempotency: if THIS exact packet already
+      // completed successfully earlier in this (interrupted, now-resumed) run,
+      // REUSE the prior result instead of re-executing — re-running would redo the
+      // work and re-issue any external writes the completed worker performed.
+      // Fail-open; kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY=off.
+      try {
+        if (workerResumeIdempotencyEnabled() && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
+          const parentRunId = getToolOutputContext()?.workflowRunId || sessionId;
+          const prior = findCompletedSubagentOutput(parentRunId, input.item);
+          const reused = prior && prior.trim()
+            ? prior
+            : `Already completed on a prior attempt this run — result reused, not re-executed (avoids duplicate side effects). Item: ${input.item}`;
+          recordResult(true, 'resume: reused prior completed result');
+          return textResult(reused);
         }
       } catch { /* fail-open */ }
 

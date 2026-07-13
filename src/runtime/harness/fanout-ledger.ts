@@ -11,6 +11,7 @@
  * instead of a hollow done.
  */
 import { getRuntimeEnv } from '../../config.js';
+import { listEvents } from './eventlog.js';
 
 export interface LedgerEntry {
   item: string | null;
@@ -88,5 +89,41 @@ export function clearLedger(sessionId: string): void {
     ledgerBySession.delete(sessionId);
   } catch {
     /* best effort */
+  }
+}
+
+/**
+ * Wave 4 Stage 1 (durable swarm resume): rebuild the in-memory coverage ledger
+ * from the DURABLE `worker_result` event log after a daemon restart cleared it
+ * (this ledger is per-process). Without it a resumed swarm's `summarizeLedger`
+ * reports empty, silently breaking the honest "M of N failed" report-back that
+ * `fanoutCoverageBlock` depends on — the resumed run would look fully-done. Keyed
+ * by packetKey when present (so an item that failed-then-succeeded collapses to
+ * its FINAL outcome), else the item label. Idempotent (re-keying overwrites, never
+ * double-counts) and best-effort. Returns the number of results folded in.
+ */
+export function rehydrateFanoutLedger(sessionId: string): number {
+  try {
+    if (!sessionId) return 0;
+    const results = listEvents(sessionId, { types: ['worker_result'] });
+    let n = 0;
+    for (const e of results) {
+      const d = e.data as { item?: unknown; ok?: unknown; reason?: unknown; packetKey?: unknown } | undefined;
+      if (!d || typeof d.ok !== 'boolean') continue;
+      const key = (typeof d.packetKey === 'string' && d.packetKey)
+        ? `pk:${d.packetKey}`
+        : (typeof d.item === 'string' && d.item ? `it:${d.item}` : `idx:${n}`);
+      recordWorkerResult({
+        sessionId,
+        callId: key,
+        item: typeof d.item === 'string' ? d.item : null,
+        ok: d.ok,
+        reason: typeof d.reason === 'string' ? d.reason : undefined,
+      });
+      n += 1;
+    }
+    return n;
+  } catch {
+    return 0;
   }
 }

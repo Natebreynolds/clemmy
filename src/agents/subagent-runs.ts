@@ -173,3 +173,33 @@ export function readSubagentOutput(parentRunId: string, id: string): string | nu
     return null;
   }
 }
+
+/**
+ * Wave 4 Stage 1 (durable swarm resume): the full persisted work-product of the
+ * most-recent SUCCESSFUL subagent run for `item` under this parent (workflow run
+ * or chat session), or null. The durable-resume idempotency guard uses it to
+ * REUSE a completed worker's real output when the run resumes, instead of
+ * re-executing the worker. Matches the task label exact-first, then case/space-
+ * folded (the resumed run replays the identical item string). Fail-open.
+ */
+export function findCompletedSubagentOutput(parentRunId: string, item: string): string | null {
+  try {
+    const target = (item ?? '').trim();
+    if (!target) return null;
+    const targetFold = target.toLowerCase().replace(/\s+/g, ' ');
+    const runs = listSubagentRuns(parentRunId);
+    for (let i = runs.length - 1; i >= 0; i -= 1) {
+      const r = runs[i];
+      if (r.status !== 'ok') continue;
+      const task = (r.task ?? '').trim();
+      if (task === target || task.toLowerCase().replace(/\s+/g, ' ') === targetFold) {
+        const full = r.outputRef ? readSubagentOutput(parentRunId, r.id) : null;
+        const reused = full ?? r.outputPreview ?? '';
+        return reused.trim() ? reused : null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}

@@ -31,7 +31,7 @@ import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
-import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
+import { fanoutLedgerEnabled, summarizeLedger, clearLedger, rehydrateFanoutLedger } from '../runtime/harness/fanout-ledger.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
@@ -1834,6 +1834,13 @@ function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null
     },
   });
   if (updated) {
+    // Wave 4 Stage 1 (durable swarm resume): rebuild the in-memory fan-out
+    // coverage ledger from the durable worker_result log — the ledger is
+    // per-process and was wiped by the restart, so without this a resumed swarm's
+    // summarizeLedger (fanoutCoverageBlock) reports empty and the run looks
+    // fully-done. Best-effort. The per-worker idempotency guard (worker-tools /
+    // orchestrator) separately prevents completed workers being re-executed.
+    try { rehydrateFanoutLedger(updated.runSessionId); } catch { /* best-effort */ }
     addNotification({
       id: `${Date.now()}-background-${updated.id}-reattached`,
       kind: 'execution',

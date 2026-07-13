@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkerJobPrompt, WorkerToolInputSchema } from './worker-job-packet.js';
+import { buildWorkerJobPrompt, WorkerToolInputSchema, workerPacketKey } from './worker-job-packet.js';
 
 const validPacket = {
   objective: 'Research one firm and return an SEO summary for the parent batch.',
@@ -54,4 +54,23 @@ test('buildWorkerJobPrompt allows no-tool local workers without forcing discover
 
   assert.match(prompt, /none needed/);
   assert.match(prompt, /If resolvedTools says "none needed"/);
+});
+
+// ── Wave 4 Stage 1: packet key drives durable-resume idempotency ─────────────
+
+test('workerPacketKey: identical packets → identical key (a resumed run replays the same call)', () => {
+  const a = workerPacketKey({ ...validPacket });
+  const b = workerPacketKey({ ...validPacket });
+  assert.equal(a, b);
+  assert.match(a, /^[a-z0-9]+$/, 'stable base36 key');
+});
+
+test('workerPacketKey: changing ANY material field yields a distinct key (a real re-processing runs, not reused)', () => {
+  const base = workerPacketKey({ ...validPacket });
+  assert.notEqual(workerPacketKey({ ...validPacket, item: `${validPacket.item} (different)` }), base);
+  assert.notEqual(workerPacketKey({ ...validPacket, instructions: `${validPacket.instructions} Also do X.` }), base);
+  assert.notEqual(workerPacketKey({ ...validPacket, resolvedTools: 'a_different_tool' }), base);
+  assert.notEqual(workerPacketKey({ ...validPacket, objective: 'A different objective entirely for this item.' }), base);
+  assert.notEqual(workerPacketKey({ ...validPacket, context: 'Different source facts.' }), base);
+  assert.notEqual(workerPacketKey({ ...validPacket, expectedOutput: 'A different shape.' }), base);
 });

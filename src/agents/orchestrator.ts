@@ -36,13 +36,13 @@ import { buildCallTool } from '../tools/call-tool.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { buildWorkerJobPrompt, resolveWorkerMaxTurns, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
-import { workerItemAlreadyCapped } from './worker-respawn-guard.js';
+import { buildWorkerJobPrompt, resolveWorkerMaxTurns, workerPacketKey, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
+import { workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
 import { acquireWorkerSlot } from './worker-concurrency.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
-import { recordSubagentRun } from './subagent-runs.js';
+import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   harnessInputGuardrails,
@@ -968,6 +968,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     strict: true,
     execute: async (params, runContext, details) => {
       const input = params as WorkerToolInput;
+      // Wave 4 Stage 1: packet key for durable-resume idempotency (see below).
+      const packetKey = workerPacketKey(input);
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const workerModel = route.model ?? resolveRoleModel('worker').modelId;
@@ -1034,7 +1036,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (!sessionId) return;
         const { preRun, ...eventData } = data;
         try {
-          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, toolCallId } });
+          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId } });
         } catch { /* durable trace is best-effort */ }
         // Route-outcome capture (adaptive routing evidence): score WORKER models,
         // not just the brain. Skipped for pre-run refusals (respawn guard) — those
@@ -1139,6 +1141,22 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const message = `ERROR: worker for "${input.item}" already exhausted its worker turn budget on a prior attempt this run and was NOT re-spawned (a re-run with the same packet would exhaust again). Report this item as failed / needs-attention; do not retry it.`;
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(message), preRun: true });
         return message;
+      }
+
+      // Wave 4 Stage 1 — durable-resume idempotency: if THIS exact packet already
+      // completed successfully earlier in this (interrupted, now-resumed) run,
+      // REUSE the prior result instead of re-executing — re-running would redo the
+      // work and re-issue any external writes the completed worker performed.
+      // Fail-open; kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY=off.
+      if (workerResumeIdempotencyEnabled() && sessionId && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
+        const ctx = getToolOutputContext();
+        const parentRunId = ctx?.workflowRunId || sessionId;
+        const prior = findCompletedSubagentOutput(parentRunId, input.item);
+        const reused = prior && prior.trim()
+          ? prior
+          : `Already completed on a prior attempt this run — result reused, not re-executed (avoids duplicate side effects). Item: ${input.item}`;
+        appendWorkerResult({ item: input.item, ok: true, model: workerModel, toolUses: [], reason: 'resume: reused prior completed result' });
+        return reused;
       }
       if (claudeAgentSdkWorkerEnabled(workerModel)) {
         // Pass the PARENT chat session so the Claude SDK worker's gates +

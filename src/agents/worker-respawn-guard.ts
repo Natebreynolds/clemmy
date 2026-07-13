@@ -1,4 +1,5 @@
 import { listEvents } from '../runtime/harness/eventlog.js';
+import { getRuntimeEnv } from '../config.js';
 
 /**
  * Drift-tolerant key for the respawn guard. The model re-describes a capped item
@@ -36,6 +37,40 @@ export function workerItemAlreadyCapped(sessionId: string, item: string | null |
     return capped.some((e) => {
       const prior = (e.data as { item?: unknown } | undefined)?.item;
       return typeof prior === 'string' && normalizeWorkerItemKey(prior) === key;
+    });
+  } catch {
+    return false;
+  }
+}
+
+// Wave 4 Stage 1 (durable swarm resume). Default ON; `=off` is the kill-switch.
+// When a 30–60-min fan-out is interrupted (daemon restart / crash) and resumes,
+// the brain replays the SAME run_worker calls — without this guard a worker that
+// already finished re-runs from scratch AND re-issues any external writes it made.
+export function workerResumeIdempotencyEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKER_RESUME_IDEMPOTENCY', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Durable-resume idempotency: TRUE if THIS exact job packet already produced a
+ * successful (ok:true) `worker_result` earlier in this run session — i.e. the run
+ * was interrupted and is now replaying a worker that already completed. The caller
+ * REUSES the prior result instead of re-executing (which would redo the work and
+ * re-issue the completed worker's external writes). Matched on the packet key
+ * (workerPacketKey over the material packet fields), so ONLY an identical packet
+ * short-circuits — a genuinely different re-processing of the same item (new
+ * instructions/tools/context) gets a distinct key and runs normally. Best-effort /
+ * fail-open: any read error returns false so the guard can never block a first
+ * spawn. Note: pre-Stage-1 `worker_result` events carry no packetKey and so never
+ * match — the guard only fires for runs that STARTED on this build (forward-only).
+ */
+export function workerAlreadyCompletedForPacket(sessionId: string, packetKey: string | null | undefined): boolean {
+  try {
+    if (!packetKey) return false;
+    const results = listEvents(sessionId, { types: ['worker_result'] });
+    return results.some((e) => {
+      const d = e.data as { ok?: unknown; packetKey?: unknown } | undefined;
+      return d?.ok === true && typeof d.packetKey === 'string' && d.packetKey === packetKey;
     });
   } catch {
     return false;
