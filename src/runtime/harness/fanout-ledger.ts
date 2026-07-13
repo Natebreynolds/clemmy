@@ -105,6 +105,12 @@ export function clearLedger(sessionId: string): void {
 export function rehydrateFanoutLedger(sessionId: string): number {
   try {
     if (!sessionId) return 0;
+    // Rebuild from the durable log as the source of truth. Clear first so the
+    // result is IDEMPOTENT: the rehydrated keys (pk:/it:-prefixed) differ from the
+    // live path's real callId keys, so folding into a non-empty ledger would
+    // double-count the same worker. On a real restart the map is already empty;
+    // clearing also makes a mid-process reattach safe.
+    clearLedger(sessionId);
     const results = listEvents(sessionId, { types: ['worker_result'] });
     let n = 0;
     for (const e of results) {

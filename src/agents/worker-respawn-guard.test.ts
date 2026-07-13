@@ -161,6 +161,10 @@ test('rehydrateFanoutLedger: a restart-wiped coverage ledger is rebuilt from dur
   assert.equal(s.done, 2);
   assert.equal(s.failed, 1);
   assert.deepEqual(s.failedItems, ['Qux Legal']);
+
+  // IDEMPOTENT: rehydrating again (clear-then-rebuild) must not double-count.
+  rehydrateFanoutLedger(sid);
+  assert.equal(summarizeLedger(sid).total, 3, 'a second rehydrate does not double-count');
   clearLedger(sid);
 });
 
