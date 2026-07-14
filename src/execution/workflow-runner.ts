@@ -2084,7 +2084,7 @@ async function awaitDeclarativeStepApproval(
   const prior = settledResolution();
   if (prior) {
     if (prior === 'approved') return;
-    throw new Error(`workflow step "${step.id}" was not approved (${prior})`);
+    throw new WorkflowStepNotApprovedError(`workflow step "${step.id}" was not approved (${prior})`);
   }
 
   // Unattended scheduled run: there is no human at 8am to click "approve".
@@ -2205,10 +2205,10 @@ async function awaitDeclarativeStepApproval(
       const resolution = settledResolution();
       if (resolution) {
         if (resolution === 'approved') return;
-        throw new Error(`workflow step "${step.id}" was not approved (${resolution})`);
+        throw new WorkflowStepNotApprovedError(`workflow step "${step.id}" was not approved (${resolution})`);
       }
       if (Date.now() - startedAt > WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS) {
-        throw new Error(`workflow step "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`);
+        throw new WorkflowStepNotApprovedError(`workflow step "${step.id}" exceeded approval wait budget (${WORKFLOW_HARNESS_APPROVAL_MAX_WAIT_MS}ms)`);
       }
     }
   } finally {
@@ -2485,6 +2485,13 @@ function workflowBrainFalloverEnabled(): boolean {
  *  recorded an external write (would double-act) — surface the original error.
  *  Healthy runs and read steps are unaffected; the extra attempts only fire on a
  *  post-retry transient (provider-overload) failure. */
+/** Approval rejection/expiry is a HUMAN decision or a hard gate — control
+ *  flow, never a soft failure an optional step may gap past (fold-1 review
+ *  wf_8abe1dc0-638). Message text preserved for NON_RETRYABLE_RE + consumers. */
+export class WorkflowStepNotApprovedError extends Error {
+  constructor(message: string) { super(message); this.name = 'WorkflowStepNotApprovedError'; }
+}
+
 async function executeStepVerified(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -2492,21 +2499,33 @@ async function executeStepVerified(
   try {
     return await executeStepVerifiedInner(step, ctx);
   } catch (err) {
-    // Control-flow signals always propagate — a park/cancel is not a failure.
-    if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
+    // Control-flow signals always propagate — a park/cancel/approval-rejection
+    // is a decision, not a soft failure an optional step may gap past.
+    if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError || err instanceof WorkflowStepNotApprovedError) throw err;
     if (step.optional !== true) throw err;
+    // Only READ-class enrichment may gap (fold-1 review): a send/write step —
+    // or any step whose session may already have recorded an external write —
+    // must surface its error loudly; gapping it would put a false "produced no
+    // data" claim in the manifest over a possibly-fired irreversible send.
+    if (stepSideEffectClass(step) !== 'read' || !canSwitchBrainForStep(step, ctx)) throw err;
     // Fold 1 (proposal-builder parity, 2026-07-14): an OPTIONAL enrichment step
     // degrades to a DECLARED GAP instead of halting the run — "note it and
     // continue with available data". Downstream bindings and the synthesis see
     // {gap:true, reason} (the context block already forbids fabricating around
     // missing data), and the manifest records the soft failure honestly.
     const reason = err instanceof Error ? err.message : String(err);
-    const gap = { gap: true, reason: `Optional step "${step.id}" produced no data: ${reason.slice(0, 400)}` };
+    // Shape speaks the codebase's soft-failure vocabulary (fold-1 review):
+    // ok:false + error makes detectBlockedSteps classify self_reported_failure
+    // → needsAttention, failure ledger, pattern penalty — a permanently broken
+    // optional step can never report clean success forever. blocked:true meta
+    // emits workflow_node_blocked, not _completed.
+    const errText = `Optional step "${step.id}" produced no data: ${reason.slice(0, 400)}`;
+    const gap = { gap: true, ok: false, error: errText, reason: errText };
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_completed',
       stepId: step.id,
       output: gap,
-      meta: { softFailed: true, optional: true, error: reason.slice(0, 500) },
+      meta: { softFailed: true, optional: true, blocked: true, error: reason.slice(0, 500) },
     });
     try {
       recordStepOutput({ workflowName: ctx.workflowSlug, runId: ctx.runId, stepId: step.id, output: gap, nowIso: new Date().toISOString() });

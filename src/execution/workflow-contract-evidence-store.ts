@@ -58,6 +58,7 @@ export function observeStepOutputShape(output: unknown): ShapeObservation | null
   if (typeof output === 'object') {
     const record = output as Record<string, unknown>;
     if (record.blocked === true) return null; // honest blocked shape, not a deliverable
+    if (record.gap === true) return null; // declared gap from an optional step — a soft failure, never learnable shape (fold-1 review: 3 gapped runs would lock required_keys [gap, reason])
     const keys = Object.keys(record)
       .filter((k) => IDENTIFIER_KEY_RE.test(k))
       .filter((k) => {
