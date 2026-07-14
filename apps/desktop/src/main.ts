@@ -181,8 +181,12 @@ function repointDashboardToLiveDaemon(): void {
   // succeeds, so a failed load leaves the old renderer able to use recovery
   // IPC. Reload even when the port is unchanged: a ready event means a new
   // daemon instance and its page/session should be bootstrapped afresh.
+  // Finalize any active local capture FIRST — this navigation replaces the
+  // renderer that owns the mic pump, so waiting preserves the recorded prefix
+  // instead of orphaning it (belt: did-start-navigation catches this too, but
+  // awaiting here guarantees the stop lands before the page is torn down).
   pendingDashboardUrl = nextUrl;
-  void win.loadURL(nextUrl).then(() => {
+  void finalizeOrphanedLocalCapture('the daemon restarted').then(() => win.loadURL(nextUrl)).then(() => {
     if (dashboardNavigationGeneration !== navigationGeneration) return;
     dashboardUrl = nextUrl;
     pendingDashboardUrl = '';
@@ -468,7 +472,10 @@ function createMainWindow(url: string): BrowserWindow {
 
 function activeMeetingCaptureLabels(): string[] {
   const labels: string[] = [];
-  if (localMeetingRecorder.status().recording) labels.push('Local microphone recording');
+  const local = localMeetingRecorder.status();
+  // A STALE capture (producer dead, no PCM arriving) must never present as a
+  // live recording — it reads as "interrupted" and self-heals via finalize.
+  if (local.recording && !local.stale) labels.push('Local microphone recording');
   if (recallCapture?.status().recording) labels.push('Online meeting recording');
   return labels;
 }
@@ -996,6 +1003,16 @@ async function launchDaemon(): Promise<void> {
     });
     mainWindow.webContents.on('render-process-gone', (_e, details) => {
       console.error('[main] renderer process gone', JSON.stringify(details));
+      // The renderer owned the mic pump — finalize any active local capture
+      // instead of letting the tray show "Recording" over a dead producer.
+      void finalizeOrphanedLocalCapture('the app window crashed');
+    });
+    // A manual reload (Cmd+R) or any top-frame navigation also kills the mic
+    // pump, and will-navigate does NOT fire for reloads — catch it here.
+    // Same-document (SPA) navigations are the renderer working normally.
+    mainWindow.webContents.on('did-start-navigation', (details) => {
+      if (!details.isMainFrame || details.isSameDocument) return;
+      void finalizeOrphanedLocalCapture('the page reloaded');
     });
     rebuildTrayMenu();
   } catch (err) {
@@ -1209,6 +1226,47 @@ async function ingestLocalMeeting(recording: LocalMeetingRecording): Promise<Rec
   });
 }
 
+// ORPHANED-CAPTURE FINALIZER (2026-07-14 review). The PCM producer lives in the
+// RENDERER (LocalMeetingCapture's mic pump); the durable WAV writer lives HERE.
+// If the renderer dies (crash, hard reload) or the window navigates to a fresh
+// daemon page, the producer is gone forever — LocalMeetingCapture has no
+// reattach path — while main's recorder + tray kept showing "Recording" with a
+// frozen byte count and the rest of the meeting silently lost. Finalizing
+// (stop + ingest) converts that silent loss into an honest, transcribed
+// partial recording, mirroring the Meetings screen's own unmount rationale.
+let orphanFinalizeInFlight: Promise<void> | null = null;
+function finalizeOrphanedLocalCapture(reason: string): Promise<void> {
+  if (!orphanFinalizeInFlight) {
+    orphanFinalizeInFlight = (async () => {
+      const status = localMeetingRecorder.status();
+      if (!status.recording || !status.sessionId) return;
+      console.warn('[local-meeting] finalizing orphaned capture:', reason, status.sessionId);
+      try {
+        const recording = await localMeetingRecorder.stop(status.sessionId);
+        try {
+          await ingestLocalMeeting(recording);
+        } catch (error) {
+          // The WAV + sidecar are durable — daemon-side sidecar recovery picks
+          // it up when the daemon is reachable again.
+          console.error('[local-meeting] orphaned capture saved but could not queue:', error instanceof Error ? error.message : error);
+        }
+        const minutes = Math.max(1, Math.round((recording.durationSeconds ?? 0) / 60));
+        try {
+          new Notification({
+            title: 'Meeting capture interrupted',
+            body: `Recording stopped because ${reason}. About ${minutes} minute${minutes === 1 ? '' : 's'} were saved and queued for transcription.`,
+          }).show();
+        } catch { /* notification is best-effort */ }
+      } catch (error) {
+        console.error('[local-meeting] failed to finalize orphaned capture:', error instanceof Error ? error.message : error);
+      } finally {
+        rebuildTrayMenu();
+      }
+    })().finally(() => { orphanFinalizeInFlight = null; });
+  }
+  return orphanFinalizeInFlight;
+}
+
 async function recoverLocalMeetingsAfterCrash(): Promise<void> {
   const recordings = await localMeetingRecorder.recoverInterruptedRecordings();
   for (const recording of recordings) {
@@ -1353,6 +1411,13 @@ ipcMain.handle('clemmy:recall-test', async (evt: IpcMainInvokeEvent) => {
 ipcMain.handle('clemmy:local-meeting-status', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
   const recorder = localMeetingRecorder.status();
+  // Self-heal floor: if ANY status observation finds the capture stale (the
+  // producer died via a path the event hooks missed), finalize it now — the
+  // 5s dashboard poll makes this at-most-~20s from producer death to an
+  // honest "interrupted + saved" state instead of a frozen Recording pill.
+  if (recorder.recording && recorder.stale) {
+    void finalizeOrphanedLocalCapture('audio stopped arriving from the app window');
+  }
   const cancellations = await retryPendingLocalMeetingCancellations().catch(() => {
     const remaining = readPendingLocalMeetingCancellations();
     return {

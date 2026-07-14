@@ -7,6 +7,7 @@ import {
   createPcmWavHeader,
   LocalMeetingRecorder,
   LOCAL_MEETING_SAMPLE_RATE,
+  STALE_CAPTURE_AFTER_MS,
 } from './local-meeting-recorder.js';
 
 async function withRecorder(
@@ -183,6 +184,40 @@ test('crash recovery never follows symlinked audio or metadata', async (t) => {
     assert.equal((await lstat(path.join(audioRoot, `local-${audioSession}.wav.part`))).isSymbolicLink(), true);
     assert.equal((await lstat(path.join(audioRoot, `local-${metadataSession}.json.part`))).isSymbolicLink(), true);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a dead producer flips status to STALE past the floor; a resumed append restores freshness', async () => {
+  // 2026-07-14 review: a renderer crash/reload kills the mic pump while main's
+  // recorder kept reporting recording:true with a frozen byte count — the tray
+  // showed "Recording" over silence. The staleness floor is what lets the tray,
+  // the status poll, and the orphan finalizer see the truth.
+  const root = await mkdtemp(path.join(os.tmpdir(), 'clementine-local-meeting-stale-'));
+  let nowMs = Date.UTC(2026, 6, 14, 10, 0, 0);
+  const recorder = new LocalMeetingRecorder({
+    rootDir: root,
+    createId: () => 'stale-floor-session',
+    now: () => new Date(nowMs),
+  });
+  try {
+    const started = await recorder.start({});
+    const chunk = new Int16Array([1, 2, 3, 4]);
+    nowMs += 1_000;
+    await recorder.append(started.sessionId!, chunk);
+    assert.equal(recorder.status().stale, false, 'live capture is not stale');
+    assert.ok(recorder.status().lastAppendAt, 'lastAppendAt is exposed');
+
+    nowMs += STALE_CAPTURE_AFTER_MS + 1_000; // silence past the floor
+    const stalled = recorder.status();
+    assert.equal(stalled.recording, true, 'main still holds the recording');
+    assert.equal(stalled.stale, true, 'no PCM past the floor ⇒ stale');
+
+    nowMs += 1_000;
+    await recorder.append(started.sessionId!, chunk); // producer resumed
+    assert.equal(recorder.status().stale, false, 'a real append restores freshness');
+  } finally {
+    await recorder.shutdown().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

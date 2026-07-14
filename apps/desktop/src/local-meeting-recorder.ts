@@ -51,7 +51,19 @@ export interface LocalMeetingRecorderStatus {
   durationSeconds: number;
   sampleRate: number;
   channels: number;
+  /** ISO time of the most recent PCM append (start time until the first chunk). */
+  lastAppendAt?: string;
+  /** True when recording but NO PCM has arrived for STALE_CAPTURE_AFTER_MS —
+   *  the renderer producer is dead (crash/reload) while main still holds an
+   *  active recording. UIs must show "interrupted", never a live Recording
+   *  pill, for a stale session (2026-07-14 review). */
+  stale?: boolean;
 }
+
+/** No PCM for this long while "recording" ⇒ the producer is gone. The renderer
+ *  pumps chunks continuously (sub-second cadence), so 15s is far past any
+ *  legitimate gap yet fast enough that a frozen capture is caught mid-meeting. */
+export const STALE_CAPTURE_AFTER_MS = 15_000;
 
 interface ActiveRecording {
   sessionId: string;
@@ -63,6 +75,8 @@ interface ActiveRecording {
   metadataPath: string;
   handle: FileHandle;
   bytes: number;
+  /** Epoch ms of the most recent append (or start). Drives staleness. */
+  lastAppendAtMs: number;
 }
 
 export interface LocalMeetingRecorderOptions {
@@ -201,6 +215,8 @@ export class LocalMeetingRecorder {
       durationSeconds: durationForBytes(active?.bytes ?? 0),
       sampleRate: LOCAL_MEETING_SAMPLE_RATE,
       channels: LOCAL_MEETING_CHANNELS,
+      lastAppendAt: active ? new Date(active.lastAppendAtMs).toISOString() : undefined,
+      stale: active ? this.now().getTime() - active.lastAppendAtMs > STALE_CAPTURE_AFTER_MS : undefined,
     };
   }
 
@@ -249,6 +265,7 @@ export class LocalMeetingRecorder {
         metadataPath,
         handle,
         bytes: 0,
+        lastAppendAtMs: this.now().getTime(),
       };
       return this.status();
     });
@@ -264,6 +281,7 @@ export class LocalMeetingRecorder {
       }
       await writeAll(active.handle, chunk);
       active.bytes += chunk.byteLength;
+      active.lastAppendAtMs = this.now().getTime();
       return this.status();
     });
   }
