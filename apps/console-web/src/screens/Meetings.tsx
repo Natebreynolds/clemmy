@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2 } from 'lucide-react';
+import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -21,9 +21,14 @@ import {
   listMeetings,
   getMeeting,
   getMeetingChatPrompt,
+  listMeetingNotes,
+  addMeetingNote,
+  deleteMeetingNote,
   type LocalMeetingSettings,
   type LocalMeetingStatus,
   type MeetingSummary,
+  type MeetingNote,
+  type MeetingNoteKind,
   type RecallSettings,
 } from '@/lib/meetings';
 import { cn } from '@/lib/cn';
@@ -138,6 +143,15 @@ export function Meetings() {
   const localElapsedSeconds = localCaptureState.sessionId
     ? localCaptureState.elapsedSeconds
     : Math.max(0, Math.floor(localStatus?.recorder?.durationSeconds ?? 0));
+  // Scratchpad keys. In-person: windowId = `local:<sessionId>`, start derived
+  // from the recorder timestamp (or elapsed). Recall/Zoom: the daemon surfaces
+  // the active recording's windowId + startedAt (the SPA has no live id otherwise).
+  const localScratchpadWindowId = localRecording && localSessionId ? `local:${localSessionId}` : undefined;
+  const localStartedAtMs = localStatus?.recorder?.startedAt
+    ? Date.parse(localStatus.recorder.startedAt)
+    : (localRecording ? Date.now() - localElapsedSeconds * 1000 : undefined);
+  const recallScratchpadWindowId = recording ? status.data?.activeWindowId : undefined;
+  const recallStartedAtMs = status.data?.activeStartedAt ? Date.parse(status.data.activeStartedAt) : undefined;
 
   useEffect(() => {
     if (typeof settings.retentionHours === 'number' && Number.isFinite(settings.retentionHours)) {
@@ -341,6 +355,10 @@ export function Meetings() {
               )}
             </div>
 
+            {localScratchpadWindowId && (
+              <ScratchpadPanel windowId={localScratchpadWindowId} startedAtMs={localStartedAtMs} />
+            )}
+
             <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
               <label className="flex items-center gap-2 text-small text-fg">
                 <Switch checked={localSettings.enabled !== false} onChange={(value) => applyLocalSetting({ enabled: value })} label="Enable local transcription" disabled={localRecording || localBusy} />
@@ -457,6 +475,10 @@ export function Meetings() {
                   </label>
                 </div>
 
+                {recallScratchpadWindowId && (
+                  <ScratchpadPanel windowId={recallScratchpadWindowId} startedAtMs={recallStartedAtMs} />
+                )}
+
                 <div className="rounded-md border border-border bg-canvas p-3">
                   <div className="flex flex-wrap items-end gap-3">
                     <label className="min-w-[15rem] flex-1 text-small text-fg">
@@ -554,6 +576,139 @@ export function Meetings() {
         </div>
       </div>
     </Page>
+  );
+}
+
+const NOTE_MARKERS: { kind: MeetingNoteKind; glyph: string; label: string }[] = [
+  { kind: 'action', glyph: '★', label: 'Action' },
+  { kind: 'question', glyph: '❓', label: 'Question' },
+  { kind: 'followup', glyph: '⚑', label: 'Follow-up' },
+];
+const markerGlyph = (kind?: MeetingNoteKind): string =>
+  NOTE_MARKERS.find((m) => m.kind === kind)?.glyph ?? '';
+
+function noteClock(atSeconds?: number): string {
+  if (typeof atSeconds !== 'number' || !Number.isFinite(atSeconds) || atSeconds < 0) return '--:--';
+  const total = Math.floor(atSeconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+/**
+ * Live scratchpad for a meeting, keyed by windowId (works for in-person AND
+ * Recall/Zoom). Notes are timestamped from `startedAtMs` at submit time (so the
+ * clock is exact regardless of poll cadence) and flow into the vault artifact's
+ * ## Notes section + the analyzer. Read-only mode is used in the detail view.
+ */
+function ScratchpadPanel({ windowId, startedAtMs, readOnly, compact }: {
+  windowId: string;
+  startedAtMs?: number;
+  readOnly?: boolean;
+  compact?: boolean;
+}) {
+  const qc = useQueryClient();
+  const notesQ = usePoll(['meeting-notes', windowId], () => listMeetingNotes(windowId), 5000);
+  const notes: MeetingNote[] = notesQ.data?.notes ?? [];
+  const [draft, setDraft] = useState('');
+  const [kind, setKind] = useState<MeetingNoteKind | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const refresh = () => qc.invalidateQueries({ queryKey: ['meeting-notes', windowId] });
+
+  const submit = async () => {
+    const text = draft.trim();
+    if (!text || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const atSeconds = typeof startedAtMs === 'number' && Number.isFinite(startedAtMs)
+        ? Math.max(0, Math.round((Date.now() - startedAtMs) / 1000))
+        : undefined;
+      await addMeetingNote(windowId, { text, kind: kind ?? undefined, atSeconds });
+      setDraft('');
+      setKind(null);
+      await refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not save note');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (id: string) => {
+    try { await deleteMeetingNote(windowId, id); await refresh(); } catch { /* leave it; next poll reconciles */ }
+  };
+
+  const sorted = [...notes].sort((a, b) => (a.atSeconds ?? 0) - (b.atSeconds ?? 0));
+
+  return (
+    <div className="rounded-lg border border-line bg-surface-2 p-4">
+      <div className="mb-2 flex items-center gap-2">
+        <StickyNote className="h-4 w-4 text-primary" aria-hidden />
+        <h4 className="text-small font-medium text-fg">Scratchpad</h4>
+        <span className="text-caption text-faint">
+          {notes.length ? `${notes.length} note${notes.length === 1 ? '' : 's'}` : (readOnly ? 'No notes' : 'Jot notes as the meeting happens')}
+        </span>
+      </div>
+      {sorted.length > 0 && (
+        <ul className={cn('mb-3 space-y-1.5 overflow-y-auto', compact ? 'max-h-40' : 'max-h-64')}>
+          {sorted.map((n) => (
+            <li key={n.id} className="group flex items-start gap-2 text-small text-fg">
+              <span className="mt-0.5 shrink-0 font-mono text-caption tabular-nums text-faint">{noteClock(n.atSeconds)}</span>
+              {n.kind && <span className="shrink-0" aria-label={n.kind}>{markerGlyph(n.kind)}</span>}
+              <span className="flex-1 whitespace-pre-wrap break-words">{n.text}</span>
+              {!readOnly && (
+                <button
+                  type="button"
+                  onClick={() => void remove(n.id)}
+                  className="shrink-0 text-faint opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
+                  aria-label="Delete note"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {!readOnly && (
+        <>
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {NOTE_MARKERS.map((m) => (
+              <button
+                key={m.kind}
+                type="button"
+                onClick={() => setKind(kind === m.kind ? null : m.kind)}
+                aria-pressed={kind === m.kind}
+                className={cn(
+                  'rounded px-2 py-1 text-caption transition-colors',
+                  kind === m.kind ? 'bg-primary/15 text-primary ring-1 ring-primary/40' : 'text-muted hover:bg-surface-3',
+                )}
+              >
+                {m.glyph} {m.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-end gap-2">
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void submit(); } }}
+              rows={2}
+              maxLength={2000}
+              placeholder="Type a note… (⌘/Ctrl+Enter to add)"
+              className="min-h-[2.5rem] flex-1 resize-y rounded-md border border-line bg-surface px-3 py-2 text-small text-fg placeholder:text-faint focus:border-primary focus:outline-none"
+            />
+            <Button onClick={() => void submit()} disabled={!draft.trim() || busy}>Add</Button>
+          </div>
+          {err && <p role="alert" className="mt-1 text-caption text-danger">{err}</p>}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -666,6 +821,11 @@ function MeetingDetailView({
       {participants.length > 0 && (
         <Section icon={Users} title="Participants">
           <div className="text-body text-muted">{participants.join(', ')}</div>
+        </Section>
+      )}
+      {asText(r.windowId) && (
+        <Section icon={StickyNote} title="Notes">
+          <ScratchpadPanel windowId={asText(r.windowId)} compact />
         </Section>
       )}
       {segments.length > 0 && (

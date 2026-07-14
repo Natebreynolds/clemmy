@@ -12,8 +12,22 @@ export interface RecallSettings {
 export interface RecallStatus {
   settings?: RecallSettings;
   credential?: { status?: string; source?: string; hasValue?: boolean };
+  /** windowId of the Recall meeting currently recording, if any — used to key
+   *  the live scratchpad during a Zoom/Meet/Teams call. */
+  activeWindowId?: string;
+  /** startedAt of that active recording, so notes can be timestamped. */
+  activeStartedAt?: string;
   regions?: Record<string, string>;
   docsUrl?: string;
+}
+
+export type MeetingNoteKind = 'action' | 'question' | 'followup';
+export interface MeetingNote {
+  id: string;
+  text: string;
+  kind?: MeetingNoteKind;
+  atSeconds?: number;
+  createdAt: string;
 }
 
 export interface LocalMeetingSettings {
@@ -60,6 +74,7 @@ export interface MeetingSummary {
   startedAt?: string;
   endedAt?: string;
   segmentCount?: number;
+  notesCount?: number;
   title?: string;
   transcriptionStatus?: 'not_started' | 'queued' | 'transcribing' | 'ready' | 'failed' | 'cancelled' | string;
   transcriptionError?: string;
@@ -70,7 +85,7 @@ export interface MeetingSegment { speaker?: string; text?: string; [k: string]: 
 export interface MeetingDetail {
   record?: {
     id?: string; provider?: string; source?: string; platform?: string; status?: string; startedAt?: string; endedAt?: string;
-    segments?: MeetingSegment[]; artifactPath?: string;
+    windowId?: string; segments?: MeetingSegment[]; notes?: MeetingNote[]; artifactPath?: string;
     transcriptionStatus?: string; transcriptionError?: string; transcriptionModel?: string;
   };
   analysis?: {
@@ -93,3 +108,19 @@ export const listMeetings = () => apiGet<{ meetings: MeetingSummary[] }>('/api/c
 export const getMeeting = (id: string) => apiGet<MeetingDetail>(`/api/console/meetings/recall/${encodeURIComponent(id)}`);
 export const getMeetingChatPrompt = (id: string) =>
   apiGet<{ prompt: string }>(`/api/console/meetings/recall/${encodeURIComponent(id)}/chat-prompt`);
+
+// ── Live scratchpad notes (keyed by windowId; works for in-person + Recall) ──
+export const listMeetingNotes = (windowId: string) =>
+  apiGet<{ notes: MeetingNote[] }>(`/api/console/meetings/notes?windowId=${encodeURIComponent(windowId)}`);
+export const addMeetingNote = (windowId: string, note: { text: string; kind?: MeetingNoteKind; atSeconds?: number }) =>
+  api<{ note: MeetingNote; notes: MeetingNote[] }>('/api/console/meetings/notes', {
+    method: 'POST', body: JSON.stringify({ windowId, ...note }),
+  });
+export const updateMeetingNote = (windowId: string, id: string, patch: { text?: string; kind?: MeetingNoteKind | null }) =>
+  api<{ notes: MeetingNote[] }>('/api/console/meetings/notes', {
+    method: 'PATCH', body: JSON.stringify({ windowId, id, ...patch }),
+  });
+export const deleteMeetingNote = (windowId: string, id: string) =>
+  api<{ notes: MeetingNote[] }>('/api/console/meetings/notes', {
+    method: 'DELETE', body: JSON.stringify({ windowId, id }),
+  });

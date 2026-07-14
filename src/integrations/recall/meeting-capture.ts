@@ -30,6 +30,26 @@ export interface RecallTranscriptSegment {
   isFinal?: boolean;
 }
 
+/** A note the user jots into the live scratchpad DURING a meeting (in-person
+ *  or Zoom/Recall). Stored on the record so it flows into the vault artifact
+ *  (## Notes) and the analyzer prompt uniformly for both providers. User-
+ *  authored — never touched by the analyzer / auto-filing. */
+export interface MeetingNote {
+  id: string;
+  text: string;
+  /** One-tap marker. Absent = a plain note. */
+  kind?: 'action' | 'question' | 'followup';
+  /** Seconds elapsed from record.startedAt when the note was taken, so the
+   *  artifact can align it to the transcript ([mm:ss]). Absent when unknown. */
+  atSeconds?: number;
+  createdAt: string;
+}
+
+/** Hard cap on a single note's text (defense-in-depth against a runaway paste). */
+export const MEETING_NOTE_MAX_CHARS = 2000;
+/** Hard cap on notes per meeting (a human scratchpad, not a data sink). */
+export const MEETING_NOTES_MAX = 500;
+
 export interface RecallMeetingRecord {
   id: string;
   windowId: string;
@@ -63,6 +83,9 @@ export interface RecallMeetingRecord {
   startedAt: string;
   endedAt?: string;
   segments: RecallTranscriptSegment[];
+  /** User-authored live scratchpad notes (see MeetingNote). Independent of
+   *  segments, so they survive the streamed→canonical rewrite and re-file. */
+  notes?: MeetingNote[];
   artifactPath?: string;
   /** Path to the JSON sidecar written by the post-meeting analyzer,
    *  populated lazily after recording-ended when analyzeOnComplete is
@@ -478,6 +501,8 @@ export function noteRecallMeetingDetected(input: {
     startedAt: existing?.startedAt ?? input.startedAt ?? nowIso(),
     endedAt: input.endedAt ?? existing?.endedAt,
     segments: existing?.segments ?? [],
+    // Preserve user notes across re-detection / streamed→canonical rewrite.
+    notes: existing?.notes,
     artifactPath: existing?.artifactPath,
     analysisPath: existing?.analysisPath,
     canonicalStatus: existing?.canonicalStatus,
@@ -532,6 +557,80 @@ export function appendRecallTranscriptSegment(input: Omit<RecallTranscriptSegmen
   return saveMeetingRecord(updated);
 }
 
+// ── Live scratchpad notes ────────────────────────────────────────────────
+// User-authored notes taken during a meeting, keyed by windowId (both
+// providers expose one live: `local:<sessionId>` for in-person, the SDK window
+// id for Recall). All mutations are synchronous read-modify-write like the
+// segment path, so on Node's single-threaded loop they stay atomic against the
+// streaming segment writes on a live Zoom call.
+
+function sanitizeNoteKind(kind: unknown): MeetingNote['kind'] | undefined {
+  return kind === 'action' || kind === 'question' || kind === 'followup' ? kind : undefined;
+}
+
+function normalizeNoteText(text: string): string {
+  return text.replace(/\s+$/g, '').slice(0, MEETING_NOTE_MAX_CHARS).trim();
+}
+
+export function listMeetingNotes(windowId: string): MeetingNote[] {
+  return loadMeetingRecord(windowId)?.notes ?? [];
+}
+
+/** Append a note. Returns the saved record + note, or null when no meeting is
+ *  found for the windowId. Throws when the per-meeting note cap is reached. */
+export function appendMeetingNote(windowId: string, input: {
+  text: string;
+  kind?: MeetingNote['kind'];
+  atSeconds?: number;
+}): { record: RecallMeetingRecord; note: MeetingNote } | null {
+  const record = loadMeetingRecord(windowId);
+  if (!record) return null;
+  const text = normalizeNoteText(input.text);
+  if (!text) return null;
+  const notes = record.notes ?? [];
+  if (notes.length >= MEETING_NOTES_MAX) throw new Error('This meeting already has the maximum number of notes.');
+  const note: MeetingNote = {
+    id: `note-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`,
+    text,
+    kind: sanitizeNoteKind(input.kind),
+    atSeconds: Number.isFinite(input.atSeconds) ? Math.max(0, Math.round(input.atSeconds as number)) : undefined,
+    createdAt: nowIso(),
+  };
+  const saved = saveMeetingRecord({ ...record, notes: [...notes, note] });
+  return { record: saved, note };
+}
+
+/** Edit a note's text and/or marker. `kind: null` clears the marker. Returns
+ *  the saved record, or null when the meeting/note is not found. */
+export function updateMeetingNote(windowId: string, id: string, patch: {
+  text?: string;
+  kind?: MeetingNote['kind'] | null;
+}): RecallMeetingRecord | null {
+  const record = loadMeetingRecord(windowId);
+  if (!record?.notes?.length) return null;
+  let found = false;
+  const notes = record.notes.map((n) => {
+    if (n.id !== id) return n;
+    found = true;
+    const text = patch.text !== undefined ? normalizeNoteText(patch.text) || n.text : n.text;
+    const kind = patch.kind === null
+      ? undefined
+      : patch.kind !== undefined ? sanitizeNoteKind(patch.kind) : n.kind;
+    return { ...n, text, kind };
+  });
+  if (!found) return null;
+  return saveMeetingRecord({ ...record, notes });
+}
+
+/** Delete a note. Returns the saved record, or null when the note was absent. */
+export function removeMeetingNote(windowId: string, id: string): RecallMeetingRecord | null {
+  const record = loadMeetingRecord(windowId);
+  if (!record?.notes?.length) return null;
+  const notes = record.notes.filter((n) => n.id !== id);
+  if (notes.length === record.notes.length) return null;
+  return saveMeetingRecord({ ...record, notes });
+}
+
 /**
  * Render the meeting's transcript markdown body from its current
  * segments. Exposed so the canonical-transcript backfill can rewrite
@@ -582,6 +681,46 @@ function renderAnalysisSection(analysis: RecallMeetingAnalysis | null | undefine
   return lines.length > 2 ? lines : [];
 }
 
+/** Marker glyphs for the artifact/analyzer rendering of a note. */
+const NOTE_MARKER: Record<NonNullable<MeetingNote['kind']>, string> = {
+  action: '★',
+  question: '❓',
+  followup: '⚑',
+};
+
+/** mm:ss (or h:mm:ss) from an elapsed-seconds offset, for transcript alignment. */
+function formatNoteClock(atSeconds: number | undefined): string {
+  if (!Number.isFinite(atSeconds) || (atSeconds as number) < 0) return '--:--';
+  const total = Math.floor(atSeconds as number);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = String(h > 0 ? m : m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+/** One markdown line per note: `- [mm:ss] ★ text`. Shared by the artifact
+ *  section and the analyzer prompt so both read identically. */
+function renderNoteLine(note: MeetingNote): string {
+  const clock = `[${formatNoteClock(note.atSeconds)}]`;
+  const marker = note.kind ? `${NOTE_MARKER[note.kind]} ` : '';
+  return `- ${clock} ${marker}${note.text}`;
+}
+
+/** The user-authored `## Notes` section. Rendered OUTSIDE the analysis managed
+ *  markers so re-file (rewriteMeetingArtifact) never clobbers it. Empty → []. */
+function renderNotesSection(record: RecallMeetingRecord): string[] {
+  const notes = record.notes ?? [];
+  if (notes.length === 0) return [];
+  return [
+    '## Notes',
+    '',
+    ...[...notes].sort((a, b) => (a.atSeconds ?? 0) - (b.atSeconds ?? 0)).map(renderNoteLine),
+    '',
+  ];
+}
+
 function renderTranscriptArtifactBody(
   record: RecallMeetingRecord,
   sourceLabel: string,
@@ -610,6 +749,7 @@ function renderTranscriptArtifactBody(
     `# ${record.title || 'Meeting Capture'}`,
     '',
     ...renderAnalysisSection(analysis),
+    ...renderNotesSection(record),
     '## Capture',
     '',
     `- Source: ${sourceLabel}`,
@@ -920,7 +1060,7 @@ export function recordMeetingTitle(
  * consistent (reindex re-chunks by mtime; no orphaned rows). Returns true
  * when it wrote a changed file (caller can trigger a reindex).
  */
-function rewriteMeetingArtifact(meetingId: string): boolean {
+export function rewriteMeetingArtifact(meetingId: string): boolean {
   const record = loadRecallMeetingById(meetingId);
   if (!record) return false;
   const artifactPath = record.artifactPath && existsSync(record.artifactPath)
@@ -1040,6 +1180,7 @@ export interface RecallMeetingSummary {
   startedAt: string;
   endedAt?: string;
   segmentCount: number;
+  notesCount: number;
   artifactPath?: string;
   analysisPath?: string;
   hasAnalysis: boolean;
@@ -1111,6 +1252,7 @@ export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeeti
     startedAt: record.startedAt,
     endedAt: record.endedAt,
     segmentCount: record.segments?.length ?? 0,
+    notesCount: record.notes?.length ?? 0,
     artifactPath: record.artifactPath,
     analysisPath: resolvedAnalysisPath,
     hasAnalysis: Boolean(resolvedAnalysisPath),
@@ -1214,6 +1356,14 @@ export function buildAnalyzerPrompt(record: RecallMeetingRecord, artifactPath: s
     `Provider: ${record.provider ?? 'recall'}`,
     `Started: ${record.startedAt}`,
     record.endedAt ? `Ended: ${record.endedAt}` : '',
+    ...(record.notes?.length
+      ? [
+          '',
+          'User notes taken live during the meeting (authoritative for intent/priorities):',
+          ...[...record.notes].sort((a, b) => (a.atSeconds ?? 0) - (b.atSeconds ?? 0)).map(renderNoteLine),
+          'Weight these notes ABOVE your own inference: treat ★ (action) notes as action-item candidates, ⚑ (follow-up) notes as decisions/follow-ups, and ❓ (question) notes as open questions to reflect in the summary. Do not omit an action the user flagged.',
+        ]
+      : []),
     '',
     'Steps:',
     '1. Read the transcript file end-to-end.',

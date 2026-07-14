@@ -325,11 +325,14 @@ import {
   type OperationalEventSource,
 } from '../runtime/operational-telemetry.js';
 import {
+  appendMeetingNote,
   appendRecallTranscriptSegment,
   buildAnalyzerPrompt,
   buildMeetingChatPrompt,
   createRecallSdkUpload,
   finalizeRecallMeeting,
+  findRecallMeetingRecord,
+  listMeetingNotes,
   listRecentRecallMeetingSummaries,
   loadRecallMeetingAnalysis,
   loadRecallMeetingById,
@@ -337,9 +340,13 @@ import {
   isRecallRegion,
   noteRecallMeetingDetected,
   patchMeetingRecord,
+  removeMeetingNote,
   renameMeeting,
+  rewriteMeetingArtifact,
+  updateMeetingNote,
   RECALL_REGIONS,
   saveRecallMeetingSettings,
+  type MeetingNote,
   type RecallMeetingSettings,
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
@@ -6805,6 +6812,70 @@ export function registerConsoleRoutes(
     }
   });
 
+  // ── Live scratchpad notes ─────────────────────────────────────────────
+  // Unified across in-person + Recall, keyed by the meeting's windowId
+  // (`local:<sessionId>` for in-person, the SDK window id for Recall). A note
+  // taken before the meeting is stopped rides the record into the analyzer;
+  // a note edited after completion re-renders the vault artifact.
+  const reindexNotesArtifact = (windowId: string): void => {
+    const record = findRecallMeetingRecord({ windowId });
+    if (record?.artifactPath) {
+      try { if (rewriteMeetingArtifact(record.id)) reindexVault(); } catch { /* maintenance retries */ }
+    }
+  };
+
+  app.get('/api/console/meetings/notes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const windowId = typeof req.query.windowId === 'string' ? req.query.windowId : '';
+    if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
+    res.json({ notes: listMeetingNotes(windowId) });
+  });
+
+  app.post('/api/console/meetings/notes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId.trim() : '';
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+    if (!windowId || !text.trim()) { res.status(400).json({ error: 'windowId and non-empty text required' }); return; }
+    const kind = req.body?.kind as MeetingNote['kind'] | undefined;
+    const atSeconds = typeof req.body?.atSeconds === 'number' ? req.body.atSeconds : undefined;
+    try {
+      const result = appendMeetingNote(windowId, { text, kind, atSeconds });
+      if (!result) { res.status(404).json({ error: 'no active meeting for this windowId' }); return; }
+      reindexNotesArtifact(windowId);
+      res.status(201).json({ note: result.note, notes: result.record.notes ?? [] });
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/meetings/notes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as { windowId?: unknown; id?: unknown; text?: unknown; kind?: unknown };
+    const windowId = typeof body.windowId === 'string' ? body.windowId.trim() : '';
+    const id = typeof body.id === 'string' ? body.id.trim() : '';
+    if (!windowId || !id) { res.status(400).json({ error: 'windowId and id required' }); return; }
+    const patch: { text?: string; kind?: MeetingNote['kind'] | null } = {};
+    if (typeof body.text === 'string') patch.text = body.text;
+    if ('kind' in body) patch.kind = body.kind === null ? null : (body.kind as MeetingNote['kind']);
+    const record = updateMeetingNote(windowId, id, patch);
+    if (!record) { res.status(404).json({ error: 'note not found' }); return; }
+    reindexNotesArtifact(windowId);
+    res.json({ notes: record.notes ?? [] });
+  });
+
+  app.delete('/api/console/meetings/notes', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId.trim()
+      : typeof req.query.windowId === 'string' ? req.query.windowId : '';
+    const id = typeof req.body?.id === 'string' ? req.body.id.trim()
+      : typeof req.query.id === 'string' ? req.query.id : '';
+    if (!windowId || !id) { res.status(400).json({ error: 'windowId and id required' }); return; }
+    const record = removeMeetingNote(windowId, id);
+    if (!record) { res.status(404).json({ error: 'note not found' }); return; }
+    reindexNotesArtifact(windowId);
+    res.json({ notes: record.notes ?? [] });
+  });
+
   // Resume upload-id → recording-id handoffs interrupted by daemon exit.
   try { recoverPendingRecallSdkUploads(); } catch { /* completion/status can retry */ }
 
@@ -6815,6 +6886,11 @@ export function registerConsoleRoutes(
     try {
       const store = await getSecretStore();
       const secret = await store.get('recall_api_key');
+      // Surface the windowId of the Recall meeting currently recording so the
+      // web UI can key the live scratchpad (Recall — unlike in-person — does
+      // not otherwise expose a live session id to the SPA).
+      const activeRecording = listRecentRecallMeetingSummaries(10)
+        .find((m) => m.provider !== 'local' && m.status === 'recording');
       res.json({
         settings: loadRecallMeetingSettings(),
         credential: {
@@ -6822,6 +6898,8 @@ export function registerConsoleRoutes(
           source: secret.source,
           hasValue: Boolean(secret.value),
         },
+        activeWindowId: activeRecording?.windowId,
+        activeStartedAt: activeRecording?.startedAt,
         regions: RECALL_REGIONS,
         docsUrl: 'https://docs.recall.ai/docs/desktop-sdk',
         signupUrl: 'https://www.recall.ai/signup',
