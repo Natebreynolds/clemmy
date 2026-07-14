@@ -33,8 +33,13 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { classifyTurnText, toOrchestratorDecision, isPlainTextContractDirective } =
-  await import('./turn-decision.js');
+const {
+  classifyTurnText,
+  toOrchestratorDecision,
+  isPlainTextContractDirective,
+  requestedVerbatimReply,
+  replyFulfillsVerbatimRequest,
+} = await import('./turn-decision.js');
 
 // ── Live bug 1: sess-mrcg3mtx — long draft-quoting answer must COMPLETE ───────
 
@@ -145,6 +150,103 @@ test('contract directive detection keys on the directive text itself', () => {
   // falls through to the stall machinery (mirrors the loop's >60-char guard).
   const ack = classifyTurnText('OK.', { toolCalls: 0, contractTurn: true });
   assert.equal(ack.kind, 'punt');
+});
+
+// ── Verbatim-echo request (2026-07-13, F1 runaway source fix) ────────────────
+// A directive that explicitly asks for an exact short reply makes that literal the
+// deliverable, not a lazy ack. requestedVerbatimReply extracts it; the loop delivers
+// the zero-tool reply ONLY when it EQUALS the literal (the equality is the guard).
+
+test('requestedVerbatimReply: extracts the literal from explicit verbatim directives', () => {
+  assert.equal(requestedVerbatimReply('Reply with just the word: ok'), 'ok');
+  assert.equal(requestedVerbatimReply("respond with only 'yes'"), 'yes');
+  assert.equal(requestedVerbatimReply('say exactly: done'), 'done');
+  assert.equal(requestedVerbatimReply('just reply "acknowledged"'), 'acknowledged');
+  assert.equal(requestedVerbatimReply('answer with the single word GO'), 'GO');
+  assert.equal(requestedVerbatimReply('reply with only the phrase "all clear"'), 'all clear');
+});
+
+test('requestedVerbatimReply: covers polite/interrogative phrasings of the same class (lead-in is safe)', () => {
+  // The reply-verb must IMMEDIATELY follow the trivial lead-in, so these extract...
+  assert.equal(requestedVerbatimReply('Can you reply with just the word ok?'), 'ok');
+  assert.equal(requestedVerbatimReply('Could you just reply ok'), 'ok');
+  assert.equal(requestedVerbatimReply('hey, just say done'), 'done');
+  assert.equal(requestedVerbatimReply('Would you reply with the single word GO'), 'GO');
+  // ...while an interrogative wrapping an ACTION clause still yields null (no leak).
+  assert.equal(requestedVerbatimReply('Can you fix the bug and reply ok'), null);
+  assert.equal(requestedVerbatimReply('Would you reconcile the accounts and reply done'), null);
+});
+
+// IO verbs are ACTION-ambiguous ("type yes" = type into the prompt you're operating;
+// "write done" = a file write), so a BARE token after an IO verb must NOT extract
+// (pre-patch review finding). Explicit verbatim intent — quotes or "the word <X>" —
+// is required for write|output|return|print|type.
+test('requestedVerbatimReply: IO verbs require explicit verbatim intent (bare token = null)', () => {
+  assert.equal(requestedVerbatimReply('type yes'), null);
+  assert.equal(requestedVerbatimReply('write done'), null);
+  assert.equal(requestedVerbatimReply('Can you please just write done'), null);
+  assert.equal(requestedVerbatimReply('return ok'), null);
+  assert.equal(requestedVerbatimReply('print done'), null);
+  // Explicit intent still extracts:
+  assert.equal(requestedVerbatimReply('type the word yes'), 'yes');
+  assert.equal(requestedVerbatimReply('write "done"'), 'done');
+  assert.equal(requestedVerbatimReply('print the word: hello'), 'hello');
+});
+
+test('requestedVerbatimReply: returns null for open tasks and non-verbatim phrasings', () => {
+  assert.equal(requestedVerbatimReply('Analyze these 50 deals and report back'), null);
+  assert.equal(requestedVerbatimReply('reply only when the report is done'), null);
+  assert.equal(requestedVerbatimReply('just send the email to bob'), null);
+  assert.equal(requestedVerbatimReply('please continue'), null);
+  // The harness's own stall steer must never read as a verbatim request.
+  assert.equal(
+    requestedVerbatimReply('Your previous response was prose, not an action. You MUST call a tool now to make progress — do not emit any text before the tool call.'),
+    null,
+  );
+  // Over-long directives are out of scope (the ask is not a simple short reply).
+  assert.equal(requestedVerbatimReply(`reply with the word ok. ${'x'.repeat(260)}`), null);
+});
+
+// ANCHORING REGRESSION (adversarial review 2026-07-13): the bindings are ^…$
+// whole-directive anchored, so an ACTION clause before a trailing ack no longer
+// leaks the ack word out of the tail. Without anchoring these all wrongly extracted
+// the trailing token and a zero-tool punt of it was delivered as "done".
+test('requestedVerbatimReply: an action clause before a trailing ack yields NO literal (anchoring holds)', () => {
+  assert.equal(requestedVerbatimReply('Fix the login bug and just reply ok'), null);
+  assert.equal(requestedVerbatimReply('Send the report to finance and then just reply done'), null);
+  assert.equal(requestedVerbatimReply('Reconcile the accounts. Only reply yes'), null);
+  assert.equal(requestedVerbatimReply('Delete the stale branches and just confirm'), null);
+  // Adverb-in-prose must not bind a bare trailing token ("exactly right" ≠ a request).
+  assert.equal(requestedVerbatimReply('Fix the bug and verify it works exactly right'), null);
+  assert.equal(requestedVerbatimReply('Reconcile the ledgers and get it exactly right.'), null);
+  // A full action directive that ENDS in the verbatim ask still yields null (the
+  // action clause at the start breaks the ^-anchor) — the task must actually run.
+  assert.equal(
+    requestedVerbatimReply('Reconcile the July invoices against the bank statement and when finished reply with just the word: done'),
+    null,
+  );
+});
+
+test('replyFulfillsVerbatimRequest: a zero-tool ack on an action-then-ack directive is NOT fulfillment', () => {
+  assert.equal(replyFulfillsVerbatimRequest('Fix the login bug and just reply ok', 'ok'), false);
+  assert.equal(replyFulfillsVerbatimRequest('Reconcile the ledgers and get it exactly right.', 'Right.'), false);
+  assert.equal(
+    replyFulfillsVerbatimRequest('Reconcile the July invoices against the bank statement and when finished reply with just the word: done', 'Done.'),
+    false,
+  );
+});
+
+test('replyFulfillsVerbatimRequest: fulfilled only when the reply EQUALS the requested literal', () => {
+  // The F1 case: exact match (tolerant of the trailing period the model adds).
+  assert.equal(replyFulfillsVerbatimRequest('Reply with just the word: ok', 'ok'), true);
+  assert.equal(replyFulfillsVerbatimRequest('Reply with just the word: ok', 'ok.'), true);
+  assert.equal(replyFulfillsVerbatimRequest('Reply with just the word: ok', 'OK'), true);
+  assert.equal(replyFulfillsVerbatimRequest("respond with only 'yes'", 'Yes.'), true);
+  // A lazy ack on an OPEN task is NOT fulfillment — no bound literal equals it.
+  assert.equal(replyFulfillsVerbatimRequest('Analyze these 50 deals', 'OK.'), false);
+  assert.equal(replyFulfillsVerbatimRequest('reply only when the report is done', 'Done.'), false);
+  // Right directive, WRONG reply → not fulfilled (equality guard holds).
+  assert.equal(replyFulfillsVerbatimRequest('Reply with just the word: ok', 'sure, done'), false);
 });
 
 // ── Live bug 3: Joshua Tree — hallucinated tool transcript stays a PUNT ──────

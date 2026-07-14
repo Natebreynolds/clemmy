@@ -88,6 +88,7 @@ import {
   STRUCTURED_OUTPUT_RECOVERY_FALLBACK,
   STALL_OUTPUT_PATTERN,
   isPlainTextContractDirective,
+  replyFulfillsVerbatimRequest,
   toOrchestratorDecision,
   evaluateStructuredDecisionStall,
   evaluateProgress,
@@ -2108,6 +2109,14 @@ async function runConversationCore(
               delivered: true,
             },
           });
+          // Synthesize the decision for the RETURN-VALUE lane (2026-07-13): every
+          // salvage here completes with decision===null, so lastDecision was
+          // undefined and respondViaHarness (respond-bridge.ts) built its reply
+          // from lastDecision → shipped "(no reply produced)" on the API/Discord
+          // surfaces while the event lane (desktop dock) showed the real reply —
+          // a parity defect across the whole salvage CLASS. The event above stays
+          // the source of truth; this mirrors it into the return value.
+          lastDecision = { summary: contractReply, reply: contractReply, done: true, nextAction: 'completed', reason: null };
           return {
             sessionId: options.sessionId,
             status: 'completed',
@@ -2116,6 +2125,53 @@ async function runConversationCore(
             lastTurn,
           };
         }
+      }
+      // VERBATIM-ECHO FULFILLMENT (2026-07-13). The user's own directive explicitly
+      // asked for an exact short reply ("Reply with just the word: ok") and the model
+      // produced EXACTLY that with zero tools. parseDecisionText nulls it as a generic
+      // ack (STALL_OUTPUT_PATTERN), so without this it falls to the stall steer ("you
+      // MUST call a tool") and the model flails call_tool with varying args until the
+      // budget cap — the F1 runaway. The requested literal is grammatically bound to a
+      // reply verb / "the word <X>" construction AND the reply EQUALS it, so this is
+      // fulfillment, not a punt. A lazy "OK." on an OPEN task has no bound literal equal
+      // to "ok" and still falls through to the stall machinery below (the deliberate
+      // ack-exclusion is untouched). Keyed on options.input — the code guarantees that
+      // is ALWAYS the user's real message (continuations only ever re-assign nextInput,
+      // and a convergence-steer prefix could push nextInput past the length gate), so
+      // this reads the user's actual ask, not a harness directive. The EQUALITY gate is
+      // the guard against re-firing: any turn whose reply is not exactly the literal
+      // (a real tool turn, an announcement) simply doesn't match. Shares the
+      // HARNESS_STALL_SALVAGE_REPLY kill-switch with the consistency salvage below.
+      if (
+        (turnResult.toolCalls ?? 0) === 0 &&
+        typeof turnResult.finalOutput === 'string' &&
+        (getRuntimeEnv('HARNESS_STALL_SALVAGE_REPLY', 'on') ?? 'on').toLowerCase() !== 'off' &&
+        replyFulfillsVerbatimRequest(options.input, turnResult.finalOutput)
+      ) {
+        const verbatimReply = turnResult.finalOutput.trim();
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'conversation_completed',
+          data: {
+            steps: stepIndex,
+            reason: 'verbatim_reply_fulfilled',
+            summary: verbatimReply,
+            reply: verbatimReply,
+            delivered: true,
+          },
+        });
+        // Mirror the reply into the return value for the respond-bridge lane
+        // (see the plain-text-contract salvage above — same class fix).
+        lastDecision = { summary: verbatimReply, reply: verbatimReply, done: true, nextAction: 'completed', reason: null };
+        return {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+        };
       }
       // Malformed/unparseable-decision RECOVERY. Sub-agents are TOOLS here (no
       // SDK handoffs — see orchestrator.ts), so a null decision means the
@@ -2254,6 +2310,9 @@ async function runConversationCore(
               stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
             },
           });
+          // Mirror the reply into the return value for the respond-bridge lane
+          // (see the plain-text-contract salvage above — same class fix).
+          lastDecision = { summary: stallInfo.userVisibleMessage, reply: stallInfo.userVisibleMessage, done: true, nextAction: 'completed', reason: null };
           return {
             sessionId: options.sessionId,
             status: 'completed',
@@ -2293,6 +2352,9 @@ async function runConversationCore(
                 stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
               },
             });
+            // Mirror the reply into the return value for the respond-bridge lane
+            // (see the plain-text-contract salvage above — same class fix).
+            lastDecision = { summary: finalText, reply: finalText, done: true, nextAction: 'completed', reason: null };
             return {
               sessionId: options.sessionId,
               status: 'completed',
