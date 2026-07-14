@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { addNotification } from '../../runtime/notifications.js';
-import { clearLiveTranscript, noteLiveTranscriptOpportunity, type LiveTranscriptSnapshot } from './live-transcript.js';
+import { clearLiveTranscript, getLiveTranscriptSnapshot, noteLiveTranscriptOpportunity, sweepOrphanedLiveSlices, type LiveTranscriptSnapshot } from './live-transcript.js';
 import { BASE_DIR } from '../../config.js';
 import { createBackgroundTask } from '../../execution/background-tasks.js';
 import { reindexVault } from '../../memory/indexer.js';
@@ -664,6 +664,9 @@ export function recoverFinalizedLocalMeetingSidecars(options: { force?: boolean 
   const result: LocalMeetingSidecarRecoveryResult = { discovered: 0, queued: 0, errors: 0 };
   let entries: string[] = [];
   try { entries = readdirSync(LOCAL_MEETING_AUDIO_DIR); } catch { return result; }
+  // Privacy sweep piggybacks the readdir we already did: orphaned live-slice
+  // temp WAVs from a daemon death are raw meeting audio nothing else deletes.
+  try { sweepOrphanedLiveSlices(LOCAL_MEETING_AUDIO_DIR, entries); } catch { /* best effort */ }
   for (const entry of entries.slice(0, 10_000)) {
     const match = /^local-([a-zA-Z0-9_-]{8,80})\.json$/.exec(entry);
     if (!match) continue;
@@ -794,7 +797,13 @@ export async function getLocalMeetingStatus(sessionIdInput?: string): Promise<{
   // returns what's been heard so far.
   let liveTranscript: LiveTranscriptSnapshot | undefined;
   if (record?.provider === 'local' && record.status === 'recording' && record.audioPath && sessionIdInput) {
-    liveTranscript = noteLiveTranscriptOpportunity(safeSessionId(sessionIdInput), record.audioPath);
+    // ONE whisper at a time on the machine (review wf_612fba66-dd3): while the
+    // batch queue is busy, serve the existing snapshot without kicking a new
+    // live pass — the view pauses; the authoritative lane never contends.
+    const batchBusy = activeMeetingId !== undefined || queuedMeetingIds.length > 0;
+    liveTranscript = batchBusy
+      ? getLiveTranscriptSnapshot(safeSessionId(sessionIdInput))
+      : noteLiveTranscriptOpportunity(safeSessionId(sessionIdInput), record.audioPath);
   }
   return {
     liveTranscript,

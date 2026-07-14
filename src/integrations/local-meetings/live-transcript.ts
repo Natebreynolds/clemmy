@@ -57,6 +57,7 @@ export interface LiveTranscriptSnapshot {
 
 interface LiveState {
   partPath: string;
+  controller: AbortController;
   transcribedBytes: number; // PCM bytes covered (absolute, excl. header)
   segments: LiveTranscriptSegment[];
   inFlight: boolean;
@@ -66,6 +67,34 @@ interface LiveState {
 }
 
 const states = new Map<string, LiveState>();
+// Temp slice files owned by an IN-FLIGHT pass of THIS process — the orphan
+// sweep must never delete the slice whisper is reading right now.
+const inFlightSlicePaths = new Set<string>();
+
+const LIVE_SLICE_NAME = /^live-slice-[a-zA-Z0-9._-]{1,200}-\d+\.wav$/;
+
+/**
+ * Privacy sweep (review wf_612fba66-dd3): a daemon death mid-pass orphans a
+ * live-slice temp WAV (up to ~5.8MB of raw meeting audio) that nothing else
+ * deletes — silently defeating the transcript-only promise. Called from the
+ * sidecar-recovery readdir (5s-throttled) with the entries it already listed.
+ * Deletes every live-slice file NOT owned by an in-flight pass of this
+ * process — such a file is garbage by construction (no age heuristic needed).
+ * Runs regardless of the kill-switch or the consent gate: deleting orphaned
+ * raw audio is the privacy-RESTORING action.
+ */
+export function sweepOrphanedLiveSlices(dir: string, entries: string[]): void {
+  for (const entry of entries) {
+    if (!LIVE_SLICE_NAME.test(entry)) continue;
+    const full = path.join(dir, entry);
+    if (inFlightSlicePaths.has(full)) continue;
+    try {
+      const info = statSync(full);
+      if (!info.isFile()) continue;
+      unlinkSync(full);
+    } catch { /* already gone or unreadable — best effort */ }
+  }
+}
 
 // getLocalTranscriptionRuntimeStatus checksums the model file — cache readiness
 // briefly so the 5s poll doesn't hash 148MB every tick.
@@ -75,15 +104,16 @@ const RUNTIME_READY_TTL_MS = 60_000;
 type LiveTranscriber = (input: {
   audioPath: string;
   durationSeconds: number;
+  signal?: AbortSignal;
 }) => Promise<LocalWhisperTranscription>;
 
-let transcriber: LiveTranscriber = ({ audioPath, durationSeconds }) =>
-  transcribeLocalMeetingAudio({ audioPath, model: DEFAULT_LOCAL_WHISPER_MODEL, durationSeconds });
+let transcriber: LiveTranscriber = ({ audioPath, durationSeconds, signal }) =>
+  transcribeLocalMeetingAudio({ audioPath, model: DEFAULT_LOCAL_WHISPER_MODEL, durationSeconds, signal });
 
 /** Test seam, mirroring meeting-capture's transcriber seam. */
 export function _setLiveTranscriberForTests(fn: LiveTranscriber | null): void {
-  transcriber = fn ?? (({ audioPath, durationSeconds }) =>
-    transcribeLocalMeetingAudio({ audioPath, model: DEFAULT_LOCAL_WHISPER_MODEL, durationSeconds }));
+  transcriber = fn ?? (({ audioPath, durationSeconds, signal }) =>
+    transcribeLocalMeetingAudio({ audioPath, model: DEFAULT_LOCAL_WHISPER_MODEL, durationSeconds, signal }));
   runtimeReadyCache = fn ? { ready: true, atMs: Date.now() } : null;
 }
 
@@ -159,10 +189,11 @@ async function runPass(sessionId: string, state: LiveState): Promise<void> {
       path.dirname(state.partPath),
       `live-slice-${sessionId}-${state.passCounter}.wav`,
     );
+    inFlightSlicePaths.add(tempPath);
     writeFileSync(tempPath, Buffer.concat([wavHeader(sliceBytes), buf.subarray(0, sliceBytes)]), { mode: 0o600 });
     const sliceStartSec = sliceStartByte / BYTES_PER_SECOND;
     const coveredThroughSec = state.transcribedBytes / BYTES_PER_SECOND;
-    const result = await transcriber({ audioPath: tempPath, durationSeconds: sliceBytes / BYTES_PER_SECOND });
+    const result = await transcriber({ audioPath: tempPath, durationSeconds: sliceBytes / BYTES_PER_SECOND, signal: state.controller.signal });
     for (const seg of result.segments as LocalWhisperSegment[]) {
       const startSeconds = seg.startSeconds + sliceStartSec;
       const endSeconds = seg.endSeconds + sliceStartSec;
@@ -179,7 +210,10 @@ async function runPass(sessionId: string, state: LiveState): Promise<void> {
     state.lastError = error instanceof Error ? error.message : String(error);
     state.updatedAt = new Date().toISOString();
   } finally {
-    if (tempPath) { try { unlinkSync(tempPath); } catch { /* already gone */ } }
+    if (tempPath) {
+      inFlightSlicePaths.delete(tempPath);
+      try { unlinkSync(tempPath); } catch { /* already gone */ }
+    }
     state.inFlight = false;
   }
 }
@@ -196,14 +230,19 @@ export function noteLiveTranscriptOpportunity(sessionId: string, finalAudioPath:
     // The desktop recorder streams into `<final>.part` and renames at stop.
     state = {
       partPath: `${finalAudioPath}.part`,
+      controller: new AbortController(),
       transcribedBytes: 0,
       segments: [],
       inFlight: false,
       passCounter: 0,
     };
-    // Crude bound for a long-lived daemon (sessions are cleared on stop/cancel,
-    // but a crashed renderer may orphan one).
-    if (states.size > 20) states.clear();
+    // Bound for a long-lived daemon: evict OTHER sessions only — a blanket
+    // clear() wiped the ACTIVE session's state mid-recording (review note).
+    if (states.size > 20) {
+      for (const key of states.keys()) {
+        if (key !== sessionId) { states.get(key)?.controller.abort(); states.delete(key); }
+      }
+    }
     states.set(sessionId, state);
   }
   if (!state.inFlight) {
@@ -226,5 +265,8 @@ export function getLiveTranscriptSnapshot(sessionId: string): LiveTranscriptSnap
 
 /** The recording ended (stop/ingest/cancel) — the batch pass owns the truth. */
 export function clearLiveTranscript(sessionId: string): void {
+  // Abort an in-flight whisper so the batch pass at stop never contends with a
+  // live pass over the same machine (review wf_612fba66-dd3).
+  states.get(sessionId)?.controller.abort();
   states.delete(sessionId);
 }
