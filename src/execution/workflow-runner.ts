@@ -15,6 +15,7 @@ import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harne
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
+import { evidenceLooksFailedOrBlocked, recallToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
@@ -1753,7 +1754,9 @@ async function runStepViaHarness(
     // rendered from the same object the reduce gate verifies — the authored
     // prose can no longer drift from what the gate demands.
     const contractSpec = !isItemInvocation && step.output ? `\n\n${renderOutputContractSpec(step.output)}` : '';
-    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}`;
+    // Fold 3: the step's learned tool pin (if healthy) rides in with the contract.
+    const pinSpec = !isItemInvocation ? renderWorkflowToolPin(workflowName, step.id) : '';
+    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}`;
     // Typed-contract delivery (P1): when the step declared inputs and the
     // contract flag + step agent are on, append the BOUND inputs/upstream
     // as a structured block AFTER the prose (never replacing it). This is
@@ -2010,6 +2013,39 @@ async function runStepViaHarness(
       .filter((t) => t.length > 0);
     const guardPhantom = (output: unknown): unknown =>
       isPhantomStepCompletion(step, stepToolUses, output) ? phantomBlockedOutput(step) : output;
+
+    // Fold 3 capture (best-effort, never blocks a step): remember the LAST
+    // proven composio call of a step that emitted a real (non-blocked) result,
+    // keyed workflow:<name>:<stepId> in the tool-choice store — the next run
+    // of this step starts with the pin injected instead of re-discovering.
+    if (workflowToolPinsEnabled() && !isItemInvocation && captured.found
+      && !(captured.value && typeof captured.value === 'object' && (captured.value as { blocked?: unknown }).blocked === true)) {
+      try {
+        const returned = listHarnessEvents(realSessionId, { types: ['tool_returned'] })
+          .filter((e) => e.data?.tool === 'composio_execute_tool'
+            && !evidenceLooksFailedOrBlocked(typeof e.data?.result === 'string' ? e.data.result : undefined));
+        const lastOk = returned[returned.length - 1];
+        const callId = lastOk?.data?.callId;
+        if (callId) {
+          const call = listHarnessEvents(realSessionId, { types: ['tool_called'] })
+            .find((e) => e.data?.callId === callId);
+          const rawArgs = typeof call?.data?.arguments === 'string' ? call.data.arguments : undefined;
+          const parsed = rawArgs ? JSON.parse(rawArgs) as { tool_slug?: string; arguments?: string } : undefined;
+          if (parsed?.tool_slug) {
+            rememberToolChoice({
+              intent: workflowStepPinIntent(workflowName, step.id),
+              description: `Proven tool for workflow "${workflowName}" step "${step.id}"`,
+              choice: {
+                kind: 'composio',
+                identifier: parsed.tool_slug,
+                invocationTemplate: stripBakedConnectionId(parsed.arguments?.slice(0, 800)),
+                testEvidence: `step completed with a non-blocked structured result (run session ${realSessionId.slice(0, 40)})`,
+              },
+            });
+          }
+        }
+      } catch { /* pins are an optimization — never fail a step over them */ }
+    }
 
     // A step is "done" only when the harness reports `completed`. The
     // awaiting_approval while-loop above guarantees a terminal status here.
@@ -2485,6 +2521,36 @@ function workflowBrainFalloverEnabled(): boolean {
  *  recorded an external write (would double-act) — surface the original error.
  *  Healthy runs and read steps are unaffected; the extra attempts only fire on a
  *  post-retry transient (provider-overload) failure. */
+/** Fold 3 (proposal-builder parity, 2026-07-14): workflow-step tool pins ride
+ *  the EXISTING tool-choice store as intents named workflow:<name>:<stepId> —
+ *  zero new storage. A successful step's last proven composio call is
+ *  remembered with provenance; future runs get it INJECTED into the step
+ *  prompt ("try this first"), like auto-brief's author-time pinning without
+ *  the hand-authoring. Never mutates the user's SKILL.md. Kill-switch:
+ *  CLEMMY_WORKFLOW_TOOL_PINS=off. */
+function workflowToolPinsEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_WORKFLOW_TOOL_PINS', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+function workflowStepPinIntent(workflowName: string, stepId: string): string {
+  return `workflow:${workflowName}:${stepId}`;
+}
+
+/** Render the learned pin for prompt injection, or '' when none/unhealthy. */
+function renderWorkflowToolPin(workflowName: string, stepId: string): string {
+  if (!workflowToolPinsEnabled()) return '';
+  try {
+    const record = recallToolChoice(workflowStepPinIntent(workflowName, stepId));
+    const choice = record?.choice;
+    if (!choice || choice.kind !== 'composio' || !choice.identifier) return '';
+    // A pin that has failed more than it has worked is retired from injection —
+    // the store keeps the track record; we just stop recommending it.
+    if ((choice.failureCount ?? 0) > (choice.successCount ?? 0)) return '';
+    const args = choice.invocationTemplate ? ` with args like: ${choice.invocationTemplate.slice(0, 600)}` : '';
+    return `\n\nLEARNED TOOL PIN (proven in a prior run of this step, last validated ${choice.testedAt}${choice.successCount ? `, ${choice.successCount}x since` : ''}): call composio_execute_tool slug "${choice.identifier}"${args}. Try this FIRST; if it fails, adapt or rediscover rather than repeating it blindly.`;
+  } catch { return ''; }
+}
+
 /** Approval rejection/expiry is a HUMAN decision or a hard gate — control
  *  flow, never a soft failure an optional step may gap past (fold-1 review
  *  wf_8abe1dc0-638). Message text preserved for NON_RETRYABLE_RE + consumers. */
