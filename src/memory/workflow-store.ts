@@ -182,6 +182,11 @@ export interface WorkflowStepInput {
    * Serialized to YAML as `retry_budget`.
    */
   retryBudget?: number;
+  /** Proposal-builder parity (2026-07-14): an ENRICHMENT step — when it fails
+   *  (contract, exhausted retries, tool error), the run CONTINUES with a
+   *  declared gap ({gap:true, reason}) instead of halting. Non-optional steps
+   *  keep today's halt behavior. Only fabrication stays fatal. */
+  optional?: boolean;
   /**
    * Goal-contract Phase 2: re-run this step until its declared `output`
    * contract PASSES, up to `maxAttempts` (default 3, clamped 1–5). Each
@@ -698,7 +703,10 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       }
       // retryBudget / retry_budget — clamp to a sane non-negative integer
       // (0..10) so a malformed value can't spin the runner.
-      const rawRetry = typeof step.retryBudget === 'number'
+if (step.optional === true || (step as Record<string, unknown>).optional === 'true') {
+        result.optional = true;
+      }
+            const rawRetry = typeof step.retryBudget === 'number'
         ? step.retryBudget
         : (step as Record<string, unknown>).retry_budget;
       if (typeof rawRetry === 'number' && Number.isFinite(rawRetry) && rawRetry > 0) {
@@ -895,6 +903,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.inputs && Object.keys(s.inputs).length > 0) out.inputs = s.inputs;
       if (s.output && Object.keys(s.output).length > 0) out.output = s.output;
       if (s.retryBudget && s.retryBudget > 0) out.retry_budget = s.retryBudget;
+      if (s.optional === true) out.optional = true;
       // Persist ALL declared classes including 'read'. Undeclared is NOT
       // the same as read: undeclared falls back to the prose heuristic,
       // which has misclassified read-only steps as write (scorpion scrape,

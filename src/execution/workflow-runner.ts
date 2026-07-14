@@ -2489,6 +2489,37 @@ async function executeStepVerified(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
+  try {
+    return await executeStepVerifiedInner(step, ctx);
+  } catch (err) {
+    // Control-flow signals always propagate — a park/cancel is not a failure.
+    if (err instanceof ParkRunSignal || err instanceof WorkflowRunCancelledError) throw err;
+    if (step.optional !== true) throw err;
+    // Fold 1 (proposal-builder parity, 2026-07-14): an OPTIONAL enrichment step
+    // degrades to a DECLARED GAP instead of halting the run — "note it and
+    // continue with available data". Downstream bindings and the synthesis see
+    // {gap:true, reason} (the context block already forbids fabricating around
+    // missing data), and the manifest records the soft failure honestly.
+    const reason = err instanceof Error ? err.message : String(err);
+    const gap = { gap: true, reason: `Optional step "${step.id}" produced no data: ${reason.slice(0, 400)}` };
+    appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
+      kind: 'step_completed',
+      stepId: step.id,
+      output: gap,
+      meta: { softFailed: true, optional: true, error: reason.slice(0, 500) },
+    });
+    try {
+      recordStepOutput({ workflowName: ctx.workflowSlug, runId: ctx.runId, stepId: step.id, output: gap, nowIso: new Date().toISOString() });
+    } catch { /* best-effort */ }
+    logger.warn({ stepId: step.id, reason: reason.slice(0, 200) }, 'optional workflow step failed — continuing with a declared gap');
+    return gap;
+  }
+}
+
+async function executeStepVerifiedInner(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+): Promise<unknown> {
   if (!workflowBrainFalloverEnabled() || step.deterministic) {
     return runStepVerifiedAttempt(step, ctx);
   }

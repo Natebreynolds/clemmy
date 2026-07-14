@@ -275,3 +275,36 @@ test('an already-"scripts/"-prefixed runner is honored and a path escape is reje
     steps: [{ id: 'run', deterministic: { runner: '../evil.js', source: 'x' } }] as never,
   }), /inside the workflow scripts\/ dir|outside scripts/);
 });
+
+test('optional step flag round-trips through parse and serialize (fold 1: declared gaps)', async () => {
+  const { readWorkflowDefinitionFile, writeWorkflow, readWorkflow } = await import('./workflow-store.js');
+  const md = `---
+name: gap-test
+description: fold-1 round trip
+steps:
+  - id: enrich
+    optional: true
+  - id: core
+---
+Body.
+
+## step: enrich
+
+Fetch enrichment data.
+
+## step: core
+
+Do the core work.
+`;
+  const tmpFile = path.join(TMP_HOME, 'gap-test-SKILL.md');
+  writeFileSync(tmpFile, md);
+  const parsed = readWorkflowDefinitionFile(tmpFile);
+  assert.ok(parsed, 'definition parses');
+  const enrich = parsed!.steps.find((s) => s.id === 'enrich');
+  const core = parsed!.steps.find((s) => s.id === 'core');
+  assert.equal(enrich?.optional, true, 'optional parses');
+  assert.equal(core?.optional, undefined, 'default stays halt-on-fail');
+  writeWorkflow('gap-test', parsed!);
+  const roundTripped = readWorkflow('gap-test');
+  assert.equal(roundTripped?.data.steps.find((s) => s.id === 'enrich')?.optional, true, 'optional survives write + re-read');
+});
