@@ -1450,7 +1450,12 @@ ipcMain.handle('clemmy:local-meeting-status', async (evt: IpcMainInvokeEvent) =>
       pendingSessionIds: remaining.map((entry) => entry.sessionId),
     };
   });
-  const daemon = await fetchDaemonJson<Record<string, unknown>>('/api/console/meetings/local/status')
+  // Pass the active recording session so the daemon can attach the live
+  // transcript view for exactly this capture.
+  const statusPath = recorder.recording && recorder.sessionId
+    ? `/api/console/meetings/local/status?sessionId=${encodeURIComponent(recorder.sessionId)}`
+    : '/api/console/meetings/local/status';
+  const daemon = await fetchDaemonJson<Record<string, unknown>>(statusPath)
     .catch((error) => ({
       runtime: { available: false, reason: error instanceof Error ? error.message : String(error) },
     }));

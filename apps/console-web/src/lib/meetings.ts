@@ -33,6 +33,12 @@ export interface LocalMeetingRuntimeStatus {
 }
 
 export interface LocalMeetingStatus {
+  liveTranscript?: {
+    segments?: Array<{ text: string; startSeconds: number; endSeconds: number }>;
+    throughSeconds?: number;
+    updatedAt?: string;
+    lastError?: string;
+  };
   settings?: LocalMeetingSettings;
   runtime?: LocalMeetingRuntimeStatus;
   recorder?: {

@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { addNotification } from '../../runtime/notifications.js';
+import { clearLiveTranscript, noteLiveTranscriptOpportunity, type LiveTranscriptSnapshot } from './live-transcript.js';
 import { BASE_DIR } from '../../config.js';
 import { createBackgroundTask } from '../../execution/background-tasks.js';
 import { reindexVault } from '../../memory/indexer.js';
@@ -565,6 +566,8 @@ export function ingestLocalMeeting(input: {
   bytes?: number;
 }): { record: RecallMeetingRecord; queue: LocalMeetingQueueSnapshot } {
   const sessionId = safeSessionId(input.sessionId);
+  // The recording is final — the batch transcription owns the truth from here.
+  clearLiveTranscript(sessionId);
   const existing = findRecallMeetingRecord({ windowId: localWindowId(sessionId) });
   if (!existing || existing.provider !== 'local') throw new LocalMeetingCaptureError('Local meeting session not found.', 404);
   const audioPath = validateLocalAudioPath(input.audioPath, true);
@@ -746,6 +749,7 @@ export function cancelLocalMeeting(sessionIdInput: string): { cancelled: true; m
   // on. Without this, a cancel whose WAV unlink failed (locked file) left
   // sidecar+WAV behind with the record deleted, and the next recovery scan
   // resurrected the discarded meeting into permanent memory (2026-07-14 review).
+  clearLiveTranscript(sessionId);
   const sidecarPath = path.join(LOCAL_MEETING_AUDIO_DIR, `local-${sessionId}.json`);
   try { unlinkSync(sidecarPath); } catch { /* absent or locked — the cancelled-record skip below still guards */ }
   if (record.audioPath && existsSync(record.audioPath)) {
@@ -772,6 +776,7 @@ export function cancelLocalMeeting(sessionIdInput: string): { cancelled: true; m
 }
 
 export async function getLocalMeetingStatus(sessionIdInput?: string): Promise<{
+  liveTranscript?: LiveTranscriptSnapshot;
   settings: LocalMeetingSettings;
   runtime: Awaited<ReturnType<typeof getLocalTranscriptionRuntimeStatus>>;
   audioRoot: string;
@@ -783,7 +788,16 @@ export async function getLocalMeetingStatus(sessionIdInput?: string): Promise<{
   const record = sessionIdInput
     ? findRecallMeetingRecord({ windowId: localWindowId(safeSessionId(sessionIdInput)) }) ?? undefined
     : undefined;
+  // Live in-person transcription (a VIEW — the batch pass at stop stays the
+  // authoritative transcript): while this session is actively recording, each
+  // status poll kicks an incremental whisper pass over the new audio and
+  // returns what's been heard so far.
+  let liveTranscript: LiveTranscriptSnapshot | undefined;
+  if (record?.provider === 'local' && record.status === 'recording' && record.audioPath && sessionIdInput) {
+    liveTranscript = noteLiveTranscriptOpportunity(safeSessionId(sessionIdInput), record.audioPath);
+  }
   return {
+    liveTranscript,
     settings: loadLocalMeetingSettings(),
     runtime: await getLocalTranscriptionRuntimeStatus(),
     audioRoot: LOCAL_MEETING_AUDIO_DIR,

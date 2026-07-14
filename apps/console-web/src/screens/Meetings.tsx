@@ -377,6 +377,20 @@ export function Meetings() {
             {localNotice && (
               <p aria-live="polite" className={cn('text-small', localNotice.tone === 'error' ? 'text-danger' : localNotice.tone === 'warn' ? 'text-warning' : 'text-muted')}>{localNotice.text}</p>
             )}
+            {localRecording && (localStatus?.liveTranscript?.segments?.length ?? 0) > 0 && (
+              <div className="rounded-md border border-border bg-subtle/40 p-3">
+                <p className="mb-1 flex items-center gap-2 text-caption text-muted">
+                  <span className="relative flex h-2 w-2" aria-hidden>
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-success" />
+                  </span>
+                  Live transcript — heard through {formatElapsed(Math.floor(localStatus?.liveTranscript?.throughSeconds ?? 0))} (runs ~20s behind)
+                </p>
+                <div className="max-h-48 overflow-y-auto whitespace-pre-wrap text-small text-fg">
+                  {(localStatus?.liveTranscript?.segments ?? []).map((seg) => seg.text).join(' ')}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </Card>
