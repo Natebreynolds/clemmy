@@ -118,15 +118,23 @@ export function summarizeFanoutCoverage(sessionId: string): LedgerSummary {
     // a chat-lane fan-out) → count the whole session, as before.
     let boundarySeq = -1;
     for (const e of events) if (e.type === 'fanout_run_boundary' && e.seq > boundarySeq) boundarySeq = e.seq;
+    // Key by ITEM identity (last-attempt-wins), NOT packetKey. The unit of coverage
+    // is the ITEM, and an item can have MULTIPLE attempts: a worker fails, the brain
+    // RETRIES it with a re-planned packet (a DIFFERENT packetKey), and it succeeds.
+    // Keying by packetKey counted those as two separate items → a phantom "failed"
+    // for an item that was actually completed (caught by a live fan-out where Cohere
+    // failed then succeeded on retry — would false-block a background run). Events
+    // arrive ASC by seq, so Map-set = last attempt wins: a retry's ok:true overrides
+    // the earlier failure, AND a Stage-2 ok:false (recorded after the success)
+    // correctly overrides it. A same-packet reuse re-emits the same item → dedups.
     const byKey = new Map<string, { item: string | null; ok: boolean }>();
     let idx = 0;
     for (const e of events) {
       if (e.type !== 'worker_result' || e.seq <= boundarySeq) continue;
       const d = e.data as { item?: unknown; ok?: unknown; packetKey?: unknown } | undefined;
       if (!d || typeof d.ok !== 'boolean') continue;
-      const key = (typeof d.packetKey === 'string' && d.packetKey)
-        ? `pk:${d.packetKey}`
-        : (typeof d.item === 'string' && d.item ? `it:${d.item}` : `idx:${idx}`);
+      const itemKey = typeof d.item === 'string' ? d.item.trim().toLowerCase().replace(/\s+/g, ' ') : '';
+      const key = itemKey ? `it:${itemKey}` : `idx:${idx}`;
       byKey.set(key, { item: typeof d.item === 'string' ? d.item : null, ok: d.ok });
       idx += 1;
     }

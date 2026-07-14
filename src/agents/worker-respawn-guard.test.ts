@@ -194,6 +194,25 @@ test('summarizeFanoutCoverage: empty / no-fanout session → zeroed coverage (ne
   assert.deepEqual(summarizeFanoutCoverage(''), { total: 0, done: 0, failed: 0, failedItems: [] });
 });
 
+test('summarizeFanoutCoverage: a RETRY with a DIFFERENT packetKey collapses to the item\'s final state (live-caught: Cohere failed then succeeded → done, not a phantom failure)', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'execution' });
+  const sid = sess.id;
+  // The real fan-out that caught this: 3 items, Cohere\'s first worker failed, the
+  // brain re-spawned Cohere with a RE-PLANNED packet (different key) → succeeded.
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Anthropic', ok: true, packetKey: 'pkAnth' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Mistral AI', ok: true, packetKey: 'pkMist' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Cohere', ok: false, packetKey: 'pkCohere1' } });
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Cohere', ok: true, packetKey: 'pkCohere2' } });
+  const cov = summarizeFanoutCoverage(sid);
+  assert.equal(cov.total, 3, 'three distinct ITEMS (not four attempts) — the retry does not inflate the count');
+  assert.equal(cov.done, 3, 'Cohere\'s successful retry wins over its earlier failure');
+  assert.equal(cov.failed, 0, 'no phantom failure for a retried-then-completed item');
+  // But a Stage-2 ok:false recorded AFTER the success still correctly overrides it.
+  appendEvent({ sessionId: sid, turn: 0, role: 'system', type: 'worker_result', data: { item: 'Cohere', ok: false, packetKey: 'pkCohere2', reason: 'stage2-verify: hollow' } });
+  assert.equal(summarizeFanoutCoverage(sid).failed, 1, 'a later Stage-2 fabrication verdict still marks the item failed (last-attempt-wins)');
+});
+
 test('summarizeFanoutCoverage: scoped to the CURRENT run — a prior run/continue\'s failures do NOT leak past a run boundary (re-review regression fix)', () => {
   resetEventLog();
   const sess = createSession({ kind: 'execution' });
