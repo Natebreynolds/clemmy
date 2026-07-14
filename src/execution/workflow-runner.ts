@@ -100,7 +100,7 @@ import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, r
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
-import { classifyContractProblems, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
+import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { runWatcherJudge, watcherJudgeEnabled, watcherWorkflowIntervalSteps, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn } from '../runtime/harness/watcher-judge.js';
@@ -1698,6 +1698,10 @@ async function runStepViaHarness(
   // unwind to processOneRunFile. Plain/synthesis propagate directly; forEach
   // preserves the typed reason through its bounded pool and then propagates.
   canPark = false,
+  // Review wf_67792612-cad defect A: forEach ITEM workers must NOT get the
+  // step's AGGREGATE contract (registered or injected) — a single-item worker
+  // submitting one object would be refused against an array-of-N contract.
+  isItemInvocation = false,
 ): Promise<HarnessStepResult> {
   // T-WF-1 — configure the codex OAuth bridge BEFORE the SDK runner
   // touches the model. Discord + chat-dock paths do this at every
@@ -1736,7 +1740,7 @@ async function runStepViaHarness(
   // Self-heal move 2: arm submission-time contract validation for this step
   // session (workflow_step_result refuses a wrong-shape result with the exact
   // problems while the model is still alive to fix it).
-  registerStepContract(realSessionId, step.output);
+  if (!isItemInvocation) registerStepContract(realSessionId, step.output);
   const approvalIds: string[] = [];
   let hadApprovals = false;
   const startedAt = Date.now();
@@ -1748,7 +1752,7 @@ async function runStepViaHarness(
     // Self-heal move 1 (2026-07-14): the output contract rides IN the prompt,
     // rendered from the same object the reduce gate verifies — the authored
     // prose can no longer drift from what the gate demands.
-    const contractSpec = step.output ? `\n\n${renderOutputContractSpec(step.output)}` : '';
+    const contractSpec = !isItemInvocation && step.output ? `\n\n${renderOutputContractSpec(step.output)}` : '';
     const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}`;
     // Typed-contract delivery (P1): when the step declared inputs and the
     // contract flag + step agent are on, append the BOUND inputs/upstream
@@ -2694,50 +2698,8 @@ function sampleStepAttemptMetrics(step: WorkflowStepInput, ctx: StepExecutionCon
  * contract is declared; if nothing parses to an object/array the original is
  * returned and the verifier fails loudly exactly as before. Exported for tests.
  */
-export function coerceOutputForContract(
-  output: unknown,
-  contract: WorkflowStepOutputContract | undefined,
-): unknown {
-  if (!contract) return output;
-  // Only a STRUCTURED contract can be satisfied by a parsed object/array. A
-  // scalar contract (string/number/boolean with no keys/verify) must NOT be
-  // coerced — a valid string output that happens to be JSON-looking would
-  // otherwise flip into a failing object (review regression #1).
-  const structured =
-    contract.type === 'object' ||
-    contract.type === 'array' ||
-    (contract.required_keys?.length ?? 0) > 0 ||
-    Boolean(contract.verify);
-  if (!structured) return output;
-  if (typeof output !== 'string') return output;
-  const text = output.trim();
-  if (!text) return output;
-  const candidates: string[] = [];
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence?.[1]) candidates.push(fence[1].trim());
-  candidates.push(text);
-  // Last resort: pull the outermost {...} or [...] block so leading/trailing
-  // prose around the JSON doesn't defeat the parse.
-  const start = text.search(/[[{]/);
-  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
-  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1));
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate);
-      // ACCEPT a parsed candidate ONLY if it actually SATISFIES the contract.
-      // This makes coercion provably unable to turn a fail into a wrong-pass or
-      // a pass into a fail (review regression #2): a non-conformant parse (e.g.
-      // an incidental [3] from prose, or an object for a string contract) is
-      // rejected, the original is returned, and the verifier fails loudly.
-      if (parsed !== null && typeof parsed === 'object' && verifyStepOutput(contract, parsed).ok) {
-        return parsed;
-      }
-    } catch {
-      /* try the next candidate */
-    }
-  }
-  return output;
-}
+// coerceOutputForContract moved to step-output-verify.ts (one binding for BOTH gates);
+// re-exported below so existing importers keep working.
 
 /** Compact, safe description of an output's actual shape — for a contract
  *  failure message so we can see WHAT was produced vs what was required
@@ -2776,6 +2738,7 @@ export class WorkflowContractViolationError extends Error {
 }
 
 // isBlockedStepOutput moved to step-output-verify.ts (one truth for both gates).
+export { coerceOutputForContract } from './step-output-verify.js';
 
 export function finalizeStepOutput(
   workflowSlug: string,
@@ -3336,6 +3299,7 @@ export async function executeStep(
                   ctx.runId,
                   itemContext,
                   true, // approval parks propagate through runWithConcurrency
+                  true, // isItemInvocation: never gate an item on the AGGREGATE contract
                 );
                 output = r.output;
                 itemSessionId = r.sessionId;

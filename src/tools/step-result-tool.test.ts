@@ -164,3 +164,19 @@ test('renderOutputContractSpec names every gated key with its type — the anti-
     assert.ok(spec.includes(must), `spec must mention ${must}`);
   }
 });
+
+test('submission gate binds like the reduce gate: fenced JSON accepted, fenced blocked exempt (review defect B)', async () => {
+  const { coerceOutputForContract, isBlockedStepOutput, verifyStepOutput } = await import('../execution/step-output-verify.js');
+  const contract = { type: 'object' as const, required_keys: ['key_findings', 'sources'], min_items: { key_findings: 1, sources: 1 } };
+  const fenced = '```json\n{"key_findings":["f1"],"sources":["u1"],"scraper_used":"x"}\n```';
+  const bound = coerceOutputForContract(fenced, contract);
+  assert.equal(verifyStepOutput(contract, bound).ok, true, 'fenced payload binds and passes — no refusal');
+  const fencedBlocked = '```json\n{"blocked": true, "reason": "credential expired"}\n```';
+  const boundBlocked = coerceOutputForContract(fencedBlocked, contract);
+  assert.equal(isBlockedStepOutput(boundBlocked), true, 'fenced honest block binds to its object (reason no longer masked)');
+  const { registerStepContract, clearStepContract, recordStepResultFromTranscript, takeStepResult } = await import('./step-result-tool.js');
+  registerStepContract('sess-fence', contract);
+  const ok = recordStepResultFromTranscript('sess-fence', 'workflow_step_result({"data": "{\\"key_findings\\":[\\"f\\"],\\"sources\\":[\\"s\\"]}"})');
+  clearStepContract('sess-fence');
+  if (ok) assert.equal(takeStepResult('sess-fence').found, true);
+});

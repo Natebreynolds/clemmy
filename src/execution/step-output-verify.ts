@@ -210,3 +210,45 @@ export function classifyContractProblems(problems: string[]): 'empty_output' | '
     && !p.includes('is not an array'));
   return emptyOnly ? 'empty_output' : 'output_contract';
 }
+
+/**
+ * Bind a JSON-text output to the contract shape (fence extraction, outer-block
+ * pull) — MOVED here from workflow-runner (review wf_67792612-cad defect B) so
+ * the submission gate and the reduce gate share ONE binding: the submission
+ * gate was verifying the RAW value and refusing fenced payloads the reduce
+ * gate would have passed. Accepts a parse when it satisfies the contract OR is
+ * an honest blocked object (previously a fenced {"blocked":true} stayed a
+ * string and its real reason was masked at reduce time).
+ */
+export function coerceOutputForContract(
+  output: unknown,
+  contract: WorkflowStepOutputContract | undefined,
+): unknown {
+  if (!contract) return output;
+  const structured =
+    contract.type === 'object' ||
+    contract.type === 'array' ||
+    (contract.required_keys?.length ?? 0) > 0 ||
+    Boolean(contract.verify);
+  if (!structured) return output;
+  if (typeof output !== 'string') return output;
+  const text = output.trim();
+  if (!text) return output;
+  const candidates: string[] = [];
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence?.[1]) candidates.push(fence[1].trim());
+  candidates.push(text);
+  const start = text.search(/[[{]/);
+  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed !== null && typeof parsed === 'object'
+        && (verifyStepOutput(contract, parsed).ok || isBlockedStepOutput(parsed))) {
+        return parsed;
+      }
+    } catch { /* try the next candidate */ }
+  }
+  return output;
+}

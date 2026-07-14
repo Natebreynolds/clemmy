@@ -21,7 +21,7 @@ import { textResult } from './shared.js';
  * unclipped, so the store has the real value.
  */
 
-import { isBlockedStepOutput, verifyStepOutput } from '../execution/step-output-verify.js';
+import { coerceOutputForContract, isBlockedStepOutput, verifyStepOutput } from '../execution/step-output-verify.js';
 import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 const stepResults = new Map<string, unknown>();
@@ -52,18 +52,24 @@ export function clearStepContract(sessionId: string): void {
 
 /** Validate a submission against the registered contract. Returns null to
  *  ACCEPT, or the refusal message to send back to the model. */
-function contractRefusal(sessionId: string, value: unknown): string | null {
+function contractRefusal(sessionId: string, value: unknown): { refusal: string } | { accept: unknown } {
   const contract = stepContracts.get(sessionId);
-  if (!contract) return null;
-  if (isBlockedStepOutput(value)) return null; // honest blocks bypass shape checks
-  const result = verifyStepOutput(contract, value);
-  if (result.ok) return null;
+  if (!contract) return { accept: value };
+  // Bind exactly like the authoritative reduce gate (fence extraction etc.) and
+  // gate on the BOUND value — the raw-value check refused payloads the reduce
+  // gate passed (review wf_67792612-cad defect B). Record the bound value so
+  // downstream receives what the gate approved.
+  const bound = coerceOutputForContract(value, contract);
+  if (isBlockedStepOutput(bound)) return { accept: bound }; // honest blocks bypass shape checks
+  const result = verifyStepOutput(contract, bound);
+  if (result.ok) return { accept: bound };
   const used = contractRefusals.get(sessionId) ?? 0;
-  if (used >= MAX_CONTRACT_REFUSALS) return null; // reduce gate stays authoritative
+  if (used >= MAX_CONTRACT_REFUSALS) return { accept: bound }; // reduce gate stays authoritative
   contractRefusals.set(sessionId, used + 1);
-  return 'Step result REJECTED (not captured) — fix these and call workflow_step_result again: '
+  return { refusal: 'Step result REJECTED (not captured) — fix these and call workflow_step_result again: '
     + result.problems.join('; ')
-    + '. Submit `data` as ONE valid JSON object with exactly the contracted keys and types.';
+    + '. Submit `data` as ONE valid JSON object with exactly the contracted keys and types.'
+    + ' If you are genuinely blocked, submit {"blocked": true, "reason": "<specifics>"} as plain JSON (no code fences).' };
 }
 
 /** Handler-side: record a step's structured result for `sessionId`. */
@@ -212,8 +218,9 @@ export function recordStepResultFromTranscript(sessionId: string, text: string):
   // but without the refusal loop (nobody is listening); it simply isn't
   // recorded, and the runner's no-result path reports honestly.
   const contract = stepContracts.get(sessionId);
-  if (contract && !isBlockedStepOutput(value) && !verifyStepOutput(contract, value).ok) return false;
-  recordStepResult(sessionId, value);
+  const bound = contract ? coerceOutputForContract(value, contract) : value;
+  if (contract && !isBlockedStepOutput(bound) && !verifyStepOutput(contract, bound).ok) return false;
+  recordStepResult(sessionId, bound);
   return true;
 }
 
@@ -235,9 +242,9 @@ export function registerStepResultTool(server: McpServer): void {
       const sessionId = ctx?.sessionId;
       const value = coerceStepData(data);
       if (sessionId) {
-        const refusal = contractRefusal(sessionId, value);
-        if (refusal) return textResult(refusal);
-        recordStepResult(sessionId, value);
+        const gate = contractRefusal(sessionId, value);
+        if ('refusal' in gate) return textResult(gate.refusal);
+        recordStepResult(sessionId, gate.accept);
         return textResult(`Step result captured (${data.length} chars).`);
       }
       // No session context — can't correlate to a step. Don't throw;
