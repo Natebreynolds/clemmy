@@ -32,7 +32,7 @@ import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
 import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
-import { classifyBlocker, matchesBlockedText, verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { classifyBlocker, matchesBlockedText, verifyDelivered, type BlockerType } from '../runtime/harness/verify-delivered.js';
 import { verifyFanoutItems, fanoutItemVerifyEnabled } from '../runtime/harness/fanout-item-verify.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
 import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
@@ -1430,7 +1430,7 @@ export function markBackgroundTaskAwaitingContinue(id: string, reason: string, r
  * blocker + what the user can do. The task is NOT auto-resumed (resume
  * would just re-block); the user re-runs once the blocker is cleared.
  */
-export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string): BackgroundTaskRecord | null {
+export function markBackgroundTaskBlocked(id: string, reason: string, resultText: string, knownBlockerType?: BlockerType): BackgroundTaskRecord | null {
   const updated = updateBackgroundTask(id, {
     ...clearParkedBackgroundState(),
     status: 'blocked',
@@ -1441,18 +1441,31 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
   if (updated) {
     // Tag the blocker by KIND (deterministic, zero-token) so the dashboard /
     // proactive brief / future routing can act on the class, not just the prose.
-    const blockerType = classifyBlocker(reason);
+    const blockerType = knownBlockerType ?? classifyBlocker(reason);
     addNotification({
       id: `${Date.now()}-background-${updated.id}-blocked`,
       kind: 'approval',
       title: `Background task blocked: ${updated.title}`,
-      body: [
-        `I couldn't finish this — I'm blocked, so I did NOT ship a partial/empty result.`,
-        ``,
-        `Blocker (${blockerType}): ${clean(reason, 600)}`,
-        ``,
-        `Re-run once that's resolved and I'll continue.`,
-      ].join('\n'),
+      // 'unverified_completion' (Move 3) is the OPPOSITE situation from the
+      // default copy: the run claims done and DID perform an irreversible
+      // external action, but the refuters couldn't verify it. Telling the user
+      // "I did NOT ship … re-run" here invites a manual DOUBLE-SEND (review
+      // wf_8e927519-d43). Say check-first instead.
+      body: blockerType === 'unverified_completion'
+        ? [
+          `The run reports this as done and it DID perform an irreversible external action — but I could not independently verify the completion.`,
+          ``,
+          `Unverified because: ${clean(reason, 600)}`,
+          ``,
+          `CHECK the actual outcome (sent messages / created records) BEFORE re-running — re-running may duplicate an irreversible send.`,
+        ].join('\n')
+        : [
+          `I couldn't finish this — I'm blocked, so I did NOT ship a partial/empty result.`,
+          ``,
+          `Blocker (${blockerType}): ${clean(reason, 600)}`,
+          ``,
+          `Re-run once that's resolved and I'll continue.`,
+        ].join('\n'),
       createdAt: nowIso(),
       read: false,
       metadata: taskNotificationMetadata(updated, { status: 'blocked', blockerType, terminalReportBack: true }),
@@ -1611,7 +1624,7 @@ async function verifyBackgroundTaskDelivery(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title'>,
   finalText: string,
   stoppedReason?: RunStoppedReason,
-): Promise<{ outcome: 'done' | 'blocked'; reason?: string }> {
+): Promise<{ outcome: 'done' | 'blocked'; reason?: string; blockerType?: BlockerType }> {
   const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
   if (classified.outcome === 'blocked') return classified;
 
@@ -1685,7 +1698,7 @@ async function verifyBackgroundTaskDelivery(
       ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
     });
     if (!verdict.delivered) {
-      return { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
+      return { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.', blockerType: verdict.blockerType };
     }
   } catch {
     return { outcome: 'done' };
@@ -2067,7 +2080,7 @@ async function finishWorkerRun(
   }
   const outcome = await verifyBackgroundTaskDelivery(task, response.text, response.stoppedReason);
   if (outcome.outcome === 'blocked') {
-    markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text);
+    markBackgroundTaskBlocked(task.id, outcome.reason ?? 'Run did not finish cleanly.', response.text, outcome.blockerType);
     finishRun(run.id, {
       status: 'failed',
       message: `Background task ${task.id} did not complete: ${outcome.reason ?? 'run did not finish cleanly'}`,
@@ -2251,7 +2264,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 
         const postApprovalOutcome = await verifyBackgroundTaskDelivery(task, result.text);
         if (postApprovalOutcome.outcome === 'blocked') {
-          markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text);
+          markBackgroundTaskBlocked(task.id, postApprovalOutcome.reason ?? 'Task could not be completed.', result.text, postApprovalOutcome.blockerType);
           finishRun(run.id, {
             status: 'failed',
             message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${postApprovalOutcome.reason ?? 'could not complete'}`,

@@ -15,7 +15,8 @@ import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harne
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { appendEvent as appendHarnessEvent, listEvents as listHarnessEvents } from '../runtime/harness/eventlog.js';
-import { evidenceLooksFailedOrBlocked, recallToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
+import { evidenceLooksFailedOrBlocked, peekToolChoice, rememberToolChoice, stripBakedConnectionId } from '../memory/tool-choice-store.js';
+import { renderedComposioResultLooksFailed } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import { addNotification, loadNotifications } from '../runtime/notifications.js';
@@ -2023,6 +2024,10 @@ async function runStepViaHarness(
       try {
         const returned = listHarnessEvents(realSessionId, { types: ['tool_returned'] })
           .filter((e) => e.data?.tool === 'composio_execute_tool'
+            // Deterministic corrective-header check FIRST (review: prose-based
+            // evidenceLooksFailedOrBlocked let every real composio failure
+            // through — the step pinned a FAILED tool as proven).
+            && !renderedComposioResultLooksFailed(typeof e.data?.result === 'string' ? e.data.result : undefined)
             && !evidenceLooksFailedOrBlocked(typeof e.data?.result === 'string' ? e.data.result : undefined));
         const lastOk = returned[returned.length - 1];
         const callId = lastOk?.data?.callId;
@@ -2540,7 +2545,9 @@ function workflowStepPinIntent(workflowName: string, stepId: string): string {
 function renderWorkflowToolPin(workflowName: string, stepId: string): string {
   if (!workflowToolPinsEnabled()) return '';
   try {
-    const record = recallToolChoice(workflowStepPinIntent(workflowName, stepId));
+    // EXACT lookup only (review: the fuzzy fallback matched unrelated generic
+    // records and injected them with fabricated 'proven in a prior run' provenance).
+    const record = peekToolChoice(workflowStepPinIntent(workflowName, stepId));
     const choice = record?.choice;
     if (!choice || choice.kind !== 'composio' || !choice.identifier) return '';
     // A pin that has failed more than it has worked is retired from injection —

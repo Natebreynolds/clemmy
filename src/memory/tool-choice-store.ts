@@ -32,6 +32,14 @@ import { recordToolEvent } from '../agents/tool-observability.js';
 
 export type ToolChoiceKind = 'cli' | 'composio' | 'mcp';
 
+/** Fold-3 pin namespace: workflow-step tool pins live in this store under
+ *  workflow:<name>:<stepId> intents but are SCOPED OUT of every shared
+ *  advertised surface and the fuzzy recall fallback (review wf_8e927519-d43:
+ *  pins flooded the chat tool-choice block, evicting genuine chat memories
+ *  and leaking workflow run args into unrelated turns). Exact-intent reads
+ *  (peekToolChoice) still return them — that is the pin's only door. */
+export const WORKFLOW_PIN_INTENT_PREFIX = 'workflow:';
+
 export interface ToolChoiceRecordChoice {
   kind: ToolChoiceKind;
   /** CLI command name when kind=cli; Composio slug when kind=composio; MCP tool name when kind=mcp. */
@@ -307,6 +315,12 @@ export function recallToolChoice(intent: string): ToolChoiceRecord | null {
   if (!best || best.score < 0.5) { emitToolChoiceEvent('recall_miss', intent); return null; }
   if (runnerUp && runnerUp.score >= best.score) { emitToolChoiceEvent('recall_miss', intent); return null; }
   const fuzzy = parseRecord(path.join(dir, `${best.slug}.md`));
+  // Workflow pins are exact-key records — a paraphrased chat intent must never
+  // fuzzy-surface a pin (wrong tool + fabricated provenance + arg leak).
+  if (fuzzy?.intent?.startsWith(WORKFLOW_PIN_INTENT_PREFIX)) {
+    emitToolChoiceEvent('recall_miss', intent);
+    return null;
+  }
   emitToolChoiceEvent(fuzzy ? 'recall_hit_fuzzy' : 'recall_miss', intent, fuzzy?.choice?.identifier);
   return fuzzy;
 }
@@ -904,7 +918,7 @@ export function matchToolChoicesForStep(
 
   let records: ToolChoiceRecord[];
   try {
-    records = opts.choices ?? listToolChoices();
+    records = (opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
   } catch {
     return [];
   }
@@ -1032,7 +1046,7 @@ export function recallComposioForSearch(
   if (q.size === 0) return [];
   let records: ToolChoiceRecord[];
   try {
-    records = opts.choices ?? listToolChoices();
+    records = (opts.choices ?? listToolChoices()).filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
   } catch {
     return [];
   }
@@ -1333,7 +1347,7 @@ export function renderToolChoicesForContext(limit = 12, maxChars = TOOL_CHOICE_B
   if (!contextInjectEnabled()) return '';
   let records: ToolChoiceRecord[];
   try {
-    records = listToolChoices();
+    records = listToolChoices().filter((r) => !r.intent.startsWith(WORKFLOW_PIN_INTENT_PREFIX));
   } catch {
     return '';
   }

@@ -258,6 +258,19 @@ function intentSeedFromSlug(toolSlug?: string): string | undefined {
   return seed || undefined;
 }
 
+/** True when a rendered composio_execute_tool result is a failure corrective.
+ *  composioFailureCorrective ALWAYS emits a first line
+ *  '⚠️ <label> FAILED|NOT CONNECTED|NOT FOUND (slug=…): …' and result clipping
+ *  never removes the head, so the first line is authoritative. ONE owner for
+ *  the header format (fold-3 review wf_8e927519-d43: evidenceLooksFailedOrBlocked
+ *  targets memo prose and let every real composio failure through the pin filter). */
+export function renderedComposioResultLooksFailed(resultStr: string | undefined): boolean {
+  if (!resultStr) return false;
+  const nl = resultStr.indexOf('\n');
+  const head = nl === -1 ? resultStr : resultStr.slice(0, nl);
+  return head.startsWith('⚠️') && /\b(FAILED|NOT CONNECTED|NOT FOUND)\b/.test(head);
+}
+
 function composioFailureCorrective(
   summary: string,
   opts: { toolName?: string; toolSlug?: string; notFound?: boolean; notConnected?: boolean; transient?: boolean; intent?: string } = {},
