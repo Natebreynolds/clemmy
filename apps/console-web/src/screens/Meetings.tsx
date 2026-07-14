@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2 } from 'lucide-react';
@@ -29,7 +29,9 @@ import {
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
 import {
-  LocalMeetingCapture,
+  sharedLocalMeetingCapture,
+  sharedLocalMeetingCaptureState,
+  subscribeSharedLocalMeetingCapture,
   type LocalMeetingCaptureState,
 } from '@/lib/local-meeting-recorder';
 
@@ -87,32 +89,26 @@ export function Meetings() {
   const [localBusy, setLocalBusy] = useState(false);
   const [retryingMeetingId, setRetryingMeetingId] = useState<string | null>(null);
   const [localNotice, setLocalNotice] = useState<{ tone: 'info' | 'warn' | 'error'; text: string } | null>(null);
-  const [localCaptureState, setLocalCaptureState] = useState<LocalMeetingCaptureState>({
-    phase: 'idle',
-    elapsedSeconds: 0,
-  });
-  const mounted = useRef(true);
-  const localCapture = useRef<LocalMeetingCapture | null>(null);
-  if (!localCapture.current) {
-    localCapture.current = new LocalMeetingCapture({
-      onState: (next) => { if (mounted.current) setLocalCaptureState(next); },
-    });
-  }
+  // The capture is a module-level SINGLETON shared with AppShell's recording
+  // pill (2026-07-14 review): recording used to be per-mount state, so any SPA
+  // navigation away from this screen silently stopped and finalized an
+  // in-progress recording. Now the mic pump survives navigation; this screen
+  // only SUBSCRIBES to its state. The no-invisible-capture invariant lives in
+  // AppShell (persistent pill + Stop) and the Electron tray dot/close guard.
+  const [localCaptureState, setLocalCaptureState] = useState<LocalMeetingCaptureState>(
+    () => sharedLocalMeetingCaptureState(),
+  );
 
   useEffect(() => {
-    mounted.current = true;
+    const unsubscribe = subscribeSharedLocalMeetingCapture(setLocalCaptureState);
     return () => {
-      mounted.current = false;
-      const capture = localCapture.current;
-      const state = capture?.state();
-      if (state?.phase === 'requesting') {
-        void capture?.cancel().catch(() => undefined);
-      } else if (state?.sessionId && state.phase !== 'stopping') {
-        // Navigating away ends and saves the meeting; it must never leave an
-        // invisible microphone capture running in the background.
-        // Never turn a stop failure into a destructive cancel: the main process
-        // and crash-recovery sidecar retain the valid captured prefix.
-        void capture?.stop().catch(() => undefined);
+      unsubscribe();
+      // Only an ABANDONED pre-session start is cancelled on unmount — the user
+      // initiated but left before the recording existed. A live recording keeps
+      // going (visible via the AppShell pill), never silently stopped.
+      const capture = sharedLocalMeetingCapture();
+      if (capture.state().phase === 'requesting') {
+        void capture.cancel().catch(() => undefined);
       }
     };
   }, []);
@@ -210,7 +206,7 @@ export function Meetings() {
   const startLocal = async () => {
     setLocalBusy(true); setLocalNotice(null);
     try {
-      await localCapture.current!.start(localTitle);
+      await sharedLocalMeetingCapture().start(localTitle);
       setLocalNotice({ tone: 'info', text: 'Recording this microphone locally. Stay on this page until you stop.' });
       await localDesktopStatus.refetch();
     } catch (e) { setLocalNotice({ tone: 'error', text: (e as Error).message }); }
@@ -221,7 +217,7 @@ export function Meetings() {
     setLocalBusy(true); setLocalNotice(null);
     try {
       const result = localCaptureState.sessionId
-        ? await localCapture.current!.stop()
+        ? await sharedLocalMeetingCapture().stop()
         : await clemmy()!.localMeetingStop!(localSessionId!);
       if (result.queued === false) {
         setLocalNotice({ tone: 'warn', text: `Audio was saved locally, but transcription could not start yet${result.error ? `: ${String(result.error)}` : '.'}` });
@@ -243,7 +239,7 @@ export function Meetings() {
       let cancellationPending = false;
       let cancellationWarning = '';
       if (localCaptureState.sessionId) {
-        await localCapture.current!.cancel();
+        await sharedLocalMeetingCapture().cancel();
         // LocalMeetingCapture intentionally returns void after releasing media.
         // Read main's durable tombstone status so a lost daemon response is not
         // misrepresented as fully cleaned up.

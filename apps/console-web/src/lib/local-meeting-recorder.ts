@@ -289,3 +289,45 @@ export class LocalMeetingCapture {
     if (this.cancelRequested) throw new Error('Local meeting recording start was cancelled.');
   }
 }
+
+// ── Shared capture instance (2026-07-14 review) ───────────────────────────────
+// The capture MUST outlive the Meetings screen: it used to be per-mount state,
+// so ANY SPA navigation (sidebar link, "Discuss in chat") unmounted the screen
+// and silently stopped + finalized an in-progress recording. The renderer JS
+// context persists across SPA navigation, so a module-level singleton keeps the
+// mic pump alive; screens SUBSCRIBE to its state instead of owning it. The
+// no-invisible-capture invariant moves to the app level: AppShell renders a
+// persistent recording pill (with Stop) whenever this capture is active, and
+// the tray dot + window-close guard in the Electron main process are unchanged.
+let sharedCapture: LocalMeetingCapture | null = null;
+let sharedCaptureState: LocalMeetingCaptureState = { phase: 'idle', elapsedSeconds: 0 };
+const sharedCaptureSubscribers = new Set<(state: LocalMeetingCaptureState) => void>();
+
+export function sharedLocalMeetingCapture(): LocalMeetingCapture {
+  if (!sharedCapture) {
+    sharedCapture = new LocalMeetingCapture({
+      onState: (next) => {
+        sharedCaptureState = next;
+        for (const notify of [...sharedCaptureSubscribers]) {
+          try { notify(next); } catch { /* one bad subscriber must not break the rest */ }
+        }
+      },
+    });
+  }
+  return sharedCapture;
+}
+
+/** Subscribe to shared-capture state. Immediately replays the latest state so a
+ *  freshly-mounted screen renders an in-progress recording without waiting for
+ *  the next transition. Returns the unsubscribe function. */
+export function subscribeSharedLocalMeetingCapture(
+  notify: (state: LocalMeetingCaptureState) => void,
+): () => void {
+  sharedCaptureSubscribers.add(notify);
+  notify(sharedCaptureState);
+  return () => { sharedCaptureSubscribers.delete(notify); };
+}
+
+export function sharedLocalMeetingCaptureState(): LocalMeetingCaptureState {
+  return sharedCaptureState;
+}
