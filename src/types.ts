@@ -417,12 +417,18 @@ export interface AuthStatus {
   message: string;
   openaiApiKeyPresent: boolean;
   codexOauthPresent: boolean;
+  /** A proven local grant exists but is terminally revoked/expired. The model
+   *  is unusable, while the daemon recovery shell must still boot so Settings
+   *  can start a fresh OAuth flow. */
+  codexAuthDead?: boolean;
+  /** Auth is intentionally unusable, but enough prior Codex state exists that
+   *  an upgraded installation must boot the dashboard as a recovery shell. */
+  codexRecoveryRequired?: boolean;
   codexAccountId?: string;
   codexLastRefresh?: string;
   codexImportPath?: string;
-  /** True when Clementine's stored grant shares the Codex CLI's rotating refresh-token
-   *  family (imported from ~/.codex/auth.json, or running directly off it). In this
-   *  state a `codex logout` revokes the family server-side and signs Clementine out
-   *  too — `clementine auth login-native` mints an independent grant that decouples it. */
+  /** True when a local token pair is legacy/unverified and may share the Codex
+   *  CLI's rotating refresh-token family. Such a pair is deliberately unusable;
+   *  `clementine auth login-native` or `login-device` mints an independent grant. */
   codexSharedWithCli?: boolean;
 }

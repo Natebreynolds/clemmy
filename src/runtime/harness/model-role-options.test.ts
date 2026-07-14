@@ -42,7 +42,8 @@ function writeAuthFiles(): void {
   const state = path.join(home, 'state');
   mkdirSync(state, { recursive: true });
   writeFileSync(path.join(state, 'auth.json'), JSON.stringify({
-    codexOauth: { accessToken: 'codex-access', refreshToken: 'codex-refresh' },
+    source: 'native',
+    codexOauth: { grantProvenance: 'clementine-oauth-v1', grantId: 'grant-model-role-options-test', accessToken: 'codex-access', refreshToken: 'codex-refresh' },
   }), 'utf-8');
   writeFileSync(path.join(state, 'claude-auth.json'), JSON.stringify({
     accessToken: 'sk-ant-oat01-test',

@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
+import { CLEMENTINE_DESKTOP_LOG_DIR } from './clementine-paths.js';
+
+const SETUP_CRASH_LOG_FILE = path.join(CLEMENTINE_DESKTOP_LOG_DIR, 'setup-crash.log');
 
 /**
  * Setup wizard window — the first-run UX.
@@ -93,8 +96,8 @@ export function createSetupWindow(opts: SetupWindowOpts): BrowserWindow {
   //                            but this handler keeps us safe against
   //                            future regressions.
   //
-  // On any crash: write a diagnostic to ~/.clementine-next/logs/desktop/
-  // setup-crash.log + show a macOS Notification + a follow-up dialog
+  // On any crash: write a diagnostic to Clementine's desktop log directory
+  // (including custom CLEMENTINE_HOME) + show a Notification + follow-up dialog
   // when the user clicks the notification. The user has SOMETHING to
   // send us instead of a black box.
   win.webContents.on('render-process-gone', (_e, details) => {
@@ -127,8 +130,8 @@ export function createSetupWindow(opts: SetupWindowOpts): BrowserWindow {
 
 /**
  * Write a structured diagnostic when the setup wizard renderer dies.
- * Designed so the user can run `cat ~/.clementine-next/logs/desktop/
- * setup-crash.log` and email/paste the result. Never throws — best-
+ * Designed so the user can read setup-crash.log and email/paste the result.
+ * Never throws — best-
  * effort logging only.
  */
 function reportSetupCrash(stage: string, details: Record<string, unknown>): void {
@@ -146,14 +149,13 @@ function reportSetupCrash(stage: string, details: Record<string, unknown>): void
     details,
   };
   try {
-    const logDir = path.join(os.homedir(), '.clementine-next', 'logs', 'desktop');
-    if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
-    appendFileSync(path.join(logDir, 'setup-crash.log'), JSON.stringify(payload) + '\n', 'utf-8');
+    if (!existsSync(CLEMENTINE_DESKTOP_LOG_DIR)) mkdirSync(CLEMENTINE_DESKTOP_LOG_DIR, { recursive: true });
+    appendFileSync(SETUP_CRASH_LOG_FILE, JSON.stringify(payload) + '\n', 'utf-8');
   } catch { /* logging is best-effort */ }
   try {
     new Notification({
       title: 'Clementine setup hit an error',
-      body: `${stage}. A diagnostic was written to ~/.clementine-next/logs/desktop/setup-crash.log — please share that file if support asks.`,
+      body: `${stage}. A diagnostic was written to ${SETUP_CRASH_LOG_FILE} — please share that file if support asks.`,
       urgency: 'critical',
     }).show();
   } catch { /* notification permissions can be denied */ }
@@ -166,7 +168,7 @@ function reportSetupCrash(stage: string, details: Record<string, unknown>): void
         type: 'error',
         title: 'Clementine setup error',
         message: `The setup wizard hit a problem: ${stage}`,
-        detail: `A diagnostic was written to:\n~/.clementine-next/logs/desktop/setup-crash.log\n\nPlease share that file when reporting the issue. Quit Clementine and reopen to try setup again.`,
+        detail: `A diagnostic was written to:\n${SETUP_CRASH_LOG_FILE}\n\nPlease share that file when reporting the issue. Quit Clementine and reopen to try setup again.`,
         buttons: ['OK'],
       });
     } catch { /* dialog can fail in some macOS states */ }
@@ -747,7 +749,7 @@ const SETUP_JS = `
           if (result && result.ok) {
             state.codexStatus = 'ok';
             state.codexAccountId = result.accountId || '';
-            state.codexMessage = result.reused ? 'Existing Codex sign-in imported' : 'Signed in with ChatGPT/Codex';
+            state.codexMessage = result.reused ? 'Existing Clementine Codex sign-in reused' : 'Signed in with ChatGPT/Codex';
           } else {
             state.codexStatus = 'error';
             state.codexMessage = (result && result.error) || 'Sign-in failed';

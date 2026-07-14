@@ -10426,8 +10426,9 @@ export function registerConsoleRoutes(
   /**
    * Re-authenticate Codex via the DAEMON's proven native OAuth flow (the same
    * path as `clementine auth login-native`). The desktop RE-AUTHENTICATE button
-   * calls this instead of the Electron-side codex-oauth.ts port — one OAuth
-   * implementation, no divergence, and it writes Clementine's OWN vault only
+   * calls this instead of the setup-only Electron OAuth port, keeping all
+   * runtime re-authentication and token locking daemon-owned. It writes
+   * Clementine's OWN vault only
    * (loginWithNativeOAuth no longer touches ~/.codex/auth.json). The request
    * awaits the full browser flow (the daemon opens the browser + runs the
    * localhost callback), so the button shows a spinner until the user finishes
@@ -10438,6 +10439,10 @@ export function registerConsoleRoutes(
     try {
       const result = await loginWithNativeOAuth();
       if (result.ok) {
+        // A re-auth must also clear the process-local provider/dead-brain
+        // registry; otherwise fallback can keep skipping the newly healthy
+        // Codex grant until its 15-minute cooldown expires.
+        resetHarnessRuntimeConfig();
         // Clear in-app confirmation (the button label flips for only ~2s and is
         // easy to miss). Also clears the 'codex-auth-revoked' alert's relevance.
         try {
@@ -10485,6 +10490,7 @@ export function registerConsoleRoutes(
     try {
       const result = await pollCodexDeviceLogin(loginId);
       if (result.status === 'complete') {
+        resetHarnessRuntimeConfig();
         try {
           addNotification({
             id: `codex-reauth-success-${new Date().toISOString()}`,

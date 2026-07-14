@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomFillSync } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { CLEMENTINE_HOME_DIR, CLEMENTINE_STATE_DIR } from './clementine-paths.js';
 
 const requireFromHere = createRequire(import.meta.url);
 
@@ -37,7 +38,7 @@ const requireFromHere = createRequire(import.meta.url);
  */
 
 const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
+const STATE_DIR = CLEMENTINE_STATE_DIR;
 const VAULT_FILE = path.join(STATE_DIR, 'secrets-vault.json');
 const META_FILE = path.join(STATE_DIR, 'secrets-meta.json');
 const KEYCHAIN_MIGRATION_MARKER = path.join(STATE_DIR, 'keychain-migrated.json');
@@ -189,7 +190,7 @@ function updateMeta(name: CredentialName, patch: Partial<CredentialMetadata>): C
 function readEnvVar(name: string): string | undefined {
   if (process.env[name] && process.env[name]!.length > 0) return process.env[name];
   const candidates = [
-    path.join(HOME, '.clementine-next', '.env'),
+    path.join(CLEMENTINE_HOME_DIR, '.env'),
     path.join(HOME, 'clementine-next', '.env'),
     path.join(process.cwd(), '.env'),
   ];

@@ -32,6 +32,7 @@ import {
 } from './local-meeting-recorder.js';
 import { isBenignPipeError } from './pipe-errors.js';
 import { isTrustedDashboardMediaUrl } from './media-permissions.js';
+import { acquireSingleInstanceLock, resolveIsolatedDevUserDataPath } from './single-instance-policy.js';
 import {
   applyUpdate,
   checkForUpdatesNow,
@@ -52,8 +53,9 @@ import {
   type CredentialName,
 } from './credentials-bridge.js';
 import { addWorkspaceDir, ensureHomeEnv, saveUserProfile, setHomeEnv, type ProfilePatch } from './setup-bridge.js';
-import { importUsableCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
+import { loadUsableClementineCodexOAuthTokens, persistCodexOAuthTokens, runCodexOAuthLogin } from './codex-oauth.js';
 import { redactSensitiveText } from './redaction.js';
+import { CLEMENTINE_DESKTOP_LOG_DIR, CLEMENTINE_HOME_DIR } from './clementine-paths.js';
 
 /**
  * Clementine Desktop — Electron main process.
@@ -87,7 +89,7 @@ import { redactSensitiveText } from './redaction.js';
  */
 
 const HOME = os.homedir();
-const LOG_DIR = path.join(HOME, '.clementine-next', 'logs', 'desktop');
+const LOG_DIR = CLEMENTINE_DESKTOP_LOG_DIR;
 const LOG_FILE = path.join(LOG_DIR, 'supervisor.log');
 
 // Disable Chromium's password manager + macOS Passwords AutoFill so the
@@ -289,9 +291,8 @@ function getWebhookSecret(): string {
   if (cachedWebhookSecret) return cachedWebhookSecret;
   // Read the same secret the daemon will read so the dashboard URL we
   // load matches the daemon's auth.
-  // The daemon's home is ~/.clementine-next; .env is the dev path, and
-  // the file vault is the fresh desktop setup path.
-  const envFile = path.join(HOME, '.clementine-next', '.env');
+  // Read the same CLEMENTINE_HOME tree that the supervised daemon receives.
+  const envFile = path.join(CLEMENTINE_HOME_DIR, '.env');
   if (existsSync(envFile)) {
     try {
       for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
@@ -302,7 +303,7 @@ function getWebhookSecret(): string {
       // fall through to the file vault
     }
   }
-  const vaultFile = path.join(HOME, '.clementine-next', 'state', 'secrets-vault.json');
+  const vaultFile = path.join(CLEMENTINE_HOME_DIR, 'state', 'secrets-vault.json');
   if (existsSync(vaultFile)) {
     try {
       const parsed = JSON.parse(readFileSync(vaultFile, 'utf-8')) as { version?: string; entries?: Record<string, string> };
@@ -830,7 +831,7 @@ function preloadPath(): string {
 
 /**
  * Boot flow:
- *   1. If first-run (no credentials, no setup-complete marker) →
+ *   1. If first-run (no setup-complete marker) →
  *      open setup wizard window. Don't start the daemon yet — the
  *      wizard writes credentials BEFORE the daemon reads them.
  *   2. Otherwise → splash → daemon → dashboard window.
@@ -1609,66 +1610,36 @@ ipcMain.handle('clemmy:setup-pick-workspace-folder', async (evt: IpcMainInvokeEv
 });
 
 ipcMain.handle('clemmy:setup-codex-login', async (evt: IpcMainInvokeEvent) => {
-  assertIpcSender(evt, ['setup', 'dashboard']);
-  // Run the OAuth dance from the Electron main process so the user
-  // never sees a terminal. Tokens are persisted to BOTH the daemon's
-  // local auth store and the codex CLI compatibility file. We do not
-  // mirror them into Keychain here; the runtime reads the native auth
-  // store directly, and avoiding extra Keychain writes prevents repeated
-  // macOS prompts during first-run setup.
+  // This direct Electron OAuth implementation is setup-only. Once the daemon
+  // is running, dashboard re-auth goes through its HTTP auth route so token
+  // persistence is coordinated with the daemon's refresh lock.
+  assertIpcSender(evt, ['setup']);
+  // Run the OAuth dance from the Electron main process so the user never sees
+  // a terminal. Tokens are persisted only to Clementine's local auth store;
+  // importing or writing the external Codex CLI grant would couple two apps to
+  // the same rotating refresh-token family.
   //
-  // First-run path: importUsableCodexOAuthTokens() short-circuits when
-  // the user already has fresh tokens (e.g. from a prior codex CLI
-  // login). For the Settings RE-AUTHENTICATE button — which must ALWAYS
-  // open the browser — use the dedicated `clemmy:codex-reauth` handler
-  // below.
+  // First-run path: reuse a healthy Clementine-owned native grant (for example
+  // after reinstalling). A CLI-imported or provenance-less legacy grant fails
+  // closed and opens the browser to mint a new independent grant. For the
+  // Dashboard re-authentication uses the daemon-owned route instead.
   try {
-    const imported = await importUsableCodexOAuthTokens();
-    const tokens = imported ?? await runCodexOAuthLogin();
-    persistCodexOAuthTokens(tokens);
+    const existing = await loadUsableClementineCodexOAuthTokens();
+    if (existing) {
+      return {
+        ok: true as const,
+        accountId: existing.accountId ?? '',
+        lastRefresh: existing.lastRefresh,
+        reused: true,
+      };
+    }
+    const tokens = await runCodexOAuthLogin();
+    await persistCodexOAuthTokens(tokens);
     return {
       ok: true as const,
       accountId: tokens.accountId ?? '',
       lastRefresh: tokens.lastRefresh,
-      reused: Boolean(imported),
-    };
-  } catch (err) {
-    return {
-      ok: false as const,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
-});
-
-/**
- * Force-fresh Codex OAuth — backs the Settings → Credentials
- * RE-AUTHENTICATE button. Bypasses the import-and-reuse short-circuit
- * in `setup-codex-login` so the browser ALWAYS opens. Use case: the
- * user wants to switch accounts, or the runtime is failing on tokens
- * that look valid on disk but aren't accepted by the backend.
- *
- * Old tokens are left in place until the new flow succeeds; on cancel
- * or failure the user keeps the working credentials they had. On
- * success, persistCodexOAuthTokens overwrites with the fresh pair.
- *
- * Reported 2026-05-23: the original button wired to
- * `setup-codex-login` looked broken because fresh tokens import
- * silently with no UI signal. This handler fixes that surface.
- */
-ipcMain.handle('clemmy:codex-reauth', async (evt: IpcMainInvokeEvent) => {
-  assertIpcSender(evt, ['dashboard']);
-  try {
-    // `prompt: 'select_account'` forces auth.openai.com to render the
-    // account picker even when the user already has a ChatGPT session
-    // cookie. Without this the IdP would silently issue tokens for the
-    // currently-cached account, defeating the purpose of the
-    // Settings RE-AUTHENTICATE button (account switch + force-fresh).
-    const tokens = await runCodexOAuthLogin({ prompt: 'select_account' });
-    persistCodexOAuthTokens(tokens);
-    return {
-      ok: true as const,
-      accountId: tokens.accountId ?? '',
-      lastRefresh: tokens.lastRefresh,
+      reused: false,
     };
   } catch (err) {
     return {
@@ -1817,7 +1788,29 @@ process.on('uncaughtException', (err: Error) => {
 // a competing daemon supervisor on a different port. We claim the
 // lock here; if we can't, we hand focus to the existing instance and
 // exit. This is the textbook Electron pattern.
-const SINGLE_INSTANCE_LOCK = app.requestSingleInstanceLock();
+// Release-candidate smoke tests need to run beside an installed Clementine
+// without sharing its state tree or Chromium profile. Keep the production lock
+// unconditional; an unpackaged build may opt out only when it also supplies a
+// non-default CLEMENTINE_HOME. Derive userData from that isolated root before
+// ready so cookies, localStorage, cache, wizard files, and session locks cannot
+// collide with the installed app.
+const ISOLATED_DEV_USER_DATA = resolveIsolatedDevUserDataPath(
+  app.isPackaged,
+  process.env.CLEMENTINE_DEV_ALLOW_MULTI_INSTANCE,
+  process.env.CLEMENTINE_HOME,
+  path.join(os.homedir(), '.clementine-next'),
+);
+if (ISOLATED_DEV_USER_DATA) {
+  const isolatedSessionData = path.join(ISOLATED_DEV_USER_DATA, 'session-data');
+  mkdirSync(isolatedSessionData, { recursive: true });
+  app.setPath('userData', ISOLATED_DEV_USER_DATA);
+  app.setPath('sessionData', isolatedSessionData);
+}
+const SINGLE_INSTANCE_LOCK = acquireSingleInstanceLock(
+  app.isPackaged,
+  ISOLATED_DEV_USER_DATA,
+  () => app.requestSingleInstanceLock(),
+);
 if (!SINGLE_INSTANCE_LOCK) {
   app.quit();
   process.exit(0);

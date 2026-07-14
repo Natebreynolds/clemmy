@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
+import { CLEMENTINE_HOME_DIR, CLEMENTINE_STATE_DIR } from './clementine-paths.js';
 
 /**
  * Setup wizard write-throughs that bypass the daemon (because the
@@ -18,9 +18,8 @@ import os from 'node:os';
  * may contain a WEBHOOK_SECRET. Idempotent — calling twice is safe.
  */
 
-const HOME = os.homedir();
-const STATE_DIR = path.join(HOME, '.clementine-next', 'state');
-const HOME_DIR = path.join(HOME, '.clementine-next');
+const STATE_DIR = CLEMENTINE_STATE_DIR;
+const HOME_DIR = CLEMENTINE_HOME_DIR;
 const HOME_ENV = path.join(HOME_DIR, '.env');
 const PROFILE_FILE = path.join(STATE_DIR, 'user-profile.json');
 

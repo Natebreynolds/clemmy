@@ -110,6 +110,30 @@ const approvalRegistry = await import('../runtime/harness/approval-registry.js')
 const runEvents = await import('../runtime/run-events.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 
+/** Write the same healthy state a successful test login would leave behind.
+ * Direct fixture writes bypass auth-store's normal "fresh grant clears DEAD"
+ * recovery signal, so explicitly remove the prior generation's latch and give
+ * each test a fresh, non-stale token timestamp. */
+function writeWorkflowCodexAuthFixture(grantId: string, accessToken: string): void {
+  const stateDir = path.join(tmp, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  rmSync(path.join(stateDir, 'codex-auth-dead.json'), { force: true });
+  writeFileSync(
+    path.join(stateDir, 'auth.json'),
+    JSON.stringify({
+      source: 'native',
+      codexOauth: {
+        grantProvenance: 'clementine-oauth-v1',
+        grantId,
+        accessToken,
+        refreshToken: 'refresh',
+        lastRefresh: new Date().toISOString(),
+      },
+    }),
+    'utf-8',
+  );
+}
+
 // ---------------------------------------------------------------------------
 // P0 — event-driven approval parking (WORKFLOW_APPROVAL_PARKING)
 // ---------------------------------------------------------------------------
@@ -1024,12 +1048,7 @@ test('generic Claude send parks the SDK boundary; rejected rerun fails instead o
   resetEventLog();
   resetHarnessRuntimeConfig();
   const stateDir = path.join(tmp, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    path.join(stateDir, 'auth.json'),
-    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-park-token', refreshToken: 'refresh' } }),
-    'utf-8',
-  );
+  writeWorkflowCodexAuthFixture('grant-workflow-park-test', 'codex-workflow-park-token');
   writeFileSync(
     path.join(stateDir, 'claude-auth.json'),
     JSON.stringify({
@@ -1205,12 +1224,7 @@ test('workflow Claude-routed read-only step uses Claude Agent SDK and returns st
   resetEventLog();
   resetHarnessRuntimeConfig();
   const stateDir = path.join(tmp, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    path.join(stateDir, 'auth.json'),
-    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-test-token', refreshToken: 'refresh' } }),
-    'utf-8',
-  );
+  writeWorkflowCodexAuthFixture('grant-workflow-step-success-test', 'codex-workflow-test-token');
   writeFileSync(
     path.join(stateDir, 'claude-auth.json'),
     JSON.stringify({
@@ -1315,12 +1329,7 @@ test('workflow Claude-routed step marks its harness session failed when the SDK 
   resetEventLog();
   resetHarnessRuntimeConfig();
   const stateDir = path.join(tmp, 'state');
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    path.join(stateDir, 'auth.json'),
-    JSON.stringify({ codexOauth: { accessToken: 'codex-workflow-test-token', refreshToken: 'refresh' } }),
-    'utf-8',
-  );
+  writeWorkflowCodexAuthFixture('grant-workflow-step-failure-test', 'codex-workflow-test-token');
   writeFileSync(
     path.join(stateDir, 'claude-auth.json'),
     JSON.stringify({

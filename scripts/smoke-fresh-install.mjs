@@ -7,17 +7,20 @@
 // setup wizard.
 //
 //   needsSetup()
-//     = !hasCompletedSetup() && !hasAnyUsableCredential()
+//     = !hasCompletedSetup()
 //
 //   hasAnyUsableCredential() reads:
 //     1. process.env.OPENAI_API_KEY
 //     2. $HOME/.clementine-next/.env
 //     3. $HOME/clementine-next/.env
 //     4. process.cwd()/.env
-//     5. $HOME/.codex/auth.json   (tokens.access_token + refresh_token)
-//     6. $HOME/.clementine-next/state/auth.json   (codexOauth)
-//     7. $HOME/.clementine-next/state/secrets-vault.json   (any key
+//     5. $HOME/.clementine-next/state/auth.json   (native codexOauth carrying
+//        grantProvenance=clementine-oauth-v1 plus a non-empty grantId)
+//     6. $HOME/.clementine-next/state/secrets-vault.json   (any key
 //        containing "openai" or "codex" with a non-empty string value)
+//
+// The external $HOME/.codex/auth.json is deliberately excluded. Clementine
+// must mint and rotate an independent Codex OAuth grant.
 //
 // Run with: node scripts/smoke-fresh-install.mjs
 //
@@ -25,6 +28,7 @@
 // unexpectedly for a clean install.
 
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -152,20 +156,38 @@ section('Phase 4 · false-positive probes for hasAnyUsableCredential()');
 async function probe(name, setup) {
   const probeHome = mkdtempSync(path.join(os.tmpdir(), 'clemmy-probe-'));
   const probeCwd = mkdtempSync(path.join(os.tmpdir(), 'clemmy-cwd-probe-'));
-  const savedHome = process.env.HOME;
-  const savedCwd = process.cwd();
-  process.env.HOME = probeHome;
-  process.chdir(probeCwd);
   try {
     await setup({ home: probeHome, cwd: probeCwd });
-    // Re-import the modules so their cached `os.homedir()` snapshot is fresh.
-    // setup-state captures HOME at module-load time, so we use a cache-busting query.
-    const url = pathToFileURL(path.join(DESKTOP_DIST, 'setup-state.js')).href + `?probe=${name}`;
-    const reloaded = await import(url);
-    return reloaded.hasAnyUsableCredential();
+    // setup-state imports clementine-paths, whose resolved HOME constants are
+    // cached for the lifetime of the module graph. A query-string re-import of
+    // setup-state alone therefore keeps the Phase-3 HOME. Evaluate every probe
+    // in a fresh process so the full graph resolves against the probe sandbox.
+    const childEnv = {
+      ...process.env,
+      HOME: probeHome,
+      USERPROFILE: probeHome,
+      CLEMMY_SETUP_STATE_URL: pathToFileURL(path.join(DESKTOP_DIST, 'setup-state.js')).href,
+    };
+    delete childEnv.CLEMENTINE_HOME;
+    delete childEnv.OPENAI_API_KEY;
+    const child = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '--eval',
+        "const setupState = await import(process.env.CLEMMY_SETUP_STATE_URL); process.stdout.write(JSON.stringify(setupState.hasAnyUsableCredential()));",
+      ],
+      { cwd: probeCwd, env: childEnv, encoding: 'utf-8' },
+    );
+    if (child.status !== 0) {
+      throw new Error(`probe ${name} failed: ${child.error?.message ?? child.stderr.trim() ?? `exit ${child.status}`}`);
+    }
+    const result = child.stdout.trim();
+    if (result !== 'true' && result !== 'false') {
+      throw new Error(`probe ${name} returned an invalid result: ${JSON.stringify(result)}`);
+    }
+    return result === 'true';
   } finally {
-    process.env.HOME = savedHome;
-    process.chdir(savedCwd);
     try { rmSync(probeHome, { recursive: true, force: true }); } catch {}
     try { rmSync(probeCwd, { recursive: true, force: true }); } catch {}
   }
@@ -181,8 +203,52 @@ const probes = [
         tokens: { access_token: 'fake', refresh_token: 'fake' },
       }));
     },
+    expected: false,
+    note: 'The external Codex CLI grant must stay isolated; Clementine should request its own browser sign-in.',
+  },
+  {
+    name: 'legacy local Codex grant explicitly sourced from the CLI',
+    setup: async ({ home }) => {
+      const stateDir = path.join(home, '.clementine-next', 'state');
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(path.join(stateDir, 'auth.json'), JSON.stringify({
+        source: 'codex_cli',
+        codexOauth: { accessToken: 'shared-access', refreshToken: 'shared-refresh' },
+      }));
+    },
+    expected: false,
+    note: 'A known CLI-imported token family is unsafe for Clementine runtime reuse.',
+  },
+  {
+    name: 'old local source:native grant without ownership provenance',
+    setup: async ({ home }) => {
+      const stateDir = path.join(home, '.clementine-next', 'state');
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(path.join(stateDir, 'auth.json'), JSON.stringify({
+        source: 'native',
+        codexOauth: { accessToken: 'ambiguous-access', refreshToken: 'ambiguous-refresh' },
+      }));
+    },
+    expected: false,
+    note: 'Older desktop builds could mislabel a CLI-derived family as native, so markerless grants fail closed.',
+  },
+  {
+    name: 'new Clementine-owned native grant with versioned provenance',
+    setup: async ({ home }) => {
+      const stateDir = path.join(home, '.clementine-next', 'state');
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(path.join(stateDir, 'auth.json'), JSON.stringify({
+        source: 'native',
+        codexOauth: {
+          grantProvenance: 'clementine-oauth-v1',
+          grantId: 'grant-smoke-fresh-install-probe',
+          accessToken: 'independent-access',
+          refreshToken: 'independent-refresh',
+        },
+      }));
+    },
     expected: true,
-    note: 'Codex CLI auth can be reused by the wizard, but it must not skip setup without setup-complete.json.',
+    note: 'Only a complete, explicitly Clementine-owned OAuth grant is reusable.',
   },
   {
     name: 'launched from a directory containing a .env with OPENAI_API_KEY',
@@ -214,7 +280,7 @@ for (const p of probes) {
   const ok = got === p.expected;
   if (ok) pass(`${p.name} → hasAnyUsableCredential() === ${got}`);
   else fail(`${p.name} → expected ${p.expected}, got ${got}`, p.note);
-  if (got && p.expected) info(`note: ${p.note}`);
+  if (ok && p.note) info(`note: ${p.note}`);
 }
 
 // ─── Summary ──────────────────────────────────────────────────────

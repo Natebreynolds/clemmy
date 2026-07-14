@@ -51,7 +51,12 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { MODELS, getRuntimeEnv } from '../../config.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
-import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthError } from '../auth-store.js';
+import {
+  refreshStoredNativeOAuth,
+  getStoredCodexOAuthTokens,
+  classifyCodexAuthError,
+  markCodexAuthDead,
+} from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { estimateInputTokens } from './token-estimator.js';
@@ -742,6 +747,10 @@ export class CodexResponsesModel implements Model {
     }
 
     let token = await loadFreshCodexAccessToken();
+    const grantSnapshot = getStoredCodexOAuthTokens();
+    // Bind terminal responses to the grant that actually sent the request. A
+    // late response from a replaced grant must never dead-latch a fresh login.
+    let requestGrantId = grantSnapshot?.accessToken === token ? grantSnapshot.grantId : undefined;
     // A 401 on a MODEL call almost always means the short-lived access token
     // just expired (or a one-off edge reject) — NOT a revoked sign-in. Force ONE
     // refresh + retry before surfacing anything (the daemon CodexNativeRuntime
@@ -799,6 +808,11 @@ export class CodexResponsesModel implements Model {
 
       if (!res.ok) {
         const detail = await safeReadErrorBody(res);
+        const modelAuthClass = classifyCodexAuthError({
+          message: detail ?? '',
+          status: res.status,
+          source: 'model',
+        });
         // Refresh-and-retry on a marker-less 401 (access-token expiry), once.
         // A 401 carrying a real revoke marker (token_revoked / invalid_grant /…)
         // classifies 'terminal' even with source:'model', so it skips the retry
@@ -806,7 +820,7 @@ export class CodexResponsesModel implements Model {
         if (
           res.status === 401
           && !refreshedOn401
-          && classifyCodexAuthError({ message: detail ?? '', status: 401, source: 'model' }) !== 'terminal'
+          && modelAuthClass !== 'terminal'
         ) {
           refreshedOn401 = true;
           const refreshResult = await refreshStoredNativeOAuth({ force: true });
@@ -814,6 +828,7 @@ export class CodexResponsesModel implements Model {
             const refreshed = getStoredCodexOAuthTokens();
             if (refreshed?.accessToken) {
               token = refreshed.accessToken;
+              requestGrantId = refreshed.grantId;
               continue; // retry the request with the fresh token (no bytes streamed yet)
             }
           }
@@ -824,10 +839,22 @@ export class CodexResponsesModel implements Model {
             throw new CodexModelError(
               `Codex sign-in is revoked or expired — re-authenticate to resume. ${refreshResult.message}`,
               401,
+              requestGrantId,
             );
           }
           // Transient refresh failure (network / 5xx): fall through to throw a
           // non-terminal 401 the loop can retry, rather than bricking auth.
+        }
+        // Persist explicit revoke/invalid-grant responses at the provider
+        // boundary, before fallback or debate wrappers can catch the error and
+        // return a survivor. Bind the latch to the grant that sent this exact
+        // request; an undefined id means re-auth raced our snapshot, in which
+        // case latching the now-current grant would be unsafe.
+        if (modelAuthClass === 'terminal' && requestGrantId) {
+          await markCodexAuthDead(
+            `Codex /responses returned ${res.status}${detail ? `: ${detail}` : ''}`,
+            requestGrantId,
+          );
         }
         // Persist a 4xx trace so operators can inspect the exact request
         // that Codex rejected. The codex-native-runtime path has the same
@@ -875,22 +902,44 @@ export class CodexResponsesModel implements Model {
         throw new CodexModelError(
           `Codex /responses returned ${res.status} ${res.statusText}${detail ? ': ' + detail : ''}`,
           res.status,
+          requestGrantId,
         );
       }
       if (!res.body) {
         throw new CodexModelError('Codex /responses returned an empty body.');
       }
 
-      yield* this.streamCodexBody(res.body, diag);
+      yield* this.streamCodexBody(res.body, requestGrantId, diag);
       return;
     }
   }
 
   /** Stream + parse the SSE body. Split out of streamCodex so the
    *  refresh-and-retry loop above never re-enters streaming once bytes flow. */
-  private async *streamCodexBody(bodyStream: ReadableStream<Uint8Array>, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
+  private async *streamCodexBody(
+    bodyStream: ReadableStream<Uint8Array>,
+    requestGrantId?: string,
+    diag?: StreamDiagnostics,
+  ): AsyncGenerator<AnyCodexEvent> {
     try {
-      yield* parseCodexSse(bodyStream);
+      for await (const event of parseCodexSse(bodyStream)) {
+        const terminalAuthDetail = terminalCodexSseAuthDetail(event);
+        if (terminalAuthDetail) {
+          // Some Codex failures arrive inside an HTTP 200 SSE stream. Persist at
+          // this same provider boundary so debate/fallback cannot swallow them.
+          // As with non-OK HTTP responses, never latch without the request's
+          // generation id because a fresh login may have raced the stream.
+          if (requestGrantId) {
+            await markCodexAuthDead(`Codex SSE terminal auth failure: ${terminalAuthDetail}`, requestGrantId);
+          }
+          throw new CodexModelError(
+            `Codex sign-in is revoked or expired — re-authenticate to resume. ${terminalAuthDetail}`,
+            401,
+            requestGrantId,
+          );
+        }
+        yield event;
+      }
     } catch (err) {
       // v0.5.21 Phase 2 — undici body-timeout fires here (no SSE bytes
       // for 30s after headers arrived). Same routing as header-timeout
@@ -920,7 +969,11 @@ export class CodexModelProvider implements ModelProvider {
 }
 
 export class CodexModelError extends Error {
-  constructor(message: string, readonly status?: number) {
+  constructor(
+    message: string,
+    readonly status?: number,
+    readonly codexGrantId?: string,
+  ) {
     super(message);
     this.name = 'CodexModelError';
   }
@@ -1368,6 +1421,32 @@ interface AnyCodexEvent {
     error?: { code?: string; message?: string };
   };
   [key: string]: unknown;
+}
+
+/** Explicit terminal auth can arrive as response.failed/response.error inside
+ * an otherwise HTTP-200 SSE response. Only inspect failure event envelopes so
+ * ordinary model text containing words such as "invalid_grant" cannot latch
+ * auth accidentally. */
+function terminalCodexSseAuthDetail(event: AnyCodexEvent): string | null {
+  if (event.type !== 'response.failed' && event.type !== 'response.error' && event.type !== 'error') {
+    return null;
+  }
+  const topLevelError = event.error;
+  const responseError = event.response?.error;
+  const candidate = responseError ?? topLevelError;
+  let detail = '';
+  if (typeof candidate === 'string') {
+    detail = candidate;
+  } else if (candidate && typeof candidate === 'object') {
+    const error = candidate as { code?: unknown; message?: unknown };
+    detail = [error.code, error.message]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .join(': ');
+  }
+  if (!detail && typeof event.message === 'string') detail = event.message;
+  return classifyCodexAuthError({ message: detail, source: 'model' }) === 'terminal'
+    ? detail
+    : null;
 }
 
 async function* parseCodexSse(stream: ReadableStream<Uint8Array>): AsyncGenerator<AnyCodexEvent> {

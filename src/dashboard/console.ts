@@ -25775,6 +25775,7 @@ const CONSOLE_JS = `
 
   function hasCodexRuntimeAuth(auth) {
     if (!auth) return false;
+    if (auth.codexAuthDead || auth.codexRecoveryRequired || auth.codexOauthPresent === false) return false;
     if (auth.codexOauthPresent || auth.hasNativeOAuth || auth.hasImportedCodexAuth) return true;
     return auth.mode !== 'api_key' && ['native', 'local_store', 'codex_cli'].includes(auth.source);
   }
@@ -25805,7 +25806,7 @@ const CONSOLE_JS = `
       return 'Optional capability key for embeddings, Realtime live voice, and direct OpenAI API features. Codex OAuth can still run the agent without this.';
     }
     if (name === 'codex_oauth_access_token' || name === 'codex_oauth_refresh_token') {
-      return 'Runtime auth for ChatGPT/Codex subscribers. Clementine can also use your existing Codex CLI login when detected.';
+      return 'Runtime auth for ChatGPT/Codex subscribers. Clementine keeps its own sign-in so Codex CLI refreshes or logout cannot revoke it.';
     }
     if (name === 'recall_api_key') {
       return 'Optional desktop meeting capture key. Recall.ai handles recording uploads; Clementine stores transcripts locally and queues analysis tasks.';
@@ -29150,12 +29151,9 @@ const CONSOLE_JS = `
             ? '    <span class="cred-action-note">ACTIVE VIA AUTH STORE</span>'
             : '    <button class="cred-set" type="button" data-cred-set="' + escMem(r.name) + '">' + (r.hasValue ? 'REPLACE' : 'SET') + ' ✎</button>',
           // Codex re-auth: surfaced only on the ACCESS token row (to
-          // avoid duplicate buttons on the refresh row). The button
-          // calls window.clemmy.setupCodexLogin() — same IPC the setup
-          // wizard's "Sign in with ChatGPT/Codex" button uses. Without
-          // this, users with expired refresh tokens had no path back to
-          // working state from the dashboard; they had to delete
-          // ~/.codex/auth.json or run a CLI command. v0.5.9 fix.
+          // avoid duplicate buttons on the refresh row). The browser flow is
+          // owned by the daemon so its token write is coordinated with runtime
+          // refreshes; the Electron-local OAuth IPC remains setup-only.
           (r.name === 'codex_oauth_access_token')
             ? '    <button class="cred-reauth" type="button" data-cred-codex-reauth>RE-AUTHENTICATE ↻</button>'
               + '    <button class="cred-reauth" type="button" data-cred-codex-reauth-remote title="Sign in from your phone or another device — no browser needed on this machine">RE-AUTH REMOTELY ⤢</button>'

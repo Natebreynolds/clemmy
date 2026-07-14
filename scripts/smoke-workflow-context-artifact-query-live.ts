@@ -28,7 +28,15 @@ mkdirSync(path.join(tmpHome, 'state'), { recursive: true });
 writeFileSync(path.join(tmpHome, 'state', 'claude-auth.json'), readFileSync(realClaudeAuth, 'utf-8'), 'utf-8');
 writeFileSync(
   path.join(tmpHome, 'state', 'auth.json'),
-  JSON.stringify({ codexOauth: { accessToken: 'codex-context-smoke-access', refreshToken: 'codex-context-smoke-refresh' } }),
+  JSON.stringify({
+    source: 'native',
+    codexOauth: {
+      grantProvenance: 'clementine-oauth-v1',
+      grantId: 'grant-smoke-context-artifact-query',
+      accessToken: 'codex-context-smoke-access',
+      refreshToken: 'codex-context-smoke-refresh',
+    },
+  }),
   'utf-8',
 );
 

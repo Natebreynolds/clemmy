@@ -30,7 +30,14 @@ const {
   clearCodexAuthDead,
   accessTokenExpiresSoon,
   accessTokenExpMs,
+  CODEX_GRANT_PROVENANCE,
+  getStoredCodexOAuthTokens,
+  importCodexCliAuth,
+  markCodexAuthDead,
+  getCodexBootstrapAvailability,
+  clearImportedAuth,
 } = await import('./auth-store.js');
+const { createRuntimeFromConfig } = await import('./factory.js');
 
 // Build a fake JWT (header.payload.sig) whose payload carries the given exp
 // (epoch SECONDS) so the exp helpers can be exercised without a live token.
@@ -44,11 +51,19 @@ const AUTH_FILE = path.join(TMP_HOME, 'state', 'auth.json');
 const LOCK_FILE = path.join(TMP_HOME, 'state', 'codex-refresh.lock');
 const DEAD_FILE = path.join(TMP_HOME, 'state', 'codex-auth-dead.json');
 const CLI_AUTH_FILE = path.join(TMP_HOME, '.codex', 'auth.json');
+const TEST_GRANT_ID = 'grant-auth-store-test';
 
-function writeNativeVault(refreshToken = 'RT_native'): void {
+function writeNativeVault(refreshToken = 'RT_native', grantId = TEST_GRANT_ID): void {
   writeFileSync(AUTH_FILE, JSON.stringify({
     source: 'native',
-    codexOauth: { accessToken: 'AT_native', refreshToken, accountId: 'acct', lastRefresh: new Date().toISOString() },
+    codexOauth: {
+      grantProvenance: CODEX_GRANT_PROVENANCE,
+      grantId,
+      accessToken: 'AT_native',
+      refreshToken,
+      accountId: 'acct',
+      lastRefresh: new Date().toISOString(),
+    },
   }), 'utf-8');
 }
 
@@ -63,7 +78,15 @@ function writeCliAuth(refreshToken = 'RT_cli'): void {
 function writeStoredAuth(lastRefreshIso: string, refreshToken = 'RT1'): void {
   writeFileSync(AUTH_FILE, JSON.stringify({
     source: 'native',
-    codexOauth: { accessToken: 'AT1', refreshToken, idToken: 'ID1', accountId: 'acct', lastRefresh: lastRefreshIso },
+    codexOauth: {
+      grantProvenance: CODEX_GRANT_PROVENANCE,
+      grantId: TEST_GRANT_ID,
+      accessToken: 'AT1',
+      refreshToken,
+      idToken: 'ID1',
+      accountId: 'acct',
+      lastRefresh: lastRefreshIso,
+    },
   }), 'utf-8');
 }
 
@@ -170,6 +193,71 @@ test('a successful refresh after a revoke clears the DEAD latch (recovery signal
   assert.equal(isCodexAuthDead(), false, 'a successful token write lifts the latch');
 });
 
+test('a late terminal response from a replaced grant cannot re-latch the fresh sign-in', async () => {
+  writeNativeVault('RT_old', 'grant-old');
+  writeNativeVault('RT_new', 'grant-new'); // successful re-auth replacement
+  clearCodexAuthDead();
+
+  const stale = await markCodexAuthDead('token_revoked from old request', 'grant-old');
+
+  assert.equal(stale, false, 'generation mismatch rejects the stale latch');
+  assert.equal(isCodexAuthDead(), false, 'fresh grant stays healthy');
+
+  const current = await markCodexAuthDead('token_revoked from current request', 'grant-new');
+  assert.equal(current, true);
+  assert.equal(isCodexAuthDead(), true, 'the active grant can still be latched');
+});
+
+test('a persisted DEAD latch from an older grant does not block or relatch a fresh grant', async () => {
+  writeNativeVault('RT_new', 'grant-new');
+  writeFileSync(DEAD_FILE, JSON.stringify({
+    reason: 'late token_revoked from prior process',
+    since: '2026-07-14T08:58:46.430Z',
+    grantId: 'grant-old',
+  }), 'utf-8');
+
+  assert.equal(isCodexAuthDead(), false, 'the old generation is not active');
+  assert.equal(getStoredCodexOAuthTokens()?.grantId, 'grant-new', 'fresh grant remains usable');
+  assert.equal(getAuthStatus().codexOauthPresent, true, 'status remains signed in on the fresh grant');
+
+  const marked = await markCodexAuthDead('current grant revoked', 'grant-new');
+  assert.equal(marked, true);
+  assert.equal(isCodexAuthDead(), true, 'the active generation can still be latched');
+  const persisted = JSON.parse(readFileSync(DEAD_FILE, 'utf-8')) as { grantId?: string; reason?: string };
+  assert.equal(persisted.grantId, 'grant-new', 'marking replaces the stale generation under lock');
+  assert.equal(persisted.reason, 'current grant revoked');
+});
+
+test('a DEAD independent grant is signed out in status and unavailable to bootstrap', async () => {
+  writeNativeVault('RT_revoked', 'grant-revoked');
+  await markCodexAuthDead('token_revoked', 'grant-revoked');
+
+  const status = getAuthStatus();
+  assert.equal(status.configured, false, 'a revoked grant cannot configure the runtime');
+  assert.equal(status.codexOauthPresent, false, 'UIs must not display a revoked grant as signed in');
+  assert.equal(status.codexAuthDead, true, 'status distinguishes a revoked grant from a never-configured install');
+  assert.equal(status.codexRecoveryRequired, true);
+  assert.equal(getStoredCodexOAuthTokens(), null, 'the shared store boundary never hands a DEAD token to a runtime');
+  assert.equal(status.codexSharedWithCli, false, 'a revoked independent grant is not mislabeled as CLI-shared');
+  assert.match(status.message, /revoked|expired/i);
+  assert.equal(getCodexBootstrapAvailability().available, false, 'bootstrap must require a fresh OAuth grant');
+  assert.doesNotThrow(
+    () => createRuntimeFromConfig(),
+    'the recovery daemon/dashboard must still boot so the user can re-authenticate',
+  );
+});
+
+test('logout removes auth and its DEAD latch under the auth-operation lock', async () => {
+  writeNativeVault('RT_logout', 'grant-logout');
+  await markCodexAuthDead('token_revoked', 'grant-logout');
+
+  await clearImportedAuth();
+
+  assert.equal(existsSync(AUTH_FILE), false);
+  assert.equal(existsSync(DEAD_FILE), false);
+  assert.equal(existsSync(LOCK_FILE), false, 'logout releases the auth-operation lock');
+});
+
 // The codex-logout-revokes-Clem trap: bootstrap used to end on an unconditional
 // importCodexCliAuth, clobbering a freshly-minted native grant with the CLI's shared
 // token family. A `codex logout` then revoked that family and signed Clementine out.
@@ -185,16 +273,19 @@ test('bootstrap keeps Clem’s own native grant — never downgrades to the CLI�
   assert.equal(vault.codexOauth.refreshToken, 'RT_native', 'native RT must NOT be clobbered by the CLI import');
 });
 
-test('auth status flags a CLI-shared sign-in (imported grant) with the decouple remedy', () => {
+test('auth status disables a CLI-shared sign-in and shows the independent-login remedy', () => {
   writeFileSync(AUTH_FILE, JSON.stringify({
     source: 'codex_cli',
     codexOauth: { accessToken: 'AT', refreshToken: 'RT', accountId: 'acct', lastRefresh: new Date().toISOString() },
   }), 'utf-8');
 
   const status = getAuthStatus();
-  assert.equal(status.codexOauthPresent, true);
+  assert.equal(status.codexOauthPresent, false, 'an imported grant is not usable runtime auth');
+  assert.equal(status.configured, false);
   assert.equal(status.codexSharedWithCli, true, 'an imported CLI grant is flagged as shared');
+  assert.equal(status.codexRecoveryRequired, true, 'an upgraded install may boot only to expose re-authentication');
   assert.match(status.message, /login-device/i, 'message points at the decouple remedy (device-code login)');
+  assert.doesNotThrow(() => createRuntimeFromConfig(), 'an upgraded CLI-linked install can reach the recovery UI');
 });
 
 test('auth status does NOT flag an independent native grant as shared', () => {
@@ -203,6 +294,46 @@ test('auth status does NOT flag an independent native grant as shared', () => {
   const status = getAuthStatus();
   assert.equal(status.codexOauthPresent, true);
   assert.equal(status.codexSharedWithCli, false, 'a native grant is independent of the CLI');
+});
+
+test('an old source:native grant without provenance fails closed on normal daemon startup', () => {
+  writeFileSync(AUTH_FILE, JSON.stringify({
+    source: 'native',
+    codexOauth: {
+      accessToken: 'AT_old_mislabeled',
+      refreshToken: 'RT_old_mislabeled',
+      accountId: 'acct-old',
+      lastRefresh: new Date().toISOString(),
+    },
+  }), 'utf-8');
+
+  assert.equal(getStoredCodexOAuthTokens(), null, 'runtime must not load an unproven token pair');
+  const status = getAuthStatus();
+  assert.equal(status.codexOauthPresent, false);
+  assert.equal(status.configured, false);
+  assert.equal(status.codexSharedWithCli, true, 'old native labels may hide a CLI-shared family');
+  assert.equal(status.codexRecoveryRequired, true);
+  assert.match(status.message, /legacy|unverified/i);
+  assert.match(status.message, /re-authenticate|login-native/i);
+  assert.doesNotThrow(() => createRuntimeFromConfig(), 'pre-marker desktop upgrades can reach re-authentication');
+});
+
+test('a never-configured Codex install does not bypass the normal startup/setup gate', () => {
+  const status = getAuthStatus();
+  assert.equal(status.codexRecoveryRequired, false);
+  assert.throws(() => createRuntimeFromConfig(), /No Codex OAuth credentials found/i);
+});
+
+test('legacy Codex CLI import command is disabled and never writes runtime auth', () => {
+  writeCliAuth('RT_cli_shared');
+  const cliBefore = readFileSync(CLI_AUTH_FILE, 'utf-8');
+
+  const result = importCodexCliAuth(CLI_AUTH_FILE);
+
+  assert.equal(result.ok, false);
+  assert.match(result.message, /disabled/i);
+  assert.equal(existsSync(AUTH_FILE), false, 'disabled import must not create a local runtime grant');
+  assert.equal(readFileSync(CLI_AUTH_FILE, 'utf-8'), cliBefore, 'external CLI auth remains untouched');
 });
 
 test('concurrent refreshes coalesce into ONE network rotation (no RT reuse → no token_revoked)', async () => {
@@ -223,6 +354,10 @@ test('concurrent refreshes coalesce into ONE network rotation (no RT reuse → n
   assert.deepEqual(seenRTs, ['RT1'], 'the one rotation used the original RT');
   assert.ok(results.every((r) => r.ok), 'every caller gets a success (shared result)');
   assert.equal(storedRefreshToken(), 'RT2', 'the rotated RT is persisted');
+  const saved = JSON.parse(readFileSync(AUTH_FILE, 'utf-8'));
+  assert.equal(saved.source, 'native');
+  assert.equal(saved.codexOauth.grantProvenance, CODEX_GRANT_PROVENANCE, 'refresh preserves ownership provenance');
+  assert.equal(saved.codexOauth.grantId, TEST_GRANT_ID, 'refresh preserves the grant generation');
 });
 
 test('skip-if-just-refreshed: a refresh right after a successful one does NOT re-submit the rotated RT', async () => {
@@ -271,9 +406,31 @@ test('a genuinely stale token still refreshes (guards do not block legitimate re
 });
 
 test('missing refresh token → ok:false, no crash', async () => {
-  writeFileSync(AUTH_FILE, JSON.stringify({ source: 'native', codexOauth: {} }), 'utf-8');
+  writeFileSync(AUTH_FILE, JSON.stringify({
+    source: 'native',
+    codexOauth: { grantProvenance: CODEX_GRANT_PROVENANCE, grantId: TEST_GRANT_ID },
+  }), 'utf-8');
   const res = await refreshStoredNativeOAuth();
   assert.equal(res.ok, false);
+});
+
+test('refresh never submits a markerless legacy token', async () => {
+  writeFileSync(AUTH_FILE, JSON.stringify({
+    source: 'native',
+    codexOauth: { accessToken: 'AT_legacy', refreshToken: 'RT_legacy', lastRefresh: tenMinAgo() },
+  }), 'utf-8');
+  let calls = 0;
+  __setRefreshTokenImplForTests(async () => {
+    calls += 1;
+    throw new Error('must not run');
+  });
+
+  const result = await refreshStoredNativeOAuth();
+
+  assert.equal(result.ok, false);
+  assert.equal(result.terminal, true);
+  assert.match(result.message, /legacy|unverified/i);
+  assert.equal(calls, 0, 'unproven refresh token must never reach the network');
 });
 
 test.after(() => {
