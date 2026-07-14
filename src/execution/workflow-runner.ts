@@ -94,13 +94,13 @@ import { recordAndDeriveStableTightenings } from './workflow-contract-evidence-s
 import { preflightWorkflow, renderPreflightReport } from './workflow-preflight.js';
 import { simulateWorkflowDryRun, renderWorkflowDryRunSimulation } from './workflow-dry-run-simulation.js';
 import { recordWorkflowOutcome, shouldStopAutoHeal, escalateThreshold, clearWorkflowFailures } from './workflow-failure-ledger.js';
-import { takeStepResult } from '../tools/step-result-tool.js';
+import { clearStepContract, registerStepContract, takeStepResult } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
-import { verifyStepOutput, isEmptyValue } from './step-output-verify.js';
+import { classifyContractProblems, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { runWatcherJudge, watcherJudgeEnabled, watcherWorkflowIntervalSteps, MAX_WATCHER_INJECTIONS, MAX_WATCHER_CHECKS, type WatcherJudgeFn } from '../runtime/harness/watcher-judge.js';
@@ -1733,6 +1733,10 @@ async function runStepViaHarness(
       : [],
   });
 
+  // Self-heal move 2: arm submission-time contract validation for this step
+  // session (workflow_step_result refuses a wrong-shape result with the exact
+  // problems while the model is still alive to fix it).
+  registerStepContract(realSessionId, step.output);
   const approvalIds: string[] = [];
   let hadApprovals = false;
   const startedAt = Date.now();
@@ -1741,7 +1745,11 @@ async function runStepViaHarness(
     // Build a fresh orchestrator each call so it picks up current memory
     // context + connected toolkit list.
     // Initial turn.
-    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}`;
+    // Self-heal move 1 (2026-07-14): the output contract rides IN the prompt,
+    // rendered from the same object the reduce gate verifies — the authored
+    // prose can no longer drift from what the gate demands.
+    const contractSpec = step.output ? `\n\n${renderOutputContractSpec(step.output)}` : '';
+    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}`;
     // Typed-contract delivery (P1): when the step declared inputs and the
     // contract flag + step agent are on, append the BOUND inputs/upstream
     // as a structured block AFTER the prose (never replacing it). This is
@@ -2030,6 +2038,9 @@ async function runStepViaHarness(
     }
     return { output: guardPhantom(prose), hadApprovals, approvalIds, usedStructuredResult: false, sessionId: realSessionId, lane: 'harness', route };
   } finally {
+    // The submission-time contract dies with the step session (a later chat
+    // turn on a reused session must never be gated).
+    clearStepContract(realSessionId);
     // Belt + suspenders: clear the heartbeat gate in finally so a throw
     // mid-resume doesn't leave the heartbeat permanently suppressed
     // for the rest of the workflow run.
@@ -2764,10 +2775,7 @@ export class WorkflowContractViolationError extends Error {
   }
 }
 
-function isBlockedStepOutput(output: unknown): boolean {
-  return output !== null && typeof output === 'object' && !Array.isArray(output) &&
-    (output as { blocked?: unknown }).blocked === true;
-}
+// isBlockedStepOutput moved to step-output-verify.ts (one truth for both gates).
 
 export function finalizeStepOutput(
   workflowSlug: string,
@@ -2800,10 +2808,14 @@ export function finalizeStepOutput(
       // likely cause, and is NOT routed to the Doctor (findContractViolationStep
       // matches only 'output_contract' — the Doctor can't fix "SF expired").
       // Both paths land on the error route, which sets needsAttention (Wave 1).
+      // Classification extracted + fixed (2026-07-14): "is not an array" is a
+      // SHAPE problem (Doctor-routable), not upstream emptiness — the old
+      // filter told the user "the source returned nothing" over 197KB of real
+      // data (live scorpion-facebook-trends misdiagnosis).
+      const isEmptyOnly = classifyContractProblems(result.problems) === 'empty_output';
       const emptyProblems = result.problems.filter(
         (p) => p.startsWith('non_empty:') || p.startsWith('min_items:'),
       );
-      const isEmptyOnly = emptyProblems.length > 0 && emptyProblems.length === result.problems.length;
       // Include the ACTUAL produced shape so the failure is diagnosable (the
       // step ran but emitted the wrong shape — e.g. its decision object instead
       // of the contracted keys) instead of only "missing key X".

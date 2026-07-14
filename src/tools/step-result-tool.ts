@@ -21,7 +21,50 @@ import { textResult } from './shared.js';
  * unclipped, so the store has the real value.
  */
 
+import { isBlockedStepOutput, verifyStepOutput } from '../execution/step-output-verify.js';
+import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
+
 const stepResults = new Map<string, unknown>();
+
+// Self-heal move 2 (2026-07-14): the step's OUTPUT CONTRACT, registered by the
+// workflow runner for the step session's lifetime. workflow_step_result
+// validates against it AT SUBMISSION and refuses with the exact problems so
+// the model fixes its own output in-turn — previously a doomed result was
+// captured silently and the run died minutes later at the reduce gate, after
+// the only agent who could fix it was gone. Bounded: after
+// MAX_CONTRACT_REFUSALS the result is accepted and the reduce gate stays
+// authoritative (a stubborn model must not spin forever). Fail-open: no
+// registered contract -> accept exactly as before.
+const stepContracts = new Map<string, WorkflowStepOutputContract>();
+const contractRefusals = new Map<string, number>();
+const MAX_CONTRACT_REFUSALS = 2;
+
+export function registerStepContract(sessionId: string, contract: WorkflowStepOutputContract | undefined): void {
+  if (!sessionId || !contract) return;
+  stepContracts.set(sessionId, contract);
+  contractRefusals.delete(sessionId);
+}
+
+export function clearStepContract(sessionId: string): void {
+  stepContracts.delete(sessionId);
+  contractRefusals.delete(sessionId);
+}
+
+/** Validate a submission against the registered contract. Returns null to
+ *  ACCEPT, or the refusal message to send back to the model. */
+function contractRefusal(sessionId: string, value: unknown): string | null {
+  const contract = stepContracts.get(sessionId);
+  if (!contract) return null;
+  if (isBlockedStepOutput(value)) return null; // honest blocks bypass shape checks
+  const result = verifyStepOutput(contract, value);
+  if (result.ok) return null;
+  const used = contractRefusals.get(sessionId) ?? 0;
+  if (used >= MAX_CONTRACT_REFUSALS) return null; // reduce gate stays authoritative
+  contractRefusals.set(sessionId, used + 1);
+  return 'Step result REJECTED (not captured) — fix these and call workflow_step_result again: '
+    + result.problems.join('; ')
+    + '. Submit `data` as ONE valid JSON object with exactly the contracted keys and types.';
+}
 
 /** Handler-side: record a step's structured result for `sessionId`. */
 export function recordStepResult(sessionId: string, value: unknown): void {
@@ -165,6 +208,11 @@ export function recordStepResultFromTranscript(sessionId: string, text: string):
   if (!sessionId || !text || stepResults.has(sessionId)) return false;
   const value = extractBalancedJsonCall(text) ?? extractXmlCall(text);
   if (value === undefined) return false;
+  // A salvaged transcript call gets the same submission gate as a real one —
+  // but without the refusal loop (nobody is listening); it simply isn't
+  // recorded, and the runner's no-result path reports honestly.
+  const contract = stepContracts.get(sessionId);
+  if (contract && !isBlockedStepOutput(value) && !verifyStepOutput(contract, value).ok) return false;
   recordStepResult(sessionId, value);
   return true;
 }
@@ -187,6 +235,8 @@ export function registerStepResultTool(server: McpServer): void {
       const sessionId = ctx?.sessionId;
       const value = coerceStepData(data);
       if (sessionId) {
+        const refusal = contractRefusal(sessionId, value);
+        if (refusal) return textResult(refusal);
         recordStepResult(sessionId, value);
         return textResult(`Step result captured (${data.length} chars).`);
       }

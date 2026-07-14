@@ -149,3 +149,64 @@ export function verifyStepOutput(
 
   return problems.length === 0 ? OK : { ok: false, problems };
 }
+
+/** A step that legitimately BLOCKED signals it couldn't produce its
+ *  deliverable; contract checks are skipped for it (the runner surfaces the
+ *  block's REASON instead of a cryptic "missing key"). One truth here — used
+ *  by both the reduce-time gate and the submission-time gate. */
+export function isBlockedStepOutput(output: unknown): boolean {
+  return output !== null && typeof output === 'object' && !Array.isArray(output) &&
+    (output as { blocked?: unknown }).blocked === true;
+}
+
+/**
+ * Self-heal move 1 (2026-07-14). Render a step's output contract as a
+ * machine-precise prompt block the RUNNER injects into every step prompt —
+ * derived from the SAME contract verifyStepOutput gates on, so prompt/contract
+ * drift is structurally impossible (the scorpion-facebook-trends class: the
+ * authored prompt named different keys than the contract, and the model
+ * improvised shapes — green or dead by coin flip).
+ */
+export function renderOutputContractSpec(contract: WorkflowStepOutputContract): string {
+  const lines: string[] = [
+    'OUTPUT CONTRACT — your workflow_step_result `data` is gated on this exact shape; a mismatch fails the run:',
+  ];
+  if (contract.type) {
+    lines.push(contract.type === 'object'
+      ? '- Submit a single JSON OBJECT (as JSON text in `data`) — never prose, never a double-encoded string.'
+      : `- The result must be of type "${contract.type}".`);
+  }
+  if (contract.required_keys?.length) {
+    lines.push(`- Required keys: ${contract.required_keys.join(', ')}.`);
+  }
+  const minItems = contract.min_items ?? {};
+  const nonEmpty = new Set(contract.non_empty ?? []);
+  for (const [pathKey, min] of Object.entries(minItems)) {
+    lines.push(`- "${pathKey || '(root)'}" must be a JSON ARRAY with at least ${min} item(s) — never an object or a sentence.`);
+    nonEmpty.delete(pathKey);
+  }
+  for (const pathKey of nonEmpty) {
+    lines.push(`- "${pathKey || '(root)'}" must be non-empty (real data, not a placeholder).`);
+  }
+  for (const pathKey of contract.verify?.url_present ?? []) {
+    lines.push(`- "${pathKey}" must contain a real http(s) URL.`);
+  }
+  for (const pathKey of contract.verify?.path_exists ?? []) {
+    lines.push(`- "${pathKey}" must be a path to a file that actually exists.`);
+  }
+  lines.push('- If you are genuinely blocked, submit {"blocked": true, "reason": "<specifics>"} instead of a partial shape.');
+  return lines.join('\n');
+}
+
+/** Wave 3 P1-9 classification, extracted + FIXED (2026-07-14): "empty output"
+ *  (upstream produced no data — remediation message, not Doctor-routed) vs
+ *  "output_contract" (the step emitted the WRONG SHAPE — diagnosable). The old
+ *  in-line filter counted `min_items: X is not an array` as emptiness, which
+ *  told the user "the source returned nothing" when 197KB of real data existed
+ *  and only the shape was wrong (live scorpion-facebook-trends misdiagnosis). */
+export function classifyContractProblems(problems: string[]): 'empty_output' | 'output_contract' {
+  const emptyOnly = problems.length > 0 && problems.every((p) =>
+    (p.startsWith('non_empty:') || p.startsWith('min_items:'))
+    && !p.includes('is not an array'));
+  return emptyOnly ? 'empty_output' : 'output_contract';
+}

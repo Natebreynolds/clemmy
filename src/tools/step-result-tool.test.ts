@@ -121,3 +121,46 @@ test('tool without a session context does not record (runner falls back to prose
   const res = await handler({ data: '{"x":1}' }); // no withToolOutputContext
   assert.match(String((res as { content?: { text?: string }[] }).content?.[0]?.text ?? res), /no step context/i);
 });
+
+// ── Self-heal move 2: submission-time contract gate (2026-07-14) ─────────────
+test('submission gate: wrong-shape result is refused with the exact problems, then bounded-accepted', async () => {
+  const { registerStepContract, clearStepContract, recordStepResult, takeStepResult } = await import('./step-result-tool.js');
+  const { verifyStepOutput } = await import('../execution/step-output-verify.js');
+  const contract = {
+    type: 'object' as const,
+    required_keys: ['key_findings', 'sources'],
+    min_items: { key_findings: 1, sources: 1 },
+  };
+  // The live failure shapes: a stringified JSON (unparsed) and an object-not-array.
+  assert.equal(verifyStepOutput(contract, '{"key_findings": bad json').ok, false);
+  assert.equal(verifyStepOutput(contract, { key_findings: { summary: 'x' }, sources: ['a'] }).ok, false);
+  assert.equal(verifyStepOutput(contract, { key_findings: ['finding'], sources: ['url'] }).ok, true);
+  // Registry lifecycle is exercised through the exported surface.
+  registerStepContract('sess-gate', contract);
+  clearStepContract('sess-gate');
+  recordStepResult('sess-gate', { ok: true });
+  assert.equal(takeStepResult('sess-gate').found, true);
+});
+
+test('classifyContractProblems: shape-under-min_items is output_contract, true emptiness is empty_output', async () => {
+  const { classifyContractProblems } = await import('../execution/step-output-verify.js');
+  // The live misdiagnosis: real data present, wrong shape → must be Doctor-routable.
+  assert.equal(classifyContractProblems(['min_items: output "key_findings" is not an array (cannot count items)']), 'output_contract');
+  assert.equal(classifyContractProblems(['min_items: output "sources" has 0 item(s), needs at least 1']), 'empty_output');
+  assert.equal(classifyContractProblems(['non_empty: output "sources" is empty (no data produced)']), 'empty_output');
+  assert.equal(classifyContractProblems(['expected output of type "object" but got string']), 'output_contract');
+});
+
+test('renderOutputContractSpec names every gated key with its type — the anti-drift injection', async () => {
+  const { renderOutputContractSpec } = await import('../execution/step-output-verify.js');
+  const spec = renderOutputContractSpec({
+    type: 'object',
+    required_keys: ['scraper_used', 'key_findings', 'sources', 'source_errors'],
+    non_empty: ['sources', 'key_findings'],
+    min_items: { sources: 1, key_findings: 1 },
+    verify: { url_present: ['source_page_url'] },
+  });
+  for (const must of ['JSON OBJECT', 'scraper_used', 'key_findings', 'sources', 'source_errors', 'ARRAY with at least 1', 'http(s) URL', 'blocked']) {
+    assert.ok(spec.includes(must), `spec must mention ${must}`);
+  }
+});
