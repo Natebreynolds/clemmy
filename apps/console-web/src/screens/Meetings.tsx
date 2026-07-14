@@ -362,7 +362,7 @@ export function Meetings() {
 
             <p className="flex gap-2 text-caption text-muted">
               <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden />
-              Audio is written only to this device and transcription runs locally. If automatic summaries are enabled, the transcript is handled by your configured Clementine model; raw audio is not sent for summarization.
+              Audio never leaves this device and transcription runs locally; the recording itself is deleted after transcription unless you choose to keep it. The transcript is saved to Clementine's memory so it can be recalled in future conversations — if a cloud embedding provider is configured (for example OpenAI), transcript text is sent to that provider for search indexing. If automatic summaries are enabled, the transcript is also handled by your configured Clementine model.
             </p>
             {!localRuntime?.modelReady && localRuntime?.available !== false && (
               <p className="text-caption text-muted">The English base model downloads once on the first transcription, then works without an internet connection.</p>
