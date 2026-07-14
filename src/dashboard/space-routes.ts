@@ -82,6 +82,20 @@ const CLEM_VIEW_BRIDGE = (slug: string): string => {
     + `};})();</script>`;
 };
 
+/** Insert a snippet as early as possible so `window.clem` is defined before any
+ *  authored <script> executes. Prefers just inside <head>; falls back to just
+ *  inside <html>, then after <!doctype>, else prepends. Case-insensitive, first
+ *  match wins. Keeps the bridge ahead of a top-of-body author script — the whole
+ *  point (see serveView). */
+function injectAtDocumentStart(html: string, snippet: string): string {
+  const m = /<head[^>]*>/i.exec(html) ?? /<html[^>]*>/i.exec(html) ?? /<!doctype[^>]*>/i.exec(html);
+  if (m) {
+    const at = m.index + m[0].length;
+    return html.slice(0, at) + snippet + html.slice(at);
+  }
+  return snippet + html;
+}
+
 function isLoopback(req: Request): boolean {
   const addr = req.socket?.remoteAddress ?? '';
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1' || addr === '';
@@ -136,10 +150,18 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       // the desktop's setWindowOpenHandler hands to the OS (the dialer/mail).
       // Same-origin inline script — allowed by the console CSP.
       const html = readFileSync(target, 'utf-8');
-      // Bridge first (so the view's own scripts can call window.clem), then the
-      // external-link shim. Both are same-origin inline scripts (console CSP).
-      const injected = `${CLEM_VIEW_BRIDGE(slug)}${EXTERNAL_LINK_SHIM}`;
-      res.send(html.includes('</body>') ? html.replace('</body>', `${injected}</body>`) : html + injected);
+      // Bridge FIRST — literally. It must be DEFINED before any authored
+      // <script> runs, so it goes at the TOP of <head>, not before </body>.
+      // (An end-of-body injection lands AFTER a view's own load()/clem.data()
+      // script, which runs first in document order → `clem` is undefined →
+      // the surface renders empty on first load. That ordering bug forced
+      // hand-rolled `waitForClem` polls in authored views.) The bridge touches
+      // no DOM, so <head> is safe. The external-link shim is a passive
+      // capture-phase click listener — order-immaterial — so it stays at
+      // </body>. Both are same-origin inline scripts (console CSP).
+      let out = injectAtDocumentStart(html, CLEM_VIEW_BRIDGE(slug));
+      out = out.includes('</body>') ? out.replace('</body>', `${EXTERNAL_LINK_SHIM}</body>`) : out + EXTERNAL_LINK_SHIM;
+      res.send(out);
       return;
     }
     res.send(readFileSync(target));
