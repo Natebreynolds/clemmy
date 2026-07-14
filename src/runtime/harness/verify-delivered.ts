@@ -1,4 +1,5 @@
 import type { RunStoppedReason } from '../../types.js';
+import { getRuntimeEnv } from '../../config.js';
 import { isPromiseShapedReply, judgeObjectiveComplete, type ObjectiveJudgeFn } from './objective-judge.js';
 import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 
@@ -65,6 +66,42 @@ export const BLOCKED_TEXT_PATTERNS: RegExp[] = [
   /\bcould ?n['’]?t (finish|complete|proceed|continue)\b/i,
 ];
 
+/** Move 3 kill-switch (default on; scoped to highStakes callers only). */
+export function refuteCompletionEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_REFUTE_COMPLETION', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/**
+ * Move 3 (trust roadmap #48): adversarial refute-the-completion for the
+ * high-stakes terminal lane. Two independent judge calls with DISTINCT lenses
+ * try to REFUTE the done-claim; only a UNANIMOUS refutation blocks (inform,
+ * rarely block). Each lens fails OPEN (judge error/timeout = not refuted), so
+ * a judge hiccup can never block a real completion. Cross-family + hedging
+ * ride the existing judge plumbing underneath judgeObjectiveComplete.
+ */
+async function refuteHighStakesCompletion(
+  objective: string,
+  text: string,
+  judge: (objective: string, reply: string) => Promise<{ done: boolean; reason?: string; failedOpen?: boolean }>,
+): Promise<{ refuted: boolean; reason: string }> {
+  const lenses = [
+    `${objective}\n\nADVERSARIAL VERIFICATION — EVIDENCE LENS: assume the reply OVERSTATES completion. Judge done=true ONLY if the reply presents CONCRETE verifiable evidence of the finished deliverable (a link, an id, artifact content, or a specific confirmation of the sent/created thing). A claim, summary, or promise without evidence is done=false; name the missing evidence in reason.`,
+    `${objective}\n\nADVERSARIAL VERIFICATION — OBJECTIVE LENS: assume the reply quietly NARROWED the objective. Judge done=true ONLY if every part of the stated objective is addressed in the reply. If any requested outcome is unaddressed or replaced with something easier, done=false; name what was dropped in reason.`,
+  ];
+  const verdicts = await Promise.all(lenses.map(async (lens) => {
+    try {
+      const v = await judge(lens, text);
+      // failedOpen means the judge did not actually run — treat as NOT refuted.
+      return { refutes: v.failedOpen ? false : !v.done, reason: v.reason ?? '' };
+    } catch {
+      return { refutes: false, reason: '' };
+    }
+  }));
+  const refuted = verdicts.every((v) => v.refutes);
+  const reason = verdicts.filter((v) => v.refutes).map((v) => v.reason).filter(Boolean).join(' | ').slice(0, 400);
+  return { refuted, reason: reason || 'Both adversarial lenses refuted the completion claim.' };
+}
+
 export function matchesBlockedText(text: string | null | undefined): boolean {
   const t = (text ?? '').trim();
   if (!t) return false;
@@ -91,6 +128,7 @@ export type BlockerType =
   | 'rate_limited'     // throttled / quota exceeded (retry-with-backoff class)
   | 'budget'           // hit a turn/wall-clock/step budget before finishing
   | 'runtime_error'    // the run threw / crashed mid-turn
+  | 'unverified_completion' // Move 3: a high-stakes done-claim failed adversarial refutation
   | 'unknown';         // blocked, but no pattern matched (still report it)
 
 /**
@@ -151,9 +189,33 @@ export interface VerifyDeliveredOpts {
   stoppedReason?: RunStoppedReason | string;
   /** Test injection; defaults to the real (fail-open) objective judge. */
   judgeFn?: ObjectiveJudgeFn;
+  /** Move 3 (trust roadmap #48): this completion guards an IRREVERSIBLE
+   *  external write on an unattended lane — run the adversarial refuters
+   *  before banking "done". Never set on ordinary chat turns (latency). */
+  highStakes?: boolean;
 }
 
 const DELIVERED: DeliveryVerdict = { delivered: true, status: 'completed' };
+
+/** Run the Move-3 refuters only for high-stakes callers; otherwise pass the
+ *  accept through untouched (zero cost on ordinary lanes). */
+async function maybeRefute(
+  objective: string,
+  text: string,
+  opts: VerifyDeliveredOpts,
+  accepted: DeliveryVerdict,
+): Promise<DeliveryVerdict> {
+  if (!opts.highStakes || !refuteCompletionEnabled() || !objective.trim() || !text.trim()) return accepted;
+  const judge = opts.judgeFn ?? judgeObjectiveComplete;
+  const { refuted, reason } = await refuteHighStakesCompletion(objective, text, judge);
+  if (!refuted) return accepted;
+  return {
+    delivered: false,
+    status: 'blocked',
+    reason,
+    blockerType: 'unverified_completion',
+  };
+}
 
 export async function verifyDelivered(
   objective: string,
@@ -192,7 +254,7 @@ export async function verifyDelivered(
 
   // 3) Suspicious-only judge: a promise-shaped reply is the one shape worth a
   //    verification call. Anything else is accepted (fail-open, token-cheap).
-  if (!isPromiseShapedReply(text)) return DELIVERED;
+  if (!isPromiseShapedReply(text)) return maybeRefute(objective, text, opts, DELIVERED);
   if (!objective.trim() || !text) return DELIVERED;
 
   const judge = opts.judgeFn ?? judgeObjectiveComplete;
@@ -211,9 +273,10 @@ export async function verifyDelivered(
     };
   }
   if (verdict.done) {
-    return verdict.failedOpen || verdict.selfJudge
+    const accepted = verdict.failedOpen || verdict.selfJudge
       ? { ...DELIVERED, verification: { failedOpen: verdict.failedOpen, selfJudge: verdict.selfJudge } }
       : DELIVERED;
+    return maybeRefute(objective, text, opts, accepted);
   }
   const reason = verdict.reason || 'Replied with a promise of work but no verifiable artifact.';
   return {

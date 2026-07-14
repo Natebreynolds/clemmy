@@ -39,7 +39,7 @@ import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
-import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent } from '../runtime/harness/eventlog.js';
+import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute } from '../runtime/harness/eventlog.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
@@ -1675,7 +1675,12 @@ async function verifyBackgroundTaskDelivery(
 
   try {
     const evidence = probeEvidence ? `${finalText}\n\n${probeEvidence}` : finalText;
+    // Move 3: a run that recorded an IRREVERSIBLE external write gets the
+    // adversarial refuters before its "done" is banked (unattended lane).
+    let refuteHighStakes = false;
+    try { refuteHighStakes = listHarnessEventsForRefute(task.runSessionId, { types: ['external_write'] }).length > 0; } catch { /* fail-open: no refuters */ }
     const verdict = await verifyDelivered(task.prompt || task.title, evidence, {
+      highStakes: refuteHighStakes,
       stoppedReason,
       ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
     });

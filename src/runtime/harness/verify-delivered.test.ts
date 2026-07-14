@@ -225,3 +225,52 @@ test('verifyDelivered carries a routable blockerType on every blocked verdict', 
   assert.equal(ok.delivered, true);
   assert.equal(ok.blockerType, undefined);
 });
+
+// ── Move 3 (trust roadmap #48): adversarial refute-the-completion ────────────
+
+test('Move 3: unanimous refutation blocks a high-stakes done-claim; split verdict delivers', async () => {
+  const { verifyDelivered } = await import('./verify-delivered.js');
+  // Both lenses refute (judge says not-done for every lens) → blocked.
+  const blocked = await verifyDelivered('Send the Q3 invoices to all 12 clients', 'All done! Everything went great.', {
+    highStakes: true,
+    judgeFn: async () => ({ done: false, reason: 'no evidence any invoice was sent' }),
+  });
+  assert.equal(blocked.delivered, false);
+  assert.equal(blocked.blockerType, 'unverified_completion');
+  // Split verdict (one lens satisfied) → inform, don't block.
+  let call = 0;
+  const split = await verifyDelivered('Send the Q3 invoices to all 12 clients', 'Sent 12 invoices; message ids: m1…m12.', {
+    highStakes: true,
+    judgeFn: async () => ({ done: (call += 1) === 1, reason: 'lens verdict' }),
+  });
+  assert.equal(split.delivered, true, 'a single refuting lens must not block (unanimity required)');
+});
+
+test('Move 3: refuters fail OPEN and never run on ordinary lanes', async () => {
+  const { verifyDelivered } = await import('./verify-delivered.js');
+  // Judge failed-open (dead judge) → not refuted → delivered.
+  const failedOpen = await verifyDelivered('objective', 'A clean, evidence-bearing reply with artifact id A-1.', {
+    highStakes: true,
+    judgeFn: async () => ({ done: true, reason: 'judge unavailable — accepting completion', failedOpen: true }),
+  });
+  assert.equal(failedOpen.delivered, true);
+  // Ordinary lane (no highStakes): the judge must not even be consulted for
+  // a non-promise-shaped reply — zero added latency.
+  let judgeCalls = 0;
+  const ordinary = await verifyDelivered('objective', 'Here is the finished report: 42 rows, saved to /tmp/report.md.', {
+    judgeFn: async () => { judgeCalls += 1; return { done: false, reason: 'x' }; },
+  });
+  assert.equal(ordinary.delivered, true);
+  assert.equal(judgeCalls, 0, 'no refuters, no judge on ordinary accepts');
+  // Kill-switch.
+  process.env.CLEMMY_REFUTE_COMPLETION = 'off';
+  try {
+    const off = await verifyDelivered('objective', 'All done! Everything went great.', {
+      highStakes: true,
+      judgeFn: async () => ({ done: false, reason: 'would refute' }),
+    });
+    assert.equal(off.delivered, true, 'kill-switch off → refuters inert');
+  } finally {
+    delete process.env.CLEMMY_REFUTE_COMPLETION;
+  }
+});
