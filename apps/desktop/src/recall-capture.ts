@@ -779,6 +779,15 @@ export class RecallDesktopCapture {
       throw new Error(this.platformSupport.message ?? 'Recall meeting capture is unsupported on this computer.');
     }
     const sdk = await this.loadSdk();
+    // Idempotent attach (2026-07-14 review): the SDK keeps its listeners in a
+    // MODULE-LEVEL array that survives init() failures AND clean shutdowns
+    // (loadSdk caches this.sdk BEFORE init() runs, and a re-import after
+    // shutdown returns the same cached module). Without this purge, every
+    // failed-init retry or post-shutdown reconnect attaches all 12 listeners
+    // AGAIN — each realtime transcript event then fires N handlers and the
+    // transcript is persisted N times. This class is the array's only
+    // consumer, so purge-before-attach is safe.
+    sdk.removeAllEventListeners?.();
     sdk.addEventListener('meeting-detected', (event) => { void this.onMeetingDetected(event as { window?: RecallSdkWindow }); });
     sdk.addEventListener('meeting-updated', (event) => this.onMeetingUpdated(event as { window?: RecallSdkWindow }));
     sdk.addEventListener('recording-started', (event) => { void this.onRecordingStarted(event as { window?: RecallSdkWindow }); });
@@ -1342,6 +1351,10 @@ export class RecallDesktopCapture {
       && event.signal !== 'SIGINT'
       && event.signal !== 'SIGTERM';
     if (!wrapperWillRestart) {
+      // Defense in depth for the listener purge in initialize(): drop this
+      // generation's listeners at shutdown so a reconnect can never double up
+      // even if a future refactor reorders the attach path.
+      this.sdk?.removeAllEventListeners?.();
       this.sdk = null;
       this.initialized = false;
       this.initializedRegion = undefined;
