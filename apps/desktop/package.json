@@ -193,6 +193,7 @@
       }
     },
     "win": {
+      "artifactName": "${productName}-Setup-${version}.${ext}",
       "icon": "build/icon.ico",
       "extraResources": [
         {

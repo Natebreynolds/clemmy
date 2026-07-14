@@ -59,6 +59,8 @@ test('manual desktop candidates build private Mac and Windows artifacts but cann
   assert.match(windowsCondition, /!contains\(github\.event\.head_commit\.message, '\[mac-only\]'\)/);
   assert.match(runScripts(windowsJob), /npm run package:win/);
   assert.match(windowsReleaseText, /\['--win', 'nsis', '--x64', '--publish', 'never'\]/);
+  assert.equal(desktopPackage.build?.win?.artifactName, '${productName}-Setup-${version}.${ext}');
+  assert.match(windowsReleaseText, /verifyWindowsUpdaterArtifacts\(\)/);
 
   const windowsUpload = (windowsJob?.steps ?? []).find((step) => step?.uses === 'actions/upload-artifact@v4');
   assert.equal(windowsUpload?.with?.name, 'clementine-windows-${{ needs.preflight.outputs.version }}');

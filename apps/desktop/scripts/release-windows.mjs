@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { load as loadYaml } from 'js-yaml';
 import {
   assertPeX64,
   RECALL_NATIVE_MANIFEST,
@@ -88,6 +89,55 @@ function verifyPackagedSha256(relativePath, expectedSha256, message) {
   if (actualSha256 !== expectedSha256) {
     throw new Error(`${message}: expected ${expectedSha256}, received ${actualSha256}`);
   }
+}
+
+function verifyWindowsUpdaterArtifacts() {
+  const desktopPackage = readJson(path.join(desktopDir, 'package.json'), 'desktop package');
+  const version = desktopPackage.version;
+  const productName = desktopPackage.build?.productName;
+  if (typeof version !== 'string' || typeof productName !== 'string') {
+    throw new Error('desktop package is missing a version or build.productName');
+  }
+
+  const expectedInstallerName = `${productName}-Setup-${version}.exe`;
+  const installerPath = path.join(releaseDir, expectedInstallerName);
+  const blockmapPath = `${installerPath}.blockmap`;
+  const updateManifestPath = path.join(releaseDir, 'latest.yml');
+  if (!existsSync(installerPath) || !statSync(installerPath).isFile()) {
+    throw new Error(`Windows installer is missing at the updater-safe path: ${installerPath}`);
+  }
+  if (!existsSync(blockmapPath) || !statSync(blockmapPath).isFile()) {
+    throw new Error(`Windows installer blockmap is missing: ${blockmapPath}`);
+  }
+
+  let manifest;
+  try {
+    manifest = loadYaml(readFileSync(updateManifestPath, 'utf8'));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Windows updater manifest is missing or invalid at ${updateManifestPath}: ${detail}`);
+  }
+  const primaryFile = manifest?.files?.[0];
+  if (
+    manifest?.version !== version
+    || manifest?.path !== expectedInstallerName
+    || primaryFile?.url !== expectedInstallerName
+  ) {
+    throw new Error(
+      `Windows updater manifest must reference ${expectedInstallerName} exactly: ${JSON.stringify(manifest)}`,
+    );
+  }
+
+  const installer = readFileSync(installerPath);
+  const actualSha512 = createHash('sha512').update(installer).digest('base64');
+  if (
+    primaryFile.size !== installer.byteLength
+    || primaryFile.sha512 !== actualSha512
+    || manifest.sha512 !== actualSha512
+  ) {
+    throw new Error(`Windows updater manifest size/hash does not match ${expectedInstallerName}`);
+  }
+  console.log(`   updater: ${expectedInstallerName} + blockmap + latest.yml verified`);
 }
 
 function verifyWhisperPackaged() {
@@ -185,6 +235,7 @@ try {
     path.join('daemon', 'apps', 'console-web', 'dist', 'index.html'),
     'console-web dist is missing from the packaged app',
   );
+  verifyWindowsUpdaterArtifacts();
 } finally {
   runNpm(['rebuild', 'better-sqlite3'], rootDir, { allowFailure: true });
 }
