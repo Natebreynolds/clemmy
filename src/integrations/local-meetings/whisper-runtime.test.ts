@@ -424,7 +424,14 @@ setInterval(() => {}, 1_000);
   }
 });
 
-test('status accepts an absolute explicit CLI and reports a pending model download', async () => {
+test('status accepts an absolute explicit CLI and reports a pending model download', {
+  // The platform gate deliberately precedes the CLI override in
+  // resolveWhisperCli: on platforms local transcription is not packaged for
+  // (Linux CI, Windows-ARM), status honestly reports unsupported even with an
+  // explicit CLI. First caught on this suite's first-ever ubuntu run (the
+  // v1.6.0 tag) — the assertion only holds where a runtime target exists.
+  skip: runtime.resolveWhisperRuntimeTarget(process.platform, process.arch) === undefined,
+}, async () => {
   const cli = await makeExecutable('status-whisper-cli.mjs', '#!/usr/bin/env node\n');
   process.env.CLEMENTINE_WHISPER_CLI = cli;
   runtime.__testing.clearCaches();
