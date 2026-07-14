@@ -334,7 +334,9 @@ import {
   loadRecallMeetingAnalysis,
   loadRecallMeetingById,
   loadRecallMeetingSettings,
+  isRecallRegion,
   noteRecallMeetingDetected,
+  patchMeetingRecord,
   renameMeeting,
   RECALL_REGIONS,
   saveRecallMeetingSettings,
@@ -342,6 +344,22 @@ import {
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
+import {
+  recoverPendingRecallSdkUploads,
+  startRecallSdkUploadReconciliation,
+} from '../integrations/recall/sdk-upload-reconcile.js';
+import {
+  cancelLocalMeeting,
+  getLocalMeetingStatus,
+  ingestLocalMeeting,
+  recoverFinalizedLocalMeetingSidecars,
+  recoverPendingLocalMeetingTranscriptions,
+  retryLocalMeetingTranscription,
+  saveLocalMeetingSettings,
+  startLocalMeeting,
+  LocalMeetingCaptureError,
+  type LocalMeetingSettings,
+} from '../integrations/local-meetings/meeting-capture.js';
 import { listMcpServerHealth, slugifyServerName } from '../runtime/mcp-namespace-shim.js';
 import { serverEnvStatus } from '../tools/mcp-server-tools.js';
 import { collectDiagnostics } from './diagnostics.js';
@@ -6659,6 +6677,137 @@ export function registerConsoleRoutes(
     res.json({ job });
   });
 
+  // ─── Local/offline in-person meeting capture ──────────────────────
+
+  // Resume audio that was finalized before a daemon restart. The queue
+  // is process-local but the record state + WAV are durable.
+  try {
+    recoverFinalizedLocalMeetingSidecars({ force: true });
+    recoverPendingLocalMeetingTranscriptions();
+  } catch { /* status/ingest can retry */ }
+
+  const sendLocalMeetingError = (res: Response, error: unknown): void => {
+    const status = error instanceof LocalMeetingCaptureError ? error.statusCode : 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : String(error) });
+  };
+
+  app.get('/api/console/meetings/local/settings', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const status = await getLocalMeetingStatus();
+      res.json({ settings: status.settings, runtime: status.runtime, audioRoot: status.audioRoot });
+    } catch (err) {
+      sendLocalMeetingError(res, err);
+    }
+  });
+
+  app.patch('/api/console/meetings/local/settings', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as Partial<LocalMeetingSettings>;
+    const patch: Partial<LocalMeetingSettings> = {};
+    if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+    if (typeof body.analyzeOnComplete === 'boolean') patch.analyzeOnComplete = body.analyzeOnComplete;
+    if (typeof body.keepAudio === 'boolean') patch.keepAudio = body.keepAudio;
+    if (typeof body.language === 'string') {
+      const language = body.language.trim().toLowerCase().replace('_', '-');
+      if (!['en', 'english', 'auto'].includes(language) && !/^en-[a-z]{2}$/.test(language)) {
+        res.status(400).json({ error: 'base.en supports English audio only' });
+        return;
+      }
+      patch.language = 'en';
+    }
+    if (body.model !== undefined) {
+      if (body.model !== 'base.en') { res.status(400).json({ error: 'model must be base.en' }); return; }
+      patch.model = body.model;
+    }
+    try {
+      res.json({ settings: saveLocalMeetingSettings(patch) });
+    } catch (err) {
+      sendLocalMeetingError(res, err);
+    }
+  });
+
+  app.post('/api/console/meetings/local/start', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
+    if (!sessionId) { res.status(400).json({ error: 'sessionId required' }); return; }
+    try {
+      res.json(startLocalMeeting({
+        sessionId,
+        title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+        audioPath: typeof req.body?.audioPath === 'string' ? req.body.audioPath : undefined,
+        startedAt: typeof req.body?.startedAt === 'string' ? req.body.startedAt : undefined,
+        sampleRate: typeof req.body?.sampleRate === 'number' ? req.body.sampleRate : undefined,
+        channels: typeof req.body?.channels === 'number' ? req.body.channels : undefined,
+      }));
+    } catch (err) {
+      sendLocalMeetingError(res, err);
+    }
+  });
+
+  const ingestLocalMeetingHandler = (req: Request, res: Response): void => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
+    const audioPath = typeof req.body?.audioPath === 'string' ? req.body.audioPath : '';
+    if (!sessionId) { res.status(400).json({ error: 'sessionId required' }); return; }
+    if (!audioPath) { res.status(400).json({ error: 'audioPath required' }); return; }
+    try {
+      const result = ingestLocalMeeting({
+        sessionId,
+        audioPath,
+        endedAt: typeof req.body?.endedAt === 'string' ? req.body.endedAt : undefined,
+        durationSeconds: typeof req.body?.durationSeconds === 'number' ? req.body.durationSeconds : undefined,
+        bytes: typeof req.body?.bytes === 'number' ? req.body.bytes : undefined,
+      });
+      res.status(202).json(result);
+    } catch (err) {
+      sendLocalMeetingError(res, err);
+    }
+  };
+  app.post('/api/console/meetings/local/ingest', ingestLocalMeetingHandler);
+  // Compatibility alias for clients that name the stop/finalize action
+  // `complete`; both paths perform the same validated, idempotent ingest.
+  app.post('/api/console/meetings/local/complete', ingestLocalMeetingHandler);
+
+  app.post('/api/console/meetings/local/cancel', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
+    if (!sessionId) { res.status(400).json({ error: 'sessionId required' }); return; }
+    try {
+      res.json(cancelLocalMeeting(sessionId));
+    } catch (err) {
+      sendLocalMeetingError(res, err);
+    }
+  });
+
+  app.post('/api/console/meetings/local/retry', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const meetingId = typeof req.body?.meetingId === 'string' ? req.body.meetingId.trim() : '';
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+    if (!meetingId && !sessionId) { res.status(400).json({ error: 'meetingId or sessionId required' }); return; }
+    try {
+      res.status(202).json(retryLocalMeetingTranscription({
+        meetingId: meetingId || undefined,
+        sessionId: sessionId || undefined,
+      }));
+    } catch (err) {
+      sendLocalMeetingError(res, err);
+    }
+  });
+
+  app.get('/api/console/meetings/local/status', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+      res.json(await getLocalMeetingStatus(sessionId));
+    } catch (err) {
+      sendLocalMeetingError(res, err);
+    }
+  });
+
+  // Resume upload-id → recording-id handoffs interrupted by daemon exit.
+  try { recoverPendingRecallSdkUploads(); } catch { /* completion/status can retry */ }
+
   // ─── Optional Recall.ai desktop meeting capture ───────────────────
 
   app.get('/api/console/meetings/recall', async (req, res) => {
@@ -6685,17 +6834,31 @@ export function registerConsoleRoutes(
   app.patch('/api/console/meetings/recall/settings', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = (req.body ?? {}) as Partial<RecallMeetingSettings>;
-    const region = typeof body.region === 'string' && body.region in RECALL_REGIONS
+    const region = isRecallRegion(body.region)
       ? body.region as RecallRegion
       : undefined;
+    const patch: Partial<RecallMeetingSettings> = {};
+    if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+    if (region) patch.region = region;
+    if (typeof body.autoRecord === 'boolean') patch.autoRecord = body.autoRecord;
+    if (typeof body.liveTranscript === 'boolean') patch.liveTranscript = body.liveTranscript;
+    if (typeof body.analyzeOnComplete === 'boolean') patch.analyzeOnComplete = body.analyzeOnComplete;
+    if (body.retentionMode !== undefined) {
+      if (body.retentionMode !== 'zero' && body.retentionMode !== 'timed') {
+        res.status(400).json({ error: 'retentionMode must be zero or timed' });
+        return;
+      }
+      patch.retentionMode = body.retentionMode;
+    }
+    if (body.retentionHours !== undefined) {
+      if (typeof body.retentionHours !== 'number' || !Number.isFinite(body.retentionHours) || body.retentionHours < 1) {
+        res.status(400).json({ error: 'retentionHours must be a positive number' });
+        return;
+      }
+      patch.retentionHours = body.retentionHours;
+    }
     try {
-      const settings = saveRecallMeetingSettings({
-        enabled: body.enabled === true,
-        region,
-        autoRecord: body.autoRecord === true,
-        liveTranscript: body.liveTranscript === true,
-        analyzeOnComplete: body.analyzeOnComplete !== false,
-      });
+      const settings = saveRecallMeetingSettings(patch);
       res.json({ settings });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -6704,6 +6867,14 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/meetings/recall/upload-token', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const requestedRegion = req.body?.region;
+    if (
+      requestedRegion !== undefined
+      && !isRecallRegion(requestedRegion)
+    ) {
+      res.status(400).json({ error: 'region must be a supported Recall data region' });
+      return;
+    }
     try {
       const settings = loadRecallMeetingSettings();
       if (!settings.enabled) {
@@ -6711,7 +6882,11 @@ export function registerConsoleRoutes(
         return;
       }
       const upload = await createRecallSdkUpload({
-        liveTranscript: req.body?.liveTranscript === true || settings.liveTranscript || settings.analyzeOnComplete,
+        // Timed retention can fetch the canonical transcript after upload
+        // reconciliation, so analysis no longer implicitly enables realtime
+        // transcript delivery. Zero retention is normalized to realtime=true.
+        liveTranscript: req.body?.liveTranscript === true || settings.liveTranscript,
+        region: requestedRegion as RecallRegion | undefined,
       });
       res.json(upload);
     } catch (err) {
@@ -6726,6 +6901,16 @@ export function registerConsoleRoutes(
     try {
       const record = noteRecallMeetingDetected({
         windowId,
+        sdkUploadId: typeof req.body?.sdkUploadId === 'string' ? req.body.sdkUploadId : undefined,
+        sdkUploadRegion: isRecallRegion(req.body?.sdkUploadRegion)
+          ? req.body.sdkUploadRegion as RecallRegion
+          : undefined,
+        recallRetentionMode: req.body?.recallRetentionMode === 'zero' || req.body?.recallRetentionMode === 'timed'
+          ? req.body.recallRetentionMode
+          : undefined,
+        recallRetentionHours: typeof req.body?.recallRetentionHours === 'number' && Number.isFinite(req.body.recallRetentionHours)
+          ? req.body.recallRetentionHours
+          : undefined,
         recordingId: typeof req.body?.recordingId === 'string' ? req.body.recordingId : undefined,
         platform: typeof req.body?.platform === 'string' ? req.body.platform : undefined,
         title: typeof req.body?.title === 'string' ? req.body.title : undefined,
@@ -6746,6 +6931,7 @@ export function registerConsoleRoutes(
     try {
       const record = appendRecallTranscriptSegment({
         windowId,
+        sdkUploadId: typeof req.body?.sdkUploadId === 'string' ? req.body.sdkUploadId : undefined,
         recordingId: typeof req.body?.recordingId === 'string' ? req.body.recordingId : undefined,
         event: typeof req.body?.event === 'string' ? req.body.event : 'transcript.data',
         speaker: typeof req.body?.speaker === 'string' ? req.body.speaker : undefined,
@@ -6764,28 +6950,50 @@ export function registerConsoleRoutes(
     const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
     if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
     try {
+      const settings = loadRecallMeetingSettings();
+      const captureRetentionMode = req.body?.recallRetentionMode === 'zero' || req.body?.recallRetentionMode === 'timed'
+        ? req.body.recallRetentionMode
+        : settings.retentionMode;
+      const captureRetentionHours = typeof req.body?.recallRetentionHours === 'number' && Number.isFinite(req.body.recallRetentionHours)
+        ? req.body.recallRetentionHours
+        : settings.retentionHours;
       const result = finalizeRecallMeeting({
         windowId,
+        sdkUploadId: typeof req.body?.sdkUploadId === 'string' ? req.body.sdkUploadId : undefined,
+        sdkUploadRegion: isRecallRegion(req.body?.sdkUploadRegion)
+          ? req.body.sdkUploadRegion as RecallRegion
+          : undefined,
         recordingId: typeof req.body?.recordingId === 'string' ? req.body.recordingId : undefined,
         platform: typeof req.body?.platform === 'string' ? req.body.platform : undefined,
         title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+        retentionMode: captureRetentionMode,
+        retentionHours: captureRetentionHours,
+        canonicalBackfill: captureRetentionMode !== 'zero',
       });
+      const effectiveRetentionMode = result.record.recallRetentionMode ?? captureRetentionMode;
       if (result.artifactPath) {
         try { reindexVault(); } catch { /* maintenance will retry */ }
       }
-      // Fire-and-forget canonical-transcript backfill. Only fires when
-      // we have a recordingId — streaming-only meetings (no SDK upload)
-      // can't be backfilled. The function catches all errors and
-      // reflects them in the meeting record's canonicalStatus, so a
-      // failed backfill never breaks this HTTP response.
-      if (result.record.recordingId) {
+      // sdkUploadId and recordingId are different Recall artifacts. Poll the
+      // authenticated SDK-upload resource until terminal, persist its actual
+      // recording id, then let that durable worker run canonical backfill.
+      if (result.record.sdkUploadId) {
+        startRecallSdkUploadReconciliation({ meetingId: result.record.id });
+      } else if (effectiveRetentionMode !== 'zero' && result.record.recordingId) {
+        // Legacy/direct callers that already have a recording id but no SDK
+        // upload id retain the existing backfill behavior.
         startCanonicalTranscriptBackfill({
           windowId: result.record.windowId,
           recordingId: result.record.recordingId,
+          region: result.record.sdkUploadRegion,
         });
       }
-      const settings = loadRecallMeetingSettings();
-      const task = result.artifactPath && settings.analyzeOnComplete
+      // Timed-retention uploads are analyzed after the canonical transcript
+      // replaces any partial realtime segments. Zero-retention and legacy
+      // recordings have no later canonical handoff, so analyze immediately.
+      const deferAnalysisUntilCanonical = Boolean(result.record.sdkUploadId)
+        && effectiveRetentionMode === 'timed';
+      const task = result.artifactPath && settings.analyzeOnComplete && !deferAnalysisUntilCanonical
         ? createBackgroundTask({
           title: `Analyze meeting transcript: ${result.record.title || result.record.platform || result.record.id}`,
           prompt: buildAnalyzerPrompt(result.record, result.artifactPath),
@@ -6794,8 +7002,11 @@ export function registerConsoleRoutes(
           maxMinutes: 30,
         })
         : undefined;
+      const responseRecord = task
+        ? (patchMeetingRecord(result.record.id, { analysisTaskId: task.id }) ?? result.record)
+        : result.record;
       res.json({
-        record: result.record,
+        record: responseRecord,
         artifactPath: result.artifactPath,
         segmentCount: result.segmentCount,
         queuedTask: task ? { id: task.id, title: task.title } : null,

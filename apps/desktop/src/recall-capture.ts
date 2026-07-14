@@ -10,6 +10,13 @@ export interface RecallCaptureSettings {
 
 export interface RecallCaptureStatus {
   sdkAvailable: boolean;
+  /**
+   * Recall ships native capture binaries only for Apple Silicon macOS and
+   * x64 Windows. Keep this separate from `sdkAvailable`: the npm package may
+   * be present in an Intel Mac bundle even though its ARM64 recorder cannot
+   * run there.
+   */
+  platformSupport: RecallPlatformSupport;
   initialized: boolean;
   enabled: boolean;
   recording: boolean;
@@ -63,7 +70,65 @@ export interface RecallCaptureStatus {
    * their actual meeting or fall back to generic desktop audio.
    */
   hasActiveMeetingWindow: boolean;
+  networkStatus?: 'reconnected' | 'disconnected';
+  mediaCaptureStatuses: Record<string, { audio?: boolean; video?: boolean }>;
+  complianceMessageStatuses: Record<string, 'sent' | 'timeout' | 'cancelled'>;
   settings: RecallCaptureSettings;
+}
+
+export interface RecallPlatformSupport {
+  supported: boolean;
+  platform: NodeJS.Platform;
+  arch: string;
+  message?: string;
+}
+
+/**
+ * Recall's macOS native executable and supporting dylibs are ARM64-only.
+ * Clementine itself still ships for Intel Macs, so this guard must run before
+ * importing the SDK (Rosetta cannot make an ARM64 child executable run from an
+ * x64 process). Recall's Windows distribution currently supports x64 only.
+ */
+export function getRecallPlatformSupport(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): RecallPlatformSupport {
+  if (platform === 'darwin' && arch === 'arm64') {
+    return { supported: true, platform, arch };
+  }
+  if (platform === 'win32' && arch === 'x64') {
+    return { supported: true, platform, arch };
+  }
+  if (platform === 'darwin' && arch === 'x64') {
+    return {
+      supported: false,
+      platform,
+      arch,
+      message: 'Recall meeting capture requires an Apple Silicon Mac. Clementine still supports Intel Macs, but Recall\'s native recorder is ARM64-only.',
+    };
+  }
+  if (platform === 'darwin') {
+    return {
+      supported: false,
+      platform,
+      arch,
+      message: `Recall meeting capture does not support macOS ${arch}; an Apple Silicon (arm64) Mac is required.`,
+    };
+  }
+  if (platform === 'win32') {
+    return {
+      supported: false,
+      platform,
+      arch,
+      message: `Recall meeting capture requires 64-bit Intel/AMD Windows (x64); Windows ${arch} is not supported.`,
+    };
+  }
+  return {
+    supported: false,
+    platform,
+    arch,
+    message: `Recall meeting capture is not available on ${platform} ${arch}; use Apple Silicon macOS or x64 Windows.`,
+  };
 }
 
 type RecallPermission = 'accessibility' | 'screen-capture' | 'microphone' | 'system-audio' | 'full-disk-access';
@@ -81,12 +146,36 @@ interface RecallRealtimeEvent {
   data?: unknown;
 }
 
+interface RecallMediaCaptureStatusEvent {
+  window?: RecallSdkWindow;
+  type?: 'video' | 'audio';
+  capturing?: boolean;
+}
+
+interface RecallComplianceMessageStatusEvent {
+  window?: RecallSdkWindow;
+  status?: 'sent' | 'timeout' | 'cancelled';
+}
+
+interface RecallNetworkStatusEvent {
+  status?: 'reconnected' | 'disconnected';
+}
+
+interface RecallShutdownEvent {
+  code?: number;
+  signal?: string;
+}
+
+export interface RecallDesktopAudioRecordingConfig {
+  [key: string]: unknown;
+}
+
 interface RecallSdk {
   init(options: Record<string, unknown>): Promise<null> | null;
   shutdown(): Promise<null> | null;
   startRecording(config: { windowId: string; uploadToken: string }): Promise<null> | null;
   stopRecording(config: { windowId: string }): Promise<null> | null;
-  prepareDesktopAudioRecording(): Promise<string>;
+  prepareDesktopAudioRecording(config?: RecallDesktopAudioRecordingConfig): Promise<string>;
   requestPermission(permission: RecallPermission): Promise<null> | null;
   addEventListener(type: string, callback: (event: unknown) => void): void;
   removeAllEventListeners?(): void;
@@ -96,6 +185,20 @@ interface RecallCaptureOptions {
   getDaemonBaseUrl(): string;
   getWebhookToken(): string;
   emit(event: Record<string, unknown>): void;
+  /** Test hook; production always uses the current Electron runtime. */
+  runtime?: { platform: NodeJS.Platform; arch: string };
+}
+
+interface RecallRecordingContext {
+  windowId: string;
+  sdkUploadId?: string;
+  sdkUploadRegion?: RecallRegion;
+  recallRetentionMode?: 'zero' | 'timed';
+  recallRetentionHours?: number;
+  recordingId?: string;
+  platform?: string;
+  title?: string;
+  startedAt: string;
 }
 
 const DEFAULT_SETTINGS: RecallCaptureSettings = {
@@ -197,10 +300,23 @@ function extractTranscript(event: RecallRealtimeEvent): {
 export class RecallDesktopCapture {
   private settings: RecallCaptureSettings = DEFAULT_SETTINGS;
   private sdk: RecallSdk | null = null;
+  private readonly platformSupport: RecallPlatformSupport;
   private initialized = false;
+  /** Region used by the current native SDK instance. This can temporarily
+   * differ from settings.region while an active capture finishes. */
+  private initializedRegion: RecallRegion | undefined;
   private sdkAvailable = false;
   private recording = false;
   private currentWindowId: string | undefined;
+  /** Create SDK Upload id. This is never Recall's eventual recording id. */
+  private currentSdkUploadId: string | undefined;
+  /** Region returned alongside the upload token; pinned for reconciliation. */
+  private currentSdkUploadRegion: RecallRegion | undefined;
+  /** Retention policy returned with the upload token; completion must use the
+   * policy in force when Recall created this upload, not later settings. */
+  private currentRecallRetentionMode: 'zero' | 'timed' | undefined;
+  private currentRecallRetentionHours: number | undefined;
+  /** Canonical Recall recording id, learned later from realtime events. */
   private currentRecordingId: string | undefined;
   private lastError: string | undefined;
   private lastEvent: string | undefined;
@@ -228,9 +344,39 @@ export class RecallDesktopCapture {
   // Wall-clock start so the live UI can render an elapsed-time pill
   // without recomputing from the SDK's recording-started event.
   private recordingStartedAt: string | undefined;
+  /** Serializes the upload-token + native start handshake. Repeated starts for
+   * the same window share this promise; a different window is rejected until
+   * the first start has either succeeded or rolled back. */
+  private startPromise: Promise<void> | null = null;
+  private startingWindowId: string | undefined;
+  /** Owns completion while a user-requested stop is awaiting the SDK's
+   * synchronous recording-ended echo. The event handler must not complete a
+   * second time with already-cleared identifiers. */
+  private manualStopContext: RecallRecordingContext | undefined;
+  private stopPromise: Promise<RecallCaptureStatus> | null = null;
+  /** Serializes graceful pre-shutdown draining. While this is non-null, new
+   * recordings are rejected so a meeting cannot appear behind the drain. */
+  private shutdownPreparationPromise: Promise<void> | null = null;
+  private preparingForShutdown = false;
+  /** Serializes native SDK teardown. Unlike prepareForShutdown(), this remains
+   * latched until listeners are removed and the native process has exited. */
+  private shutdownPromise: Promise<void> | null = null;
+  private shuttingDown = false;
   private completedRecordingKeys = new Set<string>();
+  private completionPromises = new Map<string, Promise<Record<string, unknown>>>();
+  private networkStatus: RecallCaptureStatus['networkStatus'];
+  private mediaCaptureStatuses = new Map<string, { audio?: boolean; video?: boolean }>();
+  private complianceMessageStatuses = new Map<string, 'sent' | 'timeout' | 'cancelled'>();
 
-  constructor(private readonly opts: RecallCaptureOptions) {}
+  constructor(private readonly opts: RecallCaptureOptions) {
+    this.platformSupport = getRecallPlatformSupport(
+      opts.runtime?.platform ?? process.platform,
+      opts.runtime?.arch ?? process.arch,
+    );
+    if (!this.platformSupport.supported) {
+      this.lastError = this.platformSupport.message;
+    }
+  }
 
   status(): RecallCaptureStatus {
     // Defense-in-depth: if the active window is one the user dismissed,
@@ -243,6 +389,7 @@ export class RecallDesktopCapture {
     );
     return {
       sdkAvailable: this.sdkAvailable,
+      platformSupport: { ...this.platformSupport },
       initialized: this.initialized,
       enabled: this.settings.enabled,
       recording: this.recording && !dismissedActive,
@@ -257,6 +404,9 @@ export class RecallDesktopCapture {
         this.userDismissedWindows.has(w.windowId) ? { ...w, recording: false } : w
       )),
       hasActiveMeetingWindow: this.pickActiveMeetingWindow() !== undefined,
+      networkStatus: this.networkStatus,
+      mediaCaptureStatuses: Object.fromEntries(this.mediaCaptureStatuses),
+      complianceMessageStatuses: Object.fromEntries(this.complianceMessageStatuses),
       settings: this.settings,
     };
   }
@@ -273,8 +423,32 @@ export class RecallDesktopCapture {
       await this.shutdown();
       return this.status();
     }
+    if (!this.platformSupport.supported) {
+      this.sdkAvailable = false;
+      this.lastError = this.platformSupport.message;
+      this.emit('unsupported-platform', {
+        platform: this.platformSupport.platform,
+        arch: this.platformSupport.arch,
+        error: this.platformSupport.message,
+      });
+      return this.status();
+    }
     if (this.initialized && previousRegion !== this.settings.region) {
-      await this.shutdown();
+      const captureInFlight = Boolean(
+        this.recording
+        || this.currentWindowId
+        || this.startPromise
+        || this.stopPromise
+        || this.manualStopContext,
+      );
+      if (captureInFlight) {
+        this.emit('region-change-deferred', {
+          activeRegion: this.currentSdkUploadRegion ?? this.initializedRegion ?? previousRegion,
+          requestedRegion: this.settings.region,
+        });
+      } else {
+        await this.shutdown();
+      }
     }
     await this.initialize();
     return this.status();
@@ -282,7 +456,7 @@ export class RecallDesktopCapture {
 
   async requestPermissions(): Promise<RecallCaptureStatus> {
     await this.initialize();
-    const permissions: RecallPermission[] = ['accessibility', 'microphone', 'screen-capture'];
+    const permissions: RecallPermission[] = ['accessibility', 'microphone', 'screen-capture', 'system-audio'];
     for (const permission of permissions) {
       await this.sdk?.requestPermission(permission);
     }
@@ -290,10 +464,10 @@ export class RecallDesktopCapture {
     return this.status();
   }
 
-  async startManualRecording(): Promise<RecallCaptureStatus> {
+  async startManualRecording(config?: RecallDesktopAudioRecordingConfig): Promise<RecallCaptureStatus> {
     await this.initialize();
     if (!this.sdk) throw new Error('Recall SDK is unavailable.');
-    const windowId = await this.sdk.prepareDesktopAudioRecording();
+    const windowId = await this.sdk.prepareDesktopAudioRecording(config);
     await this.startRecording(windowId, { platform: 'desktop-audio', title: 'Manual desktop audio recording' });
     return this.status();
   }
@@ -310,8 +484,8 @@ export class RecallDesktopCapture {
    * recall.ai 404s the upload) and never told the user the real fix.
    * Instead we report a `blocked` reason — almost always "grant Screen
    * Recording" — so the dashboard can guide the user. Deliberate
-   * in-person audio capture stays available via `startManualRecording()`
-   * (an explicit, separate "Record desktop audio" action).
+   * in-person audio capture stays available through the local recorder on
+   * the Meetings page.
    */
   async recordActiveMeeting(): Promise<RecallCaptureStatus> {
     await this.initialize();
@@ -336,7 +510,8 @@ export class RecallDesktopCapture {
         reason: 'no-meeting-detected',
         message:
           'No meeting window detected. Open your Zoom, Google Meet, or Teams window, then click RECORD '
-          + 'MEETING. For an in-person meeting with no window, use “Record desktop audio” in Settings → Meetings.',
+          + 'MEETING. For an in-person meeting with no window, use In-person meeting → Start local recording '
+          + 'on the Meetings page.',
       };
     this.lastError = blocked.message;
     this.emit('recording-blocked', {
@@ -373,6 +548,31 @@ export class RecallDesktopCapture {
   }
 
   async stopRecording(): Promise<RecallCaptureStatus> {
+    if (this.stopPromise) return this.stopPromise;
+    const pending = this.stopRecordingOnce();
+    this.stopPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.stopPromise === pending) this.stopPromise = null;
+    }
+  }
+
+  private async stopRecordingOnce(): Promise<RecallCaptureStatus> {
+    // A stop requested while the native start command is still resolving must
+    // run after that handshake. Otherwise the SDK can begin recording after
+    // local state has already been cleared, leaving an unowned capture.
+    const pendingStart = this.startPromise;
+    if (pendingStart) {
+      try {
+        await pendingStart;
+      } catch {
+        // startRecordingOnce owns rollback and error reporting. Once it has
+        // failed there is nothing left for a concurrent stop request to stop.
+        return this.status();
+      }
+    }
+
     // Clear LOCAL state up front, regardless of SDK echo.
     //
     // Previously this method waited for the Recall SDK to fire its own
@@ -386,26 +586,39 @@ export class RecallDesktopCapture {
     // ALWAYS effective; if the SDK later fires recording-ended too,
     // onRecordingEnded becomes a no-op repeat.
     const windowId = this.currentWindowId;
-    const recordingId = this.currentRecordingId;
-    const startedAt = this.recordingStartedAt;
-    const platform = this.lastMeeting?.platform;
-    const title = this.lastMeeting?.title;
+    if (!windowId) return this.status();
+    const detected = this.detectedWindows.get(windowId);
+    const lastMeeting = this.lastMeeting?.windowId === windowId ? this.lastMeeting : undefined;
+    const context: RecallRecordingContext = {
+      windowId,
+      sdkUploadId: this.currentSdkUploadId,
+      sdkUploadRegion: this.currentSdkUploadRegion ?? this.initializedRegion ?? this.settings.region,
+      recallRetentionMode: this.currentRecallRetentionMode,
+      recallRetentionHours: this.currentRecallRetentionHours,
+      recordingId: this.currentRecordingId,
+      platform: lastMeeting?.platform ?? detected?.platform,
+      title: lastMeeting?.title ?? detected?.title,
+      startedAt: this.recordingStartedAt ?? new Date().toISOString(),
+    };
+    this.manualStopContext = context;
     this.recording = false;
     this.recordingStartedAt = undefined;
+    this.currentSdkUploadId = undefined;
+    this.currentSdkUploadRegion = undefined;
+    this.currentRecallRetentionMode = undefined;
+    this.currentRecallRetentionHours = undefined;
     this.currentRecordingId = undefined;
-    if (windowId) {
-      const existing = this.detectedWindows.get(windowId);
-      if (existing) {
-        this.detectedWindows.set(windowId, { ...existing, recording: false });
-      }
-      // Remember the user dismissed THIS window so autoRecord doesn't
-      // immediately re-fire on the next meeting-detected event. Cleared
-      // in onMeetingClosed when the meeting window actually closes.
-      this.userDismissedWindows.add(windowId);
+    const existing = this.detectedWindows.get(windowId);
+    if (existing) {
+      this.detectedWindows.set(windowId, { ...existing, recording: false });
     }
+    // Remember the user dismissed THIS window so autoRecord doesn't
+    // immediately re-fire on the next meeting-detected event. Cleared
+    // in onMeetingClosed when the meeting window actually closes.
+    this.userDismissedWindows.add(windowId);
     this.currentWindowId = undefined;
 
-    if (windowId) {
+    try {
       if (this.sdk) {
         try {
           await this.sdk.stopRecording({ windowId });
@@ -415,46 +628,115 @@ export class RecallDesktopCapture {
         }
       }
       const complete = await this.completeRecording({
-        windowId,
-        recordingId,
-        platform,
-        title,
-        startedAt,
+        ...context,
       }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
       this.emit('recording-ended', {
-        windowId,
-        recordingId,
-        platform,
-        title,
-        startedAt,
+        ...context,
         endedAt: new Date().toISOString(),
         complete,
         source: 'stop-recording',
       });
       this.emit('recording-stop-requested', { windowId });
+    } finally {
+      if (this.manualStopContext === context) this.manualStopContext = undefined;
     }
     return this.status();
   }
 
-  async shutdown(): Promise<void> {
-    if (this.sdk) {
-      try {
-        this.sdk.removeAllEventListeners?.();
-        await this.sdk.shutdown();
-      } catch {
-        // SDK shutdown should never block app quit.
+  /**
+   * Drain every piece of capture work that must finish while the daemon is
+   * still reachable. This is intentionally public: Electron's normal quit and
+   * updater hand-off both need to await it before stopping the daemon.
+   *
+   * Calling this while a native start is waiting for its upload token first
+   * lets that handshake settle, then stops the resulting capture. Calling it
+   * during a user stop shares stopPromise. Finally it waits for natural-end or
+   * SDK-shutdown completion POSTs that may outlive the visible recording flag.
+   */
+  async prepareForShutdown(): Promise<void> {
+    if (this.shutdownPreparationPromise) return this.shutdownPreparationPromise;
+    this.preparingForShutdown = true;
+    const pending = this.prepareForShutdownOnce();
+    this.shutdownPreparationPromise = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.shutdownPreparationPromise === pending) {
+        this.shutdownPreparationPromise = null;
+        this.preparingForShutdown = false;
       }
     }
-    this.sdk = null;
-    this.initialized = false;
-    this.recording = false;
-    this.currentWindowId = undefined;
-    this.currentRecordingId = undefined;
-    this.recordingStartedAt = undefined;
-    this.detectedWindows.clear();
-    this.userDismissedWindows.clear();
-    this.promptedWindows.clear();
-    this.permissionStatuses = {};
+  }
+
+  private async prepareForShutdownOnce(): Promise<void> {
+    const pendingStart = this.startPromise;
+    if (pendingStart) {
+      await pendingStart.catch(() => undefined);
+    }
+
+    // stopRecording() is safe when idle and shares any stop already in flight.
+    await this.stopRecording().catch(() => undefined);
+    await this.drainCompletionPromises();
+  }
+
+  private async drainCompletionPromises(): Promise<void> {
+    // New aliases can be added to the map while a completion is settling. Loop
+    // until the map is genuinely empty, while de-duplicating aliases that point
+    // at the same HTTP request.
+    while (this.completionPromises.size > 0) {
+      const pending = Array.from(new Set(this.completionPromises.values()));
+      await Promise.allSettled(pending);
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    const pending = this.shutdownOnce();
+    this.shutdownPromise = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.shutdownPromise === pending) this.shutdownPromise = null;
+    }
+  }
+
+  private async shutdownOnce(): Promise<void> {
+    this.shuttingDown = true;
+    try {
+      await this.prepareForShutdown();
+      const sdk = this.sdk;
+      if (sdk) {
+        try {
+          // Close the event gate before the final drain so no native callback
+          // can enqueue a completion between the empty-map check and teardown.
+          sdk.removeAllEventListeners?.();
+          await this.drainCompletionPromises();
+          await sdk.shutdown();
+        } catch {
+          // SDK shutdown should never block app quit.
+        }
+      }
+      this.sdk = null;
+      this.initialized = false;
+      this.initializedRegion = undefined;
+      this.recording = false;
+      this.currentWindowId = undefined;
+      this.currentSdkUploadId = undefined;
+      this.currentSdkUploadRegion = undefined;
+      this.currentRecallRetentionMode = undefined;
+      this.currentRecallRetentionHours = undefined;
+      this.currentRecordingId = undefined;
+      this.recordingStartedAt = undefined;
+      this.detectedWindows.clear();
+      this.userDismissedWindows.clear();
+      this.promptedWindows.clear();
+      this.permissionStatuses = {};
+      this.networkStatus = undefined;
+      this.mediaCaptureStatuses.clear();
+      this.complianceMessageStatuses.clear();
+    } finally {
+      this.shuttingDown = false;
+    }
   }
 
   /**
@@ -479,28 +761,56 @@ export class RecallDesktopCapture {
   }
 
   private async initialize(): Promise<void> {
-    if (this.initialized) return;
+    if (this.initialized && this.initializedRegion === this.settings.region) return;
+    if (this.initialized) {
+      const captureInFlight = Boolean(
+        this.recording
+        || this.currentWindowId
+        || this.startPromise
+        || this.stopPromise
+        || this.manualStopContext,
+      );
+      if (captureInFlight) return;
+      await this.shutdown();
+    }
+    if (!this.platformSupport.supported) {
+      this.sdkAvailable = false;
+      this.lastError = this.platformSupport.message;
+      throw new Error(this.platformSupport.message ?? 'Recall meeting capture is unsupported on this computer.');
+    }
     const sdk = await this.loadSdk();
     sdk.addEventListener('meeting-detected', (event) => { void this.onMeetingDetected(event as { window?: RecallSdkWindow }); });
+    sdk.addEventListener('meeting-updated', (event) => this.onMeetingUpdated(event as { window?: RecallSdkWindow }));
     sdk.addEventListener('recording-started', (event) => { void this.onRecordingStarted(event as { window?: RecallSdkWindow }); });
     sdk.addEventListener('recording-ended', (event) => { void this.onRecordingEnded(event as { window?: RecallSdkWindow }); });
     sdk.addEventListener('meeting-closed', (event) => { this.onMeetingClosed(event as { window?: RecallSdkWindow }); });
     sdk.addEventListener('realtime-event', (event) => { void this.onRealtimeEvent(event as RecallRealtimeEvent); });
     sdk.addEventListener('error', (event) => this.onError(event));
     sdk.addEventListener('permission-status', (event) => this.onPermissionStatus(event as Record<string, unknown>));
+    sdk.addEventListener('network-status', (event) => this.onNetworkStatus(event as RecallNetworkStatusEvent));
+    sdk.addEventListener('media-capture-status', (event) => this.onMediaCaptureStatus(event as RecallMediaCaptureStatusEvent));
+    sdk.addEventListener('compliance-message-status', (event) => this.onComplianceMessageStatus(event as RecallComplianceMessageStatusEvent));
+    sdk.addEventListener('shutdown', (event) => { void this.onSdkShutdown(event as RecallShutdownEvent); });
+    const initializedRegion = this.settings.region;
     await sdk.init({
-      apiUrl: REGION_URLS[this.settings.region],
+      apiUrl: REGION_URLS[initializedRegion],
       acquirePermissionsOnStartup: [],
       restartOnError: true,
     });
     this.sdk = sdk;
     this.initialized = true;
+    this.initializedRegion = initializedRegion;
     this.lastError = undefined;
-    this.emit('initialized', { region: this.settings.region });
+    this.emit('initialized', { region: initializedRegion });
   }
 
   private async loadSdk(): Promise<RecallSdk> {
     if (this.sdk) return this.sdk;
+    if (!this.platformSupport.supported) {
+      this.sdkAvailable = false;
+      this.lastError = this.platformSupport.message;
+      throw new Error(this.platformSupport.message ?? 'Recall meeting capture is unsupported on this computer.');
+    }
     try {
       const specifier = '@recallai/desktop-sdk';
       const mod = await import(specifier);
@@ -586,6 +896,33 @@ export class RecallDesktopCapture {
     }
   }
 
+  private onMeetingUpdated(event: { window?: RecallSdkWindow }): void {
+    const win = event.window;
+    if (!win?.id) return;
+    this.noteEvent('meeting-updated');
+    const existing = this.detectedWindows.get(win.id);
+    const updated = {
+      windowId: win.id,
+      platform: win.platform ?? existing?.platform,
+      title: win.title ?? existing?.title,
+      detectedAt: existing?.detectedAt ?? new Date().toISOString(),
+      recording: Boolean(existing?.recording || (this.recording && this.currentWindowId === win.id)),
+    };
+    this.detectedWindows.set(win.id, updated);
+    if (this.lastMeeting?.windowId === win.id || this.currentWindowId === win.id) {
+      this.lastMeeting = {
+        windowId: win.id,
+        platform: updated.platform,
+        title: updated.title,
+      };
+    }
+    this.emit('meeting-updated', {
+      windowId: win.id,
+      platform: updated.platform,
+      title: updated.title,
+    });
+  }
+
   /**
    * Trigger the SDK's permission dialogs for anything we know we'll
    * need but haven't been granted yet. Idempotent — once a permission
@@ -660,28 +997,138 @@ export class RecallDesktopCapture {
 
   private async startRecording(windowId: string, meta: { platform?: string; title?: string } = {}): Promise<void> {
     if (!this.sdk) throw new Error('Recall SDK is unavailable.');
-    const upload = await this.postDaemon<{ uploadToken: string; id?: string }>('/api/console/meetings/recall/upload-token', {
+    if (this.preparingForShutdown || this.shuttingDown) {
+      throw new Error('Recall meeting capture is preparing to shut down.');
+    }
+    if (this.startPromise) {
+      if (this.startingWindowId === windowId) return this.startPromise;
+      throw new Error(`Recall is already starting a recording for ${this.startingWindowId ?? 'another meeting'}.`);
+    }
+    if (this.stopPromise || this.manualStopContext) {
+      throw new Error('Recall is still stopping the previous recording.');
+    }
+    if (this.recording || this.currentWindowId) {
+      if (this.currentWindowId === windowId) return;
+      throw new Error(`Recall is already recording ${this.currentWindowId ?? 'another meeting'}.`);
+    }
+
+    const pending = this.startRecordingOnce(windowId, meta);
+    this.startingWindowId = windowId;
+    this.startPromise = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.startPromise === pending) {
+        this.startPromise = null;
+        this.startingWindowId = undefined;
+      }
+    }
+  }
+
+  private async startRecordingOnce(windowId: string, meta: { platform?: string; title?: string }): Promise<void> {
+    const sdk = this.sdk;
+    if (!sdk) throw new Error('Recall SDK is unavailable.');
+    const requestedRegion = this.initializedRegion ?? this.settings.region;
+    const upload = await this.postDaemon<{
+      uploadToken: string;
+      sdkUploadId?: string;
+      id?: string;
+      region?: RecallRegion;
+      retentionMode?: 'zero' | 'timed';
+      retentionHours?: number;
+    }>('/api/console/meetings/recall/upload-token', {
       liveTranscript: this.settings.liveTranscript,
+      region: requestedRegion,
     });
-    await this.sdk.startRecording({ windowId, uploadToken: upload.uploadToken });
+    const sdkUploadId = upload.sdkUploadId ?? upload.id;
+    if (!sdkUploadId) {
+      throw new Error('Clementine did not receive a Recall SDK upload id; recording was not started.');
+    }
+    const sdkUploadRegion = upload.region ?? requestedRegion;
+    const recallRetentionMode = upload.retentionMode;
+    const recallRetentionHours = Number.isFinite(upload.retentionHours)
+      ? upload.retentionHours
+      : undefined;
+    const startedAt = new Date().toISOString();
+
+    // Establish ownership before entering the native SDK. The SDK may emit
+    // start, transcript, or end events synchronously while this call resolves.
+    this.userDismissedWindows.delete(windowId);
     this.recording = true;
     this.currentWindowId = windowId;
-    this.currentRecordingId = upload.id;
-    this.recordingStartedAt = new Date().toISOString();
+    this.currentSdkUploadId = sdkUploadId;
+    this.currentSdkUploadRegion = sdkUploadRegion;
+    this.currentRecallRetentionMode = recallRetentionMode;
+    this.currentRecallRetentionHours = recallRetentionHours;
+    this.currentRecordingId = undefined;
+    this.recordingStartedAt = startedAt;
     this.lastMeeting = { windowId, platform: meta.platform, title: meta.title };
     this.emit('recording-start-requested', {
       windowId,
       platform: meta.platform,
       title: meta.title,
-      recordingId: upload.id,
-      startedAt: this.recordingStartedAt,
+      sdkUploadId,
+      sdkUploadRegion,
+      recallRetentionMode,
+      recallRetentionHours,
+      startedAt,
     });
+
+    try {
+      await sdk.startRecording({ windowId, uploadToken: upload.uploadToken });
+    } catch (error) {
+      const ownsContext = this.currentWindowId === windowId
+        && this.currentSdkUploadId === sdkUploadId
+        && this.recordingStartedAt === startedAt;
+      if (ownsContext) {
+        this.recording = false;
+        this.currentWindowId = undefined;
+        this.currentSdkUploadId = undefined;
+        this.currentSdkUploadRegion = undefined;
+        this.currentRecallRetentionMode = undefined;
+        this.currentRecallRetentionHours = undefined;
+        this.currentRecordingId = undefined;
+        this.recordingStartedAt = undefined;
+        const existing = this.detectedWindows.get(windowId);
+        if (existing) this.detectedWindows.set(windowId, { ...existing, recording: false });
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastError = message;
+      this.emit('recording-start-failed', {
+        windowId,
+        sdkUploadId,
+        sdkUploadRegion,
+        recallRetentionMode,
+        recallRetentionHours,
+        error: message,
+      });
+      throw error;
+    }
+
+    // A synchronous recording-ended event has already claimed and cleared
+    // this context. Never resurrect it or overwrite the recording id it saw.
+    if (
+      this.currentWindowId !== windowId
+      || this.currentSdkUploadId !== sdkUploadId
+      || this.recordingStartedAt !== startedAt
+    ) return;
+
     await this.postDaemon('/api/console/meetings/recall/detected', {
       windowId,
-      recordingId: upload.id,
+      sdkUploadId,
+      sdkUploadRegion,
+      recallRetentionMode,
+      recallRetentionHours,
+      recordingId: this.currentRecordingId,
       platform: meta.platform,
       title: meta.title,
       status: 'recording',
+    }).catch((error) => {
+      this.emit('recording-store-failed', {
+        windowId,
+        sdkUploadId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     });
   }
 
@@ -700,8 +1147,16 @@ export class RecallDesktopCapture {
       this.noteEvent('recording-started-ignored');
       return;
     }
+    if (this.currentWindowId !== windowId) {
+      this.noteEvent('recording-started-ignored');
+      this.emit('recording-started-ignored', {
+        windowId,
+        activeWindowId: this.currentWindowId,
+        reason: 'unowned-window',
+      });
+      return;
+    }
     this.recording = true;
-    this.currentWindowId = windowId;
     this.noteEvent('recording-started');
     const existing = this.detectedWindows.get(windowId);
     if (existing) {
@@ -712,14 +1167,8 @@ export class RecallDesktopCapture {
 
   private async onRecordingEnded(event: { window?: RecallSdkWindow }): Promise<void> {
     const win = event.window;
-    const windowId = win?.id ?? this.currentWindowId;
+    const windowId = win?.id ?? this.manualStopContext?.windowId ?? this.currentWindowId;
     if (!windowId) return;
-    const startedAt = this.recordingStartedAt;
-    const recordingId = this.currentRecordingId;
-    this.recording = false;
-    this.currentWindowId = undefined;
-    this.currentRecordingId = undefined;
-    this.recordingStartedAt = undefined;
     this.noteEvent('recording-ended');
     const existing = this.detectedWindows.get(windowId);
     if (existing) {
@@ -728,20 +1177,57 @@ export class RecallDesktopCapture {
     // Same window may host another meeting later — clear the
     // already-prompted flag so the prompt fires on the next detection.
     this.promptedWindows.delete(windowId);
-    const complete = await this.completeRecording({
+
+    // stopRecording() owns completion once it snapshots the session. Native
+    // SDKs commonly echo recording-ended synchronously from stopRecording();
+    // completing here would use fields the stop path already cleared and could
+    // cause a later id-rich completion to be mistaken for a duplicate.
+    const manualContext = this.manualStopContext;
+    if (manualContext?.windowId === windowId) {
+      manualContext.platform ??= win?.platform;
+      manualContext.title ??= win?.title;
+      return;
+    }
+
+    // A late event for another window must not tear down the active session.
+    if (this.currentWindowId && this.currentWindowId !== windowId) {
+      this.emit('recording-ended-ignored', {
+        windowId,
+        activeWindowId: this.currentWindowId,
+        reason: 'stale-window',
+      });
+      return;
+    }
+
+    const ownsCurrent = this.currentWindowId === windowId;
+    const context = {
       windowId,
-      recordingId,
+      sdkUploadId: ownsCurrent ? this.currentSdkUploadId : undefined,
+      sdkUploadRegion: ownsCurrent
+        ? this.currentSdkUploadRegion ?? this.initializedRegion ?? this.settings.region
+        : undefined,
+      recallRetentionMode: ownsCurrent ? this.currentRecallRetentionMode : undefined,
+      recallRetentionHours: ownsCurrent ? this.currentRecallRetentionHours : undefined,
+      recordingId: ownsCurrent ? this.currentRecordingId : undefined,
       platform: win?.platform ?? this.lastMeeting?.platform,
       title: win?.title ?? this.lastMeeting?.title,
-      startedAt,
-    }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+      startedAt: ownsCurrent ? this.recordingStartedAt : undefined,
+    };
+    if (ownsCurrent) {
+      this.recording = false;
+      this.currentWindowId = undefined;
+      this.currentSdkUploadId = undefined;
+      this.currentSdkUploadRegion = undefined;
+      this.currentRecallRetentionMode = undefined;
+      this.currentRecallRetentionHours = undefined;
+      this.currentRecordingId = undefined;
+      this.recordingStartedAt = undefined;
+    }
+    const complete = await this.completeRecording(context)
+      .catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
     if ('duplicate' in complete && complete.duplicate === true) return;
     this.emit('recording-ended', {
-      windowId,
-      recordingId,
-      platform: win?.platform ?? this.lastMeeting?.platform,
-      title: win?.title ?? this.lastMeeting?.title,
-      startedAt,
+      ...context,
       endedAt: new Date().toISOString(),
       complete,
     });
@@ -756,6 +1242,8 @@ export class RecallDesktopCapture {
       // next meeting in this window auto-records normally.
       this.userDismissedWindows.delete(win.id);
       this.promptedWindows.delete(win.id);
+      this.mediaCaptureStatuses.delete(win.id);
+      this.complianceMessageStatuses.delete(win.id);
     }
     this.emit('meeting-closed', { windowId: win?.id, platform: win?.platform, title: win?.title });
   }
@@ -779,13 +1267,139 @@ export class RecallDesktopCapture {
     this.emit('permission-status', event);
   }
 
+  private onNetworkStatus(event: RecallNetworkStatusEvent): void {
+    if (event.status !== 'reconnected' && event.status !== 'disconnected') return;
+    this.networkStatus = event.status;
+    this.noteEvent('network-status');
+    this.emit('network-status', {
+      status: event.status,
+      recording: this.recording,
+      windowId: this.currentWindowId,
+    });
+  }
+
+  private onMediaCaptureStatus(event: RecallMediaCaptureStatusEvent): void {
+    const windowId = event.window?.id ?? this.currentWindowId;
+    if (!windowId || (event.type !== 'audio' && event.type !== 'video') || typeof event.capturing !== 'boolean') return;
+    const existing = this.mediaCaptureStatuses.get(windowId) ?? {};
+    this.mediaCaptureStatuses.set(windowId, { ...existing, [event.type]: event.capturing });
+    this.noteEvent('media-capture-status');
+    this.emit('media-capture-status', {
+      windowId,
+      platform: event.window?.platform,
+      type: event.type,
+      capturing: event.capturing,
+    });
+  }
+
+  private onComplianceMessageStatus(event: RecallComplianceMessageStatusEvent): void {
+    const windowId = event.window?.id ?? this.currentWindowId;
+    if (!windowId || !event.status) return;
+    this.complianceMessageStatuses.set(windowId, event.status);
+    this.noteEvent('compliance-message-status');
+    this.emit('compliance-message-status', {
+      windowId,
+      platform: event.window?.platform,
+      status: event.status,
+    });
+  }
+
+  private async onSdkShutdown(event: RecallShutdownEvent): Promise<void> {
+    const windowId = this.currentWindowId;
+    const wasRecording = this.recording;
+    const detected = windowId ? this.detectedWindows.get(windowId) : undefined;
+    const lastMeeting = windowId && this.lastMeeting?.windowId === windowId ? this.lastMeeting : undefined;
+    const context: RecallRecordingContext | undefined = windowId
+      ? {
+        windowId,
+        sdkUploadId: this.currentSdkUploadId,
+        sdkUploadRegion: this.currentSdkUploadRegion ?? this.initializedRegion ?? this.settings.region,
+        recallRetentionMode: this.currentRecallRetentionMode,
+        recallRetentionHours: this.currentRecallRetentionHours,
+        recordingId: this.currentRecordingId,
+        platform: lastMeeting?.platform ?? detected?.platform,
+        title: lastMeeting?.title ?? detected?.title,
+        startedAt: this.recordingStartedAt ?? new Date().toISOString(),
+      }
+      : undefined;
+    this.recording = false;
+    this.recordingStartedAt = undefined;
+    this.currentWindowId = undefined;
+    this.currentSdkUploadId = undefined;
+    this.currentSdkUploadRegion = undefined;
+    this.currentRecallRetentionMode = undefined;
+    this.currentRecallRetentionHours = undefined;
+    this.currentRecordingId = undefined;
+    if (windowId) {
+      const existing = this.detectedWindows.get(windowId);
+      if (existing) this.detectedWindows.set(windowId, { ...existing, recording: false });
+    }
+    // Recall's wrapper automatically restarts only abnormal, non-termination
+    // exits. A clean exit (or SIGINT/SIGTERM) needs a future initialize() call;
+    // leaving initialized=true would make that call incorrectly return early.
+    const wrapperWillRestart = event.code !== undefined
+      && event.code !== 0
+      && event.signal !== 'SIGINT'
+      && event.signal !== 'SIGTERM';
+    if (!wrapperWillRestart) {
+      this.sdk = null;
+      this.initialized = false;
+      this.initializedRegion = undefined;
+    }
+    this.noteEvent('shutdown');
+    this.lastError = event.code === 0
+      ? 'Recall meeting capture stopped. Reopen Meetings to reconnect.'
+      : `Recall meeting capture stopped unexpectedly (code ${event.code ?? 'unknown'}${event.signal ? `, ${event.signal}` : ''}). Automatic recovery will be attempted.`;
+    this.emit('shutdown', {
+      code: event.code,
+      signal: event.signal,
+      wasRecording,
+      windowId,
+      error: this.lastError,
+    });
+
+    // The upload may still finish in Recall even though the native process
+    // died. Persist the exact upload/session context now so the daemon can
+    // reconcile it instead of leaving a phantom `recording` for the stuck
+    // reaper. A concurrent manual stop owns its own snapshot and reaches this
+    // handler with currentWindowId already cleared, so it is not duplicated.
+    if (context) {
+      const complete = await this.completeRecording(context)
+        .catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+      if (!('duplicate' in complete && complete.duplicate === true)) {
+        this.emit('recording-ended', {
+          ...context,
+          endedAt: new Date().toISOString(),
+          complete,
+          source: 'sdk-shutdown',
+        });
+      }
+    }
+  }
+
   private async onRealtimeEvent(event: RecallRealtimeEvent): Promise<void> {
     if (event.event !== 'video_separate_png.data' && event.event !== 'audio_mixed_raw.data') {
       this.emit('realtime-event', { event: event.event, windowId: event.window?.id });
     }
     const transcript = extractTranscript(event);
-    const windowId = event.window?.id ?? this.currentWindowId;
+    const windowId = event.window?.id ?? this.currentWindowId ?? this.manualStopContext?.windowId;
     if (!transcript || !windowId) return;
+    if (transcript.recordingId) {
+      if (this.currentWindowId === windowId) {
+        this.currentRecordingId = transcript.recordingId;
+      }
+      if (this.manualStopContext?.windowId === windowId) {
+        this.manualStopContext.recordingId = transcript.recordingId;
+      }
+    }
+    const contextualRecordingId = transcript.recordingId
+      ?? (this.currentWindowId === windowId ? this.currentRecordingId : undefined)
+      ?? (this.manualStopContext?.windowId === windowId ? this.manualStopContext.recordingId : undefined);
+    const contextualSdkUploadId = this.currentWindowId === windowId
+      ? this.currentSdkUploadId
+      : this.manualStopContext?.windowId === windowId
+        ? this.manualStopContext.sdkUploadId
+        : undefined;
 
     // Interim (partial) segments drive the live UI only — emit them as a
     // transient `transcript-partial` so the live card can show a rolling
@@ -800,7 +1414,8 @@ export class RecallDesktopCapture {
 
     await this.postDaemon('/api/console/meetings/recall/transcript-event', {
       windowId,
-      recordingId: transcript.recordingId ?? this.currentRecordingId,
+      sdkUploadId: contextualSdkUploadId,
+      recordingId: contextualRecordingId,
       event: event.event,
       speaker: transcript.speaker,
       text: transcript.text,
@@ -814,24 +1429,55 @@ export class RecallDesktopCapture {
 
   private async completeRecording(input: {
     windowId: string;
+    sdkUploadId?: string;
+    sdkUploadRegion?: RecallRegion;
+    recallRetentionMode?: 'zero' | 'timed';
+    recallRetentionHours?: number;
     recordingId?: string;
     platform?: string;
     title?: string;
     startedAt?: string;
   }): Promise<Record<string, unknown>> {
-    const keys = [input.recordingId, input.windowId].filter((value): value is string => Boolean(value));
-    if (keys.some((key) => this.completedRecordingKeys.has(key))) {
+    const sessionKeys = [
+      input.sdkUploadId ? `sdk-upload:${input.sdkUploadId}` : undefined,
+      input.recordingId ? `recording:${input.recordingId}` : undefined,
+    ].filter((value): value is string => Boolean(value));
+    const windowKey = `window:${input.windowId}`;
+    // Session ids are authoritative when available. The window id is only a
+    // fallback for id-less late events; using it as an authoritative key would
+    // suppress a second, legitimate recording in the same meeting window.
+    const lookupKeys = sessionKeys.length > 0 ? sessionKeys : [windowKey];
+    if (lookupKeys.some((key) => this.completedRecordingKeys.has(key))) {
       return { skipped: true, duplicate: true };
     }
-    const complete = await this.postDaemon<Record<string, unknown>>('/api/console/meetings/recall/complete', {
+    if (lookupKeys.some((key) => this.completionPromises.has(key))) {
+      return { skipped: true, duplicate: true, pending: true };
+    }
+
+    const completePromise = this.postDaemon<Record<string, unknown>>('/api/console/meetings/recall/complete', {
       windowId: input.windowId,
+      sdkUploadId: input.sdkUploadId,
+      sdkUploadRegion: input.sdkUploadRegion,
+      recallRetentionMode: input.recallRetentionMode,
+      recallRetentionHours: input.recallRetentionHours,
       recordingId: input.recordingId,
       platform: input.platform,
       title: input.title,
       startedAt: input.startedAt,
     });
-    for (const key of keys) this.completedRecordingKeys.add(key);
-    return complete;
+    const ownedKeys = Array.from(new Set([...sessionKeys, windowKey]));
+    for (const key of ownedKeys) this.completionPromises.set(key, completePromise);
+    try {
+      const complete = await completePromise;
+      for (const key of ownedKeys) this.completedRecordingKeys.add(key);
+      return complete;
+    } finally {
+      for (const key of ownedKeys) {
+        if (this.completionPromises.get(key) === completePromise) {
+          this.completionPromises.delete(key);
+        }
+      }
+    }
   }
 
   private onError(event: unknown): void {

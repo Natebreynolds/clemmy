@@ -74,6 +74,37 @@ verify_uv_packaged() {
   fi
 }
 
+verify_whisper_packaged() {
+  local arch="$1"
+  local target="$2"
+  local expected_arch="$3"
+  local found=""
+  while IFS= read -r app; do
+    local binary="$app/Contents/Resources/daemon/vendor/whisper/$target/whisper-cli"
+    local license="$app/Contents/Resources/daemon/vendor/whisper/$target/LICENSE.whisper.cpp"
+    if [[ -f "$binary" ]]; then
+      found="$binary"
+      echo "   whisper.cpp present: $binary"
+      [[ "$(file "$binary")" == *"$expected_arch"* ]] \
+        || { echo "::error::vendored whisper.cpp for $arch has the wrong architecture: $(file "$binary")"; exit 1; }
+      if is_signed_release; then
+        codesign -v --strict "$binary" \
+          || { echo "::error::vendored whisper.cpp for $arch is not validly signed: $binary"; exit 1; }
+      else
+        echo "   whisper.cpp codesign: skipped (unsigned build)"
+      fi
+      [[ -f "$license" ]] \
+        || { echo "::error::whisper.cpp MIT license notice is missing: $license"; exit 1; }
+      [[ "$(shasum -a 256 "$license" | awk '{print $1}')" == "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d" ]] \
+        || { echo "::error::whisper.cpp license notice has an unexpected checksum: $license"; exit 1; }
+    fi
+  done < <(find "$DESKTOP_DIR/release" -maxdepth 2 -name "Clementine.app" -type d 2>/dev/null)
+  if [[ -z "$found" ]]; then
+    echo "::error::vendored whisper.cpp ($target) is MISSING from the $arch app — local meeting transcription would be unavailable"
+    exit 1
+  fi
+}
+
 verify_console_web_packaged() {
   local arch="$1"
   local found=""
@@ -94,12 +125,77 @@ is_signed_release() {
   [[ "${CSC_IDENTITY_AUTO_DISCOVERY:-}" != "false" && "${APPLE_NOTARIZE_SKIP:-}" != "true" ]]
 }
 
+# Recall publishes an ARM64-only macOS recorder even though Clementine also
+# ships an Intel build. Prove the Apple Silicon artifact contains the pinned
+# SDK plus correctly-architected native binaries, and prove the Intel runtime
+# reports Recall as unsupported before it can import/launch those binaries.
+verify_recall_packaged() {
+  local arch="$1"
+  local app="$2"
+  local executable="$3"
+  local resources="$app/Contents/Resources"
+  local recall_root="$resources/app.asar.unpacked/node_modules/@recallai/desktop-sdk"
+  local expected_version
+  local runtime_supported
+  expected_version="$(cd "$DESKTOP_DIR" && node -p "require('./package.json').optionalDependencies['@recallai/desktop-sdk']")"
+
+  runtime_supported="$(
+    cd "$resources"
+    ELECTRON_RUN_AS_NODE=1 "$executable" --input-type=module -e \
+      "const m=await import('./app.asar/dist/recall-capture.js'); process.stdout.write(String(m.getRecallPlatformSupport().supported));"
+  )"
+
+  if [[ "$arch" == "arm64" ]]; then
+    [[ "$runtime_supported" == "true" ]] \
+      || { echo "::error::arm64 app does not expose Recall meeting capture as supported"; exit 1; }
+    [[ -f "$recall_root/package.json" ]] \
+      || { echo "::error::Recall Desktop SDK is missing from the arm64 app"; exit 1; }
+    local actual_version
+    actual_version="$(node -p "require('$recall_root/package.json').version")"
+    [[ "$actual_version" == "$expected_version" ]] \
+      || { echo "::error::packaged Recall SDK $actual_version != pinned $expected_version"; exit 1; }
+    local actual_commit
+    actual_commit="$(node -p "require('$recall_root/package.json').commit_sha")"
+    [[ "$actual_commit" == "90d670e842200a4d546cbe36cc0b9c48fbe6a204" ]] \
+      || { echo "::error::packaged Recall SDK has unexpected commit $actual_commit"; exit 1; }
+    RECALL_ROOT="$recall_root" node --input-type=module -e '
+      import fs from "node:fs";
+      import path from "node:path";
+      const manifest = JSON.parse(fs.readFileSync(path.join(process.env.RECALL_ROOT, "clementine-native-manifest.json"), "utf8"));
+      if (manifest.sdkVersion !== "2.0.25"
+        || manifest.sdkCommit !== "90d670e842200a4d546cbe36cc0b9c48fbe6a204"
+        || manifest.platform !== "darwin"
+        || manifest.archiveBytes !== 50971984
+        || manifest.archiveSha256 !== "e3125c49cdf6d54593e6334024df2ecbed99e0c6b1d2e410a4187ab19421433b") {
+        throw new Error(`packaged Recall native provenance is invalid: ${JSON.stringify(manifest)}`);
+      }
+    '
+
+    local native
+    for native in \
+      "$recall_root/desktop_sdk_macos_exe" \
+      "$recall_root/Frameworks/libui_recorder.dylib" \
+      "$recall_root/Frameworks/liblibbot_desktop_rs.dylib"; do
+      [[ -f "$native" ]] || { echo "::error::Recall native binary is missing: $native"; exit 1; }
+      [[ "$(file "$native")" == *"arm64"* ]] \
+        || { echo "::error::Recall native binary is not arm64: $native"; exit 1; }
+    done
+    echo "   Recall SDK: $actual_version (arm64 native capture verified)"
+  else
+    [[ "$runtime_supported" == "false" ]] \
+      || { echo "::error::Intel app incorrectly exposes ARM64-only Recall capture as supported"; exit 1; }
+    echo "   Recall SDK: correctly reported unsupported on Intel Mac"
+  fi
+}
+
 verify_packaged_app() {
   local arch="$1"
   local expected_arch="$2"
-  local expected_version
+  local expected_desktop_version
+  local expected_daemon_version
   local app=""
-  expected_version="$(cd "$DESKTOP_DIR" && node -p "require('./package.json').version")"
+  expected_desktop_version="$(cd "$DESKTOP_DIR" && node -p "require('./package.json').version")"
+  expected_daemon_version="$(cd "$ROOT_DIR" && node -p "require('./package.json').version")"
 
   while IFS= read -r candidate; do
     app="$candidate"
@@ -116,14 +212,16 @@ verify_packaged_app() {
   local daemon_version
   bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
   daemon_version="$(node -p "require('$daemon/package.json').version")"
-  [[ "$bundle_version" == "$expected_version" ]] \
-    || { echo "::error::$arch bundle version $bundle_version != $expected_version"; exit 1; }
-  [[ "$daemon_version" == "$expected_version" ]] \
-    || { echo "::error::$arch daemon version $daemon_version != $expected_version"; exit 1; }
+  [[ "$bundle_version" == "$expected_desktop_version" ]] \
+    || { echo "::error::$arch bundle version $bundle_version != $expected_desktop_version"; exit 1; }
+  [[ "$daemon_version" == "$expected_daemon_version" ]] \
+    || { echo "::error::$arch daemon version $daemon_version != $expected_daemon_version"; exit 1; }
   [[ "$(file "$executable")" == *"$expected_arch"* ]] \
     || { echo "::error::$arch main executable has the wrong architecture"; exit 1; }
   [[ "$(file "$daemon/node_modules/better-sqlite3/build/Release/better_sqlite3.node")" == *"$expected_arch"* ]] \
     || { echo "::error::$arch packaged better-sqlite3 has the wrong architecture"; exit 1; }
+
+  verify_recall_packaged "$arch" "$app" "$executable"
 
   if is_signed_release; then
     codesign --verify --deep --strict --verbose=2 "$app"
@@ -222,12 +320,24 @@ build_arch() {
   echo "-> Verifying vendored uv shipped + signed ($arch)"
   verify_uv_packaged "$arch" "$uvtarget"
 
+  local whispertarget
+  case "$arch" in
+    arm64) whispertarget="aarch64-apple-darwin" ;;
+    x64)   whispertarget="x86_64-apple-darwin" ;;
+    *) echo "::error::unknown arch $arch for whisper.cpp verification"; exit 1 ;;
+  esac
+  echo "-> Verifying vendored whisper.cpp shipped + signed ($arch)"
+  verify_whisper_packaged "$arch" "$whispertarget" "$expected"
+
   echo "-> Verifying console-web bundle shipped ($arch)"
   verify_console_web_packaged "$arch"
 
   echo "-> Verifying packaged app identity, architecture, and stat-only boot scan ($arch)"
   verify_packaged_app "$arch" "$expected"
 }
+
+echo "-> Installing checksum-pinned Recall Desktop SDK native payload"
+(cd "$DESKTOP_DIR" && npm run vendor:recall-native -- --platform darwin)
 
 echo "-> Building desktop shell"
 (cd "$DESKTOP_DIR" && npm run build)
@@ -254,6 +364,22 @@ mkdir -p "$DESKTOP_DIR/release"
 # empty dir and the shipped feature is dead on every machine.
 echo "-> Vendoring uv runtime binaries (required for file/image conversion)"
 (cd "$ROOT_DIR" && npm run vendor:uv)
+
+# Local transcription executes whisper.cpp directly from the sealed app. Build
+# both Intel and Apple Silicon targets before the first electron-builder pass so
+# every extraResources source exists in a clean release checkout.
+echo "-> Building pinned whisper.cpp runtimes (required for local meeting transcription)"
+if is_signed_release; then
+  (cd "$ROOT_DIR" && npm run vendor:whisper -- --target aarch64-apple-darwin --force)
+  (cd "$ROOT_DIR" && npm run vendor:whisper -- --target x86_64-apple-darwin --force)
+elif [[ "${WHISPER_ALLOW_VALIDATED_CACHE:-}" == "true" ]]; then
+  echo "   unsigned rehearsal: adopting cache only after provenance, license, architecture, version, size, and SHA-256 validation"
+  (cd "$ROOT_DIR" && npm run vendor:whisper -- --target aarch64-apple-darwin --adopt-validated-cache)
+  (cd "$ROOT_DIR" && npm run vendor:whisper -- --target x86_64-apple-darwin --adopt-validated-cache)
+else
+  (cd "$ROOT_DIR" && npm run vendor:whisper -- --target aarch64-apple-darwin --force)
+  (cd "$ROOT_DIR" && npm run vendor:whisper -- --target x86_64-apple-darwin --force)
+fi
 
 build_arch arm64 arm64
 cp "$DESKTOP_DIR/release/latest-mac.yml" "$ARM64_UPDATE_FEED"

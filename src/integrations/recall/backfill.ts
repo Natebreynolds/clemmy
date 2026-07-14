@@ -36,6 +36,7 @@ import {
   findRecallMeetingRecord,
   markCanonicalTranscriptIncomplete,
   type RecallMeetingRecord,
+  type RecallRegion,
 } from './meeting-capture.js';
 
 const logger = pino({ name: 'clementine-next.recall.backfill' });
@@ -49,15 +50,19 @@ export interface BackfillResult {
   segmentCount?: number;
 }
 
+export interface BackfillInput {
+  windowId?: string;
+  recordingId?: string;
+  /** Region pinned when the SDK upload was created. */
+  region?: RecallRegion;
+}
+
 /**
  * Top-level entry point. Resolves to a result describing how the
  * backfill ended. Safe to fire-and-forget: errors are logged + reflected
  * in the meeting record's canonicalStatus, never propagated.
  */
-export async function backfillCanonicalTranscript(input: {
-  windowId?: string;
-  recordingId?: string;
-}): Promise<BackfillResult> {
+export async function backfillCanonicalTranscript(input: BackfillInput): Promise<BackfillResult> {
   const startedAt = Date.now();
   const record = findRecallMeetingRecord(input);
   if (!record) {
@@ -76,7 +81,11 @@ export async function backfillCanonicalTranscript(input: {
     // surfaces the transcript download URL in media_shortcuts. This
     // is the same shape the zoombot's desktop worker uses
     // (worker/index.ts:728), which is the battle-tested path.
-    const ready = await pollForRecordingTranscriptUrl(record.recordingId, startedAt);
+    const ready = await pollForRecordingTranscriptUrl(
+      record.recordingId,
+      startedAt,
+      input.region ?? record.sdkUploadRegion,
+    );
     if (!ready.downloadUrl) {
       const updated = markCanonicalTranscriptIncomplete(record, 'timed_out', ready.lastStatus);
       logger.warn({ id: updated.id, lastStatus: ready.lastStatus }, 'backfill: poll timed out before transcript ready');
@@ -133,12 +142,13 @@ export async function backfillCanonicalTranscript(input: {
 async function pollForRecordingTranscriptUrl(
   recordingId: string,
   startedAt: number,
+  region?: RecallRegion,
 ): Promise<{ downloadUrl?: string; lastStatus: string }> {
   let lastStatus = 'unknown';
   while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
     let snapshot: Awaited<ReturnType<typeof getRecording>>;
     try {
-      snapshot = await getRecording(recordingId);
+      snapshot = await getRecording(recordingId, { region });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const status = (err as Error & { status?: number }).status;
@@ -176,7 +186,7 @@ function sleep(ms: number): Promise<void> {
  * so it never rejects — useful when called from inside `res.json()`
  * paths where a stray reject would crash the response.
  */
-export function startCanonicalTranscriptBackfill(input: { windowId?: string; recordingId?: string }): void {
+export function startCanonicalTranscriptBackfill(input: BackfillInput): void {
   backfillCanonicalTranscript(input).catch((err) => {
     const message = err instanceof Error ? err.message : String(err);
     logger.error({ err: message, input }, 'backfill: unexpected unhandled error');

@@ -16,7 +16,10 @@ const {
   saveRecallMeetingAnalysis,
   fileMeetingFromAnalysis,
   buildMeetingChatPrompt,
+  findRecallMeetingRecord,
+  listAllRecallMeetingRecords,
   loadRecallMeetingById,
+  noteRecallMeetingDetected,
   recordMeetingTitle,
   renameMeeting,
 } = await import('./meeting-capture.js');
@@ -174,4 +177,67 @@ test('buildMeetingChatPrompt requires the full transcript and asks for next acti
   assert.match(prompt, /likely follow-up tasks/i);
   assert.match(prompt, /Do not refer to yourself as Clementine/i);
   assert.match(prompt, /Do not send messages, schedule events, update sheets, or create tasks/);
+});
+
+test('two SDK uploads in one reused window remain distinct before reconciliation', () => {
+  const windowId = 'reused-native-window';
+  const first = noteRecallMeetingDetected({
+    windowId,
+    sdkUploadId: 'same-window-upload-1',
+    status: 'recording',
+    startedAt: '2026-07-13T10:00:00.000Z',
+  });
+  appendRecallTranscriptSegment({
+    windowId,
+    sdkUploadId: 'same-window-upload-1',
+    event: 'transcript.data',
+    text: 'first sequential meeting',
+  });
+  finalizeRecallMeeting({
+    windowId,
+    sdkUploadId: 'same-window-upload-1',
+    retentionMode: 'zero',
+    canonicalBackfill: false,
+  });
+
+  const second = noteRecallMeetingDetected({
+    windowId,
+    sdkUploadId: 'same-window-upload-2',
+    status: 'recording',
+    startedAt: '2026-07-13T11:00:00.000Z',
+  });
+  appendRecallTranscriptSegment({
+    windowId,
+    sdkUploadId: 'same-window-upload-2',
+    event: 'transcript.data',
+    text: 'second sequential meeting',
+  });
+  finalizeRecallMeeting({
+    windowId,
+    sdkUploadId: 'same-window-upload-2',
+    retentionMode: 'zero',
+    canonicalBackfill: false,
+  });
+
+  assert.notEqual(first.id, second.id);
+  assert.equal(findRecallMeetingRecord({ sdkUploadId: 'same-window-upload-1' })?.id, first.id);
+  assert.equal(findRecallMeetingRecord({ sdkUploadId: 'same-window-upload-2' })?.id, second.id);
+  assert.deepEqual(
+    findRecallMeetingRecord({ sdkUploadId: 'same-window-upload-1' })?.segments.map((segment) => segment.text),
+    ['first sequential meeting'],
+  );
+  assert.deepEqual(
+    findRecallMeetingRecord({ sdkUploadId: 'same-window-upload-2' })?.segments.map((segment) => segment.text),
+    ['second sequential meeting'],
+  );
+  const records = listAllRecallMeetingRecords().filter((record) => record.windowId === windowId);
+  assert.equal(records.length, 2);
+  assert.deepEqual(new Set(records.map((record) => record.sdkUploadId)), new Set([
+    'same-window-upload-1',
+    'same-window-upload-2',
+  ]));
+  assert.deepEqual(new Set(records.map((record) => record.startedAt)), new Set([
+    '2026-07-13T10:00:00.000Z',
+    '2026-07-13T11:00:00.000Z',
+  ]));
 });

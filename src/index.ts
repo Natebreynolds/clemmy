@@ -36,6 +36,10 @@ import { PLUGINS_DIR } from './plugins/loader.js';
 import { getConfiguredDiscordInstallInfo } from './channels/discord-install.js';
 import { readMemoryIndexStatus, rebuildVaultIndex } from './memory/indexer.js';
 import { collectHarnessAudit } from './dashboard/harness-audit.js';
+import {
+  prepareLocalTranscriptionRuntime,
+  shutdownLocalTranscriptionRuntime,
+} from './integrations/local-meetings/whisper-runtime.js';
 
 const logger = pino({ name: 'clementine-next' });
 
@@ -475,7 +479,9 @@ async function main(): Promise<void> {
       writeDaemonPid(process.pid);
       registerShutdownHandlers(async () => {
         logger.info('Daemon shutting down...');
+        await shutdownLocalTranscriptionRuntime();
       });
+      await prepareLocalTranscriptionRuntime();
       logger.info({ pid: process.pid }, 'Daemon starting in foreground mode');
       const assistant = new ClementineAssistant(createRuntimeFromConfig());
       if (WEBHOOK_ENABLED) await startWebhookServer(assistant);
@@ -502,7 +508,10 @@ async function main(): Promise<void> {
 
     // Anything else: treat as legacy foreground (old behavior)
     writeDaemonPid(process.pid);
-    registerShutdownHandlers(async () => { /* cleanup */ });
+    registerShutdownHandlers(async () => {
+      await shutdownLocalTranscriptionRuntime();
+    });
+    await prepareLocalTranscriptionRuntime();
     const assistant = new ClementineAssistant(createRuntimeFromConfig());
     await startDaemon(assistant);
     return;
@@ -664,7 +673,11 @@ async function main(): Promise<void> {
       logger.info('Skipping Slack bot (SLACK_ENABLED=false)');
     }
     writeDaemonPid(process.pid);
-    registerShutdownHandlers(async () => { clearDaemonPid(); });
+    registerShutdownHandlers(async () => {
+      await shutdownLocalTranscriptionRuntime();
+      clearDaemonPid();
+    });
+    await prepareLocalTranscriptionRuntime();
     // Warm the markitdown runtime in the background so a user's FIRST file
     // conversion doesn't eat a ~½GB download under the per-conversion timeout.
     // Fire-and-forget, idempotent, never blocks the daemon loop.

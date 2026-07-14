@@ -1,21 +1,37 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check } from 'lucide-react';
+import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Switch } from '@/components/ui/Switch';
-import { Select } from '@/components/ui/Field';
+import { Input, Select } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
 import { statusTone, relativeTime } from '@/lib/inbox';
 import { clemmy, isDesktop } from '@/lib/clemmy';
-import { getRecallStatus, patchRecallSettings, listMeetings, getMeeting, getMeetingChatPrompt, type MeetingSummary, type RecallSettings } from '@/lib/meetings';
+import {
+  getRecallStatus,
+  patchRecallSettings,
+  patchLocalMeetingSettings,
+  retryLocalMeetingTranscription,
+  listMeetings,
+  getMeeting,
+  getMeetingChatPrompt,
+  type LocalMeetingSettings,
+  type LocalMeetingStatus,
+  type MeetingSummary,
+  type RecallSettings,
+} from '@/lib/meetings';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
+import {
+  LocalMeetingCapture,
+  type LocalMeetingCaptureState,
+} from '@/lib/local-meeting-recorder';
 
 const DEFAULT_REGIONS: Record<string, string> = { 'us-west-2': 'US West', 'us-east-1': 'US East', 'eu-central-1': 'EU Central', 'ap-northeast-1': 'Asia Pacific' };
 const PERMS: { key: string; label: string }[] = [
@@ -30,8 +46,18 @@ const PERMS: { key: string; label: string }[] = [
 interface SdkStatus {
   sdkAvailable?: boolean; initialized?: boolean; recording?: boolean;
   hasActiveMeetingWindow?: boolean; lastError?: string;
+  platformSupport?: { supported?: boolean; platform?: string; arch?: string; message?: string };
   permissionStatuses?: Record<string, string>;
   blocked?: { reason?: string; message?: string };
+}
+
+function formatElapsed(seconds: number): string {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = Math.floor(seconds % 60);
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`
+    : `${minutes}:${String(rest).padStart(2, '0')}`;
 }
 
 export function Meetings() {
@@ -46,10 +72,50 @@ export function Meetings() {
     8000,
     { enabled: desktop },
   );
+  const localDesktopStatus = usePoll<LocalMeetingStatus | null>(
+    ['local-meeting-status'],
+    () => (clemmy()?.localMeetingStatus?.() as Promise<LocalMeetingStatus> | undefined) ?? Promise.resolve(null),
+    5000,
+    { enabled: desktop },
+  );
   const meetings = usePoll(['meetings'], listMeetings, 12000);
   const [selected, setSelected] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'info' | 'warn' | 'error'; text: string } | null>(null);
+  const [retentionHoursDraft, setRetentionHoursDraft] = useState('24');
+  const [localTitle, setLocalTitle] = useState('');
+  const [localBusy, setLocalBusy] = useState(false);
+  const [retryingMeetingId, setRetryingMeetingId] = useState<string | null>(null);
+  const [localNotice, setLocalNotice] = useState<{ tone: 'info' | 'warn' | 'error'; text: string } | null>(null);
+  const [localCaptureState, setLocalCaptureState] = useState<LocalMeetingCaptureState>({
+    phase: 'idle',
+    elapsedSeconds: 0,
+  });
+  const mounted = useRef(true);
+  const localCapture = useRef<LocalMeetingCapture | null>(null);
+  if (!localCapture.current) {
+    localCapture.current = new LocalMeetingCapture({
+      onState: (next) => { if (mounted.current) setLocalCaptureState(next); },
+    });
+  }
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      const capture = localCapture.current;
+      const state = capture?.state();
+      if (state?.phase === 'requesting') {
+        void capture?.cancel().catch(() => undefined);
+      } else if (state?.sessionId && state.phase !== 'stopping') {
+        // Navigating away ends and saves the meeting; it must never leave an
+        // invisible microphone capture running in the background.
+        // Never turn a stop failure into a destructive cancel: the main process
+        // and crash-recovery sidecar retain the valid captured prefix.
+        void capture?.stop().catch(() => undefined);
+      }
+    };
+  }, []);
 
   const detail = useQuery({ queryKey: ['meeting', selected], queryFn: () => getMeeting(selected!), enabled: !!selected });
 
@@ -59,7 +125,29 @@ export function Meetings() {
   const rows = meetings.data?.meetings ?? [];
   const sdkData = sdk.data ?? undefined;
   const recording = Boolean(sdkData?.recording);
+  const recallUnsupported = sdkData?.platformSupport?.supported === false;
+  const recallUnsupportedMessage = sdkData?.platformSupport?.message
+    || 'Recall online meeting capture is not supported on this computer.';
   const perms = sdkData?.permissionStatuses ?? {};
+  const localStatus = localDesktopStatus.data ?? undefined;
+  const pendingLocalCancellationCount = Math.max(0, Number(
+    (localStatus as (LocalMeetingStatus & { pendingCancellationCount?: number }) | undefined)?.pendingCancellationCount ?? 0,
+  ) || 0);
+  const localSettings = localStatus?.settings ?? {};
+  const localRuntime = localStatus?.runtime;
+  const desktopRecorderSessionId = localStatus?.recorder?.recording ? localStatus.recorder.sessionId : undefined;
+  const localSessionId = localCaptureState.sessionId ?? desktopRecorderSessionId;
+  const localRecording = Boolean(localSessionId)
+    && (Boolean(desktopRecorderSessionId) || ['recording', 'stopping', 'error'].includes(localCaptureState.phase));
+  const localElapsedSeconds = localCaptureState.sessionId
+    ? localCaptureState.elapsedSeconds
+    : Math.max(0, Math.floor(localStatus?.recorder?.durationSeconds ?? 0));
+
+  useEffect(() => {
+    if (typeof settings.retentionHours === 'number' && Number.isFinite(settings.retentionHours)) {
+      setRetentionHoursDraft(String(settings.retentionHours));
+    }
+  }, [settings.retentionHours]);
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['recall-status'] }); void qc.invalidateQueries({ queryKey: ['recall-sdk'] }); };
 
@@ -74,6 +162,16 @@ export function Meetings() {
       refresh();
     } catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
     finally { setBusy(false); }
+  };
+
+  const applyRetentionHours = async () => {
+    const hours = Number(retentionHoursDraft);
+    if (!Number.isFinite(hours) || hours < 1) {
+      setNotice({ tone: 'error', text: 'Recall retention must be at least 1 hour.' });
+      setRetentionHoursDraft(String(settings.retentionHours ?? 24));
+      return;
+    }
+    await applySetting({ retentionHours: hours });
   };
 
   const grant = async () => {
@@ -100,22 +198,204 @@ export function Meetings() {
     finally { setBusy(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
   };
 
+  const applyLocalSetting = async (partial: Partial<LocalMeetingSettings>) => {
+    setLocalBusy(true); setLocalNotice(null);
+    try {
+      await patchLocalMeetingSettings(partial);
+      await localDesktopStatus.refetch();
+    } catch (e) { setLocalNotice({ tone: 'error', text: (e as Error).message }); }
+    finally { setLocalBusy(false); }
+  };
+
+  const startLocal = async () => {
+    setLocalBusy(true); setLocalNotice(null);
+    try {
+      await localCapture.current!.start(localTitle);
+      setLocalNotice({ tone: 'info', text: 'Recording this microphone locally. Stay on this page until you stop.' });
+      await localDesktopStatus.refetch();
+    } catch (e) { setLocalNotice({ tone: 'error', text: (e as Error).message }); }
+    finally { setLocalBusy(false); }
+  };
+
+  const stopLocal = async () => {
+    setLocalBusy(true); setLocalNotice(null);
+    try {
+      const result = localCaptureState.sessionId
+        ? await localCapture.current!.stop()
+        : await clemmy()!.localMeetingStop!(localSessionId!);
+      if (result.queued === false) {
+        setLocalNotice({ tone: 'warn', text: `Audio was saved locally, but transcription could not start yet${result.error ? `: ${String(result.error)}` : '.'}` });
+      } else {
+        setLocalNotice({ tone: 'info', text: 'Recording saved. Local transcription is now queued.' });
+      }
+      setLocalTitle('');
+    } catch (e) { setLocalNotice({ tone: 'error', text: (e as Error).message }); }
+    finally {
+      setLocalBusy(false);
+      await localDesktopStatus.refetch();
+      void qc.invalidateQueries({ queryKey: ['meetings'] });
+    }
+  };
+
+  const cancelLocal = async () => {
+    setLocalBusy(true); setLocalNotice(null);
+    try {
+      let cancellationPending = false;
+      let cancellationWarning = '';
+      if (localCaptureState.sessionId) {
+        await localCapture.current!.cancel();
+        // LocalMeetingCapture intentionally returns void after releasing media.
+        // Read main's durable tombstone status so a lost daemon response is not
+        // misrepresented as fully cleaned up.
+        const after = await clemmy()?.localMeetingStatus?.();
+        cancellationPending = Number(after?.pendingCancellationCount ?? 0) > 0;
+      } else {
+        const result = await clemmy()!.localMeetingCancel!(localSessionId!);
+        cancellationPending = result?.daemonCancellationPending === true;
+        cancellationWarning = typeof result?.warning === 'string' ? result.warning : '';
+      }
+      setLocalNotice(cancellationPending
+        ? {
+          tone: 'warn',
+          text: cancellationWarning || 'Local audio was discarded, but meeting-history cleanup is pending and will retry automatically.',
+        }
+        : { tone: 'warn', text: 'Local recording discarded.' });
+    } catch (e) { setLocalNotice({ tone: 'error', text: (e as Error).message }); }
+    finally { setLocalBusy(false); await localDesktopStatus.refetch(); }
+  };
+
+  const retryTranscription = async (meetingId: string) => {
+    setRetryingMeetingId(meetingId);
+    try {
+      await retryLocalMeetingTranscription(meetingId);
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['meeting', meetingId] }),
+        qc.invalidateQueries({ queryKey: ['meetings'] }),
+      ]);
+    } catch (e) {
+      setLocalNotice({ tone: 'error', text: `Could not retry transcription: ${(e as Error).message}` });
+    } finally {
+      setRetryingMeetingId(null);
+    }
+  };
+
   const discuss = async (id: string) => {
     try { const { prompt } = await getMeetingChatPrompt(id); navigate(`/chat?prompt=${encodeURIComponent(prompt)}`); }
     catch { navigate('/chat'); }
   };
 
   return (
-    <Page title="Meetings" subtitle="Recorded meetings, summaries, and action items — powered by Recall.ai">
-      {/* Capture controls */}
+    <Page title="Meetings" subtitle="Local recordings and online calls, with transcripts, summaries, and action items">
+      {/* Local in-person capture */}
+      <Card className="mb-4 p-5">
+        <div className="flex flex-wrap items-center gap-3">
+          <HardDrive className="h-5 w-5 text-primary" aria-hidden />
+          <div className="min-w-[16rem] flex-1">
+            <h3 className="text-h3 text-fg">In-person meeting</h3>
+            <p className="text-small text-muted">Record this computer's microphone and transcribe it locally with whisper.cpp.</p>
+          </div>
+          {!desktop ? (
+            <StatusPill tone="neutral">Desktop app only</StatusPill>
+          ) : localCaptureState.phase === 'error' && localCaptureState.sessionId ? (
+            <StatusPill tone="danger">Capture stopped early</StatusPill>
+          ) : localRecording ? (
+            <StatusPill tone="live">Recording · {formatElapsed(localElapsedSeconds)}</StatusPill>
+          ) : localRuntime?.available === false ? (
+            <StatusPill tone="warning">Local engine unavailable</StatusPill>
+          ) : localRuntime?.modelReady ? (
+            <StatusPill tone="success">Ready offline</StatusPill>
+          ) : (
+            <StatusPill tone="info">Local model on first use</StatusPill>
+          )}
+        </div>
+
+        {!desktop ? (
+          <p className="mt-4 text-body text-muted">Open Clementine Desktop to record an in-person meeting. The browser cannot write the protected local audio file.</p>
+        ) : localDesktopStatus.isLoading ? (
+          <Skeleton className="mt-4 h-24 w-full" />
+        ) : (
+          <div className="mt-4 space-y-4">
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="min-w-[16rem] flex-1 text-small text-fg">
+                <span className="mb-1.5 block">Meeting title <span className="text-faint">(optional)</span></span>
+                <Input
+                  value={localTitle}
+                  onChange={(event) => setLocalTitle(event.target.value)}
+                  placeholder="Weekly planning"
+                  maxLength={160}
+                  disabled={localRecording || localBusy}
+                />
+              </label>
+              {localRecording ? (
+                <>
+                  <Button variant="danger" onClick={stopLocal} disabled={localBusy || localCaptureState.phase === 'stopping'}>
+                    <Square className="h-4 w-4" aria-hidden /> Stop & transcribe
+                  </Button>
+                  <Button variant="ghost" onClick={cancelLocal} disabled={localBusy} aria-label="Discard local recording">
+                    <Trash2 className="h-4 w-4" aria-hidden /> Discard
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  onClick={startLocal}
+                  disabled={localBusy || localSettings.enabled === false || localRuntime?.available === false}
+                >
+                  <Circle className="h-4 w-4" aria-hidden /> Start local recording
+                </Button>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+              <label className="flex items-center gap-2 text-small text-fg">
+                <Switch checked={localSettings.enabled !== false} onChange={(value) => applyLocalSetting({ enabled: value })} label="Enable local transcription" disabled={localRecording || localBusy} />
+                Enable local transcription
+              </label>
+              <label className="flex items-center gap-2 text-small text-fg">
+                <Switch checked={localSettings.analyzeOnComplete !== false} onChange={(value) => applyLocalSetting({ analyzeOnComplete: value })} label="Summarize automatically" disabled={localRecording || localBusy} />
+                Summarize automatically
+              </label>
+              <label className="flex items-center gap-2 text-small text-fg">
+                <Switch checked={!!localSettings.keepAudio} onChange={(value) => applyLocalSetting({ keepAudio: value })} label="Keep raw audio" disabled={localRecording || localBusy} />
+                Keep raw audio after transcription
+              </label>
+            </div>
+
+            <p className="flex gap-2 text-caption text-muted">
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden />
+              Audio is written only to this device and transcription runs locally. If automatic summaries are enabled, the transcript is handled by your configured Clementine model; raw audio is not sent for summarization.
+            </p>
+            {!localRuntime?.modelReady && localRuntime?.available !== false && (
+              <p className="text-caption text-muted">The English base model downloads once on the first transcription, then works without an internet connection.</p>
+            )}
+            {localRuntime?.available === false && (
+              <p className="text-caption text-danger">{localRuntime.reason || 'The packaged local transcription engine could not be found.'}</p>
+            )}
+            {pendingLocalCancellationCount > 0 && (
+              <p role="status" className="text-small text-warning">
+                Meeting-history cleanup is pending for {pendingLocalCancellationCount} discarded local recording{pendingLocalCancellationCount === 1 ? '' : 's'}. Clementine retries automatically every five seconds.
+              </p>
+            )}
+            {localCaptureState.error && localCaptureState.sessionId && (
+              <p role="alert" className="text-small text-danger">{localCaptureState.error} Microphone capture has stopped; choose Stop &amp; transcribe to save the captured portion.</p>
+            )}
+            {localNotice && (
+              <p aria-live="polite" className={cn('text-small', localNotice.tone === 'error' ? 'text-danger' : localNotice.tone === 'warn' ? 'text-warning' : 'text-muted')}>{localNotice.text}</p>
+            )}
+          </div>
+        )}
+      </Card>
+
+      {/* Online-call capture */}
       <Card className="mb-6 p-5">
         <div className="flex flex-wrap items-center gap-3">
           <Video className="h-5 w-5 text-primary" aria-hidden />
           <div className="flex-1">
-            <h3 className="text-h3 text-fg">Meeting capture</h3>
-            <p className="text-small text-muted">Clementine can join and transcribe your Zoom, Meet, and Teams calls.</p>
+            <h3 className="text-h3 text-fg">Online call capture</h3>
+            <p className="text-small text-muted">Capture and transcribe Zoom, Meet, and Teams calls with the Recall Desktop SDK.</p>
           </div>
-          <StatusPill tone={credConnected ? 'success' : 'warning'}>{credConnected ? 'Recall.ai connected' : 'Not connected'}</StatusPill>
+          <StatusPill tone={recallUnsupported ? 'warning' : credConnected ? 'success' : 'warning'}>
+            {recallUnsupported ? 'Unsupported on this computer' : credConnected ? 'Recall.ai connected' : 'Not connected'}
+          </StatusPill>
         </div>
 
         {status.isLoading ? (
@@ -124,6 +404,13 @@ export function Meetings() {
           <p className="mt-4 text-body text-danger">Couldn't load meeting capture status.{' '}
             <button type="button" onClick={() => status.refetch()} className="cursor-pointer text-primary hover:underline">Retry</button>
           </p>
+        ) : desktop && sdk.isLoading ? (
+          <Skeleton className="mt-4 h-24 w-full" />
+        ) : recallUnsupported ? (
+          <div className="mt-4 rounded-md border border-warning/30 bg-warning-tint px-3 py-3">
+            <p className="text-body text-warning">{recallUnsupportedMessage}</p>
+            <p className="mt-1 text-small text-muted">Use In-person meeting above to record the microphone and transcribe locally with whisper.cpp. Local recording remains available on Intel Macs.</p>
+          </div>
         ) : !credConnected ? (
           <p className="mt-4 text-body text-muted">Add your Recall.ai key in <span className="font-medium text-fg">Connect → Keys & accounts</span> to enable meeting capture.</p>
         ) : !desktop ? (
@@ -131,10 +418,10 @@ export function Meetings() {
         ) : (
           <div className="mt-4 space-y-4">
             <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
-              <label className="flex items-center gap-2 text-small text-fg"><Switch checked={!!settings.enabled} onChange={(v) => applySetting({ enabled: v })} label="Enable meeting capture" /> Enable meeting capture</label>
+              <label className="flex items-center gap-2 text-small text-fg"><Switch checked={!!settings.enabled} onChange={(v) => applySetting({ enabled: v })} label="Enable meeting capture" disabled={busy || recording} /> Enable meeting capture</label>
               <label className="flex items-center gap-2 text-small text-fg">
                 Region
-                <Select value={settings.region ?? 'us-west-2'} onChange={(e) => applySetting({ region: e.target.value })} className="w-44" disabled={!settings.enabled || busy}>
+                <Select value={settings.region ?? 'us-west-2'} onChange={(e) => applySetting({ region: e.target.value })} className="w-44" disabled={!settings.enabled || busy || recording}>
                   {Object.entries(regions).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
                 </Select>
               </label>
@@ -148,8 +435,57 @@ export function Meetings() {
                     : <Button onClick={record} disabled={busy}><Circle className="h-4 w-4" aria-hidden /> Record this meeting</Button>}
                   <Button variant="secondary" size="sm" onClick={grant} disabled={busy}><ShieldCheck className="h-4 w-4" aria-hidden /> Grant permissions</Button>
                   <div className="mx-2 h-6 w-px bg-border" />
-                  <label className="flex items-center gap-2 text-small text-fg"><Switch checked={!!settings.autoRecord} onChange={(v) => applySetting({ autoRecord: v })} label="Auto-record" /> Auto-record meetings</label>
-                  <label className="flex items-center gap-2 text-small text-fg"><Switch checked={!!settings.liveTranscript} onChange={(v) => applySetting({ liveTranscript: v })} label="Live transcript" /> Live transcript</label>
+                  <label className="flex items-center gap-2 text-small text-fg"><Switch checked={!!settings.autoRecord} onChange={(v) => applySetting({ autoRecord: v })} label="Auto-record" disabled={busy || recording} /> Auto-record meetings</label>
+                  <label className="flex items-center gap-2 text-small text-fg">
+                    <Switch
+                      checked={settings.retentionMode === 'zero' || !!settings.liveTranscript}
+                      onChange={(v) => applySetting({ liveTranscript: v })}
+                      label="Live transcript"
+                      disabled={busy || recording || settings.retentionMode === 'zero'}
+                    />
+                    Live transcript{settings.retentionMode === 'zero' ? ' (required for zero retention)' : ''}
+                  </label>
+                </div>
+
+                <div className="rounded-md border border-border bg-canvas p-3">
+                  <div className="flex flex-wrap items-end gap-3">
+                    <label className="min-w-[15rem] flex-1 text-small text-fg">
+                      <span className="mb-1.5 block">Recall retention</span>
+                      <Select
+                        value={settings.retentionMode ?? 'timed'}
+                        onChange={(event) => {
+                          const retentionMode = event.target.value as 'zero' | 'timed';
+                          void applySetting(retentionMode === 'zero'
+                            ? { retentionMode, liveTranscript: true }
+                            : { retentionMode });
+                        }}
+                        disabled={busy || recording}
+                      >
+                        <option value="zero">Do not retain on Recall</option>
+                        <option value="timed">Retain temporarily</option>
+                      </Select>
+                    </label>
+                    {(settings.retentionMode ?? 'timed') === 'timed' && (
+                      <label className="w-40 text-small text-fg">
+                        <span className="mb-1.5 block">Retention hours</span>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={720}
+                          step={1}
+                          value={retentionHoursDraft}
+                          onChange={(event) => setRetentionHoursDraft(event.target.value)}
+                          onBlur={() => { void applyRetentionHours(); }}
+                          disabled={busy || recording}
+                        />
+                      </label>
+                    )}
+                  </div>
+                  {(settings.retentionMode ?? 'timed') === 'zero' ? (
+                    <p className="mt-2 text-caption text-muted">Zero retention relies on Recall's realtime transcript and events while the call is active. Post-meeting media and transcript backfill are unavailable, so interrupted events can leave gaps.</p>
+                  ) : (
+                    <p className="mt-2 text-caption text-muted">Timed retention lets Clementine use Recall's post-meeting media and transcript backfill during this window. Recall controls retention and deletion timing.</p>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -198,7 +534,11 @@ export function Meetings() {
               <div className="mb-3 flex justify-end">
                 <Button size="sm" onClick={() => discuss(selected)}><MessageCircle className="h-4 w-4" aria-hidden /> Discuss in chat</Button>
               </div>
-              <MeetingDetailView data={detail.data} />
+              <MeetingDetailView
+                data={detail.data}
+                retrying={retryingMeetingId === selected}
+                onRetry={() => { if (selected) void retryTranscription(selected); }}
+              />
             </>
           )}
         </div>
@@ -208,12 +548,14 @@ export function Meetings() {
 }
 
 function MeetingRow({ m, selected, onSelect }: { m: MeetingSummary; selected: boolean; onSelect: () => void }) {
-  const tone = statusTone(m.status);
+  const tone = m.provider === 'local' ? localTranscriptionTone(m) : statusTone(m.status);
   return (
     <button type="button" onClick={onSelect}
       className={cn('flex w-full items-center gap-3 rounded-md border px-3.5 py-3 text-left transition-colors cursor-pointer',
         selected ? 'border-primary bg-primary-tint' : 'border-border bg-surface hover:bg-hover')}>
-      <Video className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+      {m.provider === 'local'
+        ? <Mic className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+        : <Video className="h-4 w-4 shrink-0 text-muted" aria-hidden />}
       <div className="min-w-0 flex-1">
         <div className="truncate text-body text-fg">{m.title || `${m.platform ?? 'Meeting'} call`}</div>
         <div className="text-caption text-faint">{relativeTime(m.startedAt)}{typeof m.segmentCount === 'number' ? ` · ${m.segmentCount} segment${m.segmentCount === 1 ? '' : 's'}` : ''}</div>
@@ -221,6 +563,20 @@ function MeetingRow({ m, selected, onSelect }: { m: MeetingSummary; selected: bo
       <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
     </button>
   );
+}
+
+function localTranscriptionTone(meeting: MeetingSummary): ReturnType<typeof statusTone> {
+  switch (meeting.transcriptionStatus) {
+    case 'queued': return { tone: 'warning', label: 'Queued' };
+    case 'transcribing': return { tone: 'live', label: 'Transcribing' };
+    case 'ready': return { tone: 'success', label: 'Transcribed' };
+    case 'failed': return { tone: 'danger', label: 'Transcription failed' };
+    case 'cancelled': return { tone: 'neutral', label: 'Cancelled' };
+    default:
+      return meeting.status === 'recording'
+        ? { tone: 'live', label: 'Recording' }
+        : { tone: 'warning', label: 'Waiting' };
+  }
 }
 
 // Analysis fields vary across meetings — actionItems can be an array of
@@ -242,7 +598,15 @@ function asText(v: unknown): string {
 }
 function toList(v: unknown): unknown[] { return Array.isArray(v) ? v : v == null ? [] : [v]; }
 
-function MeetingDetailView({ data }: { data?: import('@/lib/meetings').MeetingDetail }) {
+function MeetingDetailView({
+  data,
+  retrying = false,
+  onRetry,
+}: {
+  data?: import('@/lib/meetings').MeetingDetail;
+  retrying?: boolean;
+  onRetry?: () => void;
+}) {
   const a = (data?.analysis ?? {}) as Record<string, unknown>;
   const r = (data?.record ?? {}) as Record<string, unknown>;
   const summary = asText(a.summary);
@@ -251,6 +615,9 @@ function MeetingDetailView({ data }: { data?: import('@/lib/meetings').MeetingDe
   const topics = toList(a.topics).map(asText).filter(Boolean);
   const participants = toList(a.participants).map(asText).filter(Boolean);
   const segments = toList(r.segments).filter((s) => asText((s as Record<string, unknown>)?.text));
+  const localProvider = asText(r.provider) === 'local';
+  const transcriptionStatus = asText(r.transcriptionStatus);
+  const transcriptionError = asText(r.transcriptionError);
   return (
     <div>
       <div className="mb-2 flex items-center gap-2 text-caption text-faint">
@@ -258,6 +625,17 @@ function MeetingDetailView({ data }: { data?: import('@/lib/meetings').MeetingDe
         {r.startedAt ? <span>· {relativeTime(asText(r.startedAt))}</span> : null}
       </div>
       <h3 className="mb-3 text-h2 text-fg">{asText(a.title) || 'Meeting'}</h3>
+      {localProvider && (transcriptionStatus === 'queued' || transcriptionStatus === 'transcribing') && (
+        <p className="mb-4 rounded-md border border-info/30 bg-info-tint px-3 py-2 text-small text-info" role="status">
+          {transcriptionStatus === 'queued' ? 'Local transcription is queued.' : 'Transcribing locally on this device…'}
+        </p>
+      )}
+      {localProvider && transcriptionStatus === 'failed' && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-danger/30 bg-danger-tint px-3 py-2" role="alert">
+          <p className="min-w-0 flex-1 text-small text-danger">Local transcription failed{transcriptionError ? `: ${transcriptionError}` : '.'}</p>
+          {onRetry && <Button variant="secondary" size="sm" onClick={onRetry} disabled={retrying}>{retrying ? 'Retrying…' : 'Retry transcription'}</Button>}
+        </div>
+      )}
       {summary && <p className="mb-4 whitespace-pre-wrap text-body text-fg">{linkify(summary)}</p>}
 
       {actionItems.length > 0 && (

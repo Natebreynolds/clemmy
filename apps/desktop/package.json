@@ -13,12 +13,14 @@
     "build:daemon": "cd ../.. && npm run build",
     "build:mobile-web": "cd ../mobile-web && npm run build",
     "build:console-web": "cd ../console-web && npm run build",
+    "vendor:recall-native": "node scripts/vendor-recall-native.mjs",
+    "vendor:whisper": "npm --prefix ../.. run vendor:whisper:desktop",
     "rebuild-daemon-natives": "node scripts/rebuild-daemon-natives.mjs",
     "restore-node-natives": "cd ../.. && npm rebuild better-sqlite3",
     "package:mac": "./scripts/release-mac-dual-arch.sh",
-    "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false ./scripts/release-mac-dual-arch.sh",
+    "package:mac:unsigned": "APPLE_NOTARIZE_SKIP=true CSC_IDENTITY_AUTO_DISCOVERY=false WHISPER_ALLOW_VALIDATED_CACHE=true ./scripts/release-mac-dual-arch.sh",
     "package:win": "node scripts/release-windows.mjs",
-    "package:dist": "npm run build && npm run build:daemon && npm run build:mobile-web && npm run build:console-web && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
+    "package:dist": "npm run build && npm run build:daemon && npm run build:mobile-web && npm run build:console-web && npm run vendor:recall-native && npm run vendor:whisper && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
     "release": "./scripts/release-mac-dual-arch.sh"
   },
   "dependencies": {
@@ -31,6 +33,7 @@
     "@types/node": "^24.13.2",
     "electron": "^43.0.0",
     "electron-builder": "^26.15.3",
+    "tar": "7.5.19",
     "tsx": "^4.22.5",
     "typescript": "^5.7.0"
   },
@@ -102,6 +105,20 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "../../vendor/whisper/aarch64-apple-darwin",
+        "to": "daemon/vendor/whisper/aarch64-apple-darwin",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../vendor/whisper/x86_64-apple-darwin",
+        "to": "daemon/vendor/whisper/x86_64-apple-darwin",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "afterSign": "build/notarize.cjs",
@@ -114,6 +131,7 @@
       "extendInfo": {
         "NSHumanReadableCopyright": "Clementine",
         "NSMicrophoneUsageDescription": "Clementine needs the microphone for live voice commands and optional meeting capture.",
+        "NSAudioCaptureUsageDescription": "Clementine needs system audio access for optional meeting capture and transcription.",
         "NSScreenCaptureUsageDescription": "Clementine needs screen capture for optional meeting capture and screen-aware assistance.",
         "NSCameraUsageDescription": "Clementine needs the camera only for optional video meeting capture.",
         "NSCalendarsUsageDescription": "Clementine reads your calendar to surface upcoming meetings, attach context, and trigger meeting capture.",
@@ -183,6 +201,13 @@
           "filter": [
             "**/*"
           ]
+        },
+        {
+          "from": "../../vendor/whisper/x86_64-pc-windows-msvc",
+          "to": "daemon/vendor/whisper/x86_64-pc-windows-msvc",
+          "filter": [
+            "**/*"
+          ]
         }
       ],
       "target": [
@@ -205,7 +230,7 @@
     ]
   },
   "optionalDependencies": {
-    "@recallai/desktop-sdk": "2.0.14"
+    "@recallai/desktop-sdk": "2.0.25"
   },
   "engines": {
     "node": ">=22.15.0"

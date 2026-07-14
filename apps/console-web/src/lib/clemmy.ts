@@ -26,6 +26,12 @@ interface ClemmyBridge {
   recallStop?: () => Promise<Record<string, unknown> | null>;
   recallTest?: () => Promise<Record<string, unknown> | null>;
   onRecallEvent?: (cb: (event: Record<string, unknown>) => void) => (() => void) | void;
+  // Local/offline in-person meeting capture (Electron-only).
+  localMeetingStatus?: () => Promise<Record<string, unknown>>;
+  localMeetingStart?: (payload?: { title?: string }) => Promise<Record<string, unknown>>;
+  localMeetingAppend?: (sessionId: string, chunk: ArrayBuffer) => Promise<Record<string, unknown>>;
+  localMeetingStop?: (sessionId: string) => Promise<Record<string, unknown>>;
+  localMeetingCancel?: (sessionId: string) => Promise<Record<string, unknown>>;
 }
 
 export function clemmy(): ClemmyBridge | null {

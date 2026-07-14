@@ -21,6 +21,7 @@ import {
   fileMeetingFromAnalysis,
 } from '../integrations/recall/meeting-capture.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
+import { recoverPendingLocalAudioDeletions } from '../integrations/local-meetings/meeting-capture.js';
 import { createBackgroundTask } from '../execution/background-tasks.js';
 import { checkAllSkillUpdates } from '../runtime/skill-installer.js';
 import { addNotification, reapStaleNotifications } from '../runtime/notifications.js';
@@ -97,6 +98,7 @@ const EVENTLOG_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
 // finalizes records idle (no new transcript) for 60+ min, so a live
 // call is never cut off. Cheap: a readdir + per-record timestamp check.
 const RECALL_REAPER_EVERY_N_TICKS = 20; // ~5min with a 15s tick
+const LOCAL_AUDIO_DELETION_EVERY_N_TICKS = 20; // ~5min with a 15s tick
 // Meeting filing reconcile. Folds the analyzer-derived title + summary
 // into each meeting's vault note so the existing reindex/embedding ticks
 // make the high-signal content searchable (not just the raw transcript).
@@ -394,7 +396,11 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
             try { reindexVault(); reindexed = true; } catch { /* maintenance reindex tick will retry */ }
           }
           if (record.recordingId) {
-            startCanonicalTranscriptBackfill({ windowId: record.windowId, recordingId: record.recordingId });
+            startCanonicalTranscriptBackfill({
+              windowId: record.windowId,
+              recordingId: record.recordingId,
+              region: record.sdkUploadRegion,
+            });
           }
           if (artifactPath && settings.analyzeOnComplete) {
             createBackgroundTask({
@@ -410,6 +416,20 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'recall stuck-recording reaper tick failed');
+    }
+  }
+
+  // keepAudio=false is a durable privacy intent. Retry failed/pending
+  // deletions during normal daemon maintenance so a transient file lock does
+  // not retain raw meeting audio until the next application restart.
+  if (tickCount % LOCAL_AUDIO_DELETION_EVERY_N_TICKS === 0) {
+    try {
+      const cleanup = recoverPendingLocalAudioDeletions({ force: true });
+      if (cleanup.deleted > 0 || cleanup.failed > 0) {
+        logger.info({ cleanup }, 'local meeting audio privacy cleanup tick');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'local meeting audio privacy cleanup tick failed');
     }
   }
 
