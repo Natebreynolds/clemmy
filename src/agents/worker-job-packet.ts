@@ -35,6 +35,44 @@ export const WorkerToolInputSchema = z.object({
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
 
+/**
+ * Stable, deterministic key identifying THIS worker's exact job packet — used by
+ * the durable-resume idempotency guard (worker-respawn-guard.ts) so a worker that
+ * already completed successfully in an interrupted run is NOT re-executed (and its
+ * external writes not re-issued) when the run resumes and replays the same call.
+ * Hashes the MATERIAL packet fields (no timestamp/nonce), so an identical replay
+ * maps to the same key while a genuinely DIFFERENT re-processing of the same item
+ * (new instructions/tools/context/expectedOutput) gets a distinct key and runs
+ * normally. djb2 → base36; pure + total (never throws).
+ */
+export function workerPacketKey(input: WorkerToolInput): string {
+  // LENGTH-PREFIX each field before hashing so the serialization is INJECTIVE — a
+  // plain separator join is not: objective='Summarize the' item='company Acme'
+  // and objective='Summarize the company' item='Acme' would collide and cause a
+  // false-skip (adversarial review F2). Two independent rolling hashes (djb2 +
+  // FNV-1a) concatenated give a ~64-bit digest — a 32-bit key is too thin an
+  // identity for an idempotency-of-external-writes decision across 100s of items.
+  const fields = [
+    input.objective,
+    input.item,
+    input.resolvedTools,
+    input.context,
+    input.instructions,
+    input.expectedOutput,
+    input.intent ?? '',
+  ];
+  let serialized = '';
+  for (const f of fields) serialized += `${f.length} ${f} `;
+  let h1 = 5381; // djb2
+  let h2 = 0x811c9dc5; // FNV-1a offset basis
+  for (let i = 0; i < serialized.length; i += 1) {
+    const c = serialized.charCodeAt(i);
+    h1 = ((h1 << 5) + h1 + c) | 0; // h1*33 + c
+    h2 = Math.imul(h2 ^ c, 0x01000193) >>> 0; // FNV-1a prime
+  }
+  return (h1 >>> 0).toString(36) + '-' + h2.toString(36);
+}
+
 const HEAVY_WORKER_INTENTS = ['research', 'analysis', 'analyze', 'code', 'coding', 'design'];
 
 /**

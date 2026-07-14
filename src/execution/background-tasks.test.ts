@@ -52,6 +52,8 @@ const {
   rootBackgroundTaskPromptForTests,
   sweepInvalidDoneBackgroundTasks,
   replayBackgroundTaskReportBack,
+  probeObjectiveForTask,
+  selfResumeDecision,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -65,6 +67,39 @@ const { runBackgroundTaskWatchdog } = await import('./background-task-watchdog.j
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('selfResumeDecision (Wave 3): fail-safe cheap checks + defer to judge only when warranted', () => {
+  const base = { enabled: true, autoContinueAttempts: 4, hardCap: 24, cycleToolCalls: 5 };
+  // Genuinely-continuable case → the (expensive) progress judge decides.
+  assert.deepEqual(selfResumeDecision(base), { needJudge: true, reason: 'progress check required' });
+  // Kill-switch off → park, no judge.
+  assert.equal(selfResumeDecision({ ...base, enabled: false }).resume, false);
+  assert.equal(selfResumeDecision({ ...base, enabled: false }).needJudge, undefined);
+  // Hard ceiling → park, no judge (absolute bound even while "progressing").
+  assert.equal(selfResumeDecision({ ...base, autoContinueAttempts: 24 }).resume, false);
+  assert.match(selfResumeDecision({ ...base, autoContinueAttempts: 24 }).reason, /ceiling/);
+  // No new tool activity this cycle → park without spending a judge call.
+  assert.equal(selfResumeDecision({ ...base, cycleToolCalls: 0 }).resume, false);
+  assert.equal(selfResumeDecision({ ...base, cycleToolCalls: 0 }).needJudge, undefined);
+});
+
+test('probeObjectiveForTask: goal-bound uses plan objective+criteria; ad-hoc (no goal) falls back to prompt/title', () => {
+  const task = { prompt: 'Scrape the 8 firm sites and build the sheet', title: 'Firm scrape' };
+  // Goal-bound → plan objective + success criteria (the goal-bound-only path, unchanged)
+  assert.equal(
+    probeObjectiveForTask(task, { approvedPlan: { objective: 'Build the SEO sheet', successCriteria: ['Sheet has 8 rows', 'Each row has a domain'] } }),
+    'Build the SEO sheet\nSheet has 8 rows\nEach row has a domain',
+  );
+  // approvedPlan preferred over plan
+  assert.match(probeObjectiveForTask(task, { approvedPlan: { objective: 'APPROVED' }, plan: { objective: 'DRAFT' } }), /APPROVED/);
+  // AD-HOC (no goal) → prompt (the 2026-07-13 extension: probe runs on every task)
+  assert.equal(probeObjectiveForTask(task, null), 'Scrape the 8 firm sites and build the sheet');
+  assert.equal(probeObjectiveForTask(task, undefined), 'Scrape the 8 firm sites and build the sheet');
+  // Goal present but empty plan → still falls back to the task prompt
+  assert.equal(probeObjectiveForTask(task, { approvedPlan: { objective: '  ' } }), 'Scrape the 8 firm sites and build the sheet');
+  // No prompt → title
+  assert.equal(probeObjectiveForTask({ prompt: '', title: 'Firm scrape' }, null), 'Firm scrape');
 });
 
 test('enqueueDurableChatTask kicks the drain immediately (fires without waiting for the 15s tick)', () => {

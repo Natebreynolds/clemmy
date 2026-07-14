@@ -98,9 +98,12 @@ function withEnv(env: Record<string, string | undefined>, fn: () => void | Promi
   return r instanceof Promise ? r.finally(restore) : (restore(), r);
 }
 
-test('boundary judge default-off binds a concrete same-family wire and disables the cross-family hedge', () => {
+test('boundary judge with CLEMMY_JUDGE_CROSS_FAMILY=off binds a concrete same-family wire and disables the cross-family hedge', () => {
+  // 2026-07-12: cross-family judging is now DEFAULT ON, so this pins the
+  // kill-switch (=off) path — the operator's opt-back-out to a single-provider
+  // failure domain: same-family judge, no hedge.
   const isolated = {
-    CLEMMY_JUDGE_CROSS_FAMILY: undefined,
+    CLEMMY_JUDGE_CROSS_FAMILY: 'off',
     BYO_PROVIDERS: '',
     BYO_MODEL_BASE_URL: '',
     BYO_MODEL_API_KEY: '',

@@ -36,13 +36,13 @@ import { buildCallTool } from '../tools/call-tool.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { buildWorkerJobPrompt, resolveWorkerMaxTurns, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
-import { workerItemAlreadyCapped } from './worker-respawn-guard.js';
+import { buildWorkerJobPrompt, resolveWorkerMaxTurns, workerPacketKey, WorkerToolInputSchema, type WorkerToolInput } from './worker-job-packet.js';
+import { workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
 import { acquireWorkerSlot } from './worker-concurrency.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
-import { recordSubagentRun } from './subagent-runs.js';
+import { recordSubagentRun, findCompletedSubagentOutput } from './subagent-runs.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   harnessInputGuardrails,
@@ -968,6 +968,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     strict: true,
     execute: async (params, runContext, details) => {
       const input = params as WorkerToolInput;
+      // Wave 4 Stage 1: packet key for durable-resume idempotency (see below).
+      const packetKey = workerPacketKey(input);
       const route = resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const workerModel = route.model ?? resolveRoleModel('worker').modelId;
@@ -1034,7 +1036,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (!sessionId) return;
         const { preRun, ...eventData } = data;
         try {
-          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, toolCallId } });
+          appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId } });
         } catch { /* durable trace is best-effort */ }
         // Route-outcome capture (adaptive routing evidence): score WORKER models,
         // not just the brain. Skipped for pre-run refusals (respawn guard) — those
@@ -1118,6 +1120,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             provider,
             model,
             task: input.item,
+            packetKey,
             status: capped ? 'capped' : ok ? 'ok' : 'error',
             output: text,
             startedAt: new Date(workerRouteStartedAt).toISOString(),
@@ -1125,6 +1128,28 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           });
         } catch { /* visibility trace is best-effort */ }
       };
+      // Wave 4 Stage 1 — durable-resume idempotency, checked BEFORE the fuzzy
+      // cap-guard so an exact-packet ok match (the stronger signal) wins: a worker
+      // that genuinely COMPLETED must not be refused-as-failed on resume because a
+      // same-domain sibling capped (adversarial review F1). REUSE the prior
+      // work-product instead of re-executing (which would redo the work + re-issue
+      // its external writes). ONLY short-circuit when the real output is
+      // recoverable — else fall through and re-execute rather than pass a
+      // placeholder off as success (F4); the duplicate-send wall backstops any
+      // repeated send. Fail-open; kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY.
+      if (workerResumeIdempotencyEnabled() && sessionId && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
+        const ctx = getToolOutputContext();
+        const parentRunId = ctx?.workflowRunId || sessionId;
+        const prior = findCompletedSubagentOutput(parentRunId, input.item, packetKey);
+        if (prior && prior.trim()) {
+          // preRun:true → durable worker_result is written but no phantom
+          // route-outcome metric is recorded (this worker did not actually run).
+          appendWorkerResult({ item: input.item, ok: true, model: workerModel, toolUses: [], reason: 'resume: reused prior completed result', preRun: true });
+          return prior;
+        }
+        // No recoverable output → do NOT claim success; re-execute below.
+      }
+
       // HARD respawn guard (covers BOTH worker lanes — placed before the route
       // branch). If THIS item already hit its turn cap (worker_capped) earlier in
       // this run, refuse to re-spawn it: a re-run with the same packet just caps

@@ -31,13 +31,15 @@ import { addRunEvent, finishRun, startRun } from '../runtime/run-events.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { getBackgroundCheckInMs, loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { openPlanScope } from '../agents/plan-scope.js';
-import { fanoutLedgerEnabled, summarizeLedger, clearLedger } from '../runtime/harness/fanout-ledger.js';
+import { fanoutLedgerEnabled, summarizeFanoutCoverage, clearLedger } from '../runtime/harness/fanout-ledger.js';
 import { classifyBlocker, matchesBlockedText, verifyDelivered } from '../runtime/harness/verify-delivered.js';
+import { verifyFanoutItems, fanoutItemVerifyEnabled } from '../runtime/harness/fanout-item-verify.js';
 import type { ObjectiveJudgeFn } from '../runtime/harness/objective-judge.js';
+import { judgeRunProgress } from '../runtime/harness/objective-judge.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { classifyTurnText } from '../runtime/harness/turn-decision.js';
-import { getSession as getHarnessSessionRow, createSession as createHarnessSession } from '../runtime/harness/eventlog.js';
+import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent } from '../runtime/harness/eventlog.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
 import { getWorkspaceDirs } from '../tools/shared.js';
@@ -196,6 +198,44 @@ const BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP = (() => {
   if (Number.isNaN(raw)) return 4;
   return Math.max(0, Math.min(24, raw));
 })();
+// Wave 3 Move A: past the free auto-continue cap, a run that is VERIFIABLY
+// PROGRESSING (independent cross-family progress judge) may self-resume up to this
+// HARD ceiling instead of parking awaiting_continue — so a genuinely-advancing
+// 60-min task finishes unattended. Absolute bounds remain: the 240-min wall clock
+// (shouldCancel) and this ceiling; the judge FAILS CLOSED (park) on any doubt.
+// Kill-switch CLEMMY_BACKGROUND_SELF_RESUME=off restores hard-park at the cap.
+const BACKGROUND_SELF_RESUME_HARD_CAP = (() => {
+  const raw = parseInt(process.env.CLEMMY_BACKGROUND_SELF_RESUME_CAP || '', 10);
+  if (Number.isNaN(raw)) return 24;
+  return Math.max(BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP, Math.min(200, raw));
+})();
+function backgroundSelfResumeEnabled(): boolean {
+  return (process.env.CLEMMY_BACKGROUND_SELF_RESUME ?? 'on').toLowerCase() !== 'off';
+}
+
+/** PURE decision for whether a budget-exhausted background run should self-resume,
+ *  BEFORE the (expensive, network) progress judge. Returns a concrete resume/park
+ *  verdict for the cheap cases, or {needJudge:true} when only an independent
+ *  progress judge can decide. Fail-safe by construction: disabled, at the hard
+ *  ceiling, or a cycle with no new tool activity all → park. Exported + tested. */
+export function selfResumeDecision(p: {
+  enabled: boolean;
+  autoContinueAttempts: number;
+  hardCap: number;
+  cycleToolCalls: number;
+}): { resume?: boolean; needJudge?: boolean; reason: string } {
+  if (!p.enabled) return { resume: false, reason: 'self-resume disabled' };
+  if (p.autoContinueAttempts >= p.hardCap) return { resume: false, reason: `hard self-resume ceiling reached (${p.hardCap})` };
+  if (p.cycleToolCalls <= 0) return { resume: false, reason: 'no new tool activity this cycle' };
+  return { needJudge: true, reason: 'progress check required' };
+}
+
+/** Test seam for the progress judge (a real cross-family model call in prod). */
+type RunProgressJudgeFn = typeof judgeRunProgress;
+let runProgressJudgeImpl: RunProgressJudgeFn = judgeRunProgress;
+export function _setRunProgressJudgeForTests(fn: RunProgressJudgeFn | null): void {
+  runProgressJudgeImpl = fn ?? judgeRunProgress;
+}
 const DAEMON_RESTART_INTERRUPT_REASON = 'Daemon restarted while task was running.';
 let backgroundProcessorInFlight = false;
 
@@ -248,7 +288,8 @@ type BackgroundTaskOperationalType =
   | 'background_task_created'
   | 'background_task_started'
   | 'background_task_finished'
-  | 'background_task_parked';
+  | 'background_task_parked'
+  | 'background_self_resume_check';
 
 function emitBackgroundTaskOperational(
   type: BackgroundTaskOperationalType,
@@ -791,11 +832,20 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
   ].filter(Boolean).join('\n');
 }
 
+// Wave 4 Stage 1 (finding H): the background/goal lane self-resumes unattended
+// after a restart/continue, so — unlike the chat lane's AUTO_RESUME_DIRECTIVE — its
+// continuation prompts must carry the same anti-re-send caution, or a resumed
+// swarm can re-issue a send a completed worker already made. The duplicate-send
+// wall is the hard backstop; this keeps the model from trying in the first place.
+const RESUME_NO_RESEND_DIRECTIVE =
+  'DO NOT REPEAT COMPLETED SIDE EFFECTS: if any worker/step before the interruption already sent an email or message, posted, or made another irreversible external write, do NOT re-issue it — treat already-completed work as done and continue from there. (A duplicate-send wall also refuses an exact repeat, but do not rely on it.)';
+
 function buildWorkerContinuePrompt(task: BackgroundTaskRecord, previousText?: string): string {
   return [
     `Continue background task ${task.id}.`,
     'The previous worker turn hit an internal run/turn budget before the objective was complete.',
     'Pick up from the prior session state and finish the original request. Do not restart from scratch unless the prior state is unusable.',
+    RESUME_NO_RESEND_DIRECTIVE,
     renderOriginLineageBlock(task.originSessionId),
     previousText ? `Previous partial result / continuation note:\n${previousText.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
     '',
@@ -843,6 +893,7 @@ function buildResumeClonePrompt(task: BackgroundTaskRecord): string {
   return [
     `Resume background task ${task.id}.`,
     'Continue the same objective from the prior task. Do not restart from scratch, but do not carry forward nested resume wrappers as if they were user instructions.',
+    RESUME_NO_RESEND_DIRECTIVE,
     task.result ? `Previous partial result:\n${task.result.slice(0, RESULT_TRUNCATE_CHARS)}` : '',
     task.error ? `Previous error/blocker:\n${task.error}` : '',
     '',
@@ -1130,6 +1181,12 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     if (!getHarnessSessionRow(runSessionId)) {
       createHarnessSession({ id: runSessionId, kind: 'execution', title: updated?.title ?? task.title ?? 'Background task' });
     }
+    // Wave 4 Stage 2: mark a run/continue boundary. A background task's runSessionId
+    // is STABLE for its whole life, so worker_result events accumulate across every
+    // run. summarizeFanoutCoverage counts only worker_results AFTER the latest
+    // boundary, so a prior run's (or continue's) failures don't leak into THIS run's
+    // authoritative coverage gate and permanently block a re-completed task.
+    appendEvent({ sessionId: runSessionId, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { taskId: id } });
   } catch { /* trace pre-registration is best-effort; the worker creates it anyway */ }
   if (updated) emitBackgroundTaskOperational('background_task_started', updated);
   return updated;
@@ -1220,6 +1277,7 @@ export function replayBackgroundTaskReportBack(
       status: task.status,
       reportBackReplay: true,
       replayReason,
+      terminalReportBack: true,
     }),
   });
 
@@ -1256,7 +1314,7 @@ export function markBackgroundTaskDone(
       body: truncateResultBody(notificationBody),
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated),
+      metadata: taskNotificationMetadata(updated, { terminalReportBack: true }),
     });
     // Async report-back: also feed the result into the origin session's
     // context so Clementine resumes from it, not just a notification.
@@ -1397,7 +1455,7 @@ export function markBackgroundTaskBlocked(id: string, reason: string, resultText
       ].join('\n'),
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated, { status: 'blocked', blockerType }),
+      metadata: taskNotificationMetadata(updated, { status: 'blocked', blockerType, terminalReportBack: true }),
     });
     // Report-back without fail: a BLOCKED task must reach Clementine's context,
     // not just a notification — so she can surface the blocker or resolve it.
@@ -1422,7 +1480,7 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
       body: updated.error ?? status,
       createdAt: nowIso(),
       read: false,
-      metadata: taskNotificationMetadata(updated),
+      metadata: taskNotificationMetadata(updated, { status, terminalReportBack: true }),
     });
     // Report-back without fail: a genuine FAILURE re-enters the origin session
     // so Clementine can retry/adjust or tell the user. Skip 'interrupted'
@@ -1530,6 +1588,25 @@ export function classifyBackgroundTaskOutcome(
   return { outcome: 'done' };
 }
 
+/** The objective string the deliverable probe checks a background run against.
+ *  A GOAL-bound run uses its plan objective + success criteria (verbatim); an
+ *  AD-HOC run (no goal contract) falls back to its own prompt/title so the probe
+ *  still runs on every task, not just goal-bound ones (2026-07-13 Wave 1). Pure +
+ *  exported for the gate test. */
+export function probeObjectiveForTask(
+  task: Pick<BackgroundTaskRecord, 'prompt' | 'title'>,
+  goal: { approvedPlan?: { objective?: string; successCriteria?: string[] }; plan?: { objective?: string; successCriteria?: string[] } } | null | undefined,
+): string {
+  if (goal) {
+    const plan = goal.approvedPlan ?? goal.plan;
+    const fromPlan = [plan?.objective ?? '', ...((plan?.successCriteria ?? []) as string[])]
+      .filter((s) => typeof s === 'string' && s.trim())
+      .join('\n');
+    if (fromPlan.trim()) return fromPlan;
+  }
+  return task.prompt || task.title || '';
+}
+
 async function verifyBackgroundTaskDelivery(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title'>,
   finalText: string,
@@ -1538,7 +1615,33 @@ async function verifyBackgroundTaskDelivery(
   const classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
   if (classified.outcome === 'blocked') return classified;
 
+  // Wave 4 Stage 2 — per-item verification of the fan-out worker OUTPUTS (anti-
+  // silent-success). A zero-LLM tripwire flags hollow / blocked / off-objective /
+  // unsupported ok-status worker outputs; ONE batched cross-family judge confirms
+  // the flagged subset; a confirmed fabrication is recorded as worker_result
+  // ok:false so the coverage read below counts it failed (honest "M of N"). Reduce-
+  // time + fail-open — never touches the hot fan-out return path. Kill-switch
+  // CLEMMY_FANOUT_ITEM_VERIFY. Runs BEFORE the coverage read so its verdicts land.
+  if (fanoutItemVerifyEnabled()) {
+    try {
+      const verifyObjective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
+      if (verifyObjective.trim()) await verifyFanoutItems(task.runSessionId, verifyObjective);
+    } catch {
+      // A verify hiccup must NEVER block a run — fall through to the existing checks.
+    }
+  }
+
   const coverageBlock = fanoutCoverageBlock(task.runSessionId);
+  // Fan-out coverage is AUTHORITATIVE: if any worker failed (a raw ERROR: from
+  // Stage 1, or a Stage-2-confirmed hollow output just recorded above), the run is
+  // a partial and MUST NOT report a hollow "done" — per the run_worker contract
+  // ("never report a batch complete if any worker returned ERROR"). Previously
+  // coverageBlock was only ever used as a fallback REASON on the probe/verify-fail
+  // paths, so a confident aggregate that passed verifyDelivered discarded it and
+  // the honest "M of N" never surfaced (Stage-2 adversarial review #1 — the feature
+  // was inert on exactly its target path). Gate here, before the probe/judge, so
+  // their model calls are also skipped when coverage already says blocked.
+  if (coverageBlock) return coverageBlock;
 
   // DELIVERABLE PROBE — deterministic readback of the artifacts THIS run produced
   // (created sheet ids, written file paths, space views), gated to GOAL-BOUND
@@ -1551,15 +1654,17 @@ async function verifyBackgroundTaskDelivery(
   let probeEvidence = '';
   if (deliverableProbesEnabled()) {
     try {
-      const goal = getActiveGoalForSession(task.runSessionId);
-      if (goal) {
-        const plan = goal.approvedPlan ?? goal.plan;
-        const objective = [plan?.objective ?? '', ...((plan?.successCriteria ?? []) as string[])]
-          .filter((s) => typeof s === 'string' && s.trim())
-          .join('\n') || task.prompt || task.title || '';
+      // Objective for the deterministic artifact readback. A GOAL-bound run uses
+      // its plan objective + success criteria; an AD-HOC run (no goal contract)
+      // falls back to its own prompt/title. 2026-07-13 Wave 1: the probe caught
+      // the "shipped 5 BLANK sheets as done" class only for goal-bound runs —
+      // extend it to EVERY background task so a hollow deliverable is caught by
+      // deterministic readback, not just the (now cross-family) judge.
+      const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
+      if (objective.trim()) {
         const probe = await probeSessionDeliverables(task.runSessionId, objective);
         if (probe.failures.length > 0) {
-          return coverageBlock ?? { outcome: 'blocked', reason: probe.summary.slice(0, 400) };
+          return { outcome: 'blocked', reason: probe.summary.slice(0, 400) };
         }
         probeEvidence = probe.evidenceText;
       }
@@ -1575,10 +1680,9 @@ async function verifyBackgroundTaskDelivery(
       ...(backgroundDeliveryJudgeForTests ? { judgeFn: backgroundDeliveryJudgeForTests } : {}),
     });
     if (!verdict.delivered) {
-      return coverageBlock ?? { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
+      return { outcome: 'blocked', reason: verdict.reason ?? 'Run did not produce a verifiable deliverable.' };
     }
   } catch {
-    if (coverageBlock) return coverageBlock;
     return { outcome: 'done' };
   }
 
@@ -1594,7 +1698,11 @@ async function verifyBackgroundTaskDelivery(
 function fanoutCoverageBlock(runSessionId: string): { outcome: 'blocked'; reason: string } | null {
   if (!fanoutLedgerEnabled()) return null;
   try {
-    const cov = summarizeLedger(runSessionId);
+    // Wave 4 Stage 1: read coverage from the DURABLE worker_result log (restart-
+    // surviving, deduped by packetKey) rather than the per-process in-memory
+    // ledger, so a resumed swarm reports honest "M of N" without a rehydrate that
+    // double-counted against the live path or got wiped by clearLedger-on-continue.
+    const cov = summarizeFanoutCoverage(runSessionId);
     if (cov.total > 0 && cov.failed > 0) {
       const shown = cov.failedItems.slice(0, 8).join(', ');
       const more = cov.failedItems.length > 8 ? `, +${cov.failedItems.length - 8} more` : '';
@@ -1772,6 +1880,11 @@ function reattachInterruptedTaskInPlace(id: string): BackgroundTaskRecord | null
     },
   });
   if (updated) {
+    // Wave 4 Stage 1 (durable swarm resume): no ledger rehydrate needed — coverage
+    // is now summarized directly from the durable worker_result log at the check
+    // point (fanoutCoverageBlock → summarizeFanoutCoverage), which survives the
+    // restart by construction. The per-worker idempotency guard separately skips
+    // re-executing workers that already completed.
     addNotification({
       id: `${Date.now()}-background-${updated.id}-reattached`,
       kind: 'execution',
@@ -2181,6 +2294,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      }
 	      const wallClockDeadlineMs = Date.now() + task.maxMinutes * 60_000;
 	      let autoContinueAttempts = 0;
+	      let toolCountAtLastCap = 0; // Wave 3: tool activity at each budget cycle
 	      let response: AssistantResponse;
 	      while (true) {
 	        // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
@@ -2251,9 +2365,29 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        task = recordBackgroundTaskRoute(task, run.id, response, requestedModel);
 
 	        if (response.stoppedReason !== 'max-turns-with-grace') break;
-	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) break;
+	        if (autoContinueAttempts >= BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP) {
+	          // Wave 3 Move A: past the free auto-continue cap, SELF-RESUME only if an
+	          // independent cross-family judge confirms genuine PROGRESS, under the hard
+	          // ceiling, with new tool activity — else park (baseline). Cheap checks first
+	          // (selfResumeDecision, pure/tested); the judge fails CLOSED (park). The
+	          // 240-min wall clock bounds everything regardless.
+	          const cycleToolCalls = toolCount - toolCountAtLastCap;
+	          const dec = selfResumeDecision({ enabled: backgroundSelfResumeEnabled(), autoContinueAttempts, hardCap: BACKGROUND_SELF_RESUME_HARD_CAP, cycleToolCalls });
+	          let selfResumeOk = dec.resume === true;
+	          let progressReason = dec.reason;
+	          if (dec.needJudge) {
+	            const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
+	            const prog = await runProgressJudgeImpl(objective, response.text ?? '', cycleToolCalls);
+	            selfResumeOk = prog.verdict?.progressing === true;
+	            progressReason = prog.verdict?.reason ?? `progress judge ${prog.failure ?? 'no-verdict'} → park`;
+	            emitBackgroundTaskOperational('background_self_resume_check', task, { progressing: selfResumeOk, attempt: autoContinueAttempts, hardCap: BACKGROUND_SELF_RESUME_HARD_CAP, cycleToolCalls, reason: progressReason, selfJudge: prog.selfJudge, judgeFailure: prog.failure ?? null }, selfResumeOk ? 'info' : 'warn');
+	          }
+	          addRunEvent(run.id, { type: 'status', message: `Self-resume at continue ${autoContinueAttempts}: ${selfResumeOk ? 'PROGRESSING → continuing unattended' : 'STOP → parking'} — ${progressReason}`, data: { selfResume: selfResumeOk, autoContinueAttempts, reason: progressReason, cycleToolCalls } });
+	          if (!selfResumeOk) break;
+	        }
 	        clearLedger(task.runSessionId);
 	        autoContinueAttempts += 1;
+	        toolCountAtLastCap = toolCount;
 	        addRunEvent(run.id, {
 	          type: 'status',
 	          message: `Background task hit an internal run budget; continuing automatically (${autoContinueAttempts}/${BACKGROUND_TURN_BUDGET_AUTO_CONTINUE_CAP}).`,

@@ -11,6 +11,7 @@
  * instead of a hollow done.
  */
 import { getRuntimeEnv } from '../../config.js';
+import { listEvents } from './eventlog.js';
 
 export interface LedgerEntry {
   item: string | null;
@@ -88,5 +89,63 @@ export function clearLedger(sessionId: string): void {
     ledgerBySession.delete(sessionId);
   } catch {
     /* best effort */
+  }
+}
+
+/**
+ * Wave 4 Stage 1 (durable swarm resume): coverage summarized DIRECTLY from the
+ * durable `worker_result` event log — the true, restart-surviving source — instead
+ * of the per-process in-memory ledger. This is what `fanoutCoverageBlock` reads,
+ * so a resumed swarm reports honest "M of N" with NO reliance on rehydrating a
+ * volatile ledger (the earlier rehydrate keyed `pk:`/`it:` while the live hook
+ * keyed by raw callId, so the two double-counted after resume, and the
+ * auto-continue `clearLedger` wiped the rehydrated entries — adversarial review
+ * ledger F1/F2). Dedups by packetKey (else item, else a per-event id); events
+ * arrive ASC by seq so the LAST outcome wins (a failed-then-succeeded item
+ * collapses to ok — no phantom failure after a successful retry/resume).
+ * Best-effort: any read error yields empty coverage (callers treat total:0 as
+ * "no fan-out to gate", never a hollow done).
+ */
+export function summarizeFanoutCoverage(sessionId: string): LedgerSummary {
+  const empty: LedgerSummary = { total: 0, done: 0, failed: 0, failedItems: [] };
+  try {
+    if (!sessionId) return empty;
+    const events = listEvents(sessionId, { types: ['worker_result', 'fanout_run_boundary'] });
+    // Scope to the CURRENT run: a background task's runSessionId is stable across
+    // all its runs/continues, so ignore worker_results before the latest run
+    // boundary — a prior run's failures must not leak into this run's coverage
+    // (else a re-completed continue-heavy task blocks forever). No boundary (e.g.
+    // a chat-lane fan-out) → count the whole session, as before.
+    let boundarySeq = -1;
+    for (const e of events) if (e.type === 'fanout_run_boundary' && e.seq > boundarySeq) boundarySeq = e.seq;
+    // Key by ITEM identity (last-attempt-wins), NOT packetKey. The unit of coverage
+    // is the ITEM, and an item can have MULTIPLE attempts: a worker fails, the brain
+    // RETRIES it with a re-planned packet (a DIFFERENT packetKey), and it succeeds.
+    // Keying by packetKey counted those as two separate items → a phantom "failed"
+    // for an item that was actually completed (caught by a live fan-out where Cohere
+    // failed then succeeded on retry — would false-block a background run). Events
+    // arrive ASC by seq, so Map-set = last attempt wins: a retry's ok:true overrides
+    // the earlier failure, AND a Stage-2 ok:false (recorded after the success)
+    // correctly overrides it. A same-packet reuse re-emits the same item → dedups.
+    const byKey = new Map<string, { item: string | null; ok: boolean }>();
+    let idx = 0;
+    for (const e of events) {
+      if (e.type !== 'worker_result' || e.seq <= boundarySeq) continue;
+      const d = e.data as { item?: unknown; ok?: unknown; packetKey?: unknown } | undefined;
+      if (!d || typeof d.ok !== 'boolean') continue;
+      const itemKey = typeof d.item === 'string' ? d.item.trim().toLowerCase().replace(/\s+/g, ' ') : '';
+      const key = itemKey ? `it:${itemKey}` : `idx:${idx}`;
+      byKey.set(key, { item: typeof d.item === 'string' ? d.item : null, ok: d.ok });
+      idx += 1;
+    }
+    let done = 0;
+    const failedItems: string[] = [];
+    for (const v of byKey.values()) {
+      if (v.ok) done += 1;
+      else failedItems.push(v.item ?? '(unlabeled item)');
+    }
+    return { total: byKey.size, done, failed: failedItems.length, failedItems };
+  } catch {
+    return empty;
   }
 }

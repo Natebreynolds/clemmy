@@ -81,12 +81,14 @@ import { primeTurnRecallVector, searchFactsByText, touchFactAccess } from '../..
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
+import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { maybeAutoFocusSession } from './auto-focus.js';
 import {
   MISSING_REPLY_USER_FALLBACK,
   STRUCTURED_OUTPUT_RECOVERY_FALLBACK,
   STALL_OUTPUT_PATTERN,
   isPlainTextContractDirective,
+  replyFulfillsVerbatimRequest,
   toOrchestratorDecision,
   evaluateStructuredDecisionStall,
   evaluateProgress,
@@ -1171,6 +1173,10 @@ function factsBlockForPrimer(query: string): string {
   }
 }
 const TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS = positiveIntEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS', 800);
+// Wave 2 Move A: AUGMENT the turn primer with cross-store breadcrumbs (people/
+// places/proven-tools) via the shared crossStoreBreadcrumbs helper — APPENDED to
+// the existing facts+vault+episodic primer, sync-only (no latency). Same helper is
+// used by the Claude SDK brain lane (claude-agent-brain.ts) so BOTH brains get it.
 
 function isSyntheticStallRetryInput(text: string): boolean {
   return text.startsWith('Your previous response was prose, not an action.')
@@ -1330,14 +1336,14 @@ interface TurnMemoryPrimer {
   skippedReason?: string;
 }
 
-function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = ''): TurnMemoryPrimer {
+function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = '', breadcrumbs = ''): TurnMemoryPrimer {
   const formatted = formatSearchHits(hits, TURN_MEMORY_PRIMER_MAX_CHARS);
   // Durable facts relevant to THIS message — the primer's vault search alone
   // never surfaced consolidated_facts, so a just-remembered fact was invisible.
   const factsBlock = factsBlockForPrimer(query);
   // Recently-observed breadcrumbs for this session (was a write-only table).
   const episodicBlock = episodicBlockForPrimer(sessionId);
-  if (!formatted && !factsBlock && !episodicBlock) {
+  if (!formatted && !factsBlock && !episodicBlock && !breadcrumbs) {
     return { enabled: true, query, hitCount: hits.length, injectedBytes: 0, source, skippedReason: 'no_hits' };
   }
   const sourceLabel = source === 'hybrid'
@@ -1350,6 +1356,10 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     ...(factsBlock ? ['', factsBlock] : []),
     ...(episodicBlock ? ['', episodicBlock] : []),
     ...(formatted ? ['', formatted] : []),
+    // Wave 2 Move A: cross-store breadcrumbs (people/places/proven tools) — the
+    // stores that had no per-turn auto-recall, appended so the existing blocks
+    // above are never lost.
+    ...(breadcrumbs ? ['', breadcrumbs] : []),
   ].join('\n');
   return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text };
 }
@@ -1375,28 +1385,32 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
   }
 
   try {
+    // Wave 2 Move A: APPEND sync cross-store breadcrumbs (people/places/tools) to
+    // the existing facts+vault+episodic primer — never replacing it. Self-gating +
+    // computed once (sync stores → no latency), passed into every format path below.
+    const breadcrumbs = await crossStoreBreadcrumbs(query);
     const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
-    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId);
+    if (!hybridEnabled) return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
 
     try {
       const hybridHits = await searchVaultAsyncWithTimeout(query);
       if (hybridHits && hybridHits.length > 0) {
-        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId);
+        return formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId, breadcrumbs);
       }
       if (hybridHits === null) {
         return {
-          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId),
+          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId, breadcrumbs),
           skippedReason: ftsHits.length > 0 ? 'hybrid_timeout' : 'hybrid_timeout_no_fts_hits',
         };
       }
     } catch {
       return {
-        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId),
+        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId, breadcrumbs),
         skippedReason: ftsHits.length > 0 ? 'hybrid_error' : 'hybrid_error_no_fts_hits',
       };
     }
 
-    return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId);
+    return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
   } catch (err) {
     return {
       enabled: true,
@@ -2095,6 +2109,14 @@ async function runConversationCore(
               delivered: true,
             },
           });
+          // Synthesize the decision for the RETURN-VALUE lane (2026-07-13): every
+          // salvage here completes with decision===null, so lastDecision was
+          // undefined and respondViaHarness (respond-bridge.ts) built its reply
+          // from lastDecision → shipped "(no reply produced)" on the API/Discord
+          // surfaces while the event lane (desktop dock) showed the real reply —
+          // a parity defect across the whole salvage CLASS. The event above stays
+          // the source of truth; this mirrors it into the return value.
+          lastDecision = { summary: contractReply, reply: contractReply, done: true, nextAction: 'completed', reason: null };
           return {
             sessionId: options.sessionId,
             status: 'completed',
@@ -2103,6 +2125,53 @@ async function runConversationCore(
             lastTurn,
           };
         }
+      }
+      // VERBATIM-ECHO FULFILLMENT (2026-07-13). The user's own directive explicitly
+      // asked for an exact short reply ("Reply with just the word: ok") and the model
+      // produced EXACTLY that with zero tools. parseDecisionText nulls it as a generic
+      // ack (STALL_OUTPUT_PATTERN), so without this it falls to the stall steer ("you
+      // MUST call a tool") and the model flails call_tool with varying args until the
+      // budget cap — the F1 runaway. The requested literal is grammatically bound to a
+      // reply verb / "the word <X>" construction AND the reply EQUALS it, so this is
+      // fulfillment, not a punt. A lazy "OK." on an OPEN task has no bound literal equal
+      // to "ok" and still falls through to the stall machinery below (the deliberate
+      // ack-exclusion is untouched). Keyed on options.input — the code guarantees that
+      // is ALWAYS the user's real message (continuations only ever re-assign nextInput,
+      // and a convergence-steer prefix could push nextInput past the length gate), so
+      // this reads the user's actual ask, not a harness directive. The EQUALITY gate is
+      // the guard against re-firing: any turn whose reply is not exactly the literal
+      // (a real tool turn, an announcement) simply doesn't match. Shares the
+      // HARNESS_STALL_SALVAGE_REPLY kill-switch with the consistency salvage below.
+      if (
+        (turnResult.toolCalls ?? 0) === 0 &&
+        typeof turnResult.finalOutput === 'string' &&
+        (getRuntimeEnv('HARNESS_STALL_SALVAGE_REPLY', 'on') ?? 'on').toLowerCase() !== 'off' &&
+        replyFulfillsVerbatimRequest(options.input, turnResult.finalOutput)
+      ) {
+        const verbatimReply = turnResult.finalOutput.trim();
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'conversation_completed',
+          data: {
+            steps: stepIndex,
+            reason: 'verbatim_reply_fulfilled',
+            summary: verbatimReply,
+            reply: verbatimReply,
+            delivered: true,
+          },
+        });
+        // Mirror the reply into the return value for the respond-bridge lane
+        // (see the plain-text-contract salvage above — same class fix).
+        lastDecision = { summary: verbatimReply, reply: verbatimReply, done: true, nextAction: 'completed', reason: null };
+        return {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: stepIndex,
+          lastDecision,
+          lastTurn,
+        };
       }
       // Malformed/unparseable-decision RECOVERY. Sub-agents are TOOLS here (no
       // SDK handoffs — see orchestrator.ts), so a null decision means the
@@ -2241,6 +2310,9 @@ async function runConversationCore(
               stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
             },
           });
+          // Mirror the reply into the return value for the respond-bridge lane
+          // (see the plain-text-contract salvage above — same class fix).
+          lastDecision = { summary: stallInfo.userVisibleMessage, reply: stallInfo.userVisibleMessage, done: true, nextAction: 'completed', reason: null };
           return {
             sessionId: options.sessionId,
             status: 'completed',
@@ -2280,6 +2352,9 @@ async function runConversationCore(
                 stallDetail: { signal: stallInfo.signal, ...stallInfo.detail },
               },
             });
+            // Mirror the reply into the return value for the respond-bridge lane
+            // (see the plain-text-contract salvage above — same class fix).
+            lastDecision = { summary: finalText, reply: finalText, done: true, nextAction: 'completed', reason: null };
             return {
               sessionId: options.sessionId,
               status: 'completed',

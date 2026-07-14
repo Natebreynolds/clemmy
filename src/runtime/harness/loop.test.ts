@@ -47,6 +47,13 @@ writeFileSync(
 // in scripts/verify-long-running.mjs → stall-converts-to-question.
 process.env.HARNESS_STALL_ASK_USER = 'off';
 process.env.HARNESS_MAX_STALL_RETRIES = '1';
+// Determinism: cross-family judging is now DEFAULT ON (2026-07-13), but this
+// suite tests delivery/completion mechanics, NOT judge routing. On a dev machine
+// with Claude Code logged in, judge availability falls back to ~/.claude creds
+// (NOT isolated by CLEMENTINE_HOME), so a cross-family judge would resolve LIVE
+// and make a real, nondeterministic call. Pin =off for a deterministic same-family
+// judge. Cross-family routing is covered in boundary-judge.test.ts.
+process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
 // This suite drives the loop with SCRIPTED runners that simulate tool calls by
 // emitting agent_tool_start events (no real wrapped-tool invoke). Tool-call
 // counting for those simulated calls comes from the loop's event-based fallback
@@ -4086,6 +4093,55 @@ test('runConversation: a zero-tool text reply to the draft-present directive is 
   assert.ok(delivered, 'the compliant draft reply is delivered as fulfillment of the plain-text contract');
   assert.match(String((delivered!.data as { reply?: string }).reply ?? ''), /ready for your review/);
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no "unable to make progress" banner');
+});
+
+// 2026-07-13 (F1 runaway): "Reply with just the word: ok" → the model correctly
+// replies "ok" (zero tools), but STALL_OUTPUT_PATTERN nulls it as a generic ack and
+// the stall steer ("you MUST call a tool") makes the model flail call_tool ~51× for
+// a request that needs no tool. The verbatim-echo salvage delivers the exact literal
+// the user explicitly requested and the steer never fires.
+test('runConversation: an exact reply to a verbatim request is DELIVERED, no stall steer (F1 runaway fix)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  // The model complies exactly — "ok", zero tools — the correct deliverable.
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: 'ok' });
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'Reply with just the word: ok',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  assert.equal(result.status, 'completed');
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  const delivered = completed.find((e) => (e.data as { reason?: string }).reason === 'verbatim_reply_fulfilled');
+  assert.ok(delivered, 'the exact requested reply is delivered as verbatim fulfillment');
+  assert.match(String((delivered!.data as { reply?: string }).reply ?? ''), /^ok$/);
+  // The RETURN-VALUE lane must carry the reply too: respondViaHarness builds its
+  // text from lastDecision, and an unset one shipped "(no reply produced)" on the
+  // API/Discord surfaces (pre-patch review finding — class fix across all salvages).
+  assert.equal(result.lastDecision?.reply, 'ok', 'the salvaged reply is mirrored into lastDecision for the respond-bridge lane');
+  // The whole point: the stall steer that provokes the flail NEVER fires.
+  assert.equal(listEventsForConv(sess.id, { types: ['stall_retry_attempted'] }).length, 0, 'no stall steer → no call_tool flail');
+  assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+// Guard the other side of the equality gate: a lazy generic ack on an OPEN task is
+// NOT a verbatim request, so it must still fall through to the stall machinery and
+// never be salvaged by the verbatim path.
+test('runConversation: a bare "ok" on an OPEN task is NOT verbatim-salvaged (equality gate holds)', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const runRunner: RunRunnerFn = async (_r, _a, items) => ({ history: items, lastResponseId: undefined, finalOutput: 'ok' });
+  const result = await runConversation({
+    agent: makeAgentStub(), sessionId: sess.id, input: 'Analyze these 50 deals and summarize the risks',
+    makeRunner: makeRunnerStub, runRunner,
+  });
+  const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(
+    completed.filter((e) => (e.data as { reason?: string }).reason === 'verbatim_reply_fulfilled').length,
+    0,
+    'a lazy ack on an open task is never delivered as verbatim fulfillment',
+  );
+  // It IS treated as a stall (the deliberate lazy-punt rejection is intact).
+  assert.ok(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length > 0, 'a bare ack on an open task still stalls');
 });
 
 test('runConversation: a substantive answer repeated identically across stall retries is SALVAGED, not replaced by the banner', async () => {

@@ -37,6 +37,10 @@ export interface SubagentRunRecord {
   model?: string;
   /** The single item/task this agent handled. */
   task: string;
+  /** Wave 4 Stage 1: the job-packet key (workerPacketKey), so durable-resume reuse
+   *  matches the SAME identity the idempotency guard matched — not a coarse item
+   *  label two distinct packets could share. Absent on pre-Stage-1 records. */
+  packetKey?: string;
   status: SubagentStatus;
   /** First slice of the output for at-a-glance display (full output in outputRef). */
   outputPreview: string;
@@ -138,6 +142,7 @@ export function recordSubagentRun(
       provider: input.provider,
       ...(input.model ? { model: input.model } : {}),
       task: input.task,
+      ...(input.packetKey ? { packetKey: input.packetKey } : {}),
       status: input.status,
       outputPreview: output.slice(0, PREVIEW_MAX).replace(/\s+/g, ' ').trim(),
       ...(outputRef ? { outputRef } : {}),
@@ -169,6 +174,49 @@ export function listSubagentRuns(parentRunId: string): SubagentRunRecord[] {
 export function readSubagentOutput(parentRunId: string, id: string): string | null {
   try {
     return readFileSync(outputPath(parentRunId, id), 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wave 4 Stage 1 (durable swarm resume): the FULL persisted work-product of the
+ * most-recent SUCCESSFUL subagent run matching this job packet under `parentRunId`,
+ * or null. The durable-resume idempotency guard uses it to REUSE a completed
+ * worker's real output on resume instead of re-executing.
+ *
+ * Matches by `packetKey` FIRST (the same identity the guard matched) so two
+ * DISTINCT packets that share an item label — e.g. "research acme.com" then
+ * "draft outreach for acme.com" — never cross-contaminate (adversarial review
+ * Defect 1). Falls back to the item-string match ONLY for legacy records that
+ * predate the packetKey field. Returns ONLY a real persisted work-product (the
+ * `outputRef` file) — never the 600-char preview — so a missing/blank output
+ * yields null and the caller RE-EXECUTES rather than passing a truncated preview
+ * off as the deliverable (Defect 3 / F4). Fail-open.
+ */
+export function findCompletedSubagentOutput(parentRunId: string, item: string, packetKey?: string | null): string | null {
+  try {
+    const target = (item ?? '').trim();
+    const targetFold = target.toLowerCase().replace(/\s+/g, ' ');
+    const wantKey = (packetKey ?? '').trim();
+    const runs = listSubagentRuns(parentRunId);
+    for (let i = runs.length - 1; i >= 0; i -= 1) {
+      const r = runs[i];
+      if (r.status !== 'ok') continue;
+      // When a packet key is supplied (always, in current-build reuse), match ONLY
+      // by packetKey — never fall back to the item LABEL. The label fallback is
+      // reserved for legacy callers with no key, so a keyless non-worker record
+      // (e.g. a workflow-step run sharing the parent ledger) whose label happens to
+      // equal a worker's item can never be returned as the worker's output.
+      const matches = wantKey
+        ? r.packetKey === wantKey
+        : !r.packetKey && !!target && ((r.task ?? '').trim() === target
+            || (r.task ?? '').trim().toLowerCase().replace(/\s+/g, ' ') === targetFold);
+      if (!matches) continue;
+      const full = r.outputRef ? readSubagentOutput(parentRunId, r.id) : null;
+      return full && full.trim() ? full : null;
+    }
+    return null;
   } catch {
     return null;
   }

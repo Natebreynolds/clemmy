@@ -7,7 +7,42 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, parseCompletionVerdict } = await import('./objective-judge.js');
+const { buildObjectiveJudgePrompt, judgeObjectiveComplete, shouldRunObjectiveJudge, isPromiseShapedReply, clipForJudge, JUDGE_RESPONSE_MAX_CHARS, parseCompletionVerdict, parseProgressVerdict } = await import('./objective-judge.js');
+
+test('parseProgressVerdict: on-contract PROGRESS/STUCK single-line verdicts (Wave 3 self-resume)', () => {
+  assert.deepEqual(parseProgressVerdict('PROGRESS: fetched 12 new firm records this cycle'), { progressing: true, reason: 'fetched 12 new firm records this cycle' });
+  assert.deepEqual(parseProgressVerdict('STUCK: re-running the same failing search'), { progressing: false, reason: 're-running the same failing search' });
+  assert.equal(parseProgressVerdict('PROGRESS - advancing coverage across the sheet')?.progressing, true);
+  // A STUCK marker on a later line still wins (preamble before the verdict line).
+  assert.equal(parseProgressVerdict('Assessing progress...\nSTUCK: thrashing on the same call')?.progressing, false);
+  assert.equal(parseProgressVerdict('some unparseable blob'), null);
+  assert.equal(parseProgressVerdict(''), null);
+});
+
+// Regression for the Wave-3 adversarial-review finding: the old parser scanned the
+// whole blob for the FIRST progress-ish token unanchored, so a STUCK verdict whose
+// prose merely OPENED with the word "progress" parsed as PROGRESSING and GRANTED a
+// stuck run more unattended compute — inverting the gate's fail-CLOSED guarantee.
+// Every one of these must now be NOT progressing (park), never {progressing:true}.
+test('parseProgressVerdict: FAILS CLOSED — a STUCK verdict phrased in prose never reads as PROGRESSING', () => {
+  const stuckPhrasings = [
+    'No real progress; STUCK: repeating the same failing call',
+    'No forward progress — STUCK: looping',
+    'Making no forward progress — STUCK',
+    'The run shows no progress and is STUCK looping',
+    'Progress toward the objective is minimal; the run is stuck.',
+    'In terms of progress, the run is looping and blocked. STUCK.',
+    'Progress: none. The run is thrashing.',
+    'The run should not CONTINUE; it is STUCK on the same error.',
+    'The task will not progress further; STUCK',
+  ];
+  for (const reply of stuckPhrasings) {
+    assert.equal(parseProgressVerdict(reply)?.progressing, false, `must park (not progressing): ${JSON.stringify(reply)}`);
+  }
+  // Off-contract prose with no marker and no stuck-signal ⇒ null ⇒ caller parks.
+  assert.equal(parseProgressVerdict('PROGRESSING nicely toward the sheet'), null);
+  assert.equal(parseProgressVerdict('It made good headway toward the goal'), null);
+});
 
 const baseGate = {
   optIn: true,

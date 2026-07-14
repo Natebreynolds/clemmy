@@ -204,6 +204,11 @@ export const EVENT_TYPES = [
   // mid-run daemon restart lost it; this makes the swarm's coverage + per-worker
   // spend restart-surviving and queryable for a 30-60min 100-subagent run.
   'worker_result',
+  // Wave 4 Stage 2: a run/continue boundary for a background task's stable
+  // runSessionId, so fan-out coverage (summarizeFanoutCoverage) counts only THIS
+  // run's worker_results and a prior run's failures don't leak into a later
+  // continue's completion check (would permanently block a re-completed task).
+  'fanout_run_boundary',
   // Move 2: deterministic pre-execution coherence critique of a surfaced plan
   // (uncovered success criteria, unverifiable steps) — surfaced before approval so
   // a walk-away user never green-lights a structurally weak 100-subagent plan.

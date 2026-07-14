@@ -41,6 +41,80 @@ export function isPlainTextContractDirective(input: unknown): boolean {
   return typeof input === 'string' && PLAIN_TEXT_CONTRACT_DIRECTIVE_PATTERN.test(input);
 }
 
+// ── Verbatim-echo request (2026-07-13) ─────────────────────────────────────────
+// A SHORT user directive (≤240 chars) whose ENTIRE content is a request for an
+// EXACT verbatim reply and nothing else — "Reply with just the word: ok", "respond
+// with only 'yes'", "say exactly: done". A BARE (unquoted) literal must be a SINGLE
+// token; multi-word literals must be quoted.
+//
+// The bindings are ^…$-ANCHORED (whole-directive): the reply-verb / "the word <X>"
+// construction must BEGIN the directive (after an optional trivial lead-in). This is
+// load-bearing — a $-only anchor matched the TAIL of a directive whose head was an
+// unrelated ACTION clause ("Fix the login bug and just reply ok" → extracted "ok"),
+// so a zero-tool punt of that ack word was wrongly delivered as done (adversarial
+// review 2026-07-13). Anchoring the whole directive means any real action clause
+// before the reply-request breaks the match → null → the punt correctly falls to the
+// stall machinery. The extracted literal set overlaps STALL_OUTPUT_PATTERN, so the
+// $-only "equality gate is enough" reasoning was FALSE for the action-then-ack class.
+//
+// This exists because a compliant "ok" reply (zero tools) is otherwise nulled as a
+// generic ack by STALL_OUTPUT_PATTERN and routed to the stall steer ("you MUST call
+// a tool"), which makes the model flail call_tool for a request that needs no tool.
+// The caller (loop.ts) delivers the zero-tool reply ONLY when it EQUALS this literal.
+const VERBATIM_REPLY_MAX_DIRECTIVE_CHARS = 240;
+const VERBATIM_REPLY_BINDINGS: readonly RegExp[] = [
+  // WHOLE directive = a SPEECH-verb reply request. The lead-in allows only TRIVIAL
+  // politeness ("hey", "can/could/would/will you", "please/kindly/pls",
+  // "just/only/simply") — and because the verb must IMMEDIATELY follow it, no action
+  // clause can slip in ("Can you fix the bug and reply ok" still fails, verified).
+  // Then an optional "the word/phrase <X>" construction and a quoted-or-single-bare
+  // literal at the end. SPEECH verbs only (reply|respond|answer|say) may bind a BARE
+  // token — an unambiguous ask for words.
+  /^\s*(?:hey[,!\s]+)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+|kindly\s+|pls\s+)?(?:just\s+|only\s+|simply\s+)?(?:reply|respond|answer|say)\b(?:\s+(?:back|to\s+me|with|only|just|simply|exactly|verbatim))*(?:\s+the\s+(?:single\s+|exact\s+|one\s+|only\s+)?(?:word|phrase|text|token|string|letter|character))?\s*(?:is|being)?\s*[:\-=]?\s*(?:["'“”‘’`]([^"'“”‘’`\n]{1,60})["'“”‘’`]|([A-Za-z0-9][A-Za-z0-9._-]*))\s*[.!?]*$/i,
+  // IO verbs (write|output|return|print|type) are AMBIGUOUS — "type yes" can mean
+  // "type yes into the prompt you're operating" and "write done" can mean a file
+  // write, so a BARE token after an IO verb must NOT salvage (found by the pre-patch
+  // review probing the widened verb list). IO verbs require EXPLICIT verbatim intent:
+  // a QUOTED literal, or the "the word/phrase <X>" construction (bare then allowed).
+  /^\s*(?:hey[,!\s]+)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+|kindly\s+|pls\s+)?(?:just\s+|only\s+|simply\s+)?(?:write|output|return|print|type)\b(?:\s+(?:back|to\s+me|with|only|just|simply|exactly|verbatim))*(?:\s+the\s+(?:single\s+|exact\s+|one\s+|only\s+)?(?:word|phrase|text|token|string|letter|character)\s*(?:is|being)?\s*[:\-=]?\s*(?:["'“”‘’`]([^"'“”‘’`\n]{1,60})["'“”‘’`]|([A-Za-z0-9][A-Za-z0-9._-]*))|\s*[:\-=]?\s*["'“”‘’`]([^"'“”‘’`\n]{1,60})["'“”‘’`])\s*[.!?]*$/i,
+  // WHOLE directive = a "the word/phrase <X>" request with no preceding action clause.
+  /^\s*(?:just\s+|only\s+)?the\s+(?:single\s+|exact\s+|one\s+|only\s+)?(?:word|phrase|text|token|string|letter|character)\b\s*(?:is|:|=|-|being)?\s*(?:["'“”‘’`]([^"'“”‘’`\n]{1,60})["'“”‘’`]|([A-Za-z0-9][A-Za-z0-9._-]*))\s*[.!?]*$/i,
+];
+const VERBATIM_STRIP = /^["'“”‘’`\s]+|["'“”‘’`.!?\s]+$/g;
+function normalizeVerbatim(s: string): string {
+  return s.replace(VERBATIM_STRIP, '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** The exact short literal a directive explicitly requested as the whole reply, or
+ *  null. Pure; used only to gate an additive completion path — a false null merely
+ *  falls through to today's behavior (no regression). */
+export function requestedVerbatimReply(input: unknown): string | null {
+  if (typeof input !== 'string') return null;
+  const d = input.trim();
+  if (!d || d.length > VERBATIM_REPLY_MAX_DIRECTIVE_CHARS) return null;
+  for (const re of VERBATIM_REPLY_BINDINGS) {
+    const m = d.match(re);
+    if (m) {
+      // Bindings differ in capture-group count (quoted vs bare vs marker paths);
+      // the literal is whichever group matched.
+      const literal = m.slice(1).find((g) => typeof g === 'string' && g.trim())?.trim();
+      if (literal) return literal;
+    }
+  }
+  return null;
+}
+
+/** True when the directive explicitly asked for an exact short reply AND the
+ *  zero-tool reply EQUALS it (normalized). The equality is the guard against
+ *  salvaging a lazy ack — a bare "OK." only passes if the user literally asked
+ *  for "ok". */
+export function replyFulfillsVerbatimRequest(directive: unknown, reply: unknown): boolean {
+  const requested = requestedVerbatimReply(directive);
+  if (!requested || typeof reply !== 'string') return false;
+  const r = normalizeVerbatim(reply);
+  return r.length > 0 && r === normalizeVerbatim(requested);
+}
+
 const VALID_DECISION_ACTIONS: ReadonlySet<string> = new Set([
   'awaiting_user_input',
   'awaiting_approval',

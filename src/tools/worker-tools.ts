@@ -1,9 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { WorkerToolInputSchema, type WorkerToolInput } from '../agents/worker-job-packet.js';
-import { recordSubagentRun } from '../agents/subagent-runs.js';
+import { WorkerToolInputSchema, workerPacketKey, type WorkerToolInput } from '../agents/worker-job-packet.js';
+import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
 import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot } from '../agents/worker-concurrency.js';
-import { workerItemAlreadyCapped } from '../agents/worker-respawn-guard.js';
+import { workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
@@ -118,11 +118,37 @@ export function registerWorkerTools(server: McpServer): void {
       if (!sessionId) {
         return textResult('ERROR: run_worker needs a live session context. Do this item inline instead.');
       }
+      // Wave 4 Stage 1: packet key identifies this exact job so a resumed run can
+      // detect a worker that already completed and skip re-executing it.
+      const packetKey = workerPacketKey(input);
       const recordResult = (ok: boolean, reason?: string, model?: string): void => {
         try {
-          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
+          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_result', data: { item: input.item, ok, packetKey, ...(reason ? { reason } : {}), ...(model ? { model } : {}), lane: 'sdk_brain' } });
         } catch { /* durable trace is best-effort */ }
       };
+
+      // Wave 4 Stage 1 — durable-resume idempotency (checked BEFORE the fuzzy
+      // cap-guard: an exact-packet ok match is a STRONGER signal than the
+      // domain-collapsing cap match, and must win so a worker that genuinely
+      // COMPLETED isn't refused-as-failed on resume because a same-domain sibling
+      // capped — adversarial review F1). If this exact packet already completed
+      // successfully in this run session, REUSE the prior work-product instead of
+      // re-executing (re-running would redo the work and re-issue its external
+      // writes). ONLY short-circuit when the real output is recoverable — else
+      // fall through and re-execute rather than pass a placeholder off as success
+      // (F4); the duplicate-send wall backstops any repeated send. Fail-open;
+      // kill-switch CLEMMY_WORKER_RESUME_IDEMPOTENCY.
+      try {
+        if (workerResumeIdempotencyEnabled() && workerAlreadyCompletedForPacket(sessionId, packetKey)) {
+          const parentRunId = getToolOutputContext()?.workflowRunId || sessionId;
+          const prior = findCompletedSubagentOutput(parentRunId, input.item, packetKey);
+          if (prior && prior.trim()) {
+            recordResult(true, 'resume: reused prior completed result');
+            return textResult(prior);
+          }
+          // No recoverable output → do NOT claim success; re-execute below.
+        }
+      } catch { /* fail-open */ }
 
       // HARD respawn guard: if THIS item already hit its turn cap earlier this run,
       // refuse to re-spawn it (a re-run with the same packet just caps again — the
@@ -251,6 +277,7 @@ export function registerWorkerTools(server: McpServer): void {
             provider: resultProvider,
             model: result.model ?? workerModel,
             task: input.item,
+            packetKey,
             status: capped ? 'capped' : ok ? 'ok' : 'error',
             output: result.text ?? '',
             startedAt: new Date(routeStartedAt).toISOString(),
@@ -282,6 +309,7 @@ export function registerWorkerTools(server: McpServer): void {
             provider: failedProvider,
             model: workerModel,
             task: input.item,
+            packetKey,
             status: 'error',
             output: `ERROR: worker for "${input.item}" failed: ${firstLine(err)}`,
             startedAt: new Date(routeStartedAt).toISOString(),

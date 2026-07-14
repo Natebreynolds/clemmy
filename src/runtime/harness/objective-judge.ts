@@ -641,6 +641,86 @@ export async function judgeObjectiveComplete(
   };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// PROGRESS judge (Wave 3) — should a background run that hit its turn budget
+// without finishing be GRANTED MORE compute to keep going unattended, or is it
+// STUCK and should park for a human? Cross-family + hedged (reuses the Wave-1
+// boundary-judge infra). Deliberately FAIL-CLOSED at the call site: uncertain /
+// unavailable / unparseable ⇒ NOT progressing ⇒ park, so a judge hiccup can never
+// grant a runaway more budget. The absolute wall-clock + a hard continue ceiling
+// bound it regardless of this verdict.
+// ─────────────────────────────────────────────────────────────────
+
+const PROGRESS_JUDGE_SYSTEM_PROMPT = [
+  'You decide whether a long-running AUTONOMOUS background run should be granted MORE turns to finish unattended, or STOPPED because it is stuck.',
+  'The run hit an internal turn budget WITHOUT finishing its objective.',
+  '',
+  'Answer PROGRESS only when the run is making GENUINE forward progress toward the DELIVERABLE — new results, new artifacts, advancing coverage, each cycle moving closer to done.',
+  'Answer STUCK when it is looping, repeating the same actions, thrashing, producing no new results, blocked on the same error, or drifting off the objective.',
+  'Activity alone is NOT progress: many tool calls that repeat or do not advance the objective are STUCK.',
+  'When UNCERTAIN, answer STUCK — stopping is safe (the user can resume); granting a stuck run more budget wastes it.',
+  '',
+  'Reply with EXACTLY ONE LINE: "PROGRESS: <short reason>" or "STUCK: <short reason>".',
+].join('\n');
+
+export interface RunProgressVerdict { progressing: boolean; reason: string }
+
+// Parse ONLY the contract the prompt demands — a line that STARTS with the
+// marker followed by a ":"/"-" delimiter ("PROGRESS: <reason>" / "STUCK:
+// <reason>"). The earlier version scanned the whole blob for the FIRST of a wide
+// synonym set (PROGRESS|STUCK|PROGRESSING|CONTINUE|STOP|PARK) with /is and NO
+// anchor, so a STUCK verdict whose prose merely OPENED with the word "progress"
+// ("No forward progress — STUCK: looping", "Progress toward the objective is
+// minimal; the run is stuck.") matched the lowercase "progress" first and parsed
+// as PROGRESSING — GRANTING a stuck run more unattended compute and inverting
+// this gate's fail-CLOSED guarantee (caught by the Wave-3 adversarial review).
+// Now, fail CLOSED by construction: (1) the marker must be line-anchored +
+// delimiter-gated, so prose that opens with "progress" is never a verdict;
+// (2) STUCK dominates — a STUCK marker line, OR any "stuck/thrash/loop/no
+// progress" signal anywhere, forces progressing:false; (3) no clean anchored
+// PROGRESS marker ⇒ null ⇒ the caller parks. Erring toward park is correct per
+// the contract ("when uncertain, park; the user can resume"), so the rare cost
+// is a genuine-progress reply that mentions "stuck" being parked, never a stuck
+// run being granted more budget.
+export function parseProgressVerdict(finalOutput: unknown): RunProgressVerdict | null {
+  const raw = String(finalOutput ?? '').trim();
+  if (!raw) return null;
+  const stuckSignal = /\b(?:stuck|thrash(?:ing)?|looping|no (?:new |forward )?progress)\b/i.test(raw);
+  let progressReason: string | null = null;
+  for (const line of raw.split(/\r?\n/)) {
+    const m = /^\s*(PROGRESS|PROGRESSING|STUCK)\s*[:\-]\s*(.*)$/i.exec(line.trim());
+    if (!m) continue;
+    const reason = (m[2] || '').trim().slice(0, 300);
+    if (m[1].toUpperCase() === 'STUCK') return { progressing: false, reason: reason || 'stuck' };
+    if (progressReason === null) progressReason = reason;
+  }
+  if (stuckSignal) return { progressing: false, reason: 'stuck signal in verdict' };
+  if (progressReason !== null) return { progressing: true, reason: progressReason };
+  return null;
+}
+
+/** Cross-family progress judge for a budget-exhausted background run. Returns the
+ *  verdict (or null on timeout/invalid/error — the caller treats null as NOT
+ *  progressing / park). */
+export async function judgeRunProgress(
+  objective: string,
+  recentActivity: string,
+  toolCount: number,
+): Promise<{ verdict: RunProgressVerdict | null; failure: 'timeout' | 'invalid' | 'error' | null; selfJudge: boolean }> {
+  if (!objective.trim()) return { verdict: null, failure: 'invalid', selfJudge: false };
+  const prompt = [
+    `OBJECTIVE:\n${objective.trim().slice(0, 2000)}`,
+    '',
+    `The run hit its turn budget without finishing. In the last budget cycle it made ${Math.max(0, toolCount)} tool call(s).`,
+    'Its most recent output / activity:',
+    (recentActivity || '(no output captured)').slice(0, 4000),
+    '',
+    'Is it making genuine forward progress toward the objective, or stuck?',
+  ].join('\n');
+  const run = await runHedgedJudge(PROGRESS_JUDGE_SYSTEM_PROMPT, prompt, parseProgressVerdict, (v) => v.progressing);
+  return { verdict: run.value, failure: run.failure, selfJudge: run.routing?.selfJudge === true };
+}
+
 /**
  * Deterministic detector for a DIRECTION-SEEKING question — a reply whose
  * closing move asks the user to choose, confirm, or authorize the next step.

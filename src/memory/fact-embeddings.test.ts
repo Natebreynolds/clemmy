@@ -18,6 +18,10 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 // Env wins over the (absent) file vault in a fresh test home, so this
 // flips isEmbeddingsEnabled() on.
 process.env.OPENAI_API_KEY = 'sk-test-fact-embeddings';
+// Determinism: cross-family judging is DEFAULT ON (2026-07-13); this suite tests
+// fact-derivation precedence, not judge routing. Pin =off so the dev-machine
+// ~/.claude credential fallback can't resolve a LIVE judge (see loop.test.ts note).
+process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
 
 // eslint-disable-next-line import/first
 const { resetMemoryDb, openMemoryDb } = await import('./db.js');

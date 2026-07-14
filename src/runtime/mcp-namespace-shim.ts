@@ -1300,6 +1300,38 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         args,
         mcp: true,
       });
+      // Wave 4 Stage 1 (adversarial review finding G): record an irreversible SEND
+      // in the SHARED external_write ledger PRE-dispatch — mirroring the composio
+      // and shell paths — so a throw AFTER the backend already committed (timeout /
+      // dropped response / 5xx-after-send, a routine network mode) still leaves a
+      // ledger entry and the duplicate-send wall refuses a re-send on resume.
+      // Previously the ledger entry was written ONLY on the return path below, so a
+      // throw-after-commit left NO entry → a real irreversible double-send on the
+      // exact autonomous-resume flow Wave 4 relies on. Conservative: a send that
+      // truly never left over-blocks its own retry (the safe direction, matching
+      // compensateFailedExternalWrite's "anything ambiguous stays counted"). Only
+      // irreversible sends are pre-recorded; reversible integrity writes keep the
+      // post-dispatch record. Best-effort — telemetry must never block the send.
+      let preRecordedSend = false;
+      if (needsIntegrityChecks && isIrreversibleSend && integritySessionId) {
+        try {
+          appendEvent({
+            sessionId: integritySessionId,
+            turn: 0,
+            role: 'system',
+            type: 'external_write',
+            data: {
+              shapeKey: integrityShapeKey,
+              toolName,
+              irreversible: true,
+              mcp: true,
+              preDispatch: true,
+              targets: extractDuplicateIdentityKeys(args ?? {}).slice(0, 8),
+            },
+          });
+          preRecordedSend = true;
+        } catch { /* telemetry write must never block the send */ }
+      }
       try {
         // Forward to the underlying server with the ORIGINAL tool name.
         const rawResult = await server.callTool(parsed.toolName, args);
@@ -1315,10 +1347,12 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Cap + park a large raw result for recall BEFORE the fan-out nudge, so a
         // 200KB MCP dump can't flood the chat context window unrecoverably.
         const result = clipMcpResultForRecall(toolName, normalized.result);
-        // Record the irreversible send in the SHARED external_write ledger so a
-        // later same-shape send (composio OR MCP) to the same target gets the
-        // duplicate bump. Best-effort; telemetry must never affect the result.
-        if (needsIntegrityChecks && integritySessionId) {
+        // Record the write in the SHARED external_write ledger so a later
+        // same-shape send (composio OR MCP) to the same target gets the duplicate
+        // bump. An irreversible send was already recorded PRE-dispatch above
+        // (finding G) — skip the double-record for it; reversible integrity writes
+        // record here on the return path. Best-effort; must never affect the result.
+        if (needsIntegrityChecks && integritySessionId && !preRecordedSend) {
           try {
             appendEvent({
               sessionId: integritySessionId,
@@ -1344,6 +1378,43 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         return appendMcpFanoutAdvisory(toolName, args, flagged);
       } catch (err) {
         finish('error', err instanceof Error ? err.message : String(err));
+        // Finding G (+ re-review): the pre-recorded external_write must be resolved
+        // by whether the send DEMONSTRABLY never left vs. MIGHT have committed.
+        //   - Demonstrably-never-sent (auth / 404-not-found / rate-limit-rejected /
+        //     bad-params / connection-refused / DNS) → compensate with
+        //     external_write_failed, which BOTH the shim's own duplicate check
+        //     (:1158) AND the workflow forEach resume guards (sendAlreadyClaimed =
+        //     writes>fails) net out — so a legit retry / resume isn't blocked and a
+        //     genuinely-failed send isn't dropped on resume. Parity with composio's
+        //     compensateFailedExternalWrite; without it a native send that 401'd or
+        //     ECONNREFUSED'd mid-batch was silently skipped for that recipient.
+        //   - Genuinely ambiguous (timeout / dropped response / transient) → stays
+        //     counted as an external_write_orphaned (the send may have landed → a
+        //     resume re-send is refused, the safe direction for an irreversible send).
+        if (preRecordedSend && integritySessionId && !(err instanceof BoundaryError)) {
+          const errMsg = (err instanceof Error ? err.message : String(err));
+          const kind = classifyToolError(errMsg, err);
+          const demonstrablyNeverSent = kind === 'permission_denied' || kind === 'not_found'
+            || kind === 'rate_limit' || isInvalidMcpCallResultValidationError(err)
+            || /econnrefused|enotfound|eai_again|getaddrinfo|dns|connection refused/i.test(errMsg);
+          const targets = extractDuplicateIdentityKeys(args ?? {}).slice(0, 8);
+          try {
+            appendEvent({
+              sessionId: integritySessionId,
+              turn: 0,
+              role: 'system',
+              type: demonstrablyNeverSent ? 'external_write_failed' : 'external_write_orphaned',
+              data: {
+                shapeKey: integrityShapeKey,
+                toolName,
+                slug: parsed.serverSlug,
+                targets,
+                mcp: true,
+                reason: errMsg.slice(0, 200),
+              },
+            });
+          } catch { /* telemetry write must never block */ }
+        }
         if (!(err instanceof BoundaryError) && isInvalidMcpCallResultValidationError(err)) {
           const msg = err instanceof Error ? err.message : String(err);
           const result = makeInvalidMcpResult(toolName, msg);

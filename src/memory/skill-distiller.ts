@@ -27,12 +27,32 @@ import {
 import { evidenceLooksFailedOrBlocked } from './tool-choice-store.js';
 import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
+import { rememberFact } from './facts.js';
 
 const logger = pino({ name: 'clementine-next.skill-distiller' });
 
 function distillerEnabled(): boolean {
   if ((getRuntimeEnv('CLEMMY_GOAL_CONTRACT', 'on') ?? 'on').toLowerCase() === 'off') return false;
   return (getRuntimeEnv('CLEMMY_SKILL_DISTILLER', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** Wave 2 Move B: on a quarantine (a proven-repeated failure), persist the lesson
+ *  as a durable, recallable fact so it outlives the draft. Kill-switch =off. */
+function failureLearningEnabled(): boolean {
+  return (getRuntimeEnv('CLEMMY_FAILURE_LEARNING', 'on') ?? 'on').toLowerCase() !== 'off';
+}
+
+/** PRECISE infra-transient detector for the durable-avoid-fact gate — anchored on
+ *  infra-error PHRASINGS (HTTP status, "rate limited", "timed out", econn*), NOT
+ *  bare prose tokens. The shared isTransientFailure matches bare "timeout" /
+ *  "overloaded", which over-suppresses learning from a real bug whose reason merely
+ *  mentions those words (e.g. "the timeout config was set wrong"). Used ONLY to
+ *  decide whether to mint a permanent avoid-fact, so a false negative here just
+ *  learns a fact (recoverable) rather than wrongly suppressing an approach forever. */
+function isInfraTransientFailure(text: string): boolean {
+  // 429/502/503/504 are unambiguously transient; 500 is excluded (often a real
+  // server-side bug, and a bare "500" over-matches prose quantities).
+  return /\b(?:429|502|503|504)\b|\brate[ -]?limit(?:ed|ing)?\b|\b(?:timed[ -]?out|etimedout|econnreset|econnrefused|enotfound)\b|\bconnection (?:reset|refused|timed out)\b|\bsocket hang up\b|\btemporarily unavailable\b|\bservice unavailable\b|\bserver (?:is )?overloaded\b/i.test(text);
 }
 
 /** A coarse tool "family" for the novelty gate (≥2 distinct ⇒ multi-system). */
@@ -516,7 +536,31 @@ export function reinforceDraftSkills(
         const failureCount = (skill.frontmatter.failureCount ?? 0) + 1;
         const line = recoveryTip ?? (reason ? `FAILED: ${reason}` : 'FAILED (unspecified)');
         appendSkillPitfall(name, line.slice(0, 200));
-        updateSkillFrontmatter(name, failureCount >= 2 ? { failureCount, quarantined: true } : { failureCount });
+        const quarantined = failureCount >= 2;
+        updateSkillFrontmatter(name, quarantined ? { failureCount, quarantined: true } : { failureCount });
+        // Wave 2 Move B: when an approach is QUARANTINED, persist the lesson as a
+        // durable, deduped 'feedback' fact so it survives the draft's deletion AND
+        // surfaces via unified recall on a future relevant turn. Quarantine itself
+        // happens on ANY failure (unchanged baseline); only this PERMANENT,
+        // auto-recalled avoid-fact is gated — because it can wrongly suppress a
+        // valid approach every future turn (review). Mint ONLY when the failure is:
+        //   (a) NOT a genuine infra transient — precise infra-phrasing match, not a
+        //       bare 'timeout'/'overloaded' token, so a real bug whose reason merely
+        //       mentions those words STILL learns; and
+        //   (b) SUBSTANTIVE — a contentless "unspecified" failure teaches nothing and
+        //       must not mint a permanent fact (closes the empty-reason blind spot).
+        const substantive = Boolean(recoveryTip) || Boolean(reason && reason.trim());
+        const infraTransient = isInfraTransientFailure(reason ?? '') || (!!recoveryTip && isInfraTransientFailure(recoveryTip));
+        if (quarantined && substantive && !infraTransient && failureLearningEnabled()) {
+          try {
+            rememberFact({
+              kind: 'feedback',
+              content: `Avoid repeating this: the "${name}" approach failed repeatedly and was retired. ${line}`.slice(0, 400),
+              ...(sessionId ? { derivedFrom: { sessionId, tool: 'skill_reinforce' } } : {}),
+              trustLevel: 0.6,
+            });
+          } catch { /* best-effort */ }
+        }
       }
     } catch { /* reinforcement is best-effort */ }
   }
