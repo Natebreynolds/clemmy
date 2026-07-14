@@ -13,6 +13,10 @@ export interface RecallMeetingSettings {
   autoRecord: boolean;
   liveTranscript: boolean;
   analyzeOnComplete: boolean;
+  /** Explicit cloud-media retention. `zero` never stores media on Recall. */
+  retentionMode: 'zero' | 'timed';
+  /** Used only when retentionMode is `timed`. */
+  retentionHours: number;
 }
 
 export interface RecallTranscriptSegment {
@@ -29,14 +33,33 @@ export interface RecallTranscriptSegment {
 export interface RecallMeetingRecord {
   id: string;
   windowId: string;
+  /** Capture provider. Absent on records created before local capture shipped. */
+  provider?: 'recall' | 'local';
+  source?: 'recall-desktop-sdk' | 'local-audio';
+  /** Create SDK Upload id. This is not Recall's eventual recording id. */
+  sdkUploadId?: string;
+  /** Recall data region used to create sdkUploadId. It must remain pinned
+   * even if the user changes their default region before reconciliation. */
+  sdkUploadRegion?: RecallRegion;
+  /** Durable reconciliation state for sdkUploadId → recordingId. */
+  sdkUploadStatus?: 'pending' | 'complete' | 'failed' | 'timed_out';
+  sdkUploadUpdatedAt?: string;
+  sdkUploadError?: string;
+  sdkUploadAttempts?: number;
+  sdkUploadNextAttemptAt?: string;
+  sdkUploadDeadlineAt?: string;
   recordingId?: string;
+  /** Retention stamped when this recording completed; protects against a
+   * settings change while upload reconciliation is still pending. */
+  recallRetentionMode?: RecallMeetingSettings['retentionMode'];
+  recallRetentionHours?: number;
   platform?: string;
   title?: string;
   /** Who set `title`. 'user' titles are locked — the analyzer / auto-filing
    *  never overwrites them. Absent/'analyzer' means auto-generated and
    *  safe to refine. */
   titleSource?: 'user' | 'analyzer';
-  status: 'detected' | 'recording' | 'completed';
+  status: 'detected' | 'recording' | 'completed' | 'cancelled';
   startedAt: string;
   endedAt?: string;
   segments: RecallTranscriptSegment[];
@@ -68,6 +91,28 @@ export interface RecallMeetingRecord {
   /** Last error message from a failed backfill attempt, surfaced in
    *  the dashboard so users know why it's stuck on streamed data. */
   canonicalError?: string;
+  /** Local-audio fields are intentionally optional for old Recall records. */
+  audioPath?: string;
+  audioDurationSeconds?: number;
+  audioBytes?: number;
+  audioSampleRate?: number;
+  audioChannels?: number;
+  transcriptionStatus?: 'not_started' | 'queued' | 'transcribing' | 'ready' | 'failed' | 'cancelled';
+  transcriptionUpdatedAt?: string;
+  transcriptionError?: string;
+  transcriptionModel?: string;
+  transcriptionLanguage?: string;
+  /** Durable cleanup state when local settings request that source audio not
+   * be retained after a successful transcription. */
+  audioDeletionStatus?: 'pending' | 'deleted' | 'failed';
+  audioDeletionUpdatedAt?: string;
+  audioDeletionError?: string;
+  audioDeletionAttempts?: number;
+  analysisTaskId?: string;
+  /** Analysis is optional; scheduling failures must not downgrade a ready
+   * transcript, but are retained so the dashboard can explain the absence. */
+  analysisError?: string;
+  analysisUpdatedAt?: string;
 }
 
 export interface RecallMeetingAnalysis {
@@ -91,10 +136,18 @@ export interface RecallMeetingAnalysis {
 
 export interface RecallUploadInput {
   liveTranscript?: boolean;
+  /** Region already initialized by the Desktop SDK for this capture. This is
+   * capture-scoped and must not mutate the user's persisted default. */
+  region?: RecallRegion;
 }
 
 export interface RecallUploadToken {
-  id?: string;
+  /** @deprecated This is an SDK upload id, not a recording id. */
+  id: string;
+  sdkUploadId: string;
+  region: RecallRegion;
+  retentionMode: RecallMeetingSettings['retentionMode'];
+  retentionHours: number;
   uploadToken: string;
   apiUrl: string;
 }
@@ -111,12 +164,20 @@ export const RECALL_REGIONS: Record<RecallRegion, string> = {
   'ap-northeast-1': 'https://ap-northeast-1.recall.ai',
 };
 
+export function isRecallRegion(value: unknown): value is RecallRegion {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(RECALL_REGIONS, value);
+}
+
 export const DEFAULT_RECALL_MEETING_SETTINGS: RecallMeetingSettings = {
   enabled: false,
   region: 'us-west-2',
   autoRecord: false,
   liveTranscript: false,
   analyzeOnComplete: true,
+  // One day keeps canonical-backfill available while preventing the
+  // post-2025 Recall default of retaining media forever.
+  retentionMode: 'timed',
+  retentionHours: 24,
 };
 
 function ensureDir(dir: string): void {
@@ -149,13 +210,22 @@ function isSyntheticRecallCapture(record: Pick<RecallMeetingRecord, 'windowId' |
 }
 
 function normalizeSettings(input: Partial<RecallMeetingSettings> | undefined): RecallMeetingSettings {
-  const region = input?.region && input.region in RECALL_REGIONS ? input.region : DEFAULT_RECALL_MEETING_SETTINGS.region;
+  const region = isRecallRegion(input?.region) ? input.region : DEFAULT_RECALL_MEETING_SETTINGS.region;
+  const retentionMode = input?.retentionMode === 'zero' ? 'zero' : 'timed';
+  const retentionHours = Number.isFinite(input?.retentionHours)
+    ? Math.max(1, Math.min(24 * 30, Math.round(input?.retentionHours as number)))
+    : DEFAULT_RECALL_MEETING_SETTINGS.retentionHours;
   return {
     enabled: Boolean(input?.enabled),
     region,
     autoRecord: Boolean(input?.autoRecord),
-    liveTranscript: Boolean(input?.liveTranscript),
+    // Zero retention has no post-call media to recover. Realtime transcript
+    // delivery is therefore mandatory or the meeting is guaranteed to end
+    // without any transcript at all.
+    liveTranscript: retentionMode === 'zero' ? true : Boolean(input?.liveTranscript),
     analyzeOnComplete: input?.analyzeOnComplete !== false,
+    retentionMode,
+    retentionHours,
   };
 }
 
@@ -184,10 +254,14 @@ export function recallAuthorizationHeader(apiKey: string): string {
   return `Token ${apiKey}`;
 }
 
-function buildUploadBody(input: RecallUploadInput): Record<string, unknown> {
-  if (!input.liveTranscript) return {};
-  return {
-    recording_config: {
+export function buildRecallSdkUploadBody(input: RecallUploadInput, settings: RecallMeetingSettings): Record<string, unknown> {
+  const recordingConfig: Record<string, unknown> = {
+    retention: settings.retentionMode === 'zero'
+      ? null
+      : { type: 'timed', hours: settings.retentionHours },
+  };
+  if (input.liveTranscript || settings.retentionMode === 'zero') {
+    Object.assign(recordingConfig, {
       transcript: {
         provider: {
           recallai_streaming: {
@@ -202,17 +276,27 @@ function buildUploadBody(input: RecallUploadInput): Record<string, unknown> {
           events: ['participant_events.join', 'participant_events.update', 'transcript.data', 'transcript.partial_data'],
         },
       ],
-    },
-  };
+    });
+  }
+  return { recording_config: recordingConfig };
 }
 
 export async function createRecallSdkUpload(input: RecallUploadInput = {}): Promise<RecallUploadToken> {
+  if (input.region !== undefined && !isRecallRegion(input.region)) {
+    throw new Error(`Unsupported Recall region "${String(input.region)}".`);
+  }
   const apiKey = await readSecret('recall_api_key');
   if (!apiKey) {
     throw new Error('Recall.ai API key is not configured.');
   }
 
-  const settings = loadRecallMeetingSettings();
+  const persistedSettings = loadRecallMeetingSettings();
+  // A region change can race SDK reinitialization. Use the exact region the
+  // desktop initialized for this upload without rewriting the persisted
+  // default, so token creation and the native SDK always agree atomically.
+  const settings: RecallMeetingSettings = input.region
+    ? { ...persistedSettings, region: input.region }
+    : persistedSettings;
   const apiUrl = recallApiUrl(settings.region);
   const response = await fetch(`${apiUrl}/api/v1/sdk_upload/`, {
     method: 'POST',
@@ -221,7 +305,7 @@ export async function createRecallSdkUpload(input: RecallUploadInput = {}): Prom
       'content-type': 'application/json',
       authorization: recallAuthorizationHeader(apiKey),
     },
-    body: JSON.stringify(buildUploadBody(input)),
+    body: JSON.stringify(buildRecallSdkUploadBody(input, settings)),
   });
 
   const payload = await response.json().catch(() => ({})) as { id?: string; upload_token?: string; uploadToken?: string; detail?: unknown; error?: unknown };
@@ -238,8 +322,19 @@ export async function createRecallSdkUpload(input: RecallUploadInput = {}): Prom
   if (!uploadToken) {
     throw new Error('Recall.ai upload token response did not include upload_token.');
   }
+  if (!payload.id) {
+    throw new Error('Recall.ai upload token response did not include its SDK upload id.');
+  }
 
-  return { id: payload.id, uploadToken, apiUrl };
+  return {
+    id: payload.id,
+    sdkUploadId: payload.id,
+    region: settings.region,
+    retentionMode: settings.retentionMode,
+    retentionHours: settings.retentionHours,
+    uploadToken,
+    apiUrl,
+  };
 }
 
 function readMeetingRecordFile(filePath: string): RecallMeetingRecord | null {
@@ -248,62 +343,175 @@ function readMeetingRecordFile(filePath: string): RecallMeetingRecord | null {
   catch { return null; }
 }
 
-function loadMeetingRecord(windowId: string, recordingId?: string): RecallMeetingRecord | null {
+function readStoredMeetingRecords(): Array<{ filePath: string; record: RecallMeetingRecord }> {
+  if (!existsSync(RECORDS_DIR)) return [];
+  const records: Array<{ filePath: string; record: RecallMeetingRecord }> = [];
+  try {
+    for (const entry of readdirSync(RECORDS_DIR)) {
+      if (!entry.endsWith('.json')) continue;
+      const filePath = path.join(RECORDS_DIR, entry);
+      const record = readMeetingRecordFile(filePath);
+      if (record?.id) records.push({ filePath, record });
+    }
+  } catch { /* directory may disappear during shutdown */ }
+  return records;
+}
+
+function loadMeetingRecord(windowId: string, recordingId?: string, sdkUploadId?: string): RecallMeetingRecord | null {
   if (recordingId) {
     const byRecording = readMeetingRecordFile(recordPath(recordingId));
     if (byRecording) return byRecording;
   }
-  return readMeetingRecordFile(recordPath(windowId));
+  if (sdkUploadId) {
+    const byUpload = readMeetingRecordFile(recordPath(sdkUploadId));
+    if (byUpload) return byUpload;
+  }
+
+  const stored = readStoredMeetingRecords();
+  if (recordingId) {
+    const byRecording = stored.find(({ record }) => record.recordingId === recordingId)?.record;
+    if (byRecording) return byRecording;
+  }
+  if (sdkUploadId) {
+    const byUpload = stored.find(({ record }) => record.sdkUploadId === sdkUploadId)?.record;
+    if (byUpload) return byUpload;
+  }
+
+  const legacyWindowRecord = readMeetingRecordFile(recordPath(windowId));
+  if (legacyWindowRecord) {
+    // A window-keyed record from an older Clementine build may be adopted only
+    // when it has no conflicting capture identity. Never merge a second SDK
+    // upload merely because Zoom/Meet reused the same native window id.
+    const recordingMatches = !recordingId
+      || !legacyWindowRecord.recordingId
+      || legacyWindowRecord.recordingId === recordingId;
+    const uploadMatches = !sdkUploadId
+      || !legacyWindowRecord.sdkUploadId
+      || legacyWindowRecord.sdkUploadId === sdkUploadId;
+    if (recordingMatches && uploadMatches) return legacyWindowRecord;
+  }
+
+  // Legacy/id-less realtime events still need a deterministic active record.
+  // Exact recording/sdk identities above remain authoritative; this fallback
+  // never reuses a completed meeting for a new identified capture.
+  if (!recordingId && !sdkUploadId) {
+    return stored
+      .map(({ record }) => record)
+      .filter((record) => record.windowId === windowId && record.status === 'recording')
+      .sort((a, b) => (b.startedAt || '').localeCompare(a.startedAt || ''))[0] ?? null;
+  }
+  if (recordingId && !sdkUploadId) {
+    const sameWindow = stored
+      .map(({ record }) => record)
+      .filter((record) => record.windowId === windowId)
+      .sort((a, b) => (b.startedAt || '').localeCompare(a.startedAt || ''));
+    const active = sameWindow.filter((record) => record.status === 'recording');
+    // Older desktop payloads did not include sdkUploadId on realtime/final
+    // events. Adopt only an unambiguous window session; two completed pending
+    // uploads are deliberately left separate rather than guessed/merged.
+    if (active.length === 1) return active[0];
+    if (sameWindow.length === 1) return sameWindow[0];
+  }
+  return null;
 }
 
 function saveMeetingRecord(record: RecallMeetingRecord): RecallMeetingRecord {
-  const targetPath = recordPath(record.recordingId || record.windowId);
+  const targetPath = recordPath(record.recordingId || record.sdkUploadId || record.windowId);
   writeJsonAtomic(targetPath, record);
-  if (record.recordingId) {
-    const placeholderPath = recordPath(record.windowId);
-    if (placeholderPath !== targetPath) {
-      const placeholder = readMeetingRecordFile(placeholderPath);
-      if (placeholder && (
-        placeholder.id === record.id ||
-        (placeholder.status === 'detected' && (placeholder.segments?.length ?? 0) === 0)
-      )) {
-        try { unlinkSync(placeholderPath); } catch { /* best-effort placeholder cleanup */ }
-      }
-    }
+  // recordingId arrival migrates an SDK-keyed record, while upgrades may
+  // migrate a legacy window-keyed placeholder. Remove only aliases for this
+  // exact meeting id so another session in the same window is never deleted.
+  for (const stored of readStoredMeetingRecords()) {
+    if (stored.filePath === targetPath || stored.record.id !== record.id) continue;
+    try { unlinkSync(stored.filePath); } catch { /* best-effort alias cleanup */ }
   }
   return record;
 }
 
 export function noteRecallMeetingDetected(input: {
   windowId: string;
+  provider?: RecallMeetingRecord['provider'];
+  source?: RecallMeetingRecord['source'];
+  sdkUploadId?: string;
+  sdkUploadRegion?: RecallRegion;
   recordingId?: string;
   platform?: string;
   title?: string;
   status?: RecallMeetingRecord['status'];
+  startedAt?: string;
+  endedAt?: string;
+  audioPath?: string;
+  audioDurationSeconds?: number;
+  audioBytes?: number;
+  transcriptionStatus?: RecallMeetingRecord['transcriptionStatus'];
+  transcriptionModel?: string;
+  transcriptionLanguage?: string;
+  recallRetentionMode?: RecallMeetingSettings['retentionMode'];
+  recallRetentionHours?: number;
 }): RecallMeetingRecord {
-  const existing = loadMeetingRecord(input.windowId, input.recordingId);
+  const existing = loadMeetingRecord(input.windowId, input.recordingId, input.sdkUploadId);
   const record: RecallMeetingRecord = {
-    id: existing?.id ?? `recall-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`,
+    id: existing?.id ?? `${input.provider === 'local' ? 'local' : 'recall'}-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`,
     windowId: input.windowId,
+    provider: input.provider ?? existing?.provider ?? 'recall',
+    source: input.source ?? existing?.source ?? 'recall-desktop-sdk',
+    sdkUploadId: input.sdkUploadId ?? existing?.sdkUploadId,
+    // Once an upload is created its data region is immutable. Later
+    // completion/UI payloads may reflect a newly selected default region and
+    // must not retarget this already-created SDK upload.
+    sdkUploadRegion: existing?.sdkUploadRegion ?? input.sdkUploadRegion,
+    sdkUploadStatus: existing?.sdkUploadStatus,
+    sdkUploadUpdatedAt: existing?.sdkUploadUpdatedAt,
+    sdkUploadError: existing?.sdkUploadError,
+    sdkUploadAttempts: existing?.sdkUploadAttempts,
+    sdkUploadNextAttemptAt: existing?.sdkUploadNextAttemptAt,
+    sdkUploadDeadlineAt: existing?.sdkUploadDeadlineAt,
     recordingId: input.recordingId ?? existing?.recordingId,
+    // Like region, retention is fixed in the Create SDK Upload request. A
+    // settings change later in the meeting must not rewrite that contract.
+    recallRetentionMode: existing?.recallRetentionMode ?? input.recallRetentionMode,
+    recallRetentionHours: existing?.recallRetentionHours ?? input.recallRetentionHours,
     platform: input.platform ?? existing?.platform,
     title: input.title ?? existing?.title,
     titleSource: existing?.titleSource,
     status: input.status ?? existing?.status ?? 'detected',
-    startedAt: existing?.startedAt ?? nowIso(),
-    endedAt: existing?.endedAt,
+    startedAt: existing?.startedAt ?? input.startedAt ?? nowIso(),
+    endedAt: input.endedAt ?? existing?.endedAt,
     segments: existing?.segments ?? [],
     artifactPath: existing?.artifactPath,
     analysisPath: existing?.analysisPath,
     canonicalStatus: existing?.canonicalStatus,
     canonicalUpdatedAt: existing?.canonicalUpdatedAt,
     canonicalError: existing?.canonicalError,
+    audioPath: input.audioPath ?? existing?.audioPath,
+    audioDurationSeconds: input.audioDurationSeconds ?? existing?.audioDurationSeconds,
+    audioBytes: input.audioBytes ?? existing?.audioBytes,
+    transcriptionStatus: input.transcriptionStatus ?? existing?.transcriptionStatus,
+    transcriptionUpdatedAt: existing?.transcriptionUpdatedAt,
+    transcriptionError: existing?.transcriptionError,
+    transcriptionModel: input.transcriptionModel ?? existing?.transcriptionModel,
+    transcriptionLanguage: input.transcriptionLanguage ?? existing?.transcriptionLanguage,
+    audioDeletionStatus: existing?.audioDeletionStatus,
+    audioDeletionUpdatedAt: existing?.audioDeletionUpdatedAt,
+    audioDeletionError: existing?.audioDeletionError,
+    audioDeletionAttempts: existing?.audioDeletionAttempts,
+    analysisTaskId: existing?.analysisTaskId,
+    analysisError: existing?.analysisError,
+    analysisUpdatedAt: existing?.analysisUpdatedAt,
   };
   return saveMeetingRecord(record);
 }
 
-export function appendRecallTranscriptSegment(input: Omit<RecallTranscriptSegment, 'id' | 'timestamp'> & { timestamp?: string }): RecallMeetingRecord {
-  const record = noteRecallMeetingDetected({ windowId: input.windowId, recordingId: input.recordingId, status: 'recording' });
+export function appendRecallTranscriptSegment(input: Omit<RecallTranscriptSegment, 'id' | 'timestamp'> & {
+  timestamp?: string;
+  sdkUploadId?: string;
+}): RecallMeetingRecord {
+  const record = noteRecallMeetingDetected({
+    windowId: input.windowId,
+    sdkUploadId: input.sdkUploadId,
+    recordingId: input.recordingId,
+    status: 'recording',
+  });
   const text = input.text.replace(/\s+/g, ' ').trim();
   if (!text) return record;
   const segment: RecallTranscriptSegment = {
@@ -386,13 +594,17 @@ function renderTranscriptArtifactBody(
     '---',
     `type: meeting-transcript`,
     `source: ${sourceLabel}`,
+    `provider: ${record.provider ?? 'recall'}`,
     `meeting_id: ${record.id}`,
     `window_id: ${record.windowId}`,
+    record.sdkUploadId ? `sdk_upload_id: ${record.sdkUploadId}` : '',
+    record.sdkUploadRegion ? `sdk_upload_region: ${record.sdkUploadRegion}` : '',
     record.recordingId ? `recording_id: ${record.recordingId}` : '',
     record.platform ? `platform: ${record.platform}` : '',
     record.title ? `title: ${record.title}` : '',
     `started_at: ${record.startedAt}`,
     record.endedAt ? `ended_at: ${record.endedAt}` : '',
+    record.transcriptionModel ? `transcription_model: ${record.transcriptionModel}` : '',
     '---',
     '',
     `# ${record.title || 'Meeting Capture'}`,
@@ -421,17 +633,30 @@ function defaultArtifactPath(record: RecallMeetingRecord): string {
 
 export function finalizeRecallMeeting(input: {
   windowId: string;
+  sdkUploadId?: string;
+  sdkUploadRegion?: RecallRegion;
   recordingId?: string;
   platform?: string;
   title?: string;
+  retentionMode?: RecallMeetingSettings['retentionMode'];
+  retentionHours?: number;
+  /** False for zero-retention uploads, whose media cannot be backfilled. */
+  canonicalBackfill?: boolean;
 }): { record: RecallMeetingRecord; artifactPath?: string; segmentCount: number; transcriptText: string } {
   const record = noteRecallMeetingDetected({
     windowId: input.windowId,
+    sdkUploadId: input.sdkUploadId,
+    sdkUploadRegion: input.sdkUploadRegion,
     recordingId: input.recordingId,
     platform: input.platform,
     title: input.title,
     status: 'completed',
+    recallRetentionMode: input.retentionMode,
+    recallRetentionHours: input.retentionHours,
   });
+  const hasRecordingId = Boolean(input.recordingId ?? record.recordingId);
+  const hasSdkUploadId = Boolean(input.sdkUploadId ?? record.sdkUploadId);
+  const canonicalBackfill = record.recallRetentionMode !== 'zero' && input.canonicalBackfill !== false;
   const completed: RecallMeetingRecord = {
     ...record,
     endedAt: nowIso(),
@@ -440,8 +665,14 @@ export function finalizeRecallMeeting(input: {
     // backfill. The actual backfill is kicked off by the
     // /api/console/meetings/recall/complete route after this function
     // returns, so we just stamp the intent here.
-    canonicalStatus: input.recordingId ? 'pending' : 'not_started',
+    canonicalStatus: hasRecordingId && canonicalBackfill ? 'pending' : 'not_started',
     canonicalUpdatedAt: nowIso(),
+    // A recording id can surface in realtime events before the upload itself
+    // is terminal. The authenticated SDK-upload reconciler is the sole owner
+    // of transitioning this to `complete`.
+    sdkUploadStatus: hasSdkUploadId ? 'pending' : record.sdkUploadStatus,
+    sdkUploadUpdatedAt: hasSdkUploadId ? nowIso() : record.sdkUploadUpdatedAt,
+    sdkUploadError: undefined,
   };
 
   const transcriptText = completed.segments
@@ -521,15 +752,119 @@ export function markCanonicalTranscriptIncomplete(
 /** Load a meeting record by windowId or recordingId. Exported so the
  *  backfill background task and the dashboard route can both find a
  *  record without knowing which key matched. */
-export function findRecallMeetingRecord(opts: { windowId?: string; recordingId?: string }): RecallMeetingRecord | null {
+export function findRecallMeetingRecord(opts: { windowId?: string; recordingId?: string; sdkUploadId?: string }): RecallMeetingRecord | null {
   if (opts.recordingId) {
     const byRec = readMeetingRecordFile(recordPath(opts.recordingId));
     if (byRec) return byRec;
+    const migrated = readStoredMeetingRecords().find(({ record }) => record.recordingId === opts.recordingId)?.record;
+    if (migrated) return migrated;
+  }
+  if (opts.sdkUploadId) {
+    const byUpload = readMeetingRecordFile(recordPath(opts.sdkUploadId));
+    if (byUpload) return byUpload;
+    const migrated = readStoredMeetingRecords().find(({ record }) => record.sdkUploadId === opts.sdkUploadId)?.record;
+    if (migrated) return migrated;
   }
   if (opts.windowId) {
-    return readMeetingRecordFile(recordPath(opts.windowId));
+    const byWindow = readMeetingRecordFile(recordPath(opts.windowId));
+    if (byWindow) return byWindow;
   }
   return null;
+}
+
+function findMeetingRecordByIdIncludingHidden(meetingId: string): RecallMeetingRecord | null {
+  return readStoredMeetingRecords().find(({ record }) => record.id === meetingId)?.record ?? null;
+}
+
+/** Internal shared-record update used by the local transcription queue. */
+export function patchMeetingRecord(
+  meetingId: string,
+  patch: Partial<Omit<RecallMeetingRecord, 'id' | 'windowId' | 'segments'>> & { segments?: RecallTranscriptSegment[] },
+): RecallMeetingRecord | null {
+  const existing = findMeetingRecordByIdIncludingHidden(meetingId);
+  if (!existing) return null;
+  return saveMeetingRecord({ ...existing, ...patch, id: existing.id, windowId: existing.windowId });
+}
+
+/** Remove an unneeded/cancelled meeting record from the shared history. */
+export function deleteMeetingRecord(meetingId: string): boolean {
+  let removed = false;
+  for (const stored of readStoredMeetingRecords()) {
+    if (stored.record.id !== meetingId) continue;
+    try {
+      unlinkSync(stored.filePath);
+      removed = true;
+    } catch { /* report false only when no alias could be removed */ }
+  }
+  return removed;
+}
+
+export interface LocalTranscriptResultSegment {
+  text: string;
+  startSeconds?: number;
+  endSeconds?: number;
+  speaker?: string;
+}
+
+/**
+ * Replace a local meeting's pending audio with its completed Whisper
+ * transcript, write the same vault artifact used by Recall meetings, and
+ * persist the ready state atomically. No Recall canonical backfill applies.
+ */
+export function applyLocalMeetingTranscript(input: {
+  meetingId: string;
+  text: string;
+  segments?: LocalTranscriptResultSegment[];
+  model: string;
+  language?: string;
+}): { record: RecallMeetingRecord; artifactPath?: string; transcriptText: string } {
+  const existing = findMeetingRecordByIdIncludingHidden(input.meetingId);
+  if (!existing || existing.provider !== 'local') {
+    throw new Error('Local meeting record not found.');
+  }
+  const startedMs = Date.parse(existing.startedAt);
+  const rawSegments = input.segments && input.segments.length > 0
+    ? input.segments
+    : (input.text.trim() ? [{ text: input.text.trim(), startSeconds: 0 }] : []);
+  const segments: RecallTranscriptSegment[] = rawSegments.flatMap((segment, index) => {
+    const text = segment.text.replace(/\s+/g, ' ').trim();
+    if (!text) return [];
+    const offsetMs = Number.isFinite(segment.startSeconds) ? Math.max(0, segment.startSeconds as number) * 1000 : index;
+    return [{
+      id: `seg-${Date.now().toString(36)}-${index.toString(36)}-${randomBytes(2).toString('hex')}`,
+      windowId: existing.windowId,
+      event: 'local.whisper.transcript',
+      speaker: segment.speaker,
+      text,
+      timestamp: Number.isFinite(startedMs) ? new Date(startedMs + offsetMs).toISOString() : nowIso(),
+      isFinal: true,
+    }];
+  });
+  const ready: RecallMeetingRecord = {
+    ...existing,
+    provider: 'local',
+    source: 'local-audio',
+    status: 'completed',
+    endedAt: existing.endedAt ?? nowIso(),
+    segments,
+    canonicalStatus: 'not_started',
+    canonicalUpdatedAt: nowIso(),
+    transcriptionStatus: 'ready',
+    transcriptionUpdatedAt: nowIso(),
+    transcriptionError: undefined,
+    transcriptionModel: input.model,
+    transcriptionLanguage: input.language ?? existing.transcriptionLanguage,
+  };
+  let artifactPath = existing.artifactPath;
+  if (segments.length > 0 && !isSyntheticRecallCapture(ready)) {
+    artifactPath = artifactPath ?? defaultArtifactPath(ready);
+    writeFileSync(artifactPath, renderTranscriptArtifactBody(ready, `local whisper (${input.model})`), 'utf-8');
+  }
+  const record = saveMeetingRecord({ ...ready, artifactPath });
+  const transcriptText = segments
+    .map((segment) => `[${segment.timestamp}] ${segment.speaker ? `${segment.speaker}: ` : ''}${segment.text}`)
+    .join('\n');
+  return { record, artifactPath, transcriptText };
 }
 
 /**
@@ -594,7 +929,9 @@ function rewriteMeetingArtifact(meetingId: string): boolean {
   if (!artifactPath) return false;
   const sourceLabel = record.canonicalStatus === 'ready'
     ? 'recall.ai async transcript (canonical)'
-    : 'recall.ai-desktop-sdk (streamed)';
+    : record.provider === 'local'
+      ? `local whisper (${record.transcriptionModel ?? 'unknown model'})`
+      : 'recall.ai-desktop-sdk (streamed)';
   const body = renderTranscriptArtifactBody(record, sourceLabel, loadRecallMeetingAnalysis(meetingId));
   const existing = readFileSync(artifactPath, 'utf-8');
   if (existing === body) return false;
@@ -695,6 +1032,8 @@ export function listAllRecallMeetingRecords(): RecallMeetingRecord[] {
 export interface RecallMeetingSummary {
   id: string;
   windowId: string;
+  provider?: RecallMeetingRecord['provider'];
+  source?: RecallMeetingRecord['source'];
   platform?: string;
   title?: string;
   status: RecallMeetingRecord['status'];
@@ -705,6 +1044,16 @@ export interface RecallMeetingSummary {
   analysisPath?: string;
   hasAnalysis: boolean;
   durationSeconds?: number;
+  audioPath?: string;
+  transcriptionStatus?: RecallMeetingRecord['transcriptionStatus'];
+  transcriptionError?: string;
+  transcriptionModel?: string;
+  audioDeletionStatus?: RecallMeetingRecord['audioDeletionStatus'];
+  audioDeletionError?: string;
+  analysisTaskId?: string;
+  analysisError?: string;
+  sdkUploadStatus?: RecallMeetingRecord['sdkUploadStatus'];
+  sdkUploadError?: string;
 }
 
 /**
@@ -754,6 +1103,8 @@ export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeeti
   return {
     id: record.id,
     windowId: record.windowId,
+    provider: record.provider ?? 'recall',
+    source: record.source ?? 'recall-desktop-sdk',
     platform: record.platform,
     title: record.title,
     status: record.status,
@@ -764,6 +1115,16 @@ export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeeti
     analysisPath: resolvedAnalysisPath,
     hasAnalysis: Boolean(resolvedAnalysisPath),
     durationSeconds,
+    audioPath: record.audioPath,
+    transcriptionStatus: record.transcriptionStatus,
+    transcriptionError: record.transcriptionError,
+    transcriptionModel: record.transcriptionModel,
+    audioDeletionStatus: record.audioDeletionStatus,
+    audioDeletionError: record.audioDeletionError,
+    analysisTaskId: record.analysisTaskId,
+    analysisError: record.analysisError,
+    sdkUploadStatus: record.sdkUploadStatus,
+    sdkUploadError: record.sdkUploadError,
   };
 }
 
@@ -817,6 +1178,10 @@ export function reapStuckRecallRecordings(opts: { idleMs?: number } = {}): Array
   const finalized: Array<{ record: RecallMeetingRecord; artifactPath?: string; segmentCount: number }> = [];
   for (const record of listAllRecallMeetingRecords()) {
     if (record.status !== 'recording') continue;
+    // Local in-person capture has no live transcript heartbeat; a healthy
+    // two-hour recording would otherwise look "stuck" after 60 minutes and
+    // be finalized underneath Electron while audio is still being written.
+    if (record.provider === 'local') continue;
     if (now - lastActivityMs(record) < idleMs) continue;
     const result = finalizeRecallMeeting({
       windowId: record.windowId,
@@ -837,13 +1202,16 @@ export function reapStuckRecallRecordings(opts: { idleMs?: number } = {}): Array
 export function buildAnalyzerPrompt(record: RecallMeetingRecord, artifactPath: string): string {
   const expectedAnalysisPath = analysisPathFor(record.id);
   return [
-    'You just received a meeting transcript captured by the desktop SDK.',
+    record.provider === 'local'
+      ? 'You just received a locally recorded and locally transcribed meeting transcript.'
+      : 'You just received a meeting transcript captured by the desktop SDK.',
     'Your job: produce a structured analysis the user can act on at a glance.',
     '',
     `Transcript file: ${artifactPath}`,
     `Meeting id: ${record.id}`,
     `Meeting title: ${record.title || '(unknown)'}`,
     `Platform: ${record.platform || '(unknown)'}`,
+    `Provider: ${record.provider ?? 'recall'}`,
     `Started: ${record.startedAt}`,
     record.endedAt ? `Ended: ${record.endedAt}` : '',
     '',
@@ -890,6 +1258,7 @@ export function buildMeetingChatPrompt(
     `Meeting id: ${record.id}`,
     `Meeting title: ${record.title || '(untitled meeting)'}`,
     `Platform: ${record.platform || '(unknown)'}`,
+    `Provider: ${record.provider ?? 'recall'}`,
     record.startedAt ? `Started: ${record.startedAt}` : '',
     record.endedAt ? `Ended: ${record.endedAt}` : '',
     record.artifactPath

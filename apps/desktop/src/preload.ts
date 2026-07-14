@@ -33,8 +33,8 @@ const api = {
   recallConfigure: (settings: Record<string, unknown>) => ipcRenderer.invoke('clemmy:recall-configure', settings) as Promise<Record<string, unknown> | null>,
   recallRequestPermissions: () => ipcRenderer.invoke('clemmy:recall-request-permissions') as Promise<Record<string, unknown> | null>,
   recallStartManual: () => ipcRenderer.invoke('clemmy:recall-start-manual') as Promise<Record<string, unknown> | null>,
-  /** Primary "RECORD MEETING" button — records the detected meeting
-   *  window when one is open, else falls back to desktop audio. */
+  /** Primary "RECORD MEETING" button — records a detected online-meeting
+   *  window, or returns concrete permission/no-window guidance. */
   recallRecordActive: () => ipcRenderer.invoke('clemmy:recall-record-active') as Promise<Record<string, unknown> | null>,
   /** Start recording a specific window the SDK has detected. Drives
    *  the "Record this meeting" prompt button. */
@@ -47,6 +47,18 @@ const api = {
    *  permissionStatuses + detectedWindows. Use this for the dashboard's
    *  "Test Connection" diagnostic button. */
   recallTest: () => ipcRenderer.invoke('clemmy:recall-test') as Promise<Record<string, unknown> | null>,
+
+  /** Local/offline in-person meeting capture. Audio arrives from the sandboxed
+   * renderer as small 16 kHz mono PCM chunks and is streamed straight to disk
+   * by the main process. */
+  localMeetingStatus: () => ipcRenderer.invoke('clemmy:local-meeting-status') as Promise<Record<string, unknown>>,
+  localMeetingStart: (payload?: { title?: string }) => ipcRenderer.invoke('clemmy:local-meeting-start', payload ?? {}) as Promise<Record<string, unknown>>,
+  localMeetingAppend: (sessionId: string, chunk: ArrayBuffer) => ipcRenderer.invoke(
+    'clemmy:local-meeting-append',
+    { sessionId, chunk },
+  ) as Promise<Record<string, unknown>>,
+  localMeetingStop: (sessionId: string) => ipcRenderer.invoke('clemmy:local-meeting-stop', { sessionId }) as Promise<Record<string, unknown>>,
+  localMeetingCancel: (sessionId: string) => ipcRenderer.invoke('clemmy:local-meeting-cancel', { sessionId }) as Promise<Record<string, unknown>>,
 
   /** Auto-updater status (checking/no-update/available/downloading/ready/error). */
   updaterStatus: () => ipcRenderer.invoke('clemmy:updater-status') as Promise<Record<string, unknown>>,

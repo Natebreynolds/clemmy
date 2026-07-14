@@ -14,12 +14,24 @@ import {
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { DaemonSupervisor, locateDaemonProjectRoot, type SupervisorEvent } from './daemon-supervisor.js';
 import { needsSetup, hasCompletedSetup, writeSetupComplete, type SetupConfiguredSummary } from './setup-state.js';
 import { createSetupWindow } from './setup-window.js';
 import { RecallDesktopCapture, type RecallCaptureSettings } from './recall-capture.js';
+import {
+  LocalMeetingRecorder,
+  type LocalMeetingRecording,
+} from './local-meeting-recorder.js';
 import { isBenignPipeError } from './pipe-errors.js';
+import { isTrustedDashboardMediaUrl } from './media-permissions.js';
 import {
   applyUpdate,
   checkForUpdatesNow,
@@ -96,7 +108,16 @@ let dashboardUrl = '';
 let pendingDashboardUrl = '';
 let dashboardNavigationGeneration = 0;
 let recallCapture: RecallDesktopCapture | null = null;
+const localMeetingRecorder = new LocalMeetingRecorder();
 let quitPrepared = false;
+const RECALL_TRAY_STATE_EVENTS = new Set([
+  'recording-start-requested',
+  'recording-started',
+  'recording-ended',
+  'recording-stop-requested',
+  'shutdown',
+  'error',
+]);
 
 function revealWindow(win: BrowserWindow | null): void {
   if (!win || win.isDestroyed()) return;
@@ -389,10 +410,26 @@ function createMainWindow(url: string): BrowserWindow {
   // and in practice the only permission it requests is the microphone. macOS
   // still gates the actual capture behind the system mic prompt
   // (NSMicrophoneUsageDescription), so this does not bypass the OS consent.
-  win.webContents.session.setPermissionRequestHandler((_wc, _permission, callback) => {
-    callback(true);
+  win.webContents.session.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const requestingUrl = details.requestingUrl || webContents.getURL();
+    const mediaTypes: string[] = 'mediaTypes' in details && Array.isArray(details.mediaTypes)
+      ? details.mediaTypes
+      : [];
+    const audioOnly = mediaTypes.length > 0 && mediaTypes.every((type: string) => type === 'audio');
+    callback(
+      permission === 'media'
+      && details.isMainFrame === true
+      && audioOnly
+      && isTrustedDashboardMediaUrl(requestingUrl, dashboardOrigins()),
+    );
   });
-  win.webContents.session.setPermissionCheckHandler((_wc, permission) => permission === 'media');
+  win.webContents.session.setPermissionCheckHandler((_webContents, permission, _requestingOrigin, details) => {
+    return permission === 'media'
+      && details.isMainFrame === true
+      && details.mediaType === 'audio'
+      && typeof details.requestingUrl === 'string'
+      && isTrustedDashboardMediaUrl(details.requestingUrl, dashboardOrigins());
+  });
   win.loadURL(url);
   // Keep DevTools opt-in for local testing; attached DevTools changes
   // focus/click behavior enough to make the dev app feel broken.
@@ -404,20 +441,46 @@ function createMainWindow(url: string): BrowserWindow {
     // quit; cmd-Q exits explicitly.
     if (process.platform === 'darwin' && !(app as { isQuitting?: boolean }).isQuitting) {
       event.preventDefault();
+      const activeCaptures = activeMeetingCaptureLabels();
+      if (activeCaptures.length > 0) {
+        // Never turn the red close button into an invisible microphone/screen
+        // recording. The user can stop from the visible Meetings controls, or
+        // quit Clementine explicitly (the quit path safely finalizes first).
+        dialog.showMessageBoxSync(win, {
+          type: 'warning',
+          buttons: ['Keep Recording Window Open'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+          title: 'Meeting recording is active',
+          message: activeCaptures.length === 1
+            ? `${activeCaptures[0]} is still active.`
+            : `${activeCaptures.join(' and ')} are still active.`,
+          detail: 'Stop and transcribe the meeting from the Meetings page before hiding Clementine. You can also quit Clementine to finalize the recording safely.',
+        });
+        return;
+      }
       win.hide();
     }
   });
   return win;
 }
 
+function activeMeetingCaptureLabels(): string[] {
+  const labels: string[] = [];
+  if (localMeetingRecorder.status().recording) labels.push('Local microphone recording');
+  if (recallCapture?.status().recording) labels.push('Online meeting recording');
+  return labels;
+}
+
 /**
  * Generate a 22×22 tray icon at runtime — no shipped image asset
- * required. Renders a filled circle (orange = active) on a transparent
- * background. Uses an inline SVG → nativeImage.createFromDataURL.
+ * required. Renders a filled circle (orange = daemon active, red = recording)
+ * on a transparent background. Uses an inline SVG → nativeImage.createFromDataURL.
  */
-function buildTrayIcon(active: boolean): NativeImage {
-  const color = active ? '#ff5a35' : '#666c7a';
-  const dot = active ? '#b9ff36' : '#3a3f4a';
+function buildTrayIcon(active: boolean, recording = false): NativeImage {
+  const color = recording ? '#ff3b30' : active ? '#ff5a35' : '#666c7a';
+  const dot = recording ? '#ffffff' : active ? '#b9ff36' : '#3a3f4a';
   // 22x22 is the Electron-recommended template size for menubar icons
   // on macOS retina. We use a colored variant (not template mode)
   // because the operational aesthetic wants the accent colors visible.
@@ -444,18 +507,33 @@ function setupTray(): void {
 function refreshTrayIcon(): void {
   if (!tray) return;
   const running = supervisor?.isRunning() ?? false;
-  tray.setImage(buildTrayIcon(running));
+  const activeCaptures = activeMeetingCaptureLabels();
+  tray.setImage(buildTrayIcon(running, activeCaptures.length > 0));
+  tray.setToolTip(activeCaptures.length > 0
+    ? `Clementine — ${activeCaptures.join(' and ')}`
+    : 'Clementine');
 }
 
 function rebuildTrayMenu(): void {
   if (!tray) return;
   refreshTrayIcon();
   const running = supervisor?.isRunning() ?? false;
+  const activeCaptures = activeMeetingCaptureLabels();
   const menu = Menu.buildFromTemplate([
     {
       label: running ? `● Daemon running · port ${supervisor?.getPort()}` : '○ Daemon stopped',
       enabled: false,
     },
+    ...(activeCaptures.length > 0 ? [
+      {
+        label: `● ${activeCaptures.join(' + ')}`,
+        enabled: false,
+      } as Electron.MenuItemConstructorOptions,
+      {
+        label: 'Open Recording Controls',
+        click: () => revealMainWindow(),
+      } as Electron.MenuItemConstructorOptions,
+    ] : []),
     { type: 'separator' },
     {
       label: 'Open Console',
@@ -520,7 +598,21 @@ async function prepareForQuit(): Promise<void> {
   if (quitPrepared || quitPreparing) return;
   quitPreparing = true;
   disposeAutoUpdater();
+  await recallCapture?.prepareForShutdown().catch((error) => {
+    // Still continue into SDK shutdown, but never silently skip the drain:
+    // it owns start-in-flight, stop-in-flight, and natural-end completion.
+    console.error('[recall] failed to prepare meeting capture during quit:', error instanceof Error ? error.message : error);
+  });
   await recallCapture?.shutdown().catch(() => { /* ignore */ });
+  const localRecording = await localMeetingRecorder.shutdown().catch((error) => {
+    console.error('[local-meeting] failed to finalize during quit:', error instanceof Error ? error.message : error);
+    return null;
+  });
+  if (localRecording) await ingestLocalMeeting(localRecording).catch((error) => {
+    // The finalized WAV + metadata stay on disk for recovery even if the daemon
+    // is already unavailable. Never discard a meeting just to finish quitting.
+    console.error('[local-meeting] finalized but could not queue during quit:', error instanceof Error ? error.message : error);
+  });
   await supervisor?.stop().catch(() => { /* ignore */ });
   quitPrepared = true;
   quitPreparing = false;
@@ -538,7 +630,12 @@ function clearUpdateInstallIntent(): void {
 
 async function prepareForUpdateInstall(): Promise<void> {
   markUpdateInstallIntent();
+  await recallCapture?.prepareForShutdown().catch((error) => {
+    console.error('[recall] failed to prepare meeting capture before update shutdown:', error instanceof Error ? error.message : error);
+  });
   await recallCapture?.shutdown().catch(() => { /* ignore */ });
+  const localRecording = await localMeetingRecorder.shutdown().catch(() => null);
+  if (localRecording) await ingestLocalMeeting(localRecording).catch(() => { /* durable WAV remains for recovery */ });
   await supervisor?.stop().catch(() => { /* ignore */ });
 }
 
@@ -571,15 +668,39 @@ async function probeActiveWorkBeforeInstall(): Promise<{
   total: number;
   summary: string;
 } | null> {
+  const captureSummary: string[] = [];
+  if (localMeetingRecorder.status().recording) captureSummary.push('1 local meeting recording');
+  if (recallCapture?.status().recording) captureSummary.push('1 online meeting recording');
   try {
     const payload = await fetchDaemonJson<{ total?: unknown; summary?: unknown }>(
       '/api/console/active-work',
     );
-    const total = typeof payload.total === 'number' ? payload.total : 0;
-    const summary = typeof payload.summary === 'string' ? payload.summary : '';
+    const daemonTotal = typeof payload.total === 'number' ? payload.total : 0;
+    const total = daemonTotal + captureSummary.length;
+    const daemonSummary = typeof payload.summary === 'string' && payload.summary !== 'no active work'
+      ? payload.summary
+      : '';
+    const summary = [daemonSummary, ...captureSummary].filter(Boolean).join(', ') || 'no active work';
     return { total, summary };
   } catch {
-    return null;
+    return captureSummary.length > 0
+      ? { total: captureSummary.length, summary: captureSummary.join(', ') }
+      : null;
+  }
+}
+
+async function finalizeMeetingCaptureBeforeInstall(): Promise<void> {
+  // This must be unconditional: visible `recording` becomes false before a
+  // native stop and /complete finish, and it remains false while a start is
+  // still waiting for its upload token.
+  await recallCapture?.prepareForShutdown();
+  const localRecording = await localMeetingRecorder.shutdown();
+  if (localRecording) {
+    await ingestLocalMeeting(localRecording).catch((error) => {
+      // Safe to proceed: both the repaired WAV and its final sidecar remain on
+      // disk and the daemon's startup recovery will retry the queue operation.
+      console.error('[local-meeting] finalized before update but could not queue:', error instanceof Error ? error.message : error);
+    });
   }
 }
 
@@ -600,7 +721,7 @@ async function applyUpdateFromUi(): Promise<ReturnType<typeof getUpdaterStatus> 
       title: 'Active work in progress',
       message: `Clementine has ${activeWork.summary}.`,
       detail:
-        'Installing the update now will quit the daemon and stop these runs. They will not auto-resume.\n\n'
+        'Installing the update now will quit Clementine and stop this work. Runs will not auto-resume; active meeting recordings will be finalized before the installer takes over.\n\n'
         + 'Defer to install later — Clementine will keep this update ready and prompt again when no work is active.\n\n'
         + 'Install Anyway to proceed (recommended only if you are sure these runs are safe to stop).',
     });
@@ -618,6 +739,20 @@ async function applyUpdateFromUi(): Promise<ReturnType<typeof getUpdaterStatus> 
 
   const wasReadyToInstall = getUpdaterStatus().state === 'ready-to-install';
   if (wasReadyToInstall) {
+    // quitAndInstall may trigger Electron's native before-quit immediately.
+    // Finalize meeting capture before handing control to it so the last PCM
+    // chunks and Recall completion event cannot be cut off by process exit.
+    try {
+      await finalizeMeetingCaptureBeforeInstall();
+    } catch (error) {
+      return {
+        ...getUpdaterStatus(),
+        applyResult: {
+          ok: false,
+          reason: `Install deferred — Clementine could not safely finalize the active meeting: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      };
+    }
     // Mark intent before quitAndInstall so before-quit does not block the
     // native updater. Do not stop the daemon until quitAndInstall accepts
     // the handoff; otherwise a synchronous updater failure leaves Clem
@@ -796,6 +931,13 @@ async function launchDaemon(): Promise<void> {
       getWebhookToken: () => getWebhookSecret(),
       emit: (event) => {
         mainWindow?.webContents.send('clemmy:recall-event', event);
+        // Recording lifecycle events must immediately update the persistent
+        // tray indicator. Transcript/realtime events can arrive many times per
+        // second, so never rebuild a native menu/image for those hot events.
+        const type = typeof event.type === 'string' ? event.type : '';
+        if (RECALL_TRAY_STATE_EVENTS.has(type)) {
+          rebuildTrayMenu();
+        }
       },
     });
   }
@@ -821,6 +963,23 @@ async function launchDaemon(): Promise<void> {
     const info = await supervisor.start();
     const token = getWebhookSecret();
     dashboardUrl = supervisor.getDashboardUrl(token);
+    await recoverLocalMeetingsAfterCrash().catch((error) => {
+      console.error('[local-meeting] crash recovery failed:', error instanceof Error ? error.message : error);
+    });
+    // Apply cancellation intent after crash recovery. If a crash interrupted
+    // local file deletion, recovery may briefly re-register its sidecar; the
+    // tombstone must win and remove that daemon record afterward.
+    try {
+      markRecoveredLocalMeetingCancellationsReady();
+    } catch (error) {
+      // Do not issue cleanup from an unconfirmed tombstone: without the ready
+      // marker, the regular status worker deliberately leaves it alone.
+      console.error('[local-meeting] could not arm recovered cancellation intent:', error instanceof Error ? error.message : error);
+    }
+    await retryPendingLocalMeetingCancellations().catch((error) => {
+      // Tombstones remain on disk and the five-second local status path retries.
+      console.error('[local-meeting] pending cancellation recovery failed:', error instanceof Error ? error.message : error);
+    });
     await syncRecallCaptureFromDaemon().catch((error) => {
       console.error('[recall] initial sync failed:', error instanceof Error ? error.message : error);
     });
@@ -866,6 +1025,213 @@ async function fetchDaemonJson<T>(pathname: string, init?: RequestInit): Promise
     throw new Error(message);
   }
   return payload as T;
+}
+
+function postDaemonJson<T>(pathname: string, body: Record<string, unknown>): Promise<T> {
+  return fetchDaemonJson<T>(pathname, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+interface PendingLocalMeetingCancellation {
+  sessionId: string;
+  requestedAt: string;
+  localCleanupCompletedAt?: string;
+  lastAttemptAt?: string;
+  lastError?: string;
+}
+
+interface LocalMeetingCancellationRetryStatus {
+  pendingCount: number;
+  pendingSessionIds: string[];
+}
+
+let pendingLocalCancellationRetry: Promise<LocalMeetingCancellationRetryStatus> | null = null;
+
+function localMeetingCancellationTombstonePath(): string {
+  return path.join(app.getPath('userData'), 'pending-local-meeting-cancellations.json');
+}
+
+function readPendingLocalMeetingCancellations(): PendingLocalMeetingCancellation[] {
+  const filePath = localMeetingCancellationTombstonePath();
+  if (!existsSync(filePath)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as {
+      cancellations?: Array<Partial<PendingLocalMeetingCancellation>>;
+    };
+    if (!Array.isArray(parsed.cancellations)) return [];
+    const bySession = new Map<string, PendingLocalMeetingCancellation>();
+    for (const entry of parsed.cancellations) {
+      const sessionId = typeof entry.sessionId === 'string' ? entry.sessionId.trim() : '';
+      if (!/^[a-zA-Z0-9_-]{8,80}$/.test(sessionId)) continue;
+      bySession.set(sessionId, {
+        sessionId,
+        requestedAt: typeof entry.requestedAt === 'string' && Number.isFinite(Date.parse(entry.requestedAt))
+          ? new Date(entry.requestedAt).toISOString()
+          : new Date().toISOString(),
+        localCleanupCompletedAt: typeof entry.localCleanupCompletedAt === 'string'
+          && Number.isFinite(Date.parse(entry.localCleanupCompletedAt))
+          ? new Date(entry.localCleanupCompletedAt).toISOString()
+          : undefined,
+        lastAttemptAt: typeof entry.lastAttemptAt === 'string' && Number.isFinite(Date.parse(entry.lastAttemptAt))
+          ? new Date(entry.lastAttemptAt).toISOString()
+          : undefined,
+        lastError: typeof entry.lastError === 'string' ? entry.lastError.slice(0, 500) : undefined,
+      });
+    }
+    return Array.from(bySession.values());
+  } catch {
+    // Fail closed: retain the unreadable file for support. A subsequent user
+    // cancellation writes a fresh, validated snapshot alongside it atomically.
+    return [];
+  }
+}
+
+function writePendingLocalMeetingCancellations(entries: PendingLocalMeetingCancellation[]): void {
+  const filePath = localMeetingCancellationTombstonePath();
+  mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  writeFileSync(tempPath, `${JSON.stringify({ schemaVersion: 1, cancellations: entries }, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  renameSync(tempPath, filePath);
+}
+
+function rememberPendingLocalMeetingCancellation(sessionId: string): void {
+  if (!/^[a-zA-Z0-9_-]{8,80}$/.test(sessionId)) {
+    throw new Error('invalid local meeting session ID');
+  }
+  const entries = readPendingLocalMeetingCancellations();
+  if (entries.some((entry) => entry.sessionId === sessionId)) return;
+  entries.push({ sessionId, requestedAt: new Date().toISOString() });
+  writePendingLocalMeetingCancellations(entries);
+}
+
+function markPendingLocalMeetingCancellationReady(sessionId: string): void {
+  const entries = readPendingLocalMeetingCancellations();
+  const existing = entries.find((entry) => entry.sessionId === sessionId);
+  if (!existing) throw new Error('pending local meeting cancellation was not persisted');
+  if (existing.localCleanupCompletedAt) return;
+  existing.localCleanupCompletedAt = new Date().toISOString();
+  writePendingLocalMeetingCancellations(entries);
+}
+
+function markRecoveredLocalMeetingCancellationsReady(): void {
+  const entries = readPendingLocalMeetingCancellations();
+  let changed = false;
+  const completedAt = new Date().toISOString();
+  for (const entry of entries) {
+    if (entry.localCleanupCompletedAt) continue;
+    entry.localCleanupCompletedAt = completedAt;
+    changed = true;
+  }
+  if (changed) writePendingLocalMeetingCancellations(entries);
+}
+
+function updatePendingLocalMeetingCancellationError(sessionId: string, error: unknown): void {
+  const entries = readPendingLocalMeetingCancellations();
+  const existing = entries.find((entry) => entry.sessionId === sessionId);
+  if (!existing) return;
+  existing.lastAttemptAt = new Date().toISOString();
+  existing.lastError = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+  writePendingLocalMeetingCancellations(entries);
+}
+
+function forgetPendingLocalMeetingCancellation(sessionId: string): void {
+  const entries = readPendingLocalMeetingCancellations();
+  const next = entries.filter((entry) => entry.sessionId !== sessionId);
+  if (next.length !== entries.length) writePendingLocalMeetingCancellations(next);
+}
+
+async function sendPendingLocalMeetingCancellation(sessionId: string): Promise<{
+  pending: boolean;
+  error?: string;
+}> {
+  try {
+    await postDaemonJson<Record<string, unknown>>('/api/console/meetings/local/cancel', { sessionId });
+    forgetPendingLocalMeetingCancellation(sessionId);
+    return { pending: false };
+  } catch (error) {
+    updatePendingLocalMeetingCancellationError(sessionId, error);
+    return { pending: true, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function requestDaemonLocalMeetingCancellation(sessionId: string): Promise<{
+  pending: boolean;
+  error?: string;
+}> {
+  // Persist intent before touching the daemon. If the process exits after the
+  // daemon received /start but before its response reached Electron, this is
+  // the durable evidence startup/status retry needs to remove the ghost.
+  rememberPendingLocalMeetingCancellation(sessionId);
+  // The status poll must not delete the daemon record (and its audio path)
+  // while local cancellation is still queued behind PCM writes. Only expose
+  // this tombstone to retries after the writer has closed and files are gone.
+  markPendingLocalMeetingCancellationReady(sessionId);
+  return sendPendingLocalMeetingCancellation(sessionId);
+}
+
+async function retryPendingLocalMeetingCancellations(): Promise<LocalMeetingCancellationRetryStatus> {
+  if (pendingLocalCancellationRetry) return pendingLocalCancellationRetry;
+  const pending = (async () => {
+    const entries = readPendingLocalMeetingCancellations();
+    for (const entry of entries.filter((candidate) => candidate.localCleanupCompletedAt)) {
+      const result = await sendPendingLocalMeetingCancellation(entry.sessionId);
+      if (result.pending) {
+        console.warn('[local-meeting] daemon cancellation remains pending:', entry.sessionId, result.error ?? 'unknown error');
+      }
+    }
+    const remaining = readPendingLocalMeetingCancellations();
+    return {
+      pendingCount: remaining.length,
+      pendingSessionIds: remaining.map((entry) => entry.sessionId),
+    };
+  })();
+  pendingLocalCancellationRetry = pending;
+  try {
+    return await pending;
+  } finally {
+    if (pendingLocalCancellationRetry === pending) pendingLocalCancellationRetry = null;
+  }
+}
+
+async function ingestLocalMeeting(recording: LocalMeetingRecording): Promise<Record<string, unknown>> {
+  return postDaemonJson<Record<string, unknown>>('/api/console/meetings/local/ingest', {
+    sessionId: recording.sessionId,
+    audioPath: recording.audioPath,
+    endedAt: recording.endedAt,
+    durationSeconds: recording.durationSeconds,
+    bytes: recording.bytes,
+  });
+}
+
+async function recoverLocalMeetingsAfterCrash(): Promise<void> {
+  const recordings = await localMeetingRecorder.recoverInterruptedRecordings();
+  for (const recording of recordings) {
+    try {
+      // /start is idempotent for the same session/path. Re-registering first
+      // covers both daemon persistence and a daemon state file lost in the
+      // same crash that interrupted the Electron process.
+      await postDaemonJson<Record<string, unknown>>('/api/console/meetings/local/start', {
+        sessionId: recording.sessionId,
+        title: recording.title,
+        audioPath: recording.audioPath,
+        startedAt: recording.startedAt,
+        sampleRate: recording.sampleRate,
+        channels: recording.channels,
+      });
+      await ingestLocalMeeting(recording);
+      console.info('[local-meeting] recovered interrupted recording', recording.sessionId);
+    } catch (error) {
+      // The repaired WAV and final sidecar remain durable. A future launch can
+      // retry without ever overwriting or deleting the user's audio.
+      console.error('[local-meeting] recovered audio but could not queue it:', error instanceof Error ? error.message : error);
+    }
+  }
 }
 
 async function syncRecallCaptureFromDaemon(): Promise<void> {
@@ -922,7 +1288,11 @@ ipcMain.handle('clemmy:recall-request-permissions', async (evt: IpcMainInvokeEve
 
 ipcMain.handle('clemmy:recall-start-manual', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
-  return recallCapture?.startManualRecording() ?? null;
+  try {
+    return await recallCapture?.startManualRecording() ?? null;
+  } finally {
+    rebuildTrayMenu();
+  }
 });
 
 // Primary "RECORD MEETING" path — records the detected meeting window when
@@ -931,26 +1301,42 @@ ipcMain.handle('clemmy:recall-start-manual', async (evt: IpcMainInvokeEvent) => 
 // dashboard can guide the user. See RecallDesktopCapture.recordActiveMeeting.
 ipcMain.handle('clemmy:recall-record-active', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
-  return recallCapture?.recordActiveMeeting() ?? null;
+  try {
+    return await recallCapture?.recordActiveMeeting() ?? null;
+  } finally {
+    rebuildTrayMenu();
+  }
 });
 
 ipcMain.handle('clemmy:recall-record-detected', async (evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
   assertIpcSender(evt, ['dashboard']);
   const id = (payload?.windowId ?? '').trim();
   if (!id) throw new Error('windowId required');
-  return recallCapture?.recordDetectedWindow(id) ?? null;
+  try {
+    return await recallCapture?.recordDetectedWindow(id) ?? null;
+  } finally {
+    rebuildTrayMenu();
+  }
 });
 
 ipcMain.handle('clemmy:recall-auto-record', async (evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
   assertIpcSender(evt, ['dashboard']);
   const id = (payload?.windowId ?? '').trim();
   if (!id) throw new Error('windowId required');
-  return recallCapture?.enableAutoRecordAndRecord(id) ?? null;
+  try {
+    return await recallCapture?.enableAutoRecordAndRecord(id) ?? null;
+  } finally {
+    rebuildTrayMenu();
+  }
 });
 
 ipcMain.handle('clemmy:recall-stop', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
-  return recallCapture?.stopRecording() ?? null;
+  try {
+    return await recallCapture?.stopRecording() ?? null;
+  } finally {
+    rebuildTrayMenu();
+  }
 });
 
 ipcMain.handle('clemmy:recall-test', async (evt: IpcMainInvokeEvent) => {
@@ -960,6 +1346,153 @@ ipcMain.handle('clemmy:recall-test', async (evt: IpcMainInvokeEvent) => {
   // "Test Connection" button can diagnose why recording isn't firing.
   await syncRecallCaptureFromDaemon().catch(() => { /* keep going on stale status */ });
   return recallCapture?.testConnection() ?? null;
+});
+
+// ─── Local in-person meeting capture ────────────────────────────────
+
+ipcMain.handle('clemmy:local-meeting-status', async (evt: IpcMainInvokeEvent) => {
+  assertIpcSender(evt, ['dashboard']);
+  const recorder = localMeetingRecorder.status();
+  const cancellations = await retryPendingLocalMeetingCancellations().catch(() => {
+    const remaining = readPendingLocalMeetingCancellations();
+    return {
+      pendingCount: remaining.length,
+      pendingSessionIds: remaining.map((entry) => entry.sessionId),
+    };
+  });
+  const daemon = await fetchDaemonJson<Record<string, unknown>>('/api/console/meetings/local/status')
+    .catch((error) => ({
+      runtime: { available: false, reason: error instanceof Error ? error.message : String(error) },
+    }));
+  return {
+    ...daemon,
+    recorder,
+    pendingCancellationCount: cancellations.pendingCount,
+    pendingCancellationSessionIds: cancellations.pendingSessionIds,
+  };
+});
+
+ipcMain.handle('clemmy:local-meeting-start', async (
+  evt: IpcMainInvokeEvent,
+  payload?: { title?: unknown },
+) => {
+  assertIpcSender(evt, ['dashboard']);
+  const recorder = await localMeetingRecorder.start({ title: payload?.title });
+  try {
+    const daemon = await postDaemonJson<Record<string, unknown>>('/api/console/meetings/local/start', {
+      sessionId: recorder.sessionId!,
+      title: recorder.title,
+      audioPath: recorder.audioPath!,
+      startedAt: recorder.startedAt!,
+      sampleRate: recorder.sampleRate,
+      channels: recorder.channels,
+    });
+    return { recorder, daemon };
+  } catch (error) {
+    const original = error instanceof Error ? error.message : String(error);
+    let tombstoneError: unknown;
+    try {
+      rememberPendingLocalMeetingCancellation(recorder.sessionId!);
+    } catch (persistError) {
+      tombstoneError = persistError;
+    }
+    let localCancelError: unknown;
+    try {
+      await localMeetingRecorder.cancel(recorder.sessionId!);
+    } catch (cancelError) {
+      localCancelError = cancelError;
+    }
+    if (localCancelError) {
+      throw new Error(
+        `${original} Clementine could not stop the local audio writer: ${localCancelError instanceof Error ? localCancelError.message : String(localCancelError)}${tombstoneError ? ` It also could not persist daemon cleanup: ${tombstoneError instanceof Error ? tombstoneError.message : String(tombstoneError)}` : ''}`,
+      );
+    }
+    let cancellation: Awaited<ReturnType<typeof requestDaemonLocalMeetingCancellation>>;
+    try {
+      // This repeats the initial tombstone write intentionally. A transient
+      // persistence failure above may have cleared after the local writer was
+      // closed, and daemon cleanup still must never run without durable intent.
+      cancellation = await requestDaemonLocalMeetingCancellation(recorder.sessionId!);
+    } catch (cleanupError) {
+      throw new Error(
+        `${original} Local audio capture was stopped, but Clementine could not persist daemon cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+      );
+    }
+    if (cancellation.pending) {
+      throw new Error(
+        `${original} Local audio capture was stopped, but daemon cleanup is pending and will retry automatically.`,
+      );
+    }
+    throw error;
+  } finally {
+    rebuildTrayMenu();
+  }
+});
+
+ipcMain.handle('clemmy:local-meeting-append', async (
+  evt: IpcMainInvokeEvent,
+  payload?: { sessionId?: unknown; chunk?: unknown },
+) => {
+  assertIpcSender(evt, ['dashboard']);
+  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  return localMeetingRecorder.append(sessionId, payload?.chunk);
+});
+
+ipcMain.handle('clemmy:local-meeting-stop', async (
+  evt: IpcMainInvokeEvent,
+  payload?: { sessionId?: unknown },
+) => {
+  assertIpcSender(evt, ['dashboard']);
+  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  try {
+    const recording = await localMeetingRecorder.stop(sessionId);
+    try {
+      const daemon = await ingestLocalMeeting(recording);
+      return { recording, queued: true, daemon };
+    } catch (error) {
+      // Recording success and transcription queueing are separate outcomes. The
+      // WAV is durable, so report a recoverable queue error instead of pretending
+      // the meeting itself was lost.
+      return {
+        recording,
+        queued: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  } finally {
+    rebuildTrayMenu();
+  }
+});
+
+ipcMain.handle('clemmy:local-meeting-cancel', async (
+  evt: IpcMainInvokeEvent,
+  payload?: { sessionId?: unknown },
+) => {
+  assertIpcSender(evt, ['dashboard']);
+  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
+  try {
+    rememberPendingLocalMeetingCancellation(sessionId);
+    let result: Awaited<ReturnType<typeof localMeetingRecorder.cancel>>;
+    try {
+      result = await localMeetingRecorder.cancel(sessionId);
+    } catch (error) {
+      // The local recorder is still authoritative if its own cancellation
+      // failed. Do not let the retry worker delete the daemon record while an
+      // active writer may still exist.
+      forgetPendingLocalMeetingCancellation(sessionId);
+      throw error;
+    }
+    const cancellation = await requestDaemonLocalMeetingCancellation(sessionId);
+    return {
+      ...result,
+      daemonCancellationPending: cancellation.pending,
+      warning: cancellation.pending
+        ? 'Local audio was discarded, but meeting-history cleanup is pending and will retry automatically.'
+        : undefined,
+    };
+  } finally {
+    rebuildTrayMenu();
+  }
 });
 
 // ─── Auto-update IPC ────────────────────────────────────────────────

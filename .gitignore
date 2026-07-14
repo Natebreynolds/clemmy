@@ -65,7 +65,7 @@ cvelist.diff
 console-home.png
 
 
-# Vendored uv binaries — fetched at prepack by scripts/vendor-uv.mjs, shipped in the npm tarball, not committed
+# Vendored native runtimes — uv is generated for npm/desktop packages; whisper.cpp is desktop-only. Never commit.
 vendor/
 
 # Local Netlify folder

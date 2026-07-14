@@ -18,6 +18,11 @@ const dualArchScriptText = readFileSync(
   'utf-8',
 );
 const desktopPackage = JSON.parse(readFileSync(new URL('../apps/desktop/package.json', import.meta.url), 'utf-8'));
+const rootPackage = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+const windowsReleaseText = readFileSync(
+  new URL('../apps/desktop/scripts/release-windows.mjs', import.meta.url),
+  'utf-8',
+);
 const dmgHookText = readFileSync(
   new URL('../apps/desktop/build/after-all-artifact-build.cjs', import.meta.url),
   'utf-8',
@@ -62,6 +67,23 @@ test('candidate dispatcher defaults to the next patch prerelease and rejects dow
 test('unsigned macOS rehearsal overrides the configured production signing identity', () => {
   assert.match(dualArchScriptText, /if ! is_signed_release/);
   assert.match(dualArchScriptText, /--config\.mac\.identity=null/);
+});
+
+test('desktop releases securely vendor Recall and rebuild self-validating Whisper runtimes', () => {
+  assert.match(dualArchScriptText, /vendor:recall-native -- --platform darwin/);
+  assert.match(dualArchScriptText, /vendor:whisper -- --target aarch64-apple-darwin --force/);
+  assert.match(dualArchScriptText, /vendor:whisper -- --target x86_64-apple-darwin --force/);
+  assert.match(dualArchScriptText, /WHISPER_ALLOW_VALIDATED_CACHE/);
+  assert.match(dualArchScriptText, /--adopt-validated-cache/);
+  assert.match(windowsReleaseText, /vendor:recall-native.*--platform.*win32/);
+  assert.match(windowsReleaseText, /vendor:whisper.*x86_64-pc-windows-msvc.*--force/);
+  assert.match(String(desktopPackage.scripts?.['package:dist'] ?? ''), /vendor:recall-native/);
+  assert.match(String(desktopPackage.scripts?.['package:mac:unsigned'] ?? ''), /WHISPER_ALLOW_VALIDATED_CACHE=true/);
+});
+
+test('the universal npm package does not publish host-dependent Whisper binaries', () => {
+  assert.ok(!rootPackage.files.includes('vendor/whisper'));
+  assert.ok(rootPackage.files.includes('vendor/uv'));
 });
 
 test('DMGs are signed before electron-builder disposes its temporary keychain', () => {

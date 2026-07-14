@@ -133,6 +133,33 @@ export interface RecallRecording {
 }
 
 /**
+ * Retrieve Desktop SDK Upload response. Recall has returned both the newer
+ * nested `recording: { id }` shape (matching sdk_upload webhooks) and older
+ * `recording_id`/string variants, so reconciliation accepts all of them.
+ */
+export interface RecallSdkUpload {
+  id: string;
+  status?: { code?: string; sub_code?: string | null; updated_at?: string } | string;
+  status_changes?: Array<{ code?: string; sub_code?: string | null; updated_at?: string }>;
+  data?: { code?: string; sub_code?: string | null; updated_at?: string };
+  recording_id?: string | null;
+  recording?: { id?: string } | string | null;
+  recordings?: Array<{ id?: string }>;
+  metadata?: Record<string, unknown>;
+}
+
+/** Fetch one Desktop SDK upload while it materializes its recording. */
+export async function getSdkUpload(
+  sdkUploadId: string,
+  options?: { apiKey?: string; region?: RecallRegion },
+): Promise<RecallSdkUpload> {
+  return recallApiRequest<RecallSdkUpload>(
+    `/sdk_upload/${sdkUploadId}/`,
+    options,
+  );
+}
+
+/**
  * Fetch the recording metadata for a desktop SDK upload. For Recall's
  * desktop SDK, transcription is automatic — you DON'T POST to
  * /recording/<id>/create_transcript/ (that's the bot path and returns
