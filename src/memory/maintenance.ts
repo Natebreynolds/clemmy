@@ -424,21 +424,13 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // not retain raw meeting audio until the next application restart.
   if (tickCount % LOCAL_AUDIO_DELETION_EVERY_N_TICKS === 0) {
     try {
+      // Exhaustion surfacing (notification) lives INSIDE
+      // recoverPendingLocalAudioDeletions — multiple callers run this scan, and
+      // a caller-side notify let whichever crossed the cap first consume the
+      // one-shot durable marker and silently swallow the user-facing warning.
       const cleanup = recoverPendingLocalAudioDeletions({ force: true });
       if (cleanup.deleted > 0 || cleanup.failed > 0) {
         logger.info({ cleanup: { ...cleanup, exhausted: cleanup.exhausted.length } }, 'local meeting audio privacy cleanup tick');
-      }
-      // A deletion that exhausted its retry cap is surfaced ONCE (durable
-      // marker in the record) — silent retry-forever hid the retained audio.
-      for (const item of cleanup.exhausted) {
-        addNotification({
-          id: `local-audio-delete-exhausted-${item.meetingId}`,
-          kind: 'system',
-          read: false,
-          createdAt: new Date().toISOString(),
-          title: 'Could not delete a meeting recording',
-          body: `The audio for "${item.title ?? 'a recorded meeting'}" could not be deleted after repeated tries (the file may be locked).${item.audioPath ? ` Remove it manually: ${item.audioPath}` : ''}`,
-        });
       }
     } catch (err) {
       logger.warn({ err }, 'local meeting audio privacy cleanup tick failed');

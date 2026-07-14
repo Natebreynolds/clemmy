@@ -221,3 +221,30 @@ test('a dead producer flips status to STALE past the floor; a resumed append res
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('touchActivity() re-arms the staleness floor (sleep/wake grace)', async () => {
+  // 2026-07-14 adversarial review: system sleep freezes the mic pump AND the
+  // clock check; without a wake grace, the first post-wake status poll saw
+  // stale=true and finalized a recording the user expected to CONTINUE.
+  // powerMonitor resume/unlock call touchActivity() to grant the resumed
+  // producer a fresh window; a truly dead producer re-trips 15s later.
+  const root = await mkdtemp(path.join(os.tmpdir(), 'clementine-local-meeting-wake-'));
+  let nowMs = Date.UTC(2026, 6, 14, 10, 0, 0);
+  const recorder = new LocalMeetingRecorder({
+    rootDir: root,
+    createId: () => 'wake-grace-session',
+    now: () => new Date(nowMs),
+  });
+  try {
+    await recorder.start({});
+    nowMs += 10 * 60_000; // "slept" for 10 minutes
+    assert.equal(recorder.status().stale, true, 'post-wake, wall-clock staleness trips');
+    recorder.touchActivity(); // powerMonitor resume hook
+    assert.equal(recorder.status().stale, false, 'wake grace re-arms the floor');
+    nowMs += STALE_CAPTURE_AFTER_MS + 1_000; // producer truly dead after wake
+    assert.equal(recorder.status().stale, true, 'a dead producer still trips after the grace');
+  } finally {
+    await recorder.shutdown().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});

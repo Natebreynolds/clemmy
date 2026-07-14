@@ -207,7 +207,7 @@ export function Meetings() {
     setLocalBusy(true); setLocalNotice(null);
     try {
       await sharedLocalMeetingCapture().start(localTitle);
-      setLocalNotice({ tone: 'info', text: 'Recording this microphone locally. Stay on this page until you stop.' });
+      setLocalNotice({ tone: 'info', text: 'Recording this microphone locally. You can navigate anywhere — the recording continues until you stop it (see the banner at the top).' });
       await localDesktopStatus.refetch();
     } catch (e) { setLocalNotice({ tone: 'error', text: (e as Error).message }); }
     finally { setLocalBusy(false); }

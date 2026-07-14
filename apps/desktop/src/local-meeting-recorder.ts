@@ -203,6 +203,16 @@ export class LocalMeetingRecorder {
     this.createId = options.createId ?? randomUUID;
   }
 
+  /** Re-arm the staleness floor without an append. Called on powerMonitor
+   *  resume/unlock: a wall-clock gap that spans SLEEP says nothing about
+   *  producer health (the mic pump was frozen with the rest of the app), so
+   *  the resumed producer gets a fresh STALE_CAPTURE_AFTER_MS window instead
+   *  of being finalized by the first post-wake status poll (2026-07-14
+   *  adversarial review — the sleep/wake mid-meeting kill). */
+  touchActivity(): void {
+    if (this.active) this.active.lastAppendAtMs = this.now().getTime();
+  }
+
   status(): LocalMeetingRecorderStatus {
     const active = this.active;
     return {

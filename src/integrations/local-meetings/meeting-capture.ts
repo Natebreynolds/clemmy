@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+import { addNotification } from '../../runtime/notifications.js';
 import { BASE_DIR } from '../../config.js';
 import { createBackgroundTask } from '../../execution/background-tasks.js';
 import { reindexVault } from '../../memory/indexer.js';
@@ -396,12 +397,24 @@ export function recoverPendingLocalAudioDeletions(
   options: { force?: boolean } = {},
 ): LocalAudioDeletionRecoveryResult {
   const result: LocalAudioDeletionRecoveryResult = { discovered: 0, deleted: 0, failed: 0, exhausted: [] };
+  const keepAudio = loadLocalMeetingSettings().keepAudio;
   for (const record of listAllRecallMeetingRecords()) {
     if (record.provider !== 'local' || !record.audioPath) continue;
-    if (record.audioDeletionStatus !== 'pending' && record.audioDeletionStatus !== 'failed') continue;
+    // CRASH-WINDOW sweep (2026-07-14 review): a crash between transcription-
+    // ready and the deletion's durable intent write leaves a READY record with
+    // audio and NO deletion status — invisible to the pending/failed filter, so
+    // the audio would be retained forever against the transcript-only promise.
+    const crashOrphan = !keepAudio
+      && record.transcriptionStatus === 'ready'
+      && record.audioDeletionStatus === undefined;
+    if (record.audioDeletionStatus !== 'pending' && record.audioDeletionStatus !== 'failed' && !crashOrphan) continue;
     result.discovered += 1;
     if ((record.audioDeletionAttempts ?? 0) >= MAX_LOCAL_AUDIO_DELETION_ATTEMPTS) {
-      // Already surfaced (durable marker) → stay silent; else mark + report once.
+      // Already surfaced (durable marker) → stay silent; else mark + notify ONCE.
+      // The notification is sent HERE (not by the caller) because MULTIPLE
+      // callers run this scan (maintenance tick, transcription recovery) — a
+      // caller-side notify let whichever caller crossed the cap first consume
+      // the one-shot marker and silently swallow the surfacing (review repro).
       if (!(record.audioDeletionError ?? '').startsWith(AUDIO_DELETION_EXHAUSTED_PREFIX)) {
         try {
           patchMeetingRecord(record.id, {
@@ -409,6 +422,16 @@ export function recoverPendingLocalAudioDeletions(
             audioDeletionUpdatedAt: new Date().toISOString(),
           });
           result.exhausted.push({ meetingId: record.id, title: record.title, audioPath: record.audioPath });
+          try {
+            addNotification({
+              id: `local-audio-delete-exhausted-${record.id}`,
+              kind: 'system',
+              read: false,
+              createdAt: new Date().toISOString(),
+              title: 'Could not delete a meeting recording',
+              body: `The audio for "${record.title ?? 'a recorded meeting'}" could not be deleted after repeated tries (the file may be locked). Remove it manually: ${record.audioPath}`,
+            });
+          } catch { /* notification is best-effort; the durable marker + record error remain */ }
         } catch { /* marker write failed — retry surfacing next scan */ }
       }
       result.failed += 1;
