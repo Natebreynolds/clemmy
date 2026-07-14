@@ -19,3 +19,25 @@ test('float32ToPcm16 clamps and encodes little-endian signed samples', () => {
     [-32_768, -32_768, -16_384, 0, 16_384, 32_767, 32_767],
   );
 });
+
+test('shared capture is a stable singleton whose state replays to late subscribers', async () => {
+  // 2026-07-14 review: the capture must OUTLIVE the Meetings screen so SPA
+  // navigation can never silently stop a recording. Screens subscribe; a
+  // freshly-mounted screen immediately receives the current state.
+  const { sharedLocalMeetingCapture, subscribeSharedLocalMeetingCapture, sharedLocalMeetingCaptureState } =
+    await import('./local-meeting-recorder.js');
+  const a = sharedLocalMeetingCapture();
+  const b = sharedLocalMeetingCapture();
+  assert.equal(a, b, 'one instance for the whole app');
+
+  const seen: string[] = [];
+  const unsubscribe = subscribeSharedLocalMeetingCapture((s) => { seen.push(s.phase); });
+  assert.equal(seen.length, 1, 'subscription replays the latest state immediately');
+  assert.equal(seen[0], sharedLocalMeetingCaptureState().phase);
+
+  unsubscribe();
+  const countAfterUnsub = seen.length;
+  // A second subscriber's replay must not notify the unsubscribed one.
+  subscribeSharedLocalMeetingCapture(() => undefined)();
+  assert.equal(seen.length, countAfterUnsub, 'unsubscribed listeners are never notified again');
+});

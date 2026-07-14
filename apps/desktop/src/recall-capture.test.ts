@@ -687,3 +687,83 @@ test('native SDK shutdown completes the owned upload and clean exit can initiali
   assert.equal(initCalls, 2, 'clean native exit must not leave initialize short-circuited');
   assert.equal(capture.status().initialized, true);
 });
+
+test('re-initialization never duplicates SDK listeners (failed-init retry + post-shutdown reconnect)', async () => {
+  // The REAL SDK stores listeners in a MODULE-LEVEL ARRAY (push, no dedup) that
+  // survives init() failures and clean shutdowns. The Map-based fakes elsewhere
+  // in this file dedupe by construction and can never reproduce duplication —
+  // this fake mirrors the array semantics (2026-07-14 pre-release review: every
+  // re-init attached all listeners AGAIN, so one transcript event was persisted
+  // N times after N reconnects).
+  const listeners: Array<{ type: string; cb: (event: unknown) => void }> = [];
+  const dispatch = (type: string, event: unknown) => {
+    for (const l of [...listeners]) if (l.type === type) l.cb(event);
+  };
+  const daemonCalls: Array<{ pathname: string; body: Record<string, unknown> }> = [];
+  let initCalls = 0;
+  const fakeSdk = {
+    init: async () => {
+      initCalls += 1;
+      if (initCalls === 1) throw new Error('simulated init failure');
+      return null;
+    },
+    shutdown: async () => null,
+    startRecording: async () => null,
+    stopRecording: async () => null,
+    prepareDesktopAudioRecording: async () => 'desktop-audio-window',
+    requestPermission: async () => null,
+    addEventListener: (type: string, cb: (event: unknown) => void) => { listeners.push({ type, cb }); },
+    removeAllEventListeners: () => { listeners.length = 0; },
+  };
+  const capture = new RecallDesktopCapture({
+    getDaemonBaseUrl: () => 'http://127.0.0.1:1',
+    getWebhookToken: () => 'test-token',
+    emit: () => undefined,
+    runtime: { platform: 'darwin', arch: 'arm64' },
+  });
+  Reflect.set(capture, 'loadSdk', async () => fakeSdk);
+  Reflect.set(capture, 'postDaemon', async (pathname: string, body: Record<string, unknown>) => {
+    daemonCalls.push({ pathname, body });
+    if (pathname.endsWith('/upload-token')) {
+      return { uploadToken: 'upload-token', sdkUploadId: 'sdk-upload-1', id: 'sdk-upload-1', region: 'us-east-1' };
+    }
+    return {};
+  });
+
+  // Leak path (a): init fails once AFTER listeners were attached; the retry
+  // must purge before re-attaching, leaving exactly one listener per type.
+  await assert.rejects(capture.configure({ enabled: true, liveTranscript: true }), /simulated init failure/);
+  await capture.configure({ enabled: true, liveTranscript: true });
+  assert.equal(
+    listeners.filter((l) => l.type === 'realtime-event').length,
+    1,
+    'retry after failed init must not duplicate listeners',
+  );
+
+  // The user-facing harm: one transcript event must persist exactly ONCE.
+  await capture.recordDetectedWindow('meeting-window-1');
+  dispatch('realtime-event', {
+    event: 'transcript.data',
+    window: { id: 'meeting-window-1' },
+    data: { text: 'Only once', recording_id: 'rec-1' },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(
+    daemonCalls.filter((c) => c.pathname.endsWith('/transcript-event')).length,
+    1,
+    'a single transcript event must persist exactly once',
+  );
+  await capture.stopRecording();
+
+  // Leak path (b): a clean shutdown (code 0) nulls the wrapper but the module
+  // and its listener array survive; the reconnect's initialize() must not
+  // stack a second generation of listeners.
+  dispatch('shutdown', { code: 0, signal: '' });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await capture.configure({ enabled: true, liveTranscript: true });
+  assert.equal(
+    listeners.filter((l) => l.type === 'realtime-event').length,
+    1,
+    'post-shutdown reconnect must not duplicate listeners',
+  );
+});

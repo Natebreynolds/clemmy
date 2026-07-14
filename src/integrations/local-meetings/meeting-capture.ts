@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+import { addNotification } from '../../runtime/notifications.js';
 import { BASE_DIR } from '../../config.js';
 import { createBackgroundTask } from '../../execution/background-tasks.js';
 import { reindexVault } from '../../memory/indexer.js';
@@ -45,7 +46,11 @@ export const DEFAULT_LOCAL_MEETING_SETTINGS: LocalMeetingSettings = {
   analyzeOnComplete: true,
   model: 'base.en',
   language: 'en',
-  keepAudio: true,
+  // Transcript-only by DEFAULT (product decision 2026-07-14): an in-person
+  // recording keeps the TRANSCRIPT; the raw audio is deleted as soon as
+  // transcription succeeds. Retaining audio is the explicit opt-in — recorded
+  // people's raw voices should not persist on disk unless the user chose that.
+  keepAudio: false,
 };
 
 const SETTINGS_FILE = path.join(BASE_DIR, 'state', 'meeting-capture', 'local-settings.json');
@@ -81,7 +86,9 @@ function normalizeSettings(input: Partial<LocalMeetingSettings> | undefined): Lo
     analyzeOnComplete: input?.analyzeOnComplete !== false,
     model: input?.model === 'base.en' ? input.model : DEFAULT_LOCAL_MEETING_SETTINGS.model,
     language,
-    keepAudio: input?.keepAudio !== false,
+    // Absent = transcript-only (matches DEFAULT_LOCAL_MEETING_SETTINGS);
+    // keeping raw audio requires the explicit true.
+    keepAudio: input?.keepAudio === true,
   };
 }
 
@@ -372,17 +379,64 @@ export interface LocalAudioDeletionRecoveryResult {
   discovered: number;
   deleted: number;
   failed: number;
+  /** Records that newly crossed the retry cap THIS scan — the caller surfaces
+   *  these to the user ONCE (the durable marker prevents re-surfacing). */
+  exhausted: Array<{ meetingId: string; title?: string; audioPath?: string }>;
 }
 
-/** Retry a persisted privacy cleanup once per daemon process. */
+// Bounded privacy-deletion retries (2026-07-14 review: the maintenance tick
+// retried a failed deletion FOREVER every cycle with no cap — a permanently
+// locked file meant an infinite silent loop). After this many attempts the
+// record is durably marked exhausted and surfaced to the user instead:
+// honest "I couldn't delete it, here's the path" beats silent retry-forever.
+export const MAX_LOCAL_AUDIO_DELETION_ATTEMPTS = 12;
+const AUDIO_DELETION_EXHAUSTED_PREFIX = 'retries exhausted: ';
+
+/** Retry a persisted privacy cleanup, bounded by MAX_LOCAL_AUDIO_DELETION_ATTEMPTS. */
 export function recoverPendingLocalAudioDeletions(
   options: { force?: boolean } = {},
 ): LocalAudioDeletionRecoveryResult {
-  const result: LocalAudioDeletionRecoveryResult = { discovered: 0, deleted: 0, failed: 0 };
+  const result: LocalAudioDeletionRecoveryResult = { discovered: 0, deleted: 0, failed: 0, exhausted: [] };
+  const keepAudio = loadLocalMeetingSettings().keepAudio;
   for (const record of listAllRecallMeetingRecords()) {
     if (record.provider !== 'local' || !record.audioPath) continue;
-    if (record.audioDeletionStatus !== 'pending' && record.audioDeletionStatus !== 'failed') continue;
+    // CRASH-WINDOW sweep (2026-07-14 review): a crash between transcription-
+    // ready and the deletion's durable intent write leaves a READY record with
+    // audio and NO deletion status — invisible to the pending/failed filter, so
+    // the audio would be retained forever against the transcript-only promise.
+    const crashOrphan = !keepAudio
+      && record.transcriptionStatus === 'ready'
+      && record.audioDeletionStatus === undefined;
+    if (record.audioDeletionStatus !== 'pending' && record.audioDeletionStatus !== 'failed' && !crashOrphan) continue;
     result.discovered += 1;
+    if ((record.audioDeletionAttempts ?? 0) >= MAX_LOCAL_AUDIO_DELETION_ATTEMPTS) {
+      // Already surfaced (durable marker) → stay silent; else mark + notify ONCE.
+      // The notification is sent HERE (not by the caller) because MULTIPLE
+      // callers run this scan (maintenance tick, transcription recovery) — a
+      // caller-side notify let whichever caller crossed the cap first consume
+      // the one-shot marker and silently swallow the surfacing (review repro).
+      if (!(record.audioDeletionError ?? '').startsWith(AUDIO_DELETION_EXHAUSTED_PREFIX)) {
+        try {
+          patchMeetingRecord(record.id, {
+            audioDeletionError: `${AUDIO_DELETION_EXHAUSTED_PREFIX}${record.audioDeletionError ?? 'file could not be deleted'}`,
+            audioDeletionUpdatedAt: new Date().toISOString(),
+          });
+          result.exhausted.push({ meetingId: record.id, title: record.title, audioPath: record.audioPath });
+          try {
+            addNotification({
+              id: `local-audio-delete-exhausted-${record.id}`,
+              kind: 'system',
+              read: false,
+              createdAt: new Date().toISOString(),
+              title: 'Could not delete a meeting recording',
+              body: `The audio for "${record.title ?? 'a recorded meeting'}" could not be deleted after repeated tries (the file may be locked). Remove it manually: ${record.audioPath}`,
+            });
+          } catch { /* notification is best-effort; the durable marker + record error remain */ }
+        } catch { /* marker write failed — retry surfacing next scan */ }
+      }
+      result.failed += 1;
+      continue;
+    }
     const updated = deleteLocalMeetingAudio(record, options.force === true);
     if (updated.audioDeletionStatus === 'deleted') result.deleted += 1;
     else result.failed += 1;
@@ -436,6 +490,13 @@ async function transcribeOne(meetingId: string): Promise<void> {
     }
     if (!settings.keepAudio && ready.audioPath) {
       ready = deleteLocalMeetingAudio(ready);
+    }
+    // The transcript is durable ('ready' persisted above) — the crash-recovery
+    // sidecar has served its purpose. Without this, local-<session>.json files
+    // accumulated forever (2026-07-14 review).
+    if (ready.windowId?.startsWith('local:')) {
+      const sidecarPath = path.join(LOCAL_MEETING_AUDIO_DIR, `local-${ready.windowId.slice('local:'.length)}.json`);
+      try { unlinkSync(sidecarPath); } catch { /* absent or locked — recovery skips ready records anyway */ }
     }
   } catch (error) {
     patchMeetingRecord(meetingId, {
@@ -589,6 +650,13 @@ export function recoverFinalizedLocalMeetingSidecars(options: { force?: boolean 
     return { discovered: 0, queued: 0, errors: 0 };
   }
   lastSidecarRecoveryAt = now;
+  // Consent gate (2026-07-14 review): recovery auto-transcribes found audio and
+  // files it into permanent memory — that must never happen while the feature
+  // is OFF. A user who disabled local capture has withdrawn that consent; the
+  // sidecars stay untouched and recover normally if the feature is re-enabled.
+  if (!loadLocalMeetingSettings().enabled) {
+    return { discovered: 0, queued: 0, errors: 0 };
+  }
   ensureDir(LOCAL_MEETING_AUDIO_DIR);
   const result: LocalMeetingSidecarRecoveryResult = { discovered: 0, queued: 0, errors: 0 };
   let entries: string[] = [];
@@ -621,6 +689,12 @@ export function recoverFinalizedLocalMeetingSidecars(options: { force?: boolean 
       if (record?.provider === 'local' && (
         record.transcriptionStatus === 'queued' || record.transcriptionStatus === 'transcribing'
       )) {
+        continue;
+      }
+      // A cancelled meeting is a terminal USER decision — never resurrect it
+      // (belt to the sidecar unlink in cancelLocalMeeting; this catches a
+      // cancel whose sidecar unlink failed on a locked file).
+      if (record?.provider === 'local' && record.transcriptionStatus === 'cancelled') {
         continue;
       }
       // Retry a persisted failure once per daemon process. This lets an app
@@ -668,6 +742,12 @@ export function cancelLocalMeeting(sessionIdInput: string): { cancelled: true; m
   if (activeMeetingId === record.id) throw new LocalMeetingCaptureError('Transcription is already active.', 409);
   const queueIndex = queuedMeetingIds.indexOf(record.id);
   if (queueIndex >= 0) queuedMeetingIds.splice(queueIndex, 1);
+  // Delete the crash-recovery sidecar FIRST — it is what sidecar recovery keys
+  // on. Without this, a cancel whose WAV unlink failed (locked file) left
+  // sidecar+WAV behind with the record deleted, and the next recovery scan
+  // resurrected the discarded meeting into permanent memory (2026-07-14 review).
+  const sidecarPath = path.join(LOCAL_MEETING_AUDIO_DIR, `local-${sessionId}.json`);
+  try { unlinkSync(sidecarPath); } catch { /* absent or locked — the cancelled-record skip below still guards */ }
   if (record.audioPath && existsSync(record.audioPath)) {
     try { unlinkSync(validateLocalAudioPath(record.audioPath, true)); } catch { /* never delete outside the audio root */ }
   }
@@ -676,6 +756,17 @@ export function cancelLocalMeeting(sessionIdInput: string): { cancelled: true; m
     transcriptionStatus: 'cancelled',
     transcriptionUpdatedAt: new Date().toISOString(),
   });
+  if (record.audioPath && existsSync(record.audioPath)) {
+    // The WAV survived the unlink (e.g. locked). Keep the CANCELLED record as a
+    // durable tombstone — recovery skips cancelled records, and the maintenance
+    // privacy loop keeps retrying the deletion (bounded) via the failed status.
+    patchMeetingRecord(record.id, {
+      audioDeletionStatus: 'failed',
+      audioDeletionUpdatedAt: new Date().toISOString(),
+      audioDeletionError: 'cancel could not delete the audio file (locked?) — retried by maintenance',
+    });
+    return { cancelled: true, meetingId: record.id };
+  }
   deleteMeetingRecord(record.id);
   return { cancelled: true, meetingId: record.id };
 }

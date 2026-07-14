@@ -312,3 +312,122 @@ test('cancel removes an unfinished recording and is idempotent', () => {
   assert.equal(shared.loadRecallMeetingById(started.record.id), null);
   assert.deepEqual(local.cancelLocalMeeting('cancel-me'), { cancelled: true });
 });
+
+// ── Transcript-only product decision + coherence fixes (2026-07-14) ──────────
+
+test('transcript-only DEFAULT: keeping audio is the explicit opt-in', () => {
+  assert.equal(local.DEFAULT_LOCAL_MEETING_SETTINGS.keepAudio, false);
+  // Absent keepAudio normalizes to transcript-only…
+  local.saveLocalMeetingSettings({ keepAudio: undefined });
+  assert.equal(local.loadLocalMeetingSettings().keepAudio, false);
+  // …and the explicit opt-in persists across unrelated patches.
+  local.saveLocalMeetingSettings({ keepAudio: true });
+  local.saveLocalMeetingSettings({ language: 'en' });
+  assert.equal(local.loadLocalMeetingSettings().keepAudio, true);
+});
+
+test('default flow is transcript-only end to end: audio AND sidecar gone once the transcript is durable', async () => {
+  // keepAudio deliberately ABSENT — this exercises the default path.
+  local.saveLocalMeetingSettings({ enabled: true, analyzeOnComplete: false, keepAudio: undefined });
+  local._setLocalMeetingTranscriberForTests(async () => ({
+    text: 'Transcript only.',
+    segments: [{ text: 'Transcript only.', startSeconds: 0, endSeconds: 1 }],
+    model: 'base.en',
+    language: 'en',
+  }));
+  try {
+    const started = local.startLocalMeeting({ sessionId: 'transcript-only-default' });
+    writeFakeWav(started.audioPath);
+    const sidecarPath = path.join(local.LOCAL_MEETING_AUDIO_DIR, 'local-transcript-only-default.json');
+    writeFileSync(sidecarPath, JSON.stringify({ sessionId: 'transcript-only-default', status: 'recorded' }));
+    local.ingestLocalMeeting({ sessionId: 'transcript-only-default', audioPath: started.audioPath });
+    const ready = await waitForStatus(started.record.id, 'ready');
+    assert.ok(ready?.artifactPath, 'the transcript is durable');
+    assert.equal(ready?.audioDeletionStatus, 'deleted', 'default is transcript-only: audio deleted after transcription');
+    assert.equal(existsSync(started.audioPath), false, 'raw audio does not persist by default');
+    assert.equal(existsSync(sidecarPath), false, 'crash-recovery sidecar is cleaned up with it');
+  } finally {
+    local.saveLocalMeetingSettings({ analyzeOnComplete: false, keepAudio: true });
+  }
+});
+
+test('cancel removes the recovery sidecar; a cancelled record is never resurrected', () => {
+  local.saveLocalMeetingSettings({ enabled: true, analyzeOnComplete: false, keepAudio: true });
+  // Path 1: normal cancel — sidecar and audio both removed, nothing to recover.
+  const started = local.startLocalMeeting({ sessionId: 'cancel-no-resurrect' });
+  writeFakeWav(started.audioPath);
+  const sidecarPath = path.join(local.LOCAL_MEETING_AUDIO_DIR, 'local-cancel-no-resurrect.json');
+  writeFileSync(sidecarPath, JSON.stringify({ sessionId: 'cancel-no-resurrect', status: 'recorded' }));
+  local.cancelLocalMeeting('cancel-no-resurrect');
+  assert.equal(existsSync(sidecarPath), false, 'cancel deletes the recovery sidecar');
+  assert.equal(existsSync(started.audioPath), false, 'cancel deletes the audio');
+
+  // Path 2: the locked-file shape — record survives as cancelled while a stray
+  // sidecar+WAV reappear on disk. Recovery must SKIP it (terminal user decision).
+  const locked = local.startLocalMeeting({ sessionId: 'cancel-locked-skip' });
+  writeFakeWav(locked.audioPath);
+  shared.patchMeetingRecord(locked.record.id, {
+    status: 'cancelled',
+    transcriptionStatus: 'cancelled',
+    transcriptionUpdatedAt: new Date().toISOString(),
+  });
+  const lockedSidecar = path.join(local.LOCAL_MEETING_AUDIO_DIR, 'local-cancel-locked-skip.json');
+  writeFileSync(lockedSidecar, JSON.stringify({ sessionId: 'cancel-locked-skip', status: 'recorded' }));
+  try {
+    local.recoverFinalizedLocalMeetingSidecars({ force: true });
+    const after = shared.loadRecallMeetingById(locked.record.id);
+    assert.equal(after?.transcriptionStatus, 'cancelled', 'recovery must not resurrect a cancelled meeting');
+  } finally {
+    try { unlinkSync(lockedSidecar); } catch { /* already gone */ }
+    try { unlinkSync(locked.audioPath); } catch { /* already gone */ }
+  }
+});
+
+test('sidecar recovery is consent-gated: a disabled feature never auto-transcribes found audio', () => {
+  local.saveLocalMeetingSettings({ enabled: false, analyzeOnComplete: false });
+  const sessionId = 'consent-gate-check';
+  const audioPath = path.join(local.LOCAL_MEETING_AUDIO_DIR, `local-${sessionId}.wav`);
+  const sidecarPath = path.join(local.LOCAL_MEETING_AUDIO_DIR, `local-${sessionId}.json`);
+  try {
+    writeFakeWav(audioPath);
+    writeFileSync(sidecarPath, JSON.stringify({ sessionId, status: 'recorded' }));
+    const result = local.recoverFinalizedLocalMeetingSidecars({ force: true });
+    assert.equal(result.discovered, 0, 'disabled feature: recovery must not even scan');
+    assert.equal(result.queued, 0, 'disabled feature: nothing may be queued into memory');
+  } finally {
+    try { unlinkSync(sidecarPath); } catch { /* absent */ }
+    try { unlinkSync(audioPath); } catch { /* absent */ }
+    local.saveLocalMeetingSettings({ enabled: true, analyzeOnComplete: false, keepAudio: true });
+  }
+});
+
+test('audio-deletion retries are bounded and exhaustion is surfaced exactly once', async () => {
+  local.saveLocalMeetingSettings({ enabled: true, analyzeOnComplete: false, keepAudio: false });
+  local._setLocalMeetingTranscriberForTests(async () => ({
+    text: 'Bounded retries.',
+    segments: [{ text: 'Bounded retries.', startSeconds: 0, endSeconds: 1 }],
+    model: 'base.en',
+    language: 'en',
+  }));
+  local._setLocalMeetingAudioDeleterForTests(() => {
+    throw Object.assign(new Error('permanently locked'), { code: 'EBUSY' });
+  });
+  try {
+    const started = local.startLocalMeeting({ sessionId: 'exhausted-cap' });
+    writeFakeWav(started.audioPath);
+    local.ingestLocalMeeting({ sessionId: 'exhausted-cap', audioPath: started.audioPath });
+    await waitForStatus(started.record.id, 'ready'); // deletion attempt 1 fails
+    let surfaced = 0;
+    for (let i = 0; i < local.MAX_LOCAL_AUDIO_DELETION_ATTEMPTS + 3; i += 1) {
+      const r = local.recoverPendingLocalAudioDeletions({ force: true });
+      surfaced += r.exhausted.filter((e) => e.meetingId === started.record.id).length;
+    }
+    assert.equal(surfaced, 1, 'crossing the cap is surfaced exactly once (durable marker)');
+    const record = shared.loadRecallMeetingById(started.record.id);
+    assert.match(record?.audioDeletionError ?? '', /retries exhausted/);
+    assert.ok((record?.audioDeletionAttempts ?? 0) <= local.MAX_LOCAL_AUDIO_DELETION_ATTEMPTS + 1, 'attempts stop growing after the cap');
+  } finally {
+    local._setLocalMeetingAudioDeleterForTests(null);
+    local.saveLocalMeetingSettings({ analyzeOnComplete: false, keepAudio: true });
+  }
+});

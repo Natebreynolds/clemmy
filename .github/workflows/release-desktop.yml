@@ -118,6 +118,14 @@ jobs:
         working-directory: apps/console-web
         run: npm ci
 
+      # The release-asset tests exercise apps/desktop/scripts/vendor-recall-native.mjs,
+      # which imports 'tar' from apps/desktop's own dependencies — without this install
+      # the preflight dies with ERR_MODULE_NOT_FOUND before anything builds (caught by
+      # the 2026-07-14 pre-release review; reproduced locally).
+      - name: Install desktop test dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
       - name: Unit tests
         run: npm test
 

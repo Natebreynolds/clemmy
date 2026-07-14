@@ -7,6 +7,7 @@ import { CommandPalette } from './CommandPalette';
 import { VoiceOverlay } from './VoiceOverlay';
 import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
+import { LocalRecordingBanner } from './LocalRecordingBanner';
 import { ALL_NAV } from '@/lib/nav';
 
 function titleForPath(pathname: string): string {
@@ -60,6 +61,7 @@ export function AppShell() {
           sidebarCollapsed={collapsed}
           onToggleSidebar={() => setCollapsed((v) => !v)}
         />
+        <LocalRecordingBanner />
         {needsLogin && (
           <div
             role="alert"

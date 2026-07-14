@@ -51,7 +51,19 @@ export interface LocalMeetingRecorderStatus {
   durationSeconds: number;
   sampleRate: number;
   channels: number;
+  /** ISO time of the most recent PCM append (start time until the first chunk). */
+  lastAppendAt?: string;
+  /** True when recording but NO PCM has arrived for STALE_CAPTURE_AFTER_MS —
+   *  the renderer producer is dead (crash/reload) while main still holds an
+   *  active recording. UIs must show "interrupted", never a live Recording
+   *  pill, for a stale session (2026-07-14 review). */
+  stale?: boolean;
 }
+
+/** No PCM for this long while "recording" ⇒ the producer is gone. The renderer
+ *  pumps chunks continuously (sub-second cadence), so 15s is far past any
+ *  legitimate gap yet fast enough that a frozen capture is caught mid-meeting. */
+export const STALE_CAPTURE_AFTER_MS = 15_000;
 
 interface ActiveRecording {
   sessionId: string;
@@ -63,6 +75,8 @@ interface ActiveRecording {
   metadataPath: string;
   handle: FileHandle;
   bytes: number;
+  /** Epoch ms of the most recent append (or start). Drives staleness. */
+  lastAppendAtMs: number;
 }
 
 export interface LocalMeetingRecorderOptions {
@@ -189,6 +203,16 @@ export class LocalMeetingRecorder {
     this.createId = options.createId ?? randomUUID;
   }
 
+  /** Re-arm the staleness floor without an append. Called on powerMonitor
+   *  resume/unlock: a wall-clock gap that spans SLEEP says nothing about
+   *  producer health (the mic pump was frozen with the rest of the app), so
+   *  the resumed producer gets a fresh STALE_CAPTURE_AFTER_MS window instead
+   *  of being finalized by the first post-wake status poll (2026-07-14
+   *  adversarial review — the sleep/wake mid-meeting kill). */
+  touchActivity(): void {
+    if (this.active) this.active.lastAppendAtMs = this.now().getTime();
+  }
+
   status(): LocalMeetingRecorderStatus {
     const active = this.active;
     return {
@@ -201,6 +225,8 @@ export class LocalMeetingRecorder {
       durationSeconds: durationForBytes(active?.bytes ?? 0),
       sampleRate: LOCAL_MEETING_SAMPLE_RATE,
       channels: LOCAL_MEETING_CHANNELS,
+      lastAppendAt: active ? new Date(active.lastAppendAtMs).toISOString() : undefined,
+      stale: active ? this.now().getTime() - active.lastAppendAtMs > STALE_CAPTURE_AFTER_MS : undefined,
     };
   }
 
@@ -249,6 +275,7 @@ export class LocalMeetingRecorder {
         metadataPath,
         handle,
         bytes: 0,
+        lastAppendAtMs: this.now().getTime(),
       };
       return this.status();
     });
@@ -264,6 +291,7 @@ export class LocalMeetingRecorder {
       }
       await writeAll(active.handle, chunk);
       active.bytes += chunk.byteLength;
+      active.lastAppendAtMs = this.now().getTime();
       return this.status();
     });
   }

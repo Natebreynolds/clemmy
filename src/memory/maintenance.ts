@@ -424,9 +424,13 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // not retain raw meeting audio until the next application restart.
   if (tickCount % LOCAL_AUDIO_DELETION_EVERY_N_TICKS === 0) {
     try {
+      // Exhaustion surfacing (notification) lives INSIDE
+      // recoverPendingLocalAudioDeletions — multiple callers run this scan, and
+      // a caller-side notify let whichever crossed the cap first consume the
+      // one-shot durable marker and silently swallow the user-facing warning.
       const cleanup = recoverPendingLocalAudioDeletions({ force: true });
       if (cleanup.deleted > 0 || cleanup.failed > 0) {
-        logger.info({ cleanup }, 'local meeting audio privacy cleanup tick');
+        logger.info({ cleanup: { ...cleanup, exhausted: cleanup.exhausted.length } }, 'local meeting audio privacy cleanup tick');
       }
     } catch (err) {
       logger.warn({ err }, 'local meeting audio privacy cleanup tick failed');

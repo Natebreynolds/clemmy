@@ -6,6 +6,7 @@ import {
   Menu,
   nativeImage,
   Notification,
+  powerMonitor,
   shell,
   Tray,
   type IpcMainInvokeEvent,
@@ -183,8 +184,12 @@ function repointDashboardToLiveDaemon(): void {
   // succeeds, so a failed load leaves the old renderer able to use recovery
   // IPC. Reload even when the port is unchanged: a ready event means a new
   // daemon instance and its page/session should be bootstrapped afresh.
+  // Finalize any active local capture FIRST — this navigation replaces the
+  // renderer that owns the mic pump, so waiting preserves the recorded prefix
+  // instead of orphaning it (belt: did-start-navigation catches this too, but
+  // awaiting here guarantees the stop lands before the page is torn down).
   pendingDashboardUrl = nextUrl;
-  void win.loadURL(nextUrl).then(() => {
+  void finalizeOrphanedLocalCapture('the daemon restarted').then(() => win.loadURL(nextUrl)).then(() => {
     if (dashboardNavigationGeneration !== navigationGeneration) return;
     dashboardUrl = nextUrl;
     pendingDashboardUrl = '';
@@ -469,7 +474,10 @@ function createMainWindow(url: string): BrowserWindow {
 
 function activeMeetingCaptureLabels(): string[] {
   const labels: string[] = [];
-  if (localMeetingRecorder.status().recording) labels.push('Local microphone recording');
+  const local = localMeetingRecorder.status();
+  // A STALE capture (producer dead, no PCM arriving) must never present as a
+  // live recording — it reads as "interrupted" and self-heals via finalize.
+  if (local.recording && !local.stale) labels.push('Local microphone recording');
   if (recallCapture?.status().recording) labels.push('Online meeting recording');
   return labels;
 }
@@ -997,6 +1005,21 @@ async function launchDaemon(): Promise<void> {
     });
     mainWindow.webContents.on('render-process-gone', (_e, details) => {
       console.error('[main] renderer process gone', JSON.stringify(details));
+      // The renderer owned the mic pump — finalize any active local capture
+      // instead of letting the tray show "Recording" over a dead producer.
+      void finalizeOrphanedLocalCapture('the app window crashed');
+    });
+    // A manual reload (Cmd+R) or any top-frame navigation also kills the mic
+    // pump, and will-navigate does NOT fire for reloads — catch it here.
+    // COMMIT-time ('did-navigate', not 'did-start-navigation'): a navigation
+    // that gets CANCELLED (e.g. a will-navigate preventDefault, a drag-drop
+    // attempt) never tears down the renderer, and finalizing on start-time
+    // would kill a live recording for it (2026-07-14 review, empirically
+    // confirmed in Electron 43). At commit the old document — and the mic
+    // pump — are gone for real. Same-document SPA navigations never commit a
+    // new document, so they can't reach this.
+    mainWindow.webContents.on('did-navigate', () => {
+      void finalizeOrphanedLocalCapture('the page reloaded');
     });
     rebuildTrayMenu();
   } catch (err) {
@@ -1210,6 +1233,49 @@ async function ingestLocalMeeting(recording: LocalMeetingRecording): Promise<Rec
   });
 }
 
+// ORPHANED-CAPTURE FINALIZER (2026-07-14 review). The PCM producer lives in the
+// RENDERER (LocalMeetingCapture's mic pump); the durable WAV writer lives HERE.
+// If the renderer dies (crash, hard reload) or the window navigates to a fresh
+// daemon page, the producer is gone forever — LocalMeetingCapture has no
+// reattach path — while main's recorder + tray kept showing "Recording" with a
+// frozen byte count and the rest of the meeting silently lost. Finalizing
+// (stop + ingest) converts that silent loss into an honest, transcribed
+// partial recording, mirroring the Meetings screen's own unmount rationale.
+let orphanFinalizeInFlight: Promise<void> | null = null;
+/** First-stale observation for the two-observation confirm in the status poll. */
+let staleObservation: { sessionId: string; bytes: number; atNs: bigint } | null = null;
+function finalizeOrphanedLocalCapture(reason: string): Promise<void> {
+  if (!orphanFinalizeInFlight) {
+    orphanFinalizeInFlight = (async () => {
+      const status = localMeetingRecorder.status();
+      if (!status.recording || !status.sessionId) return;
+      console.warn('[local-meeting] finalizing orphaned capture:', reason, status.sessionId);
+      try {
+        const recording = await localMeetingRecorder.stop(status.sessionId);
+        try {
+          await ingestLocalMeeting(recording);
+        } catch (error) {
+          // The WAV + sidecar are durable — daemon-side sidecar recovery picks
+          // it up when the daemon is reachable again.
+          console.error('[local-meeting] orphaned capture saved but could not queue:', error instanceof Error ? error.message : error);
+        }
+        const minutes = Math.max(1, Math.round((recording.durationSeconds ?? 0) / 60));
+        try {
+          new Notification({
+            title: 'Meeting capture interrupted',
+            body: `Recording stopped because ${reason}. About ${minutes} minute${minutes === 1 ? '' : 's'} were saved and queued for transcription.`,
+          }).show();
+        } catch { /* notification is best-effort */ }
+      } catch (error) {
+        console.error('[local-meeting] failed to finalize orphaned capture:', error instanceof Error ? error.message : error);
+      } finally {
+        rebuildTrayMenu();
+      }
+    })().finally(() => { orphanFinalizeInFlight = null; });
+  }
+  return orphanFinalizeInFlight;
+}
+
 async function recoverLocalMeetingsAfterCrash(): Promise<void> {
   const recordings = await localMeetingRecorder.recoverInterruptedRecordings();
   for (const recording of recordings) {
@@ -1354,6 +1420,30 @@ ipcMain.handle('clemmy:recall-test', async (evt: IpcMainInvokeEvent) => {
 ipcMain.handle('clemmy:local-meeting-status', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['dashboard']);
   const recorder = localMeetingRecorder.status();
+  // Self-heal floor: if status observations find the capture stale (the
+  // producer died via a path the event hooks missed), finalize — the 5s
+  // dashboard poll makes this fast. TWO-OBSERVATION CONFIRM (2026-07-14
+  // review): a single wall-clock-stale observation can be a sleep/wake or
+  // NTP-step artifact, so require a second observation ≥5s of MONOTONIC time
+  // later (hrtime pauses during sleep on macOS) with the SAME session and an
+  // UNCHANGED byte count. A live producer clears it (bytes move or stale
+  // flips false); a dead one finalizes ~5s after the first post-wake poll.
+  if (recorder.recording && recorder.stale && recorder.sessionId) {
+    const nowNs = process.hrtime.bigint();
+    if (
+      staleObservation
+      && staleObservation.sessionId === recorder.sessionId
+      && staleObservation.bytes === recorder.bytes
+      && nowNs - staleObservation.atNs >= 5_000_000_000n
+    ) {
+      staleObservation = null;
+      void finalizeOrphanedLocalCapture('audio stopped arriving from the app window');
+    } else if (!staleObservation || staleObservation.sessionId !== recorder.sessionId || staleObservation.bytes !== recorder.bytes) {
+      staleObservation = { sessionId: recorder.sessionId, bytes: recorder.bytes, atNs: nowNs };
+    }
+  } else {
+    staleObservation = null;
+  }
   const cancellations = await retryPendingLocalMeetingCancellations().catch(() => {
     const remaining = readPendingLocalMeetingCancellations();
     return {
@@ -1830,6 +1920,13 @@ app.on('ready', () => {
   // rather than a hung process. Tray + updater still arm so the user
   // can install a fix once one ships.
   boot().catch((err) => reportBootFailure('start up', err));
+  // Wake grace for the capture staleness floor (2026-07-14 review): system
+  // sleep freezes the mic pump AND the wall clock check, so the first
+  // post-wake status poll would see stale=true and finalize a recording the
+  // user expects to CONTINUE. Re-arm the floor at wake; if the producer truly
+  // died across sleep, staleness re-trips 15s later and finalizes honestly.
+  powerMonitor.on('resume', () => localMeetingRecorder.touchActivity());
+  powerMonitor.on('unlock-screen', () => localMeetingRecorder.touchActivity());
   setupTray();
   // Arm auto-updater after boot kicks off. Status changes flip the
   // tray label so the user sees "Restart to install vX.Y.Z" when an
