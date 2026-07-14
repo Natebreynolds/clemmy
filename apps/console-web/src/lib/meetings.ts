@@ -53,6 +53,7 @@ export interface MeetingSummary {
   status?: string;
   startedAt?: string;
   endedAt?: string;
+  durationSeconds?: number;
   segmentCount?: number;
   title?: string;
   transcriptionStatus?: 'not_started' | 'queued' | 'transcribing' | 'ready' | 'failed' | 'cancelled' | string;
