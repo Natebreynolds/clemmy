@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run this on the BROKEN fresh-install computer to figure out why
-# Clementine skipped the setup wizard. Inspects every source that
-# `hasAnyUsableCredential()` (apps/desktop/src/setup-state.ts) checks.
+# Clementine skipped the setup wizard. The setup-complete marker is the only
+# skip gate; the remaining checks explain credentials the wizard may reuse.
 #
 # Safe to run — read-only. Prints a verdict at the end.
 
@@ -47,7 +47,7 @@ for envfile in \
   if [[ -f "$envfile" ]]; then
     if grep -qE '^OPENAI_API_KEY\s*=\s*\S' "$envfile" 2>/dev/null; then
       echo "  ⚠ $envfile has OPENAI_API_KEY"
-      verdict_skipped_reason="$envfile contains OPENAI_API_KEY — Clementine treats this as 'already configured'."
+      echo "    (available to the wizard, but does not skip onboarding)"
     else
       echo "  · $envfile exists but no OPENAI_API_KEY"
     fi
@@ -56,7 +56,7 @@ for envfile in \
   fi
 done
 
-# 4. ~/.codex/auth.json (Codex CLI tokens)
+# 4. ~/.codex/auth.json (external Codex CLI tokens; informational only)
 CODEX_AUTH="$HOME_DIR/.codex/auth.json"
 if [[ -f "$CODEX_AUTH" ]]; then
   echo "  ⚠ ~/.codex/auth.json EXISTS"
@@ -67,19 +67,19 @@ if [[ -f "$CODEX_AUTH" ]]; then
   else
     echo "      (no python3 to parse — file size: $(stat -f%z "$CODEX_AUTH" 2>/dev/null || stat -c%s "$CODEX_AUTH") bytes)"
   fi
-  verdict_skipped_reason="${verdict_skipped_reason:+$verdict_skipped_reason; }~/.codex/auth.json present — Codex CLI tokens are treated as Clementine's auth."
+  echo "    (Clementine deliberately ignores this grant and will mint its own)"
 else
   echo "  ✓ ~/.codex/auth.json absent"
 fi
 
-# 5. ~/.clementine-next/state/auth.json (Clementine's own native codex tokens)
+# 5. ~/.clementine-next/state/auth.json (usable only with native + provenance marker)
 LOCAL_AUTH="$STATE_DIR/auth.json"
 if [[ -f "$LOCAL_AUTH" ]]; then
   echo "  ⚠ $LOCAL_AUTH EXISTS"
   if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import json; d=json.load(open('$LOCAL_AUTH')); print('     keys:', list(d.keys()))" 2>/dev/null || echo "    (parse failed)"
+    python3 -c "import json; d=json.load(open('$LOCAL_AUTH')); c=d.get('codexOauth',{}); print('     source:', d.get('source')); print('     grant provenance:', c.get('grantProvenance')); print('     grant id present:', bool(c.get('grantId'))); print('     token pair present:', bool(c.get('accessToken') and c.get('refreshToken')))" 2>/dev/null || echo "    (parse failed)"
   fi
-  verdict_skipped_reason="${verdict_skipped_reason:+$verdict_skipped_reason; }state/auth.json present — Clementine has its own codex tokens already."
+  echo "    (reusable only when source=native, provenance=clementine-oauth-v1, and grantId is non-empty; never skips onboarding)"
 else
   echo "  ✓ $LOCAL_AUTH absent"
 fi
@@ -123,10 +123,9 @@ if [[ -n "$verdict_skipped_reason" ]]; then
   echo "  ⚠ Wizard was likely skipped because:"
   echo "    $verdict_skipped_reason"
 else
-  echo "  ✓ No obvious credential source — wizard SHOULD have opened. Possible causes:"
+  echo "  ✓ setup-complete.json is absent, so the wizard SHOULD have opened regardless of credentials. Possible causes:"
   echo "    a) The bundled .app was built before the setup wizard existed."
-  echo "    b) The Electron app's process.cwd() at launch contains a .env we didn't check."
-  echo "    c) The wizard window opened but failed to attach window.clemmy (preload error)."
+  echo "    b) The wizard window opened but failed to attach window.clemmy (preload error)."
   echo
   echo "    Next: open Clementine, then run:"
   echo "      log show --predicate 'process == \"Clementine\"' --info --last 5m | head -200"
