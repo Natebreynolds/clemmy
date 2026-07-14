@@ -235,20 +235,25 @@ export function registerMemoryTools(server: McpServer): void {
     },
     async ({ kind, content, sessionId, sourcePath }) => {
       try {
-        const reconcile = (getRuntimeEnv('CLEMMY_REMEMBER_RECONCILE', 'off') || 'off').toLowerCase() === 'on';
+        const reconcile = (getRuntimeEnv('CLEMMY_REMEMBER_RECONCILE', 'on') || 'on').toLowerCase() !== 'off';
         if (reconcile) {
           // Route through the Mem0 resolver. User-stated facts pass trust
           // 1.0 so they win conflicts against derived (0.6) facts.
           const outcome = await consolidateFact(
-            { kind: kind as (typeof FACT_KINDS)[number], text: content, trustLevel: 1.0 },
+            {
+              kind: kind as (typeof FACT_KINDS)[number],
+              text: content,
+              trustLevel: 1.0,
+              sourceUri: sourcePath,
+            },
             { sessionId },
             { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
           );
-          const verb = outcome.updated
-            ? 'Updated an existing fact'
-            : outcome.deleted
-              ? 'Superseded the prior fact and recorded'
-              : outcome.noop
+          const verb = outcome.action === 'supersede'
+            ? 'Superseded the prior fact with'
+            : outcome.action === 'reinforce'
+              ? 'Reinforced an existing fact'
+              : outcome.action === 'ignore'
                 ? 'Already known — no change'
                 : 'Remembered';
           return textResult(`${verb} (${kind}): ${content}`);
@@ -359,10 +364,15 @@ export function registerMemoryTools(server: McpServer): void {
       const result = await recallEverything(objective, { limit: limit ?? 12 });
       if (result.hits.length === 0) return textResult('No relevant memory found across facts, notes, entities, resources, or tool-recall.');
       const block = formatUnifiedRecall(result, 4000);
-      // Reinforce surfaced facts (an agent-facing recall is an access).
-      for (const h of result.hits) if (h.type === 'fact') { const id = Number(h.ref); if (Number.isFinite(id)) touchFactAccess(id); }
+      // Reinforce surfaced claims selected by the agent. Policy hits reference
+      // their canonical fact id too, so they count as useful recall as well.
+      const recalledFactIds = new Set(result.hits
+        .filter((h) => h.type === 'fact' || h.type === 'policy')
+        .map((h) => Number(h.ref))
+        .filter(Number.isFinite));
+      for (const id of recalledFactIds) touchFactAccess(id);
       const facts = result.hits
-        .filter((h) => h.type === 'fact')
+        .filter((h) => h.type === 'fact' || h.type === 'policy')
         .map((h) => getFact(Number(h.ref)))
         .filter((fact): fact is ConsolidatedFact => Boolean(fact));
       appendFactRecallTrace({

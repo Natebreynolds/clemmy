@@ -24,6 +24,10 @@ export interface EntityEdgeRow {
   objectId: number;
   recurrenceCount: number;
   lastSeenAt: string;
+  confidence: number;
+  evidenceEpisodeId: string | null;
+  validFrom: string | null;
+  validTo: string | null;
 }
 
 export interface LinkSyncStats {
@@ -54,16 +58,26 @@ export function getEntityIdsForFact(factId: number): number[] {
 }
 
 /** Fact ids linked to an entity, newest fact first. Backs entity→facts recall. */
-export function getFactIdsForEntity(entityId: number, limit = 50): number[] {
+export function getFactIdsForEntity(entityId: number, limit = 50, asOf?: string): number[] {
   const db = openMemoryDb();
-  return (db.prepare(`
+  const rows = asOf ? db.prepare(`
+    SELECT fe.fact_id AS id
+    FROM fact_entities fe
+    JOIN consolidated_facts cf ON cf.id = fe.fact_id
+    WHERE fe.entity_id = ?
+      AND (cf.valid_from IS NULL OR cf.valid_from <= ?)
+      AND (cf.valid_to IS NULL OR cf.valid_to > ?)
+    ORDER BY cf.updated_at DESC
+    LIMIT ?
+  `).all(entityId, asOf, asOf, Math.max(1, limit)) : db.prepare(`
     SELECT fe.fact_id AS id
     FROM fact_entities fe
     JOIN consolidated_facts cf ON cf.id = fe.fact_id
     WHERE fe.entity_id = ? AND cf.active = 1
     ORDER BY cf.updated_at DESC
     LIMIT ?
-  `).all(entityId, Math.max(1, limit)) as { id: number }[]).map((r) => r.id);
+  `).all(entityId, Math.max(1, limit));
+  return (rows as { id: number }[]).map((r) => r.id);
 }
 
 /** Stored fact→entity edges for a set of facts — consumed by the graph builder. */
@@ -97,33 +111,125 @@ export function loadFactResourceEdges(factIds: number[]): Array<{ factId: number
     .map((r) => ({ factId: r.fact_id, resourceId: r.resource_id }));
 }
 
+export function getFactIdsForResource(resourceId: number, limit = 50, asOf?: string): number[] {
+  const db = openMemoryDb();
+  const rows = asOf ? db.prepare(`
+    SELECT fr.fact_id AS id
+    FROM fact_resources fr
+    JOIN consolidated_facts cf ON cf.id = fr.fact_id
+    WHERE fr.resource_id = ?
+      AND (cf.valid_from IS NULL OR cf.valid_from <= ?)
+      AND (cf.valid_to IS NULL OR cf.valid_to > ?)
+    ORDER BY cf.updated_at DESC
+    LIMIT ?
+  `).all(resourceId, asOf, asOf, Math.max(1, limit)) : db.prepare(`
+    SELECT fr.fact_id AS id
+    FROM fact_resources fr
+    JOIN consolidated_facts cf ON cf.id = fr.fact_id
+    WHERE fr.resource_id = ? AND cf.active = 1
+    ORDER BY cf.updated_at DESC
+    LIMIT ?
+  `).all(resourceId, Math.max(1, limit));
+  return (rows as Array<{ id: number }>).map((row) => row.id);
+}
+
+export function getResourceIdsForFact(factId: number): number[] {
+  return (openMemoryDb().prepare(
+    'SELECT resource_id FROM fact_resources WHERE fact_id = ?',
+  ).all(factId) as Array<{ resource_id: number }>).map((row) => row.resource_id);
+}
+
+export function getNeighborEntityIds(entityIds: number[], limit = 50, asOf = new Date().toISOString()): number[] {
+  if (entityIds.length === 0) return [];
+  const db = openMemoryDb();
+  const placeholders = entityIds.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT subject_id, object_id
+    FROM entity_edges
+    WHERE (invalidated_at IS NULL OR invalidated_at > ?)
+      AND (valid_from IS NULL OR valid_from <= ?)
+      AND (valid_to IS NULL OR valid_to > ?)
+      AND (subject_id IN (${placeholders}) OR object_id IN (${placeholders}))
+    ORDER BY recurrence_count DESC, last_seen_at DESC
+    LIMIT ?
+  `).all(asOf, asOf, asOf, ...entityIds, ...entityIds, Math.max(1, limit)) as Array<{ subject_id: number; object_id: number }>;
+  const seeds = new Set(entityIds);
+  const out = new Set<number>();
+  for (const row of rows) {
+    if (!seeds.has(row.subject_id)) out.add(row.subject_id);
+    if (!seeds.has(row.object_id)) out.add(row.object_id);
+  }
+  return Array.from(out);
+}
+
 // ── entity ↔ entity edges ──────────────────────────────────────────────
 
 /** Upsert a subject-predicate-object relation; reinforces recurrence + recency. */
-export function recordEntityEdge(input: { subjectId: number; predicate: string; objectId: number }): void {
+export function recordEntityEdge(input: {
+  subjectId: number;
+  predicate: string;
+  objectId: number;
+  confidence?: number;
+  evidenceEpisodeId?: string;
+  validFrom?: string;
+  validTo?: string;
+}): void {
   const predicate = input.predicate.trim().slice(0, 80);
   if (!predicate || input.subjectId === input.objectId) return;
   const db = openMemoryDb();
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT INTO entity_edges (subject_id, predicate, object_id, recurrence_count, first_seen_at, last_seen_at)
-    VALUES (?,?,?,1,?,?)
+    INSERT INTO entity_edges
+      (subject_id, predicate, object_id, recurrence_count, first_seen_at, last_seen_at,
+       confidence, evidence_episode_id, valid_from, valid_to, invalidated_at)
+    VALUES (?,?,?,1,?,?,?,?,?,?,NULL)
     ON CONFLICT(subject_id, predicate, object_id) DO UPDATE SET
       recurrence_count = recurrence_count + 1,
-      last_seen_at = excluded.last_seen_at
-  `).run(input.subjectId, predicate, input.objectId, now, now);
+      last_seen_at = excluded.last_seen_at,
+      confidence = MAX(entity_edges.confidence, excluded.confidence),
+      evidence_episode_id = COALESCE(excluded.evidence_episode_id, entity_edges.evidence_episode_id),
+      valid_from = COALESCE(entity_edges.valid_from, excluded.valid_from),
+      valid_to = excluded.valid_to,
+      invalidated_at = NULL
+  `).run(
+    input.subjectId,
+    predicate,
+    input.objectId,
+    now,
+    now,
+    Math.max(0, Math.min(1, input.confidence ?? 0.7)),
+    input.evidenceEpisodeId ?? null,
+    input.validFrom ?? now,
+    input.validTo ?? null,
+  );
 }
 
 /** All entity edges (strongest/most-recent first) — consumed by the graph. */
-export function loadEntityEdges(limit = 300): EntityEdgeRow[] {
+export function loadEntityEdges(limit = 300, asOf = new Date().toISOString()): EntityEdgeRow[] {
   const db = openMemoryDb();
   return (db.prepare(`
-    SELECT subject_id, predicate, object_id, recurrence_count, last_seen_at
+    SELECT subject_id, predicate, object_id, recurrence_count, last_seen_at,
+           confidence, evidence_episode_id, valid_from, valid_to
     FROM entity_edges
+    WHERE (invalidated_at IS NULL OR invalidated_at > ?)
+      AND (valid_from IS NULL OR valid_from <= ?)
+      AND (valid_to IS NULL OR valid_to > ?)
     ORDER BY recurrence_count DESC, last_seen_at DESC
     LIMIT ?
-  `).all(Math.max(1, limit)) as Array<{ subject_id: number; predicate: string; object_id: number; recurrence_count: number; last_seen_at: string }>)
-    .map((r) => ({ subjectId: r.subject_id, predicate: r.predicate, objectId: r.object_id, recurrenceCount: r.recurrence_count, lastSeenAt: r.last_seen_at }));
+  `).all(asOf, asOf, asOf, Math.max(1, limit)) as Array<{
+    subject_id: number; predicate: string; object_id: number; recurrence_count: number; last_seen_at: string;
+    confidence: number; evidence_episode_id: string | null; valid_from: string | null; valid_to: string | null;
+  }>).map((r) => ({
+    subjectId: r.subject_id,
+    predicate: r.predicate,
+    objectId: r.object_id,
+    recurrenceCount: r.recurrence_count,
+    lastSeenAt: r.last_seen_at,
+    confidence: r.confidence,
+    evidenceEpisodeId: r.evidence_episode_id,
+    validFrom: r.valid_from,
+    validTo: r.valid_to,
+  }));
 }
 
 // ── entity recall (resolve a free-text objective → entities) ────────────

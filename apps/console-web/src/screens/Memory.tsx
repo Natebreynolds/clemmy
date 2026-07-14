@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
-  FileSearch, Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch,
+  FileSearch, Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
@@ -19,11 +19,12 @@ import {
   listFacts, forgetFact, pinFact, getContext, addFact, addGoal, searchMemory, getMemoryFiles,
   getBrainHealth, getMemoryHealth, getToolRecall, listEntities, getSourceMap, fileBasename, FACT_KINDS,
   discoverImportSources, scanImportPath, runMemoryImport, listImportBatches, undoImportBatch,
-  type Fact, type ContextFile, type Entity, type ToolRecallRecord, type ImportScan, type ImportBatch,
+  restoreFact, updateFact,
+  type Fact, type ContextFile, type Entity, type ToolRecallRecord, type ImportScan, type ImportBatch, type MemoryHit,
 } from '@/lib/memory';
 
 type Tab = 'overview' | 'facts' | 'entities' | 'procedures' | 'sources' | 'you' | 'import';
-const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference' };
+const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference', constraint: 'Hard constraint' };
 
 export function Memory() {
   const qc = useQueryClient();
@@ -54,7 +55,7 @@ export function Memory() {
       </div>
 
       {searching ? (
-        <SearchResults loading={search.isLoading} hits={search.data?.hits ?? []} query={debouncedQ} />
+        <SearchResults loading={search.isLoading} hits={search.data?.hits ?? []} query={debouncedQ} answerability={search.data?.answerability} stores={search.data?.diagnostics?.stores} />
       ) : (
         <>
           <div className="mb-5 flex flex-wrap gap-1 border-b border-border">
@@ -122,6 +123,7 @@ function OverviewTab() {
 function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryHealth }) {
   const emb = health?.embeddings;
   const recall = health?.recall;
+  const reliability = health?.reliability;
   if (!emb) return null;
   // Clamp at 100 — coverage can transiently exceed 1 (embeddings for rows since
   // deleted), and "101% notes" reads as a bug.
@@ -149,25 +151,42 @@ function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryH
       {recall && (recall.calls ?? 0) > 0 && (
         <span className="text-muted">Recall hit-rate: <span className="font-medium text-fg">{pct(recall.hitRate)}</span> <span className="text-faint">({recall.hits}/{recall.calls})</span></span>
       )}
+      {reliability && <span className="basis-full text-caption text-muted">
+        Evidence: <span className="font-medium text-fg">{reliability.evidenceLinked ?? 0}</span> linked · <span className={(reliability.brokenEvidence ?? 0) > 0 ? 'font-medium text-warning' : 'font-medium text-fg'}>{reliability.brokenEvidence ?? 0} broken</span>
+        {' · '}{reliability.pendingReflections ?? 0} pending extractions · {reliability.unreachableFacts ?? 0} never used
+        {' · '}utility {reliability.utility ?? 0} / impressions {reliability.impressions ?? 0}
+      </span>}
     </Card>
   );
 }
 
 // ─────────── Search ───────────
-function SearchResults({ loading, hits, query }: { loading: boolean; hits: { filePath: string; title: string; snippet: string; score: number }[]; query: string }) {
+function SearchResults({ loading, hits, query, answerability, stores }: {
+  loading: boolean; hits: MemoryHit[]; query: string;
+  answerability?: 'supported' | 'partial' | 'insufficient'; stores?: string[];
+}) {
   if (loading) return <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-20 w-full" />)}</div>;
   if (hits.length === 0) return <EmptyState title="No matches" description={`Nothing in memory matches “${query}” yet.`} />;
   return (
     <div className="space-y-2">
-      <p className="mb-1 text-small text-muted">{hits.length} result{hits.length === 1 ? '' : 's'} — this is what Clementine finds when she looks something up.</p>
+      <p className="mb-1 text-small text-muted">
+        {hits.length} result{hits.length === 1 ? '' : 's'} · {answerability ?? 'partial'}
+        {stores?.length ? ` · ${stores.join(', ')}` : ''}
+      </p>
       {hits.map((hit, i) => (
         <Card key={i} className="p-4">
           <div className="mb-1 flex items-center gap-2">
             <FileSearch className="h-4 w-4 shrink-0 text-primary" aria-hidden />
-            <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{hit.title || fileBasename(hit.filePath)}</span>
-            <span className="shrink-0 font-mono text-caption text-faint">{fileBasename(hit.filePath)}</span>
+            <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{hit.title || String(hit.ref.id)}</span>
+            <StatusPill tone="neutral">{hit.ref.type}</StatusPill>
+            <span className="shrink-0 text-caption text-faint">{Math.round(hit.confidence * 100)}% confidence</span>
           </div>
-          <p className="text-small text-muted">{hit.snippet}</p>
+          <p className="text-small text-muted">{hit.text}</p>
+          {hit.whyRecalled.length > 0 && <p className="mt-2 text-caption text-faint">Why: {hit.whyRecalled.join(' · ')}</p>}
+          {hit.evidence.length > 0 && <details className="mt-2 text-caption text-muted">
+            <summary className="cursor-pointer font-medium text-fg">{hit.evidence.length} supporting source{hit.evidence.length === 1 ? '' : 's'}</summary>
+            <div className="mt-1 space-y-1">{hit.evidence.slice(0, 3).map((evidence) => <div key={`${evidence.episodeId}:${evidence.excerpt}`} className="rounded bg-subtle p-2">{evidence.excerpt}{evidence.sourceUri ? <div className="mt-1 font-mono text-faint">{evidence.sourceUri}</div> : null}</div>)}</div>
+          </details>}
         </Card>
       ))}
     </div>
@@ -177,13 +196,16 @@ function SearchResults({ loading, hits, query }: { loading: boolean; hits: { fil
 // ─────────── Facts ───────────
 function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
   const [kind, setKind] = useState<Fact['kind'] | 'all'>('all');
-  const facts = usePoll(['facts', kind], () => listFacts(kind === 'all' ? undefined : kind), 15000);
+  const [showForgotten, setShowForgotten] = useState(false);
+  const facts = usePoll(['facts', kind, showForgotten], () => listFacts(kind === 'all' ? undefined : kind, 120, showForgotten), 15000);
   const rows = facts.data?.facts ?? [];
   const [draft, setDraft] = useState('');
   const [draftKind, setDraftKind] = useState<Fact['kind']>('user');
   const add = async () => { if (!draft.trim()) return; try { await addFact(draft.trim(), draftKind); setDraft(''); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
   const onForget = async (id: Fact['id']) => { try { await forgetFact(id); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
   const onPin = async (id: Fact['id'], pinned: boolean) => { try { await pinFact(id, pinned); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
+  const onRestore = async (id: Fact['id']) => { try { await restoreFact(id); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
+  const onEdit = async (id: Fact['id'], content: string) => { try { await updateFact(id, { content }); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
   return (
     <>
       <div className="mb-3 flex flex-wrap items-center gap-2">
@@ -191,6 +213,10 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
           <button key={k.key} type="button" onClick={() => setKind(k.key)}
             className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', kind === k.key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{k.label}</button>
         ))}
+        <button type="button" onClick={() => setShowForgotten((value) => !value)}
+          className={cn('ml-auto inline-flex items-center gap-1 rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', showForgotten ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>
+          <History className="h-3.5 w-3.5" aria-hidden /> {showForgotten ? 'Showing history' : 'Show history'}
+        </button>
       </div>
       <div className="mb-4 flex flex-wrap gap-2">
         <Input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Tell Clementine something to remember…" aria-label="New fact" className="min-w-48 flex-1" onKeyDown={(e) => { if (e.key === 'Enter') void add(); }} />
@@ -199,25 +225,41 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
       </div>
       {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
         : rows.length === 0 ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
-          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} />)}</div>}
+          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} />)}</div>}
     </>
   );
 }
 
-function FactCard({ fact, onPin, onForget }: { fact: Fact; onPin: () => void; onForget: () => void }) {
+function FactCard({ fact, onPin, onForget, onRestore, onEdit }: { fact: Fact; onPin: () => void; onForget: () => void; onRestore: () => void; onEdit: (content: string) => Promise<void> }) {
   const [expanded, setExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(fact.content);
   const long = (fact.content?.length ?? 0) > 180;
   return (
     <Card className="flex items-start gap-3 p-3.5">
       {fact.pinned && <Pin className="mt-1 h-4 w-4 shrink-0 text-primary" aria-hidden />}
       <div className="min-w-0 flex-1">
-        <div className="mb-1"><StatusPill tone="neutral">{KIND_LABEL[fact.kind] ?? fact.kind}</StatusPill></div>
-        <p className={cn('text-body text-fg', !expanded && long && 'line-clamp-3')}>{fact.content}</p>
+        <div className="mb-1 flex flex-wrap gap-1.5">
+          <StatusPill tone="neutral">{KIND_LABEL[fact.kind] ?? fact.kind}</StatusPill>
+          {fact.policy && <StatusPill tone={fact.policy.enforcement === 'dispatch' ? 'warning' : 'neutral'}>{fact.policy.policy_type.replace(/_/g, ' ')} · {fact.policy.enforcement}</StatusPill>}
+          {fact.active === false && <StatusPill tone="warning">historical</StatusPill>}
+        </div>
+        {editing ? <div className="space-y-2">
+          <Input value={draft} onChange={(event) => setDraft(event.target.value)} aria-label="Edit fact" />
+          <div className="flex gap-2"><Button size="sm" onClick={async () => { await onEdit(draft.trim()); setEditing(false); }} disabled={!draft.trim() || draft.trim() === fact.content}>Save as correction</Button><Button size="sm" variant="ghost" onClick={() => { setDraft(fact.content); setEditing(false); }}>Cancel</Button></div>
+        </div> : <p className={cn('text-body text-fg', !expanded && long && 'line-clamp-3')}>{fact.content}</p>}
         {long && <button type="button" onClick={() => setExpanded((v) => !v)} className="mt-1 text-caption font-semibold text-primary hover:underline cursor-pointer">{expanded ? 'Show less' : 'Show more'}</button>}
+        <div className="mt-1 text-caption text-faint">
+          {typeof fact.confidence === 'number' ? `${Math.round(fact.confidence * 100)}% confidence · ` : ''}{fact.evidence?.length ?? 0} source{fact.evidence?.length === 1 ? '' : 's'} · used {fact.utilityCount ?? 0}× · shown {fact.impressionCount ?? 0}×
+        </div>
+        {(fact.evidence?.length ?? 0) > 0 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View provenance</summary><div className="mt-1 space-y-1">{fact.evidence?.map((item) => <div key={`${item.episodeId}:${item.excerpt}`} className="rounded bg-subtle p-2">{item.excerpt}{item.sourceUri ? <div className="mt-1 font-mono text-faint">{item.sourceUri}</div> : null}</div>)}</div></details>}
       </div>
       <div className="flex shrink-0 gap-1">
-        <Button variant="ghost" size="icon" aria-label={fact.pinned ? 'Unpin' : 'Pin'} title={fact.pinned ? 'Unpin' : 'Pin'} onClick={onPin}><Pin className={cn('h-4 w-4', fact.pinned && 'fill-primary text-primary')} aria-hidden /></Button>
-        <Button variant="ghost" size="icon" aria-label="Forget this" title="Forget this" onClick={onForget}><Trash2 className="h-4 w-4" aria-hidden /></Button>
+        {fact.active === false ? <Button variant="ghost" size="icon" aria-label="Restore" title="Restore" onClick={onRestore}><Undo2 className="h-4 w-4" aria-hidden /></Button> : <>
+          <Button variant="ghost" size="icon" aria-label="Correct" title="Correct with temporal history" onClick={() => setEditing(true)}><Pencil className="h-4 w-4" aria-hidden /></Button>
+          <Button variant="ghost" size="icon" aria-label={fact.pinned ? 'Unpin' : 'Pin'} title={fact.pinned ? 'Unpin' : 'Pin'} onClick={onPin}><Pin className={cn('h-4 w-4', fact.pinned && 'fill-primary text-primary')} aria-hidden /></Button>
+          <Button variant="ghost" size="icon" aria-label="Forget this" title="Forget this" onClick={onForget}><Trash2 className="h-4 w-4" aria-hidden /></Button>
+        </>}
       </div>
     </Card>
   );

@@ -255,10 +255,15 @@ test('ground-truth-wins: an authoritative candidate supersedes a stale low-trust
 
   assert.equal(outcome.updated, 1, 'authoritative candidate UPDATEs the stale fact');
   assert.equal(outcome.written, 0, 'no new duplicate row');
-  const after = getFact(stale.id);
-  assert.match(after?.content ?? '', /Monday 9am/, 'stale content superseded by ground truth');
-  assert.equal(after?.trustLevel, 0.9, 'trust lifted to authoritative');
-  assert.equal(after?.sourceApp, 'Google Calendar', 'source app recorded on supersede');
+  assert.equal(outcome.action, 'supersede');
+  const historical = getFact(stale.id);
+  assert.equal(historical?.active, false, 'the stale claim remains as inactive history');
+  assert.match(historical?.content ?? '', /midweek/, 'historical content is not rewritten in place');
+  assert.ok(historical?.supersededByFactId, 'the historical row points at the current claim');
+  const current = getFact(historical!.supersededByFactId!);
+  assert.match(current?.content ?? '', /Monday 9am/, 'ground truth becomes the replacement claim');
+  assert.equal(current?.trustLevel, 0.9, 'replacement carries authoritative trust');
+  assert.equal(current?.sourceApp, 'Google Calendar', 'source app recorded on replacement');
 });
 
 test('ground-truth-wins does NOT fire for a user restatement (no sourceApp) — distinct derived fact is preserved', async () => {

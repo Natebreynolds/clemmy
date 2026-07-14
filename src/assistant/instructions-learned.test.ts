@@ -84,15 +84,15 @@ test('renderFactsForInstructions mode split: pinned vs scored vs all', () => {
   const scored = renderFactsForInstructions(12, 1600, undefined, 'scored');
   const all = renderFactsForInstructions(12, 1600, undefined, 'all');
 
-  assert.match(pinned, /Standing instructions/, 'pinned mode renders the standing-instructions section');
+  assert.match(pinned, /Standing preferences/, 'pinned mode renders the typed standing-preferences section');
   assert.match(pinned, /terse/, 'pinned mode includes the pinned rule');
   assert.doesNotMatch(pinned, /coaching business/, 'pinned mode excludes scored facts');
-  assert.doesNotMatch(scored, /Standing instructions/, 'scored mode excludes the pinned section');
+  assert.doesNotMatch(scored, /Standing preferences/, 'scored mode excludes the pinned section');
   // Regression guard (review must-fix): a SALIENT pinned fact must not also leak
   // into the scored by-kind groups — that would double-send it (Tier-1 + Tier-2).
   assert.doesNotMatch(scored, /terse/, 'scored mode excludes the pinned fact CONTENT, not just its header');
   assert.match(scored, /coaching business/, 'scored mode still includes ordinary scored facts');
-  assert.match(all, /Standing instructions/, 'all mode keeps both (byte-identical legacy)');
+  assert.match(all, /Standing preferences/, 'all mode keeps both policy and scored context');
 });
 
 test('CANON-SELFASM: chat instructions carry the Now/date block (legacy mode)', () => {
@@ -136,7 +136,7 @@ test('Step 2: casual turn skips the tail BUT standing/pinned facts stay in Tier-
     assert.match(buildTurnContextBlock(ctx, 'meta_clarify', 'what can you do'), /memory_search_facts/, 'meta turn → pointer too');
 
     const casualInstr = buildAssistantInstructions(ctx, 'dashboard', 'casual', 'hey');
-    assert.match(casualInstr, /Standing instructions/, 'pinned facts present even on a casual turn (never dropped)');
+    assert.match(casualInstr, /Standing preferences/, 'pinned facts present even on a casual turn (never dropped)');
     assert.match(casualInstr, /terse/, 'the durable standing rule survives the lean turn');
 
     // A working turn still gets the full tail.

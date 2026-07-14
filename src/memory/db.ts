@@ -99,6 +99,45 @@ export interface ConsolidatedFactRow {
   // Folded as log(1+access_count) into the recall score (reinforcement)
   // and used as a decay-resistance signal. Defaults to 0.
   access_count: number;
+  // v15 — reliable recall and temporal claim history. `access_count` remains
+  // as legacy audit data; new ranking uses utility_count only.
+  valid_from: string | null;
+  valid_to: string | null;
+  superseded_by_fact_id: number | null;
+  confidence: number | null;
+  impression_count: number;
+  utility_count: number;
+  last_used_at: string | null;
+}
+
+export type MemoryEpisodeKind = 'user_turn' | 'tool_result' | 'import' | 'manual' | 'reflection';
+export type MemoryEpisodeStatus = 'available' | 'partial' | 'missing' | 'pending' | 'expired';
+
+export interface MemoryEpisodeRow {
+  id: string;
+  kind: MemoryEpisodeKind;
+  source_app: string | null;
+  session_id: string | null;
+  call_id: string | null;
+  source_uri: string | null;
+  occurred_at: string;
+  ingested_at: string;
+  content_hash: string;
+  evidence_excerpt: string | null;
+  raw_retained_until: string | null;
+  status: MemoryEpisodeStatus;
+}
+
+export type MemoryPolicyType = 'hard_constraint' | 'core_profile' | 'standing_preference';
+
+export interface MemoryPolicyRow {
+  fact_id: number;
+  policy_type: MemoryPolicyType;
+  enforcement: 'dispatch' | 'prompt';
+  applies_to_json: string;
+  priority: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export type EntityType = 'person' | 'company' | 'project' | 'place' | 'thing';
@@ -643,6 +682,164 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
 
       CREATE INDEX IF NOT EXISTS idx_reflection_pending_session
         ON reflection_pending_extractions(session_id, created_at ASC);
+    `,
+  },
+  {
+    // v15 — dependable recall + temporal evidence. This is intentionally
+    // additive: consolidated_facts remains the canonical claim store while
+    // episodes/evidence preserve the source that made each claim durable.
+    version: 15,
+    sql: `
+      ALTER TABLE consolidated_facts ADD COLUMN valid_from TEXT;
+      ALTER TABLE consolidated_facts ADD COLUMN valid_to TEXT;
+      ALTER TABLE consolidated_facts ADD COLUMN superseded_by_fact_id INTEGER REFERENCES consolidated_facts(id);
+      ALTER TABLE consolidated_facts ADD COLUMN confidence REAL;
+      ALTER TABLE consolidated_facts ADD COLUMN impression_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE consolidated_facts ADD COLUMN utility_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE consolidated_facts ADD COLUMN last_used_at TEXT;
+
+      UPDATE consolidated_facts
+      SET valid_from = COALESCE(valid_from, created_at),
+          confidence = COALESCE(confidence, trust_level, CASE WHEN derived_from_call_id IS NULL THEN 1.0 ELSE 0.6 END),
+          impression_count = MAX(impression_count, access_count);
+
+      CREATE INDEX IF NOT EXISTS idx_facts_temporal
+        ON consolidated_facts(active, valid_from, valid_to);
+      CREATE INDEX IF NOT EXISTS idx_facts_superseded
+        ON consolidated_facts(superseded_by_fact_id) WHERE superseded_by_fact_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_facts_utility
+        ON consolidated_facts(utility_count DESC, last_used_at DESC);
+
+      CREATE TABLE IF NOT EXISTS memory_episodes (
+        id                 TEXT PRIMARY KEY,
+        kind               TEXT NOT NULL CHECK (kind IN ('user_turn','tool_result','import','manual','reflection')),
+        source_app         TEXT,
+        session_id         TEXT,
+        call_id            TEXT,
+        source_uri         TEXT,
+        occurred_at        TEXT NOT NULL,
+        ingested_at        TEXT NOT NULL,
+        content_hash       TEXT NOT NULL,
+        evidence_excerpt   TEXT,
+        raw_retained_until TEXT,
+        status             TEXT NOT NULL CHECK (status IN ('available','partial','missing','pending','expired')),
+        UNIQUE(session_id, call_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_episodes_time ON memory_episodes(occurred_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_episodes_source ON memory_episodes(session_id, call_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_episodes_status ON memory_episodes(status, ingested_at);
+
+      CREATE TABLE IF NOT EXISTS fact_evidence (
+        fact_id     INTEGER NOT NULL REFERENCES consolidated_facts(id) ON DELETE CASCADE,
+        episode_id  TEXT NOT NULL REFERENCES memory_episodes(id) ON DELETE CASCADE,
+        excerpt     TEXT NOT NULL,
+        source_uri  TEXT,
+        ordinal     INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (fact_id, episode_id, ordinal)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fact_evidence_episode ON fact_evidence(episode_id);
+
+      CREATE TABLE IF NOT EXISTS memory_policies (
+        fact_id          INTEGER PRIMARY KEY REFERENCES consolidated_facts(id) ON DELETE CASCADE,
+        policy_type      TEXT NOT NULL CHECK (policy_type IN ('hard_constraint','core_profile','standing_preference')),
+        enforcement      TEXT NOT NULL CHECK (enforcement IN ('dispatch','prompt')),
+        applies_to_json  TEXT NOT NULL DEFAULT '{}',
+        priority         INTEGER NOT NULL DEFAULT 50,
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_policies_type ON memory_policies(policy_type, priority DESC);
+
+      INSERT OR REPLACE INTO memory_policies
+        (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)
+      SELECT id,
+        CASE
+          WHEN kind = 'constraint' THEN 'hard_constraint'
+          WHEN kind = 'user' THEN 'core_profile'
+          ELSE 'standing_preference'
+        END,
+        CASE WHEN kind = 'constraint' THEN 'dispatch' ELSE 'prompt' END,
+        '{}',
+        CAST(ROUND(COALESCE(importance, 5) * 10) AS INTEGER),
+        created_at,
+        updated_at
+      FROM consolidated_facts
+      WHERE active = 1 AND (kind = 'constraint' OR pinned = 1);
+
+      CREATE TRIGGER IF NOT EXISTS memory_policy_fact_ai
+      AFTER INSERT ON consolidated_facts
+      WHEN NEW.active = 1 AND (NEW.kind = 'constraint' OR NEW.pinned = 1)
+      BEGIN
+        INSERT OR REPLACE INTO memory_policies
+          (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)
+        VALUES (
+          NEW.id,
+          CASE WHEN NEW.kind = 'constraint' THEN 'hard_constraint' WHEN NEW.kind = 'user' THEN 'core_profile' ELSE 'standing_preference' END,
+          CASE WHEN NEW.kind = 'constraint' THEN 'dispatch' ELSE 'prompt' END,
+          '{}', CAST(ROUND(COALESCE(NEW.importance, 5) * 10) AS INTEGER), NEW.created_at, NEW.updated_at
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS memory_policy_fact_au
+      AFTER UPDATE OF active, kind, pinned, importance, updated_at ON consolidated_facts
+      BEGIN
+        DELETE FROM memory_policies WHERE fact_id = NEW.id;
+        INSERT INTO memory_policies
+          (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)
+        SELECT NEW.id,
+          CASE WHEN NEW.kind = 'constraint' THEN 'hard_constraint' WHEN NEW.kind = 'user' THEN 'core_profile' ELSE 'standing_preference' END,
+          CASE WHEN NEW.kind = 'constraint' THEN 'dispatch' ELSE 'prompt' END,
+          '{}', CAST(ROUND(COALESCE(NEW.importance, 5) * 10) AS INTEGER), NEW.created_at, NEW.updated_at
+        WHERE NEW.active = 1 AND (NEW.kind = 'constraint' OR NEW.pinned = 1);
+      END;
+
+      ALTER TABLE entity_edges ADD COLUMN confidence REAL NOT NULL DEFAULT 0.7;
+      ALTER TABLE entity_edges ADD COLUMN evidence_episode_id TEXT REFERENCES memory_episodes(id);
+      ALTER TABLE entity_edges ADD COLUMN valid_from TEXT;
+      ALTER TABLE entity_edges ADD COLUMN valid_to TEXT;
+      ALTER TABLE entity_edges ADD COLUMN invalidated_at TEXT;
+
+      ALTER TABLE reflection_pending_extractions ADD COLUMN expires_at TEXT;
+      ALTER TABLE reflection_pending_extractions ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+      UPDATE reflection_pending_extractions
+      SET expires_at = datetime(created_at, '+7 days')
+      WHERE expires_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_reflection_pending_expiry
+        ON reflection_pending_extractions(status, expires_at);
+
+      CREATE TABLE IF NOT EXISTS memory_generation (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        generation INTEGER NOT NULL DEFAULT 1
+      );
+      INSERT OR IGNORE INTO memory_generation (id, generation) VALUES (1, 1);
+
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_ai AFTER INSERT ON consolidated_facts
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_au AFTER UPDATE OF content_hash, active, kind ON consolidated_facts
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_ad AFTER DELETE ON consolidated_facts
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_embedding_ai AFTER INSERT ON fact_embeddings
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_embedding_au AFTER UPDATE ON fact_embeddings
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_embedding_ad AFTER DELETE ON fact_embeddings
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_entity_ai AFTER INSERT ON fact_entities
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_entity_ad AFTER DELETE ON fact_entities
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_resource_ai AFTER INSERT ON fact_resources
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_fact_resource_ad AFTER DELETE ON fact_resources
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_entity_edge_ai AFTER INSERT ON entity_edges
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_entity_edge_au AFTER UPDATE ON entity_edges
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
+      CREATE TRIGGER IF NOT EXISTS memory_generation_entity_edge_ad AFTER DELETE ON entity_edges
+      BEGIN UPDATE memory_generation SET generation = generation + 1 WHERE id = 1; END;
     `,
   },
 ];

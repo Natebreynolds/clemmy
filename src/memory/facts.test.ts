@@ -37,6 +37,7 @@ const {
   setTurnQueryVector,
   clearTurnQueryVector,
   touchFactAccess,
+  recordFactImpression,
 } = await import('./facts.js');
 const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
 
@@ -274,11 +275,11 @@ test('a pinned instruction is always rendered even when out-ranked by many newer
   }
 
   const rendered = renderFactsForInstructions(5, 4000);
-  assert.match(rendered, /Standing instructions \(always apply\)/);
+  assert.match(rendered, /Standing preferences/);
   assert.match(rendered, /Never email clients on Fridays/);
 });
 
-test('pinned standing instructions render IN FULL even when they alone exceed maxChars (exempt from the cap)', () => {
+test('policy overflow is explicit and never claims omitted preferences were applied', () => {
   const pins = [
     'Only ever add events to the Breakthrough Coaching calendar, never a personal calendar.',
     'Default sending identity is nathan.reynolds@breakthroughcoaching.ai for all outbound email.',
@@ -288,12 +289,11 @@ test('pinned standing instructions render IN FULL even when they alone exceed ma
   for (const content of pins) setFactPinned(rememberFact({ kind: 'feedback', content }).id, true);
   for (let i = 0; i < 6; i += 1) rememberFact({ kind: 'project', content: `Scored project note ${i} about scraping pipelines.` });
 
-  // A cap far SMALLER than the pinned block alone. Old behavior sliced the
-  // whole join and cut a standing rule mid-word; the fix renders pinned in full.
+  // A cap far smaller than the policy set. The renderer may summarize, but it
+  // must report exact coverage instead of silently claiming every pin applied.
   const rendered = renderFactsForInstructions(10, 200);
-  for (const content of pins) {
-    assert.ok(rendered.includes(content), `pinned standing instruction must survive in full: ${content}`);
-  }
+  assert.match(rendered, /Policy manifest: \d+\/4 shown/);
+  assert.match(rendered, /more standing preferences? available/);
 });
 
 test('message-scoped recall surfaces a query-relevant fact that global recall buries (the "MY accounts" fix)', () => {
@@ -527,20 +527,14 @@ test('derived facts without a source keep the 0.6 default and null sourceApp', (
   assert.equal(fact.sourceApp ?? null, null);
 });
 
-test('listActiveFacts(stanford): a warm high-importance fact past the updated_at rank-100 cutoff is still recalled (pool widening)', () => {
-  // Regression characterization for the recall candidate-pool bug: the pool is
-  // pre-filtered by `updated_at DESC` but SCORED by the Stanford axis
-  // (last_accessed_at + importance). With the old 100-row floor, a warm
-  // high-importance fact whose CONTENT wasn't recently edited fell out of the
-  // pool before it could be scored. We characterize BOTH states via the
-  // CLEMMY_RECALL_POOL knob: floor 100 drops it (the bug), floor 500 keeps it.
+test('listActiveFacts(stanford): a useful high-importance fact beyond the former pool is recalled', () => {
   const db = openMemoryDb();
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
   const insert = db.prepare(`
     INSERT INTO consolidated_facts
-      (kind, content, content_hash, score, active, created_at, updated_at, importance, last_accessed_at)
-    VALUES (@kind, @content, @hash, 1.0, 1, @created, @updated, @importance, @accessed)
+      (kind, content, content_hash, score, active, created_at, updated_at, importance, last_used_at, utility_count)
+    VALUES (@kind, @content, @hash, 1.0, 1, @created, @updated, @importance, @accessed, @utility)
   `);
   // 120 recently-edited, low-importance fillers — push the target past rank 100
   // by updated_at while keeping their own Stanford score low (importance 1).
@@ -553,6 +547,7 @@ test('listActiveFacts(stanford): a warm high-importance fact past the updated_at
       updated: new Date(now - i * 1000).toISOString(),
       importance: 1,
       accessed: nowIso,
+      utility: 0,
     });
   }
   // The target: edited 30 days ago (~rank 121 by updated_at) but ACCESSED today
@@ -565,26 +560,17 @@ test('listActiveFacts(stanford): a warm high-importance fact past the updated_at
     updated: new Date(now - 30 * DAY_MS).toISOString(),
     importance: 8,
     accessed: nowIso,
+    utility: 10,
   });
 
   const hasTarget = (facts: { content: string }[]) =>
     facts.some((f) => f.content.includes('default sending identity'));
 
-  process.env.CLEMMY_RECALL_POOL = '100';
-  assert.equal(
-    hasTarget(listActiveFacts({ ranking: 'stanford', limit: 10 })),
-    false,
-    'with a 100-row pool the warm high-importance fact is dropped before scoring (the bug)',
-  );
-
-  process.env.CLEMMY_RECALL_POOL = '500';
   assert.equal(
     hasTarget(listActiveFacts({ ranking: 'stanford', limit: 10 })),
     true,
-    'widening the pool to 500 recalls the warm high-importance fact',
+    'full-pool scoring recalls the useful tail fact',
   );
-
-  delete process.env.CLEMMY_RECALL_POOL;
 });
 
 test('listActiveFacts(stanford): a semantically-relevant fact is promoted by the turn query vector (bonus-only)', () => {
@@ -666,7 +652,7 @@ test('lexicalRelevance: a detailed on-point fact is not demoted by its length (s
   assert.equal(lexicalRelevance('legal contract', 'legal contract'), 1);
 });
 
-test('access reinforcement: a frequently-recalled fact outranks an equal-base never-recalled one', () => {
+test('utility reinforcement: a frequently-used fact outranks an equal-base never-used one', () => {
   process.env.CLEMMY_RECALL_REINFORCEMENT_WEIGHT = '0.1';
   clearTurnQueryVector();
   const db = openMemoryDb();
@@ -674,8 +660,8 @@ test('access reinforcement: a frequently-recalled fact outranks an equal-base ne
   const b = rememberFact({ kind: 'user', content: 'Never-recalled fact B.', importance: 5 });
   // Identical recency anchor + importance for both; A has 50 prior recalls.
   const sameTime = new Date().toISOString();
-  db.prepare('UPDATE consolidated_facts SET last_accessed_at = ?, access_count = ? WHERE id = ?').run(sameTime, 50, a.id);
-  db.prepare('UPDATE consolidated_facts SET last_accessed_at = ?, access_count = ? WHERE id = ?').run(sameTime, 0, b.id);
+  db.prepare('UPDATE consolidated_facts SET last_used_at = ?, utility_count = ? WHERE id = ?').run(sameTime, 50, a.id);
+  db.prepare('UPDATE consolidated_facts SET last_used_at = ?, utility_count = ? WHERE id = ?').run(sameTime, 0, b.id);
   const ranked = listActiveFacts({ ranking: 'stanford', limit: 5 });
   const ai = ranked.findIndex((f) => f.id === a.id);
   const bi = ranked.findIndex((f) => f.id === b.id);
@@ -691,11 +677,43 @@ test('touchFactAccess increments access_count', () => {
   assert.equal(getFact(a.id)?.accessCount, 2, 'two touches → access_count 2');
 });
 
+test('automatic impressions do not reinforce utility or change the recency anchor', () => {
+  const fact = rememberFact({ kind: 'user', content: 'Passive exposure must not self-reinforce.' });
+  recordFactImpression(fact.id);
+  recordFactImpression(fact.id);
+  const reloaded = getFact(fact.id);
+  assert.equal(reloaded?.impressionCount, 2);
+  assert.equal(reloaded?.utilityCount, 0);
+  assert.equal(reloaded?.lastUsedAt, null);
+});
+
+test('prompt impressions count only policy facts that are actually rendered', () => {
+  const shown = rememberFact({
+    kind: 'feedback',
+    content: `Prefer the compact response format. ${'a'.repeat(64)}`,
+    importance: 9,
+  });
+  const omitted = rememberFact({
+    kind: 'feedback',
+    content: `Prefer the expansive response format. ${'b'.repeat(64)}`,
+    importance: 1,
+  });
+  setFactPinned(shown.id, true);
+  setFactPinned(omitted.id, true);
+
+  const rendered = renderFactsForInstructions(10, 200, undefined, 'pinned');
+  assert.match(rendered, /compact response format/);
+  assert.doesNotMatch(rendered, /expansive response format/);
+  assert.equal(getFact(shown.id)?.impressionCount, 1);
+  assert.equal(getFact(omitted.id)?.impressionCount, 0);
+  assert.equal(getFact(shown.id)?.utilityCount, 0);
+});
+
 test('importance-aware decay: low-importance idle fades; high-importance moderately-idle survives; ancient high-importance eventually fades', () => {
   const db = openMemoryDb();
   const daysAgo = (d: number) => new Date(Date.now() - d * DAY_MS).toISOString();
   const setAge = (id: number, days: number, importance: number, access: number) => db.prepare(
-    'UPDATE consolidated_facts SET updated_at=?, created_at=?, last_accessed_at=NULL, importance=?, access_count=? WHERE id=?'
+    'UPDATE consolidated_facts SET updated_at=?, created_at=?, last_used_at=NULL, importance=?, utility_count=? WHERE id=?'
   ).run(daysAgo(days), daysAgo(days), importance, access, id);
 
   const lowIdle = rememberFact({ kind: 'project', content: 'Low importance idle fact.' });
@@ -725,7 +743,7 @@ test('importance-aware decay: pinned facts are exempt even when ancient', () => 
 test('importance-aware decay is ON by default — the idle tail fades even for high-importance; the kill-switch reverts to binary (immortal)', () => {
   const db = openMemoryDb();
   const setAncient = (id: number, importance: number) => db.prepare(
-    'UPDATE consolidated_facts SET updated_at=?, created_at=?, last_accessed_at=NULL, importance=? WHERE id=?'
+    'UPDATE consolidated_facts SET updated_at=?, created_at=?, last_used_at=NULL, importance=? WHERE id=?'
   ).run(new Date(Date.now() - 300 * DAY_MS).toISOString(), new Date(Date.now() - 300 * DAY_MS).toISOString(), importance, id);
 
   // DEFAULT (no importanceAware option) is now the importance-aware path: a fact

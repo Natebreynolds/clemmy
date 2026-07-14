@@ -823,7 +823,11 @@ test('consolidateFact: oversized resolver rewrite falls back to candidate text',
     { resolver: async () => ({ decision: 'UPDATE', target_id: target.id, rewrite: 'x'.repeat(501) }) },
   );
   assert.equal(out.updated, 1, 'unpinned target is updated');
-  assert.equal(getFact(target.id)?.content, 'Quarterly revenue target is 2M.', 'cap rejects the 501-char rewrite in favor of candidate text');
+  const historical = getFact(target.id);
+  assert.equal(historical?.content, 'Quarterly revenue target is 1M.', 'old claim is preserved for historical recall');
+  assert.equal(historical?.active, false, 'old claim is closed');
+  assert.ok(historical?.supersededByFactId, 'old claim points to its replacement');
+  assert.equal(getFact(historical!.supersededByFactId!)?.content, 'Quarterly revenue target is 2M.', 'cap rejects the 501-char rewrite in favor of a new temporal claim');
 });
 
 // Cleanup

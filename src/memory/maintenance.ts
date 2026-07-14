@@ -29,6 +29,7 @@ import { reapExpiredGoals } from '../agents/plan-proposals.js';
 import { reapStaleCheckIns } from '../agents/check-ins.js';
 import { previousLocalDayKey, runTaskLedgerHygiene } from '../tasks/task-ledger-hygiene.js';
 import { runReportOnlyCurator } from './curator.js';
+import { backfillTemporalEvidence, reapExpiredPendingReflections } from './temporal-memory.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -297,6 +298,15 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
+  if (tickCount % BACKFILL_EVERY_N_TICKS === 0) {
+    try {
+      const evidence = backfillTemporalEvidence(BACKFILL_BATCH);
+      if (evidence.linked > 0 || evidence.missing > 0) logger.info({ evidence }, 'temporal evidence backfill tick');
+    } catch (err) {
+      logger.warn({ err }, 'temporal evidence backfill tick failed');
+    }
+  }
+
   if (tickCount % MEMORY_MD_EVERY_N_TICKS === 0) {
     // No-op if the rendered auto section matches what's already on
     // disk, so this is safe to fire every 30 min even on quiet days.
@@ -322,6 +332,8 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // this, harness.db grows ~10MB/day. The reaper itself is one indexed
   // DELETE; log only when rows were actually dropped.
   if (tickCount % EVENTLOG_REAPER_EVERY_N_TICKS === 0) {
+    // Copy recoverable fact evidence before the raw tool-output TTL runs.
+    try { backfillTemporalEvidence(2_000); } catch { /* periodic backfill retries */ }
     try {
       const deleted = reapStaleToolOutputs();
       if (deleted > 0) {
@@ -339,6 +351,12 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'sessions reaper tick failed');
+    }
+    try {
+      const expiredPending = reapExpiredPendingReflections();
+      if (expiredPending > 0) logger.info({ expiredPending }, 'pending reflection evidence expired');
+    } catch (err) {
+      logger.warn({ err }, 'pending reflection reaper tick failed');
     }
   }
 

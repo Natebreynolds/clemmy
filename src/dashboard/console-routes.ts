@@ -38,11 +38,13 @@ import {
 import { getGitHubCliStatus } from '../integrations/github-cli.js';
 import { recallHybrid, getRecallStats } from '../memory/recall.js';
 import { readEmbeddingStats, getEmbeddingHealth } from '../memory/embeddings.js';
-import { FACT_KINDS, forgetFact, getFact, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, updateFact } from '../memory/facts.js';
+import { FACT_KINDS, forgetFact, getFact, getFactWithEvidence, listActiveFacts, listAllFacts, reactivateFact, rememberFact, searchFacts, setFactPinned, supersedeFact, updateFact } from '../memory/facts.js';
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
 import { openMemoryDb } from '../memory/db.js';
-import { buildMemoryGraph } from './memory-graph.js';
+import { buildMemoryGraph, buildMemoryNeighborhood } from './memory-graph.js';
+import { recallMemory } from '../memory/recall-memory.js';
+import { listMemoryPolicies } from '../memory/temporal-memory.js';
 import {
   getFocusSnapshot,
   activateFocus as activateFocusRow,
@@ -2483,6 +2485,26 @@ export function registerConsoleRoutes(
     }
   });
 
+  /** Unified evidence-backed search. The legacy /memory/search remains the
+   * vault-only compatibility endpoint. */
+  app.get('/api/console/memory/search-all', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const limit = Math.max(1, Math.min(50, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '16', 10) || 16));
+    const depthRaw = parseInt(typeof req.query.depth === 'string' ? req.query.depth : '1', 10);
+    const graphDepth: 0 | 1 | 2 = depthRaw >= 2 ? 2 : depthRaw <= 0 ? 0 : 1;
+    if (!query) {
+      res.json({ query: '', hits: [], answerability: 'insufficient', diagnostics: { candidates: 0, stores: [], elapsedMs: 0 } });
+      return;
+    }
+    try {
+      const result = await recallMemory(query, { limit, graphDepth });
+      res.json({ query, ...result });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * List durable facts. ?kind=user|project|feedback|reference filters.
    * Defaults to active only; ?includeInactive=1 includes soft-deleted.
@@ -2490,15 +2512,16 @@ export function registerConsoleRoutes(
   app.get('/api/console/memory/facts', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const kindRaw = typeof req.query.kind === 'string' ? req.query.kind : undefined;
-    const allowedKinds = new Set(['user', 'project', 'feedback', 'reference']);
-    const kind = kindRaw && allowedKinds.has(kindRaw) ? kindRaw as 'user' | 'project' | 'feedback' | 'reference' : undefined;
+    const allowedKinds = new Set(['user', 'project', 'feedback', 'reference', 'constraint']);
+    const kind = kindRaw && allowedKinds.has(kindRaw) ? kindRaw as (typeof FACT_KINDS)[number] : undefined;
     const includeInactive = req.query.includeInactive === '1' || req.query.includeInactive === 'true';
     const limit = Math.max(1, Math.min(200, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '60', 10) || 60));
     try {
       const facts = includeInactive
         ? listAllFacts(limit).filter((f) => !kind || f.kind === kind)
         : listActiveFacts({ kind, limit });
-      res.json({ facts });
+      const policies = new Map(listMemoryPolicies().map((policy) => [policy.fact_id, policy]));
+      res.json({ facts: facts.map((fact) => ({ ...fact, evidence: getFactWithEvidence(fact.id)?.evidence ?? [], policy: policies.get(fact.id) ?? null })) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -2861,9 +2884,18 @@ export function registerConsoleRoutes(
       return;
     }
     try {
-      const updated = updateFact(id, patch);
+      const existing = getFact(id);
+      if (!existing) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      const updated = patch.content
+        ? supersedeFact(id, {
+            content: patch.content,
+            importance: patch.importance ?? existing.importance ?? undefined,
+            trustLevel: 1,
+            sourceApp: 'Clementine Console',
+          })
+        : updateFact(id, { importance: patch.importance });
       if (!updated) { res.status(404).json({ error: `no fact #${id}` }); return; }
-      res.json({ ok: true, fact: updated });
+      res.json({ ok: true, fact: updated, supersededFactId: patch.content ? id : null });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -2926,6 +2958,31 @@ export function registerConsoleRoutes(
       const episodic = one('SELECT COUNT(*) AS c FROM episodic_pointers');
       const entities = one('SELECT COUNT(*) AS c FROM entities');
       const focusActive = one("SELECT COUNT(*) AS c FROM current_focus WHERE status = 'active'");
+      const evidenceLinked = one('SELECT COUNT(DISTINCT fact_id) AS c FROM fact_evidence');
+      const brokenEvidence = one(`
+        SELECT COUNT(*) AS c FROM consolidated_facts cf
+        WHERE cf.derived_from_call_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM fact_evidence fe WHERE fe.fact_id = cf.id)
+      `);
+      const missingEpisodes = one("SELECT COUNT(*) AS c FROM memory_episodes WHERE status = 'missing'");
+      const pendingReflections = one("SELECT COUNT(*) AS c FROM reflection_pending_extractions WHERE status = 'pending'");
+      const unreachableFacts = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1 AND utility_count = 0');
+      const policyRows = db.prepare('SELECT policy_type, COUNT(*) AS c FROM memory_policies GROUP BY policy_type').all() as Array<{ policy_type: string; c: number }>;
+      const policies = Object.fromEntries(policyRows.map((row) => [row.policy_type, row.c]));
+      const usage = db.prepare(`
+        SELECT COALESCE(SUM(impression_count), 0) AS impressions,
+               COALESCE(SUM(utility_count), 0) AS utility
+        FROM consolidated_facts
+      `).get() as { impressions: number; utility: number };
+      const oldestPending = (db.prepare(`
+        SELECT MIN(created_at) AS at FROM reflection_pending_extractions WHERE status = 'pending'
+      `).get() as { at: string | null }).at;
+      const relationshipCounts = {
+        factEntity: one('SELECT COUNT(*) AS c FROM fact_entities'),
+        factResource: one('SELECT COUNT(*) AS c FROM fact_resources'),
+        entityEntity: one('SELECT COUNT(*) AS c FROM entity_edges WHERE invalidated_at IS NULL'),
+        factEvidence: one('SELECT COUNT(*) AS c FROM fact_evidence'),
+      };
       const embStats = readEmbeddingStats();
       const embHealth = getEmbeddingHealth();
       res.json({
@@ -2948,6 +3005,18 @@ export function registerConsoleRoutes(
           chunkEmbeds,
         },
         recall: getRecallStats(),
+        reliability: {
+          evidenceLinked,
+          brokenEvidence,
+          missingEpisodes,
+          pendingReflections,
+          oldestPending,
+          unreachableFacts,
+          impressions: usage.impressions,
+          utility: usage.utility,
+          policies,
+          relationships: relationshipCounts,
+        },
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -3028,8 +3097,21 @@ export function registerConsoleRoutes(
         simThreshold: floatParam(req.query.simThreshold, 0.70),
         simCap: intParam(req.query.simCap, 300),
         clusterMode: req.query.cluster === 'auto' ? 'auto' : 'kind',
+        truthMode: req.query.truth === 'augmented' ? 'augmented' : 'stored',
       });
       res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/console/memory/neighborhood', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const nodeId = typeof req.query.nodeId === 'string' ? req.query.nodeId.trim() : '';
+    const depth: 1 | 2 = req.query.depth === '2' ? 2 : 1;
+    if (!nodeId) { res.status(400).json({ error: 'nodeId required' }); return; }
+    try {
+      res.json(buildMemoryNeighborhood(openMemoryDb(), nodeId, depth));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -8014,8 +8096,8 @@ export function registerConsoleRoutes(
       const sort = typeof req.query.sort === 'string' ? req.query.sort : 'stanford';
       const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
       const includeForgotten = req.query.includeForgotten === '1' || req.query.includeForgotten === 'true';
-      const allowedKinds = new Set(['user', 'project', 'feedback', 'reference']);
-      const kind = allowedKinds.has(kindParam) ? (kindParam as 'user' | 'project' | 'feedback' | 'reference') : undefined;
+      const allowedKinds = new Set(['user', 'project', 'feedback', 'reference', 'constraint']);
+      const kind = allowedKinds.has(kindParam) ? (kindParam as (typeof FACT_KINDS)[number]) : undefined;
       const limit = 100;
       let facts;
       if (query) {

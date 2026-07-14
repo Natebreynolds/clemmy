@@ -57,7 +57,7 @@ test('renderFactsForInstructions traces pinned and scored facts with their reaso
   assert.equal(entry.surface, 'facts_for_instructions');
   assert.equal(entry.objective, 'market leader accounts');
   assert.equal(entry.mode, 'all');
-  assert.ok(entry.facts.some((f) => f.id === pinned.id && f.reason === 'pinned-standing-instruction'));
+  assert.ok(entry.facts.some((f) => f.id === pinned.id && f.reason === 'policy:standing_preference'));
   assert.ok(entry.facts.some((f) => f.id === scored.id && f.reason === 'scored-stanford-objective'));
 });
 

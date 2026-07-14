@@ -10,12 +10,15 @@ function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
 }
 
-const KIND_LABELS: Record<string, string> = { USER: 'About you', PROJECT: 'Projects', FEEDBACK: 'Feedback', REFERENCE: 'Reference' };
+const KIND_LABELS: Record<string, string> = { USER: 'About you', PROJECT: 'Projects', FEEDBACK: 'Feedback', REFERENCE: 'Reference', CONSTRAINT: 'Constraints' };
 
 const TYPES: { type: string; label: string; varName?: string; hex?: string }[] = [
   { type: 'kind', label: 'Topics', varName: '--primary' },
   { type: 'entity', label: 'People & things', varName: '--success' },
   { type: 'file', label: 'Files', varName: '--info' },
+  { type: 'resource', label: 'Resources', hex: '#75E6B1' },
+  { type: 'episode', label: 'Episodes', hex: '#BFA7FF' },
+  { type: 'policy', label: 'Policies', hex: '#FF6B6B' },
   { type: 'fact', label: 'Facts', varName: '--text-subtle' },
   // WS1 non-fact stores (fixed hex — no theme var). Shown only when present.
   { type: 'tool-recall', label: 'Tool recall', hex: '#7CF5A6' },
@@ -27,6 +30,7 @@ const TYPES: { type: string; label: string; varName?: string; hex?: string }[] =
 // Fixed colors for the non-fact node types (parity with the 3D constellation).
 const STORE_COLOR: Record<string, string> = {
   'tool-recall': '#7CF5A6', skill: '#FFD166', workflow: '#67B7FF', goal: '#FF6FA8', focus: '#C792EA',
+  resource: '#75E6B1', episode: '#BFA7FF', policy: '#FF6B6B',
 };
 
 // Which topic rooms the user has folded — persisted so returning users keep

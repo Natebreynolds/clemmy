@@ -5,7 +5,7 @@ import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow, type EntityType, type EntityRow, type EpisodicPointerRow } from './db.js';
 import {
   rememberFact,
-  updateFact,
+  supersedeFact,
   deleteFact,
   demoteRolledUpSource,
   getFact,
@@ -23,6 +23,7 @@ import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadFactEmbeddings } fr
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
+import { recordMemoryEpisode } from './temporal-memory.js';
 
 /**
  * Reflection-on-tool-return — Phase 1 of the brain architecture.
@@ -704,6 +705,9 @@ export interface ConsolidateCandidate {
   /** v9 — friendly app name when the candidate came from a system of
    *  record (set by classifySource in the reflection loop). */
   sourceApp?: string;
+  /** Durable locator/time for imports and other non-tool episodes. */
+  sourceUri?: string;
+  occurredAt?: string;
   /** Pin the resulting fact (always-injected, decay-exempt). Set by the
    *  auto-capture prohibition path so a safety-critical "never …" rule can
    *  never be scoped out of context at action time. Pinned INSIDE
@@ -717,6 +721,9 @@ export interface ConsolidateContext {
 }
 
 export interface ConsolidateOutcome {
+  action: 'reinforce' | 'supersede' | 'add' | 'ignore';
+  factId?: number;
+  supersededFactId?: number;
   written: number;
   updated: number;
   deleted: number;
@@ -818,7 +825,7 @@ async function consolidateFactInner(
   ctx: ConsolidateContext = {},
   opts: ConsolidateOptions = {},
 ): Promise<ConsolidateOutcome> {
-  const out: ConsolidateOutcome = { written: 0, updated: 0, deleted: 0, noop: 0, importanceAdded: 0 };
+  const out: ConsolidateOutcome = { action: 'ignore', written: 0, updated: 0, deleted: 0, noop: 0, importanceAdded: 0 };
 
   // Pin the resulting fact when the candidate asked for it (the safety-critical
   // prohibition path). Done HERE, where the ADD/UPDATE row id is known, so the
@@ -832,6 +839,30 @@ async function consolidateFactInner(
   const scored = await findSimilarFactsScored(candidate.text, { kind: candidate.kind, topK: 5 });
   const similar = scored.map((s) => s.fact);
   const topSim = scored.length > 0 ? scored[0].sim : null;
+
+  // Exact restatements reinforce the canonical row and attach any new episode
+  // evidence without invoking a semantic conflict judge.
+  const normalizedCandidate = candidate.text.replace(/\s+/g, ' ').trim().toLowerCase();
+  const exact = similar.find((fact) => fact.content.replace(/\s+/g, ' ').trim().toLowerCase() === normalizedCandidate);
+  if (exact) {
+    const reinforced = rememberFact({
+      kind: candidate.kind,
+      content: candidate.text,
+      sessionId: ctx.sessionId,
+      derivedFrom: ctx.derivedFrom,
+      importance: candidate.importance,
+      trustLevel: candidate.trustLevel,
+      sourceApp: candidate.sourceApp,
+      sourceUri: candidate.sourceUri,
+      occurredAt: candidate.occurredAt,
+    });
+    maybePin(reinforced.id);
+    out.action = 'reinforce';
+    out.factId = reinforced.id;
+    out.noop = 1; // legacy compatibility: no new canonical row was created
+    out.importanceAdded += candidate.importance ?? 0;
+    return out;
+  }
 
   // Ground-truth-wins fast-path (Thread 1 / C2): an AUTHORITATIVE candidate
   // (system of record, trust ≥ 0.85) that clearly conflicts (high cosine)
@@ -862,16 +893,22 @@ async function consolidateFactInner(
     topSim >= GROUND_TRUTH_CONFLICT_SIM &&
     (scored[0].fact.trustLevel ?? 1.0) <= 0.6
   ) {
-    const updated = updateFact(scored[0].fact.id, {
+    const updated = supersedeFact(scored[0].fact.id, {
       content: candidate.text,
       trustLevel: candidate.trustLevel,
       importance: candidate.importance,
       sessionId: ctx.sessionId,
+      derivedFrom: ctx.derivedFrom,
       sourceApp: candidate.sourceApp,
+      sourceUri: candidate.sourceUri,
+      occurredAt: candidate.occurredAt,
     });
     if (updated) {
+      out.action = 'supersede';
+      out.factId = updated.id;
+      out.supersededFactId = scored[0].fact.id;
       out.updated = 1;
-      maybePin(scored[0].fact.id);
+      maybePin(updated.id);
       out.importanceAdded += candidate.importance ?? 0;
       return out;
     }
@@ -895,8 +932,12 @@ async function consolidateFactInner(
       importance: candidate.importance,
       trustLevel: candidate.trustLevel,
       sourceApp: candidate.sourceApp,
+      sourceUri: candidate.sourceUri,
+      occurredAt: candidate.occurredAt,
     });
     maybePin(added.id);
+    out.action = 'add';
+    out.factId = added.id;
     out.written = 1;
     out.importanceAdded += candidate.importance ?? 0;
     return out;
@@ -908,6 +949,8 @@ async function consolidateFactInner(
   );
 
   if (decision.decision === 'NOOP') {
+    out.action = 'ignore';
+    out.factId = typeof decision.target_id === 'number' ? decision.target_id : undefined;
     out.noop = 1;
     return out;
   }
@@ -927,9 +970,25 @@ async function consolidateFactInner(
   }
 
   if (pinnedTargetId === null && decision.decision === 'DELETE' && typeof decision.target_id === 'number') {
-    if (deleteFact(decision.target_id)) out.deleted = 1;
-    // After delete we still ADD the new fact below — the deleted row
-    // was the OLD state; the candidate captures the current state.
+    const replacement = supersedeFact(decision.target_id, {
+      content: candidate.text,
+      trustLevel: candidate.trustLevel,
+      importance: candidate.importance,
+      sessionId: ctx.sessionId,
+      derivedFrom: ctx.derivedFrom,
+      sourceApp: candidate.sourceApp,
+      sourceUri: candidate.sourceUri,
+      occurredAt: candidate.occurredAt,
+    });
+    if (replacement) {
+      maybePin(replacement.id);
+      out.action = 'supersede';
+      out.factId = replacement.id;
+      out.supersededFactId = decision.target_id;
+      out.deleted = 1; // legacy decision tally
+      out.importanceAdded += candidate.importance ?? 0;
+      return out;
+    }
   }
 
   if (pinnedTargetId === null && decision.decision === 'UPDATE' && typeof decision.target_id === 'number') {
@@ -938,18 +997,24 @@ async function consolidateFactInner(
       decision.rewrite && decision.rewrite.length <= CONFLICT_REWRITE_MAX_CHARS
         ? decision.rewrite
         : undefined;
-    const updated = updateFact(decision.target_id, {
+    const updated = supersedeFact(decision.target_id, {
       content: rewrite || candidate.text,
       // Tool-derived candidates keep the historical 0.6; user candidates
       // pass 1.0. updateFact MAX-merges trust, so user always wins.
       trustLevel: candidate.trustLevel ?? 0.6,
       importance: candidate.importance,
       sessionId: ctx.sessionId,
+      derivedFrom: ctx.derivedFrom,
       sourceApp: candidate.sourceApp,
+      sourceUri: candidate.sourceUri,
+      occurredAt: candidate.occurredAt,
     });
     if (updated) {
+      out.action = 'supersede';
+      out.factId = updated.id;
+      out.supersededFactId = decision.target_id;
       out.updated = 1;
-      maybePin(decision.target_id);
+      maybePin(updated.id);
       out.importanceAdded += candidate.importance ?? 0;
       return out; // UPDATE replaces ADD; no additional row
     }
@@ -966,9 +1031,13 @@ async function consolidateFactInner(
     // derivedFrom); user path passes 1.0 explicitly.
     trustLevel: candidate.trustLevel,
     sourceApp: candidate.sourceApp,
+    sourceUri: candidate.sourceUri,
+    occurredAt: candidate.occurredAt,
   };
   const added = rememberFact(rememberInput);
   maybePin(added.id);
+  out.action = 'add';
+  out.factId = added.id;
   out.written = 1;
   out.importanceAdded += candidate.importance ?? 0;
   return out;
@@ -1066,10 +1135,11 @@ const PENDING_REFLECTION_MAX_PER_SESSION = 64;
 function storePendingReflectionBatch(input: ReflectionInput, extraction: Extraction, importance: number): void {
   const db = openMemoryDb();
   const now = new Date().toISOString();
+  const expiresAt = new Date(Date.parse(now) + 7 * 24 * 60 * 60 * 1000).toISOString();
   db.prepare(`
     INSERT OR REPLACE INTO reflection_pending_extractions
-      (session_id, call_id, tool, extraction_json, importance, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+      (session_id, call_id, tool, extraction_json, importance, created_at, expires_at, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
   `).run(
     input.sessionId,
     input.callId,
@@ -1077,7 +1147,21 @@ function storePendingReflectionBatch(input: ReflectionInput, extraction: Extract
     JSON.stringify(extraction),
     importance,
     now,
+    expiresAt,
   );
+  try {
+    recordMemoryEpisode({
+      kind: 'tool_result',
+      sourceApp: input.tool ?? null,
+      sessionId: input.sessionId,
+      callId: input.callId,
+      sourceUri: `tool://${input.sessionId}/${input.callId}`,
+      occurredAt: now,
+      content: input.output.slice(0, 2_000),
+      rawRetainedUntil: new Date(Date.parse(now) + 14 * 24 * 60 * 60 * 1000).toISOString(),
+      status: 'pending',
+    });
+  } catch { /* pending extraction remains durable even if episode write fails */ }
   db.prepare(`
     DELETE FROM reflection_pending_extractions
     WHERE session_id = ?
@@ -1139,7 +1223,23 @@ function listPendingReflectionBatches(sessionId: string): PendingReflectionBatch
 
 function clearPendingReflectionBatches(sessionId: string): void {
   const db = openMemoryDb();
-  db.prepare('DELETE FROM reflection_pending_extractions WHERE session_id = ?').run(sessionId);
+  const tx = db.transaction(() => {
+    db.prepare(`
+      UPDATE memory_episodes SET status = CASE
+        WHEN evidence_excerpt IS NOT NULL AND length(evidence_excerpt) > 0 THEN 'available'
+        ELSE 'partial'
+      END
+      WHERE status = 'pending'
+        AND EXISTS (
+          SELECT 1 FROM reflection_pending_extractions rpe
+          WHERE rpe.session_id = ?
+            AND rpe.session_id = memory_episodes.session_id
+            AND rpe.call_id = memory_episodes.call_id
+        )
+    `).run(sessionId);
+    db.prepare('DELETE FROM reflection_pending_extractions WHERE session_id = ?').run(sessionId);
+  });
+  tx();
   updateSessionImportanceSnapshot(sessionId, 0);
 }
 
@@ -1219,6 +1319,18 @@ function mergeCommitStats(into: ReflectionCommitStats, next: ReflectionCommitSta
 
 async function commitExtractionMemory(input: ReflectionInput, extraction: Extraction): Promise<ReflectionCommitStats> {
   const stats = emptyCommitStats();
+  let evidenceEpisodeId: string | undefined;
+  try {
+    evidenceEpisodeId = recordMemoryEpisode({
+      kind: 'tool_result',
+      sourceApp: input.tool ?? null,
+      sessionId: input.sessionId,
+      callId: input.callId,
+      sourceUri: `tool://${input.sessionId}/${input.callId}`,
+      content: input.output.slice(0, 2_000),
+      status: input.output ? 'available' : 'partial',
+    }).id;
+  } catch { /* fact-level evidence capture still retries independently */ }
 
   // Connectors-as-authoritative-writers (Thread 1): classify the producing
   // tool's source category once for this batch. A system of record lifts the
@@ -1281,7 +1393,13 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
       try {
         const subjectId = entityIdByName.get(rel.subject.trim().toLowerCase());
         const objectId = entityIdByName.get(rel.object.trim().toLowerCase());
-        if (subjectId && objectId) recordEntityEdge({ subjectId, predicate: rel.predicate, objectId });
+        if (subjectId && objectId) recordEntityEdge({
+          subjectId,
+          predicate: rel.predicate,
+          objectId,
+          confidence: source?.trust ?? 0.7,
+          evidenceEpisodeId,
+        });
       } catch (err) {
         logger.warn({ err: err instanceof Error ? err.message : String(err), rel }, 'reflection: recordEntityEdge failed');
       }
@@ -1702,13 +1820,15 @@ export async function runRecursiveReflection(
             decision.rewrite && decision.rewrite.length <= CONFLICT_REWRITE_MAX_CHARS
               ? decision.rewrite
               : pattern.text;
-          const updated = updateFact(decision.target_id, {
+          const updated = supersedeFact(decision.target_id, {
             content: rewrite,
             // Recursive patterns are inferences over inferences — keep
             // trust strictly below direct-derived (0.6) so user-stated
             // facts always win on conflict.
             trustLevel: 0.5,
             importance: pattern.importance,
+            derivationDepth: targetDepth,
+            derivedFromFactIds: sourceIds,
           });
           if (updated) {
             result.patternsUpdated += 1;

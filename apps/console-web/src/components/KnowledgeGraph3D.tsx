@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph3D, { type ForceGraphMethods } from 'react-force-graph-3d';
 import { Vector2 } from 'three';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { X, RotateCcw, Maximize2, Search, Sparkles } from 'lucide-react';
-import { getGraph, type GraphNode, type GraphEdge } from '@/lib/memory';
+import { X, RotateCcw, Maximize2, Search, Sparkles, Layers3 } from 'lucide-react';
+import { getGraph, getGraphNeighborhood, type GraphNode, type GraphEdge } from '@/lib/memory';
 import { cn } from '@/lib/cn';
 
 /**
@@ -29,16 +29,18 @@ function hasWebGL(): boolean {
   catch { return false; }
 }
 
-const KIND_COLOR: Record<string, string> = { project: '#FF8A3D', user: '#8FA2FF', feedback: '#FF73B9', reference: '#4FD8C4' };
+const KIND_COLOR: Record<string, string> = { project: '#FF8A3D', user: '#8FA2FF', feedback: '#FF73B9', reference: '#4FD8C4', constraint: '#FF5B5B' };
 const COLOR = {
   kind: '#FF7A1A', entity: '#FFC24B', file: '#6FE0FF', similar: '#B58CFF',
   // WS1 non-fact stores
   'tool-recall': '#7CF5A6', skill: '#FFD166', workflow: '#67B7FF', goal: '#FF6FA8', focus: '#C792EA',
+  resource: '#75E6B1', episode: '#BFA7FF', policy: '#FF6B6B',
 };
-const KIND_LABEL: Record<string, string> = { project: 'Projects', user: 'About you', feedback: 'Feedback', reference: 'Reference' };
+const KIND_LABEL: Record<string, string> = { project: 'Projects', user: 'About you', feedback: 'Feedback', reference: 'Reference', constraint: 'Constraints' };
 const NODE_TYPE_LABEL: Record<string, string> = {
   'tool-recall': 'Tool recall', skill: 'Skill', workflow: 'Workflow', goal: 'Goal', focus: 'Focus',
   entity: 'Person / thing', file: 'File', kind: 'Topic', fact: 'Fact',
+  resource: 'Resource', episode: 'Episode', policy: 'Policy',
 };
 
 const dim = (hex: string, a: number) => {
@@ -57,6 +59,10 @@ const EDGE_BASE: Record<string, (w?: number) => string> = {
   uses: () => dim(COLOR.skill, 0.28),
   pursues: () => dim(COLOR.goal, 0.28),
   related: () => dim(COLOR.entity, 0.4), // stored entity↔entity relations
+  source: () => dim(COLOR.file, 0.35),
+  resource: () => dim(COLOR.resource, 0.35),
+  evidence: () => dim(COLOR.episode, 0.35),
+  governs: () => dim(COLOR.policy, 0.5),
 };
 
 function nodeVal(n: GNode): number {
@@ -68,6 +74,9 @@ function nodeVal(n: GNode): number {
   if (n.type === 'skill') return 7 + Math.min(12, (n.data?.useCount as number) || 0) * 0.4;
   if (n.type === 'tool-recall') return 5 + Math.min(10, (n.data?.successCount as number) || 0) * 0.4;
   if (n.type === 'focus') return 8;
+  if (n.type === 'resource') return 7;
+  if (n.type === 'episode') return 5;
+  if (n.type === 'policy') return 8;
   const imp = n.data?.importance as number | undefined;
   const deg = (n.data?.degree as number) || 0;
   return imp ? 2 + imp * 0.7 : 3 + Math.min(deg, 16) * 0.35;
@@ -86,6 +95,9 @@ const ALL_TYPES = [
   { type: 'fact', label: 'Facts', color: '#FFB98A' },
   { type: 'entity', label: 'People & things', color: COLOR.entity },
   { type: 'file', label: 'Files', color: COLOR.file },
+  { type: 'resource', label: 'Resources', color: COLOR.resource },
+  { type: 'episode', label: 'Episodes', color: COLOR.episode },
+  { type: 'policy', label: 'Policies', color: COLOR.policy },
   { type: 'tool-recall', label: 'Tool recall', color: COLOR['tool-recall'] },
   { type: 'skill', label: 'Skills', color: COLOR.skill },
   { type: 'workflow', label: 'Workflows', color: COLOR.workflow },
@@ -104,12 +116,14 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
 
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error' | 'nowebgl'>('loading');
   const [data, setData] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
-  const [counts, setCounts] = useState({ facts: 0, links: 0, totalFacts: 0 });
+  const [counts, setCounts] = useState({ facts: 0, links: 0, totalFacts: 0, stored: 0, inferred: 0, semantic: 0 });
   const [dims, setDims] = useState({ w: 0, h: height });
 
   // view state
   const [hideType, setHideType] = useState<Set<string>>(new Set());
   const [showSimilar, setShowSimilar] = useState(true);
+  const [showOverlays, setShowOverlays] = useState(false);
+  const [expanding, setExpanding] = useState(false);
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
   const [bloomOn, setBloomOn] = useState(!reduceMotion());
@@ -135,7 +149,8 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
     if (!hasWebGL()) { setStatus('nowebgl'); return; }
     (async () => {
       try {
-        const res = await getGraph({ layout: 'semantic', simEdges: 3, facts: 300, files: 80, entities: 100 });
+        setStatus('loading');
+        const res = await getGraph({ layout: 'semantic', simEdges: showOverlays ? 3 : 0, facts: 300, files: 80, entities: 100, truth: showOverlays ? 'augmented' : 'stored' });
         if (cancelled) return;
         const rawNodes = res.nodes ?? [];
         if (rawNodes.length === 0) { setStatus('empty'); return; }
@@ -152,6 +167,9 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           facts: nodes.filter((n) => n.type === 'fact').length,
           links: links.filter((l) => l.type === 'similar').length,
           totalFacts: res.meta?.totalFacts ?? 0,
+          stored: res.meta?.coverage?.edges?.stored ?? links.filter((link) => link.truth === 'stored').length,
+          inferred: res.meta?.coverage?.edges?.inferred ?? links.filter((link) => link.truth === 'inferred').length,
+          semantic: res.meta?.coverage?.edges?.semantic ?? links.filter((link) => link.truth === 'semantic').length,
         });
         setStatus('ready');
       } catch {
@@ -159,7 +177,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [showOverlays]);
 
   const nodeById = useMemo(() => {
     const m = new Map<string, GNode>();
@@ -178,6 +196,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
   const typeHidden = (t: string) => hideType.has(t);
   const linkEndType = (e: string | GNode) => (typeof e === 'object' ? e.type : nodeById.get(e)?.type);
   const linkVisible = (l: GLink) => {
+    if (l.truth !== 'stored' && !showOverlays) return false;
     if (l.type === 'similar') return showSimilar && (l.weight || 0) >= SIM_THRESHOLD;
     return !typeHidden(linkEndType(l.source) || '') && !typeHidden(linkEndType(l.target) || '');
   };
@@ -292,6 +311,27 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
   const fit = () => { try { fgRef.current?.zoomToFit(700, 60); } catch { /* ignore */ } };
   const reset = () => { clearFocus(); setQuery(''); setHideType(new Set()); setShowSimilar(true); fit(); };
 
+  const expandNeighborhood = async () => {
+    if (!selected) return;
+    setExpanding(true);
+    try {
+      const neighborhood = await getGraphNeighborhood(selected, 2);
+      setData((current) => {
+        if (!current) return current;
+        const nodes = new Map(current.nodes.map((node) => [node.id, node]));
+        for (const node of neighborhood.nodes) if (!nodes.has(node.id)) nodes.set(node.id, { ...node });
+        const links = new Map<string, GLink>();
+        for (const link of current.links) links.set(link.id, {
+          ...link,
+          source: typeof link.source === 'object' ? link.source.id : link.source,
+          target: typeof link.target === 'object' ? link.target.id : link.target,
+        });
+        for (const link of neighborhood.edges) links.set(link.id, { ...link });
+        return { nodes: Array.from(nodes.values()), links: Array.from(links.values()) };
+      });
+    } finally { setExpanding(false); }
+  };
+
   const focusing = !!selected || !!query;
 
   return (
@@ -353,10 +393,16 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
                 </button>
               );
             })}
-            <button type="button" onClick={() => setShowSimilar((v) => !v)}
+            {showOverlays && <button type="button" onClick={() => setShowSimilar((v) => !v)}
               className={cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption backdrop-blur transition-colors cursor-pointer',
                 !showSimilar ? 'border-white/10 bg-black/40 text-white/40 line-through' : 'border-white/15 bg-black/50 text-white/80')}>
               <span className="h-2.5 w-2.5 rounded-full" style={{ background: !showSimilar ? '#666' : COLOR.similar, boxShadow: !showSimilar ? 'none' : `0 0 8px ${COLOR.similar}` }} aria-hidden />Similar links
+            </button>}
+            <button type="button" onClick={() => setShowOverlays((value) => !value)}
+              title="Stored truth is the default; this adds explicitly labeled inferred and semantic overlays."
+              className={cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption backdrop-blur transition-colors cursor-pointer',
+                showOverlays ? 'border-violet-300/50 bg-violet-400/20 text-violet-100' : 'border-white/15 bg-black/50 text-white/80')}>
+              <Layers3 className="h-3.5 w-3.5" aria-hidden /> {showOverlays ? 'Augmented view' : 'Stored truth'}
             </button>
             <div className="ml-1 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/50 px-2.5 py-1 backdrop-blur">
               <Search className="h-3.5 w-3.5 text-white/50" aria-hidden />
@@ -369,7 +415,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
           <div className="absolute right-3 top-3 flex items-center gap-2">
             <span className="rounded-md bg-black/50 px-2 py-1 text-caption text-white/60 backdrop-blur"
               title={counts.totalFacts > counts.facts ? `Showing the ${counts.facts} most relevant of ${counts.totalFacts} facts` : undefined}>
-              {counts.totalFacts > counts.facts ? `${counts.facts} of ${counts.totalFacts}` : counts.facts} facts · {counts.links} links
+              {counts.totalFacts > counts.facts ? `${counts.facts} of ${counts.totalFacts}` : counts.facts} facts · {counts.stored} stored{showOverlays ? ` · ${counts.inferred} inferred · ${counts.semantic} semantic` : ''}
             </span>
             <button type="button" onClick={() => setBloomOn((v) => !v)} aria-label="Toggle glow" title="Toggle glow"
               className={cn('rounded-md border p-1.5 backdrop-blur cursor-pointer', bloomOn ? 'border-amber-300/50 bg-amber-400/20 text-amber-200' : 'border-white/15 bg-black/50 text-white/70 hover:text-white')}>
@@ -414,6 +460,10 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
             {sel.type === 'workflow' && typeof sel.data?.steps === 'number' && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.data.steps as number} steps</span>}
             {sel.connected > 0 && <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] text-white/70">{sel.connected} connected</span>}
           </div>
+          <button type="button" onClick={() => void expandNeighborhood()} disabled={expanding}
+            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-white/20 px-2.5 py-1.5 text-caption text-white/80 hover:bg-white/10 disabled:opacity-50">
+            <Layers3 className="h-3.5 w-3.5" aria-hidden /> {expanding ? 'Expanding…' : 'Expand stored neighborhood'}
+          </button>
         </div>
       )}
     </div>

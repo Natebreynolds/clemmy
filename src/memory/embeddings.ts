@@ -1124,6 +1124,41 @@ export function loadFactEmbeddings(factIds: number[]): Map<number, Float32Array>
   return out;
 }
 
+let activeFactEmbeddingCache: {
+  key: string;
+  vectors: Map<number, Float32Array>;
+} | null = null;
+let activeFactEmbeddingCacheDb: object | null = null;
+
+/** Load the complete active fact-vector set in the current embedding space.
+ * Cached by the DB's semantic generation, provider model, and dimension so
+ * recall does not trade correctness for an updated_at prefilter. */
+export function loadActiveFactEmbeddings(kind?: string): Map<number, Float32Array> {
+  const active = activeEmbeddingSelector();
+  if (!active) return new Map();
+  const db = openMemoryDb();
+  const generation = (db.prepare(
+    'SELECT generation FROM memory_generation WHERE id = 1',
+  ).get() as { generation: number } | undefined)?.generation ?? 0;
+  const key = `${generation}:${active.model}:${active.dim}:${kind ?? '*'}`;
+  if (activeFactEmbeddingCacheDb === db && activeFactEmbeddingCache?.key === key) return activeFactEmbeddingCache.vectors;
+  const rows = db.prepare(`
+    SELECT fe.fact_id AS id, fe.vector AS vector
+    FROM fact_embeddings fe
+    JOIN consolidated_facts cf ON cf.id = fe.fact_id
+    WHERE cf.active = 1
+      ${kind ? 'AND cf.kind = ?' : ''}
+      AND fe.model = ?
+      AND fe.dim = ?
+      AND fe.content_hash = cf.content_hash
+  `).all(...(kind ? [kind] : []), active.model, active.dim) as Array<{ id: number; vector: Buffer }>;
+  const vectors = new Map<number, Float32Array>();
+  for (const row of rows) vectors.set(row.id, bufferToVector(row.vector));
+  activeFactEmbeddingCache = { key, vectors };
+  activeFactEmbeddingCacheDb = db;
+  return vectors;
+}
+
 export interface EmbeddingStats {
   enabled: boolean;
   count: number;

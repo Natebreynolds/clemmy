@@ -1,26 +1,11 @@
 import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, type ConsolidatedFactKind, type ConsolidatedFactRow } from './db.js';
-import { cosine, embedQuery, isEmbeddingsEnabled, loadFactEmbeddings } from './embeddings.js';
+import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings } from './embeddings.js';
 import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendFactRecallTrace } from './recall-trace.js';
-
-/**
- * Floor for the Stanford recall candidate pool. The pool is pre-filtered by
- * `updated_at DESC` but SCORED by the Stanford axis (last_accessed_at +
- * importance + relevance). A small floor (the old 100) silently drops warm,
- * high-importance facts whose CONTENT wasn't recently edited before they can
- * be scored — at audit time 63 of 73 active importance>=7 facts sat past
- * rank 100 by updated_at. 500 matches findSimilarFactsScored's cap and covers
- * the full active set at our scale (~1k facts); a JS sort of 500 stays sub-ms.
- * Widening only — it never reorders the pool, so any fact surfaced today still
- * surfaces. Override via CLEMMY_RECALL_POOL (invalid/empty → 500).
- */
-function recallCandidatePoolFloor(): number {
-  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_RECALL_POOL', '500') || '500', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 500;
-}
+import { captureFactEvidence, getFactEvidence, listMemoryPolicies, type FactEvidence } from './temporal-memory.js';
 
 // ─── Per-turn semantic recall (reuse the turn's query embedding) ───────────
 // The per-turn fact ranking is SYNCHRONOUS, but embedding the query is async.
@@ -117,9 +102,19 @@ export interface ConsolidatedFact {
   // v9 — friendly app name when derived from a system of record
   // (Salesforce/Outlook/Airtable/…). NULL otherwise.
   sourceApp?: string | null;
-  // v11 — how many times this fact has been surfaced into a prompt.
-  // Reinforces recall ranking + decay resistance via log(1+accessCount).
+  // v11 legacy aggregate explicit-use counter. Retained for compatibility;
+  // ranking and decay now use utilityCount/lastUsedAt.
   accessCount?: number;
+  /** Passive render/display count. Never contributes to recall ranking. */
+  impressionCount?: number;
+  /** Confirmed explicit recall/use count. This is the reinforcement signal. */
+  utilityCount?: number;
+  lastUsedAt?: string | null;
+  validFrom?: string | null;
+  validTo?: string | null;
+  supersededByFactId?: number | null;
+  confidence?: number | null;
+  evidence?: FactEvidence[];
 }
 
 export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference', 'constraint'];
@@ -164,6 +159,13 @@ function rowToFact(row: ConsolidatedFactRow): ConsolidatedFact {
     pinned: row.pinned === 1,
     sourceApp: row.source_app ?? null,
     accessCount: row.access_count ?? 0,
+    impressionCount: row.impression_count ?? row.access_count ?? 0,
+    utilityCount: row.utility_count ?? 0,
+    lastUsedAt: row.last_used_at ?? null,
+    validFrom: row.valid_from ?? row.created_at,
+    validTo: row.valid_to ?? null,
+    supersededByFactId: row.superseded_by_fact_id ?? null,
+    confidence: row.confidence ?? row.trust_level ?? null,
   };
 }
 
@@ -205,6 +207,28 @@ export interface RememberInput {
   // v9 — friendly source-app name when this fact was derived from a system
   // of record (set by the reflection loop via classifySource).
   sourceApp?: string;
+  /** Optional durable source locator for imports/manual ingestion. */
+  sourceUri?: string;
+  /** The time the source event occurred; defaults to ingestion time. */
+  occurredAt?: string;
+}
+
+function captureEvidenceBestEffort(fact: ConsolidatedFact, input: RememberInput): void {
+  try {
+    captureFactEvidence({
+      factId: fact.id,
+      factContent: fact.content,
+      sourceApp: input.sourceApp ?? null,
+      sourcePath: input.sourceUri ?? input.path ?? null,
+      sessionId: input.derivedFrom?.sessionId ?? input.sessionId ?? null,
+      callId: input.derivedFrom?.callId ?? null,
+      tool: input.derivedFrom?.tool ?? null,
+      occurredAt: input.occurredAt ?? fact.createdAt,
+    });
+  } catch {
+    // Evidence durability is best-effort at the write boundary. The bounded
+    // maintenance backfill retries and health reports any missing source.
+  }
 }
 
 /**
@@ -262,6 +286,7 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
           -- Bias toward higher trust when conflicting writes arrive:
           -- user-stated (1.0) supersedes derived (0.6).
           trust_level             = MAX(COALESCE(trust_level, 0), ?),
+          confidence              = MAX(COALESCE(confidence, 0), ?),
           extracted_at            = COALESCE(extracted_at, ?),
           -- Importance MAX-merges too: a fact that was first derived
           -- as importance=4 but later restated with importance=8
@@ -275,10 +300,11 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
           pinned                   = MAX(pinned, ?)
       WHERE id = ?
     `).run(now, input.sessionId ?? null, input.path ?? null,
-           dfSession, dfCall, dfTool, trust, extractedAt, importance, input.sourceApp ?? null, autoPin, existing.id);
+           dfSession, dfCall, dfTool, trust, trust, extractedAt, importance, input.sourceApp ?? null, autoPin, existing.id);
     const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
       .get(existing.id) as ConsolidatedFactRow;
     const updatedFact = rowToFact(refreshed);
+    captureEvidenceBestEffort(updatedFact, input);
     emitSemanticFactUpserted(updatedFact, 'update');
     return updatedFact;
   }
@@ -294,16 +320,19 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
        score, active, created_at, updated_at,
        derived_from_session_id, derived_from_call_id, derived_from_tool,
        trust_level, extracted_at, importance,
-       derivation_depth, derived_from_fact_ids, source_app, pinned)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       derivation_depth, derived_from_fact_ids, source_app, pinned,
+       valid_from, confidence)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(input.kind, content, hash, input.sessionId ?? null, input.path ?? null,
          initialScore, now, now,
          dfSession, dfCall, dfTool, trust, extractedAt, importance,
-         derivationDepth, derivedFromIdsJson, input.sourceApp ?? null, autoPin);
+         derivationDepth, derivedFromIdsJson, input.sourceApp ?? null, autoPin,
+         input.occurredAt ?? now, trust);
 
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;
   const insertedFact = rowToFact(inserted);
+  captureEvidenceBestEffort(insertedFact, input);
   emitSemanticFactUpserted(insertedFact, 'insert');
   return insertedFact;
 }
@@ -321,23 +350,37 @@ function emitSemanticFactUpserted(fact: ConsolidatedFact, mutation: 'insert' | '
   });
 }
 
-/**
- * Touch the last_accessed_at column on a fact whenever the agent
- * retrieves it. Stanford §4.1 anchors recency decay on THIS column,
- * not creation: recall-decay shifts when a fact is re-surfaced.
- *
- * Best-effort: a missing row is a no-op. Callers (memory_search,
- * memory_recall) fire this in a loop over their result set without
- * awaiting individual completions.
- */
-export function touchFactAccess(id: number): void {
+/** Record passive exposure only. Impressions deliberately do not update the
+ * recency anchor or ranking signal, preventing a rich-get-richer prompt loop. */
+export function recordFactImpression(id: number): void {
   try {
     const db = openMemoryDb();
-    db.prepare('UPDATE consolidated_facts SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?')
-      .run(new Date().toISOString(), id);
+    db.prepare('UPDATE consolidated_facts SET impression_count = impression_count + 1 WHERE id = ?').run(id);
   } catch {
     // ignore
   }
+}
+
+/** Record an explicit/on-demand selection as useful. This is the only recall
+ * reinforcement signal used by ranking. `access_count` is retained as a
+ * backwards-compatible aggregate audit counter. */
+export function recordFactUtility(id: number): void {
+  try {
+    const now = new Date().toISOString();
+    openMemoryDb().prepare(`
+      UPDATE consolidated_facts
+      SET last_used_at = ?, last_accessed_at = ?,
+          utility_count = utility_count + 1,
+          access_count = access_count + 1
+      WHERE id = ?
+    `).run(now, now, id);
+  } catch { /* best effort */ }
+}
+
+/** @deprecated Use recordFactUtility for explicit use or
+ * recordFactImpression for automatic rendering. */
+export function touchFactAccess(id: number): void {
+  recordFactUtility(id);
 }
 
 /**
@@ -395,6 +438,44 @@ export function updateFact(
   return rowToFact(refreshed);
 }
 
+/** Temporal UPDATE: preserve the old claim, add the new claim, and connect the
+ * validity chain. Used by conflict resolution and user edits; metadata-only
+ * maintenance can continue to use updateFact. */
+export function supersedeFact(
+  id: number,
+  input: Omit<RememberInput, 'kind'> & { content: string },
+): ConsolidatedFact | null {
+  const db = openMemoryDb();
+  const existingRow = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
+    .get(id) as ConsolidatedFactRow | undefined;
+  if (!existingRow) return null;
+  const existing = rowToFact(existingRow);
+  const replacement = rememberFact({
+    ...input,
+    kind: existing.kind,
+    trustLevel: input.trustLevel ?? existing.trustLevel ?? undefined,
+    importance: input.importance ?? existing.importance ?? undefined,
+  });
+  if (replacement.id === existing.id) return replacement;
+  const now = new Date().toISOString();
+  // The replacement's occurrence time is the semantic boundary when one was
+  // supplied (for example an imported correction learned after the fact).
+  // Falling back to ingestion time preserves the ordinary live-edit behavior.
+  const boundary = replacement.validFrom ?? now;
+  const tx = db.transaction(() => {
+    db.prepare(`
+      UPDATE consolidated_facts
+      SET active = 0, valid_to = ?, superseded_by_fact_id = ?, updated_at = ?
+      WHERE id = ?
+    `).run(boundary, replacement.id, now, existing.id);
+    if (existing.pinned) {
+      db.prepare('UPDATE consolidated_facts SET pinned = 1 WHERE id = ?').run(replacement.id);
+    }
+  });
+  tx();
+  return getFact(replacement.id);
+}
+
 /**
  * Demote a depth-0 atom that has been ROLLED UP into a higher-order synthesized
  * fact (recursive reflection): clamp its importance DOWN into the decay-eligible
@@ -448,7 +529,7 @@ export function deleteFact(id: number): boolean {
  * The load-bearing reversibility primitive: soft-delete (active=0) keeps the
  * row, embedding, and provenance intact, but until now there was no way back —
  * a forgotten or auto-decayed fact was stranded. This restores it. It also
- * refreshes last_accessed_at so the just-restored fact is NOT immediately
+ * refreshes last_used_at so the just-restored fact is NOT immediately
  * idle-eligible for re-decay on the next hygiene pass (the user explicitly
  * brought it back — that counts as an access). Idempotent: a no-op on an
  * already-active fact returns false (no rows changed).
@@ -457,8 +538,8 @@ export function reactivateFact(id: number): boolean {
   const db = openMemoryDb();
   const now = new Date().toISOString();
   const info = db.prepare(
-    'UPDATE consolidated_facts SET active = 1, updated_at = ?, last_accessed_at = ? WHERE id = ? AND active = 0',
-  ).run(now, now, id);
+    'UPDATE consolidated_facts SET active = 1, updated_at = ?, last_accessed_at = ?, last_used_at = ? WHERE id = ? AND active = 0',
+  ).run(now, now, now, id);
   return info.changes > 0;
 }
 
@@ -506,24 +587,11 @@ export async function findSimilarFactsScored(
   // Semantic path — cosine over the embedded fact pool.
   if (isEmbeddingsEnabled()) {
     try {
-      // Cap the candidate pool so we never load every embedding on a
-      // large vault. Most-recently-updated facts are the relevant
-      // contradiction targets. Load stored vectors before embedding the
-      // query; fresh installs often have facts but no fact_embeddings yet,
-      // and making a network call just to discover an empty comparison
-      // pool adds latency without improving recall.
-      // Same env-driven pool floor as listActiveFacts (CLEMMY_RECALL_POOL,
-      // default 500) so this semantic-recall path — which backs both
-      // memory_search_facts and the dedup/conflict resolver — widens together
-      // and stops pre-filtering high-importance facts out by updated_at before
-      // they're ever cosine-scored. Widening only; updated_at stays the
-      // tiebreaker so today's top-K never reorders.
-      const pool = recallCandidatePoolFloor();
-      const poolRows = (options.kind
-        ? db.prepare(`SELECT id FROM consolidated_facts WHERE active = 1 AND kind = ? ORDER BY updated_at DESC LIMIT ${pool}`).all(options.kind)
-        : db.prepare(`SELECT id FROM consolidated_facts WHERE active = 1 ORDER BY updated_at DESC LIMIT ${pool}`).all()) as { id: number }[];
-      const ids = poolRows.map((r) => r.id);
-      const vectors = loadFactEmbeddings(ids);
+      // Full-pool semantic search. The vectors are generation-cached in the
+      // active provider space, so tail facts are never discarded by recency
+      // before cosine relevance is computed.
+      const vectors = loadActiveFactEmbeddings(options.kind);
+      const ids = Array.from(vectors.keys());
       if (vectors.size > 0) {
         const queryVector = await embedQuery(normalized);
         if (queryVector) {
@@ -575,7 +643,6 @@ export async function findSimilarFactsScored(
     WHERE active = 1
       ${options.kind ? 'AND kind = ?' : ''}
       AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
-    LIMIT 200
   `).all(...(options.kind ? [options.kind] : []), ...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
 
   // Score by token-occurrence count, return top-K. No cosine available on
@@ -636,7 +703,6 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
       WHERE active = 1
         AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
       ORDER BY updated_at DESC
-      LIMIT 200
     `).all(...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
     const scored = matches.map((row) => {
       const lc = row.content.toLowerCase();
@@ -645,6 +711,40 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
     });
     scored.sort((a, b) => b.hits - a.hits || (b.row.updated_at || '').localeCompare(a.row.updated_at || ''));
     return scored.slice(0, Math.max(1, limit)).map((s) => rowToFact(s.row));
+  } catch {
+    return [];
+  }
+}
+
+/** Lexical fact retrieval at a historical point in time. Unlike the live
+ * search, this deliberately includes inactive superseded rows whose validity
+ * interval contains `asOf`, while excluding claims that had not started yet. */
+export function searchFactsByTextAt(query: string, asOf: string, limit = 5): ConsolidatedFact[] {
+  const normalized = normalizeContent(query);
+  const atMs = Date.parse(asOf);
+  if (!normalized || !Number.isFinite(atMs)) return [];
+  const tokens = normalized
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 3 && !FACT_QUERY_STOPWORDS.has(token))
+    .slice(0, 12);
+  if (tokens.length === 0) return [];
+  const at = new Date(atMs).toISOString();
+  try {
+    const rows = openMemoryDb().prepare(`
+      SELECT * FROM consolidated_facts
+      WHERE COALESCE(valid_from, created_at) <= ?
+        AND (valid_to IS NULL OR valid_to > ?)
+        AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
+    `).all(at, at, ...tokens.map((token) => `%${token}%`)) as ConsolidatedFactRow[];
+    return rows
+      .map((row) => ({
+        row,
+        hits: tokens.reduce((sum, token) => sum + (row.content.toLowerCase().includes(token) ? 1 : 0), 0),
+      }))
+      .sort((a, b) => b.hits - a.hits || (b.row.valid_from ?? b.row.created_at).localeCompare(a.row.valid_from ?? a.row.created_at))
+      .slice(0, Math.max(1, limit))
+      .map(({ row }) => rowToFact(row));
   } catch {
     return [];
   }
@@ -762,10 +862,8 @@ export function listRecentlyLearnedFacts(options: { sinceHours?: number; limit?:
  */
 const STANFORD_RECENCY_DECAY_RATE = -Math.log(0.995); // ≈ 0.00501
 
-// Access-frequency reinforcement weight. log1p(access_count) is bounded and
-// gentle (0 accesses → 0, 1 → 0.69, 10 → 0.24·w, 50 → 0.39·w at w=0.1), so a
-// repeatedly-useful fact rises in recall AND clears the decay score-floor more
-// easily, while a never-recalled fact is unchanged. Tunable via
+// Utility reinforcement weight. Passive prompt impressions never contribute;
+// only explicit retrieval/use increments utility_count. Tunable via
 // CLEMMY_RECALL_REINFORCEMENT_WEIGHT (0 disables — byte-identical to before).
 function recallReinforcementWeight(): number {
   const raw = Number.parseFloat(getRuntimeEnv('CLEMMY_RECALL_REINFORCEMENT_WEIGHT', '0.1') || '0.1');
@@ -773,7 +871,7 @@ function recallReinforcementWeight(): number {
 }
 
 export function stanfordRecallScore(fact: ConsolidatedFact, nowMs: number = Date.now()): number {
-  const accessIso = fact.lastAccessedAt || fact.extractedAt || fact.updatedAt || fact.createdAt;
+  const accessIso = fact.lastUsedAt || fact.extractedAt || fact.updatedAt || fact.createdAt;
   const accessedAtMs = Date.parse(accessIso);
   const hoursSince = Number.isFinite(accessedAtMs)
     ? Math.max(0, (nowMs - accessedAtMs) / 3_600_000)
@@ -782,7 +880,7 @@ export function stanfordRecallScore(fact: ConsolidatedFact, nowMs: number = Date
   const importance = (typeof fact.importance === 'number' ? fact.importance : 5.0) / 10;
   // Reinforcement: a fact recalled many times is proven useful — promote it and
   // help it resist decay. log1p keeps it bounded so it never dominates recency.
-  const reinforcement = recallReinforcementWeight() * Math.log1p(Math.max(0, fact.accessCount ?? 0));
+  const reinforcement = recallReinforcementWeight() * Math.log1p(Math.max(0, fact.utilityCount ?? 0));
   return recency + importance + reinforcement;
 }
 
@@ -938,26 +1036,18 @@ export function listActiveFacts(options: {
   const objective = options.objective?.trim();
 
   if (ranking === 'stanford') {
-    // Over-fetch then sort in JS by Stanford recall score. Keeps the
-    // SQL simple — at our vault size (low thousands of facts) this is
-    // negligible. The pool is pre-filtered by updated_at but scored on a
-    // DIFFERENT axis (last_accessed_at + importance), so the floor must be
-    // wide enough that warm high-importance facts aren't dropped before
-    // scoring — see recallCandidatePoolFloor().
-    const candidatePool = Math.max(limit * 5, recallCandidatePoolFloor());
+    // Score the complete active set. At personal-memory scale (low thousands)
+    // the JS sort is cheap and, unlike the former updated_at pool, cannot make
+    // old but relevant facts unreachable.
     const rows = options.kind
       ? db.prepare(`
           SELECT * FROM consolidated_facts
           WHERE active = 1 AND kind = ?
-          ORDER BY updated_at DESC
-          LIMIT ?
-        `).all(options.kind, candidatePool) as ConsolidatedFactRow[]
+        `).all(options.kind) as ConsolidatedFactRow[]
       : db.prepare(`
           SELECT * FROM consolidated_facts
           WHERE active = 1
-          ORDER BY updated_at DESC
-          LIMIT ?
-        `).all(candidatePool) as ConsolidatedFactRow[];
+        `).all() as ConsolidatedFactRow[];
     const now = Date.now();
     const scoreOf = objective
       ? (fact: ConsolidatedFact) => scopedRecallScore(fact, objective, now)
@@ -966,7 +1056,7 @@ export function listActiveFacts(options: {
     // when the harness stashed a turn query embedding. Loaded once for the whole
     // candidate pool (sync DB read). No vector / flag off → s is unchanged.
     const queryVec = semanticRecallEnabled() ? getActiveTurnQueryVector(now) : null;
-    const factVectors = queryVec ? loadFactEmbeddings(rows.map((r) => r.id)) : null;
+    const factVectors = queryVec ? loadActiveFactEmbeddings(options.kind) : null;
     const wSem = semanticRecallWeight();
     return rows
       .map(rowToFact)
@@ -1013,6 +1103,12 @@ export function getFact(id: number): ConsolidatedFact | null {
   const db = openMemoryDb();
   const row = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?').get(id) as ConsolidatedFactRow | undefined;
   return row ? rowToFact(row) : null;
+}
+
+export function getFactWithEvidence(id: number): ConsolidatedFact | null {
+  const fact = getFact(id);
+  if (!fact) return null;
+  return { ...fact, evidence: getFactEvidence(id) };
 }
 
 /**
@@ -1099,8 +1195,10 @@ export function listConstraints(limit?: number): ConsolidatedFact[] {
 // rendered block. Together they replace the old hard count of 12 that silently
 // evicted genuine user rules; importance-first ordering means overflow sheds the
 // least-important, and the render signals any elision.
-const PINNED_RUNAWAY_CAP = 64;
-const PINNED_SECTION_BUDGET = 2400;
+const POLICY_RUNAWAY_CAP = 256;
+const HARD_CONSTRAINT_SUMMARY_BUDGET = 1000;
+const CORE_PROFILE_BUDGET = 1400;
+const STANDING_PREFERENCE_BUDGET = 1000;
 
 export function renderFactsForInstructions(
   limit = 10,
@@ -1146,26 +1244,24 @@ export function renderFactsForInstructions(
   // silent count cap). Closes MEM-INJ-1: real user safety rules were evicted from
   // the "always apply" block by harness-synthetic auto-pins under the old 12-cap.
   let pinned: ConsolidatedFact[] = [];
+  let policyTypeByFactId = new Map<number, 'hard_constraint' | 'core_profile' | 'standing_preference'>();
   try {
-    pinned = listPinnedFacts(PINNED_RUNAWAY_CAP);
+    const policies = listMemoryPolicies().slice(0, POLICY_RUNAWAY_CAP);
+    policyTypeByFactId = new Map(policies.map((policy) => [policy.fact_id, policy.policy_type]));
+    pinned = policies.map((policy) => getFact(policy.fact_id)).filter((fact): fact is ConsolidatedFact => Boolean(fact));
   } catch {
-    pinned = [];
+    // v14/partially migrated fallback: keep prompt assembly available.
+    try { pinned = listPinnedFacts(POLICY_RUNAWAY_CAP); } catch { pinned = []; }
+    policyTypeByFactId = new Map(pinned.map((fact) => [
+      fact.id,
+      fact.kind === 'constraint' ? 'hard_constraint' : fact.kind === 'user' ? 'core_profile' : 'standing_preference',
+    ]));
   }
   const pinnedIds = new Set(pinned.map((f) => f.id));
   const renderPinned = mode !== 'scored';
   const scored = mode === 'pinned' ? [] : facts.filter((f) => !pinnedIds.has(f.id));
 
   if ((!renderPinned || pinned.length === 0) && scored.length === 0) return '';
-
-  // Touch last_accessed for every fact we're about to EXPOSE to the model (the
-  // act of rendering = an access in Stanford's framework). Pinned facts we
-  // fetched only to filter (mode 'scored') are NOT exposed, so don't touch them.
-  // NON-CRITICAL recency bookkeeping — must NEVER break prompt assembly.
-  try {
-    for (const fact of [...(renderPinned ? pinned : []), ...scored]) touchFactAccess(fact.id);
-  } catch {
-    // recency anchor will just be slightly stale — never a turn-breaker.
-  }
 
   // Pinned standing instructions are EXEMPT from the char cap — they're the
   // user's durable rules and must NEVER be silently cut (they're already
@@ -1178,15 +1274,51 @@ export function renderFactsForInstructions(
   // elision (same primitive as the scored tail) so a dropped rule is never
   // silent and the least-important is what's shed.
   let pinnedSection = '';
+  const renderedPolicyFacts: ConsolidatedFact[] = [];
   if (renderPinned && pinned.length > 0) {
-    const header = '**Standing instructions (always apply)**';
-    const body = pinned.map((fact) => `- ${fact.content}`).join('\n');
-    if (body.length <= PINNED_SECTION_BUDGET) {
-      pinnedSection = `${header}\n${body}`;
-    } else {
-      pinnedSection = `${header}\n${clipToLineBoundary(body, PINNED_SECTION_BUDGET)}`
-        + '\n_… more standing instructions elided to fit (importance-ranked); call memory_search_facts to widen._';
-    }
+    const totalPolicyBudget = mode === 'pinned' ? maxChars : Math.min(maxChars, 1600);
+    const hardBudget = Math.min(HARD_CONSTRAINT_SUMMARY_BUDGET, Math.floor(totalPolicyBudget * 0.40));
+    const coreBudget = Math.min(CORE_PROFILE_BUDGET, Math.floor(totalPolicyBudget * 0.35));
+    const preferenceBudget = Math.min(STANDING_PREFERENCE_BUDGET, Math.max(160, totalPolicyBudget - hardBudget - coreBudget));
+    const groups = {
+      hard_constraint: pinned.filter((f) => policyTypeByFactId.get(f.id) === 'hard_constraint'),
+      core_profile: pinned.filter((f) => policyTypeByFactId.get(f.id) === 'core_profile'),
+      standing_preference: pinned
+        .filter((f) => policyTypeByFactId.get(f.id) === 'standing_preference')
+        .sort((a, b) => objective
+          ? lexicalRelevance(objective, b.content) - lexicalRelevance(objective, a.content)
+          : (b.importance ?? 5) - (a.importance ?? 5)),
+    };
+    const renderGroup = (title: string, group: ConsolidatedFact[], budget: number, suffix: (omitted: number) => string): string => {
+      if (group.length === 0) return '';
+      const lines: string[] = [];
+      let used = 0;
+      for (const fact of group) {
+        const line = `- ${fact.content}`;
+        if (used + line.length + 1 > budget) break;
+        lines.push(line);
+        renderedPolicyFacts.push(fact);
+        used += line.length + 1;
+      }
+      const omitted = group.length - lines.length;
+      return [`**${title}**`, ...lines, omitted > 0 ? suffix(omitted) : ''].filter(Boolean).join('\n');
+    };
+    pinnedSection = [
+      renderGroup(
+        'Hard constraints (enforced at dispatch)', groups.hard_constraint, hardBudget,
+        (n) => `_… ${n} more constraint${n === 1 ? '' : 's'} omitted from this summary but still enforced._`,
+      ),
+      renderGroup(
+        'Core profile', groups.core_profile, coreBudget,
+        (n) => `_… ${n} more core-profile item${n === 1 ? '' : 's'} omitted; call memory_recall_all to widen._`,
+      ),
+      renderGroup(
+        objective ? 'Standing preferences relevant to this objective' : 'Standing preferences',
+        groups.standing_preference, preferenceBudget,
+        (n) => `_… ${n} more standing preference${n === 1 ? '' : 's'} available through memory_recall_all._`,
+      ),
+    ].filter(Boolean).join('\n\n');
+    pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${pinned.length} shown; all ${groups.hard_constraint.length} hard constraints remain dispatch-enforced._`;
   }
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {
@@ -1219,13 +1351,23 @@ export function renderFactsForInstructions(
     if (scoredBlock) scoredBlock += '\n_… more facts elided to fit; call memory_search_facts to widen._';
   }
 
+  // Count only facts that actually survived policy/scored clipping and were
+  // exposed to the model. Merely considering an omitted candidate is not an
+  // impression and must never affect its audit counters.
+  const renderedScoredFacts = scored.filter((fact) => scoredBlock.includes(fact.content));
+  try {
+    for (const fact of [...renderedPolicyFacts, ...renderedScoredFacts]) recordFactImpression(fact.id);
+  } catch {
+    // Prompt assembly is fail-open; observability must never break a turn.
+  }
+
   appendFactRecallTrace({
     surface: 'facts_for_instructions',
     objective,
     mode,
     facts: [
-      ...(renderPinned ? pinned.filter((fact) => pinnedSection.includes(fact.content)).map((fact) => ({ fact, reason: 'pinned-standing-instruction' })) : []),
-      ...scored.filter((fact) => scoredBlock.includes(fact.content)).map((fact) => ({ fact, reason: objective ? 'scored-stanford-objective' : 'scored-stanford-global' })),
+      ...(renderPinned ? renderedPolicyFacts.map((fact) => ({ fact, reason: `policy:${policyTypeByFactId.get(fact.id) ?? 'standing'}` })) : []),
+      ...renderedScoredFacts.map((fact) => ({ fact, reason: objective ? 'scored-stanford-objective' : 'scored-stanford-global' })),
     ],
   });
 
@@ -1352,7 +1494,7 @@ export interface DecayResult {
 export function importanceAwareIdleThresholdDays(fact: ConsolidatedFact, baseIdleDays: number): number {
   const importance = typeof fact.importance === 'number' ? fact.importance : 5;
   const importanceFactor = 0.5 + importance / 10;
-  const accessFactor = 1 + 0.5 * Math.log1p(Math.max(0, fact.accessCount ?? 0));
+  const accessFactor = 1 + 0.5 * Math.log1p(Math.max(0, fact.utilityCount ?? 0));
   return baseIdleDays * importanceFactor * accessFactor;
 }
 
@@ -1390,22 +1532,22 @@ export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
       SELECT * FROM consolidated_facts
       WHERE active = 1
         AND pinned = 0
-        AND COALESCE(last_accessed_at, extracted_at, updated_at, created_at) < ?
-      ORDER BY COALESCE(last_accessed_at, updated_at, created_at) ASC
+        AND COALESCE(last_used_at, extracted_at, updated_at, created_at) < ?
+      ORDER BY COALESCE(last_used_at, updated_at, created_at) ASC
       LIMIT ?
     `).all(minCutoff, maxDeactivate * 8) as ConsolidatedFactRow[];
     for (const row of rows) {
       result.scanned += 1;
       if (result.deactivated >= maxDeactivate) break;
       const fact = rowToFact(row);
-      const anchorIso = fact.lastAccessedAt || fact.extractedAt || fact.updatedAt || fact.createdAt;
+      const anchorIso = fact.lastUsedAt || fact.extractedAt || fact.updatedAt || fact.createdAt;
       const idleDays = (nowMs - Date.parse(anchorIso)) / (24 * 60 * 60 * 1000);
       const threshold = importanceAwareIdleThresholdDays(fact, minIdleDays);
       if (!(idleDays >= threshold)) continue;
       if (deleteFact(fact.id)) {
         result.deactivated += 1;
         result.ids.push(fact.id);
-        result.reasons.push(`#${fact.id} imp:${fact.importance ?? 5} idle:${idleDays.toFixed(0)}d/${threshold.toFixed(0)}d acc:${fact.accessCount ?? 0}`);
+        result.reasons.push(`#${fact.id} imp:${fact.importance ?? 5} idle:${idleDays.toFixed(0)}d/${threshold.toFixed(0)}d utility:${fact.utilityCount ?? 0}`);
       }
     }
     return result;
@@ -1418,9 +1560,9 @@ export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
     SELECT * FROM consolidated_facts
     WHERE active = 1
       AND pinned = 0
-      AND COALESCE(last_accessed_at, extracted_at, updated_at, created_at) < ?
+      AND COALESCE(last_used_at, extracted_at, updated_at, created_at) < ?
       AND COALESCE(importance, 5) <= ?
-    ORDER BY COALESCE(last_accessed_at, updated_at, created_at) ASC
+    ORDER BY COALESCE(last_used_at, updated_at, created_at) ASC
     LIMIT ?
   `).all(idleCutoff, importanceCeil, maxDeactivate * 4) as ConsolidatedFactRow[];
 

@@ -1,12 +1,22 @@
-import { apiGet, apiPost } from './api';
+import { apiGet, apiPatch, apiPost } from './api';
 
 export interface Fact {
   id: number | string;
-  kind: 'user' | 'project' | 'feedback' | 'reference';
+  kind: 'user' | 'project' | 'feedback' | 'reference' | 'constraint';
   content: string;
   importance?: number | null;
   updatedAt?: string;
   pinned?: boolean;
+  active?: boolean;
+  createdAt?: string;
+  confidence?: number | null;
+  validFrom?: string | null;
+  validTo?: string | null;
+  supersededByFactId?: number | null;
+  impressionCount?: number;
+  utilityCount?: number;
+  evidence?: Array<{ episodeId: string; excerpt: string; sourceUri?: string; occurredAt?: string; status?: string }>;
+  policy?: { policy_type: 'hard_constraint' | 'core_profile' | 'standing_preference'; enforcement: 'dispatch' | 'prompt'; priority: number } | null;
 }
 
 export interface Goal {
@@ -38,10 +48,11 @@ export const FACT_KINDS: { key: Fact['kind']; label: string }[] = [
   { key: 'project', label: 'Projects' },
   { key: 'feedback', label: 'Preferences' },
   { key: 'reference', label: 'Reference' },
+  { key: 'constraint', label: 'Constraints' },
 ];
 
-export const listFacts = (kind?: Fact['kind'], limit = 80) =>
-  apiGet<{ facts: Fact[] }>(`/api/console/memory/facts?${kind ? `kind=${kind}&` : ''}limit=${limit}`);
+export const listFacts = (kind?: Fact['kind'], limit = 80, includeInactive = false) =>
+  apiGet<{ facts: Fact[] }>(`/api/console/memory/facts?${kind ? `kind=${kind}&` : ''}limit=${limit}${includeInactive ? '&includeInactive=1' : ''}`);
 
 export const forgetFact = (id: Fact['id']) =>
   apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/forget`);
@@ -53,6 +64,9 @@ export const pinFact = (id: Fact['id'], pinned = true) =>
  *  undo half of every reversible memory action — 30-day window. */
 export const restoreFact = (id: Fact['id']) =>
   apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/restore`);
+
+export const updateFact = (id: Fact['id'], patch: { content?: string; importance?: number }) =>
+  apiPatch<{ ok: boolean; fact: Fact; supersededFactId?: number | null }>(`/api/console/memory/facts/${encodeURIComponent(String(id))}`, patch);
 
 /** A core context file Clementine reads every turn (SOUL/IDENTITY/MEMORY/working). */
 export interface ContextFile {
@@ -67,9 +81,19 @@ export interface ContextFile {
 export const getContext = () =>
   apiGet<{ profile?: UserProfile; goals?: Goal[]; files?: ContextFile[] }>('/api/console/context');
 
-export interface MemoryHit { filePath: string; title: string; snippet: string; score: number }
+export interface MemoryHit {
+  ref: { type: 'fact' | 'entity' | 'resource' | 'episode' | 'note' | 'procedure' | 'policy'; id: string | number };
+  title?: string;
+  text: string;
+  score: number;
+  confidence: number;
+  evidence: Array<{ episodeId: string; excerpt: string; sourceUri?: string }>;
+  whyRecalled: string[];
+  validFrom?: string;
+  validTo?: string;
+}
 export const searchMemory = (q: string) =>
-  apiGet<{ query: string; hits: MemoryHit[] }>(`/api/console/memory/search?q=${encodeURIComponent(q)}`);
+  apiGet<{ query: string; hits: MemoryHit[]; answerability: 'supported' | 'partial' | 'insufficient'; diagnostics: { candidates: number; stores: string[]; elapsedMs: number } }>(`/api/console/memory/search-all?q=${encodeURIComponent(q)}`);
 
 export interface VaultFile { path: string; chunks: number; mtime: number; byteSize: number }
 export const getMemoryFiles = () =>
@@ -112,6 +136,13 @@ export interface MemoryHealth {
     chunkEmbeds?: number;
   };
   recall?: { calls?: number; hits?: number; empties?: number; hitRate?: number };
+  reliability?: {
+    evidenceLinked?: number; brokenEvidence?: number; missingEpisodes?: number;
+    pendingReflections?: number; oldestPending?: string | null; unreachableFacts?: number;
+    impressions?: number; utility?: number;
+    policies?: Record<string, number>;
+    relationships?: Record<string, number>;
+  };
 }
 export const getMemoryHealth = () => apiGet<MemoryHealth>('/api/console/memory/health');
 
@@ -131,7 +162,7 @@ export interface SourcePointer { id: number | string; app: string; kind?: string
 export const getSourceMap = () => apiGet<{ enabled?: boolean; count?: number; pointers?: SourcePointer[] }>('/api/console/memory/source-map');
 
 export interface GraphNode { id: string; label: string; type: string; data?: Record<string, unknown> }
-export interface GraphEdge { id: string; source: string; target: string; type: string; weight?: number; inferred?: boolean; label?: string }
+export interface GraphEdge { id: string; source: string; target: string; type: string; weight?: number; inferred?: boolean; label?: string; truth: 'stored' | 'inferred' | 'semantic'; data?: Record<string, unknown> }
 export interface GraphMeta {
   factCount?: number; totalFacts?: number; fileCount?: number; kindCount?: number; entityCount?: number; edgeCount?: number;
   semantic?: boolean;
@@ -139,12 +170,15 @@ export interface GraphMeta {
   stores?: { toolRecall?: number; skills?: number; workflows?: number; goals?: number; focus?: number };
   semanticEdges?: { enabled: boolean; requested: number; threshold: number; cap: number; count: number; embeddedFacts: number; skippedNoEmbedding: number };
   clustering?: { mode: string; clusters: number };
+  truthMode?: 'stored' | 'augmented';
+  coverage?: { totals?: Record<string, number>; visible?: Record<string, number>; edges?: { stored: number; inferred: number; semantic: number } };
 }
 export interface GraphResponse { nodes: GraphNode[]; edges: GraphEdge[]; meta?: GraphMeta }
 export interface GraphParams {
   layout?: 'semantic';
   simEdges?: number; simThreshold?: number; simCap?: number;
   facts?: number; files?: number; entities?: number;
+  truth?: 'stored' | 'augmented';
 }
 /**
  * Fetch the memory graph. Called with no args → the bare URL (byte-compatible
@@ -160,9 +194,12 @@ export const getGraph = (params?: GraphParams) => {
   if (params?.facts != null) qs.set('facts', String(params.facts));
   if (params?.files != null) qs.set('files', String(params.files));
   if (params?.entities != null) qs.set('entities', String(params.entities));
+  if (params?.truth) qs.set('truth', params.truth);
   const q = qs.toString();
   return apiGet<GraphResponse>(`/api/console/memory/graph${q ? `?${q}` : ''}`);
 };
+export const getGraphNeighborhood = (nodeId: string, depth: 1 | 2 = 1) =>
+  apiGet<GraphResponse>(`/api/console/memory/neighborhood?nodeId=${encodeURIComponent(nodeId)}&depth=${depth}`);
 
 // ─── Memory import (other agents' memory stores → Clementine facts) ─────────
 export interface ImportSource { path: string; label: string; fileCount: number }

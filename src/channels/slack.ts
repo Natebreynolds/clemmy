@@ -26,7 +26,8 @@ import { createGoalFromDraft, dismissGoalDraft, getGoalDraft, listGoalDrafts } f
 import { answerCheckIn, getCheckIn, listOpenCheckIns } from '../agents/check-ins.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { queueBackgroundTaskApprovalResolution, listBackgroundTasks, createBackgroundTask } from '../execution/background-tasks.js';
-import { rememberFact, getMemoryHealthSummary } from '../memory/facts.js';
+import { getMemoryHealthSummary } from '../memory/facts.js';
+import { consolidateFact } from '../memory/reflection.js';
 import { getNotification, markNotificationRead, requeueNotificationDelivery } from '../runtime/notifications.js';
 import { buildActivitySnapshot, formatElapsed, formatNextRun, type RunningNowItem } from '../shared/activity-snapshot.js';
 import { actionBus } from '../runtime/action-bus.js';
@@ -1120,7 +1121,13 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
         const text = (await fetchText()).trim();
         if (!text) return;
         try {
-          rememberFact({ kind: 'user', content: text });
+          await consolidateFact({
+            kind: 'user',
+            text,
+            trustLevel: 1,
+            sourceApp: 'Slack',
+            sourceUri: `slack://${channel}/${ts}`,
+          });
           await client.chat.postEphemeral({ channel, user: e.user, text: '📌 Saved that to your memory.' });
         } catch (err) { logger.warn({ err }, 'reaction save-to-memory failed'); }
       } else {

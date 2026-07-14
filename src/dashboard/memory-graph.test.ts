@@ -26,9 +26,11 @@ const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
 // eslint-disable-next-line import/first
 const { createFocus } = await import('../memory/focus.js');
 // eslint-disable-next-line import/first
-const { syncFactEntityLinks, recordEntityEdge } = await import('../memory/relations.js');
+const { syncFactEntityLinks, syncFactResourceLinks, recordEntityEdge } = await import('../memory/relations.js');
 // eslint-disable-next-line import/first
-const { buildMemoryGraph, collectNonFactStoreNodes } = await import('./memory-graph.js');
+const { upsertResourcePointer } = await import('../memory/source-map.js');
+// eslint-disable-next-line import/first
+const { buildMemoryGraph, buildMemoryNeighborhood, collectNonFactStoreNodes } = await import('./memory-graph.js');
 
 before(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
 beforeEach(() => { resetMemoryDb(); });
@@ -41,7 +43,7 @@ test('fact→entity edges are word-boundary matched, not naive substrings', () =
   rememberFact({ kind: 'project', content: 'Shipped the teamwork retro deck for Acme this week.' });
 
   const db = openMemoryDb();
-  const { edges } = buildMemoryGraph(db, { entitiesLimit: 50 });
+  const { edges } = buildMemoryGraph(db, { entitiesLimit: 50, truthMode: 'augmented' });
   const entityEdges = edges.filter((e) => e.type === 'entity');
 
   // The only entity edge should be to Acme (a real word), never to "team".
@@ -56,7 +58,7 @@ test('WS2: after link sync, the fact→entity edge is STORED (solid), not inferr
   syncFactEntityLinks();
 
   const db = openMemoryDb();
-  const { edges } = buildMemoryGraph(db, { entitiesLimit: 50 });
+  const { edges } = buildMemoryGraph(db, { entitiesLimit: 50, truthMode: 'augmented' });
   const edge = edges.find((e) => e.type === 'entity' && e.source === `fact:${fact.id}` && e.target === `entity:${acme}`);
   assert.ok(edge, 'expected a fact→entity edge');
   assert.ok(!edge?.inferred, 'a stored edge must NOT be flagged inferred (renders solid)');
@@ -77,14 +79,97 @@ test('WS2: entity↔entity edges render as labeled "related" edges between entit
   assert.equal(rel?.label, 'works at');
 });
 
+test('temporal entity edges expose stored evidence metadata and hide expired relationships', () => {
+  const dana = upsertEntity({ type: 'person', name: 'Dana' });
+  const acme = upsertEntity({ type: 'company', name: 'Acme' });
+  const legacy = upsertEntity({ type: 'company', name: 'Legacy Co' });
+  rememberFact({ kind: 'project', content: 'Dana works with Acme and previously advised Legacy Co.' });
+  syncFactEntityLinks();
+  recordEntityEdge({
+    subjectId: dana,
+    predicate: 'works at',
+    objectId: acme,
+    confidence: 0.91,
+    validFrom: '2025-01-01T00:00:00.000Z',
+  });
+  recordEntityEdge({
+    subjectId: dana,
+    predicate: 'advised',
+    objectId: legacy,
+    validFrom: '2020-01-01T00:00:00.000Z',
+    validTo: '2021-01-01T00:00:00.000Z',
+  });
+
+  const { edges } = buildMemoryGraph(openMemoryDb(), { entitiesLimit: 50 });
+  const current = edges.find((edge) => edge.type === 'related' && edge.label === 'works at');
+  assert.equal(current?.data?.confidence, 0.91);
+  assert.equal(current?.data?.validFrom, '2025-01-01T00:00:00.000Z');
+  assert.ok(!edges.some((edge) => edge.type === 'related' && edge.label === 'advised'));
+});
+
 test('inferred fact→entity edges carry inferred:true', () => {
   const acmeId = upsertEntity({ type: 'company', name: 'Acme' });
   rememberFact({ kind: 'project', content: 'Met with Acme about the renewal.' });
   const db = openMemoryDb();
-  const { edges } = buildMemoryGraph(db, { entitiesLimit: 50 });
+  const { edges } = buildMemoryGraph(db, { entitiesLimit: 50, truthMode: 'augmented' });
   const edge = edges.find((e) => e.type === 'entity' && e.target === `entity:${acmeId}`);
   assert.ok(edge, 'expected an entity edge to Acme');
   assert.equal(edge?.inferred, true, 'render-derived entity edges must be flagged inferred');
+});
+
+test('stored truth mode never emits inferred or semantic edges', () => {
+  upsertEntity({ type: 'company', name: 'Acme' });
+  rememberFact({ kind: 'project', content: 'Met with Acme about the renewal.' });
+
+  const { edges, meta } = buildMemoryGraph(openMemoryDb(), {
+    entitiesLimit: 50,
+    simEdges: 3,
+  });
+
+  assert.ok(edges.length > 0, 'stored membership/evidence edges remain visible');
+  assert.ok(edges.every((edge) => edge.truth === 'stored'));
+  assert.equal((meta.coverage as { edges: { inferred: number; semantic: number } }).edges.inferred, 0);
+  assert.equal((meta.coverage as { edges: { inferred: number; semantic: number } }).edges.semantic, 0);
+});
+
+test('stored graph projects persisted resources, episodes, policies, and their exact edges', () => {
+  const entityId = upsertEntity({ type: 'company', name: 'Acme' });
+  const resource = upsertResourcePointer({
+    app: 'Salesforce',
+    kind: 'opportunity',
+    name: 'Acme renewal',
+    whatsHere: 'contract terms',
+  });
+  const fact = rememberFact({
+    kind: 'constraint',
+    content: 'Always review the Acme renewal before sending a quote.',
+  });
+  syncFactEntityLinks();
+  syncFactResourceLinks();
+
+  const { nodes, edges } = buildMemoryGraph(openMemoryDb(), { factsLimit: 10, entitiesLimit: 50 });
+  assert.ok(nodes.some((node) => node.id === `entity:${entityId}`));
+  assert.ok(nodes.some((node) => node.id === `resource:${resource.id}`));
+  assert.ok(nodes.some((node) => node.type === 'episode'));
+  assert.ok(nodes.some((node) => node.id === `policy:${fact.id}`));
+  assert.ok(edges.some((edge) => edge.source === `fact:${fact.id}` && edge.target === `resource:${resource.id}` && edge.truth === 'stored'));
+  assert.ok(edges.some((edge) => edge.source === `fact:${fact.id}` && edge.type === 'evidence' && edge.truth === 'stored'));
+  assert.ok(edges.some((edge) => edge.source === `policy:${fact.id}` && edge.target === `fact:${fact.id}` && edge.truth === 'stored'));
+});
+
+test('stored neighborhood can load a fact omitted from the overview sample', () => {
+  const target = rememberFact({ kind: 'project', content: 'Archived tail-memory target.' });
+  const old = '2020-01-01T00:00:00.000Z';
+  openMemoryDb().prepare('UPDATE consolidated_facts SET created_at = ?, updated_at = ?, valid_from = ? WHERE id = ?')
+    .run(old, old, old, target.id);
+  for (let i = 0; i < 15; i++) rememberFact({ kind: 'project', content: `Newer overview fact ${i}.` });
+
+  const overview = buildMemoryGraph(openMemoryDb(), { factsLimit: 10 });
+  assert.ok(!overview.nodes.some((node) => node.id === `fact:${target.id}`));
+
+  const neighborhood = buildMemoryNeighborhood(openMemoryDb(), `fact:${target.id}`, 1);
+  assert.ok(neighborhood.nodes.some((node) => node.id === `fact:${target.id}`));
+  assert.ok(neighborhood.edges.every((edge) => edge.truth === 'stored'));
 });
 
 const NON_FACT_TYPES = new Set(['tool-recall', 'skill', 'workflow', 'goal', 'focus']);

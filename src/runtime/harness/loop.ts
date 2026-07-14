@@ -77,7 +77,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
-import { primeTurnRecallVector, searchFactsByText, touchFactAccess } from '../../memory/facts.js';
+import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
@@ -1156,11 +1156,10 @@ function factsBlockForPrimer(query: string): string {
   try {
     const facts = searchFactsByText(query, TURN_MEMORY_PRIMER_FACT_TOP_K);
     if (facts.length === 0) return '';
-    // Surfacing a fact into the per-turn primer IS an access in Stanford's
-    // framework (same as renderFactsForInstructions). Reinforce so a fact that
-    // is only ever recalled via this lexical primer stops looking "idle" to
-    // decayAndEvictFacts. Best-effort — never break the primer.
-    try { for (const f of facts) touchFactAccess(f.id); } catch { /* recency anchor stays slightly stale */ }
+    // Primer exposure is an impression, not proof that the memory helped.
+    // Keeping this separate from utility prevents repeated auto-context from
+    // making the same memories rank higher merely because they were shown.
+    try { for (const f of facts) recordFactImpression(f.id); } catch { /* best effort */ }
     appendFactRecallTrace({
       surface: 'turn_memory_primer',
       query,
