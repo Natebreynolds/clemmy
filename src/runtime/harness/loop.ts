@@ -79,6 +79,7 @@ import { getRuntimeEnv } from '../../config.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { primeTurnRecallVector, recordFactImpression, searchFactsByText } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
+import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
@@ -1382,6 +1383,7 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
   if (isSyntheticStallRetryInput(query)) {
     return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'synthetic_retry' };
   }
+  scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
 
   try {
     // Wave 2 Move A: APPEND sync cross-store breadcrumbs (people/places/tools) to

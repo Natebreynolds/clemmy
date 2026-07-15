@@ -13,6 +13,7 @@ const { openMemoryDb, resetMemoryDb } = await import('./db.js');
 const {
   buildFtsQuery,
   getRecallStats,
+  resolveTemporalMeetingDate,
   recall,
   recallHybrid,
   recallIndexSize,
@@ -33,19 +34,22 @@ function insertChunk(input: {
   content: string;
   title?: string | null;
   mtime?: number;
+  chunkIndex?: number;
 }): void {
   const db = openMemoryDb();
   const mtime = input.mtime ?? Date.now();
+  const chunkIndex = input.chunkIndex ?? 0;
   db.prepare(`
     INSERT INTO vault_chunks (path, chunk_index, content, title, mtime, byte_size, content_hash)
-    VALUES (?, 0, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.path,
+    chunkIndex,
     input.content,
     input.title ?? null,
     mtime,
     Buffer.byteLength(input.content, 'utf-8'),
-    `${input.path}:${mtime}:${input.content.length}`,
+    `${input.path}:${chunkIndex}:${mtime}:${input.content.length}`,
   );
 }
 
@@ -177,4 +181,61 @@ test('recallHybrid objective rerank promotes the on-objective chunk from the FTS
     '/vault/projects/legal-deploy.md',
     'objective overlap should beat a stale high-BM25 sibling chunk',
   );
+});
+
+test('relative meeting recall resolves the user timezone and ranks the exact recording first', async () => {
+  const meetingPath = '/vault/04-Meetings/2026-07-14-in-person_meeting-local-review.md';
+  insertChunk({
+    path: meetingPath,
+    chunkIndex: 0,
+    title: null,
+    content: `---
+type: meeting-transcript
+source: local whisper (base.en)
+recording_id: recording-in-person-review
+title: Scorpion Partnership Revenue and Legal Data Integration Review
+started_at: 2026-07-14T20:24:09.442Z
+ended_at: 2026-07-14T21:10:00.000Z
+---`,
+  });
+  insertChunk({
+    path: meetingPath,
+    chunkIndex: 1,
+    title: 'Summary',
+    content: '## Summary\nInternal Scorpion team meeting reviewing partnership revenue against 2026 goals and legal data integration gaps.',
+  });
+  insertChunk({
+    path: '/vault/03-Projects/legal-leadership-offsite.md',
+    content: 'Today inperson meeting meeting meeting: Legal Leadership Offsite at the Valencia office.',
+    title: 'Legal Leadership Offsite',
+  });
+  insertChunk({
+    path: '/vault/04-Meetings/2026-07-14-scorpion_discovery_meeting-aloise-wilcox.md',
+    content: '---\ntype: meeting-transcript\nsource: recall.ai async transcript (canonical)\ntitle: Aloise & Wilcox Online Visibility Gap\nstarted_at: 2026-07-14T17:00:37.814Z\n---',
+    title: 'Aloise & Wilcox Online Visibility Gap',
+  });
+
+  const nowMs = Date.parse('2026-07-15T01:23:20.713Z'); // July 14 in Los Angeles
+  assert.equal(
+    resolveTemporalMeetingDate('What was the inperson meeting I had today about?', { nowMs, timeZone: 'America/Los_Angeles' }),
+    '2026-07-14',
+  );
+
+  const firstQuery = recall('What was the inperson meeting I had today about?', {
+    limit: 5,
+    nowMs,
+    timeZone: 'America/Los_Angeles',
+  });
+  assert.equal(firstQuery[0]?.filePath, meetingPath, 'exact-date recording beats a calendar note with stronger repeated terms');
+  assert.equal(firstQuery[0]?.title, 'Scorpion Partnership Revenue and Legal Data Integration Review');
+  assert.match(firstQuery[0]?.snippet ?? '', /Recorded meeting on 2026-07-14/);
+  assert.match(firstQuery[0]?.snippet ?? '', /partnership revenue/);
+
+  const clarifiedQuery = await recallHybrid('I recorded a meeting today what was that', {
+    limit: 5,
+    nowMs,
+    timeZone: 'America/Los_Angeles',
+  });
+  assert.equal(clarifiedQuery[0]?.filePath, meetingPath);
+  assert.match(clarifiedQuery[0]?.snippet ?? '', /legal data integration/);
 });

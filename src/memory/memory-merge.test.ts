@@ -3,8 +3,11 @@ import assert from 'node:assert';
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { mergeParaphrases } from './memory-merge.js';
-import { openMemoryDb } from './db.js';
+
+const TEST_HOME = '/tmp/clemmy-test-memory-merge';
+process.env.CLEMENTINE_HOME = TEST_HOME;
+const { mergeParaphrases, selectMergeAuditToRevert } = await import('./memory-merge.js');
+type HygieneAuditEntry = import('./hygiene-audit.js').HygieneAuditEntry;
 
 // Test helper: create an in-memory test database
 function setupTestDb(): { db: Database.Database; path: string } {
@@ -112,10 +115,15 @@ test('mergeParaphrases: successfully merges similar facts', async () => {
 
 test('mergeParaphrases: respects CLEMMY_MERGE_ENABLED flag', async () => {
   // When disabled, mergeParaphrases should be a no-op
+  const previous = process.env.CLEMMY_MERGE_ENABLED;
   process.env.CLEMMY_MERGE_ENABLED = 'false';
-  const stats = await mergeParaphrases();
-  assert.equal(stats.clustersFound, 0, 'expected no clusters when disabled');
-  process.env.CLEMMY_MERGE_ENABLED = 'true';
+  try {
+    const stats = await mergeParaphrases();
+    assert.equal(stats.clustersFound, 0, 'expected no clusters when disabled');
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_MERGE_ENABLED;
+    else process.env.CLEMMY_MERGE_ENABLED = previous;
+  }
 });
 
 test('mergeParaphrases: respects CLEMMY_MERGE_THRESHOLD', async () => {
@@ -135,4 +143,30 @@ test('entity guards: prevent merging facts about different tables', async () => 
   // This is validated by the integration test which showed 0 entity blocks
   // (meaning legitimate merges passed and distinct entities were preserved)
   assert.ok(true, 'entity guard validation done via integration test');
+});
+
+test('selectMergeAuditToRevert chooses the newest unreversed merge', () => {
+  const entries: HygieneAuditEntry[] = [
+    {
+      at: '2026-07-15T02:00:00.000Z',
+      kind: 'merge-revert',
+      ids: [3],
+      detail: { canonical: 1, originalMergeAt: '2026-07-15T01:00:00.000Z' },
+    },
+    {
+      at: '2026-07-15T01:30:00.000Z',
+      kind: 'merge',
+      ids: [4],
+      detail: { canonical: 1, cluster: [{ id: 4 }] },
+    },
+    {
+      at: '2026-07-15T01:00:00.000Z',
+      kind: 'merge',
+      ids: [3],
+      detail: { canonical: 1, cluster: [{ id: 3 }] },
+    },
+  ];
+
+  assert.equal(selectMergeAuditToRevert(entries, 1)?.at, '2026-07-15T01:30:00.000Z');
+  assert.equal(selectMergeAuditToRevert(entries, 1, '2026-07-15T01:00:00.000Z'), null);
 });

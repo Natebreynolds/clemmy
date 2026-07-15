@@ -11,7 +11,10 @@ import { getActiveAuthMode, getRuntimeEnv } from '../../config.js';
 import { isUnparseableToolCallError } from '../../execution/transient-error.js';
 import { captureInteractionSignals } from '../../memory/auto-capture.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
+import { recallMemory } from '../../memory/recall-memory.js';
+import { isTemporalMeetingQuery } from '../../memory/recall.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
+import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { appendEvent, clearKill, createSession, getSession, listEvents, openEventLog } from './eventlog.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
@@ -714,9 +717,22 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
   const q = (request.message ?? '').replace(/\s+/g, ' ').trim();
   const recallOn = (getRuntimeEnv('CLEMMY_BRAIN_QUERY_RECALL', 'on') ?? 'on').trim().toLowerCase() !== 'off';
   if (q && recallOn) {
+    scheduleRecallShadow({ query: q, surface: 'claude_primer', limit: 6 });
     try {
-      const hits = await withTimeout(searchFactsHybridImpl(q, 6), queryRecallTimeoutMs(), []);
-      const bullets = hits
+      const timeoutMs = queryRecallTimeoutMs();
+      const [hits, meetingRecall] = await Promise.all([
+        withTimeout(searchFactsHybridImpl(q, 6), timeoutMs, []),
+        isTemporalMeetingQuery(q)
+          ? withTimeout(recallMemory(q, { stores: ['note'], graphDepth: 0, limit: 4 }), timeoutMs, null)
+          : Promise.resolve(null),
+      ]);
+      const meetingBullets = (meetingRecall?.hits ?? []).map((hit) => {
+        const source = hit.evidence[0]?.sourceUri;
+        const content = String(hit.text ?? '').trim();
+        const bounded = content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — load the source for the full meeting]`;
+        return `- [RECORDED MEETING · ${hit.whyRecalled.join(', ')}] ${hit.title ?? 'Meeting'}: ${bounded}${source ? ` (source: ${source})` : ''}`;
+      });
+      const factBullets = hits
         // Per-bullet bound: recall content is injected every turn and was one
         // of the last unbounded context inputs on this lane. The cut is MARKED
         // so a fact whose operative tail (URL/id) sits past the bound reads as
@@ -725,14 +741,15 @@ export async function renderClaudeAgentBrainTurnContext(request: AssistantReques
           const content = String(f.content ?? '').trim();
           return `- ${content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — search memory for the full fact]`}`;
         })
-        .filter((l) => l.length > 2)
-        .join('\n');
+        .filter((l) => l.length > 2);
+      const bullets = [...meetingBullets, ...factBullets].join('\n');
       if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
     } catch { recall = ''; }
   }
   // Wave 2 Move A: append cross-store breadcrumbs (people/things, places, proven
   // tools) — the entity/resource/tool stores that had no per-turn auto-recall on
-  // THIS lane either (the SDK brain's recall above is facts-only). Sync stores →
+  // THIS lane either (the SDK brain's recall above covers facts plus exact-date
+  // recorded meetings). Sync stores →
   // no first-token latency; self-gating via CLEMMY_UNIFIED_RECALL.
   let breadcrumbs = '';
   if (q) {

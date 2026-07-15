@@ -137,14 +137,34 @@ export interface MemoryHealth {
   };
   recall?: { calls?: number; hits?: number; empties?: number; hitRate?: number };
   reliability?: {
-    evidenceLinked?: number; brokenEvidence?: number; missingEpisodes?: number;
+    evidenceLinked?: number; evidenceAvailable?: number; evidenceUnavailable?: number;
+    unreconciledEvidence?: number; unreconciledDerivedEvidence?: number; unavailableDerivedEvidence?: number;
+    evidenceCoverage?: number; brokenEvidence?: number; missingEpisodes?: number;
     pendingReflections?: number; oldestPending?: string | null; unreachableFacts?: number;
     impressions?: number; utility?: number;
     policies?: Record<string, number>;
     relationships?: Record<string, number>;
+    shadow?: {
+      samples: number; averageOverlap: number; primaryOnly: number; legacyOnly: number;
+      tailHits: number; evidenceBacked: number; primaryFacts: number; evidenceRate: number;
+      supported: number; lastAt: string | null; bySurface: Record<string, number>;
+    };
   };
 }
 export const getMemoryHealth = () => apiGet<MemoryHealth>('/api/console/memory/health');
+
+export interface EvidenceReconciliationReport {
+  backupPath: string | null;
+  before: number;
+  processed: number;
+  available: number;
+  unavailable: number;
+  remaining: number;
+  complete: boolean;
+  elapsedMs: number;
+}
+export const reconcileMemoryEvidence = (maxFacts = 5_000) =>
+  apiPost<EvidenceReconciliationReport>('/api/console/memory/reconcile-evidence', { maxFacts, batchSize: 200 });
 
 /** A learned tool-recall (procedural) memo — which tool proved out for an intent. */
 export interface ToolRecallRecord {

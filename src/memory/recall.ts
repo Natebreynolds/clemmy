@@ -9,6 +9,7 @@ import {
   loadEmbeddingsForChunks,
 } from './embeddings.js';
 import type { MemorySearchHit } from '../types.js';
+import { loadUserProfile } from '../runtime/user-profile.js';
 
 /**
  * Hybrid recall over the vault index.
@@ -127,6 +128,136 @@ export interface RecallOptions {
    * old match. Unset or <= 0 → no recency weighting (ranking byte-identical).
    */
   recencyHalfLifeDays?: number;
+  /** Deterministic clock override used by temporal recall and tests. */
+  nowMs?: number;
+  /** IANA timezone for relative dates such as "today" and "yesterday". */
+  timeZone?: string;
+}
+
+const MEETING_INTENT_RE = /\b(?:meetings?|calls?|recorded|recording|transcripts?|captured?|capture)\b/i;
+const RELATIVE_DATE_RE = /\b(?:today|tonight|yesterday|this\s+(?:morning|afternoon|evening))\b/i;
+const IN_PERSON_RE = /\b(?:in\s*-?\s*person|inperson)(?=$|[^a-z0-9])/i;
+const GENERIC_MEETING_TITLES = new Set(['summary', 'topics', 'participants', 'capture', 'transcript', 'action items']);
+
+function datePartsAt(ms: number, timeZone: string): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date(ms));
+  const value = (type: Intl.DateTimeFormatPartTypes): number => Number(parts.find((part) => part.type === type)?.value);
+  return { year: value('year'), month: value('month'), day: value('day') };
+}
+
+function safeTimeZone(explicit?: string): string {
+  const requested = explicit?.trim() || loadUserProfile().timezone?.trim()
+    || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: requested }).format(new Date(0));
+    return requested;
+  } catch {
+    return 'UTC';
+  }
+}
+
+function shiftCalendarDate(parts: { year: number; month: number; day: number }, days: number): string {
+  const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days));
+  return shifted.toISOString().slice(0, 10);
+}
+
+/** Resolve the calendar date named by a meeting query in the user's timezone. */
+export function resolveTemporalMeetingDate(query: string, options: Pick<RecallOptions, 'nowMs' | 'timeZone'> = {}): string | null {
+  if (!MEETING_INTENT_RE.test(query)) return null;
+  const explicit = query.match(/\b(20\d{2}-\d{2}-\d{2})\b/)?.[1];
+  if (explicit) return explicit;
+  if (!RELATIVE_DATE_RE.test(query)) return null;
+  const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+  const parts = datePartsAt(nowMs, safeTimeZone(options.timeZone));
+  return shiftCalendarDate(parts, /\byesterday\b/i.test(query) ? -1 : 0);
+}
+
+export function isTemporalMeetingQuery(query: string): boolean {
+  return MEETING_INTENT_RE.test(query)
+    && (RELATIVE_DATE_RE.test(query) || /\b20\d{2}-\d{2}-\d{2}\b/.test(query));
+}
+
+interface TemporalMeetingChunk {
+  path: string;
+  title: string | null;
+  content: string;
+  mtime: number;
+}
+
+function frontmatterValue(content: string, key: string): string | undefined {
+  return content.match(new RegExp(`^${key}:\\s*(.+)$`, 'im'))?.[1]?.trim();
+}
+
+function temporalMeetingHits(query: string, options: RecallOptions, limit: number): MemorySearchHit[] {
+  const date = resolveTemporalMeetingDate(query, options);
+  if (!date) return [];
+  const db = openMemoryDb();
+  const params: unknown[] = [`%${date}%`, `%${date}%`];
+  let sql = `
+    SELECT path, MAX(mtime) AS mtime
+    FROM vault_chunks
+    WHERE REPLACE(path, '\\', '/') LIKE '%/04-Meetings/%'
+      AND (path LIKE ? OR content LIKE ?)
+  `;
+  if (options.pathPrefix) {
+    sql += ' AND path LIKE ?';
+    params.push(`${options.pathPrefix}%`);
+  }
+  sql += ' GROUP BY path ORDER BY mtime DESC LIMIT ?';
+  params.push(Math.max(limit, 12));
+  const paths = db.prepare(sql).all(...params) as Array<{ path: string; mtime: number }>;
+  const load = db.prepare(`
+    SELECT path, title, content, mtime
+    FROM vault_chunks WHERE path = ? ORDER BY chunk_index ASC
+  `);
+  const inPersonIntent = IN_PERSON_RE.test(query);
+  return paths.map(({ path: filePath, mtime }) => {
+    const chunks = load.all(filePath) as TemporalMeetingChunk[];
+    const all = chunks.map((chunk) => chunk.content).join('\n');
+    const metadata = chunks.find((chunk) => /(?:^|\n)type:\s*meeting-transcript\b/i.test(chunk.content))?.content ?? chunks[0]?.content ?? '';
+    const summary = chunks.find((chunk) => chunk.title?.trim().toLowerCase() === 'summary' || /^##\s+Summary\b/im.test(chunk.content));
+    const named = chunks.find((chunk) => chunk.title?.trim() && !GENERIC_MEETING_TITLES.has(chunk.title.trim().toLowerCase()));
+    const title = frontmatterValue(metadata, 'title') || named?.title?.trim() || deriveTitle({ title: null, path: filePath });
+    const startedAt = frontmatterValue(metadata, 'started_at');
+    const source = frontmatterValue(metadata, 'source');
+    const summaryText = (summary?.content ?? metadata)
+      .replace(/^##\s+Summary\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 420);
+    const isTranscript = /(?:^|\n)type:\s*meeting-transcript\b/i.test(metadata)
+      || /(?:^|\n)(?:recording_id|meeting_id):/im.test(all);
+    const label = `${isTranscript ? 'Recorded meeting' : 'Meeting note'} on ${date}`;
+    const details = [startedAt ? `started ${startedAt}` : '', source ? `source ${source}` : ''].filter(Boolean).join(' · ');
+    return {
+      hit: {
+        filePath,
+        title,
+        snippet: `${label}${details ? ` (${details})` : ''}: ${summaryText}`,
+        score: 10,
+      } satisfies MemorySearchHit,
+      occurredMs: Number.isFinite(Date.parse(startedAt ?? '')) ? Date.parse(startedAt!) : mtime,
+      inPersonMatch: IN_PERSON_RE.test(`${filePath} ${title} ${all}`),
+    };
+  })
+    // Occurrence time is the temporal truth; mtime is only a fallback for old
+    // notes without frontmatter. Explicit in-person wording wins before time.
+    .sort((a, b) => (inPersonIntent ? Number(b.inPersonMatch) - Number(a.inPersonMatch) : 0) || b.occurredMs - a.occurredMs)
+    .slice(0, limit)
+    .map(({ hit }, rank) => ({ ...hit, score: Number((10 - rank * 0.05).toFixed(3)) }));
+}
+
+function mergeTemporalMeetingHits(query: string, options: RecallOptions, hits: MemorySearchHit[], limit: number): MemorySearchHit[] {
+  const prioritized = temporalMeetingHits(query, options, limit);
+  if (prioritized.length === 0) return hits.slice(0, limit);
+  const merged = new Map<string, MemorySearchHit>();
+  for (const hit of [...prioritized, ...hits]) if (!merged.has(hit.filePath)) merged.set(hit.filePath, hit);
+  return Array.from(merged.values()).slice(0, limit);
 }
 
 // Recency multiplier floor: an arbitrarily old chunk is demoted to at most this
@@ -306,7 +437,7 @@ async function semanticFallback(query: string, options: RecallOptions, limit: nu
 export function recall(query: string, options: RecallOptions = {}): MemorySearchHit[] {
   const limit = Math.max(1, options.limit ?? 6);
   const rows = fetchFtsCandidates(query, options, limit);
-  const hits = rowsToHits(rows);
+  const hits = mergeTemporalMeetingHits(query, options, rowsToHits(rows), limit);
   recordRecall(hits.length);
   return hits;
 }
@@ -325,27 +456,32 @@ export async function recallHybrid(query: string, options: RecallOptions = {}): 
 
 async function recallHybridImpl(query: string, options: RecallOptions = {}): Promise<MemorySearchHit[]> {
   const limit = Math.max(1, options.limit ?? 6);
+  // An exact calendar-date meeting match is stronger than a semantic guess and
+  // needs no embedding call. Returning it immediately also keeps automatic
+  // primer assembly comfortably inside its first-token latency budget.
+  const exactMeetings = temporalMeetingHits(query, options, limit);
+  if (exactMeetings.length > 0) return exactMeetings;
   const poolSize = Math.max(limit, RERANK_CANDIDATE_POOL);
   const candidates = fetchFtsCandidates(query, options, poolSize);
   if (candidates.length === 0) {
-    return semanticFallback(query, options, limit);
+    return mergeTemporalMeetingHits(query, options, await semanticFallback(query, options, limit), limit);
   }
 
   // FTS-only fast path when embeddings aren't available.
   if (!isEmbeddingsEnabled()) {
-    return rowsToHits(reRankByScope(candidates, options).slice(0, limit));
+    return mergeTemporalMeetingHits(query, options, rowsToHits(reRankByScope(candidates, options).slice(0, limit)), limit);
   }
 
   const stored = loadEmbeddingsForChunks(candidates.map((c) => c.id));
   if (stored.size === 0) {
     // Pool has no embeddings yet — return FTS order. The backfill task
     // will fill them in over time and the next call benefits.
-    return rowsToHits(reRankByScope(candidates, options).slice(0, limit));
+    return mergeTemporalMeetingHits(query, options, rowsToHits(reRankByScope(candidates, options).slice(0, limit)), limit);
   }
 
   const queryVector = await embedQuery(query);
   if (!queryVector) {
-    return rowsToHits(reRankByScope(candidates, options).slice(0, limit));
+    return mergeTemporalMeetingHits(query, options, rowsToHits(reRankByScope(candidates, options).slice(0, limit)), limit);
   }
 
   // Rank by FTS (already ordered) and by semantic similarity. Then fuse
@@ -386,10 +522,10 @@ async function recallHybridImpl(query: string, options: RecallOptions = {}): Pro
 
   // Rescale scores using the fused order so callers see a sensible 0..10
   // gradient consistent with the FTS-only path.
-  return hits.map((hit, idx) => ({
+  return mergeTemporalMeetingHits(query, options, hits.map((hit, idx) => ({
     ...hit,
     score: Number((10 - (idx * (10 / Math.max(1, hits.length)))).toFixed(3)),
-  }));
+  })), limit);
 }
 
 /**

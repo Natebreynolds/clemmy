@@ -7,7 +7,7 @@ import {
   searchFactsByTextAt,
   type ConsolidatedFact,
 } from './facts.js';
-import { recallHybrid } from './recall.js';
+import { recallHybrid, resolveTemporalMeetingDate } from './recall.js';
 import {
   getFactIdsForEntity,
   getFactIdsForResource,
@@ -50,9 +50,14 @@ export interface MemoryRecallContext {
   asOf?: string;
   stores?: Array<'fact' | 'note' | 'entity' | 'resource' | 'episode' | 'policy' | 'procedure'>;
   resourceMinOverlap?: number;
+  /** Deterministic clock override for relative temporal queries. */
+  now?: string;
+  /** User timezone for "today"/"yesterday" resolution. */
+  timeZone?: string;
 }
 
 const STOP = new Set(['the', 'and', 'for', 'with', 'from', 'this', 'that', 'what', 'when', 'where', 'how', 'your']);
+const IN_PERSON_RE = /\b(?:in\s*-?\s*person|inperson)(?=$|[^a-z0-9])/i;
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
 
 function tokens(text: string): Set<string> {
@@ -76,11 +81,13 @@ function factHit(fact: ConsolidatedFact, score: number, why: string[]): MemoryEv
     confidence: clamp(fact.confidence ?? fact.trustLevel ?? 0.7, 0, 1),
     validFrom: fact.validFrom ?? fact.createdAt,
     validTo: fact.validTo ?? undefined,
-    evidence: getFactEvidence(fact.id).map((item) => ({
-      episodeId: item.episodeId,
-      excerpt: item.excerpt,
-      sourceUri: item.sourceUri,
-    })),
+    evidence: getFactEvidence(fact.id)
+      .filter((item) => (item.status === 'available' || item.status === 'partial') && item.excerpt.trim().length > 0)
+      .map((item) => ({
+        episodeId: item.episodeId,
+        excerpt: item.excerpt,
+        sourceUri: item.sourceUri,
+      })),
     whyRecalled: why,
   };
 }
@@ -124,16 +131,16 @@ function diversify(hits: MemoryEvidenceHit[], limit: number): MemoryEvidenceHit[
   return selected;
 }
 
-function resolveAsOf(query: string, explicit?: string): { iso?: string; ms: number } {
+function resolveAsOf(query: string, explicit?: string, nowMs = Date.now()): { iso?: string; ms: number } {
   const raw = explicit?.trim()
     || query.match(/\b(?:as of|on)\s+(\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-Z]+)?)/i)?.[1]
     || query.match(/\b(?:as of|in)\s+(\d{4})\b/i)?.[1];
-  if (!raw) return { ms: Date.now() };
+  if (!raw) return { ms: nowMs };
   const normalized = /^\d{4}$/.test(raw) ? `${raw}-12-31T23:59:59.999Z`
     : /^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T23:59:59.999Z`
       : raw.replace(' ', 'T');
   const ms = Date.parse(normalized);
-  return Number.isFinite(ms) ? { iso: new Date(ms).toISOString(), ms } : { ms: Date.now() };
+  return Number.isFinite(ms) ? { iso: new Date(ms).toISOString(), ms } : { ms: nowMs };
 }
 
 /** Evidence-backed hybrid recall over the complete local memory set. Stored
@@ -149,13 +156,16 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const merged = new Map<string, MemoryEvidenceHit>();
   if (!objective) return { hits: [], answerability: 'insufficient', diagnostics: { candidates: 0, stores: [], elapsedMs: 0 } };
   const queryTokens = tokens(objective);
-  const recallTime = resolveAsOf(objective, context.asOf);
+  const contextNowMs = context.now ? Date.parse(context.now) : Date.now();
+  const nowMs = Number.isFinite(contextNowMs) ? contextNowMs : Date.now();
+  const recallTime = resolveAsOf(objective, context.asOf, nowMs);
   const asOfMs = recallTime.ms;
   const historicalAsOf = recallTime.iso;
+  const temporalMeetingDate = resolveTemporalMeetingDate(objective, { nowMs, timeZone: context.timeZone });
 
   const [semanticFacts, notes] = await Promise.all([
     wanted.has('fact') ? findSimilarFactsScored(objective, { topK: perStore }).catch(() => []) : Promise.resolve([]),
-    wanted.has('note') ? recallHybrid(objective, { limit: perStore }).catch(() => []) : Promise.resolve([]),
+    wanted.has('note') ? recallHybrid(objective, { limit: perStore, nowMs, timeZone: context.timeZone }).catch(() => []) : Promise.resolve([]),
   ]);
 
   const factIds = new Set<number>();
@@ -186,15 +196,29 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
 
   if (wanted.has('note')) {
     usedStores.add('note');
-    notes.forEach((note, rank) => mergeHit(merged, {
-      ref: { type: 'note', id: note.filePath },
-      title: note.title,
-      text: note.snippet,
-      score: clamp(0.68 - rank * 0.025, 0.2, 0.68),
-      confidence: 0.8,
-      evidence: [{ episodeId: `note:${note.filePath}`, excerpt: note.snippet, sourceUri: note.filePath }],
-      whyRecalled: ['vault lexical/vector retrieval'],
-    }));
+    notes.forEach((note, rank) => {
+      const normalizedPath = note.filePath.replace(/\\/g, '/');
+      const inPersonMatch = IN_PERSON_RE.test(objective)
+        && IN_PERSON_RE.test(`${normalizedPath} ${note.title} ${note.snippet}`);
+      const exactTemporalMeeting = Boolean(
+        temporalMeetingDate
+        && normalizedPath.includes('/04-Meetings/')
+        && (normalizedPath.includes(temporalMeetingDate) || note.snippet.includes(temporalMeetingDate)),
+      );
+      mergeHit(merged, {
+        ref: { type: 'note', id: note.filePath },
+        title: note.title,
+        text: note.snippet,
+        score: exactTemporalMeeting
+          ? clamp(0.98 - rank * 0.01, 0.85, 0.98)
+          : clamp(0.68 - rank * 0.025, 0.2, 0.68),
+        confidence: exactTemporalMeeting ? 0.95 : 0.8,
+        evidence: [{ episodeId: `note:${note.filePath}`, excerpt: note.snippet, sourceUri: note.filePath }],
+        whyRecalled: exactTemporalMeeting
+          ? ['exact temporal match', inPersonMatch ? 'in-person capture match' : '', 'recorded meeting source', 'vault type meeting-transcript'].filter(Boolean)
+          : ['vault lexical/vector retrieval'],
+      });
+    });
   }
 
   let entityIds: number[] = [];

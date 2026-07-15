@@ -2,13 +2,12 @@ import pino from 'pino';
 import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, ConsolidatedFactRow } from './db.js';
 import { cosine } from './embeddings.js';
-import { appendHygieneAudit, HygieneAuditEntry } from './hygiene-audit.js';
+import { appendHygieneAudit, readHygieneAudit, HygieneAuditEntry } from './hygiene-audit.js';
 
 const logger = pino({ name: 'clementine-next.memory.merge' });
 
 // Configuration
 const DEFAULT_MERGE_THRESHOLD = 0.88;
-const MERGE_ENABLED = getRuntimeEnv('CLEMMY_MERGE_ENABLED', 'true') === 'true';
 
 interface Fact extends ConsolidatedFactRow {
   embedding?: Float32Array;
@@ -254,10 +253,13 @@ function consolidateCluster(canonical: Fact, others: Fact[]) {
 
 /**
  * Main paraphrase merge job. Runs nightly to consolidate semantic duplicates.
- * Fully reversible via unmergeCluster + audit log.
+ * Reversible via unmergeCluster + audit log. New merge entries retain the
+ * canonical fact's pre-merge metadata so a reversal can restore it exactly.
  */
 export async function mergeParaphrases(): Promise<MergeStats> {
-  if (!MERGE_ENABLED) {
+  // Read this at dispatch time so console/runtime feature-flag changes take
+  // effect without restarting the daemon.
+  if (getRuntimeEnv('CLEMMY_MERGE_ENABLED', 'true') !== 'true') {
     return { clustersFound: 0, factsMerged: 0, accessCountFolded: 0, importanceFolded: 0, blockedByPinned: 0, blockedByEntity: 0, errors: 0 };
   }
 
@@ -361,7 +363,16 @@ export async function mergeParaphrases(): Promise<MergeStats> {
           continue;
         }
 
-        // Consolidate metadata
+        // Consolidate metadata. Preserve the exact canonical values in the
+        // audit record before folding anything so future reversals do not have
+        // to guess which member contributed a field.
+        const canonicalBefore = {
+          importance: canonical.importance ?? 5,
+          accessCount: canonical.access_count ?? 0,
+          trustLevel: canonical.trust_level ?? 1.0,
+          lastAccessedAt: canonical.last_accessed_at ?? null,
+          sourceApp: canonical.source_app ?? null,
+        };
         const folded = consolidateCluster(canonical, merged);
 
         // Update canonical fact
@@ -384,6 +395,7 @@ export async function mergeParaphrases(): Promise<MergeStats> {
           ids: merged.map(f => f.id),
           detail: {
             canonical: canonical.id,
+            canonicalBefore,
             cluster: merged.map((f, idx) => ({
               id: f.id,
               sim: similarities[idx],
@@ -416,62 +428,124 @@ export async function mergeParaphrases(): Promise<MergeStats> {
   return stats;
 }
 
+function mergeAuditKey(canonicalId: number, at: string): string {
+  return `${canonicalId}:${at}`;
+}
+
+/** Select the newest merge for a canonical fact that has not already been
+ * reversed. Exported as a pure helper so reversal ordering is regression
+ * tested without opening a real memory database. */
+export function selectMergeAuditToRevert(
+  entries: HygieneAuditEntry[],
+  canonicalId: number,
+  mergeAt?: string,
+): HygieneAuditEntry | null {
+  const reverted = new Set(
+    entries
+      .filter((entry) => entry.kind === 'merge-revert')
+      .map((entry) => {
+        const canonical = Number(entry.detail?.canonical);
+        const originalMergeAt = typeof entry.detail?.originalMergeAt === 'string'
+          ? entry.detail.originalMergeAt
+          : '';
+        return mergeAuditKey(canonical, originalMergeAt);
+      }),
+  );
+
+  return entries.find((entry) => {
+    if (entry.kind !== 'merge' || Number(entry.detail?.canonical) !== canonicalId) return false;
+    if (mergeAt && entry.at !== mergeAt) return false;
+    return !reverted.has(mergeAuditKey(canonicalId, entry.at));
+  }) ?? null;
+}
+
 /**
  * Unmerge a cluster of facts. Reactivates all facts in a merge audit entry.
  * Called when a merge was incorrect and needs to be reverted.
  */
-export function unmergeCluster(canonicalId: number): boolean {
+export function unmergeCluster(
+  canonicalId: number,
+  options: { mergeAt?: string; reason?: string } = {},
+): boolean {
   try {
     const db = openMemoryDb();
-
-    // Read the audit log to find the merge entry
-    const auditPath = require('path').join(
-      require('../config.js').BASE_DIR,
-      'state',
-      'hygiene-audit.jsonl',
+    const mergeEntry = selectMergeAuditToRevert(
+      readHygieneAudit(2_000),
+      canonicalId,
+      options.mergeAt,
     );
-    const fs = require('fs');
-    if (!fs.existsSync(auditPath)) {
-      logger.warn({ auditPath }, 'audit log not found, cannot unmerge');
-      return false;
-    }
-
-    const lines = fs.readFileSync(auditPath, 'utf-8').trim().split('\n');
-    const mergeEntry = lines
-      .map((line: string) => {
-        try {
-          return JSON.parse(line);
-        } catch {
-          return null;
-        }
-      })
-      .find(
-        (entry: any) =>
-          entry && entry.kind === 'merge' && entry.detail?.canonical === canonicalId,
-      );
 
     if (!mergeEntry) {
-      logger.warn({ canonicalId }, 'no merge entry found for canonical fact');
+      logger.warn({ canonicalId, mergeAt: options.mergeAt }, 'no unreversed merge entry found for canonical fact');
       return false;
     }
 
-    // Reactivate the merged facts
-    const mergedIds = (mergeEntry.detail?.cluster || []).map((c: any) => c.id);
-    const now = new Date().toISOString();
-
-    for (const id of mergedIds) {
-      db.prepare('UPDATE consolidated_facts SET active = 1, updated_at = ? WHERE id = ?').run(now, id);
+    const cluster = Array.isArray(mergeEntry.detail?.cluster) ? mergeEntry.detail.cluster : [];
+    const mergedIds = cluster
+      .map((item) => Number((item as { id?: unknown })?.id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (mergedIds.length === 0) {
+      logger.warn({ canonicalId, mergeAt: mergeEntry.at }, 'merge audit entry has no valid member ids');
+      return false;
     }
 
-    // Log the unmerge in the audit trail
+    const now = new Date().toISOString();
+    const canonicalBefore = mergeEntry.detail?.canonicalBefore as {
+      importance?: unknown;
+      accessCount?: unknown;
+      trustLevel?: unknown;
+      lastAccessedAt?: unknown;
+      sourceApp?: unknown;
+    } | undefined;
+    const canRestoreCanonical = canonicalBefore !== undefined
+      && Number.isFinite(Number(canonicalBefore.importance))
+      && Number.isFinite(Number(canonicalBefore.accessCount))
+      && Number.isFinite(Number(canonicalBefore.trustLevel));
+
+    const reactivatedIds = db.transaction(() => {
+      const restored: number[] = [];
+      const reactivate = db.prepare(
+        'UPDATE consolidated_facts SET active = 1, updated_at = ? WHERE id = ? AND active = 0',
+      );
+      for (const id of mergedIds) {
+        if (reactivate.run(now, id).changes > 0) restored.push(id);
+      }
+
+      if (canRestoreCanonical) {
+        db.prepare(`
+          UPDATE consolidated_facts
+          SET importance = ?, access_count = ?, trust_level = ?, last_accessed_at = ?, source_app = ?
+          WHERE id = ?
+        `).run(
+          Number(canonicalBefore!.importance),
+          Number(canonicalBefore!.accessCount),
+          Number(canonicalBefore!.trustLevel),
+          typeof canonicalBefore!.lastAccessedAt === 'string' ? canonicalBefore!.lastAccessedAt : null,
+          typeof canonicalBefore!.sourceApp === 'string' ? canonicalBefore!.sourceApp : null,
+          canonicalId,
+        );
+      }
+      return restored;
+    })();
+
+    if (reactivatedIds.length === 0) {
+      logger.warn({ canonicalId, mergeAt: mergeEntry.at, mergedIds }, 'merge members were already active or missing');
+      return false;
+    }
+
     appendHygieneAudit({
       at: now,
-      kind: 'approve-dedup', // Reuse the approval entry kind
-      ids: mergedIds,
-      detail: { canonical: canonicalId, action: 'unmerge', reason: 'manual reversal' },
+      kind: 'merge-revert',
+      ids: reactivatedIds,
+      detail: {
+        canonical: canonicalId,
+        originalMergeAt: mergeEntry.at,
+        canonicalMetadataRestored: canRestoreCanonical,
+        reason: options.reason?.trim() || 'manual reversal',
+      },
     });
 
-    logger.info({ canonicalId, mergedIds }, 'unmerge cluster completed');
+    logger.info({ canonicalId, reactivatedIds, mergeAt: mergeEntry.at, canonicalMetadataRestored: canRestoreCanonical }, 'unmerge cluster completed');
     return true;
   } catch (err) {
     logger.error({ err: err instanceof Error ? err.message : String(err), canonicalId }, 'unmerge failed');

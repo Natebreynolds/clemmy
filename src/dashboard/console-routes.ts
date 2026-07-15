@@ -44,7 +44,8 @@ import { readHygieneAudit } from '../memory/hygiene-audit.js';
 import { openMemoryDb } from '../memory/db.js';
 import { buildMemoryGraph, buildMemoryNeighborhood } from './memory-graph.js';
 import { recallMemory } from '../memory/recall-memory.js';
-import { listMemoryPolicies } from '../memory/temporal-memory.js';
+import { readRecallShadowSummary, scheduleRecallShadow } from '../memory/recall-shadow.js';
+import { listMemoryPolicies, readTemporalEvidenceHealth, reconcileTemporalEvidence } from '../memory/temporal-memory.js';
 import {
   getFocusSnapshot,
   activateFocus as activateFocusRow,
@@ -2499,6 +2500,7 @@ export function registerConsoleRoutes(
     }
     try {
       const result = await recallMemory(query, { limit, graphDepth });
+      scheduleRecallShadow({ query, surface: 'console_search', limit, primary: result });
       res.json({ query, ...result });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -2938,6 +2940,25 @@ export function registerConsoleRoutes(
     }
   });
 
+  /** Backup-first, bounded provenance reconciliation. Every processed fact is
+   * classified as source-backed or explicitly unavailable, so repeated runs
+   * resume instead of rescanning the same missing sources. */
+  app.post('/api/console/memory/reconcile-evidence', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as { maxFacts?: unknown; batchSize?: unknown };
+    const maxFacts = typeof body.maxFacts === 'number' && Number.isFinite(body.maxFacts)
+      ? Math.max(1, Math.min(50_000, Math.floor(body.maxFacts)))
+      : 5_000;
+    const batchSize = typeof body.batchSize === 'number' && Number.isFinite(body.batchSize)
+      ? Math.max(1, Math.min(1_000, Math.floor(body.batchSize)))
+      : 200;
+    try {
+      res.json(reconcileTemporalEvidence({ maxFacts, batchSize, requireBackup: true }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   /**
    * Tier D2 — memory health/observability: fact counts, embedding coverage
    * + freshness, recall hit-rate, and the hidden layers (pinned / episodic /
@@ -2958,13 +2979,7 @@ export function registerConsoleRoutes(
       const episodic = one('SELECT COUNT(*) AS c FROM episodic_pointers');
       const entities = one('SELECT COUNT(*) AS c FROM entities');
       const focusActive = one("SELECT COUNT(*) AS c FROM current_focus WHERE status = 'active'");
-      const evidenceLinked = one('SELECT COUNT(DISTINCT fact_id) AS c FROM fact_evidence');
-      const brokenEvidence = one(`
-        SELECT COUNT(*) AS c FROM consolidated_facts cf
-        WHERE cf.derived_from_call_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM fact_evidence fe WHERE fe.fact_id = cf.id)
-      `);
-      const missingEpisodes = one("SELECT COUNT(*) AS c FROM memory_episodes WHERE status = 'missing'");
+      const evidenceHealth = readTemporalEvidenceHealth();
       const pendingReflections = one("SELECT COUNT(*) AS c FROM reflection_pending_extractions WHERE status = 'pending'");
       const unreachableFacts = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1 AND utility_count = 0');
       const policyRows = db.prepare('SELECT policy_type, COUNT(*) AS c FROM memory_policies GROUP BY policy_type').all() as Array<{ policy_type: string; c: number }>;
@@ -3006,9 +3021,10 @@ export function registerConsoleRoutes(
         },
         recall: getRecallStats(),
         reliability: {
-          evidenceLinked,
-          brokenEvidence,
-          missingEpisodes,
+          // `evidenceLinked` remains as a backwards-compatible alias for
+          // usable evidence; unavailable links never count as answer support.
+          evidenceLinked: evidenceHealth.evidenceAvailable,
+          ...evidenceHealth,
           pendingReflections,
           oldestPending,
           unreachableFacts,
@@ -3016,6 +3032,7 @@ export function registerConsoleRoutes(
           utility: usage.utility,
           policies,
           relationships: relationshipCounts,
+          shadow: readRecallShadowSummary(500),
         },
       });
     } catch (err) {
